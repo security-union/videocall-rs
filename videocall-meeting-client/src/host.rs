@@ -16,6 +16,7 @@
 
 use videocall_meeting_types::requests::{
     DisableVideoParticipantRequest, KickParticipantRequest, MuteParticipantRequest,
+    TransferHostRequest,
 };
 
 use crate::error::ApiError;
@@ -91,6 +92,23 @@ impl MeetingApiClient {
     pub async fn kick_participant(&self, meeting_id: &str, user_id: &str) -> Result<(), ApiError> {
         let path = format!("/api/v1/meetings/{meeting_id}/kick");
         let body = KickParticipantRequest {
+            user_id: user_id.to_string(),
+        };
+        let response = self.post(&path).json(&body).send().await?;
+        parse_status_only(response).await
+    }
+
+    /// Transfer host capability to an admitted participant and step down.
+    ///
+    /// Calls `POST /api/v1/meetings/{meeting_id}/transfer-host`.
+    ///
+    /// Atomically promotes the target and demotes the issuing host in a single
+    /// server-side transaction — the only sanctioned self-demotion. If the
+    /// target is not an admitted participant the server rolls back and the
+    /// caller keeps host.
+    pub async fn transfer_host(&self, meeting_id: &str, user_id: &str) -> Result<(), ApiError> {
+        let path = format!("/api/v1/meetings/{meeting_id}/transfer-host");
+        let body = TransferHostRequest {
             user_id: user_id.to_string(),
         };
         let response = self.post(&path).json(&body).send().await?;

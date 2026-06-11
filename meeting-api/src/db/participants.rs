@@ -134,6 +134,15 @@ pub async fn join_attendee(
     // the rationale. The same `COALESCE(NULLIF(...), $3)` shape applies to
     // both branches below — non-empty existing names beat the request's
     // value so rejoin never silently renames a participant. Issue #502.
+    //
+    // Host-flag policy on rejoin: `is_host` is intentionally OMITTED from both
+    // `DO UPDATE SET` branches, so a transient transport reconnect (which does
+    // NOT call REST /leave) never silently demotes the current host. An
+    // EXPLICIT leave is different — `leave_meeting` clears the host flag
+    // before this rejoin runs, so a deliberate Leave + rejoin returns them as a
+    // regular participant. The waiting-room branch inserts `is_host = FALSE`
+    // only for a brand-new row; an existing flag is preserved here and
+    // governed solely by the leave path.
     let row = if waiting_room_enabled {
         let query = format!(
             r#"
@@ -298,6 +307,110 @@ pub async fn kick(
         .bind(user_id)
         .fetch_optional(pool)
         .await
+}
+
+/// Admit the creator on rejoin into an ALREADY-ACTIVE meeting WITHOUT changing
+/// `is_host`.
+///
+/// A transfer-host may have moved host to another participant; the creator
+/// rejoining mid-meeting must NOT reclaim it — the host stays the transfer
+/// target until the meeting ends. So unlike [`upsert_host`], this never sets
+/// `is_host = TRUE` on the existing row (the `DO UPDATE` omits `is_host`), it
+/// only re-admits the creator. The `INSERT` branch's `is_host = FALSE` is a
+/// safety default for the (not-expected) brand-new-row case. Mirrors the
+/// display-name reconciliation policy of [`upsert_host`] / [`join_attendee`].
+pub async fn admit_creator_preserve_host(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+) -> Result<ParticipantRow, sqlx::Error> {
+    let query = format!(
+        r#"
+        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, is_guest, display_name, admitted_at)
+        VALUES ($1, $2, 'admitted', FALSE, FALSE, $3, NOW())
+        ON CONFLICT (meeting_id, user_id)
+        DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
+                      display_name = COALESCE(NULLIF(meeting_participants.display_name, ''), $3)
+        RETURNING {PARTICIPANT_COLUMNS}
+        "#
+    );
+    sqlx::query_as::<_, ParticipantRow>(&query)
+        .bind(meeting_id)
+        .bind(user_id)
+        .bind(display_name)
+        .fetch_one(pool)
+        .await
+}
+
+/// Atomically transfer host from `from_user_id` to `to_user_id` (single-host
+/// model: host is handed off, not shared).
+///
+/// Promotes the target (requiring `admitted`) and demotes the caller in a
+/// single transaction. If the target is not an admitted participant the
+/// transaction is rolled back and `None` is returned, so the caller is never
+/// demoted without a valid successor. Returns `Some(target_row)` on success.
+pub async fn transfer_host(
+    pool: &PgPool,
+    meeting_id: i32,
+    from_user_id: &str,
+    to_user_id: &str,
+) -> Result<Option<ParticipantRow>, sqlx::Error> {
+    let mut tx = pool.begin().await?;
+
+    let promote_query = format!(
+        r#"
+        UPDATE meeting_participants
+        SET is_host = TRUE, updated_at = NOW()
+        WHERE meeting_id = $1 AND user_id = $2 AND status = 'admitted'
+        RETURNING {PARTICIPANT_COLUMNS}
+        "#
+    );
+    let promoted = sqlx::query_as::<_, ParticipantRow>(&promote_query)
+        .bind(meeting_id)
+        .bind(to_user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+    let Some(target_row) = promoted else {
+        // Target is not an admitted participant — abort without demoting the
+        // caller so we never leave the meeting with no successor.
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    sqlx::query(
+        "UPDATE meeting_participants SET is_host = FALSE, updated_at = NOW() \
+         WHERE meeting_id = $1 AND user_id = $2",
+    )
+    .bind(meeting_id)
+    .bind(from_user_id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some(target_row))
+}
+
+/// Demote every host that is NOT the meeting creator (single-host reset).
+///
+/// In the single-host model the creator is the default host; a transfer-host
+/// may move host to someone else for the current session. This resets to the
+/// creator: called on meeting end (so the next activation starts clean) and on
+/// the creator's (re)join (so the creator reclaims sole host, never coexisting
+/// with a stale transfer target). Idempotent. `IS DISTINCT FROM` is null-safe
+/// against a NULL `creator_id`.
+pub async fn clear_non_creator_hosts(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE meeting_participants mp SET is_host = FALSE, updated_at = NOW() \
+         FROM meetings m \
+         WHERE mp.meeting_id = $1 AND m.id = mp.meeting_id \
+           AND mp.is_host = TRUE AND mp.user_id IS DISTINCT FROM m.creator_id",
+    )
+    .bind(meeting_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 /// Leave a meeting (set status to 'left').

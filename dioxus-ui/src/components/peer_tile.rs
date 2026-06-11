@@ -510,6 +510,36 @@ pub fn PeerTile(
         None
     };
 
+    let peer_is_guest = client.get_peer_is_guest(&peer_id).unwrap_or(false);
+
+    // "Transfer host": hand off and step down. Any admitted non-guest peer.
+    let on_transfer_host: Option<EventHandler<()>> = if is_current_user_host
+        && !is_self_peer
+        && !peer_is_guest
+    {
+        if let Some(ref meeting_id) = room_id {
+            let meeting_id = meeting_id.clone();
+            let peer_uid = peer_uid_for_mute.clone();
+            Some(EventHandler::new(move |_: ()| {
+                let meeting_id = meeting_id.clone();
+                let peer_uid = peer_uid.clone();
+                spawn(async move {
+                    match crate::constants::meeting_api_client() {
+                        Ok(api_client) => {
+                            if let Err(e) = api_client.transfer_host(&meeting_id, &peer_uid).await {
+                                log::warn!("transfer_host failed: {e}");
+                            }
+                        }
+                        Err(e) => log::warn!("meeting_api_client error: {e}"),
+                    }
+                });
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     generate_for_peer(
         &client,
         &peer_id,
@@ -544,6 +574,7 @@ pub fn PeerTile(
         on_mute,
         on_disable_video,
         on_kick,
+        on_transfer_host,
         pinned_peer_id.as_deref(),
         on_toggle_pin,
         &appearance,

@@ -103,6 +103,14 @@ const EVICT_INSTANCE_SUBJECT: &str = "internal.evict_instance";
 /// policy without a DB round-trip on host disconnect.
 const MEETING_SETTINGS_UPDATE_SUBJECT: &str = "internal.meeting_settings_updated";
 
+/// NATS subject (meeting-api -> chat_server) carrying per-participant host-flag
+/// changes from transfer-host. `is_host` is cached per member at JoinRoom, so
+/// without this fanout a mid-meeting change leaves the presence map stale — and
+/// the host-leave→end continuity check (which counts present hosts from that
+/// map) reads the wrong flag. JSON over an internal subject, like
+/// [`MEETING_SETTINGS_UPDATE_SUBJECT`]; publisher in `meeting-api/src/nats_events.rs`.
+const MEETING_HOST_CHANGE_SUBJECT: &str = "internal.meeting_host_changed";
+
 /// NATS subject for chat_server -> meeting-api notifications that a host
 /// just left a meeting whose `end_on_host_leave=true` policy fired. The
 /// meeting-api consumer writes `state='ended'` to the DB so the meetings
@@ -193,10 +201,29 @@ struct MeetingBecameEmptyPayload {
     room_id: String,
 }
 
+/// Payload for [`MEETING_HOST_CHANGE_SUBJECT`]: one per-user host-flag delta
+/// from a transfer-host. `is_host` is the post-change value; chat_server applies
+/// it to every `RoomMemberInfo` for `user_id` in `room_id` (all of that user's
+/// sessions), as the flag is seeded at join.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct MeetingHostChangePayload {
+    room_id: String,
+    user_id: String,
+    is_host: bool,
+}
+
 /// Internal actix message delivered when a NATS eviction message is received.
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct EvictInstance(EvictInstancePayload);
+
+/// Internal actix message for a [`MEETING_HOST_CHANGE_SUBJECT`] payload. Flips
+/// the cached `is_host` on every session of the affected user so host-gated
+/// logic and the host-leave continuity check see the fresh value without a DB
+/// round-trip.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct UpdateMemberHostFlag(MeetingHostChangePayload);
 
 /// Internal actix message delivered when a `MEETING_SETTINGS_UPDATE_SUBJECT`
 /// payload is received. Updates the `room_policy` cache so the next host
@@ -257,6 +284,31 @@ struct RoomMemberInfo {
     /// value lives in [`ChatServer::room_policy`] and is read at
     /// host-disconnect time inside [`ChatServer::leave_rooms`].
     end_on_host_leave: bool,
+}
+
+/// Apply a host-flag change to every session of a user in a room's member slice
+/// (mirrors how `is_host` is seeded at JoinRoom). Returns the rows updated (0 if
+/// the user has no session here). Factored out of
+/// [`Handler<UpdateMemberHostFlag>`] so the multi-session fan-out is unit-testable
+/// without a full actor.
+fn apply_member_host_flag(members: &mut [RoomMemberInfo], user_id: &str, is_host: bool) -> usize {
+    let mut updated = 0;
+    for member in members.iter_mut() {
+        if member.user_id == user_id {
+            member.is_host = is_host;
+            updated += 1;
+        }
+    }
+    updated
+}
+
+/// Whether a departing session was the LAST present host, given the room's
+/// members AFTER the departing session was removed. A host may hold several
+/// sessions; "ends when the host leaves" must fire only when none remain.
+/// `was_host` is the departing session's own flag. Factored out of
+/// [`ChatServer::leave_rooms`] for unit tests.
+fn was_last_present_host(remaining_members: &[RoomMemberInfo], was_host: bool) -> bool {
+    was_host && !remaining_members.iter().any(|m| m.is_host)
 }
 
 /// Cached per-room policy flags. Populated at first JoinRoom for the room and
@@ -951,10 +1003,23 @@ impl ChatServer {
         // fire ONCE per room-becomes-empty rather than once per disconnect, so
         // there is no O(n) NATS storm.
         let mut room_became_empty = false;
+        // Whether THIS departure was the last present host. Computed AFTER
+        // `members.retain(...)` removes the departing session, so a host with
+        // another live session keeps `is_host` in the remaining set and the
+        // meeting stays alive (multi-session).
+        //
+        // This path runs only via `ExecutePendingDeparture` (post grace) or an
+        // explicit `Leave`, so a timely reconnect cancels it first. The actor is
+        // single-threaded, so exactly one departure sees the host count hit zero
+        // and the end-meeting broadcast fires once.
+        let mut was_last_host = false;
         if let Some(room_id) = room {
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|m| m.session != *session_id);
                 room_became_empty = members.is_empty();
+                was_last_host = was_last_present_host(members, is_host);
+            } else {
+                was_last_host = is_host;
             }
             self.forget_room_if_empty(room_id);
 
@@ -1023,9 +1088,11 @@ impl ChatServer {
             }
 
             tokio::spawn(async move {
-                // Check host-leave behavior first: if the host is leaving and
-                // end_on_host_leave is set, end the meeting for all participants.
-                if is_host && effective_end_on_host_leave {
+                // If the LAST present host is leaving and end_on_host_leave is
+                // set, end the meeting for all. `was_last_host` was computed
+                // above from the post-removal roster, so multi-session hosts
+                // keep the meeting alive.
+                if was_last_host && effective_end_on_host_leave {
                     info!(
                         "Host {} left room {} - ending meeting for all",
                         user_id, room_id
@@ -1711,6 +1778,45 @@ impl Actor for ChatServer {
                         error!(
                             "Failed to subscribe to {}: {}, retrying in 1s",
                             MEETING_SETTINGS_UPDATE_SUBJECT, e
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            }
+        });
+
+        // Subscribe to per-participant host-flag changes so each `RoomMemberInfo`'s
+        // cached `is_host` stays fresh after a transfer-host. Like the two
+        // subscriptions above, every instance subscribes independently (no queue
+        // group): each has its own presence map and must see every change.
+        let nc_host = self.nats_connection.clone();
+        let addr_host = ctx.address();
+        tokio::spawn(async move {
+            loop {
+                match nc_host.subscribe(MEETING_HOST_CHANGE_SUBJECT).await {
+                    Ok(mut sub) => {
+                        while let Some(msg) = sub.next().await {
+                            match serde_json::from_slice::<MeetingHostChangePayload>(&msg.payload) {
+                                Ok(payload) => {
+                                    addr_host.do_send(UpdateMemberHostFlag(payload));
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "Failed to deserialize {} payload: {}",
+                                        MEETING_HOST_CHANGE_SUBJECT, e
+                                    );
+                                }
+                            }
+                        }
+                        warn!(
+                            "{} subscription stream ended, re-subscribing in 1s",
+                            MEETING_HOST_CHANGE_SUBJECT
+                        );
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to subscribe to {}: {}, retrying in 1s",
+                            MEETING_HOST_CHANGE_SUBJECT, e
                         );
                     }
                 }
@@ -2423,6 +2529,47 @@ impl Handler<UpdateRoomPolicy> for ChatServer {
             for member in members.iter_mut() {
                 member.end_on_host_leave = end_on_host_leave;
             }
+        }
+    }
+}
+
+/// Handle per-participant host-flag changes fanned out by `meeting-api` over
+/// [`MEETING_HOST_CHANGE_SUBJECT`] (transfer-host).
+///
+/// Flips the cached `is_host` on every `RoomMemberInfo` whose `user_id` matches
+/// (all of that user's sessions), so the host-leave check and host-gated logic
+/// see the post-change value without a DB round-trip. Idempotent; a no-op when
+/// no members are tracked (same create-before-join window as [`UpdateRoomPolicy`]).
+impl Handler<UpdateMemberHostFlag> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: UpdateMemberHostFlag, _ctx: &mut Self::Context) -> Self::Result {
+        let MeetingHostChangePayload {
+            room_id,
+            user_id,
+            is_host,
+        } = msg.0;
+
+        // Defensive bounds: payload is from the trusted meeting-api, but cap
+        // lengths to match the other handlers and guard against a misconfigured
+        // publisher.
+        if room_id.is_empty() || room_id.len() > 256 || user_id.is_empty() || user_id.len() > 256 {
+            warn!(
+                "Ignoring {} with invalid field lengths (room_id={}, user_id={})",
+                MEETING_HOST_CHANGE_SUBJECT,
+                room_id.len(),
+                user_id.len()
+            );
+            return;
+        }
+
+        info!(
+            "Applying host-flag change for {} in room {} (is_host={})",
+            user_id, room_id, is_host
+        );
+
+        if let Some(members) = self.room_members.get_mut(&room_id) {
+            apply_member_host_flag(members, &user_id, is_host);
         }
     }
 }
@@ -12785,6 +12932,83 @@ mod tests {
             1,
             "a JOIN-style recompute must run IMMEDIATELY (one invocation), not be \
              held behind the departure coalesce window"
+        );
+    }
+
+    // --- Transfer-host: in-memory presence-map logic -----------------
+
+    /// Build a `RoomMemberInfo` for the host-flag tests.
+    fn member(session: SessionId, user_id: &str, is_host: bool) -> RoomMemberInfo {
+        RoomMemberInfo {
+            session,
+            user_id: user_id.to_string(),
+            display_name: user_id.to_string(),
+            is_host,
+            end_on_host_leave: true,
+        }
+    }
+
+    #[test]
+    fn test_apply_member_host_flag_flips_all_sessions_of_user() {
+        // A transfer-host must update every session of the affected user and
+        // leave other users untouched — what the UpdateMemberHostFlag handler does.
+        let mut members = vec![
+            member(1, "alice@example.com", false),
+            member(2, "alice@example.com", false), // alice's second tab
+            member(3, "bob@example.com", true),    // unrelated host
+        ];
+
+        let updated = apply_member_host_flag(&mut members, "alice@example.com", true);
+        assert_eq!(updated, 2, "both of alice's sessions must be promoted");
+        assert!(members[0].is_host);
+        assert!(members[1].is_host);
+        assert!(
+            members[2].is_host,
+            "another user's host flag must be unaffected by alice's host-flag change"
+        );
+
+        // Revoke flips both alice sessions back; idempotent re-apply is a no-op
+        // beyond reporting the matched count.
+        let revoked = apply_member_host_flag(&mut members, "alice@example.com", false);
+        assert_eq!(revoked, 2);
+        assert!(!members[0].is_host);
+        assert!(!members[1].is_host);
+
+        // Unknown user → no rows updated.
+        assert_eq!(
+            apply_member_host_flag(&mut members, "nobody@example.com", true),
+            0
+        );
+    }
+
+    #[test]
+    fn test_last_host_leave_fires_only_when_no_host_remains() {
+        // A host leaving with no remaining host sessions triggers the end-meeting
+        // path; a host leaving while another of their sessions remains does NOT.
+        let after_a_leaves = vec![member(2, "bob@example.com", true)];
+        assert!(
+            !was_last_present_host(&after_a_leaves, /* departing was_host */ true),
+            "a non-last host leaving must not end the meeting"
+        );
+
+        // B (the remaining host) leaves: no host remains → last-host departure →
+        // end-meeting branch fires.
+        let after_b_leaves: Vec<RoomMemberInfo> = vec![member(3, "carol@example.com", false)];
+        assert!(
+            was_last_present_host(&after_b_leaves, true),
+            "the last present host leaving must end the meeting"
+        );
+
+        // A plain attendee (was_host=false) leaving never triggers host-leave,
+        // regardless of remaining hosts.
+        assert!(!was_last_present_host(&after_b_leaves, false));
+
+        // Multi-session host: the host has two sessions; one leaves but the
+        // other remains, so it is NOT the last host departure.
+        let host_other_session_remains = vec![member(2, "alice@example.com", true)];
+        assert!(
+            !was_last_present_host(&host_other_session_remains, true),
+            "a host with another live session must keep the meeting alive"
         );
     }
 }

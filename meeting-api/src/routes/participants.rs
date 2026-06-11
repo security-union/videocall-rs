@@ -131,52 +131,74 @@ pub async fn join_meeting(
         }
     };
 
-    let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
+    let is_creator = meeting.creator_id.as_deref() == Some(user_id.as_str());
 
-    if is_host {
-        // Activate the meeting if it's idle or ended.
+    if is_creator {
+        // Single-host model: the creator is the DEFAULT host, but a
+        // transfer-host hands host to another participant for the duration of
+        // the meeting. The creator becomes host only when (re)activating the
+        // meeting (fresh create, or restart after end/idle) — NOT when
+        // rejoining a meeting that is already active, where the current host
+        // (possibly a transfer target) must be preserved so the creator never
+        // reclaims host mid-meeting.
         let current_state = meeting.state.as_deref().unwrap_or("idle");
-        if current_state != "active" {
+        let reactivating = current_state != "active";
+        if reactivating {
             db_meetings::activate(&state.db, meeting.id).await?;
             nats_events::publish_meeting_activated(state.nats.as_ref(), &meeting_id).await;
         }
 
-        // Display-name reconciliation on rejoin (issue #502): if the meeting
-        // already has a cached non-empty `host_display_name`, do NOT
-        // overwrite it from the request. This mirrors the
-        // `COALESCE(NULLIF(...), $3)` policy in
-        // [`db_participants::upsert_host`] so both the per-meeting cached
-        // host name AND the per-participant display name stay stable across
-        // back-then-rejoin. Mid-meeting renames go through the rate-limited
-        // `update_display_name` endpoint, never through `join`.
-        let existing_host_dn_nonempty = meeting
-            .host_display_name
-            .as_deref()
-            .map(|s| !s.is_empty())
-            .unwrap_or(false);
-        if let Some(dn) = display_name {
-            if !existing_host_dn_nonempty {
-                db_meetings::set_host_display_name(&state.db, meeting.id, dn).await?;
+        let row = if reactivating {
+            // Fresh / reset session → the creator is the sole host.
+            //
+            // Display-name reconciliation on rejoin (issue #502): if the meeting
+            // already has a cached non-empty `host_display_name`, do NOT
+            // overwrite it from the request — mirrors `upsert_host`'s
+            // `COALESCE(NULLIF(...), $3)`. Mid-meeting renames go through the
+            // rate-limited `update_display_name` endpoint, never `join`.
+            let existing_host_dn_nonempty = meeting
+                .host_display_name
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
+            if let Some(dn) = display_name {
+                if !existing_host_dn_nonempty {
+                    db_meetings::set_host_display_name(&state.db, meeting.id, dn).await?;
+                }
             }
-        }
+            let r =
+                db_participants::upsert_host(&state.db, meeting.id, &user_id, display_name).await?;
+            // Demote any stale host (e.g. a transfer target left over from a
+            // previous active session that went idle) so the creator is the
+            // sole host on this fresh activation.
+            db_participants::clear_non_creator_hosts(&state.db, meeting.id).await?;
+            r
+        } else {
+            // Active meeting → re-admit the creator but PRESERVE the current
+            // host (a transfer target keeps host until the meeting ends).
+            db_participants::admit_creator_preserve_host(
+                &state.db,
+                meeting.id,
+                &user_id,
+                display_name,
+            )
+            .await?
+        };
 
-        let row =
-            db_participants::upsert_host(&state.db, meeting.id, &user_id, display_name).await?;
-
-        // Host row inserted/updated — refresh the SearchV2 doc so the
-        // creator appears in acls/participants even on a fresh meeting.
+        // Row inserted/updated — refresh the SearchV2 doc so the creator
+        // appears in acls/participants even on a fresh meeting.
         search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
-        // Token uses the persisted display_name (which reflects the
-        // reconciliation above) so the JWT carries the stable host name
-        // regardless of what the rejoin request claimed.
+        // Token reflects the creator's ACTUAL host flag from the row above — it
+        // is `false` when a transfer is in effect, so the creator rejoins as a
+        // regular participant rather than a second host.
         let persisted_dn = row.display_name.clone();
         let token = generate_room_token(
             &state.jwt_secret,
             state.token_ttl_secs,
             &user_id,
             &meeting_id,
-            true,
+            row.is_host,
             persisted_dn.as_deref().unwrap_or(&user_id),
             meeting.end_on_host_leave,
             false,
@@ -594,33 +616,34 @@ pub async fn leave_meeting(
     // drops their principal from the ACL set on the next push.
     search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
-    // Three distinct termination rules, evaluated in priority order:
+    // Single-host termination rules. `left_as_host` is the row's `is_host`
+    // BEFORE the leave flipped status to 'left' — i.e. whether the departing
+    // participant was THE host (there is at most one).
     //
-    // a) Host leaves + end_on_host_leave=true → end immediately regardless of
-    //    remaining participant count (host's explicit policy).
-    //
-    // b) Host leaves + end_on_host_leave=false → do NOT end the meeting, even
-    //    if no other participants are currently admitted.  The host deliberately
-    //    opted into "keep the meeting alive after I leave"; ending on zero count
-    //    would silently violate that intent when the host happens to be the last
-    //    one out before others join.
-    //
-    // c) Non-host (attendee) leaves + no admitted participants remain → end the
-    //    meeting.  This "last-participant-out" invariant is enforced symmetrically
-    //    here (authenticated leave) and in leave_meeting_as_guest below — both
-    //    branches call count_admitted and end_meeting on zero.
-    let is_host = meeting.creator_id.as_deref() == Some(user_id.as_str());
-    if is_host && meeting.end_on_host_leave {
-        // Rule (a).
+    // a) end_on_host_leave=true + the host leaves → end immediately for
+    //    everyone. We broadcast MEETING_ENDED here so all clients are notified
+    //    (the leaving host's own client may not round-trip the transport-layer
+    //    broadcast before navigating away).
+    // b) end_on_host_leave=false, or a non-host attendee leaves → end only when
+    //    the room is now empty (last admitted participant left). Same
+    //    "last-participant-out" invariant as leave_meeting_as_guest below.
+    let left_as_host = row.is_host;
+    if left_as_host && meeting.end_on_host_leave {
+        // Rule (a): the host leaves under eohl → end + notify clients.
         db_meetings::end_meeting(&state.db, meeting.id).await?;
-    } else if !is_host {
-        // Rule (c): host departure with eohl=false falls through without ending.
+        nats_events::publish_meeting_ended(
+            state.nats.as_ref(),
+            &meeting_id,
+            "The host has ended the meeting",
+        )
+        .await;
+    } else {
+        // Rule (b): end only when the room is now empty.
         let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
         if remaining == 0 {
             db_meetings::end_meeting(&state.db, meeting.id).await?;
         }
     }
-    // Rule (b): is_host && !end_on_host_leave — no action, meeting stays alive.
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }

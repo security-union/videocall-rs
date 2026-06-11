@@ -220,6 +220,10 @@ pub fn router() -> Router<AppState> {
             "/api/v1/meetings/{meeting_id}/kick",
             post(host::kick_participant),
         )
+        .route(
+            "/api/v1/meetings/{meeting_id}/transfer-host",
+            post(host::transfer_host),
+        )
         // Console log uploads
         .route(
             "/api/v1/meetings/{meeting_id}/console-logs",

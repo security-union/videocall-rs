@@ -249,6 +249,11 @@ pub fn Host(
         camera.set_reelection_completed_signal(client.reelection_completed_signal());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
         screen.set_reelection_completed_signal(client.reelection_completed_signal());
+        // Issue #1199: give the screen encoder its own CONGESTION step-down flag
+        // so it responds to server congestion in parity with the camera. The
+        // client sets both flags on a self-targeted CONGESTION; each AQ loop
+        // consumes its own (separate atoms avoid a swap race).
+        screen.set_congestion_step_down_flag(client.screen_congestion_step_down_flag());
 
         // Wire the relay layer-union hint atoms (issue #1108, Stage 3). Each
         // encoder OWNS its `shared_union_requested_layer` atom (initialized to the

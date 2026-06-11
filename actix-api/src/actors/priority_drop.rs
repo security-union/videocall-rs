@@ -61,9 +61,15 @@
 //! ### Behaviour on dropped packets
 //!
 //! When this module returns [`PriorityDropDecision::Drop`], the caller
-//! must still invoke `SessionLogic::on_outbound_drop` so the existing
-//! per-sender CONGESTION feedback path fires — otherwise senders whose
-//! video gets dropped will never be told to step down their tier.
+//! must still invoke `SessionLogic::on_outbound_drop`. Post-#1219 that no
+//! longer emits a sender-keyed CONGESTION signal (one slow receiver must not
+//! collapse the publisher's encode for the whole room); the publisher's own
+//! uplink distress is now detected client-side. What `on_outbound_drop` still
+//! does is call `CongestionTracker::record_drop`, which updates the
+//! per-RECEIVER `last_congestion` timestamp that relaxes this receiver's
+//! KEYFRAME_REQUEST rate limiter (#979) so its own frozen video can recover
+//! faster. So the preempt-drop here still feeds a per-receiver response — it
+//! just no longer drives the removed sender-keyed CONGESTION path.
 
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};

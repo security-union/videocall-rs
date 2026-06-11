@@ -3842,12 +3842,17 @@ fn handle_msg(
         // leak.
         //
         // CONGESTION and LAYER_HINT are intentionally exempted: both are
-        // RELAY-authored, self-ADDRESSED control packets. A congested receiver
-        // (CONGESTION) or the relay's per-source layer aggregator (LAYER_HINT,
-        // `emit_layer_hint`) publishes them onto the target publisher's OWN
-        // subject with that publisher's session_id embedded, and they MUST
-        // still reach the publisher so the client can step down its quality
-        // tier (CONGESTION) or cap its encoded simulcast ladder (LAYER_HINT).
+        // RELAY-authored, self-ADDRESSED control packets. The relay's
+        // per-source layer aggregator (LAYER_HINT, `emit_layer_hint`) publishes
+        // onto the target publisher's OWN subject with that publisher's
+        // session_id embedded, and the hint MUST still reach the publisher so
+        // the client can cap its encoded simulcast ladder. The CONGESTION
+        // carve-out is the same self-echo exemption: historically a congested
+        // receiver's downlink overflow drove the relay to author a sender-keyed
+        // CONGESTION here, but #1219 removed that emit (it collapsed the
+        // publisher's encoder for the WHOLE room on a single slow receiver).
+        // The carve-out itself stays — it still must pass any legitimately
+        // relay-authored CONGESTION through to the target.
         // Without the LAYER_HINT carve-out the publish-side layer suppression
         // built in #1108 is inert: the hint is generated but the self-echo
         // guard drops it before it leaves the relay (the #1108 delivery gap).
@@ -6193,9 +6198,13 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_handle_msg_congestion_passes_self_filter_via_subject() {
-        // CONGESTION carve-out: a congested receiver publishes onto the
-        // throttled sender's own subject so the sender can step down its
-        // quality tier. The subject match must NOT block CONGESTION.
+        // CONGESTION carve-out: a relay-authored, self-addressed CONGESTION
+        // packet rides the throttled sender's own subject so the sender can
+        // step down its quality tier; the subject-self match must NOT block
+        // it. (Historically the relay AUTHORED that packet on the
+        // receiver-downlink-overflow path; #1219 removed that sender-keyed
+        // emit. The carve-out itself stays — it still must pass any
+        // legitimately relay-authored CONGESTION through to the target.)
         let count = Arc::new(AtomicUsize::new(0));
         let actor = RecordingSession {
             count: count.clone(),

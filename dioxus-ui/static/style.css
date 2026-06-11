@@ -3663,21 +3663,20 @@ select {
    The dominant shared-content tile (`.split-screen-tile`) intentionally
    does NOT get this cap — it stays as a large, dominant display. */
 .split-peer-tile {
-  width: 100%;
-  height: 100%;
+  position: relative;
+  flex: 1 1 160px;
   max-width: 100%;
-  max-height: 100%;
   aspect-ratio: 3 / 2;
-  place-self: stretch;
   min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: visible; /* allow speaking glow box-shadow to extend beyond tile */
+  overflow: hidden;
   background-color: var(--surface-elevated);
   border: 2px solid var(--grid-item-border);
   border-radius: var(--radius-lg);
+  box-sizing: border-box;
   /* Speaking glow transition is driven by inline style from Rust speak_style(). */
 }
 
@@ -3699,6 +3698,101 @@ select {
   background: var(--gradient-fade-video);
   pointer-events: none;
   z-index: 1;
+}
+
+/* ── Screen-share right panel ─────────────────────────────────────────
+   CSS-driven auto-fill grid. Tiles auto-wrap into as many columns as
+   fit; scrolls vertically when rows exceed height. */
+.ss-peer-panel {
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 10px;
+  align-content: flex-start;
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+}
+.ss-peer-panel::-webkit-scrollbar { width: 6px; }
+.ss-peer-panel::-webkit-scrollbar-track { background: transparent; }
+.ss-peer-panel::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
+.ss-peer-panel::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.35); }
+
+/* ── Split-peer tile internals ───────────────────────────────────────
+   Fixed sizes that don't depend on --tile-h / --tile-w CSS vars.
+   These override the grid-item defaults which use calc(var(--tile-h)). */
+
+/* Name label — wraps "(Host)" to its own line via flex-wrap */
+.split-peer-tile .floating-name {
+  top: 6px;
+  left: 6px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  gap: 2px;
+  font-size: 13px;
+  max-width: 70%;
+  white-space: normal;
+  text-overflow: clip;
+  overflow: visible;
+  line-height: 1.3;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+/* "(Host)" label: wraps below name via flex-basis: 100% */
+.split-peer-tile .host-indicator {
+  flex-basis: 100%;
+  display: block !important;
+  font-size: 10px !important;
+  margin-left: 0 !important;
+  margin-top: 1px;
+  color: #888 !important;
+  line-height: 1.2;
+}
+
+/* Placeholder (camera-off) */
+.split-peer-tile .placeholder-content {
+  gap: 0.4rem;
+}
+.split-peer-tile .placeholder-content svg {
+  width: 40px;
+  height: 40px;
+}
+.split-peer-tile .placeholder-text {
+  font-size: 0.75rem;
+}
+
+/* Top icon bar */
+.split-peer-tile .tile-top-icons {
+  top: 4px;
+  right: 4px;
+  gap: 3px;
+}
+/* All icon buttons: uniform 22×22 containers, 14×14 SVGs */
+.split-peer-tile .audio-indicator,
+.split-peer-tile .signal-indicator,
+.split-peer-tile .pin-icon,
+.split-peer-tile .crop-icon,
+.split-peer-tile .tile-mute-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+}
+.split-peer-tile .audio-indicator svg,
+.split-peer-tile .signal-indicator svg,
+.split-peer-tile .pin-icon svg,
+.split-peer-tile .crop-icon svg,
+.split-peer-tile .tile-mute-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.split-peer-tile .guest-badge {
+  font-size: 0.65em;
+  padding: 1px 5px;
 }
 
 /* Local screen-share preview — rendered below camera inside .host */

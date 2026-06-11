@@ -3068,40 +3068,15 @@ pub fn AttendantsComponent(
     // many fit based on the available height, then run speaker promotion
     // independently of the normal grid's visible_tile_count.
     //
-    // Layout constants must stay in sync with container_style below:
-    //   - SS_FLEX_RATIO: right panel gets 1/(2+1) of the container width
-    //   - SS_OUTER_PAD: padding: 16px 16px 80px 16px → left + right = 32px
-    //   - SS_GAP: gap between left/right panels = 10px (container gap)
-    //   - SS_GRID_GAP: gap between tiles in the 2-col grid = 8px
-    //   - SS_GRID_PAD: padding inside the right panel div = 6px each side
-    //   - SS_BOTTOM_PAD: padding-bottom (80px) from container_style
-    //   - SS_TOP_PAD: padding-top (16px) + right panel padding (6px*2)
-    //
-    // Tile sizing: height is fixed to fit 4 tiles per column regardless of panel width.
-    // Column count collapses to 1 when right_ratio <= 0.25 or panel is too narrow.
-    // Actual tile width is controlled by the CSS grid (1fr columns), not computed here.
-    const SS_GRID_GAP: f64 = 8.0;
-    const SS_BOTTOM_PAD: f64 = 80.0;
-    const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
-    let right_ratio = 1.0 - screen_share_ratio();
-    let ss_panel_width = (right_ratio * (vw - 42.0) - 12.0).max(100.0); // ≈ right_ratio * (vw - outer_pad - gap) - grid_pad
-    let ss_cols = if right_ratio <= 0.25 || ss_panel_width < 180.0 {
-        1.0_f64 // single column
-    } else {
-        2.0_f64 // two columns
-    };
-    let ss_avail_h = vh - SS_BOTTOM_PAD - SS_VERT_PAD;
-    // Tile height: always sized to fit exactly 4 tiles per column (independent of panel width resize).
-    let ss_tile_h = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0);
-    // Natural tile width at 16:9: ss_tile_h * 16.0 / 9.0 (actual width follows grid columns).
-    // Max rows is always 4 (height is sized for exactly 4 tiles per column).
-    let ss_max_rows = 4_usize;
-    let ss_max_tiles = ss_max_rows * ss_cols as usize;
+    // Screen-share right panel: compact tiles via CSS auto-fill grid.
+    // All sizing is handled purely by CSS — no Rust column/tile calculations.
+    // Internal element sizes (text, icons) are overridden in CSS for
+    // .split-peer-tile so they don't depend on --tile-h / --tile-w.
 
     // Build a separate tile list for the screen-share right panel.
     // The grid's promotion used visible_tile_count which differs from the
     // screen-share panel's capacity, so we rebuild from scratch and re-promote.
-    let (ss_tiles, ss_overflow_count) = if has_screen_share {
+    let (ss_tiles, _ss_overflow_count) = if has_screen_share {
         let mut ss_all: Vec<String> = Vec::with_capacity(total_tiles);
         for peer_id in display_peers.iter().take(capped_real) {
             ss_all.push(peer_id.clone());
@@ -3116,12 +3091,10 @@ pub fn AttendantsComponent(
             });
         }
 
-        let (ss_vis_count, ss_ovf) = if ss_all.len() > ss_max_tiles {
-            let vis = ss_max_tiles.saturating_sub(1).max(1); // reserve 1 slot for badge
-            (vis, ss_all.len() - vis)
-        } else {
-            (ss_all.len(), 0)
-        };
+        // Show ALL participants — no artificial cap. Vertical scrolling in the
+        // right panel handles overflow when tiles hit their minimum height.
+        let ss_vis_count = ss_all.len();
+        let ss_ovf = 0;
 
         {
             let speech_map = peer_speech_priority.read();
@@ -3818,35 +3791,10 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — 1 or 2-column grid of compact peer tiles.
-                                //
-                                // HCL issues #3 + #4: columns are sized to the tile's natural
-                                // 3:2 width (`ss_tile_h * 1.5`), NOT `1fr`. `1fr` columns made
-                                // the grid stretch each cell to fill `right_pct%`, leaving the
-                                // 3:2-capped `.split-peer-tile` centered with surplus on both
-                                // sides — visually "centered with too-large column gaps" on a
-                                // wide right panel. Pairing fixed `var(--ss-tile-w)` cells
-                                // with `justify-content: start` packs the tiles to the left
-                                // edge and keeps the inter-tile gap exactly `8px`, matching
-                                // the non-share grid feel. Tiles still hold their 3:2 cap
-                                // (enforced by `.split-peer-tile { aspect-ratio: 3 / 2 }`),
-                                // so wide-screen viewports leave empty space on the right
-                                // edge of the panel instead of stretching the tiles.
+                                // Right panel — CSS-driven auto-fill grid.
                                 div {
-                                    style: {
-                                        let ss_tile_w = (ss_tile_h * TILE_AR).round();
-                                        let grid_cols = if ss_cols > 1.0 {
-                                            format!("repeat(2, {ss_tile_w:.0}px)")
-                                        } else {
-                                            format!("{ss_tile_w:.0}px")
-                                        };
-                                        format!("width: {right_pct:.2}%; min-width: 0; height: 100%; \
-                                                display: grid; grid-template-columns: {grid_cols}; \
-                                                grid-auto-rows: {ss_tile_h:.0}px; \
-                                                gap: 8px; padding: 6px; \
-                                                justify-content: start; align-content: start; \
-                                                overflow: visible;")
-                                    },
+                                    class: "ss-peer-panel",
+                                    style: "width: {right_pct:.2}%;",
                                     for tile_id in ss_tiles.iter() {
                                         {
                                             let is_mock = tile_id.starts_with("mock-");
@@ -3881,12 +3829,8 @@ pub fn AttendantsComponent(
                                         }
                                     }
 
-                                    if ss_overflow_count > 0 {
-                                        div { class: "grid-overflow-badge",
-                                            "+{ss_overflow_count}"
-                                            span { "more in meeting" }
-                                        }
-                                    }
+                                    // No overflow badge in screen-share mode — all participants
+                                    // are rendered and the panel scrolls vertically if needed.
                                 }
                             }
                         }

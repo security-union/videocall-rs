@@ -260,7 +260,7 @@
       },
       "targets": [
         {
-          "expr": "videocall_client_info{meeting_id=~\"$meeting\"}",
+          "expr": "last_over_time(videocall_client_info{meeting_id=~\"$meeting\"}[$__range])",
           "format": "table",
           "instant": true,
           "legendFormat": "",
@@ -3481,6 +3481,531 @@
           ],
           "title": "Reference Loss & Decode Errors (per receiver)",
           "description": "Per-receiver-pair receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series) is the always-on signal and returns to 0 when healthy. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update on a real WebCodecs decode fault) \u2014 read these two as 'has a fault occurred', not 'is one occurring right now'. Correlate with tier changes and p75_peer_fps to find whether degradation is isolated or widespread. All three are registered + emitted server-side and conditionally populated.",
+          "type": "timeseries"
+        }
+      ]
+    },
+    {
+      "collapsed": true,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 170
+      },
+      "id": 70,
+      "title": "Simulcast / Per-Layer",
+      "description": "Per-layer simulcast validation (#1083-A3 per-receiver layer divergence) and the #1219 CONGESTION-collapse / #1057 backpressure guards. Relay counters are labeled by 'room' (== meeting name in these tests); publisher gauges are labeled by meeting_id. The fleet-wide outbound-channel-drops panel is NOT filterable by meeting.",
+      "type": "row",
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 30,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "normal"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "cps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 171
+          },
+          "id": 71,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (layer_id) (rate(relay_layer_forwarded_by_layer_total{room=~\"$meeting\"}[1m]))",
+              "legendFormat": "layer {{layer_id}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Per-Layer Forward Mix (relay)",
+          "description": "Per-layer distribution of forwarded simulcast media packets (layer_id bucketed 0|1|2|other). Stacked = the L0/L1/L2/other mix flowing through the relay. If only layer 0 ever flows, simulcast is inert.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "max": 1,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 171
+          },
+          "id": 72,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(relay_layer_filtered_total{room=~\"$meeting\"}[1m])) / (sum(rate(relay_layer_filtered_total{room=~\"$meeting\"}[1m])) + sum(rate(relay_layer_forwarded_total{room=~\"$meeting\"}[1m])))",
+              "legendFormat": "filtered fraction",
+              "refId": "A"
+            }
+          ],
+          "title": "% Layer-Filtered (per-receiver selection)",
+          "description": "Fraction of simulcast packets the relay intentionally dropped because the layer != the receiver's recorded preference. This is the per-receiver layer-divergence signal (#1083-A3): a nonzero fraction means receivers are getting different layer mixes.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 179
+          },
+          "id": 73,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "videocall_encoder_effective_layers{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} {{media_kind}} effective",
+              "refId": "A"
+            },
+            {
+              "expr": "videocall_encoder_active_layers{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} {{media_kind}} active",
+              "refId": "B"
+            }
+          ],
+          "title": "Publisher Effective vs Active Layers",
+          "description": "The A3 core-claim panel. effective = ladder depth the publisher is configured to encode; active = layers currently encoding. The effective set should stay constant while one receiver degrades. A gap (active < effective) means AQ shed the top layer(s) at the publisher — a global cut, NOT per-receiver selection.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "cps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 179
+          },
+          "id": 74,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (outcome) (rate(relay_layer_preference_updates_total{room=~\"$meeting\"}[1m]))",
+              "legendFormat": "{{outcome}}",
+              "refId": "A"
+            }
+          ],
+          "title": "LAYER_PREFERENCE Update Outcomes",
+          "description": "Outcomes of LAYER_PREFERENCE control updates from receivers (accepted|rate_limited|truncated|layer_id_out_of_bound|ignored_other_subject). Sustained 'rate_limited' or 'layer_id_out_of_bound' means receivers are failing to register their layer preference, which would mask per-receiver divergence.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "cps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 187
+          },
+          "id": 75,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (direction) (rate(relay_layer_hint_emitted_total{room=~\"$meeting\"}[1m]))",
+              "legendFormat": "{{direction}}",
+              "refId": "A"
+            }
+          ],
+          "title": "LAYER_HINT Emitted (suppress/restore)",
+          "description": "LAYER_HINT control packets the relay emits to publishers (direction = suppress|restore). 'suppress' = relay telling a publisher to stop a layer no receiver wants; 'restore' = re-enable it. Activity here is the publish-side feedback loop (#1108 Stage 4).",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 1,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  }
+                ]
+              },
+              "unit": "cps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 187
+          },
+          "id": 76,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum(rate(relay_congestion_filtered_total{room=~\"$meeting\"}[1m]))",
+              "legendFormat": "congestion filtered",
+              "refId": "A"
+            }
+          ],
+          "title": "CONGESTION Filtered — non-target (#1220)",
+          "description": "CONGESTION control packets the relay dropped for non-target receivers (#1220 unicast-correctness coalesce). Validates that a CONGESTION signal is delivered only to the intended receiver, not broadcast — the #1219 collapse fix.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 2,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.001
+                  }
+                ]
+              },
+              "unit": "cps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 195
+          },
+          "id": 77,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (drop_reason, transport) (rate(relay_packet_drops_total{room=~\"$meeting\"}[1m]))",
+              "legendFormat": "{{transport}} {{drop_reason}}",
+              "refId": "A"
+            }
+          ],
+          "title": "#1057 Guard: relay packet drops by reason",
+          "description": "Relay backpressure loss by drop_reason and transport, filtered to this meeting. A 'mailbox_full' spike (red) is the #1057 room-wide-freeze signature — the 16-slot actix mailbox is dropping inbound messages. This must stay ~0; any sustained nonzero is the freeze precursor.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 2,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "red",
+                    "value": 0.001
+                  }
+                ]
+              },
+              "unit": "cps"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 195
+          },
+          "id": 78,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by (transport, kind) (rate(videocall_outbound_channel_drops_total[1m]))",
+              "legendFormat": "{{transport}} {{kind}}",
+              "refId": "A"
+            }
+          ],
+          "title": "#1057 Guard: outbound channel drops — FLEET-WIDE (not per-meeting)",
+          "description": "Outbound per-session channel drops by transport and kind. FLEET-WIDE: videocall_outbound_channel_drops_total carries only 'transport' and 'kind' labels (no room/meeting_id), so this is intentionally NOT filtered by $meeting — a $meeting filter would return empty. Read alongside the per-meeting relay-packet-drops panel; this is the cluster-wide backpressure backstop for #1057.",
           "type": "timeseries"
         }
       ]

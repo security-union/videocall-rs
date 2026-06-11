@@ -21,7 +21,8 @@ use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::components::performance_settings::{
     load_performance_preference, load_receive_preference, preference_to_encoder_bounds,
     save_performance_preference, save_receive_preference, DiagnosticsReader, KindReceivePref,
-    PerformancePreference, ReceivedReader, ScreenSnapshotReader, SimulcastSummary, SnapshotReader,
+    PerfControlsHandle, PerformancePreference, ReceivedReader, ScreenSnapshotReader,
+    SimulcastSummary, SnapshotReader,
 };
 use crate::constants::*;
 use crate::context::{
@@ -82,17 +83,20 @@ pub fn Host(
     #[props(default)] device_settings_generation: u32,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
     reload_devices_counter: u32,
-    /// Cross-nav from the Performance tab to the Call Diagnostics panel. The
-    /// parent (attendants) closes settings and opens the diagnostics panel. (#1095 §4a)
-    #[props(default)]
-    on_open_diagnostics: EventHandler<()>,
-    /// Sink the parent (attendants) reads to feed the Diagnostics panel's
+    /// Sink the parent (attendants) reads to feed the Diagnostics drawer's
     /// "Simulcast layers" section the live SEND simulcast snapshots. Host owns the
     /// encoders, so it builds the `DiagnosticsReader` and publishes the handle here
     /// once on mount; `None` until then. Optional so callers that don't need the
     /// cross-component detail still compile. (#1095 §6 MOVE)
     #[props(default)]
     publish_diagnostics_reader: Option<Signal<Option<DiagnosticsReader>>>,
+    /// Sink the parent (attendants) reads to feed the Diagnostics drawer the
+    /// Performance controls (sliders/Auto/meters). The panel now lives in the
+    /// drawer — a sibling of `Host` that can't reach the encoders or the
+    /// preference signals — so `Host` bundles them into a [`PerfControlsHandle`]
+    /// and publishes it here once on mount; `None` until then. (#1131 unify)
+    #[props(default)]
+    publish_perf_controls: Option<Signal<Option<PerfControlsHandle>>>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
@@ -947,6 +951,46 @@ pub fn Host(
             .min(videocall_client::max_layers_for_kind(PrefMediaKind::Audio)) as usize
     });
 
+    // Bundle the Performance controls into ONE handle and publish it to the parent
+    // (attendants) so the Diagnostics drawer — a sibling of `Host` that can't
+    // reach the encoders or the preference signals — can mount the
+    // `PerformanceSettingsPanel`. Built once per mount via `use_hook` so its
+    // closures/readers keep stable `Rc` identity and the handle stays
+    // `PartialEq`-stable; the two preference fields are the live `Signal`s (not
+    // values), so the drawer's sliders track edits reactively. (#1131 unify)
+    let perf_controls: PerfControlsHandle = {
+        let on_change = on_performance_change.clone();
+        let on_recv = on_receive_change.clone();
+        let read_snap = read_quality_snapshot.clone();
+        let read_screen_snap = read_screen_snapshot.clone();
+        let recv_reader = received_reader.clone();
+        let diag_reader = diagnostics_reader.clone();
+        use_hook(move || PerfControlsHandle {
+            performance_preference,
+            receive_preference,
+            on_change,
+            on_receive_change: on_recv,
+            read_snapshot: read_snap,
+            read_screen_snapshot: read_screen_snap,
+            received_reader: recv_reader,
+            diagnostics_reader: diag_reader,
+            // Video/screen share the CPU-derived effective ceiling; audio uses its
+            // own (non-CPU-clamped) ladder depth. Same values the modal used to
+            // forward before the panel moved into the drawer.
+            video_layer_max: send_layer_max,
+            screen_layer_max: send_layer_max,
+            audio_layer_max,
+        })
+    };
+    {
+        let handle = perf_controls.clone();
+        use_effect(move || {
+            if let Some(mut sink) = publish_perf_controls {
+                sink.set(Some(handle.clone()));
+            }
+        });
+    }
+
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -1008,20 +1052,15 @@ pub fn Host(
              }
         }
 
-        // Mobile Device Settings Modal
+        // Device Settings Modal — Audio / Video / Network / Appearance only. The
+        // Performance tab moved into the Diagnostics drawer (#1131), so the modal
+        // no longer forwards any of the SEND/RECEIVE preference, snapshot-reader,
+        // diagnostics, layer-max, or mic-state props; those now flow through the
+        // published `PerfControlsHandle` (above) directly into the drawer.
         {
             let on_mic = on_mic_change.clone();
             let on_cam = on_cam_change.clone();
             let on_spk = on_speaker_change.clone();
-            let on_perf = on_performance_change.clone();
-            let read_snap = read_quality_snapshot.clone();
-            let read_screen_snap = read_screen_snapshot.clone();
-            let on_recv = on_receive_change.clone();
-            let recv_reader = received_reader.clone();
-            let diag_reader = diagnostics_reader.clone();
-            // `send_layer_max` (computed once per mount above via use_hook) is a
-            // `usize: Copy`, captured directly by the rsx below for both the video
-            // and screen SEND layer sliders.
             rsx! {
                 DeviceSettingsModal {
                     key: "{device_settings_generation}",
@@ -1038,25 +1077,6 @@ pub fn Host(
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
                     initial_section: device_settings_initial_section.clone(),
-                    performance_preference: performance_preference(),
-                    on_performance_change: move |p: PerformancePreference| on_perf(p),
-                    read_quality_snapshot: read_snap.clone(),
-                    read_screen_snapshot: read_screen_snap.clone(),
-                    receive_preference: receive_preference(),
-                    on_receive_change: move |c: (PrefMediaKind, KindReceivePref)| on_recv(c),
-                    received_reader: recv_reader.clone(),
-                    diagnostics_reader: diag_reader.clone(),
-                    on_open_diagnostics: move |_| on_open_diagnostics.call(()),
-                    // SEND layer-count ceilings (real ladder depth). Video and
-                    // screen share the CPU-derived effective ceiling; audio uses
-                    // its own (non-CPU-clamped) ladder depth.
-                    video_layer_max: send_layer_max,
-                    screen_layer_max: send_layer_max,
-                    audio_layer_max,
-                    // Mic capture state → the audio SEND caption's present-tense
-                    // vs. "will send … when the mic is on" form. `mic_enabled` is
-                    // the Host prop; audio has no SEND snapshot to infer it from.
-                    audio_source_active: mic_enabled,
                 }
             }
         }

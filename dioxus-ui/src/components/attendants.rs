@@ -32,7 +32,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
-    performance_settings::DiagnosticsReader,
+    performance_settings::{DiagnosticsReader, PerfControlsHandle},
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
@@ -438,6 +438,29 @@ use super::attendants_layout::{
 };
 use super::density::{DensityMode, DENSITY_MODES};
 
+/// Where a settings deep link should land. The Performance controls moved out of
+/// the Settings modal into the Diagnostics drawer (#1131 unify), so an incoming
+/// `"performance"` section opens the DRAWER, not the modal; every other section
+/// (or none) opens the modal as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsDeepLink {
+    /// Open the right-side Diagnostics drawer (the new home of the Performance
+    /// controls). Do NOT open the Settings modal.
+    Drawer,
+    /// Open the Settings modal (optionally on a requested tab).
+    Modal,
+}
+
+/// Classify a requested settings-section string into where it should open. Pure
+/// so the routing contract is host-testable. The match is case-sensitive,
+/// mirroring `DeviceSettingsModal`'s own `initial_section` mapping.
+pub(crate) fn classify_settings_deep_link(section: Option<&str>) -> SettingsDeepLink {
+    match section {
+        Some("performance") => SettingsDeepLink::Drawer,
+        _ => SettingsDeepLink::Modal,
+    }
+}
+
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
@@ -727,6 +750,28 @@ pub fn AttendantsComponent(
     // Diagnostics sidebar (a sibling of Host that can't reach the encoders) can
     // render the "Simulcast layers" section from the live SEND snapshots. (#1095)
     let diagnostics_reader_sink: Signal<Option<DiagnosticsReader>> = use_signal(|| None);
+    // Host also publishes its Performance controls handle here, so the Diagnostics
+    // drawer can mount the `PerformanceSettingsPanel` (sliders/Auto/meters) — the
+    // panel moved out of the Settings modal into the drawer (#1131 unify).
+    let perf_controls_sink: Signal<Option<PerfControlsHandle>> = use_signal(|| None);
+
+    // Deep-link interception (#1131 unify): a requested `"performance"` section no
+    // longer has a Settings tab — the Performance controls live in the Diagnostics
+    // drawer now. Catch it BEFORE the modal opens: route to the drawer and clear
+    // the requested section so the (closed) modal doesn't keep a dangling
+    // "performance" target. Other sections fall through untouched. The classifier
+    // is the pure `classify_settings_deep_link` (host-tested); this effect only
+    // applies its verdict to the open-state signals.
+    use_effect(move || {
+        if classify_settings_deep_link(device_settings_initial_section().as_deref())
+            == SettingsDeepLink::Drawer
+        {
+            device_settings_open.set(false);
+            device_settings_initial_section.set(None);
+            diagnostics_open.set(true);
+        }
+    });
+
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let mut display_name_modal_open = use_signal(|| false);
@@ -4396,11 +4441,19 @@ pub fn AttendantsComponent(
                                                 diagnostics_open.set(opening);
                                                 if opening {
                                                     peer_list_open.set(false);
-                                                    // Close Device Settings so its
-                                                    // Performance-tab 4Hz tick can't
-                                                    // run alongside the diagnostics
-                                                    // one (symmetry with the reverse
-                                                    // at DeviceSettingsButton; #6).
+                                                    // Close Device Settings as a UX
+                                                    // choice — don't stack a modal
+                                                    // over the drawer (symmetry with
+                                                    // the reverse at
+                                                    // DeviceSettingsButton). The old
+                                                    // "two 4Hz loops can't coexist"
+                                                    // rationale is moot since the
+                                                    // Performance panel moved into
+                                                    // this drawer (#1131): there is
+                                                    // now ONE surface, with two
+                                                    // tick-scoped child components
+                                                    // (the panel + SimulcastLayers)
+                                                    // by design.
                                                     device_settings_open.set(false);
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
@@ -4579,13 +4632,11 @@ pub fn AttendantsComponent(
                                         }
                                     },
                                     reload_devices_counter: reload_devices_counter(),
-                                    // Cross-nav: Performance tab → Diagnostics panel.
-                                    // Close settings, open the diagnostics sidebar. (#1095 §4a)
-                                    on_open_diagnostics: move |_| {
-                                        device_settings_open.set(false);
-                                        diagnostics_open.set(true);
-                                    },
                                     publish_diagnostics_reader: diagnostics_reader_sink,
+                                    // Host publishes its Performance controls handle
+                                    // here so the Diagnostics drawer can mount the
+                                    // panel (sliders/Auto/meters). (#1131 unify)
+                                    publish_perf_controls: perf_controls_sink,
                                 }
                             }
                             if is_guest {
@@ -4697,14 +4748,10 @@ pub fn AttendantsComponent(
                         // Live SEND simulcast reader (published by Host on mount),
                         // for the "Simulcast layers" section. (#1095 §6)
                         diagnostics_reader: diagnostics_reader_sink(),
-                        // Cross-nav: Diagnostics → Performance settings. Close the
-                        // diagnostics panel, open settings on the Performance tab. (#1095 §4b)
-                        on_open_performance: move |_| {
-                            diagnostics_open.set(false);
-                            device_settings_initial_section.set(Some("performance".into()));
-                            device_settings_generation.set(device_settings_generation() + 1);
-                            device_settings_open.set(true);
-                        },
+                        // Performance controls handle (published by Host on mount),
+                        // for the migrated Performance panel in the drawer's
+                        // "Quality controls" group. (#1131 unify)
+                        perf_controls: perf_controls_sink(),
                     }
                 }
 
@@ -4891,6 +4938,39 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    // ── Settings deep-link routing (#1131 unify) ──
+    // Plain host `#[test]`s (not browser tests): the classifier is pure.
+
+    /// "performance" must route to the Diagnostics DRAWER (its new home), NOT the
+    /// Settings modal. If this reverts to `Modal`, the migration regresses: the
+    /// old Performance tab no longer exists, so the modal would land on a missing
+    /// section. This is the load-bearing assertion of the deep-link repurpose.
+    #[test]
+    fn deep_link_performance_opens_drawer() {
+        assert_eq!(
+            classify_settings_deep_link(Some("performance")),
+            SettingsDeepLink::Drawer
+        );
+    }
+
+    /// Every other section — and `None` — opens the Settings modal as before.
+    #[test]
+    fn deep_link_other_sections_open_modal() {
+        for s in ["audio", "video", "network", "appearance"] {
+            assert_eq!(
+                classify_settings_deep_link(Some(s)),
+                SettingsDeepLink::Modal,
+                "section {s:?} should open the modal"
+            );
+        }
+        assert_eq!(classify_settings_deep_link(None), SettingsDeepLink::Modal);
+        // An unknown section also falls through to the modal (default tab).
+        assert_eq!(
+            classify_settings_deep_link(Some("bogus")),
+            SettingsDeepLink::Modal
+        );
+    }
 
     /// attempt=0 should return Some(d) where d is in the base range.
     /// base = 1000, jitter in [-25%, +25%), so delay in [750, 1250).

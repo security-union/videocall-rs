@@ -35,7 +35,8 @@ use axum::{
     extract::FromRequestParts,
     http::{header, request::Parts, StatusCode},
 };
-use videocall_meeting_types::APIError;
+use jsonwebtoken::{decode, DecodingKey, Validation};
+use videocall_meeting_types::{APIError, RoomAccessTokenClaims};
 
 use crate::error::AppError;
 use crate::state::AppState;
@@ -199,6 +200,82 @@ impl FromRequestParts<AppState> for GuestObserver {
         let claims = token::decode_guest_token(&state.jwt_secret, &token)?;
 
         Ok(GuestObserver {
+            user_id: claims.sub,
+            meeting_id: claims.room,
+            display_name: claims.display_name,
+        })
+    }
+}
+
+/// Extractor for an admitted room participant. Authenticates via the
+/// `Authorization: Bearer <room_token>` header, where `<room_token>` is the
+/// HS256 room-access JWT issued by [`crate::token::generate_room_token`] (the
+/// same token the client uses to connect to the Media Server).
+///
+/// Unlike [`GuestObserver`], this accepts **both** guest and non-guest
+/// room-access tokens, but rejects observer tokens (which carry
+/// `room_join == false`) — an observer waiting in the lobby is not yet a
+/// participant and must not be treated as one.
+///
+/// The token `room` claim identifies the meeting the bearer is authorized for;
+/// handlers that bind to a `{meeting_id}` path segment must compare
+/// [`RoomMember::meeting_id`] against the path and reject a mismatch.
+///
+/// Usage in a handler:
+/// ```ignore
+/// async fn my_handler(RoomMember { user_id, meeting_id, .. }: RoomMember) { ... }
+/// ```
+#[derive(Debug)]
+pub struct RoomMember {
+    /// The participant's identity (`sub` claim). Authoritative — derived from
+    /// the signed token, never from a client-supplied header.
+    pub user_id: String,
+    /// The room/meeting ID the token authorizes (`room` claim).
+    pub meeting_id: String,
+    /// The participant's display name for this meeting.
+    pub display_name: String,
+}
+
+impl FromRequestParts<AppState> for RoomMember {
+    type Rejection = AppError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let token = extract_bearer_token(parts)
+            .ok_or_else(|| AppError::unauthorized_msg("missing Authorization: Bearer header"))?;
+
+        // Mirror `token::decode_guest_token`'s decode (Validation::default +
+        // issuer pin + HS256 signature/exp check) but WITHOUT its `is_guest`
+        // gate — a room token may be guest or non-guest, and both are valid
+        // participants for the console-log upload path.
+        let mut validation = Validation::default();
+        validation.set_issuer(&[RoomAccessTokenClaims::ISSUER]);
+
+        let claims = decode::<RoomAccessTokenClaims>(
+            &token,
+            &DecodingKey::from_secret(state.jwt_secret.as_bytes()),
+            &validation,
+        )
+        .map(|data| data.claims)
+        .map_err(|e| {
+            tracing::warn!("Room token validation failed: {e}");
+            AppError::unauthorized_msg("invalid or expired room token")
+        })?;
+
+        // Reject observer tokens: `generate_room_token` always sets
+        // `room_join: true`, while `generate_observer_token` sets it to
+        // `false`. An observer has not been admitted as a participant, so it
+        // is not a valid credential for participant-scoped routes (401 — the
+        // presented credential does not authenticate a room member).
+        if !claims.room_join {
+            return Err(AppError::unauthorized_msg(
+                "token does not grant room access",
+            ));
+        }
+
+        Ok(RoomMember {
             user_id: claims.sub,
             meeting_id: claims.room,
             display_name: claims.display_name,
@@ -848,5 +925,147 @@ mod tests {
 
         // A valid signature for the wrong audience must be rejected.
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    // -----------------------------------------------------------------------
+    // RoomMember extractor tests
+    //
+    // RoomMember authenticates participant-scoped routes (console-log upload)
+    // via `Authorization: Bearer <room_token>`. It accepts both guest and
+    // non-guest room tokens (room_join == true) and rejects observer tokens
+    // (room_join == false).
+    // -----------------------------------------------------------------------
+
+    use crate::token::{generate_observer_token, generate_room_token};
+
+    async fn extract_room_member(token: Option<&str>) -> Result<RoomMember, AppError> {
+        let state = make_test_state();
+        let mut builder = Request::builder().uri("/test").method("GET");
+        if let Some(t) = token {
+            builder = builder.header(header::AUTHORIZATION, format!("Bearer {t}"));
+        }
+        let req = builder.body(()).unwrap();
+        let (mut parts, _) = req.into_parts();
+        RoomMember::from_request_parts(&mut parts, &state).await
+    }
+
+    #[tokio::test]
+    async fn room_member_accepts_host_non_guest_token() {
+        // generate_room_token(secret, ttl, user_id, room, is_host, name,
+        //                     end_on_host_leave, is_guest)
+        let token = generate_room_token(
+            TEST_SECRET,
+            600,
+            "alice@test.com",
+            "room-A",
+            true, // is_host
+            "Alice",
+            true,
+            false, // is_guest = false
+        )
+        .unwrap();
+        let member = extract_room_member(Some(&token))
+            .await
+            .expect("valid host room token should authenticate");
+        assert_eq!(member.user_id, "alice@test.com");
+        assert_eq!(member.meeting_id, "room-A");
+        assert_eq!(member.display_name, "Alice");
+    }
+
+    #[tokio::test]
+    async fn room_member_accepts_guest_token() {
+        let token = generate_room_token(
+            TEST_SECRET,
+            600,
+            "guest:abc-123",
+            "room-B",
+            false,
+            "Guesty",
+            true,
+            true, // is_guest = true
+        )
+        .unwrap();
+        let member = extract_room_member(Some(&token))
+            .await
+            .expect("valid guest room token should authenticate");
+        assert_eq!(member.user_id, "guest:abc-123");
+        assert_eq!(member.meeting_id, "room-B");
+    }
+
+    #[tokio::test]
+    async fn room_member_rejects_missing_bearer() {
+        let err = extract_room_member(None).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn room_member_rejects_garbage_token() {
+        let err = extract_room_member(Some("not-a-jwt")).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn room_member_rejects_wrong_secret_token() {
+        // Signed by a different secret than the AppState's jwt_secret — the
+        // HS256 signature check must reject it. If signature validation were
+        // skipped, this token would otherwise decode cleanly (correct issuer,
+        // unexpired) and this test would fail.
+        let token = generate_room_token(
+            "a-different-secret",
+            600,
+            "alice@test.com",
+            "room-A",
+            true,
+            "Alice",
+            true,
+            false,
+        )
+        .unwrap();
+        let err = extract_room_member(Some(&token)).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn room_member_rejects_observer_token() {
+        // Observer tokens carry room_join == false. The extractor must reject
+        // them: an observer waiting in the lobby is not an admitted
+        // participant. If the room_join gate were dropped, this token would
+        // authenticate (it is correctly signed with the right secret/issuer)
+        // and this test would fail — which is exactly what it pins.
+        let token =
+            generate_observer_token(TEST_SECRET, "alice@test.com", "room-A", "Alice", false)
+                .unwrap();
+        let err = extract_room_member(Some(&token)).await.unwrap_err();
+        assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn room_member_surfaces_minted_room_for_cross_meeting_check() {
+        // The handler binds the upload to a `{meeting_id}` path segment by
+        // comparing it against RoomMember::meeting_id (the token's `room`
+        // claim). This test pins that the extractor surfaces the *minted*
+        // room verbatim, so a token minted for "room-A" yields meeting_id
+        // "room-A" — and a handler comparing it against path "room-B" will
+        // therefore 403. We assert against the literal we minted with (not a
+        // value derived from the result), so the assertion is not a tautology.
+        let minted_room = "room-A";
+        let token = generate_room_token(
+            TEST_SECRET,
+            600,
+            "alice@test.com",
+            minted_room,
+            false,
+            "Alice",
+            true,
+            false,
+        )
+        .unwrap();
+        let member = extract_room_member(Some(&token))
+            .await
+            .expect("valid room token should authenticate");
+        // Surfaced room must equal what we minted (handler accepts path "room-A").
+        assert_eq!(member.meeting_id, "room-A");
+        // And must NOT equal a different meeting (handler 403s on path "room-B").
+        assert_ne!(member.meeting_id, "room-B");
     }
 }

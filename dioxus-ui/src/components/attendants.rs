@@ -40,7 +40,9 @@ use crate::components::{
         MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
     },
 };
-use crate::console_log_collector::{flush_console_logs, set_console_log_context};
+use crate::console_log_collector::{
+    flush_console_logs, set_console_log_auth_token, set_console_log_context,
+};
 use crate::constants::actix_websocket_base;
 use crate::constants::{
     mock_peers_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
@@ -329,6 +331,9 @@ fn schedule_reconnect(
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
+                    // Keep console-log uploads authenticated after a reconnect
+                    // (the token rotated). O(1); token value is never logged.
+                    set_console_log_auth_token(&new_token);
                     let latest_display_name = current_display_name();
 
                     // Re-evaluate `webtransport_enabled()` at reconnect time —
@@ -903,6 +908,13 @@ pub fn AttendantsComponent(
             enable_webtransport: effective_wt_enabled,
             on_connected: {
                 let meeting_id_for_log = id.clone();
+                // Initial room_token for console-log upload auth. The collector
+                // re-receives a fresh token on every refresh via
+                // refresh_room_token_callback below, so this only needs to seed
+                // the value at connect time. Empty only in non-JWT dev builds:
+                // the collector treats "" as no token, so the upload is then
+                // unauthenticated — the server has no cookie fallback.
+                let room_token_for_logs = room_token.clone();
                 // Slugify the fallback display name so it passes SAFE_USER_ID_RE
                 // on the server (spaces and other chars would cause a 400).
                 let user_id_for_log = user_id.clone().unwrap_or_else(|| {
@@ -951,6 +963,11 @@ pub fn AttendantsComponent(
                             .unwrap_or(log::LevelFilter::Debug);
                         log::set_max_level(effective_level);
                         let dn = current_display_name();
+                        // Hand the collector the room_token BEFORE setContext:
+                        // setContext starts the upload timer, so the token must
+                        // already be in place for the very first upload to carry
+                        // `Authorization: Bearer`. Never log the token value.
+                        set_console_log_auth_token(&room_token_for_logs);
                         set_console_log_context(&meeting_id_for_log, &user_id_for_log, &dn);
                     }
                 })
@@ -1513,6 +1530,10 @@ pub fn AttendantsComponent(
                     async move {
                         match crate::meeting_api::refresh_room_token(&meeting_id).await {
                             Ok(new_token) => {
+                                // Keep console-log uploads authenticated across
+                                // token refreshes on long calls. O(1), and the
+                                // token value is never logged.
+                                set_console_log_auth_token(&new_token);
                                 let dn = display_name_signal();
                                 let (ws, wt) = build_lobby_urls(&new_token, &dn, &meeting_id);
                                 // Apply the user's transport preference so

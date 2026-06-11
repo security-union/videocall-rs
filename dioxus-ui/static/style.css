@@ -3715,12 +3715,12 @@ select {
   overflow-x: hidden;
   box-sizing: border-box;
   scrollbar-width: thin;
-  scrollbar-color: rgba(255, 255, 255, 0.2) transparent;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
 }
 .ss-peer-panel::-webkit-scrollbar { width: 6px; }
 .ss-peer-panel::-webkit-scrollbar-track { background: transparent; }
-.ss-peer-panel::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.2); border-radius: 3px; }
-.ss-peer-panel::-webkit-scrollbar-thumb:hover { background: rgba(255, 255, 255, 0.35); }
+.ss-peer-panel::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+.ss-peer-panel::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
 
 /* ── Split-peer tile internals ───────────────────────────────────────
    Fixed sizes that don't depend on --tile-h / --tile-w CSS vars.
@@ -3750,7 +3750,7 @@ select {
   font-size: 10px !important;
   margin-left: 0 !important;
   margin-top: 1px;
-  color: #888 !important;
+  color: var(--text-quaternary) !important;
   line-height: 1.2;
 }
 

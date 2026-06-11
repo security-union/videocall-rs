@@ -61,21 +61,28 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *
  *   #1131 RELOCATION: the whole panel MOVED out of the Settings → Performance
  *   modal tab into the right-side **Diagnostics drawer** (`#diagnostics-sidebar`),
- *   mounted as the "Quality controls" group. After the #1131 ITERATION 3 the drawer
- *   group order is usage-frequency: "Quality controls" (this panel) FIRST, then
- *   "Live stream state" (the live/NetEq sections), then "Connection & system" LAST
- *   (the incident-investigation group). Within "Connection & system" the four
+ *   mounted as the "Quality controls" group. After #1131 ITERATION 4 (#1222) the
+ *   drawer group order is investigation-first: "Connection & system" (the
+ *   incident-investigation anchor, always rendered) FIRST, then "Quality controls"
+ *   (this panel) second, then "Live stream state" (the live/NetEq sections) LAST.
+ *   Within "Connection & system" the four
  *   low-level pre-dumps (Reception / Sending / Encoder / Media Status) were merged
  *   into ONE collapsed `<details class="diag-disclosure">` "Raw stats" disclosure
  *   (`#diag-h-raw-stats`), and "Build info" was demoted to a second collapsed
  *   `<details>` at the very bottom — both CLOSED by default. Within "Live stream
  *   state" the NetEq sections are now per-PEER: with the "All Peers" aggregate
- *   selected (the solo-meeting default) a single placeholder section is shown
+ *   selected (the ZERO-remote-peer solo-meeting default) a single placeholder
+ *   section is shown
  *   ("Select a specific peer to view time-series charts and current status.")
- *   IN PLACE of the Current Status tiles + charts; selecting a specific peer
- *   renders the Current Status tiles and the now-horizontally-scrollable NetEq
+ *   IN PLACE of the Current Status tiles + charts. Selecting a specific peer —
+ *   or, with EXACTLY ONE remote peer, the #1222 1:1 AUTO-SELECT picking it
+ *   automatically — renders the redesigned two-tier Current Status (`.neteq-status`
+ *   > `.status-primary` / `.status-secondary` / `.status-reorder`) and the
+ *   now-horizontally-scrollable NetEq
  *   charts (`.neteq-chart-scroll` overflow-x box + a fixed `.neteq-chart-y-axis`
- *   sibling, stacked 1-up via `.neteq-charts-stack`).
+ *   sibling, stacked 1-up via `.neteq-charts-stack`), each chart carrying its own
+ *   per-chart `diag-chart-{buffer,decode,packets,reorder}-help` "?" icon (the old
+ *   section-level `diag-charts-help` was removed).
  *   The drawer title became "Performance & Diagnostics". The Settings modal now
  *   has exactly FOUR tabs (Audio / Video / Network / Appearance) and NO
  *   performance affordance at all: the transitional `settings-perf-moved` redirect
@@ -105,8 +112,9 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *   RECEIVE row (#1078; covered by the "Receive-side controls" describe block):
  *   VU gauges:      perf-vu-recv-video / -audio / -screen
  *                   readouts: perf-vu-recv-{video,audio,screen}-readout (by id)
- *                   format: `L{i}/{N} · {w}x{h}` (video/screen),
- *                           `L{i}/{N} · {kbps} kbps` (audio),
+ *                   format (#1222 quality-letter, {Q}=L/M/H or "1" single-layer):
+ *                           `{Q} · {i}/{N} · {w}x{h}` (video/screen),
+ *                           `{Q} · {i}/{N} · {kbps} kbps` (audio),
  *                           "Not receiving" placeholder when nothing decoded.
  *   Range inputs:   perf-recv-{video,audio,screen}-range-min / -range-max
  *   Auto toggles:   perf-recv-{video,audio,screen}-auto (have aria-pressed)
@@ -1208,8 +1216,9 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
 
     // Single-page: no peer is sending, so the receive video needle must read the
     // "Not receiving" placeholder. If a stream WERE being decoded it would show
-    // the `L{i}/{N} · {w}x{h}` shape; assert the union so the test is correct in
-    // both states (mirrors how the send-side test asserts its needle readout).
+    // the `{Q} · {i}/{N} · {w}x{h}` shape (#1222 quality-letter format: {Q} is a
+    // quality letter L/M/H, or "1" single-layer); assert the union so the test is
+    // correct in both states (mirrors how the send-side test asserts its needle).
     await expect(panel.locator("#perf-vu-recv-video-readout")).toBeVisible();
     await expect
       .poll(
@@ -1218,9 +1227,9 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
           timeout: 15_000,
         },
       )
-      .toMatch(/^(L\d+\/\d+ · \d+x\d+|Not receiving)$/);
+      .toMatch(/^(\S+ · \d+\/\d+ · \d+x\d+|Not receiving)$/);
 
-    // Audio receive readout: `L{i}/{N} · {kbps} kbps` or the placeholder.
+    // Audio receive readout: `{Q} · {i}/{N} · {kbps} kbps` or the placeholder.
     await expect
       .poll(
         async () => (await panel.locator("#perf-vu-recv-audio-readout").textContent())?.trim(),
@@ -1228,7 +1237,7 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
           timeout: 15_000,
         },
       )
-      .toMatch(/^(L\d+\/\d+ · \d+ kbps|Not receiving)$/);
+      .toMatch(/^(\S+ · \d+\/\d+ · \d+ kbps|Not receiving)$/);
   });
 
   test("receive fixed badge appears when a kind's two thumbs collapse to one layer", async ({
@@ -1469,13 +1478,17 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
       })
       .toBeGreaterThanOrEqual(1);
 
-    // 1-BASED DISPLAY: the BASE rung's data-testid stays 0-based
-    // (`diag-simulcast-rung-0`, so selectors/protobuf don't churn) but its visible
-    // id label is 1-based "L1" (matching the receive side). The ladder must NEVER
-    // render a "L0" label.
+    // QUALITY-LETTER DISPLAY (#1222 Directive 4): the BASE rung's data-testid
+    // stays 0-based (`diag-simulcast-rung-0`, so selectors/protobuf don't churn)
+    // but its visible id chip is now the quality LETTER — the base (index 0) is
+    // "L" (Low) in any multi-layer ladder, "1" only in the degenerate 1-layer
+    // case (which this active-ladder arm has already skipped past). The old
+    // 1-based "L1"/"L0" numeric labels are GONE: assert the base reads exactly
+    // "L" and that NO rung chip carries the retired "L1"/"L0" numeric literals.
     const baseRung = ladder.locator('[data-testid="diag-simulcast-rung-0"]');
-    await expect(baseRung.locator(".simulcast-rung-id")).toHaveText("L1");
+    await expect(baseRung.locator(".simulcast-rung-id")).toHaveText("L");
     await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L0$/ })).toHaveCount(0);
+    await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L1$/ })).toHaveCount(0);
   });
 
   // ── Drawer help popovers + position:fixed viewport-clip regression (#1131) ──
@@ -1483,10 +1496,14 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
   // CHANGE #4: the drawer's HelpPopover info ("?") icons share ONE single-open
   // signal per cluster (opening one closes its sibling), use role="dialog", and
   // wire aria-haspopup/aria-expanded/aria-controls. The "Live stream state"
-  // group's NetEq sections each grew one — `diag-status-help` on "Current Status"
-  // and `diag-charts-help` on "NetEQ charts" (popover ids `*-popover`). Identical
-  // mechanism (component, styles, clamp/flip) to the Quality-controls panel's
-  // per-kind help (`perf-{video,audio,screen}-help`).
+  // group's NetEq sections carry help popovers — `diag-status-help` on "Current
+  // Status" and, after #1222 iteration 4, a PER-CHART "?" on each of the four
+  // NetEq charts (`diag-chart-buffer-help`, `diag-chart-decode-help`,
+  // `diag-chart-packets-help`, `diag-chart-reorder-help`; popover ids
+  // `*-popover`). The old section-level `diag-charts-help` on the "NetEQ charts"
+  // heading was REMOVED in favor of the per-chart icons. Identical mechanism
+  // (component, styles, clamp/flip) to the Quality-controls panel's per-kind help
+  // (`perf-{video,audio,screen}-help`).
   //
   // CHANGE #5 (the user-reported clipping bug): every `.perf-help-popover` is now
   // `position: fixed` with a JS clamp/flip (`use_help_popover_anchor` /
@@ -1494,12 +1511,16 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
   // right border and bottom fold because an `absolute` popover anchored INSIDE
   // `#diagnostics-sidebar { overflow-y: auto }` is clipped on BOTH axes.
   //
-  // ITERATION 3 reality (why this test no longer hard-targets the NetEq "?"):
+  // ITERATION 3/4 reality (why this test no longer hard-targets the NetEq "?"):
   // the NetEq Current-Status + charts sections (and so their "?" buttons) now
   // render ONLY for a SINGLE selected peer. With the "All Peers" aggregate
-  // selected — the solo-meeting default this spec produces — those sections are
-  // replaced by a placeholder, so `diag-status-help`/`diag-charts-help` are
-  // ABSENT. The viewport-clip regression mechanism is shared by ALL drawer
+  // selected — the ZERO-remote-peer solo-meeting default this spec produces —
+  // those sections are replaced by a placeholder, so `diag-status-help` and the
+  // per-chart `diag-chart-*-help` buttons are ABSENT. (#1222 ITERATION 4 adds a
+  // 1:1 auto-select: with EXACTLY ONE remote peer the drawer auto-picks it and
+  // those sections DO render by default — but that path needs a real second peer
+  // and cannot be exercised on this solo runner; see the placeholder test below.)
+  // The viewport-clip regression mechanism is shared by ALL drawer
   // HelpPopovers, so the load-bearing regression guard below opens a
   // Quality-controls help popover (`perf-screen-help`, low in the FIRST group
   // after a full scroll) — always reachable in a solo meeting — and asserts its
@@ -1585,8 +1606,15 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     // (the "?" buttons are ABSENT under the solo "All Peers" placeholder). When
     // present, exercise the same fixed+clamp+flip guarantee on the NetEq popover
     // and the shared single-open behaviour.
+    // #1222 ITERATION 4: the section-level `diag-charts-help` was removed; each
+    // chart now carries its OWN "?" (`diag-chart-{buffer,decode,packets,reorder}-help`).
+    // We use the per-chart Buffer help as the second NetEq popover here. It shares
+    // the SAME single-open `open_help` signal as `diag-status-help`, and renders
+    // under the same gate the old charts help did (single peer selected AND that
+    // peer has NetEq history), so the status-present / charts-maybe-present
+    // conditional structure below is preserved exactly.
     const statusBtn = sidebar.locator('[data-testid="diag-status-help"]');
-    const chartsBtn = sidebar.locator('[data-testid="diag-charts-help"]');
+    const chartsBtn = sidebar.locator('[data-testid="diag-chart-buffer-help"]');
     const statusPresent = (await statusBtn.count()) > 0;
     if (!statusPresent) {
       // Solo / All-Peers runner: the NetEq help buttons legitimately do not
@@ -1597,7 +1625,7 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
 
     const chartsPresent = (await chartsBtn.count()) > 0;
     const neteqBtn = chartsPresent ? chartsBtn : statusBtn;
-    const neteqTestid = chartsPresent ? "diag-charts-help" : "diag-status-help";
+    const neteqTestid = chartsPresent ? "diag-chart-buffer-help" : "diag-status-help";
     const neteqPopoverId = `${neteqTestid}-popover`;
     const neteqPopover = page.locator(`#${neteqPopoverId}`);
 
@@ -1630,14 +1658,15 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     // render (history present). Opening the other "?" closes the first.
     if (chartsPresent) {
       const statusPopover = page.locator("#diag-status-help-popover");
-      // The charts popover is currently open; opening the status "?" must close it.
+      // The per-chart Buffer popover is currently open; opening the status "?"
+      // must close it (single-open contract across the shared open_help signal).
       await statusBtn.scrollIntoViewIfNeeded();
       await statusBtn.click();
       await expect(statusBtn).toHaveAttribute("aria-expanded", "true");
       await expect(statusPopover).toBeVisible();
-      // The previously-open charts popover is now closed (single-open).
+      // The previously-open per-chart Buffer popover is now closed (single-open).
       await expect(chartsBtn).toHaveAttribute("aria-expanded", "false");
-      await expect(page.locator("#diag-charts-help-popover")).toHaveCount(0);
+      await expect(page.locator("#diag-chart-buffer-help-popover")).toHaveCount(0);
       // Escape closes the open status popover and returns aria-expanded to false.
       await page.keyboard.press("Escape");
       await expect(statusBtn).toHaveAttribute("aria-expanded", "false");
@@ -1650,19 +1679,23 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     }
   });
 
-  // ── ITERATION 3 — group reorder (#1131) ──────────────────────────────────
+  // ── ITERATION 4 — group reorder (#1131 / #1222) ──────────────────────────
   //
   // The drawer body's three top-level groups are `div.diag-group-label`
-  // elements. After iteration 3 their DOM order is usage-frequency:
-  //   "Quality controls" → "Live stream state" → "Connection & system".
-  // (Quality controls renders once Host publishes the perf controls, which
-  // `openPerformanceDrawer` already awaits via the simulcast strip.)
+  // elements. After iteration 4 their DOM order is investigation-first:
+  //   "Connection & system" → "Quality controls" → "Live stream state".
+  // Connection & system is the always-rendered incident-investigation anchor
+  // (no gate, so it leads and unconditionally owns the `--first` modifier);
+  // Quality controls (the editable sliders/Auto) is second; Live stream state
+  // (passive read-only telemetry) is last. (Quality controls renders once Host
+  // publishes the perf controls, which `openPerformanceDrawer` already awaits
+  // via the simulcast strip.)
   //
-  // OLD-STRUCTURE FAILURE: in iteration 2 the order was
-  //   ["Connection & system", "Quality controls", "Live stream state"].
+  // OLD-STRUCTURE FAILURE: in iteration 3 the order was
+  //   ["Quality controls", "Live stream state", "Connection & system"].
   // Asserting the exact ordered text array fails against that order (and against
   // any future reshuffle), so this is a real sync guard, not a tautology.
-  test("group order: the three drawer groups render Quality controls → Live stream state → Connection & system (#1131 iter 3)", async ({
+  test("group order: the three drawer groups render Connection & system → Quality controls → Live stream state (#1131 iter 4)", async ({
     page,
   }) => {
     await joinMeeting(page, "group_order");
@@ -1674,10 +1707,14 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     // openPerformanceDrawer's simulcast-strip wait).
     await expect(groupLabels).toHaveCount(3, { timeout: 15_000 });
     await expect(groupLabels).toHaveText([
+      "Connection & system",
       "Quality controls",
       "Live stream state",
-      "Connection & system",
     ]);
+    // The first (Connection & system) group owns the `--first` modifier — it is
+    // the always-rendered anchor, so `--first` can never be orphaned (#1222).
+    await expect(groupLabels.first()).toHaveClass(/diag-group-label--first/);
+    await expect(groupLabels.first()).toHaveText("Connection & system");
   });
 
   // ── ITERATION 3 — Raw stats + Build info collapsed disclosures (#1131) ────
@@ -1747,25 +1784,40 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(buildTable).toBeVisible();
   });
 
-  // ── ITERATION 3 — All-Peers placeholder vs single-peer NetEq charts (#1131) ─
+  // ── ITERATION 3/4 — All-Peers placeholder vs single-peer NetEq charts (#1131 / #1222) ─
   //
-  // The NetEq Current-Status tiles + time-series charts are now per-PEER. With
-  // the "All Peers" aggregate selected (the solo-meeting default) a single
-  // placeholder section replaces them ("Select a specific peer to view
-  // time-series charts and current status."). Selecting a specific peer renders
-  // the Current Status tiles and the horizontally-scrollable charts: each chart
-  // is a fixed `.neteq-chart-y-axis` <svg> sibling + a `.neteq-chart-scroll`
-  // overflow-x box (stacked 1-up inside `.neteq-charts-stack`). The peer
-  // selector itself only appears with > 1 remote peer, so the single-peer arm
-  // runs only on a multi-peer runner; the placeholder arm always runs.
+  // The NetEq Current-Status + time-series charts are now per-PEER. The placeholder
+  // ("Select a specific peer to view time-series charts and current status.")
+  // shows whenever the aggregate "All Peers" view is selected — which is the
+  // case at ZERO remote peers (this solo runner's reality) AND at 2+ remote peers
+  // until the user picks one. Selecting a specific peer renders the redesigned
+  // two-tier Current Status (`.neteq-status` > `.status-primary` with two
+  // `.status-stat`, `.status-secondary` with four `.status-row`, plus a
+  // `.status-reorder` micro-row) and the horizontally-scrollable charts: each
+  // chart is a fixed `.neteq-chart-y-axis` <svg> sibling + a `.neteq-chart-scroll`
+  // overflow-x box (stacked 1-up inside `.neteq-charts-stack`).
+  //
+  // #1222 ITERATION 4 — 1:1 AUTO-SELECT: with EXACTLY ONE remote peer the drawer
+  // now auto-selects it on first appearance, so the Current Status + charts
+  // render BY DEFAULT (no placeholder) for that one peer. That path needs a real
+  // second participant emitting NetEq stats and CANNOT be exercised on this solo
+  // (zero-remote-peer) runner — the same multi-peer-harness gap (#1093) that gates
+  // the single-peer arm below. The auto-select itself is host-tested in Rust
+  // (`auto_select_peer` in diagnostics.rs). On this solo runner the placeholder
+  // arm is the correct, accurate assertion: zero peers → All-Peers placeholder.
+  //
+  // The peer selector itself only appears with > 1 entry in available_peers
+  // (All Peers + >= 1 remote peer that emitted NetEq stats), so the single-peer
+  // arm runs only on a multi-peer runner; the placeholder arm always runs.
   //
   // OLD-STRUCTURE FAILURE: in iteration 2 the default "All Peers" selection
   // showed Current Status tiles (concatenated history / "--" tiles) and the 2×2
   // `.charts-grid`, never a "Select a specific peer…" placeholder. Asserting the
   // placeholder text under All Peers fails against iteration 2. Asserting a
   // `.neteq-chart-scroll` overflow-x box (not a fixed-width grid cell) fails
-  // against the old non-scrollable 2×2 grid.
-  test("Live stream state: NetEq shows the All-Peers placeholder, and a selected peer shows scrollable charts (#1131 iter 3)", async ({
+  // against the old non-scrollable 2×2 grid. Asserting the two-tier `.neteq-status`
+  // structure (below) fails against the old 9-uniform-tile `.status-grid`.
+  test("Live stream state: NetEq shows the All-Peers placeholder, and a selected peer shows the two-tier status + scrollable charts (#1131 iter 4)", async ({
     page,
   }) => {
     await joinMeeting(page, "neteq_placeholder");
@@ -1781,15 +1833,25 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     });
     const placeholder = sidebar.locator(".diag-neteq-placeholder");
 
-    // ── All-Peers arm (always runs) ──
+    // ── All-Peers arm (always runs; this solo runner has ZERO remote peers, so
+    //    the 1:1 auto-select does NOT fire and the placeholder is the correct
+    //    default — see the block comment on the iter-4 auto-select gap) ──
     // Under the All-Peers aggregate the NetEq section is the single placeholder,
-    // and the per-peer Current-Status / charts help "?" buttons are ABSENT.
+    // and the per-peer Current-Status / per-chart help "?" buttons are ABSENT.
     await expect(placeholder).toBeVisible({ timeout: 15_000 });
     await expect(placeholder).toHaveText(
       "Select a specific peer to view time-series charts and current status.",
     );
     await expect(sidebar.locator('[data-testid="diag-status-help"]')).toHaveCount(0);
-    await expect(sidebar.locator('[data-testid="diag-charts-help"]')).toHaveCount(0);
+    // The section-level diag-charts-help was removed (#1222); the four per-chart
+    // help icons render only with a selected peer + history, so none under the
+    // All-Peers placeholder.
+    await expect(sidebar.locator('[data-testid="diag-chart-buffer-help"]')).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="diag-chart-decode-help"]')).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="diag-chart-packets-help"]')).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="diag-chart-reorder-help"]')).toHaveCount(0);
+    // The new two-tier Current Status (`.neteq-status`) is not rendered either.
+    await expect(sidebar.locator(".neteq-status")).toHaveCount(0);
     // No scrollable charts render under the placeholder.
     await expect(sidebar.locator(".neteq-chart-scroll")).toHaveCount(0);
 
@@ -1815,6 +1877,30 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(sidebar.locator('[data-testid="diag-status-help"]')).toBeVisible({
       timeout: 15_000,
     });
+
+    // #1222 ITERATION 4 — two-tier Current Status redesign: the old 9-uniform-tile
+    // `.status-grid` is GONE, replaced by `.neteq-status` (scoped to avoid the
+    // identically-named `.status-*` classes the Connection Manager section uses)
+    // with a primary stat pair, a four-row flow group, and a reorder micro-row.
+    // Assert the structure exists for the selected peer.
+    const neteqStatus = sidebar.locator(".neteq-status");
+    await expect(neteqStatus).toBeVisible({ timeout: 15_000 });
+    // Tier 1 — primary: exactly two `.status-stat` (Buffer + Target).
+    await expect(neteqStatus.locator(".status-primary")).toBeVisible();
+    await expect(neteqStatus.locator(".status-primary .status-stat")).toHaveCount(2);
+    // Tier 2 — flow group: exactly four `.status-row` (Packets awaiting /
+    // Packets per s / Expand rate / Accelerate rate).
+    await expect(neteqStatus.locator(".status-secondary")).toBeVisible();
+    await expect(neteqStatus.locator(".status-secondary .status-row")).toHaveCount(4);
+    // Tier 3 — reorder micro-row: three `.status-reorder__item` (Rate /
+    // Reordered / Max dist).
+    await expect(neteqStatus.locator(".status-reorder")).toBeVisible();
+    await expect(neteqStatus.locator(".status-reorder .status-reorder__item")).toHaveCount(3);
+    // The retired iteration-2/3 tile classes must NOT resurface inside the NetEq
+    // status block (the Connection Manager section owns its own same-named classes,
+    // hence the `.neteq-status` scope above).
+    await expect(neteqStatus.locator(".status-grid")).toHaveCount(0);
+    await expect(neteqStatus.locator(".status-item")).toHaveCount(0);
 
     // The charts section is gated on the peer having NetEq HISTORY. A fresh
     // selection may legitimately have no samples yet → the "NetEQ Buffer / Jitter

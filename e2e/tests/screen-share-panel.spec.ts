@@ -345,14 +345,8 @@ test.describe("Screen share right panel layout", () => {
       // Layout is now CSS-class-driven (.ss-peer-panel) using flexbox.
       // Verify the panel has the expected class and computed layout.
       await expect(rightPanel).toHaveClass(/ss-peer-panel/);
-      const computedDisplay = await rightPanel.evaluate(
-        (el) => getComputedStyle(el).display,
-      );
-      expect(computedDisplay).toBe("flex");
-      const computedFlexWrap = await rightPanel.evaluate(
-        (el) => getComputedStyle(el).flexWrap,
-      );
-      expect(computedFlexWrap).toBe("wrap");
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("flex");
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).flexWrap)).toBe("wrap");
 
       // Verify peer tiles (.split-peer-tile) are rendered in the right panel
       const peerTiles = hostPage.locator(".split-peer-tile");
@@ -552,14 +546,8 @@ test.describe("Screen share right panel layout", () => {
       // ── Layout is CSS-class-driven (.ss-peer-panel) using flexbox.
       // Verify the panel has the right class and computed flex layout.
       await expect(rightPanel).toHaveClass(/ss-peer-panel/);
-      const computedDisplay = await rightPanel.evaluate(
-        (el) => getComputedStyle(el).display,
-      );
-      expect(computedDisplay).toBe("flex");
-      const computedFlexWrap = await rightPanel.evaluate(
-        (el) => getComputedStyle(el).flexWrap,
-      );
-      expect(computedFlexWrap).toBe("wrap");
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("flex");
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).flexWrap)).toBe("wrap");
 
       // ── Bug #3 GEOMETRIC: the first tile's LEFT edge must sit at the
       // panel's left edge plus its padding (~6px), not centered.

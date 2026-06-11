@@ -106,12 +106,33 @@ jobs:
         # The `df -h` / `docker system df` brackets give visibility into how
         # much was reclaimed; `|| true` ensures a cleanup hiccup never fails
         # the test job.
+        #
+        # LEAKED CHROMIUM TEMP DIRS (the failure this job actually died from):
+        # The Playwright/Chromium E2E jobs (`e2e-hcl.yaml`) run on this SAME
+        # host and leak `/tmp/org.chromium.Chromium.scoped_dir.*` profile dirs
+        # whenever a Chromium process is killed (OOM / timeout / "context
+        # closed" crash) instead of closed gracefully — Chromium only removes
+        # its own scratch dir on a clean shutdown. These accumulated to 177G
+        # across ~1,900 dirs and filled the root disk to 97%, at which point
+        # THIS backend job failed with `failed to create file .../fingerprint`
+        # + `linking with cc failed` — i.e. ENOSPC masquerading as a link
+        # error. `docker system prune` does NOT touch `/tmp`, so it freed
+        # nothing against this leak. We sweep the STALE Chromium dirs here too.
+        #
+        # SHARED-HOST SAFETY for the /tmp sweep: 4 runners share this host and
+        # a live test on another runner has an in-flight scoped_dir. We delete
+        # ONLY dirs older than 24h (`-mmin +1440`, matching the build-logs
+        # janitor precedent in daily-build-images-hcl.yaml) so an in-flight
+        # browser's dir — at most ~1h old for the longest full suite — is NEVER
+        # touched. `2>/dev/null || true` keeps a sweep hiccup non-fatal.
         working-directory: backend-repo
         run: |
           echo "=== Disk usage BEFORE cleanup ==="
           df -h || true
           echo "=== Docker disk usage BEFORE cleanup ==="
           sudo docker system df || true
+          echo "=== Sweeping STALE (>24h) leaked Chromium temp profile dirs in /tmp ==="
+          sudo find /tmp -maxdepth 1 -name "org.chromium.Chromium.scoped_dir.*" -type d -mmin +1440 -exec rm -rf {} \; 2>/dev/null || true
           echo "=== Pruning ALL unused images + stopped containers + networks + build cache (volumes preserved) ==="
           sudo docker system prune -af || true
           echo "=== Disk usage AFTER cleanup ==="

@@ -9,6 +9,7 @@
     // Feature disabled — expose a no-op API so WASM calls do not throw.
     window.__consoleLogCollector = {
       setContext: function () {},
+      setAuthToken: function () {},
       flush: function () {},
     };
     return;
@@ -26,6 +27,10 @@
   var meetingId = null;
   var userId = null;
   var displayName = null;
+  // room_token for this meeting, set via setAuthToken() on join + refresh.
+  // Attached to uploads as `Authorization: Bearer <token>`. Treated as a
+  // credential: never logged, never placed in the upload body.
+  var authToken = null;
   var appVersion = null; // populated from __APP_CONFIG.imageTag (Helm-injected)
   var sessionTimestampMs = null; // set once per page load via setContext
   var preambleWritten = false;
@@ -312,15 +317,25 @@
     buffer = [];
     bufferBytes = 0;
 
+    var headers = {
+      "Content-Type": "text/plain",
+      "X-Session-Timestamp": String(sessionTimestampMs),
+      "X-Chunk-Seq": String(nextChunkSeq),
+    };
+    // Authenticate via the room_token. The console-logs route validates this
+    // room_token (a meeting-api-signed JWT) as the sole credential on BOTH
+    // deployments — it does not read the session cookie — so the Bearer header
+    // is required everywhere (fnxlabs Google OAuth and Ascend Okta PKCE alike).
+    // `credentials:"include"` is harmless and left in place, but is not an auth
+    // fallback: without a room_token the upload is rejected.
+    if (authToken) {
+      headers["Authorization"] = "Bearer " + authToken;
+    }
+
     var opts = {
       method: "POST",
       credentials: "include",
-      headers: {
-        "Content-Type": "text/plain",
-        "X-User-Id": userId,
-        "X-Session-Timestamp": String(sessionTimestampMs),
-        "X-Chunk-Seq": String(nextChunkSeq),
-      },
+      headers: headers,
       body: payload,
     };
     // Increment BEFORE fetch so even failed requests advance the counter,
@@ -401,20 +416,30 @@
     var closeChunkSeq = nextChunkSeq;
     nextChunkSeq++;
     try {
+      var closeHeaders = {
+        "Content-Type": "text/plain",
+        "X-Session-Timestamp": String(sessionTimestampMs),
+        "X-Chunk-Seq": String(closeChunkSeq),
+      };
+      // keepalive fetch supports custom headers, so the close-path upload is
+      // fully authenticated via the room_token (same contract as doUpload).
+      if (authToken) {
+        closeHeaders["Authorization"] = "Bearer " + authToken;
+      }
       fetch(url, {
         method: "POST",
         credentials: "include",
         keepalive: true,
-        headers: {
-          "Content-Type": "text/plain",
-          "X-User-Id": userId,
-          "X-Session-Timestamp": String(sessionTimestampMs),
-          "X-Chunk-Seq": String(closeChunkSeq),
-        },
+        headers: closeHeaders,
         body: payload,
       });
     } catch (_) {
       // fetch+keepalive not available — fall back to sendBeacon.
+      // NOTE: sendBeacon CANNOT set request headers, so it cannot carry the
+      // `Authorization: Bearer` token. The route requires that token on every
+      // deployment, so this beacon path will 401 — it is best-effort only,
+      // reached solely when keepalive fetch is unavailable (rare on modern
+      // browsers).
       // Embed user_id and session_ts in the body as a metadata header line
       // instead of query params to avoid leaking identifiers to access logs.
       try {
@@ -464,6 +489,17 @@
       }
       writePreamble();
       startTimer();
+    },
+
+    /**
+     * Set/update the room_token used to authenticate uploads
+     * (`Authorization: Bearer <token>`). Called by WASM on join and again on
+     * every token refresh so long calls stay authenticated. O(1); does not
+     * touch the buffer or upload timer. The token is a credential and is
+     * never logged or written into the upload body.
+     */
+    setAuthToken: function (token) {
+      authToken = token || null;
     },
 
     /** Called by WASM on hangup — immediate upload of buffered entries. */

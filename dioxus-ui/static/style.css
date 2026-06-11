@@ -641,7 +641,9 @@ h3 {
     padding: 0 15px !important;
   }
   #diagnostics-sidebar .diagnostics-section {
-    margin-bottom: 25px !important;
+    /* Zero the additive margin — `.sidebar-content` flex `gap` spaces sections
+       (Fix A). Padding / background / radius keep the mobile card look. */
+    margin-bottom: 0 !important;
     padding: 15px !important;
     background-color: var(--field-bg) !important;
     border-radius: 8px !important;
@@ -1086,7 +1088,10 @@ html[data-theme="dark"] #diagnostics-sidebar {
    gives the open/closed affordance for free. (#1223) */
 .diag-disclosure > .diag-disclosure-summary {
   cursor: pointer;
-  list-style: revert;
+  /* Hide the default disclosure marker — we render an explicit chevron SVG
+     (`.diag-disclosure-chev`) inside the summary so the open/closed affordance
+     is consistent across browsers (Fix B), mirroring `.perf-peers__summary`. */
+  list-style: none;
   font-size: 16px;
   font-weight: 600;
   color: var(--text-primary);
@@ -1096,10 +1101,43 @@ html[data-theme="dark"] #diagnostics-sidebar {
   display: flex;
   align-items: center;
 }
+/* WebKit/Blink draw their own marker even with `list-style:none`; remove it. */
+.diag-disclosure-summary::-webkit-details-marker {
+  display: none;
+}
+/* Subtle hover affordance on the clickable summary row. */
+.diag-disclosure-summary:hover {
+  background: var(--glass-bg-hover);
+  border-radius: 6px;
+}
+/* The explicit chevron points right when closed, rotates to point down when the
+   `<details>` is open. Mirrors the `.perf-peers__chev` pattern. */
+.diag-disclosure-chev {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+}
+details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
+  transform: rotate(90deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .diag-disclosure-chev {
+    transition: none;
+  }
+}
 .diag-disclosure[open] > .diag-disclosure-summary {
   margin-bottom: 10px;
   border-bottom: 1px solid var(--glass-bg-hover);
   padding-bottom: 8px;
+}
+/* "Select a specific peer…" placeholder shown for the NetEq section when the
+   "All Peers" aggregate is selected (S2). */
+.diag-neteq-placeholder {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
 }
 /* Each folded raw-stats block (Reception / Sending / Encoder / Media Status)
    keeps its own sub-heading inside the one disclosure. */
@@ -1135,7 +1173,12 @@ html[data-theme="dark"] #diagnostics-sidebar {
 
 /* Drawer sections no longer carry a bottom margin — `.sidebar-content` now
    spaces them with a single flex `gap` (iteration 3 polish). Flex gap + child
-   margins are additive, so the per-section margin is removed here. */
+   margins are additive, so the global `.diagnostics-section { margin-bottom }`
+   leaks an extra gap inside the drawer; zero it here (the global rule body is
+   unchanged so non-drawer sections keep their margin). */
+#diagnostics-sidebar .diagnostics-section {
+  margin-bottom: 0;
+}
 
 #diagnostics-sidebar .diagnostics-section h3 {
   color: var(--text-primary);

@@ -3,6 +3,7 @@ use gloo_timers::future::TimeoutFuture;
 pub use neteq::NetEqStats as RawNetEqStats;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
+use std::rc::Rc;
 
 use crate::theme::color as theme_color;
 
@@ -13,6 +14,12 @@ pub const NETEQ_SAMPLE_CAP: usize = 7200;
 /// X-axis density for the scrollable charts: pixels per elapsed second. Mirrors
 /// the signal-quality popup idiom (`px_per_sec`).
 pub const NETEQ_PX_PER_SEC: f64 = 8.0;
+
+/// Minimum chart viewport width (px) so a short meeting's chart fills the drawer
+/// before it needs to scroll. The growing chart width never drops below this
+/// (`neteq_chart_width` clamps with `.max(NETEQ_MIN_CHART_WIDTH)`). Named so the
+/// width math and its tests share one source of truth (no bare `600.0`). (#1223)
+pub const NETEQ_MIN_CHART_WIDTH: f64 = 600.0;
 
 /// Compact, parse-once NetEq sample stored in the per-peer ring buffer that
 /// backs the scrollable charts AND the Current Status tiles (one storage, no
@@ -89,6 +96,38 @@ impl NetEqSample {
     }
 }
 
+/// Shared, render-prop wrapper around the (up-to-7200-element) NetEq history.
+///
+/// The history vec is built ONCE per kept-sample tick in the parent and handed
+/// to several chart components. A plain `Vec<NetEqSample>` prop makes Dioxus
+/// derive a CONTENT-based `PartialEq`, so every render-diff would walk all 7200
+/// samples (and again per chart) just to decide "did the prop change?". Wrapping
+/// it in an `Rc` and comparing by POINTER identity (`Rc::ptr_eq`) makes that
+/// memo check O(1): if the parent handed down the same `Rc`, the prop is equal
+/// and the chart subtree is skipped — no O(n) element walk. Clone is a refcount
+/// bump, not a deep copy, so passing the same history to four charts is cheap.
+/// (#1223)
+#[derive(Clone)]
+pub struct NetEqHistory(pub Rc<Vec<NetEqSample>>);
+
+impl PartialEq for NetEqHistory {
+    fn eq(&self, other: &Self) -> bool {
+        // Identity, not content: the parent rebuilds the Rc only when the
+        // history actually changed, so pointer equality is the correct (and
+        // O(1)) "unchanged" signal. A derived content compare would be O(7200).
+        Rc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+/// Whether a specific peer (not the "All Peers" aggregate) is selected. The
+/// NetEq Current-Status tiles and the time-series charts are only meaningful for
+/// ONE peer's deque — concatenating every peer's samples into one timeline mixes
+/// unrelated clocks. Pure + host-testable so the gating decision has one source
+/// of truth. (#1223)
+pub fn single_peer_selected(selected: &str) -> bool {
+    selected != "All Peers"
+}
+
 /// Push a sample into the per-peer ring buffer, enforcing the 2-hour cap by
 /// dropping the OLDEST sample (`pop_front`) before appending. Extracted as a
 /// free fn so the retention behaviour is unit-testable without the subscribe
@@ -157,7 +196,9 @@ fn BaseChart(
     config: ChartConfig,
     /// The samples backing this chart, index-aligned with every series'
     /// `data_points`. Drives the time-based X (`first_ts` = oldest retained).
-    samples: Vec<NetEqSample>,
+    /// Wrapped in [`NetEqHistory`] so the prop memo compares by `Rc::ptr_eq`
+    /// (O(1)) instead of walking up to 7200 elements per render-diff.
+    samples: NetEqHistory,
     /// Unique scroll-container id (one per chart) so scroll-sync can target the
     /// other three siblings without self-targeting.
     scroll_id: String,
@@ -165,6 +206,8 @@ fn BaseChart(
     /// "Showing last 2 hours" caption (owner decision 2).
     capped: bool,
 ) -> Element {
+    // Deref the Rc once; everything below reads the slice/vec behind it.
+    let samples = &samples.0;
     // Empty → the "No data available" placeholder; never a mega-wide empty SVG.
     if samples.is_empty() {
         return rsx! {
@@ -187,13 +230,18 @@ fn BaseChart(
     let first_ts = samples.first().map(|s| s.timestamp_ms).unwrap_or(0);
     let last_ts = samples.last().map(|s| s.timestamp_ms).unwrap_or(first_ts);
     // Min viewport so the chart fills the drawer before it needs to scroll.
-    let min_width = 600.0;
-    let chart_width = neteq_chart_width(first_ts, last_ts, NETEQ_PX_PER_SEC, min_width);
+    let chart_width = neteq_chart_width(first_ts, last_ts, NETEQ_PX_PER_SEC, NETEQ_MIN_CHART_WIDTH);
     let total_seconds = ((last_ts.saturating_sub(first_ts)) as f64 / 1000.0).max(1.0);
 
     let max_value = config.max_value.max(1.0);
 
     // One polyline per series, x from real sample time, y normalized to max_value.
+    // N2: this builds the FULL polyline over every retained sample (the spec
+    // default). At multi-hour retention the timeline grows to ~57k px, so the
+    // SVG raster for the off-screen span could pressure low-power devices.
+    // Window-clipping the polyline to the visible scroll range is a possible
+    // future optimization — DEFERRED pending real-device profiling; no clipping
+    // is added now so the default behaviour (full history) is unchanged. (#1223)
     let series_elements: Vec<Element> = config
         .series
         .iter()
@@ -259,14 +307,22 @@ fn BaseChart(
     // Auto-follow: after each render, stick to the right edge ONLY if the user
     // is already within 20px of it (never interrupt a deliberate scroll-back).
     // INSTANT `set_scroll_left` (no smooth behavior) — reduced-motion safe.
-    // `scroll_id` is read inside the spawned closure so the effect re-runs each
-    // render as the SVG grows. (mirror signal_quality.rs:2371-2384)
+    //
+    // This is a bare `spawn` in the component body (NOT a `use_effect`), exactly
+    // mirroring the working signal_quality.rs:2371-2384 idiom. The body re-runs
+    // every render — and BaseChart re-renders whenever a new sample extends the
+    // history (the `NetEqHistory` Rc prop changes) — so the follow re-fires on
+    // each timeline growth. A `use_effect` here would re-run ONLY when a Signal
+    // read inside it changed; `last_ts` is a plain Copy `u64`, not a Signal, so an
+    // effect keyed on it would run once and never re-follow on growth — a silent
+    // regression. The bare-spawn form keeps the proven per-render behaviour.
     let scroll_id_for_follow = scroll_id.clone();
     spawn(async move {
         TimeoutFuture::new(0).await;
         if let Some(el) = gloo_utils::document().get_element_by_id(&scroll_id_for_follow) {
             let at_end = el.scroll_left() + el.client_width() >= el.scroll_width() - 20;
             if at_end {
+                // Instant jump to the right edge (no smooth behavior).
                 el.set_scroll_left(el.scroll_width());
             }
         }
@@ -638,7 +694,9 @@ impl ChartConfig {
 
 #[component]
 pub fn NetEqAdvancedChart(
-    stats_history: Vec<NetEqSample>,
+    /// Shared history wrapper — see [`NetEqHistory`]. Cloning to hand it to
+    /// `BaseChart` is a refcount bump, and the prop memo compares by pointer.
+    stats_history: NetEqHistory,
     chart_type: AdvancedChartType,
     /// Unique scroll-container id so the four stacked charts can scroll-sync
     /// without self-targeting (see `BaseChart`).
@@ -646,7 +704,7 @@ pub fn NetEqAdvancedChart(
     /// `true` only at the 2-hour cap → gates the "Showing last 2 hours" caption.
     capped: bool,
 ) -> Element {
-    if stats_history.is_empty() {
+    if stats_history.0.is_empty() {
         return rsx! {
             div { class: "neteq-advanced-chart",
                 div { class: "chart-title", "{chart_type.title()}" }
@@ -655,11 +713,13 @@ pub fn NetEqAdvancedChart(
         };
     }
 
+    // ChartConfig::* take `&[NetEqSample]`; `&stats_history.0` derefs the Rc'd
+    // Vec to a slice with no copy.
     let config = match chart_type {
-        AdvancedChartType::BufferVsTarget => ChartConfig::buffer_vs_target(&stats_history),
-        AdvancedChartType::DecodeOperations => ChartConfig::decode_operations(&stats_history),
-        AdvancedChartType::QualityMetrics => ChartConfig::quality_metrics(&stats_history),
-        AdvancedChartType::ReorderingAnalysis => ChartConfig::reordering_analysis(&stats_history),
+        AdvancedChartType::BufferVsTarget => ChartConfig::buffer_vs_target(&stats_history.0),
+        AdvancedChartType::DecodeOperations => ChartConfig::decode_operations(&stats_history.0),
+        AdvancedChartType::QualityMetrics => ChartConfig::quality_metrics(&stats_history.0),
+        AdvancedChartType::ReorderingAnalysis => ChartConfig::reordering_analysis(&stats_history.0),
     };
 
     rsx! {
@@ -930,24 +990,38 @@ mod tests {
         assert!(!should_push(last_push.get("A").copied(), 1200));
     }
 
-    /// Time-axis math: `neteq_x` maps elapsed ms → px at px_per_sec=8, and
+    /// Time-axis math: `neteq_x` maps elapsed ms → px at `NETEQ_PX_PER_SEC`, and
     /// `neteq_chart_width` grows with elapsed seconds while honouring the
-    /// min-viewport `(total_seconds*8).max(min)+10`. Catches a wrong px_per_sec
-    /// scale or a dropped `+10`/min clamp.
+    /// min-viewport `(total_seconds*px_per_sec).max(min)+10`. Expecteds are
+    /// recomputed FROM the consts (so a const change doesn't break the test), but
+    /// the assertion exercises the SOURCE `neteq_chart_width`/`neteq_x` — so a
+    /// mutation in their bodies (dropping `+10.0` or the `.max(min)` clamp, or a
+    /// wrong px_per_sec scale) makes actual != expected and fails.
     #[test]
     fn time_axis_math_x_and_width() {
-        // x: 5s after first_ts at 8 px/s = 40px.
-        assert!((neteq_x(6000, 1000, 8.0) - 40.0).abs() < 0.001);
+        // x: 5s after first_ts = 5 * NETEQ_PX_PER_SEC.
+        let expected_x = 5.0 * NETEQ_PX_PER_SEC;
+        assert!((neteq_x(6000, 1000, NETEQ_PX_PER_SEC) - expected_x).abs() < 0.001);
         // x at first_ts is 0.
-        assert!((neteq_x(1000, 1000, 8.0)).abs() < 0.001);
+        assert!((neteq_x(1000, 1000, NETEQ_PX_PER_SEC)).abs() < 0.001);
 
-        // Short span (10s) clamps to the min viewport: max(80, 600)+10 = 610.
-        let w_short = neteq_chart_width(0, 10_000, 8.0, 600.0);
-        assert!((w_short - 610.0).abs() < 0.001, "got {w_short}");
+        // Short span (10s) clamps to the min viewport: max(10s*px, min) + 10.
+        let total_short = (10_000f64 / 1000.0).max(1.0);
+        let expected_short = (total_short * NETEQ_PX_PER_SEC).max(NETEQ_MIN_CHART_WIDTH) + 10.0;
+        let w_short = neteq_chart_width(0, 10_000, NETEQ_PX_PER_SEC, NETEQ_MIN_CHART_WIDTH);
+        assert!(
+            (w_short - expected_short).abs() < 0.001,
+            "got {w_short}, expected {expected_short}"
+        );
 
-        // Long span (200s) grows past the min: 200*8 + 10 = 1610.
-        let w_long = neteq_chart_width(0, 200_000, 8.0, 600.0);
-        assert!((w_long - 1610.0).abs() < 0.001, "got {w_long}");
+        // Long span (200s) grows past the min: 200s*px + 10.
+        let total_long = (200_000f64 / 1000.0).max(1.0);
+        let expected_long = (total_long * NETEQ_PX_PER_SEC).max(NETEQ_MIN_CHART_WIDTH) + 10.0;
+        let w_long = neteq_chart_width(0, 200_000, NETEQ_PX_PER_SEC, NETEQ_MIN_CHART_WIDTH);
+        assert!(
+            (w_long - expected_long).abs() < 0.001,
+            "got {w_long}, expected {expected_long}"
+        );
     }
 
     /// Honest axis after cap: when the deque is capped, the chart origin
@@ -968,11 +1042,19 @@ mod tests {
         let last_ts = dq.back().unwrap().timestamp_ms;
         assert_eq!(first_ts, 1000, "origin must be the oldest RETAINED sample");
 
-        // Width from the honest origin: 7199 * 8 + 10 = 57602.
-        let honest = neteq_chart_width(first_ts, last_ts, 8.0, 600.0);
-        // Width if someone wrongly anchored to 0: 7200 * 8 + 10 = 57610.
-        let wrong = neteq_chart_width(0, last_ts, 8.0, 600.0);
-        assert!((honest - 57602.0).abs() < 0.001, "got {honest}");
+        // Expected from the honest origin, recomputed from the consts (so a const
+        // change doesn't break the test) but exercising the SOURCE
+        // `neteq_chart_width` — dropping `+10.0` or `.max(min)` in its body would
+        // make actual != expected and fail.
+        let total_honest = (last_ts.saturating_sub(first_ts) as f64 / 1000.0).max(1.0);
+        let expected_honest = (total_honest * NETEQ_PX_PER_SEC).max(NETEQ_MIN_CHART_WIDTH) + 10.0;
+        let honest = neteq_chart_width(first_ts, last_ts, NETEQ_PX_PER_SEC, NETEQ_MIN_CHART_WIDTH);
+        // Width if someone wrongly anchored to 0 (spans last - 0, one extra second).
+        let wrong = neteq_chart_width(0, last_ts, NETEQ_PX_PER_SEC, NETEQ_MIN_CHART_WIDTH);
+        assert!(
+            (honest - expected_honest).abs() < 0.001,
+            "got {honest}, expected {expected_honest}"
+        );
         assert_ne!(
             honest, wrong,
             "honest origin must differ from a 0-anchored origin"
@@ -998,5 +1080,24 @@ mod tests {
                 "Merge"
             ]
         );
+    }
+
+    /// `single_peer_selected` gates the Current-Status tiles + time-series charts
+    /// to a SINGLE peer; the "All Peers" aggregate gets the placeholder instead.
+    /// Catches flipping the `!=` to `==` in `single_peer_selected` (which would
+    /// invert the gate: charts for "All Peers", placeholder for a real peer).
+    #[test]
+    fn single_peer_selected_gates_only_all_peers() {
+        assert!(
+            !single_peer_selected("All Peers"),
+            "the aggregate must NOT count as a single peer"
+        );
+        assert!(
+            single_peer_selected("peer-123"),
+            "a specific peer id is a single peer"
+        );
+        // Empty string is anything-but-"All Peers", so it is treated as a single
+        // peer (it is `!= "All Peers"`). Pins the exact comparison semantics.
+        assert!(single_peer_selected(""), "empty != \"All Peers\" → single");
     }
 }

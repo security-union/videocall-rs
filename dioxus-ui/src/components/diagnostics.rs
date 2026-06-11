@@ -17,8 +17,9 @@
  */
 
 use crate::components::neteq_chart::{
-    push_capped, should_push, AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart,
-    NetEqSample, NetEqStatusDisplay, NETEQ_SAMPLE_CAP,
+    push_capped, should_push, single_peer_selected, AdvancedChartType, ChartType,
+    NetEqAdvancedChart, NetEqChart, NetEqHistory, NetEqSample, NetEqStatusDisplay,
+    NETEQ_SAMPLE_CAP,
 };
 use crate::components::performance_settings::{
     format_kbps_compact, format_mbps, format_peer_kind_line, format_send_header, format_send_layer,
@@ -516,14 +517,28 @@ pub fn Diagnostics(
         let task = spawn(async move {
             let mut rx = subscribe();
             let mut connection_events = Vec::<SerializableDiagEvent>::new();
-            // Parsed-once per-peer ring buffers (the heavy JSON decode happens
-            // HERE, not in the render path). Capped at 2 hours (#1223).
-            let mut neteq_stats = HashMap::<String, VecDeque<NetEqSample>>::new();
             // Per-peer last-kept timestamp for the ≤1 Hz throttle. Different
-            // peers throttle independently (like `peer_transport` below).
+            // peers throttle independently (like `peer_transport` below). This is
+            // the only NetEq loop-local left: the parsed-once per-peer ring
+            // buffers themselves now live in the signals and are mutated IN PLACE
+            // via `with_mut` (no full-map clone per kept sample — #1223 B1).
+            //
+            // S3 — peer-departure retention: departed peers' deques are RETAINED
+            // until the drawer closes (the `!is_open` teardown above clears every
+            // map with `.set(HashMap::new())`). There is no per-event eviction
+            // here because the diagnostics bus this loop consumes carries NO
+            // peer-departure/disconnect event — its subsystems are client_perf,
+            // connection_manager, decode_budget, heartbeat, neteq, peer_speaking,
+            // peer_status, screen_encoder_state, sender, video_decoder,
+            // video_resolution, video_source_resolution, and video. Peer removal
+            // in videocall-client fires a Rust `Callback<String>`
+            // (peer_decode_manager `on_peer_removed`/`delete_peer`), NOT a
+            // `DiagEvent`, and `peer_status` only reports media-enabled state +
+            // transport WHILE the peer exists (no "left" field). So there is no
+            // departure signal to subscribe to here; retention-until-close is
+            // intentional and bounded — maps reset on close and each deque is
+            // capped at 7200 samples/peer. Do NOT add a new event channel.
             let mut last_push_ms = HashMap::<String, u64>::new();
-            let mut neteq_buffer = HashMap::<String, Vec<u64>>::new();
-            let mut neteq_jitter = HashMap::<String, Vec<u64>>::new();
             // Per-peer transport label, locally cached. peer_status events
             // arrive on every heartbeat (~periodic), so we only push to the
             // signal when the value actually changes — heartbeat ticks must
@@ -604,9 +619,6 @@ pub fn Diagnostics(
                         } else {
                             "unknown"
                         };
-                        let mut stats_dirty = false;
-                        let mut buffer_dirty = false;
-                        let mut jitter_dirty = false;
                         for m in &evt.metrics {
                             match m.name {
                                 "stats_json" => {
@@ -622,15 +634,24 @@ pub fn Diagnostics(
                                             if let Some(sample) =
                                                 NetEqSample::from_json(json, evt.ts_ms)
                                             {
-                                                let entry = neteq_stats
-                                                    .entry(target_peer.to_string())
-                                                    .or_default();
-                                                // pop_front-then-push_back at the
-                                                // 2-hour cap (owner decision 2).
-                                                push_capped(entry, sample);
+                                                // Push IN PLACE into the signal's
+                                                // map (B1): `with_mut` mutates the
+                                                // backing map and marks the signal
+                                                // dirty itself — no full-map clone
+                                                // per kept sample. The closure is
+                                                // SYNCHRONOUS (no `.await` inside),
+                                                // so the borrow drops before the
+                                                // next `rx.recv().await`. (#1223)
+                                                neteq_stats_per_peer.with_mut(|m| {
+                                                    let dq = m
+                                                        .entry(target_peer.to_string())
+                                                        .or_default();
+                                                    // pop_front-then-push_back at
+                                                    // the 2-hour cap (decision 2).
+                                                    push_capped(dq, sample);
+                                                });
                                                 last_push_ms
                                                     .insert(target_peer.to_string(), evt.ts_ms);
-                                                stats_dirty = true;
                                             }
                                         }
                                     }
@@ -640,43 +661,32 @@ pub fn Diagnostics(
                                 // NetEq `stats_json` sample), so they keep their
                                 // own small 50-cap ring buffers that back the
                                 // Buffer/Jitter FALLBACK charts shown before any
-                                // full NetEq history exists. (#1223)
+                                // full NetEq history exists. Pushed in place via
+                                // `with_mut` (sync closure, no `.await`). (#1223)
                                 "audio_buffer_ms" => {
                                     if let MetricValue::U64(v) = &m.value {
-                                        let entry = neteq_buffer
-                                            .entry(target_peer.to_string())
-                                            .or_default();
-                                        entry.push(*v);
-                                        if entry.len() > 50 {
-                                            entry.remove(0);
-                                        }
-                                        buffer_dirty = true;
+                                        neteq_buffer_per_peer.with_mut(|m| {
+                                            let dq = m.entry(target_peer.to_string()).or_default();
+                                            dq.push(*v);
+                                            if dq.len() > 50 {
+                                                dq.remove(0);
+                                            }
+                                        });
                                     }
                                 }
                                 "jitter_buffer_delay_ms" => {
                                     if let MetricValue::U64(v) = &m.value {
-                                        let entry = neteq_jitter
-                                            .entry(target_peer.to_string())
-                                            .or_default();
-                                        entry.push(*v);
-                                        if entry.len() > 50 {
-                                            entry.remove(0);
-                                        }
-                                        jitter_dirty = true;
+                                        neteq_jitter_per_peer.with_mut(|m| {
+                                            let dq = m.entry(target_peer.to_string()).or_default();
+                                            dq.push(*v);
+                                            if dq.len() > 50 {
+                                                dq.remove(0);
+                                            }
+                                        });
                                     }
                                 }
                                 _ => {}
                             }
-                        }
-                        // Batch: update signals once per event, not per-metric.
-                        if stats_dirty {
-                            neteq_stats_per_peer.set(neteq_stats.clone());
-                        }
-                        if buffer_dirty {
-                            neteq_buffer_per_peer.set(neteq_buffer.clone());
-                        }
-                        if jitter_dirty {
-                            neteq_jitter_per_peer.set(neteq_jitter.clone());
                         }
                     }
                     "peer_status" => {
@@ -776,36 +786,39 @@ pub fn Diagnostics(
     };
 
     // Build the NetEq history for the selected peer by CLONING the already-parsed
-    // samples out of the ring buffer(s) — no JSON re-parse (the heavy decode
-    // happened once in the subscribe loop). "All Peers" concatenates every peer's
-    // deque; a specific peer uses just that deque. The drawer body re-renders at
-    // the throttled ≤1 Hz sample cadence (one re-render per KEPT sample), which is
-    // the existing accepted model — only the per-event PARSE was moved out. (#1223)
+    // samples out of the ring buffer (no JSON re-parse — the heavy decode happened
+    // once in the subscribe loop). The Current-Status tiles + time-series charts
+    // are only meaningful for ONE peer (S2): concatenating every peer's deque into
+    // one timeline mixes unrelated clocks, so for "All Peers" we build an EMPTY
+    // history and render a "pick a peer" placeholder downstream instead. The
+    // history is wrapped in an `Rc<Vec<_>>` (S1) so the chart props compare by
+    // `Rc::ptr_eq` (O(1)) instead of a content walk over up to 7200 samples. The
+    // drawer body re-renders at the throttled ≤1 Hz sample cadence (one re-render
+    // per KEPT sample) — the existing accepted model. (#1223)
     let current_peer = selected_peer();
+    let single_peer = single_peer_selected(&current_peer);
     let stats_map = neteq_stats_per_peer();
-    let neteq_stats_history: Vec<NetEqSample> = if current_peer == "All Peers" {
-        let mut all = Vec::new();
-        for stats in stats_map.values() {
-            all.extend(stats.iter().cloned());
-        }
-        all
+    let neteq_stats_history: Rc<Vec<NetEqSample>> = if single_peer {
+        Rc::new(
+            stats_map
+                .get(&current_peer)
+                .map(|peer_stats| peer_stats.iter().cloned().collect())
+                .unwrap_or_default(),
+        )
     } else {
-        stats_map
-            .get(&current_peer)
-            .map(|peer_stats| peer_stats.iter().cloned().collect())
-            .unwrap_or_default()
+        // "All Peers": no single timeline → empty history (placeholder shown).
+        Rc::new(Vec::new())
     };
 
-    // Cap caption gates on len()==7200 (owner decision 2). For a specific peer
-    // that's the peer's deque length; for "All Peers" the concatenation can
-    // exceed the cap, so check whether ANY contributing peer is at the cap.
-    let neteq_capped = if current_peer == "All Peers" {
-        stats_map.values().any(|dq| dq.len() == NETEQ_SAMPLE_CAP)
-    } else {
+    // Cap caption gates on len()==7200 (owner decision 2): the selected peer's
+    // deque length. For "All Peers" no charts are shown, so capped stays false.
+    let neteq_capped = if single_peer {
         stats_map
             .get(&current_peer)
             .map(|dq| dq.len() == NETEQ_SAMPLE_CAP)
             .unwrap_or(false)
+    } else {
+        false
     };
 
     let latest_neteq_stats = neteq_stats_history.last().cloned();
@@ -997,10 +1010,13 @@ pub fn Diagnostics(
                 // signal reads move into the child (#1128).
                 NetEqStatusAndCharts {
                     latest_stats: latest_neteq_stats,
-                    stats_history: neteq_stats_history.clone(),
+                    // Wrap in NetEqHistory (Rc) — the `.clone()` is a refcount
+                    // bump, and the child's prop memo compares by pointer (S1).
+                    stats_history: NetEqHistory(neteq_stats_history.clone()),
                     buffer_history: buffer_history.clone(),
                     jitter_history: jitter_history.clone(),
                     capped: neteq_capped,
+                    single_peer,
                 }
 
                 // ── GROUP 3 — Connection & system ──
@@ -1053,6 +1069,18 @@ pub fn Diagnostics(
                 section { class: "diagnostics-section", "aria-labelledby": "diag-h-raw-stats",
                     details { class: "diag-disclosure",
                         summary { id: "diag-h-raw-stats", class: "diag-disclosure-summary",
+                            svg {
+                                class: "diag-disclosure-chev",
+                                width: "12",
+                                height: "12",
+                                view_box: "0 0 12 12",
+                                path {
+                                    d: "M4 2 L8 6 L4 10",
+                                    fill: "none",
+                                    stroke: "currentColor",
+                                    stroke_width: "1.5",
+                                }
+                            }
                             "Raw stats"
                         }
                         div { class: "diagnostics-data",
@@ -1092,6 +1120,18 @@ pub fn Diagnostics(
                 section { class: "diagnostics-section", "aria-labelledby": "diag-h-build-info",
                     details { class: "diag-disclosure",
                         summary { id: "diag-h-build-info", class: "diag-disclosure-summary",
+                            svg {
+                                class: "diag-disclosure-chev",
+                                width: "12",
+                                height: "12",
+                                view_box: "0 0 12 12",
+                                path {
+                                    d: "M4 2 L8 6 L4 10",
+                                    fill: "none",
+                                    stroke: "currentColor",
+                                    stroke_width: "1.5",
+                                }
+                            }
                             "Build info"
                         }
                         div { class: "build-info-table",
@@ -1155,16 +1195,35 @@ const HELP_NETEQ_CHARTS: &str = "These charts trend the same audio-pipeline metr
 #[component]
 fn NetEqStatusAndCharts(
     latest_stats: Option<NetEqSample>,
-    stats_history: Vec<NetEqSample>,
+    /// Shared, Rc-wrapped history (S1) — pointer-compared by the prop memo.
+    stats_history: NetEqHistory,
     buffer_history: Vec<u64>,
     jitter_history: Vec<u64>,
     /// `true` only when the selected peer's deque is at the 2-hour cap — gates
     /// each chart's "Showing last 2 hours" caption.
     capped: bool,
+    /// `true` when a specific peer is selected (S2). The Current-Status tiles and
+    /// the time-series charts are only meaningful for one peer; for "All Peers"
+    /// we render a single placeholder section instead (no dangling empty heading).
+    single_peer: bool,
 ) -> Element {
     // Single-open help signal shared by both popovers in this cluster.
     let open_help = use_signal(|| None::<&'static str>);
-    let has_history = !stats_history.is_empty();
+    let has_history = !stats_history.0.is_empty();
+
+    // "All Peers": one placeholder section, IN PLACE of both the Current-Status
+    // tiles and the charts — no Current-Status heading is rendered, so there is
+    // no dangling empty section header. (S2)
+    if !single_peer {
+        return rsx! {
+            section { class: "diagnostics-section", "aria-labelledby": "diag-h-neteq-placeholder",
+                h3 { id: "diag-h-neteq-placeholder", "NetEQ" }
+                p { class: "diag-neteq-placeholder",
+                    "Select a specific peer to view time-series charts and current status."
+                }
+            }
+        };
+    }
 
     rsx! {
         section { class: "diagnostics-section", "aria-labelledby": "diag-h-current-status",

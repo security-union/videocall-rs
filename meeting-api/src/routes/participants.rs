@@ -616,29 +616,35 @@ pub async fn leave_meeting(
     // drops their principal from the ACL set on the next push.
     search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
-    // Single-host termination rules. `left_as_host` is the row's `is_host`
-    // BEFORE the leave flipped status to 'left' — i.e. whether the departing
-    // participant was THE host (there is at most one).
+    // Single-host termination rules, in priority order. `left_as_host` is the
+    // row's `is_host` BEFORE the leave flipped status to 'left' — i.e. whether
+    // the departing participant was THE host (there is at most one).
     //
-    // a) end_on_host_leave=true + the host leaves → end immediately for
-    //    everyone. We broadcast MEETING_ENDED here so all clients are notified
-    //    (the leaving host's own client may not round-trip the transport-layer
+    // a) Host leaves + end_on_host_leave=true → end immediately for everyone.
+    //    We broadcast MEETING_ENDED here so all clients are notified (the
+    //    leaving host's own client may not round-trip the transport-layer
     //    broadcast before navigating away).
-    // b) end_on_host_leave=false, or a non-host attendee leaves → end only when
-    //    the room is now empty (last admitted participant left). Same
-    //    "last-participant-out" invariant as leave_meeting_as_guest below.
+    // b) Host leaves + end_on_host_leave=false → do NOT end, even if no other
+    //    participant remains. The host opted into "keep the meeting alive after
+    //    I leave"; ending on zero count would silently violate that (and block
+    //    a later host-absent join).
+    // c) Non-host attendee leaves → end only when the room is now empty (last
+    //    admitted participant out). Same invariant as leave_meeting_as_guest.
     let left_as_host = row.is_host;
-    if left_as_host && meeting.end_on_host_leave {
-        // Rule (a): the host leaves under eohl → end + notify clients.
-        db_meetings::end_meeting(&state.db, meeting.id).await?;
-        nats_events::publish_meeting_ended(
-            state.nats.as_ref(),
-            &meeting_id,
-            "The host has ended the meeting",
-        )
-        .await;
+    if left_as_host {
+        if meeting.end_on_host_leave {
+            // Rule (a).
+            db_meetings::end_meeting(&state.db, meeting.id).await?;
+            nats_events::publish_meeting_ended(
+                state.nats.as_ref(),
+                &meeting_id,
+                "The host has ended the meeting",
+            )
+            .await;
+        }
+        // Rule (b): eohl=false → leave the meeting alive.
     } else {
-        // Rule (b): end only when the room is now empty.
+        // Rule (c).
         let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
         if remaining == 0 {
             db_meetings::end_meeting(&state.db, meeting.id).await?;

@@ -189,6 +189,28 @@ pub fn clear_pkce_state() {
 // Provider token exchange (browser-side PKCE flow)
 // ---------------------------------------------------------------------------
 
+/// Summarize a provider response body for error-path logging WITHOUT shipping a
+/// live token.
+///
+/// On PKCE/Ascend deployments the browser console logs are uploaded to a
+/// collector. A malformed-but-token-bearing provider response logged verbatim
+/// could therefore exfiltrate a live access/id/refresh token. This returns only
+/// the byte length and a short Debug-escaped prefix (control chars escaped),
+/// which is enough to debug a parse/status failure without dumping the token.
+///
+/// The prefix is capped deliberately short (32 chars): on an error-shaped
+/// response that nonetheless front-loads a token field, a longer window could
+/// expose a usable token prefix. 32 chars is enough to recognise a JSON error
+/// envelope (`{"error":"invalid_grant"...`) or an HTML gateway page while
+/// surfacing at most a non-sensitive JWT header fragment.
+fn redact_body(body: &str) -> String {
+    format!(
+        "{} bytes, prefix: {:?}",
+        body.len(),
+        body.chars().take(32).collect::<String>()
+    )
+}
+
 /// Response from the identity provider's token endpoint.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct ProviderTokenResponse {
@@ -196,6 +218,8 @@ pub(crate) struct ProviderTokenResponse {
     pub access_token: Option<String>,
     #[serde(default)]
     pub id_token: Option<String>,
+    #[serde(default)]
+    pub refresh_token: Option<String>,
     // Error fields — present when the provider rejects the exchange.
     #[serde(default)]
     pub error: Option<String>,
@@ -251,7 +275,10 @@ pub(crate) async fn exchange_code_with_provider(
         .map_err(|e| format!("Failed to read token response body: {e}"))?;
 
     let token_resp: ProviderTokenResponse = serde_json::from_str(&body).map_err(|e| {
-        log::error!("Failed to parse token response (HTTP {status}): {e} — body: {body}");
+        log::error!(
+            "Failed to parse token response (HTTP {status}): {e} — body: {}",
+            redact_body(&body)
+        );
         format!(
             "The identity provider returned an unexpected response (HTTP {status}). \
              Please try again."
@@ -267,11 +294,112 @@ pub(crate) async fn exchange_code_with_provider(
     }
 
     if !status.is_success() {
-        log::error!("Token endpoint returned HTTP {status}: {body}");
+        log::error!(
+            "Token endpoint returned HTTP {status}: {}",
+            redact_body(&body)
+        );
         return Err(format!(
             "Sign-in failed: the identity provider returned HTTP {status}. \
              Please try again."
         ));
+    }
+
+    Ok(token_resp)
+}
+
+/// Outcome classification for a refresh-token grant, so the caller can tell a
+/// dead token apart from a recoverable transport failure.
+pub(crate) enum RefreshError {
+    /// Provider definitively rejected the grant (invalid_grant, or a 4xx with
+    /// an error body) — the refresh token is dead and must be cleared.
+    Rejected(String),
+    /// Could not reach/parse the provider (network, CORS, 5xx, bad JSON) — the
+    /// token may still be valid; the caller must NOT clear it.
+    Transient(String),
+}
+
+/// Exchange a `refresh_token` for a fresh access/id token at the provider's
+/// token endpoint.
+///
+/// This is the **public-client** refresh grant: no `client_secret` is sent
+/// (mirrors [`exchange_code_with_provider`]). It is used by the PKCE flow when
+/// the provider bearer expires mid-session. The same CORS requirement applies —
+/// see [`exchange_code_with_provider`] for details.
+///
+/// Errors are classified as [`RefreshError::Rejected`] (the token is dead) vs
+/// [`RefreshError::Transient`] (recoverable — the caller must NOT clear the
+/// token). No error payload ever carries a token value.
+pub(crate) async fn refresh_with_provider(
+    token_endpoint: &str,
+    refresh_token: &str,
+    client_id: &str,
+) -> Result<ProviderTokenResponse, RefreshError> {
+    let params = [
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ];
+
+    let resp = reqwest::Client::new()
+        .post(token_endpoint)
+        .form(&params)
+        .send()
+        .await
+        .map_err(|e| {
+            // Network / CORS failure — the token may still be valid.
+            RefreshError::Transient(format!(
+                "Token refresh request to {token_endpoint} failed: {e}. \
+                 Ensure the provider allows CORS requests from this origin."
+            ))
+        })?;
+
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| {
+        // Body-read failure — transport-level, treat as transient.
+        RefreshError::Transient(format!("Failed to read token response body: {e}"))
+    })?;
+
+    let token_resp: ProviderTokenResponse = serde_json::from_str(&body).map_err(|e| {
+        log::error!(
+            "Failed to parse token response (HTTP {status}): {e} — body: {}",
+            redact_body(&body)
+        );
+        // Unparseable body — could be a transient gateway/HTML error page; the
+        // token may still be valid, so do not treat this as a rejection.
+        RefreshError::Transient(format!(
+            "The identity provider returned an unexpected response (HTTP {status}). \
+             Please try again."
+        ))
+    })?;
+
+    // An explicit `error` body is always a definitive rejection, regardless of
+    // the HTTP status — check it BEFORE the status-class split below.
+    if let Some(ref err) = token_resp.error {
+        let desc = token_resp
+            .error_description
+            .as_deref()
+            .unwrap_or("no description");
+        return Err(RefreshError::Rejected(format!(
+            "Token endpoint error '{err}': {desc}"
+        )));
+    }
+
+    if !status.is_success() {
+        log::error!(
+            "Token endpoint returned HTTP {status}: {}",
+            redact_body(&body)
+        );
+        if status.is_server_error() {
+            // 5xx: server-side and retryable — the token may still be valid.
+            return Err(RefreshError::Transient(format!(
+                "Token refresh failed: the identity provider returned HTTP {status} \
+                 (server-side; will retry)."
+            )));
+        }
+        // 4xx (without an explicit error body): treat as a definitive rejection.
+        return Err(RefreshError::Rejected(format!(
+            "Token refresh failed: the identity provider returned HTTP {status}."
+        )));
     }
 
     Ok(token_resp)
@@ -327,5 +455,36 @@ mod tests {
     fn to_hex_produces_lowercase_pairs() {
         assert_eq!(to_hex(&[0x00, 0x0f, 0xff]), "000fff");
         assert_eq!(to_hex(&[0xab, 0xcd]), "abcd");
+    }
+
+    #[test]
+    fn redact_body_bounds_output_and_omits_full_body() {
+        // A token-bearing JSON body well over the 32-char prefix cap. The secret
+        // is a long, unique run that must NOT survive into the redacted output.
+        let secret = "x".repeat(200);
+        let big = format!("{{\"access_token\":\"{secret}\",\"token_type\":\"Bearer\"}}");
+
+        let redacted = redact_body(&big);
+
+        // The full body / full secret must never appear in the redacted output.
+        // This test FAILS if redact_body is reverted to logging the raw body
+        // (e.g. `format!("{body}")`), which would emit the entire token.
+        assert!(
+            !redacted.contains(&secret),
+            "redacted output must not contain the full secret run"
+        );
+        assert!(
+            !redacted.contains(&big),
+            "redacted output must not contain the full body"
+        );
+
+        // Output is bounded: the 32-char prefix cap keeps it far smaller than the
+        // ~225-char input. (A raw `format!("{body}")` would be >= big.len().)
+        assert!(
+            redacted.len() < big.len(),
+            "redacted output ({}) must be shorter than the input ({})",
+            redacted.len(),
+            big.len()
+        );
     }
 }

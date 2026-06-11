@@ -1992,7 +1992,7 @@ fn layer_kind_noun(kind: PrefMediaKind) -> &'static str {
 /// One row in the popup's "Layers" section, rendered IDENTICALLY to the
 /// Performance dialog's per-peer `PeerRow`: the quality dot
 /// (`perf-q-dot--{state}` + non-color glyph), the metric text from
-/// [`peer_row_metric`] ("540p · ~600k · L2/3", 1-based), and — only when the
+/// [`peer_row_metric`] ("540p · ~600k · M · 2/3", 1-based), and — only when the
 /// reception is below the full-ladder top — a tinted reason chip
 /// (`perf-reason-chip--{reason}`). The whole row carries the same
 /// full-sentence `aria-label` ([`peer_row_aria_label`]) so color is never the
@@ -4297,9 +4297,11 @@ mod tests {
         let q_base = quality_state(0, full);
         let q_top = quality_state(full - 1, full);
         assert_ne!(q_base, q_top);
-        // Metric is 1-based and uses the full-ladder denominator.
+        // Metric is 1-based and uses the full-ladder denominator. After the
+        // Directive 4 layer-name rename (#1222) the visible chip is the quality
+        // LETTER + position/total: index 1 of a 3-rung ladder → "M · 2/3".
         let s = snap(PrefMediaKind::Video, 1, None);
         let metric = peer_row_metric(&s, full, "");
-        assert!(metric.contains("L2/3"), "metric was: {metric}");
+        assert!(metric.contains("M · 2/3"), "metric was: {metric}");
     }
 }

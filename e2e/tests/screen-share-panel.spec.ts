@@ -614,4 +614,80 @@ test.describe("Screen share right panel layout", () => {
       await browser2.close();
     }
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 5. Layout switches back to normal grid when screen sharing stops
+  //
+  // When screen sharing is active the meeting uses a split layout
+  // (.split-screen-tile + .split-peer-tile). When the sharer clicks the
+  // "Stop Screen Share" button, the meeting must revert to the normal
+  // CSS-grid layout with .grid-item tiles inside #grid-container and no
+  // split-layout artifacts remaining.
+  // ──────────────────────────────────────────────────────────────────────
+  test("layout reverts to normal grid when screen sharing stops", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_switchback_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSSwitchHost",
+      "SSSwitchGuest",
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      // Give time for WebSocket/WebTransport peer discovery
+      await hostPage.waitForTimeout(3000);
+
+      // Guest starts screen sharing
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+
+      if (!shareActivated) {
+        test.skip(
+          true,
+          "Screen share could not be auto-accepted. " +
+            "The --auto-select-desktop-capture-source flag may not be supported " +
+            "in this Chromium build or display environment.",
+        );
+        return;
+      }
+
+      // ---- ASSERT: split layout is active on host's view ----
+      await expect(hostPage.locator(".split-screen-tile")).toBeVisible({ timeout: 10_000 });
+      await expect(hostPage.locator(".split-peer-tile").first()).toBeVisible({ timeout: 10_000 });
+
+      // ---- ACT: guest stops screen sharing ----
+      // Wake the auto-hidden controls bar on the guest page.
+      await guestPage.mouse.move(400, 400);
+      await guestPage.waitForTimeout(300);
+      await guestPage.locator(".video-controls-container").hover();
+      await guestPage.waitForTimeout(500);
+
+      const stopButton = guestPage.locator("button.video-control-button", {
+        has: guestPage.locator(".tooltip", { hasText: /Stop.*Shar/ }),
+      });
+      await expect(stopButton).toBeVisible({ timeout: 10_000 });
+      await stopButton.click();
+
+      // ---- ASSERT: split layout disappears, normal grid is restored ----
+      // Wait for the split-screen-tile to disappear from the host's view.
+      await expect(hostPage.locator(".split-screen-tile")).toHaveCount(0, { timeout: 15_000 });
+      await expect(hostPage.locator(".split-peer-tile")).toHaveCount(0, { timeout: 10_000 });
+
+      // Normal grid tiles should be visible again.
+      const gridItems = hostPage.locator("#grid-container .grid-item");
+      await expect(gridItems.first()).toBeVisible({ timeout: 10_000 });
+
+      // The #grid-container should use normal CSS grid properties.
+      const containerStyle = await hostPage.locator("#grid-container").getAttribute("style");
+      expect(containerStyle).toBeTruthy();
+      expect(containerStyle).toContain("grid-template-columns");
+      expect(containerStyle).toContain("grid-template-rows");
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
 });

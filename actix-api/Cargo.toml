@@ -55,6 +55,7 @@ tokio = { version = "1.28.2", features = ["full"] }
 tokio-stream = "0.1"
 tracing = "0.1.37"
 tracing-subscriber = { version = "0.3.17", features = ["fmt", "ansi", "env-filter", "time", "tracing-log"] }
+videocall-aq = { path = "../videocall-aq", version = "0.1.0" }
 videocall-meeting-types = { path = "../videocall-meeting-types", version = "0.1.2" }
 videocall-types = { path= "../videocall-types", version = "5.0.0" }
 urlencoding = "2.1.3"

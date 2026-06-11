@@ -94,7 +94,7 @@ use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::EncoderBitrateController;
 use crate::health_reporter::ClimbLimiterSnapshot;
-use videocall_aq::fit_within_preserving_aspect;
+use videocall_aq::{fit_within_preserving_aspect, simulcast_layer_target_dims};
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
     msg.contains("closed codec")
@@ -305,6 +305,15 @@ struct LayerEncoder {
     /// Current encoder width/height for this layer (dynamic reconfigure).
     current_w: u32,
     current_h: u32,
+    /// This layer's tier bounding box (issue #1196). For simulcast layers this
+    /// is the layer's own `SIMULCAST_LAYER_TIERS` rung — the source frame is
+    /// fitted INSIDE this box (aspect-preserving) rather than configured at the
+    /// raw box dims, so a non-16:9 capture is not squashed. For the
+    /// single-stream layer the box is the shared adaptive tier max and these
+    /// fields are unused (the single-stream path fits against the shared
+    /// `local_tier_max_*` instead).
+    tier_w: u32,
+    tier_h: u32,
     /// Cached bitrate (bps) last applied to this layer's encoder.
     local_bitrate: u32,
     /// Kept alive so the JS output callback stays valid (see struct doc).
@@ -363,12 +372,8 @@ pub struct CameraEncoder {
     shared_video_tier_index: Rc<AtomicU32>,
     /// Current audio quality tier index (0=high, 3=emergency).
     shared_audio_tier_index: Rc<AtomicU32>,
-    /// Last fps_ratio from the encoder control loop (f32 bits in AtomicU32).
-    shared_encoder_fps_ratio: Rc<AtomicU32>,
     /// Worst peer FPS from the encoder control loop (f32 bits in AtomicU32).
     shared_encoder_p75_peer_fps: Rc<AtomicU32>,
-    /// Last bitrate_ratio from the encoder control loop (f32 bits in AtomicU32).
-    shared_encoder_bitrate_ratio: Rc<AtomicU32>,
     /// PID target bitrate kbps from the encoder control loop (f32 bits in AtomicU32).
     shared_encoder_target_bitrate_kbps: Rc<AtomicU32>,
     /// Tier transition events buffer, drained by health reporter each health packet.
@@ -550,6 +555,29 @@ const fn initial_active_layer_count() -> u32 {
     1
 }
 
+/// How many per-layer `VideoEncoder`s to have CONSTRUCTED given the current
+/// active-layer count and the ladder ceiling (issue #1204, lazy construction).
+///
+/// This is the single source of truth shared by the cold-start build loop
+/// (`0..n`) and the in-loop lazy-build trigger (`built_len < n` ⇒ build the
+/// missing `built_len..n`). Returns `active.clamp(1, ceiling)`: at cold start
+/// `active == 1` so only the BASE encoder is built (NOT the ceiling), and an
+/// upper rung's encoder is built only once the AQ ramp/restore raises `active`
+/// past it. Floored at 1 (the base layer is always present) and capped at the
+/// ceiling (never build more encoders than the ladder has rungs).
+///
+/// Free `const fn` so the lazy-vs-eager boundary is host-testable without a live
+/// `CameraEncoder` / `VideoEncoder` (which need `getUserMedia` + WebCodecs).
+const fn encoders_to_build(active: usize, ceiling: usize) -> usize {
+    if active < 1 {
+        1
+    } else if active > ceiling {
+        ceiling
+    } else {
+        active
+    }
+}
+
 /// Decide whether a just-encoded frame counts as "healthy" for the purpose of
 /// resetting the encoder restart counter.
 ///
@@ -707,6 +735,31 @@ fn should_pin_single_layer_low(
     }
 }
 
+/// Compute the next single-layer-low pin value for one AQ tick, given the peer
+/// count reading.
+///
+/// Issue #1172: `peer_count()` returns `None` on a momentarily-busy `inner`
+/// borrow. A `None` reading is NOT "0 peers" — treating it as 0 would fall below
+/// the release threshold and drop the pin mid-call, forcing a tier reconfigure +
+/// keyframe on a spurious read. On `None` this returns the unchanged
+/// `currently_pinned` value so the caller's atomic holds its prior state until a
+/// real count arrives. On `Some(count)` it defers to [`should_pin_single_layer_low`].
+///
+/// Pure (no atomics / DOM) so the borrow-fail-hold behavior is host-testable and
+/// a mutation that maps `None` onto 0 peers fails a unit test.
+#[inline]
+fn next_single_layer_pin(
+    effective_layers: u32,
+    other_peer_count: Option<usize>,
+    currently_pinned: bool,
+) -> bool {
+    match other_peer_count {
+        Some(count) => should_pin_single_layer_low(effective_layers, count, currently_pinned),
+        // Borrow-fail tick: hold prior state, do not treat as 0 peers.
+        None => currently_pinned,
+    }
+}
+
 impl CameraEncoder {
     /// Construct a camera encoder, with arguments:
     ///
@@ -756,9 +809,7 @@ impl CameraEncoder {
             screen_sharing_active: Rc::new(AtomicBool::new(false)),
             shared_video_tier_index: Rc::new(AtomicU32::new(0)),
             shared_audio_tier_index: Rc::new(AtomicU32::new(0)),
-            shared_encoder_fps_ratio: Rc::new(AtomicU32::new(0)),
             shared_encoder_p75_peer_fps: Rc::new(AtomicU32::new(0)),
-            shared_encoder_bitrate_ratio: Rc::new(AtomicU32::new(0)),
             shared_encoder_target_bitrate_kbps: Rc::new(AtomicU32::new(0)),
             shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
             shared_climb_limiter_snapshot: Rc::new(RefCell::new(ClimbLimiterSnapshot::default())),
@@ -771,10 +822,12 @@ impl CameraEncoder {
             // device ceiling: the publisher's ENCODE/EGRESS OUTPUT is byte-identical
             // to the legacy single-stream path at startup, and the AQ control loop
             // *earns* more layers up to `max_layers` at runtime from observed
-            // backpressure headroom + uplink budget. (All `ceiling` VideoEncoders
-            // are still constructed at setup; lazy per-layer construction is a
-            // tracked follow-up — so this is byte-identical OUTPUT, not byte-
-            // identical memory.)
+            // backpressure headroom + uplink budget. Per-layer VideoEncoders are
+            // now constructed LAZILY on first activation (issue #1204): cold start
+            // allocates only the base-layer encoder, and the encode loop builds an
+            // upper rung's encoder the first time the ramp/restore raises the
+            // active count past it — so this is byte-identical OUTPUT *and* no
+            // longer pre-allocates encoders for un-earned rungs.
             shared_active_layer_count: Rc::new(AtomicU32::new(initial_active_layer_count())),
             // EFFECTIVE ladder depth = the configured device CEILING (#1143
             // observability), distinct from the active count above. Stays at
@@ -839,9 +892,7 @@ impl CameraEncoder {
         let screen_sharing_active = self.screen_sharing_active.clone();
         let shared_video_tier_idx = self.shared_video_tier_index.clone();
         let shared_audio_tier_idx = self.shared_audio_tier_index.clone();
-        let shared_encoder_fps_ratio = self.shared_encoder_fps_ratio.clone();
         let shared_encoder_p75_peer_fps = self.shared_encoder_p75_peer_fps.clone();
-        let shared_encoder_bitrate_ratio = self.shared_encoder_bitrate_ratio.clone();
         let shared_encoder_target_bitrate_kbps = self.shared_encoder_target_bitrate_kbps.clone();
         let shared_tier_transitions = self.shared_tier_transitions.clone();
         let shared_climb_limiter_snapshot = self.shared_climb_limiter_snapshot.clone();
@@ -877,13 +928,15 @@ impl CameraEncoder {
         // encode loop already holds a strong clone for `send_media_packet`, so
         // this is the established lifetime pattern). `peer_count()` is a
         // non-blocking `try_borrow` read that counts off the cached key Rc WITHOUT
-        // cloning it (#1156) — if the inner is momentarily busy it returns `0`, so
-        // `other_peers == 0` is below the release threshold and the gate stores
-        // `false` (pin released) for that tick rather than blocking the loop; the
-        // next tick (≤1s later) re-reads the real count and self-corrects. In
-        // practice the borrow never fails here: all `inner` borrows are short and
-        // non-blocking and none is held across an `.await`, so on single-threaded
-        // wasm no borrow is active mid-tick.
+        // cloning it (#1156) — if the inner is momentarily busy it returns `None`
+        // (NOT `0`). A `None` reading is treated as "no fresh count this tick", so
+        // the gate HOLDS its prior pin value rather than releasing it (#1172): a
+        // spurious `0` would otherwise fall below the release threshold and flip a
+        // pinned publisher off for one tick, emitting a needless keyframe. The next
+        // tick (≤1s later) re-reads the real count. In practice the borrow never
+        // fails here: all `inner` borrows are short and non-blocking and none is
+        // held across an `.await`, so on single-threaded wasm no borrow is active
+        // mid-tick — the `None` arm is a correctness fail-safe, not a hot path.
         let peer_count_client = self.client.clone();
         let single_layer_low_pin = self.single_layer_low_pin.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -933,6 +986,14 @@ impl CameraEncoder {
             let mut last_wt_drop_snapshot: u64 =
                 videocall_transport::webtransport::unistream_drop_count();
             let mut wt_drop_window_start_ms: f64 = js_sys::Date::now();
+            // Independent sliding window for the WebTransport uplink-SATURATION
+            // self-trigger (#1219 prerequisite). SEPARATE from the WT drop window
+            // above: the drop counter only moves on stream teardown, whereas this
+            // counts slow `writer.ready()` events (a slow-but-alive uplink). Both
+            // are WT-only and flat at 0 on WebSocket, so this is a no-op there.
+            let mut last_wt_stall_snapshot: u64 =
+                videocall_transport::webtransport::unistream_ready_stall_count();
+            let mut wt_stall_window_start_ms: f64 = js_sys::Date::now();
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
             // instead of waiting on receiver diagnostics. Runs for the lifetime
             // of the owning CameraEncoder: this `spawn_local` future is NOT bound
@@ -963,13 +1024,14 @@ impl CameraEncoder {
                 // adaptive (medium-tier) stream is heavy on every receiver's
                 // decoder, so once the call has more than 3 OTHER peers we pin this
                 // publisher's single stream to the `low` rung (640×360) instead.
-                // `peer_count()` returns the count of REMOTE peers only (the relay
-                // never echoes our own packets back, and session_id 0 / self is
-                // never inserted into the peer decode manager) — exactly the
-                // ">3 others" engage semantics #1136 wants (a 5+-participant call).
-                // It reads `.len()` off the cached `Rc<Vec<String>>` WITHOUT
-                // cloning it, so this 1 Hz hot loop no longer allocates a
-                // `Vec<String>` per tick just to count peers (#1156).
+                // `peer_count()` returns `Some(count)` of REMOTE peers only (the
+                // relay never echoes our own packets back, and session_id 0 /
+                // self is never inserted into the peer decode manager) — exactly
+                // the ">3 others" engage semantics #1136 wants (a 5+-participant
+                // call). It reads `.len()` off the cached `Rc<Vec<String>>`
+                // WITHOUT cloning it, so this 1 Hz hot loop no longer allocates a
+                // `Vec<String>` per tick just to count peers (#1156). It returns
+                // `None` on a busy borrow — see the skip below (#1172).
                 //
                 // The decision is hysteretic (#1156): the pin engages at > 3 and
                 // releases at < 3, holding its prior state at exactly 3. Feeding
@@ -981,10 +1043,16 @@ impl CameraEncoder {
                 // (n_layers > 1) the pin stays cleared — the receiver-driven layer
                 // chooser already sheds cost there.
                 if n_layers == 1 {
+                    // Issue #1172: a momentarily-busy `inner` borrow returns
+                    // `None`, which is NOT "0 peers". Feeding 0 here would fall
+                    // below the release threshold and drop the pin mid-call,
+                    // forcing a tier reconfigure + keyframe on a spurious read.
+                    // `next_single_layer_pin` HOLDS the prior pin on `None` so the
+                    // atomic keeps its value until a real count arrives.
                     let other_peers = peer_count_client.peer_count();
                     let currently_pinned = single_layer_low_pin.load(Ordering::Relaxed);
                     single_layer_low_pin.store(
-                        should_pin_single_layer_low(n_layers as u32, other_peers, currently_pinned),
+                        next_single_layer_pin(n_layers as u32, other_peers, currently_pinned),
                         Ordering::Relaxed,
                     );
                 }
@@ -1114,6 +1182,62 @@ impl CameraEncoder {
                     }
                 }
 
+                // Client-side WebTransport uplink-SATURATION detection
+                // (#1219 prerequisite). The WT DROP block above only fires on
+                // stream/connection TEARDOWN (STOP_SENDING / RESET_STREAM /
+                // close); it stays FLAT on a slow-but-alive uplink because the WT
+                // media send path is `.await`-blocking and a WritableStream
+                // signals backpressure by leaving `writer.ready()` PENDING, not
+                // by rejecting the write. So a genuine bandwidth cliff (link slow,
+                // ACKs flowing, no reset) would NEVER self-shed on the drop
+                // counter. The transport therefore also exposes
+                // `unistream_ready_stall_count()`, incremented once per slow
+                // `writer.ready().await` (> producer-side READY_STALL_THRESHOLD_MS)
+                // on the established media path. A SUSTAINED cluster of those
+                // within the window means the uplink is saturated, so we self-shed
+                // a layer — the same gentle, single-rung `force_video_step_down`
+                // the drop/WS blocks use (NOT `force_congestion_cut`): this is the
+                // publisher's OWN gradual uplink adaptation, where one rung per
+                // window is the right granularity; the hard multi-tier cut is
+                // reserved for the server-authored CONGESTION path, which is a
+                // stronger, externally-corroborated signal. Window/snapshot are
+                // INDEPENDENT of the WT drop, WS, and server-congestion paths;
+                // each axis sheds at most one layer per its own window, so they
+                // cannot compound into a runaway double step-down. WS users hold
+                // this counter flat at 0 → true no-op. This is the signal that
+                // lets the relay's room-wide sender-keyed CONGESTION (bug #1219)
+                // be removed: a WT publisher now sees its own uplink saturation
+                // directly.
+                {
+                    use crate::adaptive_quality_constants::{
+                        evaluate_self_congestion, WT_SATURATION_STALL_THRESHOLD,
+                        WT_SATURATION_WINDOW_MS,
+                    };
+                    let current_wt_stalls =
+                        videocall_transport::webtransport::unistream_ready_stall_count();
+                    let elapsed_ms = now - wt_stall_window_start_ms;
+                    let decision = evaluate_self_congestion(
+                        current_wt_stalls,
+                        last_wt_stall_snapshot,
+                        elapsed_ms,
+                        WT_SATURATION_WINDOW_MS,
+                        WT_SATURATION_STALL_THRESHOLD,
+                    );
+                    if decision.step_down {
+                        log::warn!(
+                            "CameraEncoder: client WT uplink saturation detected ({} slow ready() \
+                             events in {:.0}ms), forcing video step-down",
+                            current_wt_stalls.saturating_sub(last_wt_stall_snapshot),
+                            elapsed_ms,
+                        );
+                        encoder_control.force_video_step_down();
+                    }
+                    if decision.roll_window {
+                        last_wt_stall_snapshot = decision.new_snapshot;
+                        wt_stall_window_start_ms = now;
+                    }
+                }
+
                 // Sender encoder backpressure (issue #1108). Feed the depth the
                 // encode loop published into the controller, then advance the AQ
                 // one tick. This is the SOLE gradual quality axis now: receiver
@@ -1142,22 +1266,13 @@ impl CameraEncoder {
                 let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
                 // Write encoder decision inputs to shared atomics for health
-                // reporting. Issue #1108: the receiver-FPS-derived signals are
-                // gone — `last_fps_ratio()` / `last_bitrate_ratio()` now return
-                // NaN (the health reporter's is_finite() guard drops those proto
-                // fields), and `last_p75_peer_fps()` is REPOINTED to carry the new
-                // sender backpressure signal (encoder queue depth) so the existing
-                // host telemetry channel surfaces it with no proto/Grafana churn.
-                shared_encoder_fps_ratio.store(
-                    (encoder_control.last_fps_ratio() as f32).to_bits(),
-                    Ordering::Relaxed,
-                );
+                // reporting. Issue #1184: the dead receiver-FPS-derived ratios
+                // (`encoder_fps_ratio` / `encoder_bitrate_ratio`) and their
+                // shared atomics have been removed; `encoder_queue_depth()`
+                // carries the sender backpressure signal (encoder queue depth)
+                // through the existing host telemetry channel.
                 shared_encoder_p75_peer_fps.store(
-                    (encoder_control.last_p75_peer_fps() as f32).to_bits(),
-                    Ordering::Relaxed,
-                );
-                shared_encoder_bitrate_ratio.store(
-                    (encoder_control.last_bitrate_ratio() as f32).to_bits(),
+                    (encoder_control.encoder_queue_depth() as f32).to_bits(),
                     Ordering::Relaxed,
                 );
                 shared_encoder_target_bitrate_kbps.store(
@@ -1414,19 +1529,9 @@ impl CameraEncoder {
         }
     }
 
-    /// Returns the encoder fps_ratio atomic (f32 bits).
-    pub fn shared_encoder_fps_ratio(&self) -> Rc<AtomicU32> {
-        self.shared_encoder_fps_ratio.clone()
-    }
-
     /// Returns the encoder worst peer FPS atomic (f32 bits).
     pub fn shared_encoder_p75_peer_fps(&self) -> Rc<AtomicU32> {
         self.shared_encoder_p75_peer_fps.clone()
-    }
-
-    /// Returns the encoder bitrate_ratio atomic (f32 bits).
-    pub fn shared_encoder_bitrate_ratio(&self) -> Rc<AtomicU32> {
-        self.shared_encoder_bitrate_ratio.clone()
     }
 
     /// Returns the encoder target bitrate kbps atomic (f32 bits).
@@ -1896,7 +2001,16 @@ impl CameraEncoder {
                 let width = track_settings.get_width().expect("width is None");
                 let height = track_settings.get_height().expect("height is None");
 
-                // --- Setup video encoders (one per simulcast layer) ---
+                // Native capture dims (the true source aspect), stamped onto
+                // every emitted camera packet so receiver diagnostics can detect
+                // aspect distortion at the source (issue #1196). Mirrors the
+                // screen encoder's `source_width_atomic` / `source_height_atomic`
+                // stamping; the camera dims are fixed for the encoder's lifetime
+                // here, so plain captured `u32`s suffice (no atomic needed).
+                let source_width = width as u32;
+                let source_height = height as u32;
+
+                // --- Setup video encoders (LAZY per-layer construction, #1204) ─
                 // The output and error handler closures must be re-created on
                 // each restart because Closure::wrap consumes them and the new
                 // VideoEncoder needs fresh JS function references. Each layer
@@ -1904,14 +2018,41 @@ impl CameraEncoder {
                 // its own error closure, and its own config object. The closures
                 // are stored in the LayerEncoder so they outlive the encoder.
                 //
-                // PR A: n_layers == 1, so this loop runs once and produces a
-                // single layer at the native resolution with layer_id 0 —
+                // LAZY CONSTRUCTION (issue #1204): we build layer N's VideoEncoder
+                // only on its FIRST ACTIVATION — at cold start that is just the
+                // base layer (`shared_active_layer_count` == 1 via the camera's
+                // earn-up ramp), so the upper-rung VideoEncoders are NOT allocated
+                // until the AQ ramp/restore raises the active count past them.
+                // Previously all `n_layers` encoders were built up front even
+                // though cold start activates only the base, wasting WebCodecs /
+                // VPX allocations for rungs that may never be earned. The
+                // OUTPUT/EGRESS is unchanged: the encode loop already only encodes
+                // layers with `layer_id < active`, so for any given active-count
+                // sequence the same frames are emitted whether the un-earned
+                // encoders existed or not. Teardown-after-shed is intentionally
+                // NOT implemented (issue #1204 marks it optional and gated on a
+                // rebuild-latency measurement) — a shed encoder is retained so a
+                // later restore reuses it with no rebuild stall.
+                //
+                // PR A: n_layers == 1, so only the base layer is ever built —
                 // byte-identical to the legacy single-encoder path.
-                let mut layers: Vec<LayerEncoder> = Vec::with_capacity(n_layers);
-                // `sequence_numbers` has exactly `n_layers` elements (vec![0;
-                // n_layers]), so enumerating it yields one (idx, persisted-seq)
-                // pair per layer.
-                for (layer_idx, &initial_seq) in sequence_numbers.iter().enumerate() {
+                //
+                // `build_layer` constructs ONE `LayerEncoder` for `layer_idx`
+                // (seeded from its persisted sequence). It is a closure so both
+                // the initial cold-start build and the lazy in-loop build share
+                // one construction site. On `VideoEncoder::new` / fatal-configure
+                // failure it returns `Err(LayerBuildError)` (the caller does the
+                // already-built-layer cleanup + restart bookkeeping, which a
+                // closure cannot do via `continue 'restart`).
+                enum LayerBuildError {
+                    /// `VideoEncoder::new` failed — surface to `on_error`.
+                    CreateFailed(String),
+                    /// A FATAL `configure()` error before the encode loop.
+                    ConfigureFatal,
+                }
+                let build_layer = |layer_idx: usize,
+                                   initial_seq: u64|
+                 -> Result<LayerEncoder, LayerBuildError> {
                     let layer_id = layer_idx as u32;
 
                     let (video_output_box, seq_out) = {
@@ -1967,6 +2108,8 @@ impl CameraEncoder {
                                     buffer.as_mut_slice(),
                                     &userid,
                                     aes.clone(),
+                                    source_width,
+                                    source_height,
                                     layer_id,
                                 );
                                 // Phase 2 of WT freeze fix: route camera video on
@@ -1998,16 +2141,7 @@ impl CameraEncoder {
                             let msg =
                                 format!("Failed to create video encoder (layer {layer_id}): {e:?}");
                             error!("{msg}");
-                            // Close any already-built layer encoders before retry.
-                            for built in &layers {
-                                let _ = built.encoder.close();
-                            }
-                            stop_media_stream_tracks(&device);
-                            if let Some(cb) = &on_error {
-                                cb.emit(msg);
-                            }
-                            restart_count += 1;
-                            continue 'restart;
+                            return Err(LayerBuildError::CreateFailed(msg));
                         }
                     };
 
@@ -2015,20 +2149,43 @@ impl CameraEncoder {
                     //  - single-stream (n_layers == 1): native camera resolution
                     //    and the shared adaptive bitrate — the legacy path, with
                     //    tier-resolution stepping preserved (see encode loop).
-                    //  - simulcast (n_layers > 1): each layer encodes at its
-                    //    FIXED SIMULCAST_LAYER_TIERS resolution (issue #989, PR B)
-                    //    and its own initial bitrate (tier ideal). Resolution is
-                    //    fixed for simulcast layers; only the bitrate adapts.
-                    let (layer_w, layer_h, init_bitrate_bps) = if simulcast {
+                    //  - simulcast (n_layers > 1): each layer's tier is a
+                    //    BOUNDING BOX, not a fixed output size (issue #1196).
+                    //    The native capture dims are fitted INSIDE the layer's
+                    //    SIMULCAST_LAYER_TIERS rung (aspect-preserving) so the
+                    //    very first GOP already carries the source aspect — a
+                    //    non-16:9 capture (e.g. a 4:3 webcam) is never
+                    //    per-axis-squashed into the 16:9 tier dims. `tier_w` /
+                    //    `tier_h` are recorded so the per-frame loop can re-fit
+                    //    against THIS layer's box when the source dims change.
+                    //    The per-layer bitrate still adapts (tier ideal here).
+                    let (layer_w, layer_h, tier_w, tier_h, init_bitrate_bps) = if simulcast {
                         let tiers = simulcast_layers(n_layers);
                         let tier = &tiers[layer_idx];
+                        // Seed the first GOP at the aspect-fitted dims, not the
+                        // raw 16:9 tier dims. `width`/`height` are the native
+                        // track dims read up front (the true source aspect).
+                        let (fit_w, fit_h) = fit_within_preserving_aspect(
+                            width as u32,
+                            height as u32,
+                            tier.max_width,
+                            tier.max_height,
+                        );
                         (
+                            fit_w,
+                            fit_h,
                             tier.max_width,
                             tier.max_height,
                             tier.ideal_bitrate_kbps as f64 * 1000.0,
                         )
                     } else {
+                        // Single-stream: native resolution; the tier_w/tier_h
+                        // fields are unused on this path (the legacy loop fits
+                        // against the shared `local_tier_max_*`), so mirror the
+                        // layer dims to keep them well-defined.
                         (
+                            width as u32,
+                            height as u32,
                             width as u32,
                             height as u32,
                             current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0,
@@ -2044,6 +2201,54 @@ impl CameraEncoder {
                         if is_fatal_encoder_error(&e) {
                             error!("CameraEncoder: fatal configure error before encode loop (layer {layer_id}), restarting: {e:?}");
                             let _ = video_encoder.close();
+                            return Err(LayerBuildError::ConfigureFatal);
+                        }
+                        error!("Error configuring video encoder (layer {layer_id}): {e:?}");
+                    }
+
+                    Ok(LayerEncoder {
+                        encoder: video_encoder,
+                        config,
+                        seq_out,
+                        layer_id,
+                        current_w: layer_w,
+                        current_h: layer_h,
+                        tier_w,
+                        tier_h,
+                        local_bitrate: init_bitrate_bps as u32,
+                        _output_closure: output_closure,
+                        _error_closure: error_closure,
+                    })
+                };
+
+                // Cold-start build: only the layers that are ACTIVE right now
+                // (base layer at cold start; more only if a prior cycle already
+                // earned them and the shared atomic still reflects that). Upper
+                // rungs are built lazily on first activation in the encode loop.
+                // `sequence_numbers` has exactly `n_layers` elements, so the
+                // index range is always in-bounds.
+                let initial_active_layers = encoders_to_build(
+                    shared_active_layer_count.load(Ordering::Relaxed) as usize,
+                    n_layers,
+                );
+                let mut layers: Vec<LayerEncoder> = Vec::with_capacity(n_layers);
+                for (layer_idx, &initial_seq) in
+                    sequence_numbers[..initial_active_layers].iter().enumerate()
+                {
+                    match build_layer(layer_idx, initial_seq) {
+                        Ok(le) => layers.push(le),
+                        Err(LayerBuildError::CreateFailed(msg)) => {
+                            for built in &layers {
+                                let _ = built.encoder.close();
+                            }
+                            stop_media_stream_tracks(&device);
+                            if let Some(cb) = &on_error {
+                                cb.emit(msg);
+                            }
+                            restart_count += 1;
+                            continue 'restart;
+                        }
+                        Err(LayerBuildError::ConfigureFatal) => {
                             for built in &layers {
                                 let _ = built.encoder.close();
                             }
@@ -2051,20 +2256,7 @@ impl CameraEncoder {
                             restart_count += 1;
                             continue 'restart;
                         }
-                        error!("Error configuring video encoder (layer {layer_id}): {e:?}");
                     }
-
-                    layers.push(LayerEncoder {
-                        encoder: video_encoder,
-                        config,
-                        seq_out,
-                        layer_id,
-                        current_w: layer_w,
-                        current_h: layer_h,
-                        local_bitrate: init_bitrate_bps as u32,
-                        _output_closure: output_closure,
-                        _error_closure: error_closure,
-                    });
                 }
 
                 let video_processor =
@@ -2159,6 +2351,52 @@ impl CameraEncoder {
                     local_active_layers =
                         shared_active_layer_count.load(Ordering::Relaxed) as usize;
 
+                    // Lazy per-layer construction (issue #1204). If the AQ ramp /
+                    // restore raised the active count past the layers we have
+                    // built so far, construct the newly-activated rung(s) NOW,
+                    // before the reconfigure + encode passes below read
+                    // `layers[layer_id]`. The clamp keeps this in-bounds; in
+                    // single-stream mode `n_layers == 1` so the base is always
+                    // already present and this loop never runs. Each new layer is
+                    // seeded from its PERSISTED sequence number so a receiver that
+                    // picks up the freshly-earned rung sees a dense stream.
+                    if simulcast && layers.len() < encoders_to_build(local_active_layers, n_layers)
+                    {
+                        let want = encoders_to_build(local_active_layers, n_layers);
+                        let already_built = layers.len();
+                        let mut build_failed = false;
+                        for (offset, &initial_seq) in
+                            sequence_numbers[already_built..want].iter().enumerate()
+                        {
+                            let layer_idx = already_built + offset;
+                            match build_layer(layer_idx, initial_seq) {
+                                Ok(le) => {
+                                    log::info!(
+                                        "CameraEncoder: lazily constructed simulcast layer {} on first activation (#1204)",
+                                        layer_idx
+                                    );
+                                    layers.push(le);
+                                }
+                                Err(_) => {
+                                    // VideoEncoder::new or a fatal configure failed
+                                    // for the newly-activated rung. Restart the
+                                    // whole encode cycle (the normal 'encode
+                                    // cleanup persists already-built layers' seqs).
+                                    error!(
+                                        "CameraEncoder: failed to lazily construct simulcast layer {}, restarting",
+                                        layer_idx
+                                    );
+                                    build_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if build_failed {
+                            restart_count += 1;
+                            break 'encode;
+                        }
+                    }
+
                     // Single-stream tier dims + shared bitrate (only meaningful
                     // when NOT simulcast — the adaptive single-stream resolution
                     // path is preserved verbatim for n_layers == 1).
@@ -2193,18 +2431,21 @@ impl CameraEncoder {
                         local_tier_max_height = new_tier_h;
                     }
 
-                    // Per-layer reconfiguration.
+                    // Per-layer reconfiguration (PRE-FRAME pass: bitrate only).
                     //
                     //  - Single-stream (n_layers == 1): the legacy logic —
                     //    tier-resolution stepping (tier dims) + shared adaptive
                     //    bitrate, applied verbatim. N=1 behavior is unchanged.
-                    //  - Simulcast (n_layers > 1, issue #989 PR B): RESOLUTION IS
-                    //    FIXED per layer (set at construction from
-                    //    SIMULCAST_LAYER_TIERS), so tier-resolution stepping is
-                    //    retired here; only the per-layer adaptive bitrate is
-                    //    reconfigured. Layers with layer_id >= active count are
-                    //    skipped entirely (not reconfigured, not encoded) so a
-                    //    dropped top layer costs no encode CPU.
+                    //  - Simulcast (n_layers > 1): only the per-layer adaptive
+                    //    bitrate is reconfigured HERE. Per-layer RESOLUTION is
+                    //    aspect-fitted into each layer's tier bounding box (issue
+                    //    #1196) — seeded at construction and re-fitted in the
+                    //    per-frame encode loop below where the live frame dims are
+                    //    known (so a source-aspect change is followed). It is NOT
+                    //    a fixed 16:9 tier size and is not handled in this pass.
+                    //    Layers with layer_id >= active count are skipped entirely
+                    //    (not reconfigured, not encoded) so a dropped top layer
+                    //    costs no encode CPU.
                     let mut fatal_reconfigure = false;
                     for layer in layers.iter_mut() {
                         // Simulcast: skip inactive (shed) top layers entirely.
@@ -2213,7 +2454,9 @@ impl CameraEncoder {
                         }
 
                         if simulcast {
-                            // Per-layer adaptive bitrate (fixed resolution).
+                            // Per-layer adaptive bitrate. Resolution for
+                            // simulcast layers is aspect-fitted in the per-frame
+                            // encode loop (issue #1196), not here.
                             let new_layer_bitrate = {
                                 let atomics = shared_layer_bitrates_bps.borrow();
                                 atomics
@@ -2465,75 +2708,156 @@ impl CameraEncoder {
                                 }
 
                                 // Dimension-change handling (rotation, camera
-                                // switch). SIMULCAST: each layer's resolution is
-                                // FIXED by its tier — the encoder downscales the
-                                // source frame automatically — so we do NOT track
-                                // frame dimensions or reconfigure on frame-size
-                                // change (the `!simulcast` gate below). SINGLE-
-                                // STREAM: keep the legacy behavior of following
-                                // the frame size, constrained to the current tier
-                                // max while preserving the frame's native aspect
-                                // ratio (#1037).
+                                // switch). Both paths now treat the tier as a
+                                // BOUNDING BOX and fit the source frame inside it
+                                // aspect-preserving (issue #1196) — neither path
+                                // configures the encoder at raw per-axis tier
+                                // dims, which would bake a stretch/squash into the
+                                // stream for a non-16:9 capture.
+                                //  - SIMULCAST: each layer re-fits the frame into
+                                //    ITS OWN tier rung (`layer.tier_w/tier_h`) and
+                                //    reconfigures when the fitted dims drift from
+                                //    `layer.current_w/current_h` (handled in the
+                                //    `simulcast` branch just below). The seed at
+                                //    construction already fitted the first GOP, so
+                                //    in steady state this is a no-op.
+                                //  - SINGLE-STREAM: legacy behavior — follow the
+                                //    frame size, constrained to the shared current
+                                //    tier max while preserving aspect (#1037),
+                                //    handled in the `!simulcast` branch.
                                 //
                                 // `frame_width` / `frame_height` are the raw
                                 // native VideoFrame dimensions (the true source
-                                // aspect). Fitting them uniformly (rather than a
-                                // per-axis `.min()`) prevents the encoder from
-                                // baking a stretch/squash into the stream when the
-                                // source (e.g. a 4:3 webcam) does not match the
-                                // 16:9 tier ceiling. For N==1 this matches the
-                                // legacy single encoder; the computed values are
-                                // only consumed on the `!simulcast` reconfigure
-                                // path below.
-                                let (clamped_width, clamped_height) =
-                                    if frame_width > 0 && frame_height > 0 {
-                                        fit_within_preserving_aspect(
-                                            frame_width,
-                                            frame_height,
-                                            local_tier_max_width,
-                                            local_tier_max_height,
-                                        )
-                                    } else {
-                                        // Degenerate frame dims: leave as-is so
-                                        // the `> 0` change-detection below skips
-                                        // the reconfigure.
-                                        (frame_width, frame_height)
-                                    };
+                                // aspect). The single-stream path fits them
+                                // against the shared `local_tier_max_*` (computed
+                                // inside the `!simulcast` branch below so the fit
+                                // runs only when consumed — not ~N× per second on
+                                // the simulcast path); the simulcast branch fits
+                                // against each layer's own tier box via
+                                // `simulcast_layer_target_dims`.
 
-                                if !simulcast
-                                    && clamped_width > 0
-                                    && clamped_height > 0
-                                    && (clamped_width != layer.current_w
-                                        || clamped_height != layer.current_h)
-                                {
-                                    // Guard: do not configure a closed encoder.
-                                    if layer.encoder.state() == CodecState::Closed {
-                                        log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
-                                        fatal_encode = true;
-                                        break;
-                                    }
-
-                                    log::info!("Camera dimensions changed from {}x{} to {clamped_width}x{clamped_height}, reconfiguring encoder (layer {})", layer.current_w, layer.current_h, layer.layer_id);
-
-                                    layer.current_w = clamped_width;
-                                    layer.current_h = clamped_height;
-
-                                    let new_config = VideoEncoderConfig::new(
-                                        get_video_codec_string(),
-                                        layer.current_h,
+                                // SIMULCAST per-layer aspect re-fit (issue #1196).
+                                // Fit the source frame into THIS layer's tier box
+                                // and reconfigure only when the fitted dims drift
+                                // from the current config. Mirrors the single-
+                                // stream reconfigure block below (closed-encoder
+                                // guard, fatal handling, log line). The new config
+                                // carries the layer's CURRENT cached bitrate and
+                                // is stored back into `layer.config`, so it
+                                // composes with the per-layer bitrate path: this
+                                // dims change re-applies the cached bitrate (never
+                                // clobbering it), and the next tick's pre-frame
+                                // bitrate reconfigure mutates THIS config in place,
+                                // preserving the new dims.
+                                if simulcast {
+                                    let decision = simulcast_layer_target_dims(
+                                        frame_width,
+                                        frame_height,
+                                        layer.tier_w,
+                                        layer.tier_h,
                                         layer.current_w,
+                                        layer.current_h,
                                     );
-                                    new_config.set_bitrate(layer.local_bitrate as f64);
-                                    new_config.set_latency_mode(LatencyMode::Realtime);
-                                    if let Err(e) = layer.encoder.configure(&new_config) {
-                                        CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
-                                            .fetch_add(1, Ordering::Relaxed);
-                                        if is_fatal_encoder_error(&e) {
-                                            error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                    if decision.needs_reconfigure {
+                                        // Guard: do not configure a closed encoder.
+                                        if layer.encoder.state() == CodecState::Closed {
+                                            log::warn!("CameraEncoder: encoder closed before per-layer dimension reconfigure (layer {})", layer.layer_id);
                                             fatal_encode = true;
                                             break;
                                         }
-                                        error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
+
+                                        log::info!(
+                                            "CameraEncoder: layer dimension change -> {}x{} (was {}x{}) within tier {}x{} (layer {})",
+                                            decision.target_w,
+                                            decision.target_h,
+                                            layer.current_w,
+                                            layer.current_h,
+                                            layer.tier_w,
+                                            layer.tier_h,
+                                            layer.layer_id,
+                                        );
+
+                                        layer.current_w = decision.target_w;
+                                        layer.current_h = decision.target_h;
+
+                                        // Replace this layer's config with one at
+                                        // the new dims + the cached bitrate, and
+                                        // store it back so subsequent in-place
+                                        // bitrate reconfigures keep the new dims.
+                                        layer.config = VideoEncoderConfig::new(
+                                            get_video_codec_string(),
+                                            layer.current_h,
+                                            layer.current_w,
+                                        );
+                                        layer.config.set_bitrate(layer.local_bitrate as f64);
+                                        layer.config.set_latency_mode(LatencyMode::Realtime);
+                                        if let Err(e) = layer.encoder.configure(&layer.config) {
+                                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            if is_fatal_encoder_error(&e) {
+                                                error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                                fatal_encode = true;
+                                                break;
+                                            }
+                                            error!("Error reconfiguring camera layer for dimension change (layer {}): {e:?}", layer.layer_id);
+                                        }
+                                    }
+                                }
+
+                                // SINGLE-STREAM aspect re-fit (#1037). Compute the
+                                // fit only here, inside the `!simulcast` branch, so
+                                // the simulcast path doesn't pay ~N× fit calls per
+                                // second for a value it never consumes.
+                                if !simulcast {
+                                    let (clamped_width, clamped_height) =
+                                        if frame_width > 0 && frame_height > 0 {
+                                            fit_within_preserving_aspect(
+                                                frame_width,
+                                                frame_height,
+                                                local_tier_max_width,
+                                                local_tier_max_height,
+                                            )
+                                        } else {
+                                            // Degenerate frame dims: leave as-is so
+                                            // the `> 0` change-detection below skips
+                                            // the reconfigure.
+                                            (frame_width, frame_height)
+                                        };
+
+                                    if clamped_width > 0
+                                        && clamped_height > 0
+                                        && (clamped_width != layer.current_w
+                                            || clamped_height != layer.current_h)
+                                    {
+                                        // Guard: do not configure a closed encoder.
+                                        if layer.encoder.state() == CodecState::Closed {
+                                            log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
+                                            fatal_encode = true;
+                                            break;
+                                        }
+
+                                        log::info!("Camera dimensions changed from {}x{} to {clamped_width}x{clamped_height}, reconfiguring encoder (layer {})", layer.current_w, layer.current_h, layer.layer_id);
+
+                                        layer.current_w = clamped_width;
+                                        layer.current_h = clamped_height;
+
+                                        let new_config = VideoEncoderConfig::new(
+                                            get_video_codec_string(),
+                                            layer.current_h,
+                                            layer.current_w,
+                                        );
+                                        new_config.set_bitrate(layer.local_bitrate as f64);
+                                        new_config.set_latency_mode(LatencyMode::Realtime);
+                                        if let Err(e) = layer.encoder.configure(&new_config) {
+                                            CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
+                                                .fetch_add(1, Ordering::Relaxed);
+                                            if is_fatal_encoder_error(&e) {
+                                                error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
+                                                fatal_encode = true;
+                                                break;
+                                            }
+                                            error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
+                                        }
                                     }
                                 }
 
@@ -2682,11 +3006,11 @@ impl CameraEncoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_simulcast_layers, clamp_layer_count, format_layer_transition, frame_is_healthy,
-        initial_active_layer_count, is_fatal_encoder_error_message, layer_ceiling_to_count,
-        shed_reason, should_pin_single_layer_low, LayerView, SimulcastLayerInfo,
-        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
-        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
+        frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
+        layer_ceiling_to_count, next_single_layer_pin, shed_reason, should_pin_single_layer_low,
+        LayerView, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
 
@@ -3002,6 +3326,45 @@ mod tests {
     }
 
     #[test]
+    fn lazy_construction_builds_only_active_encoders_not_the_ceiling() {
+        // Issue #1204: the number of per-layer VideoEncoders CONSTRUCTED is the
+        // ACTIVE count (floored at 1, capped at the ceiling), NOT the ladder
+        // ceiling. This is the single source of truth used by BOTH the cold-start
+        // build loop and the in-loop lazy-build trigger, so testing it pins the
+        // lazy boundary without a live VideoEncoder.
+
+        // Cold start: active == 1 over a 3-rung ceiling builds ONLY the base
+        // encoder. The upper two rungs' encoders are NOT constructed — this is
+        // the core #1204 assertion (an un-earned layer has no encoder yet).
+        assert_eq!(
+            encoders_to_build(1, 3),
+            1,
+            "cold start must build only the base encoder, not the 3-rung ceiling"
+        );
+        // A mutation that built the ceiling at cold start (e.g. returning
+        // `ceiling`) would make this 3 and FAIL.
+        assert_ne!(
+            encoders_to_build(1, 3),
+            3,
+            "un-earned upper rungs must NOT be constructed at cold start"
+        );
+
+        // After the ramp earns the 2nd rung, exactly 2 encoders exist; the 3rd is
+        // still un-built until active rises to 3.
+        assert_eq!(encoders_to_build(2, 3), 2);
+        assert_eq!(encoders_to_build(3, 3), 3);
+
+        // Floor: a degenerate active 0 still builds the base (base is always
+        // present). Cap: active above the ceiling never builds more than the
+        // ladder has rungs.
+        assert_eq!(encoders_to_build(0, 3), 1, "base is always built");
+        assert_eq!(encoders_to_build(99, 3), 3, "never build past the ceiling");
+
+        // Single-stream ceiling (PR-A default): only ever the one base encoder.
+        assert_eq!(encoders_to_build(1, 1), 1);
+    }
+
+    #[test]
     fn initial_active_layer_count_is_one() {
         // Issue #1140 / #1141: every camera publisher cold-starts ACTIVE at the
         // base layer only (1), regardless of the device ceiling. This preserves
@@ -3143,6 +3506,43 @@ mod tests {
             false
         ));
     }
+
+    /// Issue #1172: a borrow-fail tick (`peer_count() == None`) must PRESERVE the
+    /// prior pin state — it is NOT 0 peers. A genuine `Some(0)` reading still
+    /// releases. This test fails if the tick maps `None` onto 0 peers (the bug)
+    /// because `next_single_layer_pin(1, None, true)` would then release to
+    /// `false`.
+    #[test]
+    fn single_layer_pin_holds_on_borrow_fail_releases_on_real_zero() {
+        // Borrow-fail while PINNED: hold the pin (do not release on a spurious 0).
+        assert!(
+            next_single_layer_pin(1, None, true),
+            "None (borrow-fail) must hold a prior ENGAGED pin, not release it"
+        );
+        // Borrow-fail while UNPINNED: hold unpinned (do not spuriously engage).
+        assert!(
+            !next_single_layer_pin(1, None, false),
+            "None (borrow-fail) must hold a prior RELEASED pin"
+        );
+
+        // A GENUINE 0-peer reading still releases an engaged pin (0 < release
+        // threshold). This is the behavior the borrow-fail case must NOT mimic.
+        assert!(
+            !next_single_layer_pin(1, Some(0), true),
+            "a real 0-peer reading must RELEASE the pin"
+        );
+        // A genuine high count still engages from unpinned.
+        assert!(
+            next_single_layer_pin(1, Some(SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD + 1), false),
+            "a real >threshold reading must ENGAGE the pin"
+        );
+        // A genuine simulcast reading (>1 layer) always releases regardless of
+        // prior — the pin only applies in single-stream mode.
+        assert!(
+            !next_single_layer_pin(2, Some(50), true),
+            "simulcast publisher: a real reading releases the pin"
+        );
+    }
 }
 
 /// Browser-only tests: exercise the real `transform_video_chunk` layer-id
@@ -3172,9 +3572,23 @@ mod wasm_tests {
     fn transform_video_chunk_layer_zero_omits_field() {
         let aes = Rc::new(Aes128State::new(false));
         let mut buf = vec![0u8; 100_000];
-        let wrapper =
-            super::transform_video_chunk(make_chunk(), 0, buf.as_mut_slice(), "alice", aes, 0);
+        // Stamp a 4:3 source (640x480) so the new source-dims field (issue
+        // #1196) is exercised end-to-end through the real production function.
+        let wrapper = super::transform_video_chunk(
+            make_chunk(),
+            0,
+            buf.as_mut_slice(),
+            "alice",
+            aes,
+            640,
+            480,
+            0,
+        );
         // Layer 0 round-trips to 0 and (proto3 tag-5-when-nonzero) is wire-absent.
+        // (The source dims live in the AES-encrypted inner MediaPacket, so they
+        // cannot be asserted from the outer wrapper here; the host-runnable
+        // `transform::tests::video_metadata_carries_source_dims` covers the
+        // VideoMetadata stamping on the unencrypted path.)
         let bytes = wrapper.write_to_bytes().unwrap();
         let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
         assert_eq!(parsed.simulcast_layer_id, 0);
@@ -3184,8 +3598,16 @@ mod wasm_tests {
     fn transform_video_chunk_layer_two_round_trips() {
         let aes = Rc::new(Aes128State::new(false));
         let mut buf = vec![0u8; 100_000];
-        let wrapper =
-            super::transform_video_chunk(make_chunk(), 0, buf.as_mut_slice(), "alice", aes, 2);
+        let wrapper = super::transform_video_chunk(
+            make_chunk(),
+            0,
+            buf.as_mut_slice(),
+            "alice",
+            aes,
+            640,
+            480,
+            2,
+        );
         let bytes = wrapper.write_to_bytes().unwrap();
         let parsed = PacketWrapper::parse_from_bytes(&bytes).unwrap();
         assert_eq!(parsed.simulcast_layer_id, 2);

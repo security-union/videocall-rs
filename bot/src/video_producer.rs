@@ -190,6 +190,7 @@ impl VideoProducer {
                                 quit,
                                 media_start,
                                 loop_duration,
+                                aq,
                                 encoder_output_fps,
                                 encoder_errors_generic,
                                 encoder_frames_ok,
@@ -505,6 +506,7 @@ impl VideoProducer {
                         media_start,
                         loop_duration,
                         is_speaking,
+                        aq,
                         encoder_output_fps,
                         encoder_errors_generic,
                         encoder_frames_ok,
@@ -868,7 +870,11 @@ impl VideoProducer {
     /// simulcast (Blocker 1). Each layer downscales this native frame to its own
     /// tier resolution. Unlike the single-stream path this loop does NOT rebuild
     /// encoders on AQ tier changes (see the REVISIT note at the AQ-poll site),
-    /// which is why it takes no `aq` handle.
+    /// which is why it takes no `aq` handle for GEOMETRY. It DOES take `aq` for
+    /// the per-layer AQ wiring (issue #1083 V21): each iteration it reads the
+    /// active layer count + per-layer target bitrates and (a) skips encoding/
+    /// sending any layer at or above the active count (top-down shed) and (b)
+    /// re-applies a layer's bitrate when its target changed.
     #[allow(clippy::too_many_arguments)]
     fn ekg_video_loop_simulcast(
         user_id: String,
@@ -879,6 +885,7 @@ impl VideoProducer {
         quit: Arc<AtomicBool>,
         media_start: Instant,
         loop_duration: Duration,
+        aq: Arc<BotAq>,
         encoder_output_fps: Arc<AtomicU32>,
         encoder_errors_generic: Arc<AtomicU64>,
         encoder_frames_ok: Arc<AtomicU64>,
@@ -930,21 +937,47 @@ impl VideoProducer {
         let mut prev_frame_index: Option<usize> = None;
         let mut render_count: u64 = 0;
 
+        // Per-layer AQ state (issue #1083 V21). `active` is how many top-down
+        // layers we currently encode/send; `last_applied_kbps[id]` tracks the
+        // bitrate last pushed to each layer's encoder so we only reconfigure on
+        // a real change. Seed from the AQ snapshot immediately so the initial
+        // budget-capped per-layer targets land before the first frame.
+        let mut last_simulcast_epoch = aq.simulcast_epoch();
+        let mut last_applied_kbps = vec![0u32; layers.len()];
+        let mut active = apply_simulcast_aq(
+            &mut layers,
+            &aq.simulcast_snapshot(),
+            &mut last_applied_kbps,
+            &user_id,
+        );
+
         loop {
             if quit.load(Ordering::Relaxed) {
                 info!("EKG simulcast producer stopping for {}", user_id);
                 break;
             }
 
-            // REVISIT (#989): in simulcast mode the layer GEOMETRY (resolution
-            // and fps) is FIXED by the ladder and does NOT follow AQ tier
-            // changes — exactly like the browser client (camera_encoder.rs runs
-            // fixed-resolution simulcast encoders). We therefore do NOT poll
-            // `aq.tier_epoch()` to rebuild encoders here. Per-layer bitrate is
-            // also pinned to each tier's ideal for now; per-layer AQ bitrate
-            // shed and active-layer-count shedding are deferred until Tony's AQ
-            // controller rework (PRs #1115/#1117) lands, to avoid conflicting
-            // with it. For N==1 the legacy AQ-adaptive path above is untouched.
+            // Layer GEOMETRY (resolution and fps) is FIXED by the ladder and does
+            // NOT follow AQ tier changes — exactly like the browser client
+            // (camera_encoder.rs runs fixed-resolution simulcast encoders), so we
+            // do NOT poll `aq.tier_epoch()` to rebuild encoders here.
+            //
+            // Per-layer AQ wiring (issue #1083 V21 — the deferral to Tony's AQ
+            // rework #1115/#1117 is OVER; those PRs are in this base): poll the
+            // cheap `simulcast_epoch` each iteration (one Acquire load) and, only
+            // when it changed, re-read the active layer count + budget-capped
+            // per-layer target bitrates and re-apply them. Layers at/above
+            // `active` are shed (skipped below) — the base layer always flows.
+            let current_simulcast_epoch = aq.simulcast_epoch();
+            if current_simulcast_epoch != last_simulcast_epoch {
+                last_simulcast_epoch = current_simulcast_epoch;
+                active = apply_simulcast_aq(
+                    &mut layers,
+                    &aq.simulcast_snapshot(),
+                    &mut last_applied_kbps,
+                    &user_id,
+                );
+            }
             let elapsed_us = media_start.elapsed().as_micros() as u64;
             let position_in_loop_us = elapsed_us % loop_duration_us;
             let frame_in_loop = (position_in_loop_us / frame_interval_us) as usize;
@@ -967,6 +1000,15 @@ impl VideoProducer {
             rgb_to_i420_into(&frame_buf, &mut i420_buf);
 
             for layer in layers.iter_mut() {
+                // Top-down shed (issue #1083 V21): skip any layer at/above the
+                // AQ's active count entirely — no encode, no send. The base layer
+                // (id 0) is always < active (active is floored at 1), so it always
+                // flows. A shed layer's pacing deadline is left untouched; on
+                // restore the `next_due_us > +interval` resync below prevents a
+                // catch-up burst.
+                if layer.layer_id as usize >= active {
+                    continue;
+                }
                 // Per-layer pacing (Blocker 2): a layer slower than render_fps
                 // (e.g. a 20fps base layer under a 30fps render loop) only
                 // encodes when its OWN deadline has elapsed, so its VBR target
@@ -1113,6 +1155,7 @@ impl VideoProducer {
         media_start: Instant,
         loop_duration: Duration,
         is_speaking: Arc<AtomicBool>,
+        aq: Arc<BotAq>,
         encoder_output_fps: Arc<AtomicU32>,
         encoder_errors_generic: Arc<AtomicU64>,
         encoder_frames_ok: Arc<AtomicU64>,
@@ -1157,16 +1200,40 @@ impl VideoProducer {
         let mut prev_frame_index: Option<usize> = None;
         let mut render_count: u64 = 0;
 
+        // Per-layer AQ state (issue #1083 V21) — see ekg_video_loop_simulcast for
+        // the rationale. Seed from the AQ snapshot before the first frame.
+        let mut last_simulcast_epoch = aq.simulcast_epoch();
+        let mut last_applied_kbps = vec![0u32; layers.len()];
+        let mut active = apply_simulcast_aq(
+            &mut layers,
+            &aq.simulcast_snapshot(),
+            &mut last_applied_kbps,
+            &user_id,
+        );
+
         loop {
             if quit.load(Ordering::Relaxed) {
                 info!("Costume simulcast producer stopping for {}", user_id);
                 break;
             }
 
-            // REVISIT (#989): identical to the EKG simulcast loop — layer
-            // geometry is FIXED by the ladder and AQ tier changes are
-            // intentionally ignored. Per-layer AQ bitrate shed / active-layer
-            // shedding deferred until Tony's AQ rework (#1115/#1117).
+            // Layer geometry is FIXED by the ladder and AQ tier changes are
+            // intentionally ignored (matches the browser fixed-resolution
+            // simulcast encoders). Per-layer AQ wiring (issue #1083 V21 — the
+            // deferral to Tony's AQ rework #1115/#1117 is OVER; those PRs are in
+            // this base): poll `simulcast_epoch` and, only on change, re-apply the
+            // active count + budget-capped per-layer targets. Identical to the EKG
+            // simulcast loop.
+            let current_simulcast_epoch = aq.simulcast_epoch();
+            if current_simulcast_epoch != last_simulcast_epoch {
+                last_simulcast_epoch = current_simulcast_epoch;
+                active = apply_simulcast_aq(
+                    &mut layers,
+                    &aq.simulcast_snapshot(),
+                    &mut last_applied_kbps,
+                    &user_id,
+                );
+            }
             let elapsed_us = media_start.elapsed().as_micros() as u64;
             let position_in_loop_us = elapsed_us % loop_duration_us;
             let frame_in_loop = (position_in_loop_us / frame_interval_us) as usize;
@@ -1182,6 +1249,12 @@ impl VideoProducer {
             let source_frame = renderer.frame_i420(speaking, frame_in_loop);
 
             for layer in layers.iter_mut() {
+                // Top-down shed (issue #1083 V21) — see ekg_video_loop_simulcast.
+                // Skip any layer at/above the AQ active count; base layer always
+                // flows (active floored at 1).
+                if layer.layer_id as usize >= active {
+                    continue;
+                }
                 // Per-layer pacing (Blocker 2) — see ekg_video_loop_simulcast
                 // for the rationale. Encode only when this layer's own deadline
                 // has elapsed; resync on a stall to avoid a catch-up burst.
@@ -1417,6 +1490,85 @@ fn build_and_send_layer(
     Ok(packet_sender.try_send(out_frame).is_ok())
 }
 
+/// Pure decision half of [`apply_simulcast_aq`] (issue #1083 V21) — no encoder
+/// side effects, so it is host-unit-testable without a real libvpx encoder.
+///
+/// Given the lock-free [`SimulcastSnapshot`], the ladder length `n_layers`, and
+/// the per-layer bitrate last pushed to each encoder (`last_applied_kbps`,
+/// indexed by `layer_id`), it returns:
+///
+/// * `active` — the active layer COUNT the caller honors (skip any layer with
+///   `layer_id >= active`; top-down shed, base layer always flows); and
+/// * `to_apply[id]` — `Some(kbps)` for each ACTIVE layer whose target CHANGED
+///   since `last_applied_kbps[id]` (so the caller reconfigures only on a real
+///   change, avoiding a per-frame `vpx_codec_enc_config_set`), else `None`.
+///   Shed layers (`id >= active`) and unchanged targets are always `None`.
+///
+/// Fail-open: a non-simulcast snapshot returns `(n_layers, all-None)` — the full
+/// ladder stays active and no encoder is touched (legacy behavior).
+fn simulcast_layer_directives(
+    snapshot: &crate::aq_controller::SimulcastSnapshot,
+    n_layers: usize,
+    last_applied_kbps: &[u32],
+) -> (usize, Vec<Option<u32>>) {
+    if !snapshot.is_simulcast {
+        return (n_layers, vec![None; n_layers]);
+    }
+    let active = snapshot.active.clamp(1, n_layers);
+    let mut to_apply = vec![None; n_layers];
+    for (id, slot) in to_apply.iter_mut().enumerate() {
+        // Only ACTIVE layers get a (possibly rescaled) target; shed layers are
+        // not encoded, so there is nothing to reconfigure.
+        if id >= active {
+            continue;
+        }
+        if let Some(&target) = snapshot.layer_bitrates_kbps.get(id) {
+            if target != 0 && last_applied_kbps.get(id).copied() != Some(target) {
+                *slot = Some(target);
+            }
+        }
+    }
+    (active, to_apply)
+}
+
+/// Apply the AQ's current simulcast decision to the layer encoders (issue #1083
+/// V21). Computes the directives via [`simulcast_layer_directives`] and, for
+/// each ACTIVE layer whose target changed, re-applies it via
+/// `update_bitrate_kbps` (the budget cap rescales these as the active count
+/// shrinks under congestion). Returns the active layer COUNT the caller must
+/// honor (skip any layer with `layer_id >= active`).
+///
+/// Mirrors the browser's per-frame consumption in
+/// `videocall-client/src/encode/camera_encoder.rs` (shared-atomic read of the
+/// active count + per-layer targets) but adapted to the bot's synchronous loop:
+/// the browser reads every frame; the bot reads only when `simulcast_epoch`
+/// changed (the caller gates this) so the steady-state cost is one Acquire load.
+fn apply_simulcast_aq(
+    layers: &mut [SimulcastLayer],
+    snapshot: &crate::aq_controller::SimulcastSnapshot,
+    last_applied_kbps: &mut [u32],
+    user_id: &str,
+) -> usize {
+    let (active, to_apply) = simulcast_layer_directives(snapshot, layers.len(), last_applied_kbps);
+    for layer in layers.iter_mut() {
+        let id = layer.layer_id as usize;
+        let Some(Some(target)) = to_apply.get(id).copied() else {
+            continue;
+        };
+        if let Err(e) = layer.encoder.update_bitrate_kbps(target) {
+            // Non-fatal: log and keep the previous target rather than killing
+            // the producer thread.
+            warn!(
+                "[{}] simulcast L{} update_bitrate_kbps({}) failed: {}",
+                user_id, id, target, e
+            );
+        } else if let Some(slot) = last_applied_kbps.get_mut(id) {
+            *slot = target;
+        }
+    }
+    active
+}
+
 /// One simulcast layer's encoder + per-layer sequence/keyframe bookkeeping.
 ///
 /// Used only on the N>=2 path. Geometry (`enc_w`/`enc_h`/`framerate`) is FIXED
@@ -1553,5 +1705,103 @@ mod tests {
         // the loop level; here we pin that the helper writes the value it's
         // given the framerate for).
         assert!((mp.duration - (1000.0 / 24.0)).abs() < 1e-6);
+    }
+
+    // ------------------------------------------------------------------
+    // Per-layer AQ consumption (issue #1083 V21) — the pure decision half.
+    // Tested without a real libvpx encoder via `simulcast_layer_directives`.
+    // ------------------------------------------------------------------
+
+    use crate::aq_controller::SimulcastSnapshot;
+
+    fn snap(is_simulcast: bool, active: usize, bitrates: &[u32]) -> SimulcastSnapshot {
+        SimulcastSnapshot {
+            is_simulcast,
+            layer_count: bitrates.len().max(1),
+            active,
+            layer_bitrates_kbps: bitrates.to_vec(),
+        }
+    }
+
+    /// V21 top-down shed: when the AQ active count is below the ladder length,
+    /// the directive's returned `active` must equal that count so the caller
+    /// skips the top layer(s). Fails if a shed (active < N) were ignored and the
+    /// full ladder kept being encoded.
+    #[test]
+    fn directives_active_count_drives_top_down_shed() {
+        // 3-layer ladder, AQ has shed down to 2 active.
+        let s = snap(true, 2, &[400, 900, 1500]);
+        let last = [0u32; 3];
+        let (active, to_apply) = simulcast_layer_directives(&s, 3, &last);
+        assert_eq!(active, 2, "active count must follow the AQ shed (2 of 3)");
+        // Layer 2 (the shed top layer) must get NO bitrate directive.
+        assert_eq!(to_apply[2], None, "shed top layer must not be reconfigured");
+        // Base + middle (active) get their targets since last_applied was 0.
+        assert_eq!(to_apply[0], Some(400));
+        assert_eq!(to_apply[1], Some(900));
+    }
+
+    /// V21 base-always-flows: even an absurd active=0 from the AQ must floor at
+    /// 1 so the base layer keeps flowing. Fails if a 0 active count silenced the
+    /// whole publisher.
+    #[test]
+    fn directives_floor_active_at_one() {
+        let s = snap(true, 0, &[400, 900, 1500]);
+        let last = [0u32; 3];
+        let (active, to_apply) = simulcast_layer_directives(&s, 3, &last);
+        assert_eq!(active, 1, "active must floor at 1 (base always flows)");
+        assert_eq!(to_apply[0], Some(400), "base layer still gets its target");
+        assert_eq!(to_apply[1], None);
+        assert_eq!(to_apply[2], None);
+    }
+
+    /// V21 bitrate propagation on cap change: when the budget cap rescales a
+    /// layer's target, the directive must surface the NEW value; an UNCHANGED
+    /// target (already applied) must surface `None` so the encoder is not
+    /// reconfigured every frame. Fails if either the change is dropped or an
+    /// unchanged value is needlessly re-applied.
+    #[test]
+    fn directives_propagate_only_changed_bitrates() {
+        // last_applied: base already at 300 (rescaled earlier), others unset.
+        let last = [300u32, 0, 0];
+        // New snapshot: base rescaled to 250 (cap tightened), middle at 700.
+        let s = snap(true, 2, &[250, 700, 1500]);
+        let (active, to_apply) = simulcast_layer_directives(&s, 3, &last);
+        assert_eq!(active, 2);
+        assert_eq!(to_apply[0], Some(250), "changed base target must propagate");
+        assert_eq!(
+            to_apply[1],
+            Some(700),
+            "newly-active middle target propagates"
+        );
+
+        // Re-run with last_applied now matching: base unchanged => None.
+        let last2 = [250u32, 700, 0];
+        let (_, to_apply2) = simulcast_layer_directives(&s, 3, &last2);
+        assert_eq!(
+            to_apply2[0], None,
+            "an unchanged target must NOT trigger a reconfigure"
+        );
+        assert_eq!(
+            to_apply2[1], None,
+            "unchanged middle target must not reconfigure"
+        );
+    }
+
+    /// N==1 / non-simulcast path untouched: a non-simulcast snapshot must return
+    /// the full ladder active and touch NO bitrate (legacy single-stream and the
+    /// fail-open guard). Fails if the wiring leaked into the non-simulcast path.
+    #[test]
+    fn directives_non_simulcast_is_inert() {
+        // is_simulcast = false; the snapshot bitrates must be ignored entirely.
+        let s = snap(false, 1, &[0]);
+        let last = [0u32; 3];
+        let (active, to_apply) = simulcast_layer_directives(&s, 3, &last);
+        assert_eq!(active, 3, "non-simulcast keeps the full ladder active");
+        assert!(
+            to_apply.iter().all(|d| d.is_none()),
+            "non-simulcast must issue no bitrate directives: {:?}",
+            to_apply
+        );
     }
 }

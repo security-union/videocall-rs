@@ -109,6 +109,72 @@ pub fn fit_within_preserving_aspect(src_w: u32, src_h: u32, max_w: u32, max_h: u
     (out_w, out_h)
 }
 
+/// Per-layer encoder dimension decision for the simulcast encode path
+/// (issue #1196).
+///
+/// `target_w` / `target_h` are the source `(frame_w, frame_h)` fitted inside
+/// the layer's tier bounding box `(tier_w, tier_h)` via
+/// [`fit_within_preserving_aspect`]. `needs_reconfigure` is `true` iff those
+/// fitted dims differ from the layer's currently-configured `(current_w,
+/// current_h)` — i.e. the encoder must be reconfigured to the new dims.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SimulcastLayerDims {
+    /// Width the layer's encoder should be configured to.
+    pub target_w: u32,
+    /// Height the layer's encoder should be configured to.
+    pub target_h: u32,
+    /// `true` iff `(target_w, target_h)` differs from the supplied
+    /// `(current_w, current_h)` — the caller should reconfigure.
+    pub needs_reconfigure: bool,
+}
+
+/// Decide a simulcast layer's encoder target dimensions for a given source
+/// frame (issue #1196).
+///
+/// The tier's `(tier_w, tier_h)` is treated as a **bounding box**, not a fixed
+/// output size: the source `(frame_w, frame_h)` is fitted inside it with a
+/// single uniform downscale (never an upscale, never a per-axis stretch) via
+/// [`fit_within_preserving_aspect`]. This is the fix for issue #1196 — the old
+/// simulcast encode path configured each layer at the raw 16:9 `tier_w x
+/// tier_h`, so a non-16:9 capture (a 4:3 webcam, a 16:10 screen) was per-axis
+/// scaled by WebCodecs and the stretch/squash was baked into the bitstream.
+///
+/// `needs_reconfigure` lets the caller skip a no-op `configure()` when the
+/// fitted dims already match the layer's current config (the common steady
+/// state). Degenerate `frame_w == 0 || frame_h == 0` inputs report
+/// `needs_reconfigure == false` so the live encoder is never reconfigured to a
+/// fallback box on a transient bad frame; the caller keeps the last good dims.
+///
+/// This is a pure function (no atomics, no WebCodecs) so the per-layer
+/// "decide target dims" step — the exact wiring that issue #1196's bug dropped
+/// — is host-testable off-wasm, per the repo's pure-helper + `#[cfg(test)]`
+/// convention.
+pub fn simulcast_layer_target_dims(
+    frame_w: u32,
+    frame_h: u32,
+    tier_w: u32,
+    tier_h: u32,
+    current_w: u32,
+    current_h: u32,
+) -> SimulcastLayerDims {
+    // Degenerate source: do not touch the live encoder. Report the current
+    // dims and no reconfigure so a transient 0-dim frame can't reset the
+    // encoder to the fallback box.
+    if frame_w == 0 || frame_h == 0 {
+        return SimulcastLayerDims {
+            target_w: current_w,
+            target_h: current_h,
+            needs_reconfigure: false,
+        };
+    }
+    let (target_w, target_h) = fit_within_preserving_aspect(frame_w, frame_h, tier_w, tier_h);
+    SimulcastLayerDims {
+        target_w,
+        target_h,
+        needs_reconfigure: target_w != current_w || target_h != current_h,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +346,156 @@ mod tests {
         // A 1x1 source should never produce a 0 dimension.
         let (w, h) = fit_within_preserving_aspect(1, 1, 1280, 720);
         assert!(w >= 2 && h >= 2, "floor-of-2 violated: {w}x{h}");
+    }
+
+    // ── simulcast_layer_target_dims (issue #1196) ───────────────────────────
+
+    /// The camera simulcast ladder (n == 3) is `[low 640x360, standard
+    /// 960x540, hd 1280x720]`. A 4:3 source LARGER than every rung must
+    /// downscale uniformly into each box and KEEP 4:3 — never the raw 16:9
+    /// tier dims. This is the per-rung ladder the issue calls out.
+    ///
+    /// Mutation guard (adversarial-review check #2): if the encode path
+    /// reverted to the buggy behavior of configuring each layer at the raw
+    /// `(tier_w, tier_h)`, layer 0 would be 640x360 (16:9), layer 1 960x540,
+    /// layer 2 1280x720 — all 16:9, all DIFFERENT from the values asserted
+    /// here, so this test would fail. That is exactly the regression we lock.
+    #[test]
+    fn camera_four_three_ladder_preserves_aspect_per_rung() {
+        // 1280x960 (4:3) is larger than all three rungs, so each rung binds.
+        let src = (1280u32, 960u32);
+        // (tier box, expected fitted dims) — all 4:3, never the 16:9 tier dims.
+        let cases = [
+            ((640u32, 360u32), (480u32, 360u32)),
+            ((960, 540), (720, 540)),
+            ((1280, 720), (960, 720)),
+        ];
+        for ((tier_w, tier_h), (exp_w, exp_h)) in cases {
+            // current dims deliberately set to the RAW tier dims (the buggy
+            // seed) so `needs_reconfigure` proves the fix changes them.
+            let d = simulcast_layer_target_dims(src.0, src.1, tier_w, tier_h, tier_w, tier_h);
+            assert_eq!(
+                (d.target_w, d.target_h),
+                (exp_w, exp_h),
+                "4:3 src {}x{} into tier {tier_w}x{tier_h} must fit to {exp_w}x{exp_h}, not raw tier dims",
+                src.0,
+                src.1
+            );
+            // The fitted dims preserve 4:3, the raw tier dims are 16:9 -> they
+            // MUST differ, so a reconfigure is required off the buggy seed.
+            assert_ne!(
+                (d.target_w, d.target_h),
+                (tier_w, tier_h),
+                "fitted dims must differ from raw 16:9 tier dims for a 4:3 source"
+            );
+            assert!(
+                d.needs_reconfigure,
+                "must reconfigure away from the raw 16:9 tier seed for a 4:3 source"
+            );
+        }
+    }
+
+    /// A 4:3 source SMALLER than the upper rungs must NOT be upscaled: only
+    /// rungs whose box is smaller than the source bind. Pins the no-upscale
+    /// contract on the simulcast decision so a future "always scale to tier"
+    /// regression is caught.
+    #[test]
+    fn camera_small_four_three_source_does_not_upscale() {
+        let src = (640u32, 480u32); // 4:3, smaller than standard/hd rungs
+                                    // low 640x360 binds on height -> 480x360.
+        let low = simulcast_layer_target_dims(src.0, src.1, 640, 360, 640, 360);
+        assert_eq!((low.target_w, low.target_h), (480, 360));
+        // standard 960x540 and hd 1280x720 do NOT bind -> source unchanged.
+        let std_ = simulcast_layer_target_dims(src.0, src.1, 960, 540, 960, 540);
+        assert_eq!((std_.target_w, std_.target_h), (640, 480));
+        let hd = simulcast_layer_target_dims(src.0, src.1, 1280, 720, 1280, 720);
+        assert_eq!((hd.target_w, hd.target_h), (640, 480));
+    }
+
+    /// The screen simulcast ladder (n == 3) is `[low 1280x720, medium
+    /// 1280x720, high 1920x1080]`. A 16:10 capture must fit into each box and
+    /// KEEP 16:10, never the 16:9 tier dims.
+    ///
+    /// Mutation guard: the buggy path used raw `tier.max_width/max_height`, so
+    /// the top rung would be 1920x1080 (16:9). The asserted 1728x1080 (16:10)
+    /// differs, so reverting the fix fails this test.
+    #[test]
+    fn screen_sixteen_ten_ladder_preserves_aspect_per_rung() {
+        let src = (1920u32, 1200u32); // 16:10 display
+                                      // low/medium share the 1280x720 box; high is 1920x1080.
+        let cases = [
+            ((1280u32, 720u32), (1152u32, 720u32)),
+            ((1920, 1080), (1728, 1080)),
+        ];
+        for ((tier_w, tier_h), (exp_w, exp_h)) in cases {
+            let d = simulcast_layer_target_dims(src.0, src.1, tier_w, tier_h, tier_w, tier_h);
+            assert_eq!(
+                (d.target_w, d.target_h),
+                (exp_w, exp_h),
+                "16:10 src into tier {tier_w}x{tier_h} must fit to {exp_w}x{exp_h}, not raw tier dims"
+            );
+            assert_ne!(
+                (d.target_w, d.target_h),
+                (tier_w, tier_h),
+                "fitted dims must differ from the 16:9 tier dims for a 16:10 source"
+            );
+            assert!(d.needs_reconfigure);
+        }
+    }
+
+    /// Steady state: when the layer is already configured at the fitted dims,
+    /// `needs_reconfigure` must be `false` so the encode loop skips a redundant
+    /// `configure()` every frame.
+    #[test]
+    fn simulcast_target_dims_no_reconfigure_when_already_fitted() {
+        // 1280x960 into 1280x720 fits to 960x720; feeding that back as current
+        // must report no reconfigure.
+        let d = simulcast_layer_target_dims(1280, 960, 1280, 720, 960, 720);
+        assert_eq!((d.target_w, d.target_h), (960, 720));
+        assert!(
+            !d.needs_reconfigure,
+            "already-fitted dims must not reconfigure"
+        );
+    }
+
+    /// Degenerate (0-dim) frame must leave the live encoder untouched: report
+    /// the current dims and no reconfigure, so a transient bad frame can't
+    /// reset the encoder to a fallback box.
+    #[test]
+    fn simulcast_target_dims_zero_frame_keeps_current() {
+        let d = simulcast_layer_target_dims(0, 0, 1280, 720, 960, 720);
+        assert_eq!((d.target_w, d.target_h), (960, 720));
+        assert!(!d.needs_reconfigure);
+    }
+
+    /// Mid-share aspect change on a SCREEN rung (issue #1196, REQUIRED 1). The
+    /// share starts 16:10 (1920x1200) and switches to 4:3 (1600x1200) — e.g. a
+    /// window-region resize or a shared-surface switch. On a rung whose tier box
+    /// is 1280x720, the rung was seeded at the 16:10 fit (1152x720); after the
+    /// switch the helper must re-fit to the 4:3 result (960x720) and report
+    /// `needs_reconfigure`, so the higher rung self-corrects instead of baking
+    /// the new aspect into a stale 1152x720 config.
+    ///
+    /// Mutation guard (adversarial check #2): if the screen extra_layers loop
+    /// dropped the per-frame re-fit (the confirmed gap before this fix), the rung
+    /// would stay at 1152x720 and squash the 4:3 content. This pins the decision
+    /// the loop must act on; reverting the loop's re-fit makes the screen rung
+    /// distort exactly as asserted-against here.
+    #[test]
+    fn screen_rung_mid_share_aspect_change_refits() {
+        // Rung tier box (screen low/medium share 1280x720).
+        let (tier_w, tier_h) = (1280u32, 720u32);
+        // Construction-time seed for the initial 16:10 share.
+        let seed = simulcast_layer_target_dims(1920, 1200, tier_w, tier_h, tier_w, tier_h);
+        assert_eq!((seed.target_w, seed.target_h), (1152, 720));
+        // Now the source switches to 4:3 1600x1200; current dims are the 16:10
+        // seed, so the helper must re-fit and flag a reconfigure.
+        let d =
+            simulcast_layer_target_dims(1600, 1200, tier_w, tier_h, seed.target_w, seed.target_h);
+        assert_eq!((d.target_w, d.target_h), (960, 720));
+        assert!(
+            d.needs_reconfigure,
+            "a mid-share aspect change must reconfigure the screen rung"
+        );
     }
 }

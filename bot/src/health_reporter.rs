@@ -227,19 +227,13 @@ fn build_health_packet(
     // Encoder-decision telemetry, matching what the browser CameraEncoder
     // publishes (camera_encoder.rs: shared_encoder_*_bits). These fields
     // feed the Grafana AQ dashboards so bot-populated calls show the same
-    // diagnostics as browser-populated ones.
-    let fps_ratio = aq.last_fps_ratio();
+    // diagnostics as browser-populated ones. NOTE(#1184): the dead
+    // encoder_fps_ratio / encoder_bitrate_ratio proto fields were removed; only
+    // the live p75 (encoder-queue depth) + target-bitrate signals remain.
     let p75_peer_fps = aq.last_p75_peer_fps();
-    let bitrate_ratio = aq.last_bitrate_ratio();
     let target_bitrate = aq.last_target_bitrate_kbps();
-    if fps_ratio.is_finite() && fps_ratio > 0.0 {
-        hp.encoder_fps_ratio = Some(fps_ratio as f64);
-    }
     if p75_peer_fps.is_finite() && p75_peer_fps > 0.0 {
         hp.encoder_p75_peer_fps = Some(p75_peer_fps as f64);
-    }
-    if bitrate_ratio.is_finite() && bitrate_ratio > 0.0 {
-        hp.encoder_bitrate_ratio = Some(bitrate_ratio as f64);
     }
     if target_bitrate.is_finite() && target_bitrate > 0.0 {
         hp.encoder_target_bitrate_kbps = Some(target_bitrate as f64);

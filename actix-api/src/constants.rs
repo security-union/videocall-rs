@@ -416,6 +416,58 @@ pub const KEYFRAME_LIMITER_CLEANUP_INTERVAL: u32 = 64;
 /// are intentionally separate constants.
 pub const KEYFRAME_REQUEST_MAX_LAYER_ID: u32 = 2;
 
+/// Compile-time link tying [`KEYFRAME_REQUEST_MAX_LAYER_ID`] to the ACTUAL
+/// simulcast ladder depth (#1185).
+///
+/// `KEYFRAME_REQUEST_MAX_LAYER_ID` is the TOP real layer id, i.e. `ladder
+/// depth - 1`. It is hand-set to `2` above because the production ladder ships
+/// 3 layers (ids 0,1,2). Before this assert that pairing was purely a comment:
+/// if the ladder grew (e.g. video → 5 layers, top id 4) and nobody bumped this
+/// constant, the `layer.min(KEYFRAME_REQUEST_MAX_LAYER_ID)` clamp at
+/// `packet_handler.rs` would SILENTLY collapse a real upper layer's keyframe
+/// budget onto the id-2 bucket — a genuine functional regression with no build
+/// failure to catch it (#1068's clamp depends on this bound equalling the real
+/// ladder top).
+///
+/// The ladder depth's single source of truth is the `videocall-aq` crate
+/// (`SIMULCAST_MAX_LAYERS` / `SCREEN_SIMULCAST_MAX_LAYERS`), which the browser
+/// client (`layer_chooser.rs`, `camera_encoder.rs`) also derives its caps from.
+/// `videocall-aq` builds on native targets (it is explicitly "shared between
+/// the browser client and native consumers"), so the relay can reference it
+/// directly here — this is the FIRST relay-side compile-time tie to the ladder
+/// (the relay is otherwise deliberately layer-count-agnostic on the forwarding
+/// path; this assert is a build-time guard, not runtime ladder knowledge).
+///
+/// VIDEO and SCREEN have independent caps; the keyframe limiter keys on the
+/// cleartext `simulcast_layer_id` WITHOUT knowing the packet's media kind, so a
+/// single clamp bound must cover the DEEPEST ladder across kinds. We therefore
+/// tie to the MAX of the two caps. Today both are 3, so the top id is 2.
+///
+/// If either cap changes in `videocall-aq`, this assert FAILS the build with a
+/// clear message until `KEYFRAME_REQUEST_MAX_LAYER_ID` (and the doc above) are
+/// updated to match.
+const _: () = {
+    // Deepest ladder across the two video/screen caps the relay must cover.
+    let max_ladder_depth = if videocall_aq::constants::SIMULCAST_MAX_LAYERS
+        >= videocall_aq::constants::SCREEN_SIMULCAST_MAX_LAYERS
+    {
+        videocall_aq::constants::SIMULCAST_MAX_LAYERS
+    } else {
+        videocall_aq::constants::SCREEN_SIMULCAST_MAX_LAYERS
+    };
+    // Top real layer id == ladder depth - 1. Keep the keyframe clamp's bucket
+    // ceiling (`KEYFRAME_REQUEST_MAX_LAYER_ID + 1` buckets) exactly equal to the
+    // real ladder so no real layer id collapses onto a shared bucket.
+    assert!(
+        KEYFRAME_REQUEST_MAX_LAYER_ID as usize + 1 == max_ladder_depth,
+        "KEYFRAME_REQUEST_MAX_LAYER_ID is out of sync with the simulcast ladder \
+         (videocall_aq::constants::SIMULCAST_MAX_LAYERS / SCREEN_SIMULCAST_MAX_LAYERS). \
+         It must equal max(ladder depths) - 1. Update KEYFRAME_REQUEST_MAX_LAYER_ID \
+         and its doc comment to match the new ladder, then re-check the #1068 clamp \
+         at packet_handler.rs."
+    );
+};
+
 /// Maximum number of `session_ids` the relay will accept from a single
 /// VIEWPORT control packet (HCL issue #988).
 ///
@@ -551,6 +603,64 @@ pub const LAYER_HINT_SUPPRESS_DEBOUNCE_MS: u64 = 2000;
 /// to suppress a layer some unseen receiver still wants. FIRST GUESS / PENDING
 /// PERF REVIEW.
 pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
+
+/// Trailing-debounce window (in milliseconds) for COALESCING room-wide
+/// LAYER_HINT recomputes triggered by DEPARTURES (leave / evict) (#1203).
+///
+/// ## The O(n) storm this absorbs
+///
+/// A room-wide recompute (`RecomputeLayerHints { source: None }`) fans out over
+/// every publisher in the room, and each per-source union scan is itself
+/// O(receivers) (see [`LAYER_HINT_MAX_RECEIVERS_SCANNED`]). So a single
+/// room-wide recompute is O(publishers × receivers). The relay fires one such
+/// recompute per DEPARTURE (the `leave_rooms` and `forget_session`/evict paths).
+/// A reconnection wave or a meeting ending disconnects many sessions in a tight
+/// burst, firing the handler once PER departing connection — an O(n) storm that
+/// runs inside the single-threaded `ChatServer` actor and stalls every room it
+/// serves (the exact O(n)-per-connection fan-out hazard the Change Impact Policy
+/// warns about).
+///
+/// ## Why DEPARTURES are safe to debounce but JOINS are not
+///
+/// The emit policy is ASYMMETRIC (mirroring the suppress-lazy / restore-eager
+/// split in [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`]):
+///
+/// * **Departures (leave/evict) → DEBOUNCE.** A leaving receiver can only RAISE
+///   a remaining publisher's fail-open union (its constraint disappears), and a
+///   leaving publisher's own per-source state is reaped synchronously regardless.
+///   A raise is "restore-eager" demand, but NOBODY is actively waiting on a
+///   departure-driven recompute: the union only governs whether the relay tells a
+///   publisher it MAY drop an upper layer (suppress). Coalescing a burst of
+///   departures into ONE trailing recompute computes the correct FINAL union once
+///   the burst settles, instead of N times over transient intermediate
+///   membership. Delaying it by this window cannot black-tile anyone (a publisher
+///   over-encoding for a few hundred ms is the fail-open-safe direction).
+///
+/// * **Joins → IMMEDIATE (never debounced).** A NEW receiver has no recorded
+///   preference, so under fail-open it wants the FULL ladder from every existing
+///   publisher — its recompute can RESTORE a layer a publisher had suppressed. A
+///   real human is waiting on that tile; delaying it leaves the joiner stuck on a
+///   low/black layer for the window. The join recompute (`chat_server.rs` join
+///   path) stays a direct `do_send`.
+///
+/// * **Per-LAYER_PREFERENCE recompute → IMMEDIATE (never debounced).** That path
+///   is the latency-sensitive UPGRADE case and is already rate-limited upstream by
+///   [`LAYER_PREFERENCE_MIN_UPDATE_INTERVAL`]; debouncing it would slow real
+///   viewport-driven layer switches.
+///
+/// ## Why 300 ms
+///
+/// 300 ms is an order of magnitude below the ~5 s receiver chooser / AQ
+/// adaptation loop, so it CANNOT delay simulcast convergence — it only dedups a
+/// sub-second departure burst into a single recompute. It is long enough to
+/// swallow a reconnection wave's disconnect cluster (which arrives within tens to
+/// low-hundreds of ms) yet short enough that a genuine sustained drop in demand
+/// still reclaims publisher CPU/uplink well within a second. It sits comfortably
+/// under [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`] (2000 ms): the coalesce window only
+/// decides WHEN the union is recomputed; the suppress-lazy debounce then still
+/// governs whether a LOWER hint is actually emitted, so the two debounces
+/// compose without double-counting.
+pub const LAYER_HINT_RECOMPUTE_COALESCE_MS: u64 = 300;
 
 #[cfg(test)]
 mod tests {

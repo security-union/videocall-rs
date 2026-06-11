@@ -20,11 +20,13 @@
 //! (phase 3c of discussion #793).
 //!
 //! When `videocall-client` is built with `--features netsim` and the
-//! browser tab's URL carries `?netsim=<profile>`, this module
+//! browser tab's URL carries `?netsim=<profile>` (uplink) and/or
+//! `?netsim_down=<profile>` (downlink, issue #1080), this module
 //! constructs a [`videocall_netsim::NetSimShim`] from the named
-//! profile and parks it in the per-tab hook slot via
-//! [`super::netsim_hook::install_hook`]. The shim then shapes all
-//! outbound media on this tab.
+//! profile and parks it in the matching per-tab hook slot (via
+//! [`super::netsim_control::install_profile`]). The uplink shim shapes
+//! outbound media on this tab; the downlink shim drops eligible inbound
+//! media (see `netsim_hook::shape_inbound`).
 //!
 //! Phase 3d will have the bots-app harness launch a Chrome instance
 //! at `<meeting-url>?netsim=lossy_mobile` and rely on this module to
@@ -39,28 +41,29 @@
 //! touch `window.location`, and never link `videocall-netsim`. The
 //! production code path is byte-for-byte equivalent to pre-3c.
 
-use std::sync::Arc;
+use videocall_netsim::Direction;
 
-use log::{info, warn};
-use videocall_netsim::{resolve_profile, Direction, NetSimShim};
+use super::netsim_control::install_profile;
 
-use super::netsim_hook::install_hook;
-
-/// Inspect `window.location.search` for `?netsim=<profile>` and, if
-/// the profile name resolves via [`videocall_netsim::resolve_profile`],
-/// build a [`NetSimShim`] in [`Direction::Up`] and install it in the
-/// per-tab hook slot.
+/// Inspect `window.location.search` for `?netsim=<profile>` (uplink) and
+/// `?netsim_down=<profile>` (downlink, issue #1080) and install the
+/// matching shim(s) in the per-tab hook slot(s).
 ///
-/// Returns `true` when a shim was successfully installed, `false`
-/// otherwise. Reasons to return `false`:
+/// Both params are honored independently, so a URL may impair the uplink,
+/// the downlink, or both. The downlink param exists for symmetry and for
+/// static (non-mid-call) e2e setups; the mid-call climb→impair→heal flow
+/// uses the `window.__vcNetsim` runtime control surface instead (see
+/// `netsim_control`).
+///
+/// Returns `true` when AT LEAST ONE shim was successfully installed,
+/// `false` otherwise. Reasons a given direction installs nothing:
 /// - `window` is undefined (worker / SSR-ish context),
 /// - `window.location.search` is missing or empty,
-/// - no `netsim=` key is present among the query params,
+/// - the corresponding key is absent among the query params,
 /// - the param value does not resolve to a known preset.
 ///
-/// Never panics. Callers should not depend on this returning
-/// anything other than completion — the installed hook is the
-/// observable effect.
+/// Never panics. Callers should not depend on this returning anything
+/// other than completion — the installed hook is the observable effect.
 pub(super) fn try_install_from_url() -> bool {
     let Some(window) = web_sys::window() else {
         // Worker / non-browser context. No `window`, nothing to do.
@@ -72,7 +75,15 @@ pub(super) fn try_install_from_url() -> bool {
         Err(_) => return false,
     };
 
-    let Some(raw_value) = find_param(&search, "netsim") else {
+    let up = install_from_param(&search, "netsim", Direction::Up);
+    let down = install_from_param(&search, "netsim_down", Direction::Down);
+    up || down
+}
+
+/// Resolve `?<key>=<profile>` from `search` and install it for
+/// `direction`. Returns `true` iff a shim was installed.
+fn install_from_param(search: &str, key: &str, direction: Direction) -> bool {
+    let Some(raw_value) = find_param(search, key) else {
         return false;
     };
 
@@ -85,25 +96,10 @@ pub(super) fn try_install_from_url() -> bool {
     };
     let name = decoded.trim().to_ascii_lowercase();
 
-    let Some(profile) = resolve_profile(&name) else {
-        warn!("netsim: unknown profile '{name}' in ?netsim=, ignoring");
-        return false;
-    };
-
-    info!("netsim: installing profile '{name}' from URL");
-    let shim = NetSimShim::new(profile, Direction::Up);
-    // `NetSimShim` is `!Sync` on wasm32 (uses `RefCell` for poison
-    // safety — see PR #811 finding 2 and the `NetSimShim` doc
-    // comment) but the wasm runtime is single-threaded, so an
-    // `Arc<NetSimShim>` here is safe. The thread-local in
-    // `netsim_hook` stores `Option<Arc<NetSimShim>>` so it can hand
-    // out `Arc` clones without taking ownership; switching to `Rc`
-    // would force every consumer to change, when the actual
-    // multi-thread sharing risk is zero on wasm32.
-    #[allow(clippy::arc_with_non_send_sync)]
-    let arc = Arc::new(shim);
-    install_hook(Some(arc));
-    true
+    // `install_profile` resolves + validates the preset, logs on failure,
+    // and installs into the slot matching `direction`. Returns whether it
+    // succeeded so we can propagate it to the caller.
+    install_profile(&name, direction)
 }
 
 /// Find the value of `key` in a `?k1=v1&k2=v2`-style query string.

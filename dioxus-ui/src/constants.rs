@@ -144,6 +144,40 @@ pub struct RuntimeConfig {
     #[serde(rename = "experimentalSimulcastMaxLayers")]
     #[serde(default = "default_experimental_simulcast_max_layers")]
     pub experimental_simulcast_max_layers: u32,
+    /// **TEST-ONLY** override for the device-capability simulcast ceiling
+    /// (`capability_max_simulcast_layers`), issue #1093.
+    ///
+    /// The containerized e2e CI runner reports a low `navigator.hardwareConcurrency`
+    /// (often 1–2 logical cores), which clamps the sniffed capability ceiling to
+    /// **1** layer — so the multi-party per-receiver simulcast SEND assertions in
+    /// `e2e/tests/simulcast-per-receiver.spec.ts` could never observe >1 emitted
+    /// layer and had to be `test.fixme`'d. When set, this REPLACES the sniffed
+    /// ceiling (cores + UA platform) so a test can force the publisher to a known
+    /// layer count regardless of the runner's core count. It is clamped to the real
+    /// ladder depth (`SIMULCAST_MAX_LAYERS`) and a `0` is treated as `1`, so a bogus
+    /// value can never request absurd or zero layer counts (see
+    /// [`crate::components::capability_check::apply_capability_override`]).
+    ///
+    /// This affects ONLY the capability ceiling — it does NOT change the
+    /// `experimentalSimulcastMaxLayers` flag, which remains an independent input to
+    /// the `min(flag, ceiling)` the encoder is configured with. It also does not
+    /// touch the audio ceiling (`max_layers_for_kind(Audio)`), which is decoupled
+    /// per #1082.
+    ///
+    /// When active, `capability_max_simulcast_layers()` emits a `warn!` naming the
+    /// override so it can never silently leak into a production incident unnoticed.
+    /// Production `config.js` (and the e2e docker stack's committed `config.js`)
+    /// omit this key entirely.
+    ///
+    /// CRITICAL (config.js bind-mount trap, see project memory): `Option<u32>` +
+    /// `#[serde(default)]` so a `config.js` that predates / omits this key parses
+    /// to `None` (override inactive — sniffed behaviour unchanged), never a
+    /// startup-bricking parse failure. The e2e docker stack bind-mounts the host's
+    /// committed `config.js`, which does NOT contain this key, so the UI must (and
+    /// does) behave identically when it is absent.
+    #[serde(rename = "testCapabilityMaxLayersOverride")]
+    #[serde(default)]
+    pub test_capability_max_layers_override: Option<u32>,
     /// Operator dial for the WASM logger's max level (issue: console-log perf).
     /// Valid values (case-insensitive): `trace` / `debug` / `info` / `warn` /
     /// `error` (`off` is also accepted). When **absent** the logger initialises
@@ -228,6 +262,24 @@ pub fn experimental_simulcast_max_layers() -> u32 {
     app_config()
         .map(|c| c.experimental_simulcast_max_layers)
         .unwrap_or(3)
+}
+
+/// **TEST-ONLY** override for the device-capability simulcast ceiling (#1093).
+///
+/// Returns `Some(n)` only when `config.js` explicitly sets
+/// `testCapabilityMaxLayersOverride`; returns `None` when the key is absent or the
+/// config can't be read — i.e. in every production and default-docker deployment,
+/// where the sniffed `capability_max_simulcast_layers()` ceiling is used unchanged.
+/// The raw value is NOT clamped here; clamping into `[1, SIMULCAST_MAX_LAYERS]`
+/// (and the `warn!`) happens at the single consumption point in
+/// [`crate::components::capability_check::capability_max_simulcast_layers`] via
+/// [`crate::components::capability_check::apply_capability_override`], so the
+/// clamp logic stays host-testable in one place.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn test_capability_max_layers_override() -> Option<u32> {
+    app_config()
+        .ok()
+        .and_then(|c| c.test_capability_max_layers_override)
 }
 
 /// Parse a `logLevel` string (case-insensitive `trace`/`debug`/`info`/`warn`/

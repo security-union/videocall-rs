@@ -27,22 +27,62 @@
  * does NOT modify the committed `dioxus-ui/scripts/config.js` nor the
  * developer's gitignored `config.local.js`).
  *
- * ## STATUS: MULTI-PARTY TESTS ARE `test.fixme` PENDING #1093
+ * ## STATUS: #1093 hook DELIVERED — the 4 SEND-side tests now RUN
  *
- * EVERY test in this spec joins TWO (or three) authenticated browser contexts —
- * a publisher + receiver(s) — each running camera + simulcast encode/decode.
- * In headless CI that crashes the renderer ("Target page/context closed") so the
- * 2nd context never reaches the grid, AND the capability ceiling clamps the
- * runner to 1 layer (so the multi-layer assertions would skip anyway). All of
- * these are therefore marked `test.fixme` (skipped, not run) until issue #1093
- * lands a renderer-crash-resilient / netsim runner + a capability-override hook
- * to force >=2 layers. The single-context structural coverage of the receive
- * Performance panel lives in `performance-settings.spec.ts` (#1078 Receive-side
- * controls), which is green. The `@impair` WS-divergence test stays `@impair`-
- * gated (and is subject to the same #1093 limits); the WT case stays `fixme`.
+ * Every test here joins TWO (or three) authenticated browser contexts — a
+ * publisher + receiver(s) — each running camera + simulcast encode/decode. Two
+ * things historically blocked them in headless CI: (1) the 2nd/3rd context never
+ * reached the grid, and (2) the device-sniffed capability ceiling clamped a
+ * low-core container to 1 layer, so the multi-layer assertions would have skipped
+ * anyway. Issue #1093 delivered the mitigations that unblock the SEND-side cases:
  *
- * The descriptions below document the INTENDED behaviour each `fixme` test will
- * assert once #1093 unblocks them.
+ *   - CAPABILITY-OVERRIDE HOOK — the test-only `testCapabilityMaxLayersOverride`
+ *     config key (commit bbfe784f) REPLACES the sniffed ceiling, so the runner
+ *     emits the full ladder regardless of core count. Wired via
+ *     `enableSimulcastFlag(ctx, 3, { capabilityMaxLayersOverride: 3 })`. Each
+ *     SEND test ALSO asserts the override took effect (the `TEST-OVERRIDDEN`
+ *     publisher console warn) BEFORE its `layerCount <= 1` skip guard, so a
+ *     silently-broken override fails loud rather than skipping (see
+ *     `assertCapabilityOverrideActive`).
+ *   - WAITING-ROOM AUTO-ADMIT — the host's pre-join Waiting Room toggle is
+ *     switched OFF in `joinMeeting` (with an async-settle on its `aria-checked`),
+ *     so subsequent joiners are admitted straight into the grid instead of being
+ *     parked. (This — NOT a renderer crash — was the real 2/3-context join blocker.)
+ *   - SERIAL-MODE renderer mitigation — each multi-browser describe runs
+ *     `mode: "serial"`, capping the peak concurrent heavy-renderer count on the
+ *     8-vCPU CI runner.
+ *
+ * THEREFORE THE FOLLOWING NOW RUN in the default `dioxus` suite (no longer
+ * `test.fixme`):
+ *   1. publisher emits >1 simulcast layer when the flag is on
+ *   2. receive needle never exceeds the user's max-layer threshold
+ *   3. default receive preference is Auto (full range)
+ *   4. receive Performance panel renders video + audio + content controls
+ *   5. audio readout reflects the multi-layer ladder when the flag is on (the
+ *      waiting-room auto-admit fix unblocks the 2-context join; audio's capability
+ *      ceiling is DECOUPLED from the cores-based video clamp (#1082), so the
+ *      publisher emits the full 3-rung audio ladder regardless of runner core
+ *      count — NO capability override needed)
+ *   6. flag pinned to 1 / single-layer no-regression (the same 2-context join,
+ *      unblocked by the waiting-room fix; needs NO override — it pins the flag to 1)
+ *
+ * STILL `test.fixme` (with their gating issues — verify against the test bodies
+ * below before editing this list):
+ *   - receive diagnostics per-peer rows + "+N more" tail (#1093 — needs a real
+ *     multi-PUBLISHER, i.e. 3+ context, harness; documented stub)
+ *   - publish-side layer suppression, Stage 3 WT + WS (#1093 — 3-context harness)
+ *
+ * The WT/QUIC per-receiver divergence (#1080 WT half) NO LONGER `test.fixme`s:
+ * it now RUNS in the default `dioxus` suite via the client-side `netsim` hook
+ * (no toxiproxy — see below and `helpers/downlink-impair.ts`).
+ *
+ * The `@impair` WS-divergence test (#1080 + #1108) RUNS, but only under
+ * `--project=impair` (it is grep-inverted out of the default suite). The
+ * single-context structural coverage of the receive Performance panel also lives
+ * in `performance-settings.spec.ts` (#1078 Receive-side controls), which is green.
+ *
+ * The descriptions on the remaining `test.fixme` cases document the INTENDED
+ * behaviour each will assert once its gating issue unblocks it.
  *
  * ## What runs in the default suite vs. the `@impair` project
  *
@@ -64,7 +104,8 @@
  *       5. Performance panel renders ALL THREE received-quality controls
  *          (video + audio + content) — #1082 structural assertion.
  *       6. AUDIO layering active under the flag (#1082-B: 2 → 3 layers). The
- *          audio needle readout's `L{i}/{N} · {kbps} kbps` reports the live
+ *          audio needle readout's `{Q} · {i}/{N} · {kbps} kbps` (#1222
+ *          quality-letter format) reports the live
  *          per-snapshot `layer_count` (the only DOM signal of audio simulcast);
  *          the ladder-length and bitrate invariants are asserted unconditionally
  *          and the >1-layer assertion is capability-gated like VIDEO send.
@@ -99,31 +140,43 @@
  *          `make e2e-impair`). See `TODO(ci)` in that test for the dedicated
  *          CI-job follow-up.
  *
- *   - STILL BLOCKED (documented `test.fixme`) — issue #1080, WT path:
- *       The same divergence over WebTransport/QUIC cannot be produced: toxiproxy
- *       is TCP-only and Playwright's proxy cannot carry QUIC/UDP, and per-client
- *       UDP `netem` needs an isolated netns the shared Playwright harness does
- *       not provide. Kept as `test.fixme` with the concrete blocker inline.
+ *   - RUNS IN THE DEFAULT `dioxus` SUITE (issue #1080, WT path):
+ *       Per-receiver congestion DIVERGENCE over WebTransport/QUIC. toxiproxy
+ *       (the WS mechanism) is TCP-only and cannot shape QUIC/UDP, so this case
+ *       instead uses the CLIENT-SIDE `netsim` hook: `impairDownlinkNetsim(page)`
+ *       installs a per-TAB inbound shim that drops VIDEO/SCREEN packets on ONLY
+ *       the degraded receiver (the `crushed_downlink` preset; AUDIO + control/RTT
+ *       always pass), pushing its `loss_per_sec` over the chooser's step-down
+ *       threshold. It is LOSS-ONLY (no bandwidth/delay emulation), works on BOTH
+ *       transports, needs NO proxy/profile, and is therefore NOT tagged `@impair`
+ *       — it runs against a plain `make e2e-up` stack (provided the UI image was
+ *       built with the `netsim` cargo feature). See `helpers/downlink-impair.ts`.
  *
  * ## Capability-ceiling caveat (see helpers/simulcast-config.ts)
  *
- * `capability_max_simulcast_layers()` reads a live ~100ms CPU benchmark with no
- * test override. On a weak CI runner the ceiling can clamp to 1 even with the
- * flag = 3, in which case the publisher emits a single layer. Test 1 detects
- * this (`layer_count <= 1`) and SKIPS rather than asserts a false negative.
+ * Post-#1140/#1141 `capability_max_simulcast_layers()` derives the ceiling from
+ * cheap device facts (core count + UA platform) with NO CPU benchmark; on a
+ * low-core CI container it clamps to 1, so the publisher would emit a single
+ * layer even with the flag = 3. The #1093 `testCapabilityMaxLayersOverride` hook
+ * (wired via `enableSimulcastFlag(ctx, 3, { capabilityMaxLayersOverride: 3 })`)
+ * REPLACES that sniffed ceiling so the runner emits the full ladder; the
+ * SEND-side and WT-divergence tests use it and prove it took effect via
+ * `assertCapabilityOverrideActive` BEFORE their `layer_count <= 1` skip guard.
+ * Tests without the override still SKIP rather than assert a false negative.
  *
  * Selectors used (all stable, defined in dioxus-ui source). This spec targets
  * the RECEIVE side only; since the unified send+receive panel landed (#1078) the
  * receive controls/needles live under the `perf-recv-*` / `perf-vu-recv-*`
  * namespace (the bare `perf-*` / `perf-vu-*` ids are now the SEND side):
- *   - `[data-testid="open-settings"]`               toolbar gear (settings modal)
- *   - `.device-settings-modal`                      the settings modal root
- *   - `role="tab" name="Performance"`               Performance nav tab
- *   - `#settings-panel-performance`                 the perf tabpanel
+ *   - toolbar "Open Diagnostics" button             opens the Diagnostics drawer
+ *       (#1131: the perf controls MOVED here from the Settings → Performance tab;
+ *        the tab + the `perf-open-diagnostics` cross-nav button are gone)
+ *   - `#diagnostics-sidebar`                        the drawer root scoping perf-*
  *   - `#perf-vu-recv-video-readout`                 video received-quality readout
- *       text format: `L{idx+1}/{count} · {w}x{h}` or "Not receiving"
+ *       text format: `{Q} · {idx+1}/{count} · {w}x{h}` or "Not receiving"
+ *       (#1222: `{Q}` is the quality letter L/M/H, or "1" single-layer)
  *   - `#perf-vu-recv-audio-readout`                 audio received-quality readout
- *       text format: `L{idx+1}/{count} · {kbps} kbps` or "Not receiving"
+ *       text format: `{Q} · {idx+1}/{count} · {kbps} kbps` or "Not receiving"
  *   - `[data-testid="perf-recv-video-range-max"]`   video max-layer range thumb
  *   - `[data-testid="perf-recv-video-auto"]`        video "Reset" button (#1131 §D
  *       REPURPOSED this testid off the former Auto TOGGLE; it is now a plain
@@ -140,6 +193,8 @@ import {
   impairDownlink,
   healDownlink,
   assertProxyUp,
+  impairDownlinkNetsim,
+  healDownlinkNetsim,
 } from "../helpers/downlink-impair";
 import { waitForServices } from "../helpers/wait-for-services";
 
@@ -149,6 +204,65 @@ import { waitForServices } from "../helpers/wait-for-services";
 
 /** Transport the publish-suppression (#1108 Stage 3) cases are parameterised over. */
 type Transport = "webtransport" | "websocket";
+
+/**
+ * Distinctive, stable substring of the `warn!` line that
+ * `capability_max_simulcast_layers()` (dioxus-ui/src/components/capability_check.rs)
+ * emits to the browser console WHENEVER the #1093 `testCapabilityMaxLayersOverride`
+ * key is honoured. The full line is:
+ *
+ *   "simulcast capability ceiling is TEST-OVERRIDDEN to N layer(s) (requested
+ *    testCapabilityMaxLayersOverride=M, clamped to [1, D]); the device-sniffed
+ *    ceiling was S (...). This is an e2e-only hook (issue #1093) ..."
+ *
+ * We match the `TEST-OVERRIDDEN` token: it is unique to that override branch (the
+ * non-override path logs an `info!` "simulcast capability ceiling: ..." with NO
+ * such token), so its presence proves the override actually replaced the sniffed
+ * ceiling — i.e. the `/config.js` route patch landed `testCapabilityMaxLayersOverride`
+ * and the UI consumed it. Asserting this BEFORE the `layerCount <= 1` skip guard
+ * stops a silently-broken override (key rename, route interception failing, config
+ * clobber) from clamping to 1 layer and SKIPPING the test — which would turn the
+ * suite green having tested nothing.
+ */
+const CAPABILITY_OVERRIDE_LOG_TOKEN = "TEST-OVERRIDDEN";
+
+/**
+ * Attach a console-message collector to `page` and return the live array of
+ * captured message texts (wasm `log::warn!`/`info!` lines surface here via
+ * `console_log`). MUST be called BEFORE the page's first navigation so the boot
+ * log — which includes the capability-ceiling decision — is captured.
+ */
+function collectConsole(page: Page): string[] {
+  const lines: string[] = [];
+  page.on("console", (msg) => {
+    lines.push(msg.text());
+  });
+  return lines;
+}
+
+/**
+ * Assert — failing, never skipping — that the #1093 capability override actually
+ * took effect on the publisher, by waiting for the `TEST-OVERRIDDEN` `warn!` line
+ * to appear in the collected console output. This is the positive proof that the
+ * override injection worked; it must run BEFORE any `test.skip(layerCount <= 1)`
+ * guard so a broken override fails loudly instead of skipping the test.
+ *
+ * `lines` is the array returned by {@link collectConsole}, attached to the
+ * publisher page before navigation.
+ */
+async function assertCapabilityOverrideActive(lines: string[]): Promise<void> {
+  await expect
+    .poll(() => lines.some((line) => line.includes(CAPABILITY_OVERRIDE_LOG_TOKEN)), {
+      timeout: 30_000,
+      intervals: [250, 500, 1000],
+      message:
+        `expected the publisher console to log the #1093 capability override ("${CAPABILITY_OVERRIDE_LOG_TOKEN}"). ` +
+        "Its absence means testCapabilityMaxLayersOverride did NOT take effect (config.js route " +
+        "interception failing, key rename, or config clobber) — the override is silently broken and the " +
+        "multi-layer assertion would otherwise SKIP on a clamped single layer, testing nothing.",
+    })
+    .toBe(true);
+}
 
 /**
  * Pin a BrowserContext to a specific media transport BEFORE its first navigation
@@ -218,12 +332,16 @@ async function pinReceiverToBaseLayer(page: Page, kind: "video" | "audio" | "scr
  * Applies to BOTH publisher and receiver contexts.
  */
 async function joinMeeting(page: Page, meetingId: string, displayName: string): Promise<void> {
-  // Pre-join camera defaults to OFF; force it ON before the app boots so the
-  // publisher emits video. addInitScript runs on every navigation in this page
-  // before the page's own scripts.
+  // Pre-join camera AND mic default to OFF (see `load_preferred_camera_on` /
+  // `load_preferred_mic_on`, context.rs); force BOTH ON before the app boots so
+  // the publisher emits video AND audio. The audio-ladder / flag-OFF specs read
+  // the receiver's AUDIO readout, which stays "Not receiving" forever unless the
+  // publisher's mic is actually sending. addInitScript runs on every navigation
+  // in this page before the page's own scripts.
   await page.addInitScript(() => {
     try {
       window.localStorage.setItem("vc_prejoin_camera_on", "true");
+      window.localStorage.setItem("vc_prejoin_mic_on", "true");
     } catch {
       /* storage may be unavailable pre-navigation; the app origin sets it */
     }
@@ -276,6 +394,64 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
         });
     }
 
+    // HOST ONLY: disable the Waiting Room before starting. The first joiner
+    // becomes the host, and the host's pre-join card defaults the Waiting Room
+    // toggle ON, which parks every SUBSEQUENT joiner (the receiver(s)) on the
+    // "Waiting to be admitted" screen — they never reach #grid-container and the
+    // receiver join times out. (This — NOT a renderer crash — is what actually
+    // blocks the 2/3-context joins in this spec; see #1093.) The Waiting Room
+    // option is rendered ONLY for the owner (pre_join_settings_card.rs `is_owner`),
+    // so this is a no-op on a non-host pre-join card. We toggle it OFF so the
+    // later joiners are auto-admitted straight into the grid (matching the admit
+    // flow proven in two-users-meeting.spec.ts, but without cross-page
+    // choreography in every test). The toggle is a `button[role="switch"]` inside
+    // the row labelled "Waiting Room".
+    const waitingRoomRow = page.locator(".settings-option-row", {
+      has: page.getByText("Waiting Room", { exact: true }),
+    });
+    const waitingRoomToggle = waitingRoomRow.getByRole("switch");
+    // The switch is rendered ONLY on the owner's pre-join card (`is_owner` in
+    // pre_join_settings_card.rs); on a non-host page it is absent and this whole
+    // block is a no-op. Guard on visibility so the receiver's card never blocks.
+    if (await waitingRoomToggle.isVisible().catch(() => false)) {
+      // SETTLE the toggle before reading it. Its `aria-checked` is seeded ASYNC
+      // from the server meeting status: the card can render `false` first and flip
+      // to `true` a beat later. A one-shot read can therefore catch the transient
+      // `false`, skip the click, and leave the Waiting Room ON — parking every
+      // later joiner. Poll until two consecutive reads (~250 ms apart) agree, so we
+      // act on the SETTLED state. Bounded; if it never settles we fall through and
+      // simply don't toggle (worst case = the pre-existing one-shot behaviour).
+      let settled: string | null = null;
+      await expect
+        .poll(
+          async () => {
+            const first = await waitingRoomToggle.getAttribute("aria-checked").catch(() => null);
+            await page.waitForTimeout(250);
+            const second = await waitingRoomToggle.getAttribute("aria-checked").catch(() => null);
+            if (first !== null && first === second) {
+              settled = second;
+              return true;
+            }
+            return false;
+          },
+          { timeout: 10_000, intervals: [250, 500] },
+        )
+        .toBe(true)
+        .catch(() => {
+          /* never settled within budget — fall through without toggling */
+        });
+      if (settled === "true") {
+        await waitingRoomToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+        // The toggle writes the meeting setting via the meeting-api; wait for the
+        // switch to flip to OFF so the setting has been applied before we join.
+        await expect(waitingRoomToggle).toHaveAttribute("aria-checked", "false", {
+          timeout: 10_000,
+        });
+      }
+    }
+
     const cameraToggle = page.locator('[data-testid="prejoin-camera-toggle"]');
     if (await cameraToggle.isVisible().catch(() => false)) {
       if ((await cameraToggle.getAttribute("aria-pressed")) !== "true") {
@@ -301,6 +477,21 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
         .toBeGreaterThan(0);
     }
 
+    // Enable the MIC on the pre-join card too, so the publisher actually sends
+    // audio (the receiver's audio-ladder / flag-OFF readout assertions need a
+    // real decoded audio stream). The persisted `vc_prejoin_mic_on=true` seed
+    // above is the primary lever; this click is belt-and-suspenders in case the
+    // toggle rendered from a stale default before the seed was read. Same
+    // `aria-pressed` contract as the camera toggle (pre_join_settings_card.rs).
+    const micToggle = page.locator('[data-testid="prejoin-mic-toggle"]');
+    if (await micToggle.isVisible().catch(() => false)) {
+      if ((await micToggle.getAttribute("aria-pressed")) !== "true") {
+        await micToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+      }
+    }
+
     await page.waitForTimeout(500);
     await joinButton.click().catch(() => {
       /* auto-join already unmounted the pre-join button */
@@ -311,37 +502,58 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
 }
 
 /**
- * Open Settings → Performance and return the visible perf tabpanel locator.
+ * Open the in-meeting Diagnostics drawer (the new home of the Performance
+ * controls, #1131) and return the drawer locator that scopes the perf controls.
  *
- * The #1095 redesign REMOVED the old `Receive | Send` direction toggle: every
- * per-kind card now renders both a Sending and a Receiving column at once, so the
- * receive controls/meters (`perf-recv-*` / `perf-vu-recv-*`) are always mounted
- * once the Performance tab is open. We assert the receive video meter is visible
- * as a readiness guard (this whole spec reads RECEIVE needles/controls).
+ * #1131 RELOCATION: the Performance panel MOVED out of the Settings → Performance
+ * modal tab into the right-side Diagnostics drawer (`#diagnostics-sidebar`),
+ * mounted as the "Quality controls" group. The receive controls/meters
+ * (`perf-recv-*` / `perf-vu-recv-*`) now render directly inside the drawer's
+ * `.sidebar-content` (no `#settings-panel-performance` tabpanel any more). The
+ * `perf-*` COMPONENTS are unchanged — only the mount moved — so this spec's
+ * RECEIVE assertions are untouched; only the opening flow swapped from "Settings
+ * → Performance tab" to "Open Diagnostics".
+ *
+ * The #1095 redesign already removed the `Receive | Send` direction toggle: every
+ * per-kind card renders both a Sending and a Receiving column at once, so the
+ * receive controls/meters are always mounted once the drawer is open. We assert
+ * the receive video meter is visible INSIDE the drawer as a readiness +
+ * relocation guard (this whole spec reads RECEIVE needles/controls).
  */
 async function openPerformancePanel(page: Page) {
-  await page.locator('[data-testid="open-settings"]').click();
-  await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
-  await page.getByRole("tab", { name: "Performance" }).click();
-  const panel = page.locator("#settings-panel-performance");
-  await expect(panel).toBeVisible({ timeout: 10_000 });
-  // The #1095 redesign removed the Receive | Send direction toggle: both
-  // directions render together, so the receive-side meter is always present.
-  // Assert it as a readiness guard (was: click the receive toggle segment).
-  await expect(page.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible({ timeout: 5_000 });
-  return panel;
+  // The diagnostics button carries no data-testid; locate it via its tooltip
+  // text (mirrors protocol-selection.spec.ts::openDiagnosticsPanel).
+  const diagButton = page.locator("button", {
+    has: page.locator("span.tooltip", { hasText: "Open Diagnostics" }),
+  });
+  await diagButton.click();
+  const drawer = page.locator("#diagnostics-sidebar");
+  await expect(drawer).toBeVisible({ timeout: 10_000 });
+  // Readiness + relocation proof: the migrated receive video meter is present
+  // INSIDE the drawer (not anywhere else on the page).
+  await expect(drawer.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible({
+    timeout: 10_000,
+  });
+  return drawer;
 }
 
 /**
  * Parse the video received-quality readout `#perf-vu-recv-video-readout`.
  * Returns null while the readout reads "Not receiving" (nothing decoded yet),
- * otherwise `{ layerIndex, layerCount }` (1-based "L{idx+1}/{count}" → 0-based).
+ * otherwise `{ layerIndex, layerCount }`.
+ *
+ * #1222 Directive 4 — the readout format changed from `"L{idx+1}/{count} · …"`
+ * to `"{Q} · {idx+1}/{count} · …"` where `{Q}` is the quality letter
+ * (L/M/H, or "1" for a degenerate single-layer ladder). We parse the
+ * `{position}/{count}` numbers AFTER the leading quality letter + " · "; the
+ * letter itself is not load-bearing for these tests (the position/count is the
+ * 0-based index basis every assertion uses), so we skip past it permissively.
  */
 async function readVideoLayer(
   page: Page,
 ): Promise<{ layerIndex: number; layerCount: number } | null> {
   const text = (await page.locator("#perf-vu-recv-video-readout").textContent())?.trim() ?? "";
-  const m = text.match(/^L(\d+)\/(\d+)/);
+  const m = text.match(/^\S+\s+·\s+(\d+)\/(\d+)/);
   if (!m) return null;
   return { layerIndex: Number(m[1]) - 1, layerCount: Number(m[2]) };
 }
@@ -351,8 +563,9 @@ async function readVideoLayer(
  *
  * The audio readout format (see `format_readout` in
  * `dioxus-ui/src/components/performance_settings.rs`) is
- * `"L{idx+1}/{count} · {kbps} kbps"` while receiving, or "Not receiving" before
- * the first audio frame is decoded.
+ * `"{Q} · {idx+1}/{count} · {kbps} kbps"` while receiving (#1222 Directive 4:
+ * `{Q}` is the quality letter L/M/H, or "1" single-layer), or "Not receiving"
+ * before the first audio frame is decoded.
  *
  * `count` is the LIVE per-snapshot `layer_count` reported by the publisher's
  * audio ladder — this is the only DOM-observable signal of #1082-B (AUDIO went
@@ -362,13 +575,14 @@ async function readVideoLayer(
  * we assert here.
  *
  * Returns null while the readout reads "Not receiving"; otherwise
- * `{ layerIndex (0-based), layerCount, kbps }`.
+ * `{ layerIndex (0-based), layerCount, kbps }`. We skip the leading quality
+ * letter + " · " and parse the `{position}/{count} · {kbps} kbps` tail.
  */
 async function readAudioLayer(
   page: Page,
 ): Promise<{ layerIndex: number; layerCount: number; kbps: number } | null> {
   const text = (await page.locator("#perf-vu-recv-audio-readout").textContent())?.trim() ?? "";
-  const m = text.match(/^L(\d+)\/(\d+)\s+·\s+(\d+)\s+kbps/);
+  const m = text.match(/^\S+\s+·\s+(\d+)\/(\d+)\s+·\s+(\d+)\s+kbps/);
   if (!m) return null;
   return {
     layerIndex: Number(m[1]) - 1,
@@ -394,7 +608,45 @@ const AUDIO_LADDER_KBPS = [24, 32, 50] as const;
 test.describe("Per-receiver simulcast (flag-on)", () => {
   // Two real browser contexts (publisher + receiver) drive several specs; the
   // peer-discovery + layer-adaptation waits make these slower than a unit test.
-  test.describe.configure({ timeout: 180_000 });
+  //
+  // SERIAL (#1093 renderer-crash mitigation). Each test here launches TWO (the
+  // @impair divergence test THREE) Chromium *browsers* — a publisher + receiver(s)
+  // — each running a live camera plus simulcast encode/decode (multiple concurrent
+  // WebCodecs `VideoEncoder`s on the publisher, multi-layer decode on the
+  // receiver). That is the heaviest renderer footprint in the suite.
+  //
+  // The crash in #1093 ("Target page, context or browser has been closed" — the
+  // 2nd context never reaches `#grid-container` within the 30 s join timeout) is
+  // renderer OOM/kill on the 8-vCPU self-hosted CI runner (c7a.2xlarge) when too
+  // many heavy WebCodecs renderers are alive at once. Two levers bound that, and
+  // we use BOTH:
+  //
+  //   1. PER-RENDERER FOOTPRINT — already in place: BROWSER_ARGS
+  //      (helpers/auth-context.ts) and the project CHROME_ARGS
+  //      (playwright.config.ts) both carry `--disable-dev-shm-usage` (don't put
+  //      the renderer's shared memory in the typically-undersized container
+  //      `/dev/shm`, the classic "context closed" trigger), `--disable-gpu`, and
+  //      `--renderer-process-limit=1`. These shrink each renderer but do NOT bound
+  //      the NUMBER of concurrent renderers.
+  //
+  //   2. CONCURRENT-RENDERER COUNT — this `mode: "serial"`. The project runs
+  //      `workers: 2`, so a heavy test in THIS spec can otherwise overlap with a
+  //      test in ANOTHER spec file on the second worker (and, during a retry, with
+  //      the teardown/`browser.close()` of the previous test in this same spec).
+  //      Serial mode pins this whole describe to a single worker and runs its
+  //      tests strictly one-at-a-time, so at most ONE publisher+receiver(s) group
+  //      of browsers from this spec is ever live — capping the peak heavy-renderer
+  //      count this spec contributes. (`fullyParallel:false` already orders
+  //      in-file tests, but does not prevent the cross-file overlap or couple the
+  //      retry lifecycle; serial makes the one-at-a-time guarantee explicit and
+  //      load-bearing, and on a genuinely starved runner its skip-on-first-failure
+  //      yields a fast clean signal instead of 4× retried OOM crashes.)
+  //
+  // The in-test dual load (publisher encoding while the receiver decodes) is
+  // inherent to a cross-peer simulcast assertion and cannot be removed; the joins
+  // are already staggered (awaited sequentially, publisher before receiver) so the
+  // two renderers do not ramp their encoders at the same instant.
+  test.describe.configure({ mode: "serial", timeout: 180_000 });
 
   test.beforeAll(async () => {
     await waitForServices();
@@ -403,14 +655,18 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // -------------------------------------------------------------------------
   // 1. Multi-layer SEND active (flag-on) — proxy via received ladder size.
   //
-  // FIXME(#1093): multi-party (2-context) — needs a renderer-crash-resilient
-  // runner + a capability-override hook to force >=2 layers. In headless CI the
-  // two authenticated contexts each running camera + simulcast encode/decode
-  // crash the renderer ("Target page/context closed") so the 2nd context never
-  // reaches the grid, AND the capability ceiling clamps the runner to 1 layer so
-  // the multi-layer assertion would skip anyway.
+  // UN-FIXME'd (#1093): the renderer-crash mitigation (serial describe + the
+  // existing `--disable-dev-shm-usage` / `--renderer-process-limit=1` launch
+  // flags) lets the 2-context publisher+receiver join survive on the 8-vCPU CI
+  // runner, and the `capabilityMaxLayersOverride: 3` hook REPLACES the device-
+  // sniffed ceiling (which clamps a low-core container to 1) so the publisher
+  // actually emits the full ladder and the multi-layer SEND assertion RUNS
+  // instead of skipping. The `test.skip(layerCount <= 1)` guard below is retained
+  // as defence-in-depth: with the override in effect it should not trip, but if
+  // some future runner still clamps it degrades to a skip rather than a false
+  // negative.
   // -------------------------------------------------------------------------
-  test.fixme("publisher emits >1 simulcast layer when the flag is on", async ({ baseURL }) => {
+  test("publisher emits >1 simulcast layer when the flag is on", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_send_${Date.now()}`;
 
@@ -430,15 +686,28 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         uiURL,
       );
       // Flag ON for BOTH ends: the publisher must encode multiple layers, and
-      // the receiver must be allowed to climb above the base layer.
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(rxCtx, 3);
+      // the receiver must be allowed to climb above the base layer. The #1093
+      // `capabilityMaxLayersOverride: 3` REPLACES the device-sniffed capability
+      // ceiling so a low-core CI container (sniffed → 1) still encodes the full
+      // ladder, making the multi-layer SEND assertion exercisable.
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
 
+      // Capture the publisher console BEFORE navigation so the capability-ceiling
+      // boot log (the #1093 override warn) is collected.
+      const pubConsole = collectConsole(pubPage);
+
       await joinMeeting(pubPage, meetingId, "SimPublisher");
       await joinMeeting(rxPage, meetingId, "SimReceiver");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — assert the override actually took effect
+      // BEFORE the skip guard below. If injection silently broke, layerCount would
+      // clamp to 1 and the test would SKIP having tested nothing; this fails loud
+      // instead. See assertCapabilityOverrideActive.
+      await assertCapabilityOverrideActive(pubConsole);
 
       // Each side should see the other's tile (peers connected).
       await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
@@ -486,11 +755,11 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    Drag the video max thumb to the lowest layer with a HEALTHY downlink
   //    and assert the needle never exceeds that threshold.
   //
-  // FIXME(#1093): multi-party (2-context) — needs a renderer-crash-resilient
-  // runner + a capability-override hook to force >=2 layers. Headless CI crashes
-  // the 2nd context ("Target page/context closed") and clamps to 1 layer.
+  // UN-FIXME'd (#1093): the renderer-crash mitigation (serial describe + launch
+  // flags) lets the 2-context join survive on CI, and `capabilityMaxLayersOverride:
+  // 3` forces a >1-layer ladder so there is headroom for the threshold to clamp.
   // -------------------------------------------------------------------------
-  test.fixme("receive needle never exceeds the user's max-layer threshold", async ({ baseURL }) => {
+  test("receive needle never exceeds the user's max-layer threshold", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_thresh_${Date.now()}`;
 
@@ -509,14 +778,23 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "SimReceiver2",
         uiURL,
       );
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(rxCtx, 3);
+      // #1093 override forces a multi-layer ladder so the threshold has headroom
+      // to clamp (a single-layer runner would have nothing to step down to).
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
 
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
       await joinMeeting(pubPage, meetingId, "SimPublisher2");
       await joinMeeting(rxPage, meetingId, "SimReceiver2");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
+      // take effect; see assertCapabilityOverrideActive. Runs before the skip guard.
+      await assertCapabilityOverrideActive(pubConsole);
 
       await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
@@ -589,11 +867,14 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // 4. Default Auto — with no threshold set the panel shows Auto (full range)
   //    and the needle is free to reflect auto-selection across the full ladder.
   //
-  // FIXME(#1093): multi-party (2-context) — needs a renderer-crash-resilient
-  // runner + a capability-override hook to force >=2 layers. Headless CI crashes
-  // the 2nd context ("Target page/context closed") and clamps to 1 layer.
+  // UN-FIXME'd (#1093): the renderer-crash mitigation (serial describe + launch
+  // flags) lets the 2-context join survive on CI. The `capabilityMaxLayersOverride:
+  // 3` is passed for consistency with the other SEND tests (the full ladder is the
+  // realistic state this asserts the default Auto range against), though this
+  // test's assertions are structural (the thumbs sit at the range extremes) and do
+  // not themselves require >1 layer.
   // -------------------------------------------------------------------------
-  test.fixme("default receive preference is Auto (full range)", async ({ baseURL }) => {
+  test("default receive preference is Auto (full range)", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_auto_${Date.now()}`;
 
@@ -612,14 +893,26 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "SimReceiver3",
         uiURL,
       );
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(rxCtx, 3);
+      // #1093 override forces the full ladder so the "full automatic range" the
+      // default-Auto assertion checks actually SPANS up (max thumb top index > 0);
+      // on a single-layer runner the range would collapse to [0,0] and the
+      // "range spans up" check would be vacuous.
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
 
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
       await joinMeeting(pubPage, meetingId, "SimPublisher3");
       await joinMeeting(rxPage, meetingId, "SimReceiver3");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — the "range spans up" assertion below relies
+      // on the override forcing a multi-layer ladder; prove the override landed (fail,
+      // not skip) before asserting against it. See assertCapabilityOverrideActive.
+      await assertCapabilityOverrideActive(pubConsole);
 
       await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
@@ -636,13 +929,21 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       const maxThumb = rxPage.locator('[data-testid="perf-recv-video-range-max"]');
       await expect(minThumb).toHaveValue("0");
       // The max thumb sits at the top index (full range). The exact top value is
-      // the ladder size minus one; assert it is non-zero (range spans up).
+      // the ladder size minus one. With the #1093 override forcing the full
+      // ladder this MUST be non-zero — assert it so the "range spans up" claim is
+      // real (otherwise a single-layer [0,0] range would satisfy the value check
+      // vacuously and the test would prove nothing about Auto being full-range).
       const topValue = await maxThumb.getAttribute("max");
+      expect(
+        Number(topValue),
+        "default Auto range must span up (multi-layer ladder)",
+      ).toBeGreaterThan(0);
       await expect(maxThumb).toHaveValue(String(topValue));
 
       // The needle gauge is present and the readout reflects auto-selection
-      // (either actively decoding "L../.." or "Not receiving" before first
-      // frame). It must NOT be artificially clamped — full range is in effect.
+      // (either actively decoding "{Q} · {i}/{n} · …" — #1222 quality-letter
+      // format — or "Not receiving" before the first frame). It must NOT be
+      // artificially clamped — full range is in effect.
       await expect(panel.locator("#perf-vu-recv-video-readout")).toBeVisible();
       await expect
         .poll(
@@ -652,7 +953,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
             intervals: [500, 1000, 2000],
           },
         )
-        .toMatch(/^(L\d+\/\d+|Not receiving)/);
+        .toMatch(/^(\S+ · \d+\/\d+|Not receiving)/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -668,15 +969,16 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    assertion (no capability ceiling dependency): the controls are always
   //    rendered regardless of how many layers the runner ends up emitting.
   //
-  // FIXME(#1093): multi-party (2-context) — although the assertion itself is
-  // structural (capability-independent), it still requires the publisher +
-  // receiver 2-context join, which crashes the 2nd renderer in headless CI
-  // ("Target page/context closed"). Needs a renderer-crash-resilient runner (a
-  // capability-override hook is not strictly required for this one, but the join
-  // is). The single-context structural coverage of the receive panel lives in
-  // performance-settings.spec.ts (#1078 Receive-side controls).
+  // UN-FIXME'd (#1093): the assertion itself is structural
+  // (capability-independent — the controls render regardless of layer count), so
+  // the ONLY thing that blocked it was the 2-context join crashing the 2nd
+  // renderer. The renderer-crash mitigation (serial describe + launch flags)
+  // unblocks that join. `capabilityMaxLayersOverride: 3` is still passed for
+  // parity with the other SEND tests / a realistic multi-layer state, but is not
+  // strictly required here. The single-context structural coverage of the receive
+  // panel also lives in performance-settings.spec.ts (#1078 Receive-side controls).
   // -------------------------------------------------------------------------
-  test.fixme("receive Performance panel renders video + audio + content controls", async ({
+  test("receive Performance panel renders video + audio + content controls", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";
@@ -697,14 +999,22 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "SimReceiver5",
         uiURL,
       );
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(rxCtx, 3);
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const rxPage = await rxCtx.newPage();
 
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
       await joinMeeting(pubPage, meetingId, "SimPublisher5");
       await joinMeeting(rxPage, meetingId, "SimReceiver5");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — this test passes capabilityMaxLayersOverride
+      // for parity / a realistic multi-layer state, so prove it landed (fail, not skip).
+      // See assertCapabilityOverrideActive.
+      await assertCapabilityOverrideActive(pubConsole);
 
       await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
         timeout: 30_000,
@@ -746,9 +1056,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       }
 
       // The audio readout must be present and reflect a valid state: either
-      // actively decoding ("L../.. kbps") or the "Not receiving" placeholder
-      // before the first audio frame. (Layer-count content is asserted in the
-      // dedicated audio-layering test below.)
+      // actively decoding ("{Q} · {i}/{n} · {kbps} kbps" — #1222 quality-letter
+      // format) or the "Not receiving" placeholder before the first audio frame.
+      // (Layer-count content is asserted in the dedicated audio-layering test below.)
       await expect(panel.locator("#perf-vu-recv-audio-readout")).toBeVisible();
       await expect
         .poll(
@@ -758,7 +1068,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
             intervals: [500, 1000, 2000],
           },
         )
-        .toMatch(/^(L\d+\/\d+ · \d+ kbps|Not receiving)/);
+        .toMatch(/^(\S+ · \d+\/\d+ · \d+ kbps|Not receiving)/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -768,7 +1078,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // -------------------------------------------------------------------------
   // 6. AUDIO layering is active under the flag (#1082-B: audio 2 → 3 layers).
   //    The only DOM-observable signal of audio simulcast is the audio needle
-  //    readout's reported `layer_count` (`L{i}/{N} · {kbps} kbps`). With the
+  //    readout's reported `layer_count` (`{Q} · {i}/{N} · {kbps} kbps`, #1222
+  //    quality-letter format). With the
   //    flag on and a capable runner, the publisher emits up to 3 audio layers,
   //    so the receiver's readout `N` rises above 1. As with VIDEO send, a weak
   //    CI runner's capability ceiling can clamp audio to a single layer — in
@@ -780,9 +1091,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // runner + a capability-override hook to force >=2 layers. Headless CI crashes
   // the 2nd context ("Target page/context closed") and clamps audio to 1 layer.
   // -------------------------------------------------------------------------
-  test.fixme("audio readout reflects the multi-layer ladder when the flag is on", async ({
-    baseURL,
-  }) => {
+  test("audio readout reflects the multi-layer ladder when the flag is on", async ({ baseURL }) => {
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_simulcast_audio_${Date.now()}`;
 
@@ -867,18 +1176,19 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //
   // FIXME(#1093): multi-PEER (>= 2 publishers + 1 receiver, i.e. 3 contexts) —
   // needs a renderer-crash-resilient runner + a capability-override hook. After
-  // the #1095 redesign the per-peer receive breakdown lives in the Diagnostics
-  // sidebar (reached via the `diag-open-performance` ⇄ `perf-open-diagnostics`
-  // cross-nav), one block per kind, only rendered when >= 1 peer is decoding that
-  // kind:
+  // the #1131 unification the per-peer receive breakdown lives in the Diagnostics
+  // drawer's "Simulcast layers" section (Group B of the same open drawer), one
+  // block per kind, only rendered when >= 1 peer is decoding that kind:
   //   * 0 peers → the kind block is absent (single-context receive coverage —
   //     the "Not receiving" readout placeholder — is green in
   //     performance-settings.spec.ts → receive-needle/readout tests),
   //   * >= 1 peer → `[data-testid="diag-simulcast-recv-{kind}"]` with a head
-  //     "{kind} · {n} peer(s) · {spread}", the top-3 peers as
+  //     "{kind} · {n} peer(s) · {spread}" where {spread} is the quality-letter
+  //     range (#1222: e.g. "L–H", or a single letter "H" when all peers share a
+  //     layer), the top-3 peers as
   //     `[data-testid="diag-simulcast-recv-peer-{sessionId}"]` rows, plus, when
   //     n > 3, a `[data-testid="diag-simulcast-recv-more-{kind}"]` tail
-  //     ("+{n-3} more peer(s) at L{lo}").
+  //     ("+{n-3} more peer(s) on {Quality}" — the full quality word, e.g. "Low").
   //
   // Exercising the per-peer rows + the "+N more" tail therefore requires a real
   // multi-peer simulcast meeting (>= 2 senders so the receiver has >= 2 peers for
@@ -891,10 +1201,12 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // INTENDED assertions once #1093 unblocks this (sketch — left unimplemented on
   // purpose so it is a documented stub, not a runnable test):
   //   1. Join >= 2 publishers (cameras ON, flag ON) + 1 receiver into one room.
-  //   2. openPerformancePanel(rxPage), then click `perf-open-diagnostics` to land
-  //      in the Diagnostics sidebar's "Simulcast layers" section.
+  //   2. openPerformancePanel(rxPage) — one open drawer surfaces BOTH the perf
+  //      controls (Group A) and the "Simulcast layers" section (Group B); no
+  //      cross-nav click needed any more (#1131).
   //   3. expect.poll `[data-testid="diag-simulcast-recv-video"]` head to read
-  //      /\d+ peer\(s\) · L/.
+  //      /\d+ peer\(s\) · [LMH]/ (#1222: the spread starts with a quality letter
+  //      L/M/H, not the old "L{n}" number).
   //   4. Assert a `[data-testid="diag-simulcast-recv-peer-{sessionId}"]` row
   //      exists for each visible peer (top-3), and with >= 4 publishers assert
   //      `[data-testid="diag-simulcast-recv-more-video"]` reads /\+\d+ more/.
@@ -906,7 +1218,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // multi-peer harness will additionally exercise, in the perf panel:
   //   * `[data-testid="perf-recv-{kind}-peers"]` — a native <details> (collapsed
   //     by default) whose `[data-testid="perf-recv-{kind}-peers-summary"]` shows
-  //     "{n} peers · L{lo}–L{hi}". After expanding it:
+  //     "{n} peers · {Qlo}–{Qhi}" (#1222: quality-letter spread, e.g. "L–H").
+  //     After expanding it:
   //   * one `[data-testid="perf-recv-{kind}-peer-{sessionId}"]` row per peer, each
   //     carrying a quality dot `…-peer-{sessionId}-q` (class
   //     `perf-q-dot--{optimal|medium|low}`) and — only when the peer is below the
@@ -963,8 +1276,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //    message if someone runs the impair project without the proxy.
   //
   //    SCOPE: WebSocket only — `routeDownlinkThroughProxy` pins the degraded
-  //    context to WS because toxiproxy is TCP-only. The WT/QUIC equivalent
-  //    stays `test.fixme` immediately below with its concrete blocker.
+  //    context to WS because toxiproxy is TCP-only. The WT/QUIC equivalent runs
+  //    immediately below via the client-side `netsim` hook (no toxiproxy, so it
+  //    lives in the default `dioxus` suite, not under `@impair`).
   //
   //    TODO(ci): this `@impair` test is NOT yet wired into a CI job. The
   //    existing CI workflows run `--project=dioxus` (full, e2e-hcl.yaml) and
@@ -1083,17 +1397,29 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       // PHASE 3 — the degraded receiver's chosen layer must drop strictly BELOW
       // the healthy receiver's. The sender and the healthy receiver share
       // neither the proxy nor the relay channel, so the healthy peer stays high.
+      // Guard against a vacuous pass on BOTH sides:
+      //   - HEALTHY must be decoding (non-null) — a null healthy read returns
+      //     false so we never compare against a missing baseline.
+      //   - DEGRADED must ALSO still be decoding (non-null). Under the
+      //     `crushed_downlink` preset the degraded receiver can lose decode
+      //     entirely (keyframe starvation) and read "Not receiving" →
+      //     `readVideoLayer` returns null. Treating a null degraded as the base
+      //     layer (index 0) would pass this assertion for the WRONG reason
+      //     ("stopped decoding" rather than "stepped down to a lower layer"). So
+      //     a null degraded read ALSO returns false — pinning the claim to
+      //     "degraded converged to a strictly lower DECODED layer."
+      //   - The degraded peer may legitimately oscillate through brief "Not
+      //     receiving" windows under heavy loss. Returning false on null does
+      //     NOT fail fast — the poll keeps going (timeout 90s, intervals settle
+      //     at 5s) until it catches a frame window where degraded IS decoding at
+      //     a lower index. That is the intended semantics.
       await expect
         .poll(
           async () => {
             const healthy = await readVideoLayer(healthyPage);
             const degraded = await readVideoLayer(degradedPage);
-            // Degraded may briefly read "Not receiving" mid-step-down; treat
-            // that as the base layer (the lowest possible — still a divergence
-            // only if the healthy peer is above base).
-            const degradedIdx = degraded?.layerIndex ?? 0;
-            if (!healthy) return false;
-            return degradedIdx < healthy.layerIndex;
+            if (!healthy || !degraded) return false;
+            return degraded.layerIndex < healthy.layerIndex;
           },
           { timeout: 90_000, intervals: [2000, 3000, 5000] },
         )
@@ -1145,35 +1471,46 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
-  // 2b. WT/QUIC per-receiver divergence — STILL BLOCKED (documented). #1108 +
-  //     #1080 (WT path), tracked under #1093 for the harness work.
+  // 2b. WT/QUIC per-receiver divergence — now EXERCISED via the client-side
+  //     netsim hook (issue #1080 WT half + #1108).
   //
-  // The same relay-side overflow → loss → step-down mechanism (and therefore the
-  // same #1108 "one bad receiver doesn't degrade the others" proof) applies on
-  // the WebTransport path, but we cannot impair ONE WT client from this
-  // Playwright harness:
-  //   - WebTransport is QUIC over UDP. toxiproxy (used by the WS case above) is
-  //     TCP-only, and Playwright's `newContext({ proxy })` only carries the
-  //     browser's TCP/HTTP(S) traffic — neither can shape QUIC/UDP datagrams.
-  //   - Per-client UDP impairment needs `tc qdisc … netem` keyed to that
-  //     client's 5-tuple in an ISOLATED netns/veth. Playwright runs Chromium on
-  //     the host in a SHARED netns, so a netem qdisc there degrades EVERY
-  //     context (sender + both receivers), not just the degraded one.
-  // When the bots-app netsim orchestrator can drive a per-client veth (the #1093
-  // harness work), this can reuse the WS case's identical assertion against a UDP
-  // netem hook. (Multi-party renderer-crash + capability concerns also apply
-  // here — see #1093.)
+  // The same chooser step-down → divergence (and therefore the same #1108 "one
+  // bad receiver doesn't degrade the others" proof) applies on the WebTransport
+  // path. The WS case above manufactures loss RELAY-side via a toxiproxy TCP
+  // bandwidth clamp, which cannot work for WT: toxiproxy is TCP-only and
+  // Playwright's `newContext({ proxy })` only carries TCP/HTTP(S), so neither can
+  // shape QUIC/UDP datagrams; and per-client UDP `tc … netem` needs an isolated
+  // netns the shared-netns Playwright harness does not provide.
   //
-  // The body below is written out (but `fixme`d) so it is READY the moment a
-  // per-client UDP downlink-impairment helper exists. It mirrors the WS test
-  // exactly, INCLUDING the #1108 non-regression assertion (the healthy peer's
-  // layer must not shrink when the OTHER receiver goes bad). The only missing
-  // piece is the impairment hook — sketched here as `impairDownlinkUdp` /
-  // `healDownlinkUdp` (NOT YET IMPLEMENTED; see #1093). Until that helper lands,
-  // referencing it would not type-check, so the impairment + heal calls are left
-  // as TODO markers rather than live calls.
+  // #1080's WT half solves this by moving the impairment INTO the client: when
+  // the dioxus UI is built with the `netsim` cargo feature, every page exposes
+  // `window.__vcNetsim`, and `impairDownlinkNetsim(page)` installs a PER-TAB
+  // inbound shim that drops ~40% of arriving VIDEO/SCREEN packets (the
+  // `crushed_downlink` preset; AUDIO + control/RTT always pass). Those dropped
+  // packets are real sequence gaps → the receive-side `SequenceTracker` pushes
+  // `loss_per_sec` over the chooser's >= 5 gaps/sec step-down threshold → ONLY
+  // that receiver drops a layer. It is LOSS-ONLY (no bandwidth/delay emulation)
+  // and works on BOTH transports with no proxy/profile, so this runs against a
+  // plain `make e2e-up` stack. See `helpers/downlink-impair.ts` for the full
+  // mechanism and semantics.
+  //
+  // GROUPING: deliberately NOT tagged `@impair`. The `@impair` tag forces a test
+  // into the `impair` Playwright project, which requires the toxiproxy compose
+  // profile (`make e2e-up-impair`) and is grep-inverted OUT of the default
+  // `dioxus` suite. This test needs NO toxiproxy — the netsim hook is client-side
+  // — so it runs as a normal `dioxus`-suite test against `make e2e-up`. Its only
+  // extra requirement is that the UI image carries the `netsim` feature, which
+  // `assertNetsimAvailable` (inside `impairDownlinkNetsim`) checks with an
+  // actionable rebuild error rather than a confusing TypeError.
+  //
+  // It mirrors the WS test's structure exactly, INCLUDING the #1108
+  // non-regression assertion (the healthy peer's layer must not shrink when the
+  // OTHER receiver goes bad). The capability-ceiling override (#1093) is wired
+  // like the SEND tests so a low-core CI runner still emits the full ladder
+  // (otherwise PHASE 1 would skip-clamp). Multi-party renderer-crash mitigation
+  // is the describe-level `mode: "serial"`.
   // -------------------------------------------------------------------------
-  test.fixme("one bad receiver does not degrade the others over WebTransport (WT, #1108) — needs per-client UDP netem", async ({
+  test("one bad receiver does not degrade the others over WebTransport (WT, #1108) — client-side netsim, no toxiproxy", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";
@@ -1182,10 +1519,11 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
     // 1 publisher + 2 receivers, ALL on WebTransport (the production-primary
     // transport). Unlike the WS case we do NOT pin the degraded receiver to WS —
     // the whole point of this case is to prove the #1108 isolation holds on the
-    // QUIC path too.
+    // QUIC path too. The netsim hook works regardless of the elected transport.
     const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
     const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
     const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let degradedPage: Page | undefined;
     try {
       const pubCtx = await createAuthenticatedContext(
         pubBrowser,
@@ -1205,33 +1543,42 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "SimDegradedWT",
         uiURL,
       );
-      await enableSimulcastFlag(pubCtx, 3);
-      await enableSimulcastFlag(healthyCtx, 3);
-      await enableSimulcastFlag(degradedCtx, 3);
-
-      // TODO(#1093): route ONLY the degraded receiver's QUIC/UDP downlink
-      // through a per-client netem veth here, e.g.:
-      //   await routeDownlinkThroughUdpNetem(degradedCtx);
+      // Flag ON for all three, with the #1093 capability override so a low-core
+      // CI runner (sniffed ceiling → 1) still encodes the full ladder — otherwise
+      // PHASE 1's skip guard below would clamp this test on CI, testing nothing.
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(healthyCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(degradedCtx, 3, { capabilityMaxLayersOverride: 3 });
 
       const pubPage = await pubCtx.newPage();
       const healthyPage = await healthyCtx.newPage();
-      const degradedPage = await degradedCtx.newPage();
+      degradedPage = await degradedCtx.newPage();
+
+      // Capture the publisher console BEFORE navigation so the #1093 override
+      // boot warn is collected (proven via assertCapabilityOverrideActive below).
+      const pubConsole = collectConsole(pubPage);
 
       await joinMeeting(pubPage, meetingId, "SimPublisherDWT");
       await joinMeeting(healthyPage, meetingId, "SimHealthyWT");
       await joinMeeting(degradedPage, meetingId, "SimDegradedWT");
 
+      // POSITIVE OVERRIDE PROOF (#1093) — assert the override took effect BEFORE
+      // the skip guard, so a silently-broken override fails loud instead of
+      // skip-clamping to a single layer. See assertCapabilityOverrideActive.
+      await assertCapabilityOverrideActive(pubConsole);
+
       await openPerformancePanel(healthyPage);
       await openPerformancePanel(degradedPage);
 
       // PHASE 1 — let both receivers climb above the base layer on a healthy
-      // (un-impaired) downlink. Capability ceiling can clamp to a single layer
-      // on a weak runner; SKIP rather than assert a false negative.
+      // (un-impaired) downlink. Capability ceiling can still clamp to a single
+      // layer if the override somehow failed; SKIP rather than assert a false
+      // negative (the override proof above already fails loud in that case).
       await expect
         .poll(
           async () => {
             const healthy = await readVideoLayer(healthyPage);
-            const degraded = await readVideoLayer(degradedPage);
+            const degraded = await readVideoLayer(degradedPage!);
             if (!healthy || !degraded) return -1;
             return Math.min(healthy.layerCount, degraded.layerCount);
           },
@@ -1248,7 +1595,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       );
 
       await expect
-        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
           timeout: 30_000,
           intervals: [1000, 2000, 3000],
         })
@@ -1261,19 +1608,36 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         "healthy receiver must be decoding before we impair the other receiver",
       ).not.toBeNull();
 
-      // PHASE 2 — clamp ONLY the degraded receiver's QUIC downlink.
-      // TODO(#1093): await impairDownlinkUdp({ rateKb: 15 });
+      // PHASE 2 — impair ONLY the degraded receiver's downlink, client-side, via
+      // the per-TAB netsim hook (drops inbound VIDEO/SCREEN packets → sequence
+      // gaps → loss_per_sec over the chooser's step-down threshold). Installed on
+      // the degraded receiver's PAGE so the sender + healthy peer are untouched.
+      await impairDownlinkNetsim(degradedPage);
 
       // PHASE 3 — the degraded receiver's chosen layer must drop strictly BELOW
-      // the healthy receiver's.
+      // the healthy receiver's. Guard against a vacuous pass on BOTH sides:
+      //   - HEALTHY must be decoding (non-null) — a null healthy read returns
+      //     false so we never compare against a missing baseline.
+      //   - DEGRADED must ALSO still be decoding (non-null). Under
+      //     `crushed_downlink` (40% inbound video drop) the degraded receiver
+      //     can lose decode entirely (keyframe starvation) and read "Not
+      //     receiving" → `readVideoLayer` returns null. Treating a null degraded
+      //     as the base layer (index 0) would pass this assertion for the WRONG
+      //     reason ("stopped decoding" rather than "stepped down to a lower
+      //     layer"). So a null degraded read ALSO returns false — this pins the
+      //     claim to "degraded converged to a strictly lower DECODED layer."
+      //   - With 40% loss the degraded peer may legitimately oscillate through
+      //     brief "Not receiving" windows. Returning false on null does NOT fail
+      //     fast — the poll simply keeps going (timeout 90s, intervals settle at
+      //     5s) until it catches a frame window where degraded IS decoding at a
+      //     lower index. That is the intended semantics.
       await expect
         .poll(
           async () => {
             const healthy = await readVideoLayer(healthyPage);
-            const degraded = await readVideoLayer(degradedPage);
-            const degradedIdx = degraded?.layerIndex ?? 0;
-            if (!healthy) return false;
-            return degradedIdx < healthy.layerIndex;
+            const degraded = await readVideoLayer(degradedPage!);
+            if (!healthy || !degraded) return false;
+            return degraded.layerIndex < healthy.layerIndex;
           },
           { timeout: 90_000, intervals: [2000, 3000, 5000] },
         )
@@ -1293,16 +1657,22 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
           `went bad over WT (before=${healthyBeforeImpair!.layerIndex}, after=${healthyFinal!.layerIndex})`,
       ).toBeGreaterThanOrEqual(healthyBeforeImpair!.layerIndex);
 
-      // PHASE 4 — heal and prove climb-back.
-      // TODO(#1093): await healDownlinkUdp();
+      // PHASE 4 — heal and prove climb-back (recovery confirms the divergence was
+      // the impairment, not a permanent failure). Conservative hysteresis on
+      // re-climb, so a generous window.
+      await healDownlinkNetsim(degradedPage);
       await expect
-        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
           timeout: 90_000,
           intervals: [2000, 3000, 5000],
         })
         .toBeGreaterThan(0);
     } finally {
-      // TODO(#1093): await healDownlinkUdp();
+      // Clear the netsim impairment so a failure mid-test does not leave the tab
+      // degraded. healDownlinkNetsim tolerates a closed/absent page (teardown-safe).
+      if (degradedPage) {
+        await healDownlinkNetsim(degradedPage);
+      }
       await pubBrowser.close();
       await healthyBrowser.close();
       await degradedBrowser.close();
@@ -1331,13 +1701,18 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 // for the 2-context join + cross-peer decode.
 // ---------------------------------------------------------------------------
 test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression", () => {
-  test.describe.configure({ timeout: 180_000 });
+  // SERIAL — same #1093 renderer-crash mitigation as the flag-on describe: this
+  // control also launches a publisher + receiver (two heavy renderers) and polls
+  // a cross-peer decoded stream, so under `workers: 2` it could run concurrently
+  // with another multi-browser test and overcommit the 8-vCPU CI runner. Run it
+  // one-at-a-time so at most one publisher+receiver pair is live.
+  test.describe.configure({ mode: "serial", timeout: 180_000 });
 
   test.beforeAll(async () => {
     await waitForServices();
   });
 
-  test.fixme("flag pinned to 1 emits a single layer for video, audio, and content", async ({
+  test("flag pinned to 1 emits a single layer for video, audio, and content", async ({
     baseURL,
   }) => {
     const uiURL = baseURL || "http://localhost:3001";
@@ -1378,7 +1753,9 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 
       // Wait until the receiver is decoding the publisher's VIDEO, then assert
       // the ladder is a SINGLE layer (count == 1). With the flag off the encoder
-      // produces exactly one layer, so the readout must report `L1/1`.
+      // produces exactly one layer, so the readout reports position/count "1/1"
+      // (#1222: the single-layer quality letter is "1", so the readout reads
+      // "1 · 1/1 · …"; `readVideoLayer` parses the position/count tail).
       let video: { layerIndex: number; layerCount: number } | null = null;
       await expect
         .poll(
@@ -1450,12 +1827,14 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 //
 // NOTE — publisher-side DOM observability is NO LONGER a blocker. It WAS (the
 // old design exposed nothing), but the #1095 redesign on THIS branch surfaces the
-// publisher's per-rung send ladder in the Diagnostics sidebar's "Simulcast
+// publisher's per-rung send ladder in the Diagnostics drawer's "Simulcast
 // layers" section: one chip per layer, testid `diag-simulcast-rung-{layer_id}`,
 // with the shed state conveyed by an `is-shed` CSS class (active rungs carry
-// `is-active`). The body below is written against THOSE selectors (reached via
-// the `perf-open-diagnostics` cross-nav on the publisher), so it goes green the
-// moment the #1093 multi-party harness lands — no further UI work is needed.
+// `is-active`). The body below is written against THOSE selectors (reached by
+// simply opening the unified drawer on the publisher — #1131 removed the
+// cross-nav button; the ladder shares the drawer with the perf controls), so it
+// goes green the moment the #1093 multi-party harness lands — no further UI work
+// is needed.
 // (The earlier `perf-video-diag-rung-*` / `data-shed` / `data-bitrate-kbps`
 // contract from the never-merged `feat/perf-panel-simulcast-diagnostics` branch
 // does NOT exist; do not reintroduce it.)
@@ -1481,7 +1860,12 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 // default suite once unblocked.
 // ---------------------------------------------------------------------------
 test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
-  test.describe.configure({ timeout: 240_000 });
+  // SERIAL — same #1093 renderer-crash mitigation. These cases launch THREE
+  // browsers each (1 publisher + 2 receivers), all running camera + simulcast
+  // encode/decode, so they are the heaviest in the spec; never let two of them
+  // (or one of them and another multi-browser test) run concurrently on the
+  // 8-vCPU CI runner.
+  test.describe.configure({ mode: "serial", timeout: 240_000 });
 
   test.beforeAll(async () => {
     await waitForServices();
@@ -1554,24 +1938,17 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
           timeout: 30_000,
         });
 
-        // Open the receive Performance panels (where the max-layer sliders live)
-        // on both receivers, and the Diagnostics sidebar on the publisher (where
-        // the per-rung SEND ladder now lives after the #1095 redesign — it MOVED
-        // out of the Performance panel into the "Simulcast layers" section). Reach
-        // it via the in-panel "Diagnostics" cross-nav button so this also exercises
-        // the Perf→Diagnostics nav.
+        // Open the unified Diagnostics drawer (#1131) on all three contexts. ONE
+        // surface now hosts BOTH the receive max-layer sliders (Group A — the
+        // migrated Performance panel) AND the publisher's per-rung SEND ladder
+        // (Group B — the "Simulcast layers" section). So the same
+        // `openPerformancePanel` opener gives the receivers their sliders and the
+        // publisher its ladder — no Settings tab, no cross-nav button (both were
+        // removed when the surfaces merged in #1131).
         await openPerformancePanel(rxAPage);
         await openPerformancePanel(rxBPage);
-        await pubPage.locator('[data-testid="open-settings"]').click();
-        await expect(pubPage.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
-        await pubPage.getByRole("tab", { name: "Performance" }).click();
-        await expect(pubPage.locator("#settings-panel-performance")).toBeVisible({
-          timeout: 10_000,
-        });
-        // The publisher's per-rung send ladder is in the Diagnostics sidebar now,
-        // not behind a SEND-direction segment (the Receive | Send toggle was
-        // removed in #1095). Cross-nav to it.
-        await pubPage.locator('[data-testid="perf-open-diagnostics"]').click();
+        await openPerformancePanel(pubPage);
+        // The publisher's per-rung send ladder lives in the SAME open drawer.
         await expect(pubPage.locator("#diagnostics-sidebar.visible")).toBeVisible({
           timeout: 5_000,
         });

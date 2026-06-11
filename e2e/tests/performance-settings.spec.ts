@@ -57,11 +57,46 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  * split into a **Sending** column AND a **Receiving** column rendered together
  * (the old Receive | Send direction toggle was removed). SEND-side testids are
  * UNCHANGED (below); RECEIVE-side uses the `perf-recv-*` / `perf-vu-recv-*`
- * namespace (further down). Cross-nav: `perf-open-diagnostics` (Perf→Diagnostics)
- * and `diag-open-performance` (Diagnostics→Perf).
+ * namespace (further down).
  *
- *   Tab/nav/panel:  settings-tab-performance (id) · settings-nav-performance
- *                   (data-testid, role="tab") · settings-panel-performance (id)
+ *   #1131 RELOCATION: the whole panel MOVED out of the Settings → Performance
+ *   modal tab into the right-side **Diagnostics drawer** (`#diagnostics-sidebar`),
+ *   mounted as the "Quality controls" group. After #1131 ITERATION 4 (#1222) the
+ *   drawer group order is investigation-first: "Connection & system" (the
+ *   incident-investigation anchor, always rendered) FIRST, then "Quality controls"
+ *   (this panel) second, then "Live stream state" (the live/NetEq sections) LAST.
+ *   Within "Connection & system" the four
+ *   low-level pre-dumps (Reception / Sending / Encoder / Media Status) were merged
+ *   into ONE collapsed `<details class="diag-disclosure">` "Raw stats" disclosure
+ *   (`#diag-h-raw-stats`), and "Build info" was demoted to a second collapsed
+ *   `<details>` at the very bottom — both CLOSED by default. Within "Live stream
+ *   state" the NetEq sections are now per-PEER: with the "All Peers" aggregate
+ *   selected (the ZERO-remote-peer solo-meeting default) a single placeholder
+ *   section is shown
+ *   ("Select a specific peer to view time-series charts and current status.")
+ *   IN PLACE of the Current Status tiles + charts. Selecting a specific peer —
+ *   or, with EXACTLY ONE remote peer, the #1222 1:1 AUTO-SELECT picking it
+ *   automatically — renders the redesigned two-tier Current Status (`.neteq-status`
+ *   > `.status-primary` / `.status-secondary` / `.status-reorder`) and the
+ *   now-horizontally-scrollable NetEq
+ *   charts (`.neteq-chart-scroll` overflow-x box + a fixed `.neteq-chart-y-axis`
+ *   sibling, stacked 1-up via `.neteq-charts-stack`), each chart carrying its own
+ *   per-chart `diag-chart-{buffer,decode,packets,reorder}-help` "?" icon (the old
+ *   section-level `diag-charts-help` was removed).
+ *   The drawer title became "Performance & Diagnostics". The Settings modal now
+ *   has exactly FOUR tabs (Audio / Video / Network / Appearance) and NO
+ *   performance affordance at all: the transitional `settings-perf-moved` redirect
+ *   row was REMOVED in the iteration (the drawer is the only home of the
+ *   Performance controls; the "performance" deep link still routes to the drawer
+ *   via attendants).
+ *   The `perf-open-diagnostics` / `diag-open-performance` cross-nav buttons (and
+ *   their `#settings-panel-performance` tabpanel wrapper) are GONE — the panel
+ *   now renders directly inside `.sidebar-content`, so its `perf-*` testids are
+ *   scoped to `#diagnostics-sidebar` (NOT a settings tabpanel). The `perf-*`
+ *   COMPONENTS themselves are byte-for-byte unchanged — only the mount moved, so
+ *   every slider / Auto / meter / strip assertion below survives with just the
+ *   opening flow swapped from "open Settings → Performance tab" to "open the
+ *   Diagnostics drawer".
  *
  *   SEND row (this spec's primary coverage; testids unchanged by #1078):
  *   VU gauges:      perf-vu-video / -audio / -screen (one per section)
@@ -77,8 +112,9 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *   RECEIVE row (#1078; covered by the "Receive-side controls" describe block):
  *   VU gauges:      perf-vu-recv-video / -audio / -screen
  *                   readouts: perf-vu-recv-{video,audio,screen}-readout (by id)
- *                   format: `L{i}/{N} · {w}x{h}` (video/screen),
- *                           `L{i}/{N} · {kbps} kbps` (audio),
+ *                   format (#1222 quality-letter, {Q}=L/M/H or "1" single-layer):
+ *                           `{Q} · {i}/{N} · {w}x{h}` (video/screen),
+ *                           `{Q} · {i}/{N} · {kbps} kbps` (audio),
  *                           "Not receiving" placeholder when nothing decoded.
  *   Range inputs:   perf-recv-{video,audio,screen}-range-min / -range-max
  *   Auto toggles:   perf-recv-{video,audio,screen}-auto (have aria-pressed)
@@ -87,15 +123,18 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *   Fixed badge:    perf-recv-{video,audio,screen}-fixed-badge
  *
  * ─── How the panel is reached ────────────────────────────────────────────────
- * The Performance tab lives inside the in-meeting device-settings modal, so each
- * test must be in a real meeting room first. We reuse the PROVEN in-meeting
- * modal flow from `settings-modal.spec.ts`: inject the session cookie
- * (helpers/auth.ts) on the default `dioxus`-project `page` (whose Chromium flags
- * already include `--use-fake-device-for-media-stream` so the camera produces a
- * synthetic stream), drive the home-page meeting form, click through
- * "Start/Join Meeting" to `#grid-container`, then open the gear
- * (`[data-testid="open-settings"]`) → `.device-settings-modal` and click the
- * Performance tab.
+ * The Performance controls now live in the in-meeting **Diagnostics drawer**, so
+ * each test must be in a real meeting room first. We reuse the PROVEN in-meeting
+ * flow: inject the session cookie (helpers/auth.ts) on the default
+ * `dioxus`-project `page` (whose Chromium flags already include
+ * `--use-fake-device-for-media-stream` so the camera produces a synthetic
+ * stream), drive the home-page meeting form, click through "Start/Join Meeting"
+ * to `#grid-container`, then open the drawer via the toolbar "Open Diagnostics"
+ * button (the canonical opener also used by protocol-selection.spec.ts /
+ * diagnostics-peer-transport.spec.ts). The perf panel renders as the "Quality
+ * controls" group inside `#diagnostics-sidebar`; `openPerformanceDrawer` waits on
+ * the migrated simulcast strip (`perf-simulcast-strip`) appearing INSIDE that
+ * scope as readiness + relocation proof.
  *
  * ─── Local vs CI ─────────────────────────────────────────────────────────────
  * Reaching the in-meeting settings modal requires a real meeting-room
@@ -259,12 +298,47 @@ async function openSettingsModal(page: Page): Promise<void> {
   await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
 }
 
-/** Open the modal (if needed) and switch to the Performance tab. */
-async function openPerformanceTab(page: Page): Promise<void> {
-  await openSettingsModal(page);
-  // The nav button carries role="tab" + data-testid="settings-nav-performance".
-  await page.locator('[data-testid="settings-nav-performance"]').click();
-  await expect(page.locator("#settings-panel-performance")).toBeVisible({ timeout: 5_000 });
+/**
+ * The Diagnostics drawer root. The Performance panel (#1131) is mounted as the
+ * "Quality controls" group inside `.sidebar-content` here, so EVERY perf
+ * assertion scopes to this locator (not the dead `#settings-panel-performance`
+ * tabpanel). Scoping inside the drawer is what makes the relocation a real
+ * regression guard: a `perf-*` testid that resurfaced anywhere ELSE on the page
+ * (e.g. a relapsed Settings tab) would NOT satisfy `sidebar.locator(...)`.
+ */
+function perfDrawer(page: Page): Locator {
+  return page.locator("#diagnostics-sidebar");
+}
+
+/**
+ * Open the in-meeting Diagnostics drawer via the toolbar "Open Diagnostics"
+ * button — the new (and only) home of the Performance controls (#1131). Returns
+ * once the drawer is open with the migrated panel inside it.
+ *
+ * MUTATION DISCIPLINE: we wait on the migrated simulcast strip
+ * (`perf-simulcast-strip`) being visible *inside* `#diagnostics-sidebar`, not
+ * merely anywhere on the page. If the panel failed to mount in the drawer (the
+ * relocation regressed), this helper throws and every dependent test fails.
+ */
+async function openPerformanceDrawer(page: Page): Promise<void> {
+  // The diagnostics button carries no data-testid; locate it via its tooltip
+  // text (mirrors protocol-selection.spec.ts::openDiagnosticsPanel).
+  const diagButton = page.locator("button", {
+    has: page.locator("span.tooltip", { hasText: "Open Diagnostics" }),
+  });
+  await diagButton.click();
+  const sidebar = perfDrawer(page);
+  await expect(sidebar).toBeVisible({ timeout: 10_000 });
+  // The drawer title renamed to "Performance & Diagnostics" (#1131 §4).
+  await expect(sidebar.getByRole("heading", { name: "Performance & Diagnostics" })).toBeVisible({
+    timeout: 5_000,
+  });
+  // Relocation proof: the migrated panel's simulcast strip is present INSIDE the
+  // drawer (the "Quality controls" group). This fails if the panel didn't move
+  // into the drawer.
+  await expect(sidebar.locator('[data-testid="perf-simulcast-strip"]')).toBeVisible({
+    timeout: 5_000,
+  });
 }
 
 /**
@@ -320,14 +394,16 @@ async function setRangeValue(page: Page, testid: string, value: number): Promise
  * (WebKit doesn't reliably pass `pointer-events:none` through a disabled control),
  * making the ceiling undraggable. So the floor is pinned via `tabindex=-1` (no
  * keyboard) + `aria-disabled` (SR) + CSS `pointer-events:none` (no pointer) +
- * `z-index:0` (below the max) — but is NOT `disabled`. If a regression re-adds
- * `disabled`, the `toBeEnabled()` here fails (Playwright treats `disabled` as the
- * not-enabled state). Pinned at position 0 (the always-sent base layer).
+ * `z-index:0` (below the max) — but is NOT HTML-`disabled`. Playwright's
+ * `toBeEnabled()` also treats `aria-disabled="true"` as disabled, so assert the
+ * raw DOM attribute directly. Pinned at position 0 (the always-sent base layer).
  */
 async function expectPinnedFloor(minInput: Locator): Promise<void> {
-  // NOT `disabled` — the WebKit fix. (`toBeEnabled` asserts the absence of the
-  // disabled state on a form control.)
-  await expect(minInput).toBeEnabled();
+  // NOT HTML-`disabled` — the WebKit fix. `aria-disabled` is expected and is
+  // asserted below, so `toBeEnabled()` would be the wrong matcher here.
+  await expect
+    .poll(async () => minInput.evaluate((el) => (el as HTMLInputElement).hasAttribute("disabled")))
+    .toBe(false);
   await expect(minInput).toHaveAttribute("tabindex", "-1");
   await expect(minInput).toHaveAttribute("aria-disabled", "true");
   await expect(minInput).toHaveValue("0");
@@ -346,12 +422,12 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "render");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     // Both directions render together now (no toggle); this guards the send
     // meters rendered before we assert them.
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // ── Three live VU gauges visible (one per stream section) ──
     await expect(panel.locator('[data-testid="perf-vu-video"]')).toBeVisible();
@@ -410,48 +486,70 @@ test.describe("Performance settings panel (#961)", () => {
     }
   });
 
-  test("no-scroll: the Performance panel content fits the modal body without scrolling on a desktop display (#1095)", async ({
+  test("desktop layout: the Quality-controls perf cards stay contained in the drawer (#1208/#1213, adapted to the drawer)", async ({
     page,
   }) => {
-    // The user's headline #1095 requirement: "all metrics fit in one dialog
-    // without scrolling". This is a DESKTOP requirement (the spec accepts a small
-    // scroll on mobile), so assert at exactly the 768px desktop target the layout
-    // was budgeted against (~622px content vs ~634px usable). The ~12px headroom
-    // is deliberately tight so a regression that re-grows a card (+padding/margin)
-    // or re-splits a caption onto a second line pushes scrollHeight past
-    // clientHeight and fails here, rather than hiding behind generous slack.
+    // The drawer (#1131) is a SINGLE SCROLLING SURFACE by design. After #1131
+    // iteration 3 the group order is usage-frequency: "Quality controls" (the
+    // perf cards — now the FIRST group) → "Live stream state" → "Connection &
+    // system" LAST. The perf cards therefore sit at the TOP of the drawer, the
+    // "Live stream state" + "Connection & system" groups sit below them, the
+    // content is legitimately taller than the viewport, and the drawer scrolls
+    // vertically. The #1208/#1213 lesson: do NOT assert vertical overflow in
+    // either direction (a scrolling-by-design surface SHOULD overflow
+    // vertically). The stable contract is (a) NO horizontal overflow, and (b)
+    // the LAST perf card (.perf-kind-card) is reachable by scrolling the
+    // drawer's own scroll container — the explicit scrollIntoView below brings
+    // the card into view from the bottom-most scroll position, proving it is not
+    // clipped on either fold of the over-tall surface.
     await page.setViewportSize({ width: 1280, height: 768 });
-    await joinMeeting(page, "no_scroll");
-    await openPerformanceTab(page);
+    await joinMeeting(page, "drawer_containment");
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     await expect(panel).toBeVisible();
-    // All three cards must be present (so we're measuring the full content, not a
-    // partially-rendered panel).
+    // All three Quality-controls perf cards must be present (so we're measuring
+    // the full content, not a partially-rendered panel).
     await expect(panel.locator(".perf-kind-card")).toHaveCount(3);
 
-    // The scrollable container is `.settings-panel` (it carries overflow-y:auto),
-    // which WRAPS the `#settings-panel-performance` tabpanel. It must NOT be
-    // overflowing: scrollHeight <= clientHeight (allow 1px for sub-pixel
-    // rounding). If this fails, the panel scrolls — the no-scroll requirement is
-    // broken.
-    const scrollContainer = page.locator(".settings-panel");
-    const overflow = await scrollContainer.evaluate((el) => el.scrollHeight - el.clientHeight);
+    // The drawer's scroll container is `.sidebar-content` (it carries
+    // overflow-y:auto inside `#diagnostics-sidebar`).
+    const scrollContainer = panel.locator(".sidebar-content");
+    await expect(scrollContainer).toBeVisible();
+    const horizontalOverflow = await scrollContainer.evaluate(
+      (el) => el.scrollWidth - el.clientWidth,
+    );
     expect(
-      overflow,
-      `Performance panel overflows its modal body by ${overflow}px (no-scroll requirement)`,
+      horizontalOverflow,
+      "drawer perf-controls content must not overflow horizontally",
     ).toBeLessThanOrEqual(1);
+
+    // Scroll the drawer to the bottom, then explicitly bring the LAST perf card
+    // into view. After the reorder the perf cards are at the TOP of the drawer
+    // (above "Live stream state" + "Connection & system"), so scrolling all the
+    // way down scrolls PAST them; the scrollIntoView is what proves the card is
+    // reachable and not clipped on either fold of the over-tall surface.
+    await scrollContainer.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+    });
+    await scrollContainer.evaluate((el) => {
+      // The last perf card sits in the top "Quality controls" group; scroll it
+      // back into view from the bottom-most scroll position.
+      const cards = el.querySelectorAll(".perf-kind-card");
+      cards[cards.length - 1]?.scrollIntoView({ block: "center" });
+    });
+    await expect(panel.locator(".perf-kind-card").last()).toBeVisible();
   });
 
   test("Reset button: absent at the full range, appears after a thumb drag, and clears back to the full range when clicked (#1131)", async ({
     page,
   }) => {
     await joinMeeting(page, "reset_button");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     // The former "Auto" toggle is now a conditionally-rendered "Reset" button; the
     // `perf-video-auto` testid was repurposed onto it. It is not a toggle (no
     // aria-pressed) and is only present while the stream is constrained.
@@ -507,10 +605,10 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "help_popover");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     const helpBtn = panel.locator('[data-testid="perf-video-help"]');
     const popover = page.locator("#perf-video-help-popover");
 
@@ -569,10 +667,10 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "intro_collapsed");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The big always-visible intro paragraph (it used to be a
     // `.settings-section-description` in the panel) is GONE — collapsed behind a
@@ -609,10 +707,10 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "persist");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // VIDEO SEND is a LAYER-COUNT control: the floor (min) thumb is PINNED at the
     // base layer (non-interactive, NOT `disabled` — WebKit fix), and lowering the
@@ -694,12 +792,12 @@ test.describe("Performance settings panel (#961)", () => {
     }
     await expect(grid).toBeVisible({ timeout: 15_000 });
 
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     // Both directions render together after reload (no toggle); guard that the
     // send meters are present before re-reading the persisted send-side video
     // preference.
     await selectSendDirection(page);
-    const panelAfter = page.locator("#settings-panel-performance");
+    const panelAfter = perfDrawer(page);
 
     // Lowered ceiling restored (not the full ladder) → the Reset button is
     // RENDERED, the ceiling thumb is back at the lowered position, and the base
@@ -728,11 +826,11 @@ test.describe("Performance settings panel (#961)", () => {
     // video meter readout stays "Camera — off" (the LS preference alone doesn't
     // populate the pre-join device list that resolve_initial_enabled requires).
     await joinMeeting(page, "vu_live", { ensureCameraOn: true });
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     // Both directions render together now; the send meters are always present.
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The video meter readout is updated by a ~4 Hz rAF loop from the live
     // encoder snapshot. With the fake camera producing a synthetic stream, the
@@ -754,10 +852,10 @@ test.describe("Performance settings panel (#961)", () => {
     page,
   }) => {
     await joinMeeting(page, "no_fixed_badge");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The "Fixed" badge was a TIER-slider concept (both thumbs pinned to one
     // tier). ALL THREE SEND controls (video, screen, AND audio) are now
@@ -785,16 +883,15 @@ test.describe("Performance settings panel (#961)", () => {
     // on any runner (no skip-guard needed) — the deterministic drag target.
     await enableSimulcastFlag(page.context(), 3);
     await joinMeeting(page, "send_ceiling_grabbable");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     const minInput = panel.locator('[data-testid="perf-audio-range-min"]');
     const maxInput = panel.locator('[data-testid="perf-audio-range-max"]');
 
     // (a) DOM contract: the max is interactive/enabled and the floor is pinned
-    // WITHOUT `disabled` (the WebKit fix). If a regression re-adds `disabled` to
-    // the floor, expectPinnedFloor's toBeEnabled() fails here.
+    // WITHOUT HTML-`disabled` (the WebKit fix).
     await expect(maxInput).toBeEnabled();
     await expectPinnedFloor(minInput);
     // Audio is capability-independent (~3 layers), so the ceiling starts at the
@@ -848,10 +945,10 @@ test.describe("Performance settings panel (#961)", () => {
     // anchor for the strip markup. §1: each side title is prefixed with an
     // aria-hidden directional arrow (`.perf-dir-arrow`).
     await joinMeeting(page, "send_rungs");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The audio send rung strip is a role=img container with at least one pip.
     const audioStrip = panel.locator('[data-testid="perf-audio-send-rungs"]');
@@ -881,10 +978,10 @@ test.describe("Performance settings panel (#961)", () => {
     // the configured count, and names each kind's trigger.
     await enableSimulcastFlag(page.context(), 3);
     await joinMeeting(page, "caption_source_aware");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     // Per-kind trigger phrase in the OFF-state caption.
     const triggers: Record<string, RegExp> = {
       video: /Will send \d+ layers? when the camera is on/,
@@ -924,9 +1021,9 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     page,
   }) => {
     await joinMeeting(page, "both_directions");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // The #1095 redesign removed the `Receive | Send` segmented toggle: the
     // panel now shows three per-kind cards, each split into a Sending column and
@@ -961,20 +1058,28 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
       ).toBeVisible();
     }
 
-    // The Diagnostics cross-nav button lives in the panel header (#1095 §4a).
-    await expect(panel.locator('[data-testid="perf-open-diagnostics"]')).toBeVisible();
+    // SINGLE SURFACE (#1131): the panel now lives INSIDE the Diagnostics drawer,
+    // so the former Perf→Diagnostics cross-nav button (`perf-open-diagnostics`) is
+    // gone — there is nowhere left to navigate to. Assert it no longer renders,
+    // and that the receive controls we just checked are inside `#diagnostics-sidebar`
+    // (the relocation), not on a stray Settings tab.
+    await expect(panel.locator('[data-testid="perf-open-diagnostics"]')).toHaveCount(0);
+    await expect(
+      perfDrawer(page).locator('[data-testid="perf-vu-recv-video"]'),
+      "receive controls render inside the Diagnostics drawer (relocation proof)",
+    ).toBeVisible();
   });
 
   test("receive row renders a range slider, needle, and help for each kind (Reset absent at full range)", async ({
     page,
   }) => {
     await joinMeeting(page, "recv_render");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     // Both directions render together (no toggle); guard the receive meters
     // rendered before asserting the receive controls.
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // Per kind, the RECEIVE row exposes its full control set in the perf-recv-*
     // namespace: needle gauge, dual-thumb range (min + max), Auto toggle, help.
@@ -1019,10 +1124,10 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     // a real regression guard: if the empty-state gate regressed (a stray
     // disclosure rendered with no peers), this fails.
     await joinMeeting(page, "recv_peers_empty");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     for (const kind of ["video", "audio", "screen"] as const) {
       // No <details> disclosure…
@@ -1046,10 +1151,10 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     page,
   }) => {
     await joinMeeting(page, "recv_auto_default");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     for (const kind of ["video", "audio", "screen"] as const) {
       // Default = full automatic range: the Reset button (repurposed from the
@@ -1073,10 +1178,10 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     page,
   }) => {
     await joinMeeting(page, "recv_reset_button");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
     const resetBtn = panel.locator('[data-testid="perf-recv-video-auto"]');
     const minInput = panel.locator('[data-testid="perf-recv-video-range-min"]');
     const maxInput = panel.locator('[data-testid="perf-recv-video-range-max"]');
@@ -1104,15 +1209,16 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
     page,
   }) => {
     await joinMeeting(page, "recv_needle");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // Single-page: no peer is sending, so the receive video needle must read the
     // "Not receiving" placeholder. If a stream WERE being decoded it would show
-    // the `L{i}/{N} · {w}x{h}` shape; assert the union so the test is correct in
-    // both states (mirrors how the send-side test asserts its needle readout).
+    // the `{Q} · {i}/{N} · {w}x{h}` shape (#1222 quality-letter format: {Q} is a
+    // quality letter L/M/H, or "1" single-layer); assert the union so the test is
+    // correct in both states (mirrors how the send-side test asserts its needle).
     await expect(panel.locator("#perf-vu-recv-video-readout")).toBeVisible();
     await expect
       .poll(
@@ -1121,9 +1227,9 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
           timeout: 15_000,
         },
       )
-      .toMatch(/^(L\d+\/\d+ · \d+x\d+|Not receiving)$/);
+      .toMatch(/^(\S+ · \d+\/\d+ · \d+x\d+|Not receiving)$/);
 
-    // Audio receive readout: `L{i}/{N} · {kbps} kbps` or the placeholder.
+    // Audio receive readout: `{Q} · {i}/{N} · {kbps} kbps` or the placeholder.
     await expect
       .poll(
         async () => (await panel.locator("#perf-vu-recv-audio-readout").textContent())?.trim(),
@@ -1131,17 +1237,17 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
           timeout: 15_000,
         },
       )
-      .toMatch(/^(L\d+\/\d+ · \d+ kbps|Not receiving)$/);
+      .toMatch(/^(\S+ · \d+\/\d+ · \d+ kbps|Not receiving)$/);
   });
 
   test("receive fixed badge appears when a kind's two thumbs collapse to one layer", async ({
     page,
   }) => {
     await joinMeeting(page, "recv_fixed_badge");
-    await openPerformanceTab(page);
+    await openPerformanceDrawer(page);
     await selectReceiveDirection(page);
 
-    const panel = page.locator("#settings-panel-performance");
+    const panel = perfDrawer(page);
 
     // Pin both video RECEIVE thumbs to the same interior layer so min == max →
     // the receive Fixed badge appears. Dragging a thumb leaves the full automatic
@@ -1156,35 +1262,38 @@ test.describe("Performance settings panel — Receive-side controls (#1078)", ()
 });
 
 // ---------------------------------------------------------------------------
-// Cross-nav + the relocated "Simulcast layers" diagnostics section (#1095).
+// Single-surface unification (#1131) + the "Simulcast layers" diagnostics
+// section (#1095, in the "Live stream state" group of the same drawer).
 //
-// The #1095 redesign REMOVED the in-panel per-row diagnostics footers (the old
-// `perf-{kind}-diag-*` disclosure/ladder/peer rows) and MOVED that detail into
-// the Call Diagnostics panel's new "Simulcast layers" section. The Performance
-// panel now offers a "Diagnostics" cross-nav button (`perf-open-diagnostics`)
-// that closes settings and opens the diagnostics sidebar; the diagnostics header
-// offers a "Performance" cross-nav button (`diag-open-performance`) back.
+// #1131 collapsed the two surfaces into ONE: the Performance panel moved INTO
+// the Diagnostics drawer, so the former Perf↔Diag cross-nav buttons
+// (`perf-open-diagnostics` / `diag-open-performance`) are GONE — there is no
+// second surface to navigate to. The old round-trip cross-nav test is replaced
+// below by (a) a single-surface assertion that the perf panel and the
+// "Simulcast layers" section coexist in ONE open drawer, and (b) a Settings-modal
+// assertion that the modal has exactly FOUR tabs and NO performance affordance.
 //
-// The relocated section is fed by the live `DiagnosticsReader` Host publishes to
-// the parent, so:
+// #1131 ITERATION: the transitional `settings-perf-moved` redirect row was
+// REMOVED (the product decision reversed the one-release link). The contract is
+// now: the Settings modal has exactly four tabs and offers NO path to Performance
+// at all — the drawer is the only home of the Performance controls, opened via the
+// toolbar "Open Diagnostics" button (and the "performance" deep link, which still
+// routes to the drawer via attendants). The old "moved row opens the drawer"
+// round-trip test is therefore deleted and replaced by a "no performance
+// affordance" assertion below.
+//
+// The "Simulcast layers" section is fed by the live `DiagnosticsReader` Host
+// publishes, so:
 //   * Video (sending) static line "Camera — off" when the camera is off — the
 //     #1101 stale-count regression, now asserted in its new home.
 //   * Screen (sending) static line "Screen — not sharing" with no active share.
 //   * The per-layer ladder (`diag-simulcast-ladder` + `diag-simulcast-rung-{id}`)
 //     renders >= 1 rung when simulcast is active (capability-gated, SHAPE only).
 //
-// Open the diagnostics sidebar via the cross-nav button itself, so these tests
-// also cover the Perf→Diagnostics nav. All live-content assertions use
+// The drawer is opened via the single `openPerformanceDrawer` helper (the
+// toolbar "Open Diagnostics" button). All live-content assertions use
 // `expect.poll` (the section refreshes on a ~4 Hz tick).
 // ---------------------------------------------------------------------------
-
-/** Open Performance, then click the "Diagnostics" cross-nav button (#1095 §4a). */
-async function openDiagnosticsFromPerformance(page: Page): Promise<void> {
-  await openPerformanceTab(page);
-  await page.locator('[data-testid="perf-open-diagnostics"]').click();
-  // The settings overlay closes and the diagnostics sidebar becomes visible.
-  await expect(page.locator("#diagnostics-sidebar.visible")).toBeVisible({ timeout: 5_000 });
-}
 
 /** Trimmed text of the named "Simulcast layers" SEND ladder block (by title). */
 async function simulcastSendText(page: Page, title: string): Promise<string> {
@@ -1195,7 +1304,7 @@ async function simulcastSendText(page: Page, title: string): Promise<string> {
   return (t ?? "").trim();
 }
 
-test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)", () => {
+test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast layers (#1095)", () => {
   test.beforeAll(async () => {
     await waitForServices();
   });
@@ -1207,28 +1316,35 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
     await enableSimulcastFlag(page.context(), 3);
   });
 
-  test("cross-nav: Performance → Diagnostics opens the panel, Diagnostics → Performance returns", async ({
+  test("single surface: the Quality-controls perf panel and Simulcast layers coexist in ONE open drawer", async ({
     page,
   }) => {
-    await joinMeeting(page, "xnav");
+    await joinMeeting(page, "single_surface");
 
-    // ── ROUND-TRIP 1: Performance → Diagnostics ──
-    // Before navigating, the Performance panel must be the thing on screen.
-    await openPerformanceTab(page);
-    await expect(page.locator("#settings-panel-performance")).toBeVisible();
-    // Click the in-panel "Diagnostics" cross-nav button.
-    await page.locator('[data-testid="perf-open-diagnostics"]').click();
-    // The settings modal is gone AND the diagnostics sidebar is open.
-    await expect(page.locator(".device-settings-modal")).toHaveCount(0);
-    await expect(page.locator("#diagnostics-sidebar.visible")).toBeVisible({ timeout: 5_000 });
+    // ONE open action puts BOTH the perf controls and the live diagnostics on
+    // screen at once — the whole point of #1131. `openPerformanceDrawer` already
+    // asserts the title + the migrated simulcast strip inside the drawer.
+    await openPerformanceDrawer(page);
+    const sidebar = perfDrawer(page);
 
-    // The relocated "Simulcast layers" section (#1095 §6 MOVE) is now present in
-    // the Diagnostics sidebar — assert the heading AND the moved sub-structure so
-    // this fails if the MOVE regressed (a bare heading could survive an empty
+    // QUALITY CONTROLS — the migrated Performance panel (the FIRST group after
+    // the #1131 iteration-3 reorder). Assert a perf control is visible INSIDE the
+    // drawer (relocation proof, not anywhere on the page).
+    await expect(
+      sidebar.locator('[data-testid="perf-simulcast-strip"]'),
+      "perf strip inside the drawer",
+    ).toBeVisible();
+    await expect(
+      sidebar.locator('[data-testid="perf-vu-video"]'),
+      "send video meter inside the drawer",
+    ).toBeVisible();
+
+    // LIVE STREAM STATE — the "Simulcast layers" section coexists in the SAME
+    // drawer (#1095 §6 MOVE). Assert the heading AND the moved sub-structure so this
+    // fails if the section regressed (a bare heading could survive an empty
     // section). Single-context (camera off / no peers) so the live ladder +
     // per-peer testids are NOT in the DOM; assert the always-present structure:
     // both SEND blocks (by title) and the per-peer RECEIVE sub-section header.
-    const sidebar = page.locator("#diagnostics-sidebar");
     await expect(sidebar.getByRole("heading", { name: "Simulcast layers" })).toBeVisible();
     await expect(sidebar.locator('.simulcast-send-title:text-is("Video (sending)")')).toBeVisible();
     await expect(
@@ -1236,17 +1352,67 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
     ).toBeVisible();
     await expect(sidebar.locator(".simulcast-recv-title")).toBeVisible();
 
-    // ── ROUND-TRIP 2: Diagnostics → Performance (must LAND on the Performance
-    //    tab, not just reopen settings) ──
-    await page.locator('[data-testid="diag-open-performance"]').click();
-    // Settings reopens AND the Performance tabpanel is the active one (the
-    // `device_settings_initial_section = "performance"` wiring) …
-    await expect(page.locator("#settings-panel-performance")).toBeVisible({ timeout: 5_000 });
-    // …proven by a Performance-only control being visible (the panel content, not
-    // just the tabpanel wrapper, is mounted) …
-    await expect(page.locator('[data-testid="perf-vu-video"]')).toBeVisible({ timeout: 5_000 });
-    // …and the diagnostics sidebar has closed (unmounted).
-    await expect(page.locator("#diagnostics-sidebar.visible")).toHaveCount(0);
+    // The cross-nav buttons are GONE on both sides of the (now single) surface.
+    await expect(sidebar.locator('[data-testid="diag-open-performance"]')).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="perf-open-diagnostics"]')).toHaveCount(0);
+  });
+
+  test("Settings has exactly FOUR tabs and offers NO performance affordance (#1131 iteration removed the moved row)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "settings_no_perf");
+
+    // ── The Settings modal has exactly FOUR tabs (Performance tab removed) ──
+    await openSettingsModal(page);
+    const modal = page.locator(".device-settings-modal");
+    const tabs = modal.getByRole("tab");
+    await expect(tabs).toHaveCount(4);
+    // The four surviving tabs, by accessible name.
+    for (const name of ["Audio", "Video", "Network", "Appearance"] as const) {
+      await expect(modal.getByRole("tab", { name }), `${name} tab present`).toBeVisible();
+    }
+    // The Performance tab is GONE — it is NOT one of the tabs.
+    await expect(modal.getByRole("tab", { name: "Performance" })).toHaveCount(0);
+    await expect(modal.locator('[data-testid="settings-nav-performance"]')).toHaveCount(0);
+
+    // ── NEW CONTRACT (#1131 iteration): the transitional `settings-perf-moved`
+    //    redirect row was REMOVED — the modal offers NO path to Performance at
+    //    all. The Performance controls live ONLY in the Diagnostics drawer.
+    // MUTATION DISCIPLINE: if a regression re-added the moved row (or any
+    // performance redirect affordance) in the modal, the count below flips to ≥1
+    // and this fails. The previous iteration asserted the row was PRESENT and
+    // round-tripped to the drawer; this asserts its ABSENCE — break the source by
+    // re-adding the `settings-perf-moved` button and this test goes red.
+    await expect(
+      modal.locator('[data-testid="settings-perf-moved"]'),
+      "the transitional 'Performance moved to Diagnostics' row is gone",
+    ).toHaveCount(0);
+    // No performance affordance survives under any of the usual ids either.
+    await expect(modal.locator('[data-testid="perf-open-diagnostics"]')).toHaveCount(0);
+    await expect(modal.getByRole("link", { name: /performance/i })).toHaveCount(0);
+
+    // The modal still works as a settings modal: it does NOT auto-route to the
+    // drawer, and the drawer is NOT open just because Settings is.
+    await expect(perfDrawer(page)).toHaveCount(0);
+
+    // ── The drawer remains reachable via the ONLY remaining opener (Open
+    //    Diagnostics). Close Settings (the modal is open from openSettingsModal
+    //    above; toggle the gear once to close it), then open the drawer the
+    //    canonical way and confirm the migrated perf panel is its destination. ──
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(modal).toHaveCount(0);
+
+    await openPerformanceDrawer(page);
+    const sidebar = perfDrawer(page);
+    await expect(sidebar).toBeVisible({ timeout: 5_000 });
+    await expect(
+      sidebar.getByRole("heading", { name: "Performance & Diagnostics" }),
+      "the drawer is the only home of the Performance controls",
+    ).toBeVisible();
+    await expect(
+      sidebar.locator('[data-testid="perf-simulcast-strip"]'),
+      "the migrated perf panel lives in the drawer",
+    ).toBeVisible();
   });
 
   // Camera-off regression (the #1101 fix), now in its new home: the relocated
@@ -1258,7 +1424,7 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
   }) => {
     // Join WITHOUT turning the camera on, so send_video is gated to None.
     await joinMeeting(page, "diag_cam_off");
-    await openDiagnosticsFromPerformance(page);
+    await openPerformanceDrawer(page);
 
     await expect
       .poll(async () => simulcastSendText(page, "Video (sending)"), { timeout: 15_000 })
@@ -1275,7 +1441,7 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
     page,
   }) => {
     await joinMeeting(page, "diag_screen_idle");
-    await openDiagnosticsFromPerformance(page);
+    await openPerformanceDrawer(page);
 
     await expect
       .poll(async () => simulcastSendText(page, "Screen (sending)"), { timeout: 15_000 })
@@ -1288,7 +1454,7 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
     page,
   }) => {
     await joinMeeting(page, "diag_ladder", { ensureCameraOn: true });
-    await openDiagnosticsFromPerformance(page);
+    await openPerformanceDrawer(page);
 
     const sidebar = page.locator("#diagnostics-sidebar");
     // Wait for the camera-on Video (sending) line to settle into one of its two
@@ -1312,12 +1478,470 @@ test.describe("Performance ⇄ Diagnostics cross-nav + Simulcast layers (#1095)"
       })
       .toBeGreaterThanOrEqual(1);
 
-    // 1-BASED DISPLAY: the BASE rung's data-testid stays 0-based
-    // (`diag-simulcast-rung-0`, so selectors/protobuf don't churn) but its visible
-    // id label is 1-based "L1" (matching the receive side). The ladder must NEVER
-    // render a "L0" label.
+    // QUALITY-LETTER DISPLAY (#1222 Directive 4): the BASE rung's data-testid
+    // stays 0-based (`diag-simulcast-rung-0`, so selectors/protobuf don't churn)
+    // but its visible id chip is now the quality LETTER — the base (index 0) is
+    // "L" (Low) in any multi-layer ladder, "1" only in the degenerate 1-layer
+    // case (which this active-ladder arm has already skipped past). The old
+    // 1-based "L1"/"L0" numeric labels are GONE: assert the base reads exactly
+    // "L" and that NO rung chip carries the retired "L1"/"L0" numeric literals.
     const baseRung = ladder.locator('[data-testid="diag-simulcast-rung-0"]');
-    await expect(baseRung.locator(".simulcast-rung-id")).toHaveText("L1");
+    await expect(baseRung.locator(".simulcast-rung-id")).toHaveText("L");
     await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L0$/ })).toHaveCount(0);
+    await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L1$/ })).toHaveCount(0);
+  });
+
+  // ── Drawer help popovers + position:fixed viewport-clip regression (#1131) ──
+  //
+  // CHANGE #4: the drawer's HelpPopover info ("?") icons share ONE single-open
+  // signal per cluster (opening one closes its sibling), use role="dialog", and
+  // wire aria-haspopup/aria-expanded/aria-controls. The "Live stream state"
+  // group's NetEq sections carry help popovers — `diag-status-help` on "Current
+  // Status" and, after #1222 iteration 4, a PER-CHART "?" on each of the four
+  // NetEq charts (`diag-chart-buffer-help`, `diag-chart-decode-help`,
+  // `diag-chart-packets-help`, `diag-chart-reorder-help`; popover ids
+  // `*-popover`). The old section-level `diag-charts-help` on the "NetEQ charts"
+  // heading was REMOVED in favor of the per-chart icons. Identical mechanism
+  // (component, styles, clamp/flip) to the Quality-controls panel's per-kind help
+  // (`perf-{video,audio,screen}-help`).
+  //
+  // CHANGE #5 (the user-reported clipping bug): every `.perf-help-popover` is now
+  // `position: fixed` with a JS clamp/flip (`use_help_popover_anchor` /
+  // `compute_help_popover_position`). They previously clipped at the drawer's
+  // right border and bottom fold because an `absolute` popover anchored INSIDE
+  // `#diagnostics-sidebar { overflow-y: auto }` is clipped on BOTH axes.
+  //
+  // ITERATION 3/4 reality (why this test no longer hard-targets the NetEq "?"):
+  // the NetEq Current-Status + charts sections (and so their "?" buttons) now
+  // render ONLY for a SINGLE selected peer. With the "All Peers" aggregate
+  // selected — the ZERO-remote-peer solo-meeting default this spec produces —
+  // those sections are replaced by a placeholder, so `diag-status-help` and the
+  // per-chart `diag-chart-*-help` buttons are ABSENT. (#1222 ITERATION 4 adds a
+  // 1:1 auto-select: with EXACTLY ONE remote peer the drawer auto-picks it and
+  // those sections DO render by default — but that path needs a real second peer
+  // and cannot be exercised on this solo runner; see the placeholder test below.)
+  // The viewport-clip regression mechanism is shared by ALL drawer
+  // HelpPopovers, so the load-bearing regression guard below opens a
+  // Quality-controls help popover (`perf-screen-help`, low in the FIRST group
+  // after a full scroll) — always reachable in a solo meeting — and asserts its
+  // box stays inside the viewport. The NetEq-specific aria + single-open contract
+  // is then asserted CONDITIONALLY, only when a real peer made the NetEq "?"
+  // buttons render (a multi-peer runner). Both paths use the same fixed+clamp+flip
+  // code, so reverting `position: fixed` (or the clamp/flip in
+  // `compute_help_popover_position`) turns the guard red.
+  //
+  // MUTATION REASONING: we scroll the drawer to the bottom, open the target "?"
+  // near the bottom fold, then assert its boundingBox is fully inside the viewport
+  // (x ≥ 0, y ≥ 0, right ≤ innerWidth, bottom ≤ innerHeight). Under the OLD
+  // `position:absolute` (top: calc(100% + 8px); anchored inside the scroll box) a
+  // popover opened that low extended past the bottom fold AND past the right
+  // border — box.bottom/right would exceed the viewport and the check would FAIL.
+  test("Drawer help popovers (position:fixed clamp/flip): a bottom-of-drawer popover stays within the viewport (#1131)", async ({
+    page,
+  }) => {
+    // Use a SHORT viewport so the bottom-of-drawer popover would clearly overflow
+    // the bottom fold under the old absolute positioning — making the regression
+    // unambiguous on any runner.
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await joinMeeting(page, "neteq_help_viewport");
+    await openPerformanceDrawer(page);
+
+    const sidebar = perfDrawer(page);
+    const scrollContainer = sidebar.locator(".sidebar-content");
+    await expect(scrollContainer).toBeVisible();
+
+    // ── Load-bearing regression guard: a Quality-controls help popover.
+    // `perf-screen-help` is the Content/screen card's "?", reliably present in a
+    // solo meeting (the Quality-controls panel renders once Host publishes the
+    // controls — `openPerformanceDrawer` already waited on its simulcast strip).
+    const guardBtn = sidebar.locator('[data-testid="perf-screen-help"]');
+    await expect(guardBtn).toBeVisible({ timeout: 15_000 });
+    const guardPopoverId = await guardBtn.getAttribute("aria-controls");
+    expect(guardPopoverId, "help button wires aria-controls to its popover id").not.toBeNull();
+    const guardPopover = page.locator(`#${guardPopoverId}`);
+
+    // Scroll the drawer all the way down so the help button sits near the bottom
+    // fold — the worst case for the reported clip — then open it.
+    await scrollContainer.evaluate((el) => {
+      el.scrollTop = el.scrollHeight;
+    });
+    await guardBtn.scrollIntoViewIfNeeded();
+    await expect(guardBtn).toHaveAttribute("aria-haspopup", "dialog");
+    await expect(guardBtn).toHaveAttribute("aria-expanded", "false");
+    await guardBtn.click();
+    await expect(guardBtn).toHaveAttribute("aria-expanded", "true");
+    await expect(guardPopover).toBeVisible();
+    await expect(guardPopover).toHaveAttribute("role", "dialog");
+
+    // ── VIEWPORT-CLIP REGRESSION (CHANGE #5) ──
+    // The popover's layout box must be fully inside the viewport. position:fixed +
+    // clamp/flip guarantees this; the old absolute-in-scroll-box clipped past the
+    // bottom fold and the right border, so box.bottom > innerHeight (or box.right >
+    // innerWidth) and this assertion would fail.
+    const viewport = page.viewportSize();
+    expect(viewport, "viewport size is known").not.toBeNull();
+    const vp = viewport as { width: number; height: number };
+    const box = await guardPopover.boundingBox();
+    expect(box, "the open popover has a layout box").not.toBeNull();
+    const b = box as { x: number; y: number; width: number; height: number };
+    // Left/top edges on-screen…
+    expect(b.x, "popover left edge ≥ 0 (not clipped off the left)").toBeGreaterThanOrEqual(0);
+    expect(b.y, "popover top edge ≥ 0 (not clipped off the top)").toBeGreaterThanOrEqual(0);
+    // …right edge inside the viewport width (the right-border clip half of the bug)…
+    expect(
+      b.x + b.width,
+      "popover right edge ≤ viewport width (not clipped at the drawer's right border)",
+    ).toBeLessThanOrEqual(vp.width + 1);
+    // …bottom edge inside the viewport height (the bottom-fold clip half of the bug).
+    expect(
+      b.y + b.height,
+      "popover bottom edge ≤ viewport height (not clipped at the drawer's bottom fold)",
+    ).toBeLessThanOrEqual(vp.height + 1);
+    // Close the guard popover so its open state doesn't bleed into the NetEq path.
+    await page.keyboard.press("Escape");
+    await expect(guardBtn).toHaveAttribute("aria-expanded", "false");
+
+    // ── NetEq-specific aria + single-open contract (CHANGE #4) ──
+    // Only assertable when a real peer made the per-peer NetEq sections render
+    // (the "?" buttons are ABSENT under the solo "All Peers" placeholder). When
+    // present, exercise the same fixed+clamp+flip guarantee on the NetEq popover
+    // and the shared single-open behaviour.
+    // #1222 ITERATION 4: the section-level `diag-charts-help` was removed; each
+    // chart now carries its OWN "?" (`diag-chart-{buffer,decode,packets,reorder}-help`).
+    // We use the per-chart Buffer help as the second NetEq popover here. It shares
+    // the SAME single-open `open_help` signal as `diag-status-help`, and renders
+    // under the same gate the old charts help did (single peer selected AND that
+    // peer has NetEq history), so the status-present / charts-maybe-present
+    // conditional structure below is preserved exactly.
+    const statusBtn = sidebar.locator('[data-testid="diag-status-help"]');
+    const chartsBtn = sidebar.locator('[data-testid="diag-chart-buffer-help"]');
+    const statusPresent = (await statusBtn.count()) > 0;
+    if (!statusPresent) {
+      // Solo / All-Peers runner: the NetEq help buttons legitimately do not
+      // render (placeholder shown). The regression guard above already covered
+      // the fixed-popover contract. Nothing more to assert here.
+      return;
+    }
+
+    const chartsPresent = (await chartsBtn.count()) > 0;
+    const neteqBtn = chartsPresent ? chartsBtn : statusBtn;
+    const neteqTestid = chartsPresent ? "diag-chart-buffer-help" : "diag-status-help";
+    const neteqPopoverId = `${neteqTestid}-popover`;
+    const neteqPopover = page.locator(`#${neteqPopoverId}`);
+
+    await neteqBtn.scrollIntoViewIfNeeded();
+    await expect(neteqBtn).toHaveAttribute("aria-haspopup", "dialog");
+    await expect(neteqBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(neteqBtn).toHaveAttribute("aria-controls", neteqPopoverId);
+    await expect(neteqPopover).toHaveCount(0);
+
+    await neteqBtn.click();
+    await expect(neteqBtn).toHaveAttribute("aria-expanded", "true");
+    await expect(neteqPopover).toBeVisible();
+    await expect(neteqPopover).toHaveAttribute("role", "dialog");
+
+    // Same viewport-clip guarantee on the NetEq popover (it sits in the MIDDLE
+    // "Live stream state" group, still well down the drawer).
+    const neteqBox = await neteqPopover.boundingBox();
+    expect(neteqBox, "the open NetEq popover has a layout box").not.toBeNull();
+    const nb = neteqBox as { x: number; y: number; width: number; height: number };
+    expect(nb.x, "NetEq popover left edge ≥ 0").toBeGreaterThanOrEqual(0);
+    expect(nb.y, "NetEq popover top edge ≥ 0").toBeGreaterThanOrEqual(0);
+    expect(nb.x + nb.width, "NetEq popover right edge ≤ viewport width").toBeLessThanOrEqual(
+      vp.width + 1,
+    );
+    expect(nb.y + nb.height, "NetEq popover bottom edge ≤ viewport height").toBeLessThanOrEqual(
+      vp.height + 1,
+    );
+
+    // Shared single-open behaviour: assertable only when BOTH NetEq popovers
+    // render (history present). Opening the other "?" closes the first.
+    if (chartsPresent) {
+      const statusPopover = page.locator("#diag-status-help-popover");
+      // The per-chart Buffer popover is currently open; opening the status "?"
+      // must close it (single-open contract across the shared open_help signal).
+      await statusBtn.scrollIntoViewIfNeeded();
+      await statusBtn.click();
+      await expect(statusBtn).toHaveAttribute("aria-expanded", "true");
+      await expect(statusPopover).toBeVisible();
+      // The previously-open per-chart Buffer popover is now closed (single-open).
+      await expect(chartsBtn).toHaveAttribute("aria-expanded", "false");
+      await expect(page.locator("#diag-chart-buffer-help-popover")).toHaveCount(0);
+      // Escape closes the open status popover and returns aria-expanded to false.
+      await page.keyboard.press("Escape");
+      await expect(statusBtn).toHaveAttribute("aria-expanded", "false");
+      await expect(statusPopover).toHaveCount(0);
+    } else {
+      // Single-popover path: Escape still closes it (keyboard-operable).
+      await page.keyboard.press("Escape");
+      await expect(neteqBtn).toHaveAttribute("aria-expanded", "false");
+      await expect(neteqPopover).toHaveCount(0);
+    }
+  });
+
+  // ── ITERATION 4 — group reorder (#1131 / #1222) ──────────────────────────
+  //
+  // The drawer body's three top-level groups are `div.diag-group-label`
+  // elements. After iteration 4 their DOM order is investigation-first:
+  //   "Connection & system" → "Quality controls" → "Live stream state".
+  // Connection & system is the always-rendered incident-investigation anchor
+  // (no gate, so it leads and unconditionally owns the `--first` modifier);
+  // Quality controls (the editable sliders/Auto) is second; Live stream state
+  // (passive read-only telemetry) is last. (Quality controls renders once Host
+  // publishes the perf controls, which `openPerformanceDrawer` already awaits
+  // via the simulcast strip.)
+  //
+  // OLD-STRUCTURE FAILURE: in iteration 3 the order was
+  //   ["Quality controls", "Live stream state", "Connection & system"].
+  // Asserting the exact ordered text array fails against that order (and against
+  // any future reshuffle), so this is a real sync guard, not a tautology.
+  test("group order: the three drawer groups render Connection & system → Quality controls → Live stream state (#1131 iter 4)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "group_order");
+    await openPerformanceDrawer(page);
+
+    const sidebar = perfDrawer(page);
+    const groupLabels = sidebar.locator(".diag-group-label");
+    // All three groups present (Quality controls is guaranteed by
+    // openPerformanceDrawer's simulcast-strip wait).
+    await expect(groupLabels).toHaveCount(3, { timeout: 15_000 });
+    await expect(groupLabels).toHaveText([
+      "Connection & system",
+      "Quality controls",
+      "Live stream state",
+    ]);
+    // The first (Connection & system) group owns the `--first` modifier — it is
+    // the always-rendered anchor, so `--first` can never be orphaned (#1222).
+    await expect(groupLabels.first()).toHaveClass(/diag-group-label--first/);
+    await expect(groupLabels.first()).toHaveText("Connection & system");
+  });
+
+  // ── ITERATION 3 — Raw stats + Build info collapsed disclosures (#1131) ────
+  //
+  // Inside "Connection & system" (now the LAST group) the four low-level
+  // pre-dumps (Reception / Sending / Encoder / Media Status) were merged into a
+  // single collapsed `<details class="diag-disclosure">` "Raw stats" disclosure
+  // (`summary#diag-h-raw-stats`), and "Build info" became a second collapsed
+  // `<details>` at the very bottom. Both are CLOSED by default (no `open` attr).
+  //
+  // OLD-STRUCTURE FAILURE: in iteration 2 the same four pre-dumps were ALWAYS
+  // visible as standalone `Reception Stats` / `Sending Stats` / `Encoder
+  // Settings` / `Media Status` `<section>`s (their `<pre>` content visible
+  // without any click), and Build info was an always-open `<section>`. Asserting
+  // the content is HIDDEN until the summary is clicked fails against that
+  // structure (the content would already be visible). Asserting all four blocks
+  // live inside ONE disclosure also fails (they were four separate sections).
+  test("Connection & system: Raw stats + Build info are collapsed <details> that expand on click (#1131 iter 3)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "raw_stats_disclosure");
+    await openPerformanceDrawer(page);
+
+    const sidebar = perfDrawer(page);
+
+    // ── Raw stats disclosure ──
+    const rawSummary = sidebar.locator("summary#diag-h-raw-stats");
+    await expect(rawSummary).toBeVisible({ timeout: 15_000 });
+    await expect(rawSummary).toHaveText(/Raw stats/);
+    // The chevron affordance (iteration 3) lives inside the summary.
+    await expect(rawSummary.locator(".diag-disclosure-chev")).toHaveCount(1);
+
+    // The enclosing <details> is the disclosure; its merged-blocks container.
+    const rawDetails = sidebar.locator("details.diag-disclosure", { has: rawSummary });
+    const rawBody = rawDetails.locator(".diagnostics-data");
+    const rawBlocks = rawBody.locator(".diag-raw-block");
+
+    // COLLAPSED BY DEFAULT: a closed <details> does not render its non-summary
+    // content, so the merged blocks are not visible until the summary is clicked.
+    await rawSummary.scrollIntoViewIfNeeded();
+    await expect(rawBody).toBeHidden();
+
+    // EXPAND: clicking the summary opens the disclosure and reveals the four
+    // merged blocks (Reception / Sending / Encoder / Media Status), each with its
+    // own sub-heading <h4>. (The standalone iteration-2 sections are gone.)
+    await rawSummary.click();
+    await expect(rawBody).toBeVisible();
+    await expect(rawBlocks).toHaveCount(4);
+    const rawHeadings = rawBlocks.locator("h4");
+    await expect(rawHeadings).toHaveText([
+      "Reception Stats",
+      "Sending Stats",
+      "Encoder Settings",
+      "Media Status",
+    ]);
+
+    // ── Build info disclosure (the second, bottom-most collapsed <details>) ──
+    const buildSummary = sidebar.locator("summary#diag-h-build-info");
+    await buildSummary.scrollIntoViewIfNeeded();
+    await expect(buildSummary).toBeVisible();
+    await expect(buildSummary).toHaveText(/Build info/);
+    const buildDetails = sidebar.locator("details.diag-disclosure", { has: buildSummary });
+    const buildTable = buildDetails.locator(".build-info-table");
+    // COLLAPSED BY DEFAULT (was an always-open section in iteration 2).
+    await expect(buildTable).toBeHidden();
+    await buildSummary.click();
+    await expect(buildTable).toBeVisible();
+  });
+
+  // ── ITERATION 3/4 — All-Peers placeholder vs single-peer NetEq charts (#1131 / #1222) ─
+  //
+  // The NetEq Current-Status + time-series charts are now per-PEER. The placeholder
+  // ("Select a specific peer to view time-series charts and current status.")
+  // shows whenever the aggregate "All Peers" view is selected — which is the
+  // case at ZERO remote peers (this solo runner's reality) AND at 2+ remote peers
+  // until the user picks one. Selecting a specific peer renders the redesigned
+  // two-tier Current Status (`.neteq-status` > `.status-primary` with two
+  // `.status-stat`, `.status-secondary` with four `.status-row`, plus a
+  // `.status-reorder` micro-row) and the horizontally-scrollable charts: each
+  // chart is a fixed `.neteq-chart-y-axis` <svg> sibling + a `.neteq-chart-scroll`
+  // overflow-x box (stacked 1-up inside `.neteq-charts-stack`).
+  //
+  // #1222 ITERATION 4 — 1:1 AUTO-SELECT: with EXACTLY ONE remote peer the drawer
+  // now auto-selects it on first appearance, so the Current Status + charts
+  // render BY DEFAULT (no placeholder) for that one peer. That path needs a real
+  // second participant emitting NetEq stats and CANNOT be exercised on this solo
+  // (zero-remote-peer) runner — the same multi-peer-harness gap (#1093) that gates
+  // the single-peer arm below. The auto-select itself is host-tested in Rust
+  // (`auto_select_peer` in diagnostics.rs). On this solo runner the placeholder
+  // arm is the correct, accurate assertion: zero peers → All-Peers placeholder.
+  //
+  // The peer selector itself only appears with > 1 entry in available_peers
+  // (All Peers + >= 1 remote peer that emitted NetEq stats), so the single-peer
+  // arm runs only on a multi-peer runner; the placeholder arm always runs.
+  //
+  // OLD-STRUCTURE FAILURE: in iteration 2 the default "All Peers" selection
+  // showed Current Status tiles (concatenated history / "--" tiles) and the 2×2
+  // `.charts-grid`, never a "Select a specific peer…" placeholder. Asserting the
+  // placeholder text under All Peers fails against iteration 2. Asserting a
+  // `.neteq-chart-scroll` overflow-x box (not a fixed-width grid cell) fails
+  // against the old non-scrollable 2×2 grid. Asserting the two-tier `.neteq-status`
+  // structure (below) fails against the old 9-uniform-tile `.status-grid`.
+  test("Live stream state: NetEq shows the All-Peers placeholder, and a selected peer shows the two-tier status + scrollable charts (#1131 iter 4)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "neteq_placeholder");
+    await openPerformanceDrawer(page);
+
+    const sidebar = perfDrawer(page);
+
+    // The Peer Selection dropdown only renders with > 1 entry in available_peers
+    // (i.e. at least one remote peer that emitted NetEq stats). In a solo meeting
+    // it is absent and "All Peers" is the implicit selection.
+    const peerSelect = sidebar.locator("select.peer-selector", {
+      has: page.locator('option:text-is("All Peers")'),
+    });
+    const placeholder = sidebar.locator(".diag-neteq-placeholder");
+
+    // ── All-Peers arm (always runs; this solo runner has ZERO remote peers, so
+    //    the 1:1 auto-select does NOT fire and the placeholder is the correct
+    //    default — see the block comment on the iter-4 auto-select gap) ──
+    // Under the All-Peers aggregate the NetEq section is the single placeholder,
+    // and the per-peer Current-Status / per-chart help "?" buttons are ABSENT.
+    await expect(placeholder).toBeVisible({ timeout: 15_000 });
+    await expect(placeholder).toHaveText(
+      "Select a specific peer to view time-series charts and current status.",
+    );
+    await expect(sidebar.locator('[data-testid="diag-status-help"]')).toHaveCount(0);
+    // The section-level diag-charts-help was removed (#1222); the four per-chart
+    // help icons render only with a selected peer + history, so none under the
+    // All-Peers placeholder.
+    await expect(sidebar.locator('[data-testid="diag-chart-buffer-help"]')).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="diag-chart-decode-help"]')).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="diag-chart-packets-help"]')).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="diag-chart-reorder-help"]')).toHaveCount(0);
+    // The new two-tier Current Status (`.neteq-status`) is not rendered either.
+    await expect(sidebar.locator(".neteq-status")).toHaveCount(0);
+    // No scrollable charts render under the placeholder.
+    await expect(sidebar.locator(".neteq-chart-scroll")).toHaveCount(0);
+
+    // ── Single-peer arm (multi-peer runner only) ──
+    const hasSelector = (await peerSelect.count()) > 0;
+    test.skip(
+      !hasSelector,
+      "solo meeting: no remote peer emitted NetEq stats, so the Peer Selection " +
+        "dropdown is absent and only the All-Peers placeholder can be exercised",
+    );
+
+    // Pick the first specific peer (the option after "All Peers").
+    const peerOptions = peerSelect.locator("option");
+    const optionCount = await peerOptions.count();
+    expect(optionCount, "peer selector lists All Peers + at least one peer").toBeGreaterThan(1);
+    const firstPeerValue = await peerOptions.nth(1).getAttribute("value");
+    expect(firstPeerValue, "first specific peer has a value").not.toBeNull();
+    await peerSelect.selectOption(firstPeerValue as string);
+
+    // Now the placeholder is gone and the Current Status cluster (with its "?"
+    // help) renders for the selected peer.
+    await expect(placeholder).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="diag-status-help"]')).toBeVisible({
+      timeout: 15_000,
+    });
+
+    // #1222 ITERATION 4 — two-tier Current Status redesign: the old 9-uniform-tile
+    // `.status-grid` is GONE, replaced by `.neteq-status` (scoped to avoid the
+    // identically-named `.status-*` classes the Connection Manager section uses)
+    // with a primary stat pair, a four-row flow group, and a reorder micro-row.
+    // Assert the structure exists for the selected peer.
+    const neteqStatus = sidebar.locator(".neteq-status");
+    await expect(neteqStatus).toBeVisible({ timeout: 15_000 });
+    // Tier 1 — primary: exactly two `.status-stat` (Buffer + Target).
+    await expect(neteqStatus.locator(".status-primary")).toBeVisible();
+    await expect(neteqStatus.locator(".status-primary .status-stat")).toHaveCount(2);
+    // Tier 2 — flow group: exactly four `.status-row` (Packets awaiting /
+    // Packets per s / Expand rate / Accelerate rate).
+    await expect(neteqStatus.locator(".status-secondary")).toBeVisible();
+    await expect(neteqStatus.locator(".status-secondary .status-row")).toHaveCount(4);
+    // Tier 3 — reorder micro-row: three `.status-reorder__item` (Rate /
+    // Reordered / Max dist).
+    await expect(neteqStatus.locator(".status-reorder")).toBeVisible();
+    await expect(neteqStatus.locator(".status-reorder .status-reorder__item")).toHaveCount(3);
+    // The retired iteration-2/3 tile classes must NOT resurface inside the NetEq
+    // status block (the Connection Manager section owns its own same-named classes,
+    // hence the `.neteq-status` scope above).
+    await expect(neteqStatus.locator(".status-grid")).toHaveCount(0);
+    await expect(neteqStatus.locator(".status-item")).toHaveCount(0);
+
+    // The charts section is gated on the peer having NetEq HISTORY. A fresh
+    // selection may legitimately have no samples yet → the "NetEQ Buffer / Jitter
+    // History" fallback (no scrollable charts) is shown instead. Handle BOTH:
+    //   - history present → `.neteq-chart-scroll` (overflow-x) + a fixed
+    //     `.neteq-chart-y-axis` sibling, stacked in `.neteq-charts-stack`;
+    //   - no history yet → the buffer/jitter fallback heading.
+    const chartScroll = sidebar.locator(".neteq-chart-scroll").first();
+    const fallbackHeading = sidebar.getByRole("heading", {
+      name: "NetEQ Buffer / Jitter History",
+    });
+    await expect(chartScroll.or(fallbackHeading).first()).toBeVisible({ timeout: 15_000 });
+
+    if ((await sidebar.locator(".neteq-chart-scroll").count()) > 0) {
+      // Scrollable charts present: assert the time-series structure.
+      const stack = sidebar.locator(".neteq-charts-stack");
+      await expect(stack).toBeVisible();
+      // Four charts stacked 1-up, each with its own scroll box and a fixed Y-axis.
+      await expect(sidebar.locator(".neteq-chart-scroll")).toHaveCount(4);
+      await expect(sidebar.locator(".neteq-chart-y-axis")).toHaveCount(4);
+
+      // The scroll box is a horizontal-overflow container (the iteration-3 change
+      // from the old fixed 2×2 grid). Assert computed overflow-x is scrollable —
+      // this is the load-bearing "now scrollable" contract; it does NOT assert a
+      // fixed direction "fits", honouring the #1208/#1213 lesson.
+      const overflowX = await chartScroll.evaluate((el) => getComputedStyle(el).overflowX);
+      expect(overflowX, "the NetEq chart container scrolls horizontally").toMatch(/auto|scroll/);
+
+      // The fixed Y-axis svg is a SIBLING of the scroll box inside the wrapper
+      // (rendered OUTSIDE the scroll container so it stays pinned while the
+      // timeline scrolls). Each `.neteq-chart-wrapper` holds exactly one of each.
+      const wrapper = sidebar.locator(".neteq-chart-wrapper").first();
+      await expect(wrapper.locator(".neteq-chart-y-axis")).toHaveCount(1);
+      await expect(wrapper.locator(".neteq-chart-scroll")).toHaveCount(1);
+      // Sibling proof: the y-axis is NOT a descendant of the scroll box (it would
+      // otherwise be clipped). The scroll box contains the growing SVG, not the
+      // fixed axis.
+      await expect(
+        wrapper.locator(".neteq-chart-scroll .neteq-chart-y-axis"),
+        "the fixed Y-axis must live OUTSIDE the scroll box (a sibling, not a child)",
+      ).toHaveCount(0);
+    }
   });
 });

@@ -17,8 +17,8 @@
  */
 
 use crate::auth::{
-    check_session, clear_access_token, clear_id_token, clear_user_profile, get_user_profile,
-    UserProfile,
+    check_session, clear_access_token, clear_id_token, clear_refresh_token, clear_user_profile,
+    get_user_profile, UserProfile,
 };
 use crate::components::about_modal::AboutModal;
 use crate::components::browser_compatibility::BrowserCompatibility;
@@ -303,9 +303,14 @@ pub fn Home() -> Element {
     let on_logout = move |_| {
         // Clear all client-side auth state
         clear_access_token();
+        clear_refresh_token();
         clear_id_token();
         clear_user_profile();
         clear_display_name_from_storage();
+
+        // Defense-in-depth: drop any in-flight refresh Shared so a stale wave
+        // can't linger post-logout.
+        crate::meeting_api::reset_refresh_inflight();
 
         // Reset in-memory signals
         user_profile.set(None);

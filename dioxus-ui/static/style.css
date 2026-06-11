@@ -7799,7 +7799,7 @@ html[data-theme="light"] .settings-divider {
 /* Two side-by-side columns (Send | Receive). Collapses to one column below the
    card-width threshold (Send on top), driven PURELY by the card's own width via
    the `@container` query — the redundant viewport `@media (max-width: 639px)`
-   collapse was dropped in #1131 so the columns track the card (now in the wider
+   collapse was dropped in issue 1131 so the columns track the card (now in the wider
    720px drawer), not the viewport. `.perf-kind-card` sets `container-type:
    inline-size`, so this resolves correctly. */
 .perf-card-cols {

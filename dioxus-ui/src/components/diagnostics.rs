@@ -121,12 +121,17 @@ fn render_reception(map: &BTreeMap<(String, String), ReceptionEntry>) -> Option<
             .fps
             .map(|v| format!("{v:.2}"))
             .unwrap_or_else(|| "-".into());
+        // Timestamp renders at SECOND granularity on purpose: the change-gate
+        // in the subscribe loop compares rendered strings, and a millisecond
+        // timestamp changes on every 500ms heartbeat — which would make the
+        // dump never byte-identical and defeat the gate entirely (each event
+        // would re-render the drawer body for an invisible ms tick).
         text.push_str(&format!(
-            "Peer: {peer} ({kind})\nFPS: {fps}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nTimestamp: {}\n\n",
+            "Peer: {peer} ({kind})\nFPS: {fps}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nTimestamp: {}s\n\n",
             fmt1(e.bitrate_kbps),
             fmt1(e.loss_per_sec),
             fmt1(e.kf_req_per_sec),
-            e.last_ts_ms,
+            e.last_ts_ms / 1000,
         ));
     }
     Some(text)
@@ -700,10 +705,14 @@ pub fn Diagnostics(
                     "video" if update_reception(&mut reception, &evt) => {
                         if let Some(text) = render_reception(&reception) {
                             // Change-gate (mirrors the peer_status arm):
-                            // consecutive dumps are usually byte-identical
-                            // — skip the set() so the drawer body doesn't
-                            // re-render for no change. `.peek()` reads
-                            // without subscribing this loop.
+                            // skip the set() when the dump is unchanged so
+                            // the drawer body doesn't re-render per event.
+                            // This works ONLY because render_reception emits
+                            // the timestamp at second granularity — at ms
+                            // granularity every heartbeat would produce a
+                            // distinct string and the gate would never
+                            // suppress (pinned by the gate-effectiveness
+                            // test). `.peek()` reads without subscribing.
                             if diagnostics_data.peek().as_deref() != Some(text.as_str()) {
                                 diagnostics_data.set(Some(text));
                             }
@@ -1820,7 +1829,7 @@ mod tests {
         let evt = DiagEvent {
             subsystem: "video",
             stream_id: None,
-            ts_ms: 1234,
+            ts_ms: 1_234_000,
             metrics: vec![
                 m("fps_received", MetricValue::F64(30.0)),
                 m("bitrate_kbps", MetricValue::F64(850.0)),
@@ -1840,9 +1849,11 @@ mod tests {
             !text.contains("self-id"),
             "from_peer (self-id) must NOT be the label: {text}"
         );
+        // Second granularity (1_234_000 ms → 1234s) — load-bearing for the
+        // change-gate; see reception_render_is_stable_within_a_second.
         assert!(
-            text.contains("Timestamp: 1234"),
-            "timestamp present: {text}"
+            text.contains("Timestamp: 1234s"),
+            "second-granularity timestamp present: {text}"
         );
         // Fields this event never carried still render with static labels.
         assert!(text.contains("Loss: -/s"), "loss placeholder: {text}");
@@ -1863,7 +1874,7 @@ mod tests {
         let heartbeat = DiagEvent {
             subsystem: "video",
             stream_id: None,
-            ts_ms: 1000,
+            ts_ms: 1_000_000,
             metrics: vec![
                 m("fps_received", MetricValue::F64(30.0)),
                 m("bitrate_kbps", MetricValue::F64(850.0)),
@@ -1874,7 +1885,7 @@ mod tests {
         let loss = DiagEvent {
             subsystem: "video",
             stream_id: None,
-            ts_ms: 1500,
+            ts_ms: 1_500_000,
             metrics: vec![
                 m("media_type", MetricValue::Text("VIDEO".to_string())),
                 m("to_peer", MetricValue::Text("peer-abc".to_string())),
@@ -1894,13 +1905,47 @@ mod tests {
             text.contains("Keyframe requests: 0.5/s"),
             "kf folded in: {text}"
         );
-        assert!(text.contains("Timestamp: 1500"), "ts advanced: {text}");
+        assert!(text.contains("Timestamp: 1500s"), "ts advanced: {text}");
         // Still exactly ONE block for the single (peer, kind) key.
         assert_eq!(
             text.matches("Peer: ").count(),
             1,
             "one merged block: {text}"
         );
+    }
+
+    /// Change-gate effectiveness pin: the subscribe loop suppresses re-renders
+    /// by comparing rendered strings, which only works if the render is STABLE
+    /// when the data hasn't changed. Two identical-data folds within the same
+    /// wall-clock second must render byte-identically (the timestamp renders
+    /// at second granularity); a later-second fold may differ. Reverting the
+    /// timestamp to millisecond granularity fails the equality assertion —
+    /// exactly the defect that made the original gate a no-op.
+    #[test]
+    fn reception_render_is_stable_within_a_second() {
+        let mk = |ts_ms: u64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms,
+            metrics: vec![
+                m("fps_received", MetricValue::F64(30.0)),
+                m("bitrate_kbps", MetricValue::F64(850.0)),
+                m("media_type", MetricValue::Text("VIDEO".to_string())),
+                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+            ],
+        };
+        let mut map = BTreeMap::new();
+        assert!(update_reception(&mut map, &mk(1_000_000)));
+        let first = render_reception(&map).expect("non-empty");
+        // Same data, 400ms later — same second → identical render → the
+        // subscribe loop's gate suppresses the set().
+        assert!(update_reception(&mut map, &mk(1_000_400)));
+        let second = render_reception(&map).expect("non-empty");
+        assert_eq!(first, second, "same-second same-data render must be stable");
+        // A later second is allowed to differ (and does, via the timestamp).
+        assert!(update_reception(&mut map, &mk(2_000_000)));
+        let third = render_reception(&map).expect("non-empty");
+        assert_ne!(first, third, "later-second render reflects the new second");
     }
 
     /// An event lacking the (to_peer, media_type) key must not fold (no

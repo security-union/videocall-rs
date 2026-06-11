@@ -161,13 +161,19 @@ pub fn format_simulcast_summary(s: &SimulcastSummary) -> String {
     )
 }
 
-/// Format one SEND simulcast layer line, e.g. `"L1 640×360 · 400 kbps"`. The
-/// `layer_id` is the internal 0-based id; the DISPLAYED layer number is 1-based
-/// (`layer_id + 1`) to match the receive side's `L1/3` convention — users count
-/// layers from 1, not 0. Pure.
-pub fn format_send_layer(layer_id: u32, width: u32, height: u32, bitrate_kbps: u32) -> String {
-    let layer_num = layer_id + 1;
-    format!("L{layer_num} {width}×{height} · {bitrate_kbps} kbps")
+/// Format one SEND simulcast layer line, e.g. `"Low · 640×360 · 400 kbps"`. The
+/// `layer_id` is the internal 0-based id; `count` is the ladder size. The
+/// DISPLAYED label is the quality name (Low/Medium/High) via
+/// [`layer_quality_label`] — the internal id stays 0-based for e2e/protobuf. Pure.
+pub fn format_send_layer(
+    layer_id: u32,
+    count: u32,
+    width: u32,
+    height: u32,
+    bitrate_kbps: u32,
+) -> String {
+    let name = layer_quality_label(layer_id, count, false);
+    format!("{name} · {width}×{height} · {bitrate_kbps} kbps")
 }
 
 /// Format the SEND simulcast header for a kind, e.g.
@@ -185,22 +191,24 @@ pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
     }
 }
 
-/// Format one RECEIVE per-kind line for a peer, e.g. `"video L2/3 · 1280×720"`
-/// or `"audio L1/3 · 24 kbps"`. Returns `None` when the kind is not flowing.
-/// Pure / host-tested.
+/// Format one RECEIVE per-kind line for a peer, e.g. `"video M · 2/3 · 1280×720"`
+/// or `"audio L · 1/3 · 24 kbps"`. The quality LETTER (Low/Med/High → L/M/H) is
+/// followed by the 1-based position/total. Returns `None` when the kind is not
+/// flowing. Pure / host-tested.
 pub fn format_peer_kind_line(
     kind_label: &str,
     snap: Option<&ReceivedLayerSnapshot>,
 ) -> Option<String> {
     let s = snap?;
-    let layer = s.layer_index + 1;
+    let letter = layer_quality_label(s.layer_index, s.layer_count, true);
     let detail = if matches!(s.kind, PrefMediaKind::Audio) {
         format!("{} kbps", s.kbps)
     } else {
         format!("{}×{}", s.width, s.height)
     };
     Some(format!(
-        "{kind_label} L{layer}/{} · {detail}",
+        "{kind_label} {letter} · {}/{} · {detail}",
+        s.layer_index + 1,
         s.layer_count
     ))
 }
@@ -380,21 +388,51 @@ pub fn format_kbps_compact(kbps: u32) -> String {
     format!("{s}M")
 }
 
-/// Format the RECEIVE per-kind layer spread across peers, e.g. `"L1–L3"`, or
-/// `"L3"` when every peer is on the same layer. `layers` is the list of
-/// 0-based `layer_index` values; the DISPLAYED numbers are 1-based (via `+1`).
-/// Empty → empty string (caller renders the "not receiving" state).
-/// Pure / host-tested.
-pub fn format_receive_spread(layers: &[u32]) -> String {
+/// Position→quality label for simulcast tiers (#1222). `index` is the 0-based
+/// ladder position; `count` the ladder size; `compact` returns the single letter
+/// for space-constrained chips. Degenerate: count<=1 → "Single" (compact "1").
+/// Top index (`count-1`) is always High; everything between 0 and top is Medium.
+/// Pure / host-testable.
+pub fn layer_quality_label(index: u32, count: u32, compact: bool) -> &'static str {
+    if count <= 1 {
+        return if compact { "1" } else { "Single" };
+    }
+    if count == 2 {
+        return match (index, compact) {
+            (0, false) => "Low",
+            (0, true) => "L",
+            (_, false) => "High",
+            (_, true) => "H",
+        };
+    }
+    let top = count - 1;
+    match (index, compact) {
+        (0, false) => "Low",
+        (0, true) => "L",
+        (i, false) if i >= top => "High",
+        (i, true) if i >= top => "H",
+        (_, false) => "Medium",
+        (_, true) => "M",
+    }
+}
+
+/// Format the RECEIVE per-kind layer spread across peers by quality LETTER, e.g.
+/// `"L–H"`, or a single letter `"H"` when every peer is on the same layer.
+/// `layers` is the list of 0-based `layer_index` values; `count` is the ladder
+/// size for the kind (the basis for the quality letters). Empty → empty string
+/// (caller renders the "not receiving" state). Pure / host-tested.
+pub fn format_receive_spread(layers: &[u32], count: u32) -> String {
     let Some(&first) = layers.first() else {
         return String::new();
     };
-    let lo = layers.iter().copied().min().unwrap_or(first) + 1;
-    let hi = layers.iter().copied().max().unwrap_or(first) + 1;
+    let lo = layers.iter().copied().min().unwrap_or(first);
+    let hi = layers.iter().copied().max().unwrap_or(first);
+    let lo_letter = layer_quality_label(lo, count, true);
+    let hi_letter = layer_quality_label(hi, count, true);
     if lo == hi {
-        format!("L{lo}")
+        hi_letter.to_string()
     } else {
-        format!("L{lo}–L{hi}")
+        format!("{lo_letter}\u{2013}{hi_letter}")
     }
 }
 
@@ -541,16 +579,16 @@ pub fn send_rungs_aria(rungs: &[SendRung]) -> String {
     }
 }
 
-/// VIDEO RECEIVE summary, e.g. `"Pulling up to high quality · L1–L3 across 4
+/// VIDEO RECEIVE summary, e.g. `"Pulling up to high quality · L–H across 4
 /// peers"`. No peers → `"Not receiving video"`. `layers` is the per-peer
-/// `layer_index` list (1-indexed for display via [`format_receive_spread`]).
-/// Pure / host-tested.
-pub fn format_video_receive_summary(layers: &[u32]) -> String {
+/// `layer_index` list; `count` is the video ladder size (the basis for the
+/// quality letters via [`format_receive_spread`]). Pure / host-tested.
+pub fn format_video_receive_summary(layers: &[u32], count: u32) -> String {
     let n = layers.len();
     if n == 0 {
         return "Not receiving video".to_string();
     }
-    let spread = format_receive_spread(layers);
+    let spread = format_receive_spread(layers, count);
     let peers = if n == 1 {
         "1 peer".to_string()
     } else {
@@ -771,23 +809,36 @@ pub fn reason_aria_clause(r: DegradeReason) -> &'static str {
     }
 }
 
-/// The per-peer row metric text (§3). video/screen `"{res} · ~{kbps} · L{i}/{n}"`;
-/// audio `"{kbps}k · {label} · L{i}/{n}"`. `n` is the FULL-ladder length (so the
-/// "L i / n" denominator matches the color basis). `audio_label` is the receive
-/// audio rung label (e.g. "mid (32k)") supplied by the caller (the receive
-/// submodule owns that mapping). Pure / host-tested.
+/// The per-peer row metric text (§3, Directive 4 SITE 6b). video/screen
+/// `"{res} · ~{kbps} · {Q} · {i}/{n}"`; audio `"{kbps}k · {label} · {Q} · {i}/{n}"`,
+/// where `{Q}` is the quality LETTER (L/M/H via [`layer_quality_label`]) and `n`
+/// is the FULL-ladder length (so the `{i}/{n}` denominator matches the color
+/// basis). `audio_label` is the receive audio rung label (e.g. "mid (32k)")
+/// supplied by the caller (the receive submodule owns that mapping). Pure /
+/// host-tested.
+///
+/// NOTE (#1222): this helper is shared with the signal-quality popup
+/// (`signal_quality.rs`). The drawer layer-name rename (Directive 4) is global,
+/// so the visible `L{i}/{n}` → `{Q} · {i}/{n}` swap propagates to that surface
+/// too; its unit test + doc comment are updated in lockstep (Option A).
 pub fn peer_row_metric(
     snap: &ReceivedLayerSnapshot,
     full_ladder_len: u32,
     audio_label: &str,
 ) -> String {
     let i = snap.layer_index + 1;
+    // Quality LETTER (L/M/H) over the FULL ladder — the internal layer_index
+    // stays 0-based; only the visible chip changes (e2e/protobuf stability).
+    let q = layer_quality_label(snap.layer_index, full_ladder_len, true);
     if matches!(snap.kind, PrefMediaKind::Audio) {
-        format!("{}k · {} · L{i}/{full_ladder_len}", snap.kbps, audio_label)
+        format!(
+            "{}k · {} · {q} · {i}/{full_ladder_len}",
+            snap.kbps, audio_label
+        )
     } else {
         let res = format_send_layer_short(snap.width, snap.height);
         format!(
-            "{res} · ~{} · L{i}/{full_ladder_len}",
+            "{res} · ~{} · {q} · {i}/{full_ladder_len}",
             format_kbps_compact(snap.kbps)
         )
     }
@@ -2439,6 +2490,10 @@ fn SendLayerCell(
     // Reset shown IFF not at the full ladder (ceiling below the top). At full the
     // slot is empty so the head reads clean (mirrors SendCell's rule).
     let show_reset = ceiling_pos < last_pos;
+    // Ladder size as a Copy `usize` so the rung tooltips + the `on_change`
+    // closure can use it WITHOUT borrowing `labels` after it is moved into the
+    // closure / cloned into the slider below (Directive 4 SITE 2/3).
+    let ladder_count = labels.len();
 
     rsx! {
         div { class: "perf-side perf-side--send",
@@ -2496,7 +2551,7 @@ fn SendLayerCell(
                 on_change: move |s: RangeSel| {
                     // Only the ceiling (max) thumb is interactive; map its position
                     // to the stored layer-ceiling (None at full = Auto).
-                    on_ceiling_change.call(thumb_pos_to_layer_ceiling(s.max_pos, labels.len()));
+                    on_ceiling_change.call(thumb_pos_to_layer_ceiling(s.max_pos, ladder_count));
                 },
             }
             div {
@@ -2510,9 +2565,16 @@ fn SendLayerCell(
                         class: if rung.active { "perf-rung is-active" } else { "perf-rung is-shed" },
                         "data-testid": "{id_prefix}-send-rung-{rung.layer_id}",
                         title: if rung.active {
-                            format!("Layer {} — publishing {}", rung.layer_id + 1, rung.res_label)
+                            format!(
+                                "{} layer — publishing {}",
+                                layer_quality_label(rung.layer_id, ladder_count as u32, false),
+                                rung.res_label
+                            )
                         } else {
-                            format!("Layer {} — not published (ceiling lowered)", rung.layer_id + 1)
+                            format!(
+                                "{} layer — not published (ceiling lowered)",
+                                layer_quality_label(rung.layer_id, ladder_count as u32, false)
+                            )
                         },
                         span { class: "perf-rung__bar", "aria-hidden": "true" }
                         span { class: "perf-rung__label", "{rung.res_label}" }
@@ -2678,6 +2740,7 @@ pub fn PerformanceSettingsPanel(
             .iter()
             .map(|p| p.snap.layer_index)
             .collect::<Vec<_>>(),
+        videocall_client::max_layers_for_kind(PrefMediaKind::Video),
     );
     // Audio has no per-layer encoder snapshot; derive its send summary from the
     // chosen LAYER CEILING (count-aware) so it tracks the rung strip when the user
@@ -2928,9 +2991,10 @@ pub fn peers_for_kind(peers: &[PeerReceiveDiag], kind: PrefMediaKind) -> Vec<Pee
 // ══════════════════════════════════════════════════════════════════════════
 pub mod receive {
     use super::{
-        format_receive_spread, level_from_fraction, peer_row_aria_label, peer_row_metric,
-        quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
-        reason_chip_title, tick_offsets, write_meter_level, write_readout_text, PeerKindSnap,
+        format_receive_spread, layer_quality_label, level_from_fraction, peer_row_aria_label,
+        peer_row_metric, quality_state_glyph, quality_state_modifier, reason_chip_modifier,
+        reason_chip_text, reason_chip_title, tick_offsets, write_meter_level, write_readout_text,
+        PeerKindSnap,
     };
     use dioxus::prelude::*;
     use std::rc::Rc;
@@ -3221,15 +3285,18 @@ pub mod receive {
     }
 
     /// Format the readout line for a received snapshot. Video/screen show
-    /// `"L{i+1}/{n} · {w}x{h}"`; audio shows `"L{i+1}/{n} · {kbps} kbps"`. Pure.
+    /// `"{Q} · {i+1}/{n} · {w}x{h}"`; audio shows `"{Q} · {i+1}/{n} · {kbps} kbps"`,
+    /// where `{Q}` is the quality letter (L/M/H via [`super::layer_quality_label`]).
+    /// Pure.
     pub fn format_readout(snap: &ReceivedLayerSnapshot) -> String {
         let layer = snap.layer_index + 1;
+        let q = layer_quality_label(snap.layer_index, snap.layer_count, true);
         match snap.kind {
             PrefMediaKind::Audio => {
-                format!("L{layer}/{} · {} kbps", snap.layer_count, snap.kbps)
+                format!("{q} · {layer}/{} · {} kbps", snap.layer_count, snap.kbps)
             }
             _ => format!(
-                "L{layer}/{} · {}x{}",
+                "{q} · {layer}/{} · {}x{}",
                 snap.layer_count, snap.width, snap.height
             ),
         }
@@ -3545,8 +3612,10 @@ pub mod receive {
         // summary reuses `format_receive_spread` over the per-peer layer indices.
         let full_ladder_len = max_layers_for_kind(kind);
         let peer_count = peers.len();
-        let spread =
-            format_receive_spread(&peers.iter().map(|p| p.snap.layer_index).collect::<Vec<_>>());
+        let spread = format_receive_spread(
+            &peers.iter().map(|p| p.snap.layer_index).collect::<Vec<_>>(),
+            full_ladder_len,
+        );
         let agg = if peer_count == 1 {
             format!("1 peer · {spread}")
         } else {
@@ -3997,7 +4066,7 @@ pub mod receive {
                 kbps: 900,
                 reason: None,
             };
-            assert_eq!(format_readout(&v), "L2/3 · 960x540");
+            assert_eq!(format_readout(&v), "M · 2/3 · 960x540");
             let a = ReceivedLayerSnapshot {
                 kind: PrefMediaKind::Audio,
                 layer_index: 0,
@@ -4007,7 +4076,7 @@ pub mod receive {
                 kbps: 24,
                 reason: None,
             };
-            assert_eq!(format_readout(&a), "L1/3 · 24 kbps");
+            assert_eq!(format_readout(&a), "L · 1/3 · 24 kbps");
             let s = ReceivedLayerSnapshot {
                 kind: PrefMediaKind::Screen,
                 layer_index: 2,
@@ -4017,7 +4086,7 @@ pub mod receive {
                 kbps: 2500,
                 reason: None,
             };
-            assert_eq!(format_readout(&s), "L3/3 · 1920x1080");
+            assert_eq!(format_readout(&s), "H · 3/3 · 1920x1080");
         }
 
         #[test]
@@ -4037,7 +4106,7 @@ pub mod receive {
                 st.level,
                 crate::components::performance_settings::MAX_METER_LEVEL
             );
-            assert_eq!(st.text, "L3/3 · 1280x720");
+            assert_eq!(st.text, "H · 3/3 · 1280x720");
             let empty = gauge_state(None);
             assert_eq!(empty.level, EMPTY_METER_LEVEL);
             assert_eq!(empty.level, 0); // no signal → all bars unlit
@@ -4177,15 +4246,49 @@ mod tests {
         );
     }
 
+    /// `layer_quality_label` (#1222): position→quality name (full + compact).
+    /// Pins every branch — 3-layer Low/Med/High, 2-layer Low/High, degenerate
+    /// 1-layer "Single"/"1", and the i>=top rule in a 4-layer ladder (index 1 and
+    /// 2 are BOTH Medium; index 3 is High). Mutating `i >= top` to `i > top` would
+    /// make (3,4) report Medium instead of High → fails; mutating the count==2
+    /// branch flips (1,2); the (any,1) cases pin the degenerate guard.
+    #[test]
+    fn layer_quality_label_all_branches() {
+        // 3-layer full + compact.
+        assert_eq!(layer_quality_label(0, 3, false), "Low");
+        assert_eq!(layer_quality_label(1, 3, false), "Medium");
+        assert_eq!(layer_quality_label(2, 3, false), "High");
+        assert_eq!(layer_quality_label(0, 3, true), "L");
+        assert_eq!(layer_quality_label(1, 3, true), "M");
+        assert_eq!(layer_quality_label(2, 3, true), "H");
+        // 2-layer: Low/High only (no Medium).
+        assert_eq!(layer_quality_label(0, 2, false), "Low");
+        assert_eq!(layer_quality_label(1, 2, false), "High");
+        assert_eq!(layer_quality_label(0, 2, true), "L");
+        assert_eq!(layer_quality_label(1, 2, true), "H");
+        // 1-layer degenerate.
+        assert_eq!(layer_quality_label(0, 1, false), "Single");
+        assert_eq!(layer_quality_label(0, 1, true), "1");
+        assert_eq!(layer_quality_label(5, 1, false), "Single");
+        // 4-layer: top = index 3 is High; everything 0<i<top is Medium.
+        assert_eq!(layer_quality_label(0, 4, false), "Low");
+        assert_eq!(layer_quality_label(1, 4, false), "Medium");
+        assert_eq!(layer_quality_label(2, 4, false), "Medium");
+        assert_eq!(layer_quality_label(3, 4, false), "High");
+    }
+
     #[test]
     fn send_layer_and_header_formatting() {
-        // DISPLAY 1-based: internal layer_id 0 (the base) renders "L1"; id 2
-        // renders "L3" — matching the receive side's L{i}/n convention. (The
-        // internal id stays 0-based; only the rendered number is +1.)
-        assert_eq!(format_send_layer(0, 640, 360, 400), "L1 640×360 · 400 kbps");
+        // DISPLAY by quality name: in a 3-layer ladder, internal layer_id 0 (the
+        // base) renders "Low"; id 2 (the top) renders "High". The internal id /
+        // data-testid suffix stays 0-based; only the visible label changes (#1222).
         assert_eq!(
-            format_send_layer(2, 1280, 720, 1500),
-            "L3 1280×720 · 1500 kbps"
+            format_send_layer(0, 3, 640, 360, 400),
+            "Low · 640×360 · 400 kbps"
+        );
+        assert_eq!(
+            format_send_layer(2, 3, 1280, 720, 1500),
+            "High · 1280×720 · 1500 kbps"
         );
         // Header: active/effective vs single-stream.
         let multi = SimulcastSendSnapshot {
@@ -4206,7 +4309,7 @@ mod tests {
 
     #[test]
     fn peer_kind_line_formats_video_audio_and_none() {
-        // Video → resolution; layer is 1-indexed for display.
+        // Video → resolution; quality LETTER + 1-indexed position/total.
         let v = ReceivedLayerSnapshot {
             kind: PrefMediaKind::Video,
             layer_index: 2,
@@ -4218,7 +4321,7 @@ mod tests {
         };
         assert_eq!(
             format_peer_kind_line("video", Some(&v)),
-            Some("video L3/3 · 1280×720".to_string())
+            Some("video H · 3/3 · 1280×720".to_string())
         );
         // Audio → kbps detail.
         let a = ReceivedLayerSnapshot {
@@ -4232,7 +4335,7 @@ mod tests {
         };
         assert_eq!(
             format_peer_kind_line("audio", Some(&a)),
-            Some("audio L1/3 · 24 kbps".to_string())
+            Some("audio L · 1/3 · 24 kbps".to_string())
         );
         // None → no line.
         assert_eq!(format_peer_kind_line("screen", None), None);
@@ -4363,14 +4466,14 @@ mod tests {
 
     #[test]
     fn receive_spread_range_collapse_and_empty() {
-        // Mixed layers → lo–hi (1-indexed).
-        assert_eq!(format_receive_spread(&[0, 1, 2]), "L1–L3");
-        assert_eq!(format_receive_spread(&[2, 0]), "L1–L3");
-        // All same → single label.
-        assert_eq!(format_receive_spread(&[2, 2, 2]), "L3");
-        assert_eq!(format_receive_spread(&[0]), "L1");
+        // Mixed layers in a 3-ladder → lo–hi quality letters (L–H), en-dash.
+        assert_eq!(format_receive_spread(&[0, 1, 2], 3), "L\u{2013}H");
+        assert_eq!(format_receive_spread(&[2, 0], 3), "L\u{2013}H");
+        // All same → single letter (no count; endpoints imply the ladder).
+        assert_eq!(format_receive_spread(&[2, 2, 2], 3), "H");
+        assert_eq!(format_receive_spread(&[0], 3), "L");
         // Empty → empty string.
-        assert_eq!(format_receive_spread(&[]), "");
+        assert_eq!(format_receive_spread(&[], 3), "");
     }
 
     #[test]
@@ -4460,15 +4563,15 @@ mod tests {
 
     #[test]
     fn video_receive_summary_peers_and_spread() {
-        assert_eq!(format_video_receive_summary(&[]), "Not receiving video");
+        assert_eq!(format_video_receive_summary(&[], 3), "Not receiving video");
         assert_eq!(
-            format_video_receive_summary(&[0, 1, 2, 2]),
-            "Pulling up to high quality · L1–L3 across 4 peers"
+            format_video_receive_summary(&[0, 1, 2, 2], 3),
+            "Pulling up to high quality · L\u{2013}H across 4 peers"
         );
-        // Singular peer.
+        // Singular peer: index 1 in a 3-ladder → "M".
         assert_eq!(
-            format_video_receive_summary(&[1]),
-            "Pulling up to high quality · L2 across 1 peer"
+            format_video_receive_summary(&[1], 3),
+            "Pulling up to high quality · M across 1 peer"
         );
     }
 
@@ -5531,15 +5634,18 @@ mod tests {
 
     #[test]
     fn peer_row_metric_video_and_audio_shapes() {
-        // Video/screen: "{res} · ~{kbps} · L{i}/{n}". n is the FULL ladder length
-        // passed in (3), not the snapshot's own layer_count.
+        // Video/screen: "{res} · ~{kbps} · {Q} · {i}/{n}" (Directive 4 SITE 6b).
+        // n is the FULL ladder length passed in (3); index 1 of 3 → letter "M",
+        // 1-based position 2. (peer_row_metric is the real e2e-string site; the
+        // rename propagates to signal_quality.rs too — #1222.) Mutating the
+        // `layer_quality_label` letter or the i/n arithmetic breaks this literal.
         let v = snap(PrefMediaKind::Video, 1, 960, 540, 600, None);
-        assert_eq!(peer_row_metric(&v, 3, "ignored"), "540p · ~600k · L2/3");
-        // Audio: "{kbps}k · {label} · L{i}/{n}".
+        assert_eq!(peer_row_metric(&v, 3, "ignored"), "540p · ~600k · M · 2/3");
+        // Audio: "{kbps}k · {label} · {Q} · {i}/{n}".
         let a = snap(PrefMediaKind::Audio, 1, 0, 0, 32, None);
         assert_eq!(
             peer_row_metric(&a, 3, "mid (32k)"),
-            "32k · mid (32k) · L2/3"
+            "32k · mid (32k) · M · 2/3"
         );
     }
 

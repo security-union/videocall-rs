@@ -205,6 +205,11 @@ fn BaseChart(
     /// `true` only when the peer's deque is at the 2-hour cap — gates the
     /// "Showing last 2 hours" caption (owner decision 2).
     capped: bool,
+    /// When `false`, suppress the in-SVG `.chart-title` (the diagnostics drawer
+    /// renders its own `.diag-chart-head__title` above each chart, so the internal
+    /// title would duplicate the heading — #1222). Defaults to `true`.
+    #[props(default = true)]
+    show_title: bool,
 ) -> Element {
     // Deref the Rc once; everything below reads the slice/vec behind it.
     let samples = &samples.0;
@@ -212,7 +217,9 @@ fn BaseChart(
     if samples.is_empty() {
         return rsx! {
             div { class: "neteq-advanced-chart",
-                div { class: "chart-title", "{config.title}" }
+                if show_title {
+                    div { class: "chart-title", "{config.title}" }
+                }
                 div { class: "no-data", "No data available" }
             }
         };
@@ -330,7 +337,9 @@ fn BaseChart(
 
     rsx! {
         div { class: "neteq-advanced-chart",
-            div { class: "chart-title", "{config.title}" }
+            if show_title {
+                div { class: "chart-title", "{config.title}" }
+            }
             div { class: "neteq-chart-wrapper",
                 // Fixed Y-axis overlay (outside the scroll box).
                 svg {
@@ -703,11 +712,18 @@ pub fn NetEqAdvancedChart(
     scroll_id: String,
     /// `true` only at the 2-hour cap → gates the "Showing last 2 hours" caption.
     capped: bool,
+    /// Forwarded to [`BaseChart`]: when `false`, suppress the in-SVG
+    /// `.chart-title` (the diagnostics drawer renders its own per-chart heading —
+    /// #1222). Defaults to `true`.
+    #[props(default = true)]
+    show_title: bool,
 ) -> Element {
     if stats_history.0.is_empty() {
         return rsx! {
             div { class: "neteq-advanced-chart",
-                div { class: "chart-title", "{chart_type.title()}" }
+                if show_title {
+                    div { class: "chart-title", "{chart_type.title()}" }
+                }
                 div { class: "no-data", "No data available" }
             }
         };
@@ -723,62 +739,200 @@ pub fn NetEqAdvancedChart(
     };
 
     rsx! {
-        BaseChart { config, samples: stats_history, scroll_id, capped }
+        BaseChart { config, samples: stats_history, scroll_id, capped, show_title }
     }
 }
 
-/// Current Status tiles for the newest NetEq sample. Styling lives ONCE in
-/// `style.css` under `.neteq-status .status-*` (the inline `<style>` dup that
-/// disagreed with the global `.status-*` block was removed in iteration 3 — the
-/// drawer-scoped, namespaced rules are now the single source of truth).
+// ── Current Status threshold classifiers (Directive 5, #1222) ─────────────────
+// Each returns `(class, reason)` where `class` ∈ `is-good | is-warn | is-poor`
+// and `reason` is the WCAG text shown alongside the color (never color alone).
+// Compared on the SAME units the value strings use (‰ for expand/accel, ‱ for
+// reorder; buffer/target/packets are raw). Pure / host-testable.
+
+/// Buffer health vs the adaptive Target. `0` is poor (queue ran dry); within
+/// ±20% of target is good; otherwise the buffer has drifted from target.
+fn classify_buffer(buffer_ms: u32, target_ms: u32) -> (&'static str, Option<&'static str>) {
+    if buffer_ms == 0 {
+        ("is-poor", Some("buffer empty — audio starving"))
+    } else if buffer_ms >= (target_ms as f32 * 0.8) as u32
+        && buffer_ms <= (target_ms as f32 * 1.2) as u32
+    {
+        ("is-good", None)
+    } else {
+        ("is-warn", Some("buffer drifting from target"))
+    }
+}
+
+/// Packets-awaiting-decode queue depth. ≤8 steady-low is healthy; 9–20 building;
+/// >20 decode can't keep up.
+fn classify_packets(packets: u32) -> (&'static str, Option<&'static str>) {
+    if packets <= 8 {
+        ("is-good", None)
+    } else if packets <= 20 {
+        ("is-warn", Some("queue building"))
+    } else {
+        ("is-poor", Some("decode falling behind"))
+    }
+}
+
+/// Expand (loss-concealment) rate in ‰. `0` is healthy; a few ‰ is occasional
+/// concealment; sustained high (>50‰) means the network is dropping/delaying audio.
+fn classify_expand(expand_permille: f32) -> (&'static str, Option<&'static str>) {
+    if expand_permille == 0.0 {
+        ("is-good", None)
+    } else if expand_permille <= 50.0 {
+        ("is-warn", Some("occasional concealment"))
+    } else {
+        ("is-poor", Some("sustained packet loss — network degraded"))
+    }
+}
+
+/// Accelerate (catch-up) rate in ‰. ≤30‰ normal; 30–80‰ draining a full buffer;
+/// >80‰ chronically overfull (high-latency catch-up).
+fn classify_accel(accel_permille: f32) -> (&'static str, Option<&'static str>) {
+    if accel_permille <= 30.0 {
+        ("is-good", None)
+    } else if accel_permille <= 80.0 {
+        ("is-warn", Some("draining a full buffer"))
+    } else {
+        ("is-poor", Some("buffer overfull — high latency catch-up"))
+    }
+}
+
+/// Reorder rate in ‱ (lifetime cumulative). ≤50‱ healthy; 50–200‱ some
+/// reordering; >200‱ heavy reordering / path instability.
+fn classify_reorder(reorder_permyriad: u32) -> (&'static str, Option<&'static str>) {
+    if reorder_permyriad <= 50 {
+        ("is-good", None)
+    } else if reorder_permyriad <= 200 {
+        ("is-warn", Some("some reordering"))
+    } else {
+        ("is-poor", Some("heavy reordering — path instability"))
+    }
+}
+
+/// Current Status — two-tier "stat + details" layout (iteration 4, #1222).
+/// Tier 1 = primary Buffer + Target stats; Tier 2 = the flow group (Packets
+/// awaiting / Packets-per-sec / Expand / Accel) as compact rows; Tier 3 = the
+/// demoted reordering trio. Value/class/reason are factored ONCE so the populated
+/// and `None` branches share the render (the `None` branch passes `"--"` values,
+/// `None` reasons, and neutral `""` classes). Quality classes tint the VALUE only
+/// (`.is-good/.is-warn/.is-poor` in style.css → var(--diag-q-*)). Styling lives
+/// ONCE in `style.css` under `.neteq-status .status-*`.
 #[component]
 pub fn NetEqStatusDisplay(latest_stats: Option<NetEqSample>) -> Element {
-    if let Some(stats) = latest_stats {
-        let buffer_class = if stats.buffer_ms == 0 {
-            "status-value warning"
-        } else if stats.buffer_ms >= (stats.target_ms as f32 * 0.8) as u32
-            && stats.buffer_ms <= (stats.target_ms as f32 * 1.2) as u32
-        {
-            "status-value good"
-        } else {
-            "status-value"
-        };
-        // Expand / accelerate rates arrive as Q14 fractions converted to per-mille
-        // (‰) by `q14::to_per_mille` (1000‰ = 100%); the reorder rate is per-myriad
-        // (‱) from `reorder_rate_permyriad`. The value strings carry the unit so the
-        // numbers are interpretable without guessing the scale (cleanup #1131).
-        let expand_str = format!("{:.1}\u{2030}", stats.expand_rate);
-        let accel_str = format!("{:.1}\u{2030}", stats.accel_rate);
+    // Factor every value/class/reason once from the optional sample. Expand /
+    // accelerate rates arrive as Q14 fractions converted to per-mille (‰); the
+    // reorder rate is per-myriad (‱). The value strings carry the unit so the
+    // numbers are interpretable without guessing the scale.
+    let buffer_val = latest_stats
+        .as_ref()
+        .map(|s| s.buffer_ms.to_string())
+        .unwrap_or_else(|| "--".to_string());
+    let target_val = latest_stats
+        .as_ref()
+        .map(|s| s.target_ms.to_string())
+        .unwrap_or_else(|| "--".to_string());
+    let packets_val = latest_stats
+        .as_ref()
+        .map(|s| s.packets_awaiting_decode.to_string())
+        .unwrap_or_else(|| "--".to_string());
+    let pps_val = latest_stats
+        .as_ref()
+        .map(|s| s.packets_per_sec.to_string())
+        .unwrap_or_else(|| "--".to_string());
+    let expand_str = latest_stats
+        .as_ref()
+        .map(|s| format!("{:.1}\u{2030}", s.expand_rate))
+        .unwrap_or_else(|| "--".to_string());
+    let accel_str = latest_stats
+        .as_ref()
+        .map(|s| format!("{:.1}\u{2030}", s.accel_rate))
+        .unwrap_or_else(|| "--".to_string());
+    let reorder_str = latest_stats
+        .as_ref()
+        .map(|s| format!("{}\u{2031}", s.reorder_rate))
+        .unwrap_or_else(|| "--".to_string());
+    let reordered_val = latest_stats
+        .as_ref()
+        .map(|s| s.reordered_packets.to_string())
+        .unwrap_or_else(|| "--".to_string());
+    let maxdist_val = latest_stats
+        .as_ref()
+        .map(|s| s.max_reorder_distance.to_string())
+        .unwrap_or_else(|| "--".to_string());
 
-        rsx! {
-            div { class: "neteq-status",
-                div { class: "status-grid",
-                    div { class: "status-item", div { class: "{buffer_class}", "{stats.buffer_ms}" } div { class: "status-label", "BUFFER (MS)" } div { class: "status-subtitle", "Audio data buffered for playback" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.target_ms}" } div { class: "status-label", "TARGET (MS)" } div { class: "status-subtitle", "Optimal buffer size for network" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.packets_awaiting_decode}" } div { class: "status-label", "PACKETS" } div { class: "status-subtitle", "Encoded packets awaiting decode" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.packets_per_sec}" } div { class: "status-label", "PACKETS/S" } div { class: "status-subtitle", "Audio packets received in the last second" } }
-                    div { class: "status-item", div { class: "status-value", "{expand_str}" } div { class: "status-label", "EXPAND RATE (\u{2030})" } div { class: "status-subtitle", "Audio stretched to fill gaps (loss/late) \u{2014} per-mille of output" } }
-                    div { class: "status-item", div { class: "status-value", "{accel_str}" } div { class: "status-label", "ACCEL RATE (\u{2030})" } div { class: "status-subtitle", "Audio compressed to drain a full buffer \u{2014} per-mille of output" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.reorder_rate}\u{2031}" } div { class: "status-label", "REORDER RATE (\u{2031})" } div { class: "status-subtitle", "Out-of-order packets \u{2014} per-myriad of received" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.reordered_packets}" } div { class: "status-label", "REORDERED PACKETS" } div { class: "status-subtitle", "Total packets received out-of-order" } }
-                    div { class: "status-item", div { class: "status-value", "{stats.max_reorder_distance}" } div { class: "status-label", "MAX REORDER DISTANCE" } div { class: "status-subtitle", "Largest gap in packet sequence" } }
+    // Quality classes + reasons (neutral for the None branch).
+    let (buffer_q, buffer_reason) = latest_stats
+        .as_ref()
+        .map(|s| classify_buffer(s.buffer_ms, s.target_ms))
+        .unwrap_or(("", None));
+    let (packets_q, packets_title) = latest_stats
+        .as_ref()
+        .map(|s| classify_packets(s.packets_awaiting_decode))
+        .map(|(c, r)| (c, r.unwrap_or("")))
+        .unwrap_or(("", ""));
+    let (expand_q, expand_title) = latest_stats
+        .as_ref()
+        .map(|s| classify_expand(s.expand_rate))
+        .map(|(c, r)| (c, r.unwrap_or("")))
+        .unwrap_or(("", ""));
+    let (accel_q, accel_title) = latest_stats
+        .as_ref()
+        .map(|s| classify_accel(s.accel_rate))
+        .map(|(c, r)| (c, r.unwrap_or("")))
+        .unwrap_or(("", ""));
+    let (reorder_q, reorder_title) = latest_stats
+        .as_ref()
+        .map(|s| classify_reorder(s.reorder_rate))
+        .map(|(c, r)| (c, r.unwrap_or("")))
+        .unwrap_or(("", ""));
+    // Target is neutral (no color); packets/s, reordered, max-dist are neutral too.
+    let target_q = "";
+
+    rsx! {
+        div { class: "neteq-status",
+            // Tier 1 — primary: Buffer + Target.
+            div { class: "status-primary",
+                div { class: "status-stat status-stat--primary {buffer_q}",
+                    div { class: "status-stat__value", "{buffer_val}" }
+                    div { class: "status-stat__label", "Buffer" }
+                    div { class: "status-stat__unit", "ms" }
+                    if let Some(r) = buffer_reason {
+                        div { class: "status-stat__reason", "{r}" }
+                    }
+                }
+                div { class: "status-stat status-stat--primary {target_q}",
+                    div { class: "status-stat__value", "{target_val}" }
+                    div { class: "status-stat__label", "Target" }
+                    div { class: "status-stat__unit", "ms" }
                 }
             }
-        }
-    } else {
-        rsx! {
-            div { class: "neteq-status",
-                div { class: "status-grid",
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "BUFFER (MS)" } div { class: "status-subtitle", "Audio data buffered for playback" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "TARGET (MS)" } div { class: "status-subtitle", "Optimal buffer size for network" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "PACKETS" } div { class: "status-subtitle", "Encoded packets awaiting decode" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "PACKETS/S" } div { class: "status-subtitle", "Audio packets received in the last second" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "EXPAND RATE (\u{2030})" } div { class: "status-subtitle", "Audio stretched to fill gaps (loss/late) \u{2014} per-mille of output" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "ACCEL RATE (\u{2030})" } div { class: "status-subtitle", "Audio compressed to drain a full buffer \u{2014} per-mille of output" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "REORDER RATE (\u{2031})" } div { class: "status-subtitle", "Out-of-order packets \u{2014} per-myriad of received" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "REORDERED PACKETS" } div { class: "status-subtitle", "Total packets received out-of-order" } }
-                    div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "MAX REORDER DISTANCE" } div { class: "status-subtitle", "Largest gap in packet sequence" } }
+            // Tier 2 — flow group, 4-up compact rows. `title` carries the reason.
+            div { class: "status-secondary",
+                div { class: "status-row {packets_q}", title: "{packets_title}",
+                    span { class: "status-row__label", "Packets awaiting" }
+                    span { class: "status-row__value", "{packets_val}" }
                 }
+                div { class: "status-row",
+                    span { class: "status-row__label", "Packets / s" }
+                    span { class: "status-row__value", "{pps_val}" }
+                }
+                div { class: "status-row {expand_q}", title: "{expand_title}",
+                    span { class: "status-row__label", "Expand rate" }
+                    span { class: "status-row__value", "{expand_str}" }
+                }
+                div { class: "status-row {accel_q}", title: "{accel_title}",
+                    span { class: "status-row__label", "Accelerate rate" }
+                    span { class: "status-row__value", "{accel_str}" }
+                }
+            }
+            // Tier 3 — reordering trio, demoted muted micro-row.
+            div { class: "status-reorder",
+                span { class: "status-reorder__head", "Reordering" }
+                span { class: "status-reorder__item {reorder_q}", title: "{reorder_title}", "Rate {reorder_str}" }
+                span { class: "status-reorder__item", "Reordered {reordered_val}" }
+                span { class: "status-reorder__item", "Max dist {maxdist_val}" }
             }
         }
     }
@@ -1099,5 +1253,88 @@ mod tests {
         // Empty string is anything-but-"All Peers", so it is treated as a single
         // peer (it is `!= "All Peers"`). Pins the exact comparison semantics.
         assert!(single_peer_selected(""), "empty != \"All Peers\" → single");
+    }
+
+    // ── Directive 5 threshold classifiers (#1222) ────────────────────────────
+    // Each pins BOTH sides of every boundary so mutating any threshold fails.
+
+    /// Buffer vs target 100ms: 80 good, 79 warn (drift low), 120 good, 121 warn
+    /// (drift high), 0 poor (empty). ±20% window = [80,120].
+    #[test]
+    fn classify_buffer_boundaries() {
+        assert_eq!(classify_buffer(80, 100), ("is-good", None));
+        assert_eq!(
+            classify_buffer(79, 100),
+            ("is-warn", Some("buffer drifting from target"))
+        );
+        assert_eq!(classify_buffer(120, 100), ("is-good", None));
+        assert_eq!(
+            classify_buffer(121, 100),
+            ("is-warn", Some("buffer drifting from target"))
+        );
+        assert_eq!(
+            classify_buffer(0, 100),
+            ("is-poor", Some("buffer empty — audio starving"))
+        );
+    }
+
+    /// Packets awaiting: 8 good, 9 warn, 20 warn, 21 poor.
+    #[test]
+    fn classify_packets_boundaries() {
+        assert_eq!(classify_packets(8), ("is-good", None));
+        assert_eq!(classify_packets(9), ("is-warn", Some("queue building")));
+        assert_eq!(classify_packets(20), ("is-warn", Some("queue building")));
+        assert_eq!(
+            classify_packets(21),
+            ("is-poor", Some("decode falling behind"))
+        );
+    }
+
+    /// Expand ‰: 0 good, 1 warn, 50 warn, 51 poor.
+    #[test]
+    fn classify_expand_boundaries() {
+        assert_eq!(classify_expand(0.0), ("is-good", None));
+        assert_eq!(
+            classify_expand(1.0),
+            ("is-warn", Some("occasional concealment"))
+        );
+        assert_eq!(
+            classify_expand(50.0),
+            ("is-warn", Some("occasional concealment"))
+        );
+        assert_eq!(
+            classify_expand(51.0),
+            ("is-poor", Some("sustained packet loss — network degraded"))
+        );
+    }
+
+    /// Accel ‰: 30 good, 31 warn, 80 warn, 81 poor.
+    #[test]
+    fn classify_accel_boundaries() {
+        assert_eq!(classify_accel(30.0), ("is-good", None));
+        assert_eq!(
+            classify_accel(31.0),
+            ("is-warn", Some("draining a full buffer"))
+        );
+        assert_eq!(
+            classify_accel(80.0),
+            ("is-warn", Some("draining a full buffer"))
+        );
+        assert_eq!(
+            classify_accel(81.0),
+            ("is-poor", Some("buffer overfull — high latency catch-up"))
+        );
+    }
+
+    /// Reorder ‱: 50 good, 51 warn, 200 warn, 201 poor.
+    #[test]
+    fn classify_reorder_boundaries() {
+        assert_eq!(classify_reorder(50), ("is-good", None));
+        assert_eq!(classify_reorder(51), ("is-warn", Some("some reordering")));
+        assert_eq!(classify_reorder(200), ("is-warn", Some("some reordering")));
+        assert_eq!(
+            classify_reorder(201),
+            ("is-poor", Some("heavy reordering — path instability"))
+        );
     }
 }

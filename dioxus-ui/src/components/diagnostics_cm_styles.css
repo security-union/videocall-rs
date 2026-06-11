@@ -58,9 +58,9 @@
 .type-webtransport { background: #1C1C1E; color: #0A84FF; border: 1px solid #38383A; }
 
 .rtt-value { padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; }
-.rtt-good { background: #1C1C1E; color: #30D158; border: 1px solid #38383A; }
-.rtt-ok { background: #1C1C1E; color: #FF9F0A; border: 1px solid #38383A; }
-.rtt-poor { background: #1C1C1E; color: #FF453A; border: 1px solid #38383A; }
+.rtt-good { background: #1C1C1E; color: var(--diag-q-good); border: 1px solid #38383A; }
+.rtt-ok { background: #1C1C1E; color: var(--diag-q-warn); border: 1px solid #38383A; }
+.rtt-poor { background: #1C1C1E; color: var(--diag-q-poor); border: 1px solid #38383A; }
 
 .servers-list { margin-bottom: 16px; }
 .servers-grid { display: grid; gap: 8px; }

@@ -23,8 +23,8 @@ use crate::components::neteq_chart::{
 };
 use crate::components::performance_settings::{
     format_kbps_compact, format_mbps, format_peer_kind_line, format_send_header, format_send_layer,
-    format_send_layer_short, format_send_total_kbps, format_simulcast_summary, peers_for_kind,
-    DiagnosticsReader, HelpPopover, PerfControlsHandle, PerformanceSettingsPanel,
+    format_send_layer_short, format_send_total_kbps, format_simulcast_summary, layer_quality_label,
+    peers_for_kind, DiagnosticsReader, HelpPopover, PerfControlsHandle, PerformanceSettingsPanel,
 };
 use crate::context::{
     confirm_transport_change, load_transport_sticky, TransportPreference, TransportPreferenceCtx,
@@ -36,6 +36,91 @@ use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use videocall_client::{PrefMediaKind, VideoCallClient};
 use videocall_diagnostics::{subscribe, MetricValue};
+
+/// Build the Reception raw-stats dump from a subsystem `"video"` [`DiagEvent`]
+/// (FIX 1, #1222). The producer (videocall-client diagnostics_manager) emits
+/// `fps_received` / `bitrate_kbps` / `media_type`, plus `from_peer` (the LOCAL
+/// self-id — useless as a label) and `to_peer` (the REMOTE source we receive
+/// FROM). We surface `to_peer` as the peer label. Returns `None` when none of
+/// the recognized stat metrics (fps_received / bitrate_kbps / media_type)
+/// appeared, mirroring the old `if !text.is_empty()` guard. Pure / host-testable.
+fn format_reception_text(evt: &videocall_diagnostics::DiagEvent) -> Option<String> {
+    let mut text = String::new();
+    let mut peer: Option<String> = None;
+    for m in &evt.metrics {
+        match m.name {
+            "fps_received" => {
+                if let MetricValue::F64(v) = &m.value {
+                    text.push_str(&format!("FPS: {v:.2}\n"));
+                }
+            }
+            "bitrate_kbps" => {
+                if let MetricValue::F64(v) = &m.value {
+                    text.push_str(&format!("Bitrate: {v:.1} kbps\n"));
+                }
+            }
+            "media_type" => {
+                if let MetricValue::Text(t) = &m.value {
+                    text.push_str(&format!("Media Type: {t}\n"));
+                }
+            }
+            // The remote source peer we receive FROM (NOT from_peer/self-id).
+            "to_peer" => {
+                if let MetricValue::Text(t) = &m.value {
+                    peer = Some(t.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+    if text.is_empty() {
+        return None;
+    }
+    let peer = peer.unwrap_or_else(|| "unknown".to_string());
+    text.push_str(&format!("Peer: {}\nTimestamp: {}\n", peer, evt.ts_ms));
+    Some(text)
+}
+
+/// Decide whether the diagnostics drawer should auto-select the sole peer
+/// (FIX 2, #1222). Returns `Some(peer)` only when the user has NOT made a
+/// manual selection, the current selection is still the `"All Peers"` default,
+/// and exactly one real peer exists. Pure / host-testable.
+fn auto_select_peer(current: &str, user_picked: bool, peer_keys: &[String]) -> Option<String> {
+    if !user_picked && current == "All Peers" && peer_keys.len() == 1 {
+        Some(peer_keys[0].clone())
+    } else {
+        None
+    }
+}
+
+/// Quality class + reason for a Per-Peer Summary BUFFER value (Directive 5,
+/// #1222). Absolute thresholds (these rows have no per-peer target handy):
+/// `0` → poor "starving"; `< 40ms` → warn "low buffer"; else good (no reason).
+/// Returns `(class, reason)` where `reason` is `""` for the neutral/good case.
+/// Pure / host-testable.
+fn peer_buffer_class(buffer_ms: u64) -> (&'static str, &'static str) {
+    if buffer_ms == 0 {
+        ("is-poor", "starving")
+    } else if buffer_ms < 40 {
+        ("is-warn", "low buffer")
+    } else {
+        ("is-good", "")
+    }
+}
+
+/// Quality class + reason for a Per-Peer Summary JITTER value (Directive 5,
+/// #1222). `<= 30ms` → good; `<= 60ms` → warn "elevated jitter"; else poor
+/// "high jitter". Returns `(class, reason)` (`""` reason for good). Pure /
+/// host-testable.
+fn peer_jitter_class(jitter_ms: u64) -> (&'static str, &'static str) {
+    if jitter_ms <= 30 {
+        ("is-good", "")
+    } else if jitter_ms <= 60 {
+        ("is-warn", "elevated jitter")
+    } else {
+        ("is-poor", "high jitter")
+    }
+}
 
 // Serializable versions of DiagEvent structures
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -479,6 +564,10 @@ pub fn Diagnostics(
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut selected_peer = use_signal(|| "All Peers".to_string());
+    // FIX 2: tracks whether the user has explicitly chosen a peer in the
+    // selector. The one-shot auto-select effect (below) only fires while this
+    // is false, so an automatic pick never fights a manual one.
+    let mut user_picked_peer = use_signal(|| false);
     let mut diagnostics_data = use_signal(|| None::<String>);
     let mut sender_stats = use_signal(|| None::<String>);
     let mut connection_manager_state = use_signal(|| None::<String>);
@@ -527,10 +616,10 @@ pub fn Diagnostics(
             // until the drawer closes (the `!is_open` teardown above clears every
             // map with `.set(HashMap::new())`). There is no per-event eviction
             // here because the diagnostics bus this loop consumes carries NO
-            // peer-departure/disconnect event — its subsystems are client_perf,
-            // connection_manager, decode_budget, heartbeat, neteq, peer_speaking,
-            // peer_status, screen_encoder_state, sender, video_decoder,
-            // video_resolution, video_source_resolution, and video. Peer removal
+            // peer-departure/disconnect event — the subsystems this loop actually
+            // matches (the only arms below) are: video, sender, neteq,
+            // peer_status, and connection_manager. None of them reports a peer
+            // "left" event. Peer removal
             // in videocall-client fires a Rust `Callback<String>`
             // (peer_decode_manager `on_peer_removed`/`delete_peer`), NOT a
             // `DiagEvent`, and `peer_status` only reports media-enabled state +
@@ -547,37 +636,13 @@ pub fn Diagnostics(
 
             while let Ok(evt) = rx.recv().await {
                 match evt.subsystem {
-                    "decoder" => {
-                        let mut text = String::new();
-                        for m in &evt.metrics {
-                            match m.name {
-                                "fps" => {
-                                    if let MetricValue::F64(v) = &m.value {
-                                        text.push_str(&format!("FPS: {v:.2}\n"));
-                                    }
-                                }
-                                "bitrate_kbps" => {
-                                    if let MetricValue::F64(v) = &m.value {
-                                        text.push_str(&format!("Bitrate: {v:.1} kbps\n"));
-                                    }
-                                }
-                                "media_type" => {
-                                    if let MetricValue::Text(t) = &m.value {
-                                        text.push_str(&format!("Media Type: {t}\n"));
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-                        if !text.is_empty() {
-                            let peer_id = evt
-                                .stream_id
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string());
-                            text.push_str(&format!(
-                                "Peer: {}\nTimestamp: {}\n",
-                                peer_id, evt.ts_ms
-                            ));
+                    // The receiver feed is subsystem "video" (producer
+                    // videocall-client diagnostics_manager). It carries
+                    // fps_received / bitrate_kbps / media_type and the
+                    // to_peer text metric (the REMOTE source we receive FROM;
+                    // from_peer is the local self-id and useless as a label).
+                    "video" => {
+                        if let Some(text) = format_reception_text(&evt) {
                             diagnostics_data.set(Some(text));
                         }
                     }
@@ -757,6 +822,30 @@ pub fn Diagnostics(
         });
     });
 
+    // FIX 2 — auto-select the sole peer in a 1:1 call so the NetEq Current
+    // Status + charts render by default instead of the "All Peers" placeholder.
+    // This is a guarded one-shot: it reads `neteq_stats_per_peer` INSIDE the
+    // closure (so the effect re-runs when peers appear) but `.peek()`s
+    // selected_peer + user_picked_peer so the `selected_peer.set(...)` below
+    // does NOT retrigger this effect. `Signal::set` is synchronous, so the
+    // peeks (which read current values) happen BEFORE the set. The decision is
+    // delegated to the pure `auto_select_peer` helper (host-tested): it only
+    // fires when the user hasn't picked, the current selection is still the
+    // "All Peers" default, and exactly one peer exists.
+    use_effect(move || {
+        let map = neteq_stats_per_peer(); // subscribe to peer-map changes
+        let keys: Vec<String> = map
+            .keys()
+            .filter(|k| k.as_str() != "All Peers")
+            .cloned()
+            .collect();
+        let cur = selected_peer.peek().clone(); // peek BEFORE set
+        let picked = *user_picked_peer.peek();
+        if let Some(k) = auto_select_peer(&cur, picked, &keys) {
+            selected_peer.set(k);
+        }
+    });
+
     // The live "Simulcast layers" section runs its OWN 250 ms (≈4 Hz) refresh
     // tick, scoped to its child component `SimulcastLayersSection` (below), so the
     // tick re-renders ONLY that small subtree — NOT this top-level `Diagnostics`
@@ -858,22 +947,18 @@ pub fn Diagnostics(
     };
     let peer_info = format!("Showing statistics for: {current_peer_display}");
 
-    // Group order (owner decision 1, iteration 3): usage-frequency order —
-    // Quality controls → Live stream state → Connection & system. The `--first`
-    // modifier (no top border / extra top padding) must land on whichever group
-    // RENDERS FIRST. Quality controls is gated on `perf_controls`: when it's
-    // published, it leads and takes `--first`, so Live stream state takes the
-    // plain (bordered) label; when `perf_controls` is `None`, Quality controls
-    // does not render, so Live stream state becomes the first visible group and
-    // must take `--first` instead. This keeps the top divider off the actual
-    // first group in BOTH cases.
-    let has_quality = perf_controls.is_some();
-    let quality_label_class = "diag-group-label diag-group-label--first";
-    let live_label_class = if has_quality {
-        "diag-group-label"
-    } else {
-        "diag-group-label diag-group-label--first"
-    };
+    // Group order (owner decision, iteration 4): investigation-first —
+    // Connection & system → Quality controls → Live stream state.
+    // Connection & system is the incident-investigation anchor; it is the first
+    // thing an operator reaches for when something is wrong, so it leads the
+    // body. Quality controls (the editable sliders/Auto the user actively tunes)
+    // comes second; Live stream state (passive read-only telemetry) comes last.
+    // Because Connection & system has NO render gate, it ALWAYS renders, so it
+    // unconditionally takes the `--first` modifier (no top border / extra top
+    // padding). The old `perf_controls`-dependent `--first` juggling is gone:
+    // `--first` can no longer be orphaned on a sub-second window where the
+    // Performance handle hasn't been published yet, because the always-present
+    // Connection & system group owns it.
 
     rsx! {
         div {
@@ -896,135 +981,14 @@ pub fn Diagnostics(
                 }
             }
             div { class: "sidebar-content",
-                // ── GROUP 1 — Quality controls (the migrated Performance panel) ──
-                // Leads the body (owner decision 1: usage-frequency order). The
-                // label AND the panel render together: gating both on
-                // `perf_controls` avoids an orphaned group divider in the
-                // sub-second window before `Host` publishes the handle (#1131
-                // review F3). When present it is the FIRST group and carries
-                // `--first`; when absent, Live stream state below takes `--first`.
-                //
-                // The Performance controls (simulcast strip + per-kind cards with
-                // sliders / Auto / live meters / help) render inside their own
-                // child component so the panel's 250 ms refresh tick + rAF meter
-                // drivers re-render ONLY that subtree — NOT this top-level body.
-                // The child also reads the preference signals, keeping all
-                // reactive perf state out of this body. (#1131 unify, #1128)
-                if let Some(controls) = perf_controls.clone() {
-                    div { class: "{quality_label_class}", role: "presentation",
-                        "Quality controls"
-                    }
-                    DiagnosticsPerformancePanel { controls, audio_source_active: mic_enabled }
-                }
-
-                // ── GROUP 2 — Live stream state ──
-                // Order (owner decision 1): Simulcast layers → Peer Selection
-                // (MOVED here — it scopes the NetEq sections below) → Per-Peer
-                // Summary (MOVED up — pick the bad peer BEFORE the detail) →
-                // Current Status tiles + scrollable NetEq charts.
-                div { class: "{live_label_class}", role: "presentation",
-                    "Live stream state"
-                }
-                // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
-                // per-peer RECEIVE breakdown. Extracted into its own child so its
-                // 4 Hz refresh tick re-renders ONLY this section, not the NetEq
-                // prelude / charts in this parent (perf review #1).
-                SimulcastLayersSection { is_open, reader: diagnostics_reader.clone() }
-                // Peer Selection (MOVED from the Connection group): it scopes the
-                // Per-Peer Summary + Current Status + charts that follow, so it
-                // belongs at the top of those sections. Reads `selected_peer` /
-                // `available_peers` / `current_peer` here in the parent — these
-                // are value-typed and do NOT tick per NetEq event.
-                if available_peers.len() > 1 {
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-selection",
-                        h3 { id: "diag-h-peer-selection", "Peer Selection" }
-                        select {
-                            class: "peer-selector",
-                            onchange: move |e: Event<FormData>| {
-                                selected_peer.set(e.value());
-                            },
-                            value: "{current_peer}",
-                            for peer in available_peers.iter() {
-                                {
-                                    let label = if peer == "All Peers" {
-                                        "All Peers".to_string()
-                                    } else {
-                                        peer_display_name(peer)
-                                    };
-                                    rsx! {
-                                        option {
-                                            value: "{peer}",
-                                            selected: peer == &current_peer,
-                                            "{label}"
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        p { class: "peer-info", "{peer_info}" }
-                    }
-                }
-                // Per-Peer Summary (MOVED up from last): a triage index — pick the
-                // bad peer before drilling into the detail. Keeps its >2-peers
-                // gate. Reads stats_map / buffer_map / jitter_map / peer_transport
-                // here in the parent (value-typed; no NetEq-event churn).
-                if available_peers.len() > 2 {
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-summary",
-                        h3 { id: "diag-h-peer-summary", "Per-Peer Summary" }
-                        div { class: "peer-summary",
-                            {
-                                let transport_map = peer_transport_per_peer();
-                                rsx! {
-                                    for (peer_id, _) in stats_map.iter() {
-                                        {
-                                            let display = peer_display_name(peer_id);
-                                            let latest_buffer = buffer_map.get(peer_id).and_then(|b| b.last()).unwrap_or(&0);
-                                            let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
-                                            let summary = format!("Buffer: {latest_buffer}ms, Jitter: {latest_jitter}ms");
-                                            let (badge_label, badge_class, badge_title) = match transport_map.get(peer_id).map(String::as_str) {
-                                                Some("webtransport") => ("WT", "connection-type type-webtransport", "WebTransport"),
-                                                Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
-                                                _ => ("\u{2014}", "connection-type", "Transport unknown"),
-                                            };
-                                            rsx! {
-                                                div { class: "peer-summary-item",
-                                                    strong { "{display}" }
-                                                    div {
-                                                        style: "display:flex; gap:8px; align-items:center;",
-                                                        span { class: "{badge_class}", title: "{badge_title}", "{badge_label}" }
-                                                        span { "{summary}" }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Current Status tiles + scrollable NetEq charts, with their two
-                // info-icon popovers, live in a child component so toggling a
-                // popover re-renders ONLY that subtree. The already-computed,
-                // value-typed history/latest/capped are passed in as props; no
-                // signal reads move into the child (#1128).
-                NetEqStatusAndCharts {
-                    latest_stats: latest_neteq_stats,
-                    // Wrap in NetEqHistory (Rc) — the `.clone()` is a refcount
-                    // bump, and the child's prop memo compares by pointer (S1).
-                    stats_history: NetEqHistory(neteq_stats_history.clone()),
-                    buffer_history: buffer_history.clone(),
-                    jitter_history: jitter_history.clone(),
-                    capped: neteq_capped,
-                    single_peer,
-                }
-
-                // ── GROUP 3 — Connection & system ──
-                // The incident-investigation group, demoted to last (owner
-                // decision 1). Order: Connection Manager → Transport Preference →
-                // collapsed Raw stats disclosure (Reception + Sending + Encoder +
-                // Media Status merged) → collapsed Build info at the very bottom.
-                div { class: "diag-group-label", role: "presentation",
+                // ── GROUP 1 — Connection & system ──
+                // The incident-investigation anchor, promoted to FIRST (owner
+                // decision, iteration 4). It has NO render gate, so it always
+                // renders and unconditionally owns `--first`. Order: Connection
+                // Manager → Transport Preference → collapsed Raw stats disclosure
+                // (Reception + Sending + Encoder + Media Status merged) →
+                // collapsed Build info at the very bottom.
+                div { class: "diag-group-label diag-group-label--first", role: "presentation",
                     "Connection & system"
                 }
                 section { class: "diagnostics-section", "aria-labelledby": "diag-h-connection-manager",
@@ -1164,6 +1128,139 @@ pub fn Diagnostics(
                         }
                     }
                 }
+
+                // ── GROUP 2 — Quality controls (the migrated Performance panel) ──
+                // Second (owner decision, iteration 4: editable controls before
+                // passive telemetry). The label AND the panel render together:
+                // gating both on `perf_controls` avoids an orphaned group divider
+                // in the sub-second window before `Host` publishes the handle
+                // (#1131 review F3). This group no longer owns `--first` — the
+                // always-present Connection & system group above does.
+                //
+                // The Performance controls (simulcast strip + per-kind cards with
+                // sliders / Auto / live meters / help) render inside their own
+                // child component so the panel's 250 ms refresh tick + rAF meter
+                // drivers re-render ONLY that subtree — NOT this top-level body.
+                // The child also reads the preference signals, keeping all
+                // reactive perf state out of this body. (#1131 unify, #1128)
+                if let Some(controls) = perf_controls.clone() {
+                    div { class: "diag-group-label", role: "presentation",
+                        "Quality controls"
+                    }
+                    DiagnosticsPerformancePanel { controls, audio_source_active: mic_enabled }
+                }
+
+                // ── GROUP 3 — Live stream state ──
+                // Last (owner decision, iteration 4: passive read-only telemetry).
+                // Order: Simulcast layers → Peer Selection (scopes the NetEq
+                // sections below) → Per-Peer Summary (pick the bad peer BEFORE the
+                // detail) → Current Status tiles + scrollable NetEq charts.
+                div { class: "diag-group-label", role: "presentation",
+                    "Live stream state"
+                }
+                // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
+                // per-peer RECEIVE breakdown. Extracted into its own child so its
+                // 4 Hz refresh tick re-renders ONLY this section, not the NetEq
+                // prelude / charts in this parent (perf review #1).
+                SimulcastLayersSection { is_open, reader: diagnostics_reader.clone() }
+                // Peer Selection (MOVED from the Connection group): it scopes the
+                // Per-Peer Summary + Current Status + charts that follow, so it
+                // belongs at the top of those sections. Reads `selected_peer` /
+                // `available_peers` / `current_peer` here in the parent — these
+                // are value-typed and do NOT tick per NetEq event.
+                if available_peers.len() > 1 {
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-selection",
+                        h3 { id: "diag-h-peer-selection", "Peer Selection" }
+                        select {
+                            class: "peer-selector",
+                            onchange: move |e: Event<FormData>| {
+                                user_picked_peer.set(true);
+                                selected_peer.set(e.value());
+                            },
+                            value: "{current_peer}",
+                            for peer in available_peers.iter() {
+                                {
+                                    let label = if peer == "All Peers" {
+                                        "All Peers".to_string()
+                                    } else {
+                                        peer_display_name(peer)
+                                    };
+                                    rsx! {
+                                        option {
+                                            value: "{peer}",
+                                            selected: peer == &current_peer,
+                                            "{label}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        p { class: "peer-info", "{peer_info}" }
+                    }
+                }
+                // Per-Peer Summary (MOVED up from last): a triage index — pick the
+                // bad peer before drilling into the detail. Keeps its >2-peers
+                // gate. Reads stats_map / buffer_map / jitter_map / peer_transport
+                // here in the parent (value-typed; no NetEq-event churn).
+                if available_peers.len() > 2 {
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-summary",
+                        h3 { id: "diag-h-peer-summary", "Per-Peer Summary" }
+                        div { class: "peer-summary",
+                            {
+                                let transport_map = peer_transport_per_peer();
+                                rsx! {
+                                    for (peer_id, _) in stats_map.iter() {
+                                        {
+                                            let display = peer_display_name(peer_id);
+                                            let latest_buffer = buffer_map.get(peer_id).and_then(|b| b.last()).unwrap_or(&0);
+                                            let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
+                                            // Color-code buffer/jitter (Directive 5): each value
+                                            // gets its own classified span; the title carries the
+                                            // reason so meaning never depends on color alone.
+                                            let (buf_class, buf_title) = peer_buffer_class(*latest_buffer);
+                                            let (jit_class, jit_title) = peer_jitter_class(*latest_jitter);
+                                            let (badge_label, badge_class, badge_title) = match transport_map.get(peer_id).map(String::as_str) {
+                                                Some("webtransport") => ("WT", "connection-type type-webtransport", "WebTransport"),
+                                                Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
+                                                _ => ("\u{2014}", "connection-type", "Transport unknown"),
+                                            };
+                                            rsx! {
+                                                div { class: "peer-summary-item",
+                                                    strong { "{display}" }
+                                                    div {
+                                                        style: "display:flex; gap:8px; align-items:center;",
+                                                        span { class: "{badge_class}", title: "{badge_title}", "{badge_label}" }
+                                                        span {
+                                                            "Buffer: "
+                                                            span { class: "peer-stat {buf_class}", title: "{buf_title}", "{latest_buffer}ms" }
+                                                            ", Jitter: "
+                                                            span { class: "peer-stat {jit_class}", title: "{jit_title}", "{latest_jitter}ms" }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Current Status tiles + scrollable NetEq charts, with their two
+                // info-icon popovers, live in a child component so toggling a
+                // popover re-renders ONLY that subtree. The already-computed,
+                // value-typed history/latest/capped are passed in as props; no
+                // signal reads move into the child (#1128).
+                NetEqStatusAndCharts {
+                    latest_stats: latest_neteq_stats,
+                    // Wrap in NetEqHistory (Rc) — the `.clone()` is a refcount
+                    // bump, and the child's prop memo compares by pointer (S1).
+                    stats_history: NetEqHistory(neteq_stats_history.clone()),
+                    buffer_history: buffer_history.clone(),
+                    jitter_history: jitter_history.clone(),
+                    capped: neteq_capped,
+                    single_peer,
+                }
             }
         }
     }
@@ -1176,9 +1273,17 @@ pub fn Diagnostics(
 /// (‰) by `q14::to_per_mille`, REORDER = `reorder_rate_permyriad` (‱).
 const HELP_NETEQ_STATUS: &str = "A live snapshot of each peer's audio jitter buffer — the queue that absorbs network timing variance before audio is played. Buffer is what's queued now; Target is the size NetEq is aiming for given recent jitter (Buffer near Target is healthy; Buffer at 0 means it ran dry → choppy audio). Packets is how many encoded packets are waiting to decode. Expand rate (‰ of output) rises when audio is stretched to cover lost or late packets; Accelerate rate (‰) rises when audio is sped up to drain an over-full buffer. Reorder rate (‱ of packets) and Max reorder distance show how often packets arrive out of order. A few ‰ of expand/accelerate is normal; sustained high expand means the network is dropping or delaying audio.";
 
-/// Plain-language explanation for the NetEq charts grid info icon (#1131). Each
-/// sentence maps to one chart's real series — see `neteq_chart::ChartConfig`.
-const HELP_NETEQ_CHARTS: &str = "These charts trend the same audio-pipeline metrics over the most recent samples (the X axis is in seconds). Buffer Size vs Target: the live buffer tracking NetEq's target — they should track closely; the buffer dipping toward 0 signals starvation. Decode Operations: how the decoder spent each second — mostly Normal is healthy, while rising Expand (concealment) or Accelerate (catch-up) means the network is delivering audio late or in bursts. Packets Awaiting Decode: queue depth over time — steady is good, a sustained climb means decode can't keep up. Packet Reordering: how often packets arrive out of order (rate in ‱) and the largest sequence gap (in packets) — occasional reordering is normal on the public internet.";
+/// Buffer vs Target chart explanation (#1222).
+const HELP_CHART_BUFFER: &str = "The live jitter buffer (gauge, ms) plotted against NetEq's adaptive Target. Target rises automatically when the network gets jittery and settles back (~80 ms baseline) when it's calm. The buffer should track the target closely. Healthy: buffer hugging target; a buffer line dipping toward 0 means the queue ran dry and audio is starving.";
+
+/// Decode Operations chart explanation (#1222).
+const HELP_CHART_DECODE: &str = "How the decoder spent each second, as true per-second rates: Normal (ordinary playback), Expand (loss concealment — stretching audio over missing/late packets), Accelerate (catch-up — speeding up to drain a full buffer), plus Preemptive and Merge. Healthy: Normal dominant near ~100/s with Expand at 0; rising Expand means the network is dropping or delaying audio.";
+
+/// Packets Awaiting Decode chart explanation (#1222).
+const HELP_CHART_PACKETS: &str = "Queue depth over time — how many encoded packets are waiting to be decoded (a gauge, not a rate). Healthy: low and steady. A sustained climb means decode is falling behind the incoming stream.";
+
+/// Packet Reordering chart explanation (#1222).
+const HELP_CHART_REORDER: &str = "Two lifetime measures: the share of packets that arrived out of order (rate, ‱ of received) and the largest sequence gap seen (running max, in packets). Both are cumulative by design, so they only ever hold or rise. Healthy: flat at 0 on a clean LAN; slow, occasional growth is normal on the public internet.";
 
 /// Current Status tiles + the scrollable NetEq charts, with one info-icon
 /// popover on each cluster header (#1131 cleanup). Pulled into its own child so
@@ -1188,10 +1293,12 @@ const HELP_NETEQ_CHARTS: &str = "These charts trend the same audio-pipeline metr
 /// — the heavy JSON decode happens in the subscribe loop, not here), so no extra
 /// signal reads enter the parent body (tick-scoping #1128).
 ///
-/// The two popovers share one single-open signal keyed by the help id, so opening
-/// one closes the other — identical to the Performance panel's help behaviour
-/// (same [`HelpPopover`] component, same `.perf-help*` styles, same 44px hit area
-/// + aria treatment). testids: `diag-status-help`, `diag-charts-help`.
+/// All popovers (the Current Status section ⓘ plus the four per-chart ⓘ) share one
+/// single-open signal keyed by the help id, so opening one closes the others —
+/// identical to the Performance panel's help behaviour (same [`HelpPopover`]
+/// component, same `.perf-help*` styles, same 44px hit area + aria treatment).
+/// testids: `diag-status-help`, `diag-chart-buffer-help`, `diag-chart-decode-help`,
+/// `diag-chart-packets-help`, `diag-chart-reorder-help` (#1222).
 #[component]
 fn NetEqStatusAndCharts(
     latest_stats: Option<NetEqSample>,
@@ -1241,31 +1348,69 @@ fn NetEqStatusAndCharts(
         }
         if has_history {
             section { class: "diagnostics-section", "aria-labelledby": "diag-h-neteq-charts",
-                div { class: "diag-section-head",
-                    h3 { id: "diag-h-neteq-charts", "NetEQ charts" }
-                    HelpPopover {
-                        key_id: "diag-charts",
-                        help_testid: "diag-charts-help",
-                        help_label: "About the NetEq charts",
-                        help_body: HELP_NETEQ_CHARTS,
-                        open_help,
-                    }
-                }
+                // The section keeps its heading (aria anchor), but the single
+                // section-level help popover is gone (Directive 3): each chart now
+                // carries its OWN per-chart ⓘ in a `.diag-chart-head` so the
+                // explanation sits where the user is looking. All four popovers
+                // share the existing `open_help` signal (single-open contract).
+                h3 { id: "diag-h-neteq-charts", "NetEQ charts" }
                 // Four scrollable charts, 1-up full drawer width, stacked. Each
                 // has a UNIQUE scroll id so the shared `onscroll` scroll-sync can
                 // copy scroll_left onto the other three siblings (one timeline).
+                // `show_title: false` suppresses the in-SVG `.chart-title` so the
+                // `.diag-chart-head__title` is the single visible heading.
                 div { class: "diagnostics-charts neteq-charts-stack",
                     div { class: "chart-container",
-                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::BufferVsTarget, scroll_id: "neteq-chart-scroll-buffer".to_string(), capped }
+                        div { class: "diag-chart-head",
+                            span { class: "diag-chart-head__title", "Buffer Size vs Target" }
+                            HelpPopover {
+                                key_id: "diag-chart-buffer",
+                                help_testid: "diag-chart-buffer-help",
+                                help_label: "About the Buffer vs Target chart",
+                                help_body: HELP_CHART_BUFFER,
+                                open_help,
+                            }
+                        }
+                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::BufferVsTarget, scroll_id: "neteq-chart-scroll-buffer".to_string(), capped, show_title: false }
                     }
                     div { class: "chart-container",
-                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::DecodeOperations, scroll_id: "neteq-chart-scroll-decode".to_string(), capped }
+                        div { class: "diag-chart-head",
+                            span { class: "diag-chart-head__title", "Decode Operations" }
+                            HelpPopover {
+                                key_id: "diag-chart-decode",
+                                help_testid: "diag-chart-decode-help",
+                                help_label: "About the Decode Operations chart",
+                                help_body: HELP_CHART_DECODE,
+                                open_help,
+                            }
+                        }
+                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::DecodeOperations, scroll_id: "neteq-chart-scroll-decode".to_string(), capped, show_title: false }
                     }
                     div { class: "chart-container",
-                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::QualityMetrics, scroll_id: "neteq-chart-scroll-packets".to_string(), capped }
+                        div { class: "diag-chart-head",
+                            span { class: "diag-chart-head__title", "Packets Awaiting Decode" }
+                            HelpPopover {
+                                key_id: "diag-chart-packets",
+                                help_testid: "diag-chart-packets-help",
+                                help_label: "About the Packets Awaiting Decode chart",
+                                help_body: HELP_CHART_PACKETS,
+                                open_help,
+                            }
+                        }
+                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::QualityMetrics, scroll_id: "neteq-chart-scroll-packets".to_string(), capped, show_title: false }
                     }
                     div { class: "chart-container",
-                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::ReorderingAnalysis, scroll_id: "neteq-chart-scroll-reorder".to_string(), capped }
+                        div { class: "diag-chart-head",
+                            span { class: "diag-chart-head__title", "Packet Reordering" }
+                            HelpPopover {
+                                key_id: "diag-chart-reorder",
+                                help_testid: "diag-chart-reorder-help",
+                                help_label: "About the Packet Reordering chart",
+                                help_body: HELP_CHART_REORDER,
+                                open_help,
+                            }
+                        }
+                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::ReorderingAnalysis, scroll_id: "neteq-chart-scroll-reorder".to_string(), capped, show_title: false }
                     }
                 }
             }
@@ -1375,10 +1520,11 @@ fn SimulcastLayersSection(is_open: bool, reader: Option<DiagnosticsReader>) -> E
         div { class: "diagnostics-section",
             h3 { "Simulcast layers" }
             p { class: "simulcast-effective", "{summary_line}" }
-            // Both the SEND ladder and the RECEIVE breakdown now label layers
-            // 1-based ("L1" = base), so they read consistently under this single
-            // heading. A one-line hint states the shared convention (#10).
-            p { class: "simulcast-note", "Layers are numbered from 1 (L1 = base)." }
+            // Both the SEND ladder and the RECEIVE breakdown now label layers by
+            // quality NAME (Low/Medium/High, compact L/M/H), so they read
+            // consistently under this single heading. A one-line hint states the
+            // shared convention (#1222, site 10).
+            p { class: "simulcast-note", "Layers are named by quality: Low, Medium, High." }
             SimulcastSendLadder {
                 title: "Video (sending)",
                 not_sharing_text: "Camera — off",
@@ -1455,33 +1601,40 @@ fn SimulcastSendLadder(
             span { class: "simulcast-send-title", "{title}" }
             span { class: "simulcast-send-header", "{header_line}" }
             div { class: "simulcast-send-ladder", "data-testid": "diag-simulcast-ladder",
-                for layer in snap.layers.iter().cloned() {
-                    {
-                        let active = layer.layer_id < snap.active_layers;
-                        let grow = (layer.bitrate_kbps as f32 / max_kbps as f32).max(0.4);
-                        let chip_class = if active {
-                            "simulcast-rung is-active"
-                        } else {
-                            "simulcast-rung is-shed"
-                        };
-                        let full = format_send_layer(
-                            layer.layer_id, layer.width, layer.height, layer.bitrate_kbps,
-                        );
-                        let res_short = format_send_layer_short(layer.width, layer.height);
-                        let kbps_short = format_kbps_compact(layer.bitrate_kbps);
-                        // DISPLAY 1-based (L1 = base) to match the receive side; the
-                        // internal `layer_id` (and the data-testid suffix) stays
-                        // 0-based so e2e selectors / protobuf don't churn.
-                        let layer_num = layer.layer_id + 1;
-                        rsx! {
-                            div {
-                                class: chip_class,
-                                "data-testid": "diag-simulcast-rung-{layer.layer_id}",
-                                title: "{full}",
-                                style: "flex-grow: {grow};",
-                                span { class: "simulcast-rung-id", "L{layer_num}" }
-                                span { class: "simulcast-rung-res", "{res_short}" }
-                                span { class: "simulcast-rung-kbps", "{kbps_short}" }
+                {
+                    // Ladder size = number of effective layers in this send stream;
+                    // the basis for the per-rung quality letter (Low/Med/High → L/M/H).
+                    let ladder_count = snap.layers.len() as u32;
+                    rsx! {
+                        for layer in snap.layers.iter().cloned() {
+                            {
+                                let active = layer.layer_id < snap.active_layers;
+                                let grow = (layer.bitrate_kbps as f32 / max_kbps as f32).max(0.4);
+                                let chip_class = if active {
+                                    "simulcast-rung is-active"
+                                } else {
+                                    "simulcast-rung is-shed"
+                                };
+                                let full = format_send_layer(
+                                    layer.layer_id, ladder_count, layer.width, layer.height, layer.bitrate_kbps,
+                                );
+                                let res_short = format_send_layer_short(layer.width, layer.height);
+                                let kbps_short = format_kbps_compact(layer.bitrate_kbps);
+                                // DISPLAY the quality LETTER (L/M/H); the internal
+                                // `layer_id` (and the data-testid suffix) stays 0-based
+                                // so e2e selectors / protobuf don't churn.
+                                let letter = layer_quality_label(layer.layer_id, ladder_count, true);
+                                rsx! {
+                                    div {
+                                        class: chip_class,
+                                        "data-testid": "diag-simulcast-rung-{layer.layer_id}",
+                                        title: "{full}",
+                                        style: "flex-grow: {grow};",
+                                        span { class: "simulcast-rung-id", "{letter}" }
+                                        span { class: "simulcast-rung-res", "{res_short}" }
+                                        span { class: "simulcast-rung-kbps", "{kbps_short}" }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1514,17 +1667,40 @@ fn SimulcastReceiveBreakdown(peers: Vec<videocall_client::PeerReceiveDiag>) -> E
                         rsx! {}
                     } else {
                         let n = kind_peers.len();
+                        // Ladder size for this kind = the shared per-peer layer_count
+                        // (use the max in case peers report different ladder depths).
+                        // It is the basis for the quality LETTERS in the spread/tail.
+                        let count = kind_peers
+                            .iter()
+                            .map(|p| p.snap.layer_count)
+                            .max()
+                            .unwrap_or(1);
+                        // Spread = lowest..highest layer INDEX, rendered as quality
+                        // letters (L/M/H). Compute from explicit min/max over indices
+                        // so it is independent of the display sort below.
+                        let lo_idx = kind_peers
+                            .iter()
+                            .map(|p| p.snap.layer_index)
+                            .min()
+                            .unwrap_or(0);
+                        let hi_idx = kind_peers
+                            .iter()
+                            .map(|p| p.snap.layer_index)
+                            .max()
+                            .unwrap_or(0);
+                        let spread = if lo_idx == hi_idx {
+                            layer_quality_label(lo_idx, count, true).to_string()
+                        } else {
+                            format!(
+                                "{}\u{2013}{}",
+                                layer_quality_label(lo_idx, count, true),
+                                layer_quality_label(hi_idx, count, true)
+                            )
+                        };
+                        // Full quality word for the "+N more" tail (e.g. "Low").
+                        let tail_label = layer_quality_label(lo_idx, count, false);
                         // Sort by layer DESC (highest quality first) — top-3 shown.
                         kind_peers.sort_by_key(|p| std::cmp::Reverse(p.snap.layer_index));
-                        // Spread = lowest..highest layer; the Vec is now DESC, so
-                        // last = lowest, first = highest.
-                        let lowest_layer = kind_peers.last().map(|p| p.snap.layer_index + 1).unwrap_or(1);
-                        let highest_layer = kind_peers.first().map(|p| p.snap.layer_index + 1).unwrap_or(1);
-                        let spread = if lowest_layer == highest_layer {
-                            format!("L{lowest_layer}")
-                        } else {
-                            format!("L{lowest_layer}–L{highest_layer}")
-                        };
                         let extra = n.saturating_sub(3);
                         kind_peers.truncate(3);
                         rsx! {
@@ -1550,7 +1726,7 @@ fn SimulcastReceiveBreakdown(peers: Vec<videocall_client::PeerReceiveDiag>) -> E
                                 if extra > 0 {
                                     span { class: "simulcast-recv-more",
                                         "data-testid": "diag-simulcast-recv-more-{kind_label}",
-                                        "+{extra} more peer(s) at L{lowest_layer}"
+                                        "+{extra} more peer(s) on {tail_label}"
                                     }
                                 }
                             }
@@ -1559,5 +1735,96 @@ fn SimulcastReceiveBreakdown(peers: Vec<videocall_client::PeerReceiveDiag>) -> E
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use videocall_diagnostics::{DiagEvent, Metric, MetricValue};
+
+    fn m(name: &'static str, value: MetricValue) -> Metric {
+        Metric { name, value }
+    }
+
+    /// FIX 1: a synthetic subsystem `"video"` event must format to a Reception
+    /// dump that carries the fps, the bitrate, and the `to_peer` (NOT `from_peer`)
+    /// label. Mutating the metric key `"fps_received"` back to `"fps"` (the old,
+    /// never-emitted name) drops the FPS line → the `"30"` assertion fails.
+    #[test]
+    fn reception_text_uses_to_peer_and_real_metric_keys() {
+        let evt = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1234,
+            metrics: vec![
+                m("fps_received", MetricValue::F64(30.0)),
+                m("bitrate_kbps", MetricValue::F64(850.0)),
+                m("media_type", MetricValue::Text("VIDEO".to_string())),
+                m("from_peer", MetricValue::Text("self-id".to_string())),
+                m("to_peer", MetricValue::Text("peer-abc".to_string())),
+            ],
+        };
+        let text = format_reception_text(&evt).expect("recognized metrics → Some");
+        assert!(text.contains("30"), "FPS value present: {text}");
+        assert!(text.contains("850"), "bitrate present: {text}");
+        assert!(text.contains("VIDEO"), "media type present: {text}");
+        // The peer label is the REMOTE source (to_peer), not the local self-id.
+        assert!(text.contains("peer-abc"), "to_peer label present: {text}");
+        assert!(
+            !text.contains("self-id"),
+            "from_peer (self-id) must NOT be the label: {text}"
+        );
+        assert!(
+            text.contains("Timestamp: 1234"),
+            "timestamp present: {text}"
+        );
+    }
+
+    /// FIX 1: an event with none of the recognized stat metrics yields `None`
+    /// (mirrors the old `if !text.is_empty()` guard) — no empty dump is written.
+    #[test]
+    fn reception_text_none_when_no_recognized_metrics() {
+        let evt = DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1,
+            metrics: vec![m("decode_errors_total", MetricValue::U64(0))],
+        };
+        assert!(format_reception_text(&evt).is_none());
+    }
+
+    /// FIX 2: auto-select fires only for the sole-peer default case. Mutating
+    /// the `user_picked` guard flips case 3; mutating `len() == 1` flips case 2.
+    #[test]
+    fn auto_select_peer_only_for_sole_unpicked_default() {
+        let p1 = vec!["p1".to_string()];
+        let p1p2 = vec!["p1".to_string(), "p2".to_string()];
+        assert_eq!(
+            auto_select_peer("All Peers", false, &p1),
+            Some("p1".to_string())
+        );
+        assert_eq!(auto_select_peer("All Peers", false, &p1p2), None);
+        assert_eq!(auto_select_peer("All Peers", true, &p1), None);
+        assert_eq!(auto_select_peer("p1", false, &p1), None);
+    }
+
+    /// Directive 5: per-peer BUFFER classifier boundaries. 0 → poor; 39 → warn;
+    /// 40 → good. Mutating any threshold flips a boundary case.
+    #[test]
+    fn peer_buffer_class_boundaries() {
+        assert_eq!(peer_buffer_class(0), ("is-poor", "starving"));
+        assert_eq!(peer_buffer_class(39), ("is-warn", "low buffer"));
+        assert_eq!(peer_buffer_class(40), ("is-good", ""));
+    }
+
+    /// Directive 5: per-peer JITTER classifier boundaries. 30 → good; 31 → warn;
+    /// 60 → warn; 61 → poor.
+    #[test]
+    fn peer_jitter_class_boundaries() {
+        assert_eq!(peer_jitter_class(30), ("is-good", ""));
+        assert_eq!(peer_jitter_class(31), ("is-warn", "elevated jitter"));
+        assert_eq!(peer_jitter_class(60), ("is-warn", "elevated jitter"));
+        assert_eq!(peer_jitter_class(61), ("is-poor", "high jitter"));
     }
 }

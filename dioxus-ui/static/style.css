@@ -1447,65 +1447,121 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin-bottom: 6px;
 }
 
+/* Current Status — two-tier compact layout (iteration 4). Replaces the 9 uniform
+   110px tiles. Quality classes (.is-good/.is-warn/.is-poor) tint the VALUE only;
+   each colored state also carries a text reason (.status-stat__reason or title)
+   so meaning never depends on color alone (WCAG 1.4.1). Uses var(--text-*): the
+   drawer is bi-theme — under dark theme --text-* resolves to the settings-modal
+   dark tokens remapped inside #diagnostics-sidebar, and under light theme it
+   inherits the default light --text-* (the light drawer is intentionally NOT
+   remapped). No .settings-modal ancestor dependency either way. */
 .neteq-status {
   background: var(--surface-elevated);
-  padding: 15px;
+  padding: 16px;
   border-radius: 8px;
   box-shadow: var(--shadow-sm);
-}
-
-/* Single-source `.status-*` tiles, NAMESPACED under `.neteq-status` (iteration 3
-   polish). This is now the ONLY definition — the inline `<style>` dup that lived
-   in `NetEqStatusDisplay` (and disagreed: 36px vs 18px) was deleted. The styled
-   36px-tile proportions are preserved here, using theme tokens. */
-.neteq-status .status-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  display: flex;
+  flex-direction: column;
   gap: 12px;
 }
 
-.neteq-status .status-item {
-  text-align: center;
-  padding: 16px 12px;
+/* Tier 1 — primary stats (Buffer | Target) */
+.neteq-status .status-primary {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+.neteq-status .status-stat {
   background: var(--border);
   border-radius: 8px;
-  min-height: 110px;
+  padding: 12px 14px;
   display: flex;
   flex-direction: column;
-  align-items: center;
-  gap: 6px;
+  gap: 2px;
 }
-
-.neteq-status .status-value {
-  font-size: 32px;
-  font-weight: 700;
-  line-height: 1;
+.neteq-status .status-stat__value {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.1;
   color: var(--text-primary);
-  white-space: nowrap;
-  margin: 0;
+  font-variant-numeric: tabular-nums;
 }
-
-.neteq-status .status-value.warning {
-  color: var(--error-text);
+.neteq-status .status-stat__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
 }
-
-.neteq-status .status-value.good {
-  color: var(--success);
-}
-
-.neteq-status .status-label {
+.neteq-status .status-stat__unit {
   font-size: 11px;
+  color: var(--text-tertiary);
+}
+.neteq-status .status-stat__reason {
+  font-size: 11px;
+  line-height: 1.3;
+  margin-top: 2px;
+  color: var(--text-secondary);
+}
+
+/* Tier 2 — flow group, label-left / value-right rows */
+.neteq-status .status-secondary {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px 16px;
+}
+.neteq-status .status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.neteq-status .status-row__label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.neteq-status .status-row__value {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tier 3 — reordering, demoted muted micro-row */
+.neteq-status .status-reorder {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding-top: 4px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.neteq-status .status-reorder__head {
   font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
-  line-height: 1.2;
+  letter-spacing: 0.4px;
+  font-size: 11px;
 }
 
-.neteq-status .status-subtitle {
-  font-size: 9px;
-  color: var(--text-tertiary);
-  line-height: 1.3;
+/* Quality tinting — VALUE color only; canonical tokens (Directive 5) */
+.neteq-status .is-good   .status-stat__value,
+.neteq-status .is-good   .status-row__value,
+.neteq-status .status-reorder__item.is-good  { color: var(--diag-q-good); }
+.neteq-status .is-warn   .status-stat__value,
+.neteq-status .is-warn   .status-row__value,
+.neteq-status .status-reorder__item.is-warn  { color: var(--diag-q-warn); }
+.neteq-status .is-poor   .status-stat__value,
+.neteq-status .is-poor   .status-row__value,
+.neteq-status .status-reorder__item.is-poor  { color: var(--diag-q-poor); }
+.neteq-status .is-warn   .status-stat__reason { color: var(--diag-q-warn); }
+.neteq-status .is-poor   .status-stat__reason { color: var(--diag-q-poor); }
+
+/* Mobile: primary stacks, secondary single column */
+@media (max-width: 639px) {
+  .neteq-status .status-primary,
+  .neteq-status .status-secondary { grid-template-columns: 1fr; }
 }
 
 .diagnostics-charts {
@@ -1523,6 +1579,21 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .neteq-charts-stack .chart-container {
   min-height: 0;
   width: 100%;
+}
+
+/* Per-chart heading row (title + ⓘ) for the four NetEq charts (iteration 4).
+   Replaces the single section-level charts help popover; each chart now carries
+   its own explanation where the user is looking. */
+.neteq-charts-stack .diag-chart-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.neteq-charts-stack .diag-chart-head__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
 }
 
 /* `.charts-grid` is no longer used for the NetEq charts (they stack 1-up). Kept
@@ -1596,27 +1667,22 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
 }
 
+/* Per-peer Buffer/Jitter value color-coding (iteration 4, Directive 5). Tints
+   the value span only; the `title` attribute carries the text reason so meaning
+   never depends on color alone (WCAG 1.4.1). */
+.peer-summary .peer-stat.is-good { color: var(--diag-q-good); }
+.peer-summary .peer-stat.is-warn { color: var(--diag-q-warn); }
+.peer-summary .peer-stat.is-poor { color: var(--diag-q-poor); }
+
 @media (max-width: 37.5em) {
   .charts-grid {
     grid-template-columns: 1fr;
     gap: 10px;
   }
-  /* Namespaced to match the single-source `.neteq-status .status-*` rules
-     (iteration 3) so the mobile tile sizing still wins by specificity. */
-  .neteq-status .status-grid {
-    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
-    gap: 6px;
-  }
-  .neteq-status .status-item {
-    padding: 10px 8px;
-    min-height: 0;
-  }
-  .neteq-status .status-value {
-    font-size: 22px;
-  }
-  .neteq-status .status-label {
-    font-size: 9px;
-  }
+  /* The old `.neteq-status .status-grid/item/value/label` mobile overrides were
+     removed with the two-tier Current Status redesign (iteration 4); the new
+     `.status-primary` / `.status-secondary` mobile collapse lives in its own
+     `@media (max-width: 639px)` block above. */
   .neteq-advanced-chart {
     padding: 10px;
   }

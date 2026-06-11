@@ -416,6 +416,58 @@ pub const KEYFRAME_LIMITER_CLEANUP_INTERVAL: u32 = 64;
 /// are intentionally separate constants.
 pub const KEYFRAME_REQUEST_MAX_LAYER_ID: u32 = 2;
 
+/// Compile-time link tying [`KEYFRAME_REQUEST_MAX_LAYER_ID`] to the ACTUAL
+/// simulcast ladder depth (#1185).
+///
+/// `KEYFRAME_REQUEST_MAX_LAYER_ID` is the TOP real layer id, i.e. `ladder
+/// depth - 1`. It is hand-set to `2` above because the production ladder ships
+/// 3 layers (ids 0,1,2). Before this assert that pairing was purely a comment:
+/// if the ladder grew (e.g. video → 5 layers, top id 4) and nobody bumped this
+/// constant, the `layer.min(KEYFRAME_REQUEST_MAX_LAYER_ID)` clamp at
+/// `packet_handler.rs` would SILENTLY collapse a real upper layer's keyframe
+/// budget onto the id-2 bucket — a genuine functional regression with no build
+/// failure to catch it (#1068's clamp depends on this bound equalling the real
+/// ladder top).
+///
+/// The ladder depth's single source of truth is the `videocall-aq` crate
+/// (`SIMULCAST_MAX_LAYERS` / `SCREEN_SIMULCAST_MAX_LAYERS`), which the browser
+/// client (`layer_chooser.rs`, `camera_encoder.rs`) also derives its caps from.
+/// `videocall-aq` builds on native targets (it is explicitly "shared between
+/// the browser client and native consumers"), so the relay can reference it
+/// directly here — this is the FIRST relay-side compile-time tie to the ladder
+/// (the relay is otherwise deliberately layer-count-agnostic on the forwarding
+/// path; this assert is a build-time guard, not runtime ladder knowledge).
+///
+/// VIDEO and SCREEN have independent caps; the keyframe limiter keys on the
+/// cleartext `simulcast_layer_id` WITHOUT knowing the packet's media kind, so a
+/// single clamp bound must cover the DEEPEST ladder across kinds. We therefore
+/// tie to the MAX of the two caps. Today both are 3, so the top id is 2.
+///
+/// If either cap changes in `videocall-aq`, this assert FAILS the build with a
+/// clear message until `KEYFRAME_REQUEST_MAX_LAYER_ID` (and the doc above) are
+/// updated to match.
+const _: () = {
+    // Deepest ladder across the two video/screen caps the relay must cover.
+    let max_ladder_depth = if videocall_aq::constants::SIMULCAST_MAX_LAYERS
+        >= videocall_aq::constants::SCREEN_SIMULCAST_MAX_LAYERS
+    {
+        videocall_aq::constants::SIMULCAST_MAX_LAYERS
+    } else {
+        videocall_aq::constants::SCREEN_SIMULCAST_MAX_LAYERS
+    };
+    // Top real layer id == ladder depth - 1. Keep the keyframe clamp's bucket
+    // ceiling (`KEYFRAME_REQUEST_MAX_LAYER_ID + 1` buckets) exactly equal to the
+    // real ladder so no real layer id collapses onto a shared bucket.
+    assert!(
+        KEYFRAME_REQUEST_MAX_LAYER_ID as usize + 1 == max_ladder_depth,
+        "KEYFRAME_REQUEST_MAX_LAYER_ID is out of sync with the simulcast ladder \
+         (videocall_aq::constants::SIMULCAST_MAX_LAYERS / SCREEN_SIMULCAST_MAX_LAYERS). \
+         It must equal max(ladder depths) - 1. Update KEYFRAME_REQUEST_MAX_LAYER_ID \
+         and its doc comment to match the new ladder, then re-check the #1068 clamp \
+         at packet_handler.rs."
+    );
+};
+
 /// Maximum number of `session_ids` the relay will accept from a single
 /// VIEWPORT control packet (HCL issue #988).
 ///

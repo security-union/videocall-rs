@@ -21,12 +21,18 @@ message DiagnosticsPacket {
 
 // Video-specific diagnostic metrics
 message VideoMetrics {
-  float fps_received = 1;      // Frames per second being received (fps)
+  // Field 1 (fps_received) removed in #1184: dead receiver-FPS telemetry that was
+  // only ever written, never consumed. Field number reserved to prevent reuse.
+  reserved 1;
+  reserved "fps_received";
   uint32 bitrate_kbps = 2;     // Current measured bitrate (kilobits per second)
 }
 
 // Audio-specific diagnostic metrics
 message AudioMetrics {
-  float fps_received = 1;      // Frames per second being received (fps)
+  // Field 1 (fps_received) removed in #1184: dead receiver-FPS telemetry that was
+  // only ever written, never consumed. Field number reserved to prevent reuse.
+  reserved 1;
+  reserved "fps_received";
   uint32 bitrate_kbps = 2;     // Current measured bitrate (kilobits per second)
 }

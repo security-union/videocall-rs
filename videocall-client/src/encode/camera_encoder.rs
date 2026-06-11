@@ -372,12 +372,8 @@ pub struct CameraEncoder {
     shared_video_tier_index: Rc<AtomicU32>,
     /// Current audio quality tier index (0=high, 3=emergency).
     shared_audio_tier_index: Rc<AtomicU32>,
-    /// Last fps_ratio from the encoder control loop (f32 bits in AtomicU32).
-    shared_encoder_fps_ratio: Rc<AtomicU32>,
     /// Worst peer FPS from the encoder control loop (f32 bits in AtomicU32).
     shared_encoder_p75_peer_fps: Rc<AtomicU32>,
-    /// Last bitrate_ratio from the encoder control loop (f32 bits in AtomicU32).
-    shared_encoder_bitrate_ratio: Rc<AtomicU32>,
     /// PID target bitrate kbps from the encoder control loop (f32 bits in AtomicU32).
     shared_encoder_target_bitrate_kbps: Rc<AtomicU32>,
     /// Tier transition events buffer, drained by health reporter each health packet.
@@ -739,6 +735,31 @@ fn should_pin_single_layer_low(
     }
 }
 
+/// Compute the next single-layer-low pin value for one AQ tick, given the peer
+/// count reading.
+///
+/// Issue #1172: `peer_count()` returns `None` on a momentarily-busy `inner`
+/// borrow. A `None` reading is NOT "0 peers" — treating it as 0 would fall below
+/// the release threshold and drop the pin mid-call, forcing a tier reconfigure +
+/// keyframe on a spurious read. On `None` this returns the unchanged
+/// `currently_pinned` value so the caller's atomic holds its prior state until a
+/// real count arrives. On `Some(count)` it defers to [`should_pin_single_layer_low`].
+///
+/// Pure (no atomics / DOM) so the borrow-fail-hold behavior is host-testable and
+/// a mutation that maps `None` onto 0 peers fails a unit test.
+#[inline]
+fn next_single_layer_pin(
+    effective_layers: u32,
+    other_peer_count: Option<usize>,
+    currently_pinned: bool,
+) -> bool {
+    match other_peer_count {
+        Some(count) => should_pin_single_layer_low(effective_layers, count, currently_pinned),
+        // Borrow-fail tick: hold prior state, do not treat as 0 peers.
+        None => currently_pinned,
+    }
+}
+
 impl CameraEncoder {
     /// Construct a camera encoder, with arguments:
     ///
@@ -788,9 +809,7 @@ impl CameraEncoder {
             screen_sharing_active: Rc::new(AtomicBool::new(false)),
             shared_video_tier_index: Rc::new(AtomicU32::new(0)),
             shared_audio_tier_index: Rc::new(AtomicU32::new(0)),
-            shared_encoder_fps_ratio: Rc::new(AtomicU32::new(0)),
             shared_encoder_p75_peer_fps: Rc::new(AtomicU32::new(0)),
-            shared_encoder_bitrate_ratio: Rc::new(AtomicU32::new(0)),
             shared_encoder_target_bitrate_kbps: Rc::new(AtomicU32::new(0)),
             shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
             shared_climb_limiter_snapshot: Rc::new(RefCell::new(ClimbLimiterSnapshot::default())),
@@ -873,9 +892,7 @@ impl CameraEncoder {
         let screen_sharing_active = self.screen_sharing_active.clone();
         let shared_video_tier_idx = self.shared_video_tier_index.clone();
         let shared_audio_tier_idx = self.shared_audio_tier_index.clone();
-        let shared_encoder_fps_ratio = self.shared_encoder_fps_ratio.clone();
         let shared_encoder_p75_peer_fps = self.shared_encoder_p75_peer_fps.clone();
-        let shared_encoder_bitrate_ratio = self.shared_encoder_bitrate_ratio.clone();
         let shared_encoder_target_bitrate_kbps = self.shared_encoder_target_bitrate_kbps.clone();
         let shared_tier_transitions = self.shared_tier_transitions.clone();
         let shared_climb_limiter_snapshot = self.shared_climb_limiter_snapshot.clone();
@@ -911,13 +928,15 @@ impl CameraEncoder {
         // encode loop already holds a strong clone for `send_media_packet`, so
         // this is the established lifetime pattern). `peer_count()` is a
         // non-blocking `try_borrow` read that counts off the cached key Rc WITHOUT
-        // cloning it (#1156) — if the inner is momentarily busy it returns `0`, so
-        // `other_peers == 0` is below the release threshold and the gate stores
-        // `false` (pin released) for that tick rather than blocking the loop; the
-        // next tick (≤1s later) re-reads the real count and self-corrects. In
-        // practice the borrow never fails here: all `inner` borrows are short and
-        // non-blocking and none is held across an `.await`, so on single-threaded
-        // wasm no borrow is active mid-tick.
+        // cloning it (#1156) — if the inner is momentarily busy it returns `None`
+        // (NOT `0`). A `None` reading is treated as "no fresh count this tick", so
+        // the gate HOLDS its prior pin value rather than releasing it (#1172): a
+        // spurious `0` would otherwise fall below the release threshold and flip a
+        // pinned publisher off for one tick, emitting a needless keyframe. The next
+        // tick (≤1s later) re-reads the real count. In practice the borrow never
+        // fails here: all `inner` borrows are short and non-blocking and none is
+        // held across an `.await`, so on single-threaded wasm no borrow is active
+        // mid-tick — the `None` arm is a correctness fail-safe, not a hot path.
         let peer_count_client = self.client.clone();
         let single_layer_low_pin = self.single_layer_low_pin.clone();
         wasm_bindgen_futures::spawn_local(async move {
@@ -997,13 +1016,14 @@ impl CameraEncoder {
                 // adaptive (medium-tier) stream is heavy on every receiver's
                 // decoder, so once the call has more than 3 OTHER peers we pin this
                 // publisher's single stream to the `low` rung (640×360) instead.
-                // `peer_count()` returns the count of REMOTE peers only (the relay
-                // never echoes our own packets back, and session_id 0 / self is
-                // never inserted into the peer decode manager) — exactly the
-                // ">3 others" engage semantics #1136 wants (a 5+-participant call).
-                // It reads `.len()` off the cached `Rc<Vec<String>>` WITHOUT
-                // cloning it, so this 1 Hz hot loop no longer allocates a
-                // `Vec<String>` per tick just to count peers (#1156).
+                // `peer_count()` returns `Some(count)` of REMOTE peers only (the
+                // relay never echoes our own packets back, and session_id 0 /
+                // self is never inserted into the peer decode manager) — exactly
+                // the ">3 others" engage semantics #1136 wants (a 5+-participant
+                // call). It reads `.len()` off the cached `Rc<Vec<String>>`
+                // WITHOUT cloning it, so this 1 Hz hot loop no longer allocates a
+                // `Vec<String>` per tick just to count peers (#1156). It returns
+                // `None` on a busy borrow — see the skip below (#1172).
                 //
                 // The decision is hysteretic (#1156): the pin engages at > 3 and
                 // releases at < 3, holding its prior state at exactly 3. Feeding
@@ -1015,10 +1035,16 @@ impl CameraEncoder {
                 // (n_layers > 1) the pin stays cleared — the receiver-driven layer
                 // chooser already sheds cost there.
                 if n_layers == 1 {
+                    // Issue #1172: a momentarily-busy `inner` borrow returns
+                    // `None`, which is NOT "0 peers". Feeding 0 here would fall
+                    // below the release threshold and drop the pin mid-call,
+                    // forcing a tier reconfigure + keyframe on a spurious read.
+                    // `next_single_layer_pin` HOLDS the prior pin on `None` so the
+                    // atomic keeps its value until a real count arrives.
                     let other_peers = peer_count_client.peer_count();
                     let currently_pinned = single_layer_low_pin.load(Ordering::Relaxed);
                     single_layer_low_pin.store(
-                        should_pin_single_layer_low(n_layers as u32, other_peers, currently_pinned),
+                        next_single_layer_pin(n_layers as u32, other_peers, currently_pinned),
                         Ordering::Relaxed,
                     );
                 }
@@ -1176,22 +1202,13 @@ impl CameraEncoder {
                 let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
                 // Write encoder decision inputs to shared atomics for health
-                // reporting. Issue #1108: the receiver-FPS-derived signals are
-                // gone — `last_fps_ratio()` / `last_bitrate_ratio()` now return
-                // NaN (the health reporter's is_finite() guard drops those proto
-                // fields), and `last_p75_peer_fps()` is REPOINTED to carry the new
-                // sender backpressure signal (encoder queue depth) so the existing
-                // host telemetry channel surfaces it with no proto/Grafana churn.
-                shared_encoder_fps_ratio.store(
-                    (encoder_control.last_fps_ratio() as f32).to_bits(),
-                    Ordering::Relaxed,
-                );
+                // reporting. Issue #1184: the dead receiver-FPS-derived ratios
+                // (`encoder_fps_ratio` / `encoder_bitrate_ratio`) and their
+                // shared atomics have been removed; `encoder_queue_depth()`
+                // carries the sender backpressure signal (encoder queue depth)
+                // through the existing host telemetry channel.
                 shared_encoder_p75_peer_fps.store(
-                    (encoder_control.last_p75_peer_fps() as f32).to_bits(),
-                    Ordering::Relaxed,
-                );
-                shared_encoder_bitrate_ratio.store(
-                    (encoder_control.last_bitrate_ratio() as f32).to_bits(),
+                    (encoder_control.encoder_queue_depth() as f32).to_bits(),
                     Ordering::Relaxed,
                 );
                 shared_encoder_target_bitrate_kbps.store(
@@ -1448,19 +1465,9 @@ impl CameraEncoder {
         }
     }
 
-    /// Returns the encoder fps_ratio atomic (f32 bits).
-    pub fn shared_encoder_fps_ratio(&self) -> Rc<AtomicU32> {
-        self.shared_encoder_fps_ratio.clone()
-    }
-
     /// Returns the encoder worst peer FPS atomic (f32 bits).
     pub fn shared_encoder_p75_peer_fps(&self) -> Rc<AtomicU32> {
         self.shared_encoder_p75_peer_fps.clone()
-    }
-
-    /// Returns the encoder bitrate_ratio atomic (f32 bits).
-    pub fn shared_encoder_bitrate_ratio(&self) -> Rc<AtomicU32> {
-        self.shared_encoder_bitrate_ratio.clone()
     }
 
     /// Returns the encoder target bitrate kbps atomic (f32 bits).
@@ -2937,9 +2944,9 @@ mod tests {
     use super::{
         build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
         frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
-        layer_ceiling_to_count, shed_reason, should_pin_single_layer_low, LayerView,
-        SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
-        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        layer_ceiling_to_count, next_single_layer_pin, shed_reason, should_pin_single_layer_low,
+        LayerView, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
 
@@ -3434,6 +3441,43 @@ mod tests {
             SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD + 1,
             false
         ));
+    }
+
+    /// Issue #1172: a borrow-fail tick (`peer_count() == None`) must PRESERVE the
+    /// prior pin state — it is NOT 0 peers. A genuine `Some(0)` reading still
+    /// releases. This test fails if the tick maps `None` onto 0 peers (the bug)
+    /// because `next_single_layer_pin(1, None, true)` would then release to
+    /// `false`.
+    #[test]
+    fn single_layer_pin_holds_on_borrow_fail_releases_on_real_zero() {
+        // Borrow-fail while PINNED: hold the pin (do not release on a spurious 0).
+        assert!(
+            next_single_layer_pin(1, None, true),
+            "None (borrow-fail) must hold a prior ENGAGED pin, not release it"
+        );
+        // Borrow-fail while UNPINNED: hold unpinned (do not spuriously engage).
+        assert!(
+            !next_single_layer_pin(1, None, false),
+            "None (borrow-fail) must hold a prior RELEASED pin"
+        );
+
+        // A GENUINE 0-peer reading still releases an engaged pin (0 < release
+        // threshold). This is the behavior the borrow-fail case must NOT mimic.
+        assert!(
+            !next_single_layer_pin(1, Some(0), true),
+            "a real 0-peer reading must RELEASE the pin"
+        );
+        // A genuine high count still engages from unpinned.
+        assert!(
+            next_single_layer_pin(1, Some(SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD + 1), false),
+            "a real >threshold reading must ENGAGE the pin"
+        );
+        // A genuine simulcast reading (>1 layer) always releases regardless of
+        // prior — the pin only applies in single-stream mode.
+        assert!(
+            !next_single_layer_pin(2, Some(50), true),
+            "simulcast publisher: a real reading releases the pin"
+        );
     }
 }
 

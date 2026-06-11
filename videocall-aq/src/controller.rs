@@ -1037,36 +1037,19 @@ impl EncoderBitrateController {
 
     // --- Telemetry accessors (issue #1108) ---
     //
-    // Receiver FPS no longer feeds the sender AQ, so the former fps_ratio /
-    // bitrate_ratio observability signals no longer exist. They are repointed to
-    // `f64::NAN` so the health reporter's `is_finite()` guard silently drops the
-    // corresponding (now-dead) proto fields — see the `// TODO(#1108 cleanup)`
-    // in the removed-fan-in comment at the top of this file. The
-    // `last_p75_peer_fps` accessor is REPOINTED to carry the new sender
-    // backpressure signal (encoder queue depth) so the existing host telemetry
-    // channel surfaces it with zero proto/Grafana churn.
+    // Receiver FPS no longer feeds the sender AQ. The former fps_ratio /
+    // bitrate_ratio observability signals and their dead proto fields were
+    // removed in issue #1184. The encoder-queue-depth signal that briefly reused
+    // the legacy `last_p75_peer_fps` channel now has a self-describing accessor,
+    // `encoder_queue_depth` (below).
 
-    /// Deprecated FPS-ratio telemetry — receiver FPS was removed from the sender
-    /// AQ (issue #1108). Returns `NaN` so the health reporter omits the field.
-    /// TODO(#1108 cleanup): remove this accessor + its proto field.
-    pub fn last_fps_ratio(&self) -> f64 {
-        f64::NAN
-    }
-
-    /// Repointed (issue #1108): now carries the sender's encoder backpressure
-    /// signal — the last sampled `encode_queue_size()` — reusing this telemetry
-    /// channel so the host panel can surface the new signal without a new proto
-    /// field. (Despite the legacy name, this is NOT a receiver FPS.)
-    /// TODO(#1108 cleanup): rename the field/proto to `encoder_queue_depth`.
-    pub fn last_p75_peer_fps(&self) -> f64 {
+    /// The sender's encoder backpressure signal — the last sampled
+    /// `encode_queue_size()`. Renamed from the legacy `last_p75_peer_fps`
+    /// (issue #1184): the accessor had been repointed off receiver FPS onto
+    /// encoder-queue depth (issue #1108) but kept the misleading name. The host
+    /// telemetry channel surfaces this with no proto/Grafana churn.
+    pub fn encoder_queue_depth(&self) -> f64 {
         self.last_encoder_queue_depth as f64
-    }
-
-    /// Deprecated bitrate-ratio telemetry — the receiver-FPS PID that produced it
-    /// was removed (issue #1108). Returns `NaN` so the health reporter omits the
-    /// field. TODO(#1108 cleanup): remove this accessor + its proto field.
-    pub fn last_bitrate_ratio(&self) -> f64 {
-        f64::NAN
     }
 
     /// Last emitted target bitrate (kbps). In simulcast mode this is the sum of

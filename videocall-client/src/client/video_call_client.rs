@@ -1579,13 +1579,18 @@ impl VideoCallClient {
     ///
     /// The relay never echoes the local publisher's own packets and the local
     /// session is never inserted into the peer decode manager, so this is the
-    /// count of OTHERS, not including self. A momentarily-busy `inner` borrow
-    /// returns `0` (same fail-safe as `sorted_peer_keys`), which the caller treats
-    /// as "no remote peers this tick" and self-corrects on the next read.
-    pub fn peer_count(&self) -> usize {
+    /// count of OTHERS, not including self.
+    ///
+    /// Returns `None` on a momentarily-busy `inner` borrow (issue #1172). A
+    /// borrow-fail is NOT zero peers — callers that make a quality decision on
+    /// the count (e.g. the camera AQ single-layer pin) must treat `None` as "no
+    /// reading this tick" and HOLD their prior state, not collapse to 0 peers
+    /// and release a pin. Callers that only need a best-effort count can use
+    /// `.unwrap_or(0)` to preserve the historical fail-to-zero behavior.
+    pub fn peer_count(&self) -> Option<usize> {
         match self.inner.try_borrow() {
-            Ok(inner) => inner.peer_decode_manager.sorted_string_keys().len(),
-            Err(_) => 0,
+            Ok(inner) => Some(inner.peer_decode_manager.sorted_string_keys().len()),
+            Err(_) => None,
         }
     }
 
@@ -1924,9 +1929,7 @@ impl VideoCallClient {
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &self,
-        fps_ratio: Rc<AtomicU32>,
         p75_peer_fps: Rc<AtomicU32>,
-        bitrate_ratio: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
@@ -1942,9 +1945,7 @@ impl VideoCallClient {
             if let Some(hr) = &inner.health_reporter {
                 if let Ok(mut reporter) = hr.try_borrow_mut() {
                     reporter.set_encoder_metric_sources(
-                        fps_ratio,
                         p75_peer_fps,
-                        bitrate_ratio,
                         target_bitrate_kbps,
                         screen_tier,
                         screen_active,

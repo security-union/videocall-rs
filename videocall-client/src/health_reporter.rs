@@ -189,12 +189,8 @@ pub struct HealthReporter {
     adaptive_video_tier: Rc<RefCell<Rc<AtomicU32>>>,
     /// Adaptive audio tier index from CameraEncoder (0=high, 3=emergency).
     adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
-    /// Encoder fps_ratio (f32 bits in AtomicU32). Wrapped in RefCell for late binding.
-    encoder_fps_ratio: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder p75 peer FPS (f32 bits in AtomicU32).
     encoder_p75_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
-    /// Encoder bitrate_ratio (f32 bits in AtomicU32).
-    encoder_bitrate_ratio: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder PID target bitrate kbps (f32 bits in AtomicU32).
     encoder_target_bitrate_kbps: Rc<RefCell<Rc<AtomicU32>>>,
     /// Screen share quality tier index.
@@ -406,11 +402,7 @@ impl HealthReporter {
             connection_controller: Rc::new(RefCell::new(None)),
             adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            encoder_fps_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(f32::NAN.to_bits())))),
             encoder_p75_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            encoder_bitrate_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(
-                f32::NAN.to_bits(),
-            )))),
             encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
@@ -521,9 +513,7 @@ impl HealthReporter {
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &mut self,
-        fps_ratio: Rc<AtomicU32>,
         p75_peer_fps: Rc<AtomicU32>,
-        bitrate_ratio: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
@@ -535,9 +525,7 @@ impl HealthReporter {
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
     ) {
-        *self.encoder_fps_ratio.borrow_mut() = fps_ratio;
         *self.encoder_p75_peer_fps.borrow_mut() = p75_peer_fps;
-        *self.encoder_bitrate_ratio.borrow_mut() = bitrate_ratio;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
         *self.adaptive_screen_tier.borrow_mut() = screen_tier;
         *self.screen_sharing_active.borrow_mut() = screen_active;
@@ -1061,9 +1049,7 @@ impl HealthReporter {
         let connection_controller = Rc::downgrade(&self.connection_controller);
         let adaptive_video_tier = self.adaptive_video_tier.clone();
         let adaptive_audio_tier = self.adaptive_audio_tier.clone();
-        let encoder_fps_ratio = self.encoder_fps_ratio.clone();
         let encoder_p75_peer_fps = self.encoder_p75_peer_fps.clone();
-        let encoder_bitrate_ratio = self.encoder_bitrate_ratio.clone();
         let encoder_target_bitrate_kbps = self.encoder_target_bitrate_kbps.clone();
         let adaptive_screen_tier = self.adaptive_screen_tier.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
@@ -1149,14 +1135,8 @@ impl HealthReporter {
                             };
 
                         // Read encoder decision inputs from shared atomics (f32 bits → f64).
-                        let fps_ratio_val =
-                            f32::from_bits(encoder_fps_ratio.borrow().load(Ordering::Relaxed))
-                                as f64;
                         let p75_peer_fps_val =
                             f32::from_bits(encoder_p75_peer_fps.borrow().load(Ordering::Relaxed))
-                                as f64;
-                        let bitrate_ratio_val =
-                            f32::from_bits(encoder_bitrate_ratio.borrow().load(Ordering::Relaxed))
                                 as f64;
                         let target_bitrate_kbps_val = f32::from_bits(
                             encoder_target_bitrate_kbps.borrow().load(Ordering::Relaxed),
@@ -1243,9 +1223,7 @@ impl HealthReporter {
                             videocall_transport::webtransport::datagram_drop_count(),
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
-                            fps_ratio_val,
                             p75_peer_fps_val,
-                            bitrate_ratio_val,
                             target_bitrate_kbps_val,
                             screen_tier_val,
                             screen_active_val,
@@ -1309,9 +1287,7 @@ impl HealthReporter {
         datagram_drops_total: u64,
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
-        encoder_fps_ratio: f64,
         encoder_p75_peer_fps: f64,
-        encoder_bitrate_ratio: f64,
         encoder_target_bitrate_kbps: f64,
         adaptive_screen_tier: u32,
         screen_sharing_active: bool,
@@ -1387,9 +1363,6 @@ impl HealthReporter {
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
         // Encoder decision inputs (P0)
-        if encoder_fps_ratio.is_finite() {
-            pb.encoder_fps_ratio = Some(encoder_fps_ratio);
-        }
         if encoder_p75_peer_fps.is_finite() {
             pb.encoder_p75_peer_fps = Some(encoder_p75_peer_fps);
         }
@@ -1417,9 +1390,6 @@ impl HealthReporter {
 
         if encoder_target_bitrate_kbps.is_finite() {
             pb.encoder_target_bitrate_kbps = Some(encoder_target_bitrate_kbps);
-        }
-        if encoder_bitrate_ratio.is_finite() {
-            pb.encoder_bitrate_ratio = Some(encoder_bitrate_ratio);
         }
 
         // Tier transition events (P2)
@@ -2084,10 +2054,8 @@ mod tests {
             0,
             0,
             0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
             0,
             false,
             0,
@@ -2164,10 +2132,8 @@ mod tests {
             0,
             0,
             0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
             0,
             false,
             0,
@@ -2220,10 +2186,8 @@ mod tests {
             0,
             0,
             0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
             0,
             false,
             0,
@@ -2289,10 +2253,8 @@ mod tests {
             0,
             0,
             0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
             0,
             false,
             0,

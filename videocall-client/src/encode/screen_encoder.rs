@@ -783,6 +783,15 @@ impl ScreenEncoder {
             let mut last_wt_drop_snapshot: u64 =
                 videocall_transport::webtransport::unistream_drop_count();
             let mut wt_drop_window_start_ms: f64 = js_sys::Date::now();
+            // Independent sliding window for the WebTransport uplink-SATURATION
+            // self-trigger (#1219 prerequisite); SEPARATE from the WT drop window
+            // above (drops = teardown; stalls = slow-but-alive uplink). Per the
+            // attribution note above, this is the screen loop's OWN baseline
+            // against the shared global stall counter — the camera loop has its
+            // own. WS users hold the counter flat at 0 → no-op.
+            let mut last_wt_stall_snapshot: u64 =
+                videocall_transport::webtransport::unistream_ready_stall_count();
+            let mut wt_stall_window_start_ms: f64 = js_sys::Date::now();
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
             // instead of waiting on receiver diagnostics. Runs for the lifetime
             // of the owning ScreenEncoder. This `spawn_local` future is NOT bound
@@ -911,6 +920,53 @@ impl ScreenEncoder {
                     if decision.roll_window {
                         last_wt_drop_snapshot = decision.new_snapshot;
                         wt_drop_window_start_ms = now;
+                    }
+                }
+
+                // 4) Client-side WebTransport uplink-SATURATION → step down
+                // (#1219 prerequisite). The WT DROP block above (3) only fires on
+                // stream teardown and is FLAT on a slow-but-alive uplink, because
+                // a WritableStream signals backpressure by leaving
+                // `writer.ready()` PENDING (the `.await`-blocking media send path
+                // never sees a write rejection). The transport exposes
+                // `unistream_ready_stall_count()` — incremented once per slow
+                // `writer.ready().await` on the established media path — so a
+                // SUSTAINED cluster of slow readys self-sheds a layer here. We use
+                // the gentle single-rung `force_video_step_down` (NOT
+                // `force_congestion_cut`): this is the publisher's own gradual
+                // uplink adaptation; the hard cut stays reserved for the
+                // server-authored CONGESTION path. Window/snapshot independent of
+                // all other axes; one rung per its OWN window. WS users hold the
+                // counter flat at 0 → no-op. Screen is frequently the heaviest
+                // egress, so detecting its own uplink saturation here is at least
+                // as important as on the camera.
+                {
+                    use crate::adaptive_quality_constants::{
+                        evaluate_self_congestion, WT_SATURATION_STALL_THRESHOLD,
+                        WT_SATURATION_WINDOW_MS,
+                    };
+                    let current_wt_stalls =
+                        videocall_transport::webtransport::unistream_ready_stall_count();
+                    let elapsed_ms = now - wt_stall_window_start_ms;
+                    let decision = evaluate_self_congestion(
+                        current_wt_stalls,
+                        last_wt_stall_snapshot,
+                        elapsed_ms,
+                        WT_SATURATION_WINDOW_MS,
+                        WT_SATURATION_STALL_THRESHOLD,
+                    );
+                    if decision.step_down {
+                        log::warn!(
+                            "ScreenEncoder: client WT uplink saturation detected ({} slow ready() \
+                             events in {:.0}ms), forcing video step-down",
+                            current_wt_stalls.saturating_sub(last_wt_stall_snapshot),
+                            elapsed_ms,
+                        );
+                        encoder_control.force_video_step_down();
+                    }
+                    if decision.roll_window {
+                        last_wt_stall_snapshot = decision.new_snapshot;
+                        wt_stall_window_start_ms = now;
                     }
                 }
 

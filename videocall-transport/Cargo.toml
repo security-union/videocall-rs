@@ -39,6 +39,7 @@ features = [
     "CloseEvent",
     "Event",
     "MessageEvent",
+    "Performance",
     "ReadableStream",
     "ReadableStreamDefaultReader",
     "WebSocket",

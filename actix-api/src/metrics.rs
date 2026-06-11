@@ -150,6 +150,8 @@ pub fn forget_room_metrics(room: &str) {
     let _ = RELAY_VIEWPORT_FORWARDED_TOTAL.remove_label_values(&[room]);
     let _ = RELAY_LAYER_FILTERED_TOTAL.remove_label_values(&[room]);
     let _ = RELAY_LAYER_FORWARDED_TOTAL.remove_label_values(&[room]);
+    // relay_congestion_filtered_total{room} (#1220).
+    let _ = RELAY_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
 
     // relay_room_bytes_total{room, direction}.
     for direction in ["inbound", "outbound"] {
@@ -977,6 +979,31 @@ lazy_static! {
     )
     .expect("Failed to create relay_layer_filtered_total metric");
 
+    /// CONGESTION packets dropped at the relay because the receiving session was
+    /// NOT the target (#1220 — CONGESTION unicast-correctness).
+    ///
+    /// CONGESTION is relay-authored and self-ADDRESSED: it is published onto the
+    /// target sender's own per-session subject (`room.{room}.{sender_sid}`), but
+    /// the NATS room wildcard delivers it to EVERY session in the room. Before
+    /// #1220 each NON-target receiver forwarded it to its transport, where the
+    /// client discarded it. This counter records each such non-target CONGESTION
+    /// dropped at the relay BEFORE the transport hop (subject/`session_id`
+    /// scoping — see the filter in `chat_server.rs::handle_msg`). It is an
+    /// EXPECTED, fan-out-correctness drop — like
+    /// [`RELAY_VIEWPORT_FILTERED_TOTAL`] / [`RELAY_LAYER_FILTERED_TOTAL`] it is
+    /// deliberately kept OFF `relay_packet_drops_total` (which is backpressure
+    /// loss). In a healthy N-person room you expect ~(N-1) increments here per 1
+    /// CONGESTION actually delivered.
+    ///
+    /// CARDINALITY: `room` only (user-provided, unbounded over time), same
+    /// caveats as the other room-labeled counters above.
+    pub static ref RELAY_CONGESTION_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_congestion_filtered_total",
+        "Total CONGESTION packets dropped at the relay for non-target receivers (self-addressed control packet not destined for this session) (#1220)",
+        &["room"]
+    )
+    .expect("Failed to create relay_congestion_filtered_total metric");
+
     /// Simulcast media packets that ENTERED the per-receiver layer filter and
     /// were forwarded — the denominator complement of `relay_layer_filtered_total`
     /// (#989), measured over EXACTLY the same population as the filtered counter.
@@ -1686,6 +1713,9 @@ mod tests {
             .inc();
         RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[room]).inc();
         RELAY_LAYER_FORWARDED_TOTAL.with_label_values(&[room]).inc();
+        RELAY_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .inc();
         RELAY_ROOM_BYTES_TOTAL
             .with_label_values(&[room, "outbound"])
             .inc();
@@ -1751,6 +1781,12 @@ mod tests {
         );
         assert_eq!(
             RELAY_LAYER_FORWARDED_TOTAL.with_label_values(&[room]).get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
             0.0
         );
         assert_eq!(

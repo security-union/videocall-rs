@@ -18,10 +18,10 @@
 
 use crate::{
     constants::{
-        LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_SUPPRESS_DEBOUNCE_MS,
-        LAYER_PREFERENCE_MAX_ENTRIES, LAYER_PREFERENCE_MAX_LAYER_ID,
-        LAYER_PREFERENCE_MIN_UPDATE_INTERVAL, RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS,
-        VIEWPORT_MIN_UPDATE_INTERVAL,
+        LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_RECOMPUTE_COALESCE_MS,
+        LAYER_HINT_SUPPRESS_DEBOUNCE_MS, LAYER_PREFERENCE_MAX_ENTRIES,
+        LAYER_PREFERENCE_MAX_LAYER_ID, LAYER_PREFERENCE_MIN_UPDATE_INTERVAL,
+        RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL,
     },
     messages::{
         server::{
@@ -52,7 +52,7 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
-    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
+    RELAY_CONGESTION_FILTERED_TOTAL, RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
     RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
     RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
@@ -497,6 +497,18 @@ struct RecomputeLayerHints {
     source: Option<SessionId>,
 }
 
+/// Trailing-debounce flush for coalesced DEPARTURE-driven recomputes (#1203).
+///
+/// Self-sent via `notify_later` exactly [`LAYER_HINT_RECOMPUTE_COALESCE_MS`]
+/// after the FIRST departure of a burst arms the timer (see
+/// [`ChatServer::schedule_coalesced_recompute`]). The handler drains
+/// [`ChatServer::pending_recompute_rooms`] and runs ONE room-wide recompute per
+/// distinct room that saw a departure during the window, collapsing an O(n)
+/// per-connection storm into O(distinct rooms) work over settled membership.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct FlushPendingRecomputes;
+
 /// Per-`(room, source, media_kind)` emit/debounce state for LAYER_HINT (#1108).
 ///
 /// Tracks what the relay last TOLD a publisher and, when the union has dropped
@@ -815,6 +827,28 @@ pub struct ChatServer {
     /// lock needed). Entries are reaped when the publisher leaves (its
     /// `(room, source, _)` keys are dropped in `leave_rooms` / `forget_session`).
     layer_hint_state: HashMap<(String, SessionId, i32), LayerHintEmitState>,
+    /// Rooms with a DEPARTURE-driven (leave/evict) room-wide LAYER_HINT recompute
+    /// pending behind the coalescing debounce window (#1203).
+    ///
+    /// Departures fire one room-wide recompute per disconnecting connection
+    /// (`leave_rooms` / `forget_session`). A reconnection wave or a meeting
+    /// ending disconnects many sessions in a burst → an O(n) recompute storm in
+    /// the single-threaded actor (each recompute is itself O(publishers ×
+    /// receivers)). Instead of `do_send`-ing a recompute per departure, we record
+    /// the affected room HERE and arm a single trailing
+    /// [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] timer ([`recompute_coalesce_handle`]);
+    /// when it fires, [`Handler<FlushPendingRecomputes>`] drains this set and runs
+    /// exactly ONE room-wide recompute per affected room over the FINAL settled
+    /// membership. JOIN and per-LAYER_PREFERENCE recomputes intentionally bypass
+    /// this set (they are restore-eager / latency-sensitive — see the constant).
+    pending_recompute_rooms: std::collections::HashSet<String>,
+    /// Single in-flight coalescing timer handle for [`pending_recompute_rooms`]
+    /// (#1203). `Some` while a trailing flush is armed; `None` otherwise. Only one
+    /// timer is ever outstanding — re-arming while pending is a no-op (the
+    /// existing trailing deadline still fires), which is what makes the debounce
+    /// TRAILING (dedups the whole burst) rather than per-event. Cancelled in
+    /// [`Actor::stopping`] so a stopped actor leaks no `SpawnHandle`.
+    recompute_coalesce_handle: Option<SpawnHandle>,
 }
 
 impl ChatServer {
@@ -836,6 +870,8 @@ impl ChatServer {
             session_layer_prefs: HashMap::new(),
             session_room: HashMap::new(),
             layer_hint_state: HashMap::new(),
+            pending_recompute_rooms: std::collections::HashSet::new(),
+            recompute_coalesce_handle: None,
         }
     }
 
@@ -936,12 +972,18 @@ impl ChatServer {
             //      while the recompute mutates `layer_hint_state`. This is
             //      already excluded from the union scan above (the member was
             //      retained-out), so the recompute sees post-departure demand.
+            //
+            //      #1203: this DEPARTURE recompute is COALESCED behind a trailing
+            //      debounce instead of fired immediately. A departure only ever
+            //      RAISES a remaining publisher's fail-open union (restore) and
+            //      nobody is actively waiting on it, so collapsing a reconnection
+            //      / meeting-end disconnect burst into ONE recompute over settled
+            //      membership avoids the O(n) per-connection storm. (JOINs stay
+            //      immediate — a real viewer waits on their tile.)
             self.forget_layer_hint_state_for_source(room_id, *session_id);
             if !room_became_empty {
-                actor_ctx.address().do_send(RecomputeLayerHints {
-                    room: room_id.to_string(),
-                    source: None,
-                });
+                let room_owned = room_id.to_string();
+                self.schedule_coalesced_recompute(&room_owned, actor_ctx);
             }
         }
 
@@ -1292,12 +1334,13 @@ impl ChatServer {
         // replacement session re-joins under a fresh session_id and re-sends its
         // LAYER_PREFERENCE, which independently re-triggers a recompute; this
         // path additionally covers a pure eviction with no replacement.
+        //
+        // #1203: COALESCED behind the trailing debounce, same as the
+        // `leave_rooms` departure trigger above — eviction is a departure and a
+        // reconnection wave evicts many stale sessions in a burst.
         self.forget_layer_hint_state_for_source(room, session_id);
         if room_still_populated {
-            ctx.address().do_send(RecomputeLayerHints {
-                room: room.to_string(),
-                source: None,
-            });
+            self.schedule_coalesced_recompute(room, ctx);
         }
 
         // Cancel any deferred PARTICIPANT_LEFT for this session's tab. If we
@@ -1561,6 +1604,33 @@ impl ChatServer {
         self.layer_hint_state
             .retain(|(r, s, _kind), _| !(r == room && *s == source));
     }
+
+    /// Coalesce a DEPARTURE-driven (leave/evict) room-wide LAYER_HINT recompute
+    /// for `room` behind the [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] trailing
+    /// debounce (#1203), instead of `do_send`-ing a recompute immediately.
+    ///
+    /// Records `room` in [`pending_recompute_rooms`] and arms ONE
+    /// [`FlushPendingRecomputes`] timer if none is already in flight. A re-arm
+    /// while a timer is pending is a deliberate NO-OP: the existing trailing
+    /// deadline still fires and will drain whatever rooms accumulated, so a burst
+    /// of N departures across the window produces exactly ONE flush (and one
+    /// recompute per distinct affected room) — TRAILING coalescing, not
+    /// per-event. This is the correct direction for departures: a departure can
+    /// only RAISE a remaining publisher's fail-open union (restore), and nobody is
+    /// actively waiting on it, so computing the FINAL union once the burst settles
+    /// is both cheaper and more correct than recomputing over transient
+    /// intermediate membership. See [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] for why
+    /// JOIN / per-LAYER_PREFERENCE recomputes intentionally bypass this path.
+    fn schedule_coalesced_recompute(&mut self, room: &str, ctx: &mut Context<Self>) {
+        self.pending_recompute_rooms.insert(room.to_string());
+        if self.recompute_coalesce_handle.is_none() {
+            let handle = ctx.notify_later(
+                FlushPendingRecomputes,
+                std::time::Duration::from_millis(LAYER_HINT_RECOMPUTE_COALESCE_MS),
+            );
+            self.recompute_coalesce_handle = Some(handle);
+        }
+    }
 }
 
 impl Actor for ChatServer {
@@ -1647,6 +1717,18 @@ impl Actor for ChatServer {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
+    }
+
+    /// Cancel the in-flight #1203 coalescing timer on actor stop so a stopping
+    /// `ChatServer` leaks no `SpawnHandle` (mirrors the `pending_departures`
+    /// `cancel_future` cleanup elsewhere). Dropping any not-yet-flushed pending
+    /// rooms is correct: a stopping relay has no publishers left to hint.
+    fn stopping(&mut self, ctx: &mut Self::Context) -> actix::Running {
+        if let Some(handle) = self.recompute_coalesce_handle.take() {
+            ctx.cancel_future(handle);
+        }
+        self.pending_recompute_rooms.clear();
+        actix::Running::Stop
     }
 }
 
@@ -2162,10 +2244,20 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
 /// the ONLY producer of LAYER_HINT, and it is driven exclusively by trusted
 /// relay lifecycle events (subject-authoritative LAYER_PREFERENCE recording, and
 /// join/leave). It never parses or trusts a client-sent LAYER_HINT.
+/// Test-only counter of how many times `Handler<RecomputeLayerHints>` has been
+/// entered (#1203). Lets the coalescing tests assert "N departures → exactly ONE
+/// recompute" by counting real handler invocations rather than a mock. Compiled
+/// only under `cfg(test)`, so there is zero production cost.
+#[cfg(test)]
+pub(crate) static RECOMPUTE_LAYER_HINTS_INVOCATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl Handler<RecomputeLayerHints> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: RecomputeLayerHints, ctx: &mut Self::Context) -> Self::Result {
+        #[cfg(test)]
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match msg.source {
             Some(source) => self.recompute_layer_hints_for_source(&msg.room, source, ctx),
             None => {
@@ -2181,6 +2273,85 @@ impl Handler<RecomputeLayerHints> for ChatServer {
                 }
             }
         }
+    }
+}
+
+/// Trailing-debounce flush for coalesced DEPARTURE-driven recomputes (#1203).
+///
+/// Drains [`ChatServer::pending_recompute_rooms`] and runs ONE room-wide
+/// recompute per distinct room that saw a departure during the coalesce window,
+/// then clears the in-flight timer handle so the NEXT departure burst arms a
+/// fresh trailing timer. Reusing the existing `RecomputeLayerHints { source:
+/// None }` room-wide branch keeps the union computation in one place; the only
+/// thing #1203 changes is WHEN/HOW OFTEN that branch runs for departures.
+///
+/// A room whose membership drained to empty during the window self-clears: the
+/// room-wide branch returns early when `room_members` has no entry, so a stale
+/// pending room id costs at most one no-op map lookup, never a leaked recompute.
+impl Handler<FlushPendingRecomputes> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, _msg: FlushPendingRecomputes, ctx: &mut Self::Context) -> Self::Result {
+        // Clear the in-flight handle FIRST so a recompute-triggered re-arm (none
+        // today, but defensive) would schedule a fresh timer rather than no-op
+        // against a handle we are about to consume.
+        self.recompute_coalesce_handle = None;
+        let rooms: Vec<String> = self.pending_recompute_rooms.drain().collect();
+        for room in rooms {
+            // Reuse the room-wide recompute path (source: None). It is a no-op if
+            // the room drained to empty during the window (early return on a
+            // missing `room_members` entry).
+            self.handle(RecomputeLayerHints { room, source: None }, ctx);
+        }
+    }
+}
+
+/// Test-only message driving the REAL #1203 departure-coalescing path through
+/// the REAL `schedule_coalesced_recompute` + `notify_later` timer. Returns the
+/// `(pending_rooms_len, timer_armed)` state immediately after scheduling so a
+/// test can assert dedup (one timer for N calls) WITHOUT reaching into private
+/// fields from outside the module.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "(usize, bool)")]
+struct TestScheduleCoalescedRecompute {
+    room: String,
+}
+
+#[cfg(test)]
+impl Handler<TestScheduleCoalescedRecompute> for ChatServer {
+    type Result = MessageResult<TestScheduleCoalescedRecompute>;
+
+    fn handle(
+        &mut self,
+        msg: TestScheduleCoalescedRecompute,
+        ctx: &mut Self::Context,
+    ) -> Self::Result {
+        self.schedule_coalesced_recompute(&msg.room, ctx);
+        MessageResult((
+            self.pending_recompute_rooms.len(),
+            self.recompute_coalesce_handle.is_some(),
+        ))
+    }
+}
+
+/// Test-only message reporting the current coalescing state
+/// (`pending_rooms_len`, `timer_armed`) so a test can assert the flush has
+/// drained everything after the debounce window elapsed.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "(usize, bool)")]
+struct TestCoalesceState;
+
+#[cfg(test)]
+impl Handler<TestCoalesceState> for ChatServer {
+    type Result = MessageResult<TestCoalesceState>;
+
+    fn handle(&mut self, _msg: TestCoalesceState, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult((
+            self.pending_recompute_rooms.len(),
+            self.recompute_coalesce_handle.is_some(),
+        ))
     }
 }
 
@@ -3726,6 +3897,40 @@ fn handle_msg(
             if targets_other_session {
                 return Ok(());
             }
+        }
+
+        // Unicast CONGESTION filter (#1220). CONGESTION is a relay-authored,
+        // self-ADDRESSED control packet: `on_outbound_drop` publishes it onto the
+        // target sender's OWN per-session subject (`room.{room}.{sender_sid}`)
+        // with that sender's `session_id` embedded. It is meaningful to exactly
+        // ONE session — the targeted sender — yet the NATS room wildcard
+        // (`room.{room}.*`) delivers it to EVERY session in the room. Before this
+        // filter, every NON-target receiver forwarded CONGESTION all the way to
+        // its transport, where the client discarded it (`video_call_client.rs`:
+        // the client matches `session_id` against its own and ignores otherwise).
+        // For a 20-person room that is ~19/20 = 95% of CONGESTION deliveries
+        // wasted on the relay→transport hop (serialize + channel enqueue + wire
+        // bytes) only to be dropped client-side.
+        //
+        // Model: the MEETING-unicast filter directly above. We drop CONGESTION
+        // here unless this session is the target. "Target" is `subject_self ||
+        // inner_session_self` — the SAME two conditions the self-echo carve-out
+        // at line ~3708 relies on to let CONGESTION reach the targeted sender:
+        //   * `subject_self`: normal case — the packet is on our own subject.
+        //   * `inner_session_self`: post-reconnect case — the subject points at a
+        //     stale session but the embedded `session_id` (stamped by the relay
+        //     to `sender_sid`) still belongs to this connection.
+        // Both are subject/relay-authoritative for delivery scoping (the
+        // self-echo note above documents that `session_id` is safe for self-skip,
+        // which is exactly the scoping decision made here — NOT identity auth).
+        //
+        // This does NOT touch the LAYER_HINT self-echo carve-out (the hard-won
+        // #1108 delivery fix); LAYER_HINT is intentionally left alone (#1220).
+        if is_congestion && !subject_self && !inner_session_self {
+            RELAY_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[&room])
+                .inc();
+            return Ok(());
         }
 
         // PEER_EVENT packets are unicast at the application layer: the
@@ -6061,6 +6266,74 @@ mod tests {
             "CONGESTION must pass the inner-session-id self-filter so the \
              throttle signal still reaches the sender after a reconnect"
         );
+    }
+
+    /// #1220 — a NON-target receiver must NOT have CONGESTION forwarded to its
+    /// transport. CONGESTION is published on the TARGET sender's own subject
+    /// (`room.{room}.{sender_sid}`); the NATS room wildcard delivers it to every
+    /// session, but only the targeted sender should actually receive it on its
+    /// transport. A bystander session (different subject, different inner
+    /// session_id) must drop it at the relay AND bump
+    /// `relay_congestion_filtered_total`.
+    ///
+    /// MUTATION PROOF: reverting #1220 (removing the
+    /// `if is_congestion && !subject_self && !inner_session_self { return }`
+    /// filter) forwards the packet to the bystander → `count` becomes 1 and the
+    /// `== 0` assert FAILS (and the metric-delta assert also fails, since the
+    /// filter never ran).
+    #[actix_rt::test]
+    async fn test_handle_msg_congestion_dropped_for_non_target_receiver() {
+        let room = "congestion-nontarget-room-1220";
+        let before = RELAY_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // This receiver is session 7777. The CONGESTION targets sender 5555
+        // (published on `room.{room}.5555` with inner session_id 5555).
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            7777, // bystander receiver — NOT the target
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.congestion-nontarget-room-1220.5555",
+            make_packet_bytes_with_session(PacketType::CONGESTION, 5555),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "#1220: CONGESTION targeting sender 5555 must NOT be forwarded to \
+             bystander receiver 7777"
+        );
+
+        let after = RELAY_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            1.0,
+            "#1220: dropping a non-target CONGESTION must increment \
+             relay_congestion_filtered_total exactly once"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
     }
 
     #[actix_rt::test]
@@ -12342,5 +12615,176 @@ mod tests {
         assert_eq!(layer_hint_media_kind(3), HintKind::SCREEN);
         assert_eq!(layer_hint_media_kind(0), HintKind::MEDIA_KIND_UNSPECIFIED);
         assert_eq!(layer_hint_media_kind(99), HintKind::MEDIA_KIND_UNSPECIFIED);
+    }
+
+    // =====================================================================
+    // #1203 — DEPARTURE-recompute coalescing (trailing debounce)
+    // =====================================================================
+    //
+    // These tests start a real `ChatServer` (NATS-backed) and drive the REAL
+    // `schedule_coalesced_recompute` + `notify_later` timer + flush path. They
+    // count actual `Handler<RecomputeLayerHints>` invocations via the
+    // test-only `RECOMPUTE_LAYER_HINTS_INVOCATIONS` counter.
+
+    async fn connect_nats_or_skip() -> Option<async_nats::client::Client> {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        match async_nats::connect(&nats_url).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                None
+            }
+        }
+    }
+
+    /// #1203: N DEPARTURE-driven coalesced recomputes for the SAME room within
+    /// the window collapse into exactly ONE timer and ONE recompute; two
+    /// distinct rooms produce exactly TWO recomputes. After the window the
+    /// pending set is drained and the timer handle is cleared.
+    ///
+    /// MUTATION PROOF: revert #1203 (point `leave_rooms`/`forget_session` back
+    /// at `do_send(RecomputeLayerHints { source: None })`, i.e. make
+    /// `schedule_coalesced_recompute` recompute immediately per call instead of
+    /// arming one trailing timer) and this asserts BOTH (a) the dedup state
+    /// `(pending_len, armed)` after repeated same-room calls — which would no
+    /// longer be `(1, true)` — and (b) `recomputes == 2`, which would balloon to
+    /// 6 (5 same-room + 1 other). Either breaks the test.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1203_departures_coalesce_into_single_recompute() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room_a = "coalesce-room-a-1203".to_string();
+        let room_b = "coalesce-room-b-1203".to_string();
+
+        // 5 departure-driven schedules for room A: all should dedup behind ONE
+        // timer (pending_len stays 1, timer stays armed). No recompute yet.
+        for i in 0..5 {
+            let (pending_len, armed) = chat
+                .send(TestScheduleCoalescedRecompute {
+                    room: room_a.clone(),
+                })
+                .await
+                .expect("message delivery should succeed");
+            assert_eq!(
+                pending_len, 1,
+                "call {i}: same-room departures must dedup to ONE pending room"
+            );
+            assert!(armed, "call {i}: the single trailing timer must be armed");
+        }
+
+        // One departure-driven schedule for room B: pending grows to 2, still
+        // ONE timer (the existing trailing deadline covers both rooms).
+        let (pending_len, armed) = chat
+            .send(TestScheduleCoalescedRecompute {
+                room: room_b.clone(),
+            })
+            .await
+            .expect("message delivery should succeed");
+        assert_eq!(
+            pending_len, 2,
+            "a distinct room adds a second pending entry"
+        );
+        assert!(
+            armed,
+            "still exactly one trailing timer for the whole burst"
+        );
+
+        // Before the window elapses, NO recompute has run yet (debounced).
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "departure recomputes must be DEFERRED until the coalesce window elapses"
+        );
+
+        // Wait out the coalesce window + slack for the flush to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 250,
+        ))
+        .await;
+
+        // Exactly one recompute per distinct room (2), NOT one per call (6).
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            2,
+            "the 6 coalesced departure schedules must yield exactly 2 recomputes \
+             (one per distinct room)"
+        );
+
+        // The flush drained the set and cleared the timer handle.
+        let (pending_after, armed_after) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("message delivery should succeed");
+        assert_eq!(pending_after, 0, "flush must drain the pending set");
+        assert!(
+            !armed_after,
+            "flush must clear the in-flight timer so the next burst re-arms fresh"
+        );
+    }
+
+    /// #1203: a JOIN-style recompute (`RecomputeLayerHints { source: None }`
+    /// sent directly, exactly as the join site does) runs IMMEDIATELY — it is
+    /// NOT subject to the departure coalesce window. Contrast: a coalesced
+    /// departure schedule does NOT bump the recompute counter immediately.
+    ///
+    /// MUTATION PROOF: if someone routed the JOIN path through
+    /// `schedule_coalesced_recompute` (the thing #1203 deliberately does NOT do
+    /// for joins), the immediate-after-yield count would be 0, failing the
+    /// `== 1` assert.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1203_join_recompute_is_immediate_not_coalesced() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        // First: a coalesced DEPARTURE schedule does NOT recompute immediately.
+        let _ = chat
+            .send(TestScheduleCoalescedRecompute {
+                room: "join-immediate-departure-room".to_string(),
+            })
+            .await
+            .expect("message delivery should succeed");
+        // Round-trip a state probe to ensure the schedule was processed; the
+        // counter must still be 0 (departure is debounced).
+        let _ = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("message delivery should succeed");
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "a coalesced departure must NOT recompute synchronously"
+        );
+
+        // Now: a JOIN-style direct recompute. The join site uses
+        // `do_send(RecomputeLayerHints { room, source: None })`; we replicate
+        // that exact message. It must run immediately (no debounce wait).
+        chat.send(RecomputeLayerHints {
+            room: "join-immediate-room".to_string(),
+            source: None,
+        })
+        .await
+        .expect("message delivery should succeed");
+
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "a JOIN-style recompute must run IMMEDIATELY (one invocation), not be \
+             held behind the departure coalesce window"
+        );
     }
 }

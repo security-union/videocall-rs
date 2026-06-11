@@ -552,6 +552,64 @@ pub const LAYER_HINT_SUPPRESS_DEBOUNCE_MS: u64 = 2000;
 /// PERF REVIEW.
 pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
 
+/// Trailing-debounce window (in milliseconds) for COALESCING room-wide
+/// LAYER_HINT recomputes triggered by DEPARTURES (leave / evict) (#1203).
+///
+/// ## The O(n) storm this absorbs
+///
+/// A room-wide recompute (`RecomputeLayerHints { source: None }`) fans out over
+/// every publisher in the room, and each per-source union scan is itself
+/// O(receivers) (see [`LAYER_HINT_MAX_RECEIVERS_SCANNED`]). So a single
+/// room-wide recompute is O(publishers × receivers). The relay fires one such
+/// recompute per DEPARTURE (the `leave_rooms` and `forget_session`/evict paths).
+/// A reconnection wave or a meeting ending disconnects many sessions in a tight
+/// burst, firing the handler once PER departing connection — an O(n) storm that
+/// runs inside the single-threaded `ChatServer` actor and stalls every room it
+/// serves (the exact O(n)-per-connection fan-out hazard the Change Impact Policy
+/// warns about).
+///
+/// ## Why DEPARTURES are safe to debounce but JOINS are not
+///
+/// The emit policy is ASYMMETRIC (mirroring the suppress-lazy / restore-eager
+/// split in [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`]):
+///
+/// * **Departures (leave/evict) → DEBOUNCE.** A leaving receiver can only RAISE
+///   a remaining publisher's fail-open union (its constraint disappears), and a
+///   leaving publisher's own per-source state is reaped synchronously regardless.
+///   A raise is "restore-eager" demand, but NOBODY is actively waiting on a
+///   departure-driven recompute: the union only governs whether the relay tells a
+///   publisher it MAY drop an upper layer (suppress). Coalescing a burst of
+///   departures into ONE trailing recompute computes the correct FINAL union once
+///   the burst settles, instead of N times over transient intermediate
+///   membership. Delaying it by this window cannot black-tile anyone (a publisher
+///   over-encoding for a few hundred ms is the fail-open-safe direction).
+///
+/// * **Joins → IMMEDIATE (never debounced).** A NEW receiver has no recorded
+///   preference, so under fail-open it wants the FULL ladder from every existing
+///   publisher — its recompute can RESTORE a layer a publisher had suppressed. A
+///   real human is waiting on that tile; delaying it leaves the joiner stuck on a
+///   low/black layer for the window. The join recompute (`chat_server.rs` join
+///   path) stays a direct `do_send`.
+///
+/// * **Per-LAYER_PREFERENCE recompute → IMMEDIATE (never debounced).** That path
+///   is the latency-sensitive UPGRADE case and is already rate-limited upstream by
+///   [`LAYER_PREFERENCE_MIN_UPDATE_INTERVAL`]; debouncing it would slow real
+///   viewport-driven layer switches.
+///
+/// ## Why 300 ms
+///
+/// 300 ms is an order of magnitude below the ~5 s receiver chooser / AQ
+/// adaptation loop, so it CANNOT delay simulcast convergence — it only dedups a
+/// sub-second departure burst into a single recompute. It is long enough to
+/// swallow a reconnection wave's disconnect cluster (which arrives within tens to
+/// low-hundreds of ms) yet short enough that a genuine sustained drop in demand
+/// still reclaims publisher CPU/uplink well within a second. It sits comfortably
+/// under [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`] (2000 ms): the coalesce window only
+/// decides WHEN the union is recomputed; the suppress-lazy debounce then still
+/// governs whether a LOWER hint is actually emitted, so the two debounces
+/// compose without double-counting.
+pub const LAYER_HINT_RECOMPUTE_COALESCE_MS: u64 = 300;
+
 #[cfg(test)]
 mod tests {
     use super::*;

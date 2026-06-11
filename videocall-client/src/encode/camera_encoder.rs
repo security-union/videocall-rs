@@ -928,13 +928,15 @@ impl CameraEncoder {
         // encode loop already holds a strong clone for `send_media_packet`, so
         // this is the established lifetime pattern). `peer_count()` is a
         // non-blocking `try_borrow` read that counts off the cached key Rc WITHOUT
-        // cloning it (#1156) — if the inner is momentarily busy it returns `0`, so
-        // `other_peers == 0` is below the release threshold and the gate stores
-        // `false` (pin released) for that tick rather than blocking the loop; the
-        // next tick (≤1s later) re-reads the real count and self-corrects. In
-        // practice the borrow never fails here: all `inner` borrows are short and
-        // non-blocking and none is held across an `.await`, so on single-threaded
-        // wasm no borrow is active mid-tick.
+        // cloning it (#1156) — if the inner is momentarily busy it returns `None`
+        // (NOT `0`). A `None` reading is treated as "no fresh count this tick", so
+        // the gate HOLDS its prior pin value rather than releasing it (#1172): a
+        // spurious `0` would otherwise fall below the release threshold and flip a
+        // pinned publisher off for one tick, emitting a needless keyframe. The next
+        // tick (≤1s later) re-reads the real count. In practice the borrow never
+        // fails here: all `inner` borrows are short and non-blocking and none is
+        // held across an `.await`, so on single-threaded wasm no borrow is active
+        // mid-tick — the `None` arm is a correctness fail-safe, not a hot path.
         let peer_count_client = self.client.clone();
         let single_layer_low_pin = self.single_layer_low_pin.clone();
         wasm_bindgen_futures::spawn_local(async move {

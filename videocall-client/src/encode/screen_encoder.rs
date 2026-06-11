@@ -300,6 +300,19 @@ pub struct ScreenEncoder {
     /// When set to `true`, the next encoded frame will be forced as a keyframe.
     /// Used by the PLI (Picture Loss Indication) mechanism.
     force_keyframe: Arc<AtomicBool>,
+    /// When set to `true`, the screen AQ control loop calls
+    /// `force_congestion_cut()` on its next tick. Set by the `VideoCallClient`
+    /// when a server CONGESTION signal targeting us arrives (issue #1199).
+    ///
+    /// This MIRRORS the camera's `congestion_step_down` flag (see
+    /// `CameraEncoder::set_congestion_step_down_flag`), but is a SEPARATE atom
+    /// per encoder — exactly like the split `force_camera_keyframe` /
+    /// `force_screen_keyframe` flags. A single shared flag would be a bug: each
+    /// AQ loop consumes its flag with `swap(false)`, so two loops sharing one
+    /// flag would race and only one would ever observe a given CONGESTION
+    /// signal. With one flag per encoder the client sets BOTH, and the camera
+    /// and screen loops each clear their own — every live publisher steps down.
+    congestion_step_down: Arc<AtomicBool>,
     /// Holds the *original* video track returned by getDisplayMedia so that `stop()` can call
     /// `.stop()` on it directly.  The browser's native screen-share indicator bar (the
     /// "You are sharing" bar with "Stop sharing" / "Hide") is only dismissed when the
@@ -442,6 +455,10 @@ impl ScreenEncoder {
             tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
             force_keyframe: Arc::new(AtomicBool::new(false)),
+            // Server-CONGESTION step-down flag (issue #1199). Owned per-encoder
+            // and shared to the client via `set_congestion_step_down_flag`, like
+            // the camera's. Starts cleared.
+            congestion_step_down: Arc::new(AtomicBool::new(false)),
             active_video_track: Rc::new(RefCell::new(None)),
             screen_sharing_active,
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
@@ -677,6 +694,9 @@ impl ScreenEncoder {
         let shared_screen_tier_idx = self.shared_screen_tier_index.clone();
         let shared_tier_transitions = self.shared_tier_transitions.clone();
         let reelection_completed_signal = self.reelection_completed_signal.clone();
+        // Server-CONGESTION step-down flag (issue #1199): the screen AQ loop
+        // consumes this with `swap(false)` each tick, mirroring the camera.
+        let congestion_flag = self.congestion_step_down.clone();
         let shared_target_bitrate = self.shared_screen_encoder_target_bitrate_kbps.clone();
         let shared_adaptive_tier = self.shared_screen_adaptive_tier.clone();
         let shared_cause_hint = self.shared_screen_cause_hint.clone();
@@ -719,13 +739,50 @@ impl ScreenEncoder {
             // Enable simulcast on the screen controller when >1 layer. The
             // controller is `is_screen`, so its per-layer PIDs use the SCREEN
             // ladder. n_layers == 1 leaves it single-stream (byte-identical).
+            //
+            // EARN-UP COLD START (issue #1200): use
+            // `set_simulcast_ceiling_start_at_base`, NOT `set_simulcast_layers`.
+            // The latter seeds `active_layer_count == n` (all rungs hot from
+            // frame one — ~4.2 Mbps / 3 encodes immediately), which is what the
+            // screen path used to do. Mirroring the camera (#1140/#1141), we now
+            // configure the device CEILING to `n_layers` but START the active
+            // count at the BASE rung (1); the headroom-probe ramp in
+            // `EncoderBitrateController::tick` earns the upper rungs up to the
+            // ceiling only when backpressure + uplink budget allow. The
+            // receiver-side LayerChooser already handles an upper layer that
+            // appears late, so a late-earned 1080p rung is delivered correctly.
             if n_layers > 1 {
-                encoder_control.set_simulcast_layers(n_layers);
+                encoder_control.set_simulcast_ceiling_start_at_base(n_layers);
                 let mut atomics = shared_layer_bitrates_bps.borrow_mut();
                 if atomics.len() != n_layers {
                     *atomics = (0..n_layers).map(|_| Rc::new(AtomicU32::new(0))).collect();
                 }
             }
+            // Client-side uplink-backpressure self-trigger windows (issue #1199,
+            // mirroring the camera AQ loop). The WS send-buffer drop counter and
+            // the WT unistream drop counter are TRANSPORT-GLOBAL statics
+            // (`websocket::websocket_drop_count()` /
+            // `webtransport::unistream_drop_count()`), shared by the camera,
+            // screen, and microphone egress on the SAME connection.
+            //
+            // DROP-COUNTER ATTRIBUTION DECISION (issue #1199, requirement 3):
+            // each controller keeps its OWN baseline snapshot + sliding window
+            // against the shared global counters. We deliberately do NOT attempt
+            // to attribute drops to a specific media-kind (the transport does not
+            // tag drops by stream, and a single browser TCP send buffer / QUIC
+            // connection is the shared bottleneck). So a drop burst is observed
+            // independently by BOTH the camera and the screen loop, and BOTH may
+            // shed a layer. That is the CORRECT behavior: the uplink is shared,
+            // so when it is distressed every live egress should back off. The
+            // baselines are SEPARATE (not shared) only so the two loops' sliding
+            // windows roll on their own cadence and neither clears the other's
+            // accounting — they are NOT a partition of the drops.
+            let mut last_ws_drop_snapshot: u64 =
+                videocall_transport::websocket::websocket_drop_count();
+            let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
+            let mut last_wt_drop_snapshot: u64 =
+                videocall_transport::webtransport::unistream_drop_count();
+            let mut wt_drop_window_start_ms: f64 = js_sys::Date::now();
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
             // instead of waiting on receiver diagnostics. Runs for the lifetime
             // of the owning ScreenEncoder. This `spawn_local` future is NOT bound
@@ -759,6 +816,101 @@ impl ScreenEncoder {
                             b.best,
                             b.worst,
                         );
+                    }
+                }
+
+                // ── Network-congestion signal consumers (issue #1199) ─────────
+                // Mirror the camera AQ loop's three signal consumers so the
+                // SCREEN publisher responds to network distress instead of being
+                // blind to it. The screen share is frequently the heaviest egress
+                // in the call, so reacting here is at least as important as on the
+                // camera. These blocks run BEFORE the gradual backpressure/tick
+                // below so a forced cut takes effect on this same tick.
+
+                // 1) Server-authored CONGESTION → aggressive congestion cut.
+                // The relay is actively dropping our packets; cut hard (multi-tier
+                // + shed the top active layer). `swap(false)` consumes our OWN
+                // per-encoder flag, so this never races the camera's flag.
+                if congestion_flag.swap(false, Ordering::AcqRel) {
+                    log::warn!(
+                        "ScreenEncoder: server CONGESTION signal received, forcing aggressive congestion cut"
+                    );
+                    encoder_control.force_congestion_cut();
+                }
+
+                // 2) Client-side WebSocket send-buffer backpressure → step down.
+                // When the browser's TCP send buffer is full, outbound packets are
+                // dropped locally (websocket.rs send_binary) and the global
+                // `websocket_drop_count()` increments. A sustained cluster within
+                // the window self-triggers an AQ step-down without waiting for the
+                // server. For WebTransport users this counter stays flat at 0, so
+                // the block is a true no-op. (See the attribution note above: this
+                // window is the screen loop's OWN baseline against the shared
+                // global counter — the camera loop has its own.)
+                {
+                    let current_ws_drops = videocall_transport::websocket::websocket_drop_count();
+                    let elapsed_ms = now - ws_drop_window_start_ms;
+                    if elapsed_ms >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_WINDOW_MS
+                    {
+                        let delta = current_ws_drops.saturating_sub(last_ws_drop_snapshot);
+                        if delta
+                            >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_DROP_THRESHOLD
+                        {
+                            log::warn!(
+                                "ScreenEncoder: client WS backpressure detected ({} drops in {:.0}ms), \
+                                 forcing video step-down",
+                                delta,
+                                elapsed_ms,
+                            );
+                            encoder_control.force_video_step_down();
+                        }
+                        last_ws_drop_snapshot = current_ws_drops;
+                        ws_drop_window_start_ms = now;
+                    }
+                }
+
+                // 3) Client-side WebTransport unistream backpressure → step down
+                // (issue #1178 self-trigger). On WebTransport, media frames ride
+                // persistent unidirectional QUIC streams; a failed media-frame
+                // write increments `unistream_drop_count()` — the WT analogue of
+                // the WS send-buffer drop. A sustained cluster self-sheds a layer
+                // without waiting for the slower server CONGESTION signal. The
+                // window/snapshot are independent of the WS window and the
+                // congestion flag, and each axis sheds at most one layer per
+                // ITS OWN window. (Note: distinct axes are NOT cross-gated within
+                // a single tick — a co-occurring server CONGESTION and a WS/WT
+                // drop-burst can each shed a layer in the same tick, because a
+                // floor-case `force_congestion_cut` does not stamp the shared
+                // min-interval guard. Collapsing toward base under correlated
+                // severe distress is acceptable; this matches the camera loop.)
+                // For WebSocket users this counter stays flat at 0 (no-op).
+                {
+                    use crate::adaptive_quality_constants::{
+                        evaluate_self_congestion, WT_SELF_CONGESTION_DROP_THRESHOLD,
+                        WT_SELF_CONGESTION_WINDOW_MS,
+                    };
+                    let current_wt_drops =
+                        videocall_transport::webtransport::unistream_drop_count();
+                    let elapsed_ms = now - wt_drop_window_start_ms;
+                    let decision = evaluate_self_congestion(
+                        current_wt_drops,
+                        last_wt_drop_snapshot,
+                        elapsed_ms,
+                        WT_SELF_CONGESTION_WINDOW_MS,
+                        WT_SELF_CONGESTION_DROP_THRESHOLD,
+                    );
+                    if decision.step_down {
+                        log::warn!(
+                            "ScreenEncoder: client WT uplink backpressure detected ({} unistream \
+                             media-frame drops in {:.0}ms), forcing video step-down",
+                            current_wt_drops.saturating_sub(last_wt_drop_snapshot),
+                            elapsed_ms,
+                        );
+                        encoder_control.force_video_step_down();
+                    }
+                    if decision.roll_window {
+                        last_wt_drop_snapshot = decision.new_snapshot;
+                        wt_drop_window_start_ms = now;
                     }
                 }
 
@@ -942,6 +1094,19 @@ impl ScreenEncoder {
     /// which sets it when a remote peer sends a KEYFRAME_REQUEST.
     pub fn set_force_keyframe_flag(&mut self, flag: Arc<AtomicBool>) {
         self.force_keyframe = flag;
+    }
+
+    /// Replace the internal congestion step-down flag with an externally-owned
+    /// one (issue #1199).
+    ///
+    /// Call this after construction to share the flag with `VideoCallClient`,
+    /// which sets it when a server CONGESTION signal targeting us is received.
+    /// This is the SCREEN analogue of
+    /// [`CameraEncoder::set_congestion_step_down_flag`](crate::CameraEncoder::set_congestion_step_down_flag):
+    /// the client hands each encoder its OWN flag so both step down on the same
+    /// signal without racing over a shared `swap`.
+    pub fn set_congestion_step_down_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.congestion_step_down = flag;
     }
 
     /// Allows setting a callback to receive encoder settings updates
@@ -1841,109 +2006,143 @@ impl ScreenEncoder {
             // and reconfigures each layer's bitrate from the AQ control loop.
             // Layers >= active_layer_count are skipped (shed) — no encode CPU,
             // no egress.
+            //
+            // LAZY CONSTRUCTION (issue #1204): now that the screen ladder earns
+            // up from the base rung (#1200), an upper rung's VideoEncoder is built
+            // only on its FIRST ACTIVATION rather than all of layers 1..n at
+            // setup. `build_extra_layer` constructs ONE higher rung; at setup we
+            // build only the rungs already active (`1..initial_active`), and the
+            // encode loop builds the rest when the AQ ramp/restore raises the
+            // active count. OUTPUT is unchanged — the encode loop already encodes
+            // only `layer_id < active`. Teardown-after-shed is intentionally NOT
+            // implemented (issue #1204 marks it optional, gated on a
+            // rebuild-latency measurement) — a shed rung is retained for reuse.
+            let build_extra_layer = |layer_idx: usize,
+                                     initial_seq: u64|
+             -> Result<LayerEncoder, ()> {
+                let layer_id = layer_idx as u32;
+                let screen_tiers = simulcast_screen_layers(n_layers);
+                let tier = &screen_tiers[layer_idx];
+                // Treat the tier as a BOUNDING BOX, not a fixed output size
+                // (issue #1196): fit the actual capture dims inside the
+                // layer's rung, aspect-preserving. This is a construction
+                // SEED — the first GOP is aspect-correct — and the per-frame
+                // encode loop re-fits each rung against this same tier box
+                // (`tier_w`/`tier_h` recorded below) when the share's source
+                // aspect changes mid-share, exactly like the base screen
+                // layer's per-frame reconfigure and the camera's per-layer
+                // path. `width` / `height` are the real capture dims read
+                // from `getSettings()` above, so a non-16:9 display (16:10,
+                // ultrawide, portrait) is never per-axis-squashed into the
+                // 16:9 tier dims on rungs 1..n.
+                let (layer_w, layer_h) =
+                    fit_within_preserving_aspect(width, height, tier.max_width, tier.max_height);
+                let init_bitrate_bps = tier.ideal_bitrate_kbps as f64 * 1000.0;
+
+                // Per-layer output handler: own seq cell + #903 metadata
+                // (shared, stream-level) + layer_id stamp.
+                let (output_box, seq_out) = {
+                    let client = client.clone();
+                    let userid = userid.clone();
+                    let aes = aes.clone();
+                    let mut buffer: Vec<u8> = Vec::with_capacity(150_000);
+                    let mut local_seq = initial_seq;
+                    let seq_out = Rc::new(std::cell::Cell::new(initial_seq));
+                    let seq_out_inner = seq_out.clone();
+                    let source_w = source_width_atomic.clone();
+                    let source_h = source_height_atomic.clone();
+                    let target_bitrate = shared_target_bitrate.clone();
+                    let adaptive_tier = shared_adaptive_tier.clone();
+                    let cause_hint = shared_cause_hint.clone();
+                    (
+                        Box::new(move |chunk: JsValue| {
+                            let chunk = web_sys::EncodedVideoChunk::from(chunk);
+                            // NOTE: higher layers do NOT update current_fps
+                            // (only the base layer does), so the AQ setpoint
+                            // is not inflated N×.
+                            let byte_length = chunk.byte_length() as usize;
+                            if buffer.len() < byte_length {
+                                buffer.resize(byte_length, 0);
+                            }
+                            let packet: PacketWrapper = transform_screen_chunk(
+                                chunk,
+                                local_seq,
+                                buffer.as_mut_slice(),
+                                &userid,
+                                aes.clone(),
+                                source_w.load(Ordering::Relaxed),
+                                source_h.load(Ordering::Relaxed),
+                                target_bitrate.load(Ordering::Relaxed),
+                                adaptive_tier.borrow().clone(),
+                                cause_hint.borrow().clone(),
+                                layer_id,
+                            );
+                            client.send_media_packet(packet, MediaStreamKey::Screen);
+                            local_seq += 1;
+                            seq_out_inner.set(local_seq);
+                        }) as Box<dyn FnMut(JsValue)>,
+                        seq_out,
+                    )
+                };
+                let error_closure = Closure::wrap(Box::new(move |e: JsValue| {
+                    error!("Screen encoder error (layer {layer_id}): {e:?}");
+                }) as Box<dyn FnMut(JsValue)>);
+                let output_closure = Closure::wrap(output_box);
+                let init = VideoEncoderInit::new(
+                    error_closure.as_ref().unchecked_ref(),
+                    output_closure.as_ref().unchecked_ref(),
+                );
+                let encoder = match VideoEncoder::new(&init) {
+                    Ok(enc) => Box::new(enc),
+                    Err(e) => {
+                        error!("Failed to create screen encoder (layer {layer_id}): {e:?}");
+                        return Err(());
+                    }
+                };
+                let config = VideoEncoderConfig::new(get_video_codec_string(), layer_h, layer_w);
+                config.set_bitrate(init_bitrate_bps);
+                config.set_latency_mode(LatencyMode::Realtime);
+                set_vbr_mode(&config);
+                if let Err(e) = encoder.configure(&config) {
+                    SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
+                    error!("Error configuring screen encoder (layer {layer_id}): {e:?}");
+                    if is_fatal_encoder_error(&e) {
+                        let _ = encoder.close();
+                        return Err(());
+                    }
+                }
+                Ok(LayerEncoder {
+                    encoder,
+                    config,
+                    seq_out,
+                    layer_id,
+                    current_w: layer_w,
+                    current_h: layer_h,
+                    tier_w: tier.max_width,
+                    tier_h: tier.max_height,
+                    local_bitrate: init_bitrate_bps as u32,
+                    _output_closure: output_closure,
+                    _error_closure: error_closure,
+                })
+            };
+
             let mut extra_layers: Vec<LayerEncoder> = Vec::new();
             if simulcast {
-                let screen_tiers = simulcast_screen_layers(n_layers);
-                // layer_idx 1..n (layer 0 is the base `screen_encoder`).
-                for (layer_idx, &initial_seq) in sequence_numbers.iter().enumerate().skip(1) {
-                    let layer_id = layer_idx as u32;
-                    let tier = &screen_tiers[layer_idx];
-                    // Treat the tier as a BOUNDING BOX, not a fixed output size
-                    // (issue #1196): fit the actual capture dims inside the
-                    // layer's rung, aspect-preserving. This is a construction
-                    // SEED — the first GOP is aspect-correct — and the per-frame
-                    // encode loop re-fits each rung against this same tier box
-                    // (`tier_w`/`tier_h` recorded below) when the share's source
-                    // aspect changes mid-share, exactly like the base screen
-                    // layer's per-frame reconfigure and the camera's per-layer
-                    // path. `width` / `height` are the real capture dims read
-                    // from `getSettings()` above, so a non-16:9 display (16:10,
-                    // ultrawide, portrait) is never per-axis-squashed into the
-                    // 16:9 tier dims on rungs 1..n.
-                    let (layer_w, layer_h) = fit_within_preserving_aspect(
-                        width,
-                        height,
-                        tier.max_width,
-                        tier.max_height,
-                    );
-                    let init_bitrate_bps = tier.ideal_bitrate_kbps as f64 * 1000.0;
-
-                    // Per-layer output handler: own seq cell + #903 metadata
-                    // (shared, stream-level) + layer_id stamp.
-                    let (output_box, seq_out) = {
-                        let client = client.clone();
-                        let userid = userid.clone();
-                        let aes = aes.clone();
-                        let mut buffer: Vec<u8> = Vec::with_capacity(150_000);
-                        let mut local_seq = initial_seq;
-                        let seq_out = Rc::new(std::cell::Cell::new(initial_seq));
-                        let seq_out_inner = seq_out.clone();
-                        let source_w = source_width_atomic.clone();
-                        let source_h = source_height_atomic.clone();
-                        let target_bitrate = shared_target_bitrate.clone();
-                        let adaptive_tier = shared_adaptive_tier.clone();
-                        let cause_hint = shared_cause_hint.clone();
-                        (
-                            Box::new(move |chunk: JsValue| {
-                                let chunk = web_sys::EncodedVideoChunk::from(chunk);
-                                // NOTE: higher layers do NOT update current_fps
-                                // (only the base layer does), so the AQ setpoint
-                                // is not inflated N×.
-                                let byte_length = chunk.byte_length() as usize;
-                                if buffer.len() < byte_length {
-                                    buffer.resize(byte_length, 0);
-                                }
-                                let packet: PacketWrapper = transform_screen_chunk(
-                                    chunk,
-                                    local_seq,
-                                    buffer.as_mut_slice(),
-                                    &userid,
-                                    aes.clone(),
-                                    source_w.load(Ordering::Relaxed),
-                                    source_h.load(Ordering::Relaxed),
-                                    target_bitrate.load(Ordering::Relaxed),
-                                    adaptive_tier.borrow().clone(),
-                                    cause_hint.borrow().clone(),
-                                    layer_id,
-                                );
-                                client.send_media_packet(packet, MediaStreamKey::Screen);
-                                local_seq += 1;
-                                seq_out_inner.set(local_seq);
-                            }) as Box<dyn FnMut(JsValue)>,
-                            seq_out,
-                        )
-                    };
-                    let error_closure = Closure::wrap(Box::new(move |e: JsValue| {
-                        error!("Screen encoder error (layer {layer_id}): {e:?}");
-                    })
-                        as Box<dyn FnMut(JsValue)>);
-                    let output_closure = Closure::wrap(output_box);
-                    let init = VideoEncoderInit::new(
-                        error_closure.as_ref().unchecked_ref(),
-                        output_closure.as_ref().unchecked_ref(),
-                    );
-                    let encoder = match VideoEncoder::new(&init) {
-                        Ok(enc) => Box::new(enc),
-                        Err(e) => {
-                            error!("Failed to create screen encoder (layer {layer_id}): {e:?}");
-                            for built in &extra_layers {
-                                let _ = built.encoder.close();
-                            }
-                            let _ = screen_encoder.close();
-                            restart_count += 1;
-                            continue 'restart;
-                        }
-                    };
-                    let config =
-                        VideoEncoderConfig::new(get_video_codec_string(), layer_h, layer_w);
-                    config.set_bitrate(init_bitrate_bps);
-                    config.set_latency_mode(LatencyMode::Realtime);
-                    set_vbr_mode(&config);
-                    if let Err(e) = encoder.configure(&config) {
-                        SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
-                        error!("Error configuring screen encoder (layer {layer_id}): {e:?}");
-                        if is_fatal_encoder_error(&e) {
-                            let _ = encoder.close();
+                // Build only the higher rungs that are ACTIVE right now (cold
+                // start: none, since the screen ladder earns up from the base).
+                // `shared_active_layer_count` is the active count INCLUDING the
+                // base layer 0, so the active HIGHER rungs are indices
+                // `1..initial_active`. Upper rungs are built lazily on first
+                // activation in the encode loop below.
+                let initial_active =
+                    (shared_active_layer_count.load(Ordering::Relaxed) as usize).clamp(1, n_layers);
+                // Skip the base (rung 0); enumerate the active higher rungs.
+                for (offset, &initial_seq) in sequence_numbers[1..initial_active].iter().enumerate()
+                {
+                    let layer_idx = 1 + offset;
+                    match build_extra_layer(layer_idx, initial_seq) {
+                        Ok(le) => extra_layers.push(le),
+                        Err(()) => {
                             for built in &extra_layers {
                                 let _ = built.encoder.close();
                             }
@@ -1952,19 +2151,6 @@ impl ScreenEncoder {
                             continue 'restart;
                         }
                     }
-                    extra_layers.push(LayerEncoder {
-                        encoder,
-                        config,
-                        seq_out,
-                        layer_id,
-                        current_w: layer_w,
-                        current_h: layer_h,
-                        tier_w: tier.max_width,
-                        tier_h: tier.max_height,
-                        local_bitrate: init_bitrate_bps as u32,
-                        _output_closure: output_closure,
-                        _error_closure: error_closure,
-                    });
                 }
             }
 
@@ -2030,6 +2216,20 @@ impl ScreenEncoder {
             let mut local_keyframe_interval = tier_keyframe_interval.load(Ordering::Relaxed);
             let mut local_tier_max_width = tier_max_width.load(Ordering::Relaxed);
             let mut local_tier_max_height = tier_max_height.load(Ordering::Relaxed);
+
+            // Log-on-change guard for the "Updating screen bitrate" line
+            // (issue #1221-pt1). The bitrate reconfigure below is gated on
+            // `new_bitrate != local_bitrate`, but `local_bitrate` is also
+            // mutated each tick by the simulcast base-layer per-layer bitrate
+            // pass (it tracks the LAST APPLIED bitrate, not the last LOGGED
+            // one), so the single-stream `info!` could re-fire on essentially
+            // every frame as the two sources interleave — 16,878 lines in one
+            // 46-minute meeting. We log ONLY when the applied bitrate differs
+            // from the value we last LOGGED (seeded to the initial config
+            // bitrate so the first genuine change logs, but a steady-state
+            // bitrate never does). This is logging-only: the reconfigure
+            // decision and `local_bitrate` bookkeeping are untouched.
+            let mut last_logged_bitrate = local_bitrate;
 
             // Track whether the inner loop exited due to a fatal encode error
             // vs. a stream-read error or shutdown signal.
@@ -2133,7 +2333,12 @@ impl ScreenEncoder {
                 // Update the bitrate if it has changed from diagnostics system
                 let new_bitrate = current_bitrate.load(Ordering::Relaxed) * 1000;
                 if new_bitrate != local_bitrate && !tier_dims_changed {
-                    info!("Updating screen bitrate to {new_bitrate}");
+                    // Log-on-change only (issue #1221-pt1): suppress the line
+                    // unless this differs from the bitrate we last logged.
+                    if new_bitrate != last_logged_bitrate {
+                        info!("Updating screen bitrate to {new_bitrate}");
+                        last_logged_bitrate = new_bitrate;
+                    }
                     local_bitrate = new_bitrate;
                     // Guard: check encoder state before bitrate reconfigure
                     if screen_encoder.state() == CodecState::Closed {
@@ -2173,6 +2378,56 @@ impl ScreenEncoder {
                 } else {
                     1
                 };
+
+                // Lazy per-rung construction (issue #1204). If the AQ ramp /
+                // restore raised the active count past the higher rungs we have
+                // built so far, construct the newly-activated rung(s) NOW, before
+                // the bitrate-reconfigure + encode passes below index
+                // `extra_layers`. `extra_layers` holds rungs 1..(len+1), so the
+                // next index to build is `extra_layers.len() + 1`; the target
+                // higher-rung count is `local_active_layers - 1` (minus the base).
+                // The clamp keeps indices in-bounds; no-op when N=1 (not
+                // simulcast) or when nothing new became active. Each rung is
+                // seeded from its PERSISTED sequence so a receiver picking up the
+                // freshly-earned rung sees a dense stream.
+                if simulcast {
+                    let want_extra = local_active_layers.min(n_layers).saturating_sub(1);
+                    if extra_layers.len() < want_extra {
+                        let mut build_failed = false;
+                        // Higher-rung layer_idx == extra-index + 1 (skip base 0).
+                        // Enumerate the not-yet-built rung slice to satisfy
+                        // needless_range_loop while keeping the absolute index.
+                        let next_rung = extra_layers.len() + 1;
+                        for (offset, &initial_seq) in sequence_numbers[next_rung..(want_extra + 1)]
+                            .iter()
+                            .enumerate()
+                        {
+                            let layer_idx = next_rung + offset;
+                            match build_extra_layer(layer_idx, initial_seq) {
+                                Ok(le) => {
+                                    info!(
+                                        "ScreenEncoder: lazily constructed simulcast rung {} on first activation (#1204)",
+                                        layer_idx
+                                    );
+                                    extra_layers.push(le);
+                                }
+                                Err(()) => {
+                                    error!(
+                                        "ScreenEncoder: failed to lazily construct simulcast rung {}, restarting",
+                                        layer_idx
+                                    );
+                                    build_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if build_failed {
+                            restart_count += 1;
+                            break 'encode;
+                        }
+                    }
+                }
+
                 if simulcast {
                     let atomics = shared_layer_bitrates_bps.borrow();
                     // Base layer (0): apply its per-layer target to screen_encoder.
@@ -2710,6 +2965,48 @@ mod tests {
         assert_eq!(cause_hint_from_trigger("coordination"), "manual-cap");
         assert_eq!(cause_hint_from_trigger("nonsense_unknown_trigger"), "");
         assert_eq!(cause_hint_from_trigger(""), "");
+    }
+
+    /// Issue #1199: the screen encoder must read an EXTERNALLY-owned congestion
+    /// step-down flag (the client hands it the screen-specific atom). This pins
+    /// that `set_congestion_step_down_flag` rewires the screen encoder's internal
+    /// flag to the shared atom — the same indirection as the re-election signal —
+    /// so a server CONGESTION signal set by the client reaches the screen AQ
+    /// loop. It also pins the SEPARATE-flag design: the screen flag is a distinct
+    /// atom from the camera's, so the two AQ loops' `swap(false)` consumers never
+    /// race over one shared flag.
+    #[test]
+    fn screen_encoder_reads_externally_owned_congestion_flag() {
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+            1, // max_layers (single layer)
+        );
+
+        // Two distinct flags stand in for the client's camera vs screen atoms.
+        // The congestion flag is an `Arc` (shared with the client, like the
+        // keyframe flags), distinct from the `Rc` re-election signal.
+        let camera_flag = std::sync::Arc::new(AtomicBool::new(false));
+        let screen_flag = std::sync::Arc::new(AtomicBool::new(false));
+        encoder.set_congestion_step_down_flag(screen_flag.clone());
+
+        // The client sets the SCREEN flag (the CONGESTION dispatch sets both).
+        screen_flag.store(true, Ordering::Release);
+        assert!(
+            encoder.congestion_step_down.swap(false, Ordering::AcqRel),
+            "screen encoder must observe the externally-owned SCREEN congestion flag"
+        );
+        // The camera's flag is independent: setting it must NOT appear on the
+        // screen encoder's flag (separate atoms — no swap race).
+        camera_flag.store(true, Ordering::Release);
+        assert!(
+            !encoder.congestion_step_down.load(Ordering::Acquire),
+            "the screen congestion flag must be SEPARATE from the camera's"
+        );
     }
 
     #[test]

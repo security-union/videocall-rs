@@ -112,6 +112,15 @@ impl BotNetSimShim {
         self.inner.direction()
     }
 
+    /// Cumulative microseconds of delay imposed *only* by the bandwidth/
+    /// token-bucket shaper (NOT latency, jitter, or reorder) — see
+    /// [`videocall_netsim::NetSimShim::bandwidth_wait_us`]. The bot's AQ tick
+    /// samples this on an interval; a positive delta means the uplink was
+    /// bandwidth-saturated during that interval (issue #1083 V21).
+    pub fn bandwidth_wait_us(&self) -> u64 {
+        self.inner.bandwidth_wait_us()
+    }
+
     /// Decide how a packet of `size_bytes` should be handled under the
     /// current profile and bucket state. Thread-safe.
     ///

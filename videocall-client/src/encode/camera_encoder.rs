@@ -555,6 +555,29 @@ const fn initial_active_layer_count() -> u32 {
     1
 }
 
+/// How many per-layer `VideoEncoder`s to have CONSTRUCTED given the current
+/// active-layer count and the ladder ceiling (issue #1204, lazy construction).
+///
+/// This is the single source of truth shared by the cold-start build loop
+/// (`0..n`) and the in-loop lazy-build trigger (`built_len < n` ⇒ build the
+/// missing `built_len..n`). Returns `active.clamp(1, ceiling)`: at cold start
+/// `active == 1` so only the BASE encoder is built (NOT the ceiling), and an
+/// upper rung's encoder is built only once the AQ ramp/restore raises `active`
+/// past it. Floored at 1 (the base layer is always present) and capped at the
+/// ceiling (never build more encoders than the ladder has rungs).
+///
+/// Free `const fn` so the lazy-vs-eager boundary is host-testable without a live
+/// `CameraEncoder` / `VideoEncoder` (which need `getUserMedia` + WebCodecs).
+const fn encoders_to_build(active: usize, ceiling: usize) -> usize {
+    if active < 1 {
+        1
+    } else if active > ceiling {
+        ceiling
+    } else {
+        active
+    }
+}
+
 /// Decide whether a just-encoded frame counts as "healthy" for the purpose of
 /// resetting the encoder restart counter.
 ///
@@ -799,10 +822,12 @@ impl CameraEncoder {
             // device ceiling: the publisher's ENCODE/EGRESS OUTPUT is byte-identical
             // to the legacy single-stream path at startup, and the AQ control loop
             // *earns* more layers up to `max_layers` at runtime from observed
-            // backpressure headroom + uplink budget. (All `ceiling` VideoEncoders
-            // are still constructed at setup; lazy per-layer construction is a
-            // tracked follow-up — so this is byte-identical OUTPUT, not byte-
-            // identical memory.)
+            // backpressure headroom + uplink budget. Per-layer VideoEncoders are
+            // now constructed LAZILY on first activation (issue #1204): cold start
+            // allocates only the base-layer encoder, and the encode loop builds an
+            // upper rung's encoder the first time the ramp/restore raises the
+            // active count past it — so this is byte-identical OUTPUT *and* no
+            // longer pre-allocates encoders for un-earned rungs.
             shared_active_layer_count: Rc::new(AtomicU32::new(initial_active_layer_count())),
             // EFFECTIVE ladder depth = the configured device CEILING (#1143
             // observability), distinct from the active count above. Stays at
@@ -1919,7 +1944,7 @@ impl CameraEncoder {
                 let source_width = width as u32;
                 let source_height = height as u32;
 
-                // --- Setup video encoders (one per simulcast layer) ---
+                // --- Setup video encoders (LAZY per-layer construction, #1204) ─
                 // The output and error handler closures must be re-created on
                 // each restart because Closure::wrap consumes them and the new
                 // VideoEncoder needs fresh JS function references. Each layer
@@ -1927,14 +1952,41 @@ impl CameraEncoder {
                 // its own error closure, and its own config object. The closures
                 // are stored in the LayerEncoder so they outlive the encoder.
                 //
-                // PR A: n_layers == 1, so this loop runs once and produces a
-                // single layer at the native resolution with layer_id 0 —
+                // LAZY CONSTRUCTION (issue #1204): we build layer N's VideoEncoder
+                // only on its FIRST ACTIVATION — at cold start that is just the
+                // base layer (`shared_active_layer_count` == 1 via the camera's
+                // earn-up ramp), so the upper-rung VideoEncoders are NOT allocated
+                // until the AQ ramp/restore raises the active count past them.
+                // Previously all `n_layers` encoders were built up front even
+                // though cold start activates only the base, wasting WebCodecs /
+                // VPX allocations for rungs that may never be earned. The
+                // OUTPUT/EGRESS is unchanged: the encode loop already only encodes
+                // layers with `layer_id < active`, so for any given active-count
+                // sequence the same frames are emitted whether the un-earned
+                // encoders existed or not. Teardown-after-shed is intentionally
+                // NOT implemented (issue #1204 marks it optional and gated on a
+                // rebuild-latency measurement) — a shed encoder is retained so a
+                // later restore reuses it with no rebuild stall.
+                //
+                // PR A: n_layers == 1, so only the base layer is ever built —
                 // byte-identical to the legacy single-encoder path.
-                let mut layers: Vec<LayerEncoder> = Vec::with_capacity(n_layers);
-                // `sequence_numbers` has exactly `n_layers` elements (vec![0;
-                // n_layers]), so enumerating it yields one (idx, persisted-seq)
-                // pair per layer.
-                for (layer_idx, &initial_seq) in sequence_numbers.iter().enumerate() {
+                //
+                // `build_layer` constructs ONE `LayerEncoder` for `layer_idx`
+                // (seeded from its persisted sequence). It is a closure so both
+                // the initial cold-start build and the lazy in-loop build share
+                // one construction site. On `VideoEncoder::new` / fatal-configure
+                // failure it returns `Err(LayerBuildError)` (the caller does the
+                // already-built-layer cleanup + restart bookkeeping, which a
+                // closure cannot do via `continue 'restart`).
+                enum LayerBuildError {
+                    /// `VideoEncoder::new` failed — surface to `on_error`.
+                    CreateFailed(String),
+                    /// A FATAL `configure()` error before the encode loop.
+                    ConfigureFatal,
+                }
+                let build_layer = |layer_idx: usize,
+                                   initial_seq: u64|
+                 -> Result<LayerEncoder, LayerBuildError> {
                     let layer_id = layer_idx as u32;
 
                     let (video_output_box, seq_out) = {
@@ -2023,16 +2075,7 @@ impl CameraEncoder {
                             let msg =
                                 format!("Failed to create video encoder (layer {layer_id}): {e:?}");
                             error!("{msg}");
-                            // Close any already-built layer encoders before retry.
-                            for built in &layers {
-                                let _ = built.encoder.close();
-                            }
-                            stop_media_stream_tracks(&device);
-                            if let Some(cb) = &on_error {
-                                cb.emit(msg);
-                            }
-                            restart_count += 1;
-                            continue 'restart;
+                            return Err(LayerBuildError::CreateFailed(msg));
                         }
                     };
 
@@ -2092,17 +2135,12 @@ impl CameraEncoder {
                         if is_fatal_encoder_error(&e) {
                             error!("CameraEncoder: fatal configure error before encode loop (layer {layer_id}), restarting: {e:?}");
                             let _ = video_encoder.close();
-                            for built in &layers {
-                                let _ = built.encoder.close();
-                            }
-                            stop_media_stream_tracks(&device);
-                            restart_count += 1;
-                            continue 'restart;
+                            return Err(LayerBuildError::ConfigureFatal);
                         }
                         error!("Error configuring video encoder (layer {layer_id}): {e:?}");
                     }
 
-                    layers.push(LayerEncoder {
+                    Ok(LayerEncoder {
                         encoder: video_encoder,
                         config,
                         seq_out,
@@ -2114,7 +2152,45 @@ impl CameraEncoder {
                         local_bitrate: init_bitrate_bps as u32,
                         _output_closure: output_closure,
                         _error_closure: error_closure,
-                    });
+                    })
+                };
+
+                // Cold-start build: only the layers that are ACTIVE right now
+                // (base layer at cold start; more only if a prior cycle already
+                // earned them and the shared atomic still reflects that). Upper
+                // rungs are built lazily on first activation in the encode loop.
+                // `sequence_numbers` has exactly `n_layers` elements, so the
+                // index range is always in-bounds.
+                let initial_active_layers = encoders_to_build(
+                    shared_active_layer_count.load(Ordering::Relaxed) as usize,
+                    n_layers,
+                );
+                let mut layers: Vec<LayerEncoder> = Vec::with_capacity(n_layers);
+                for (layer_idx, &initial_seq) in
+                    sequence_numbers[..initial_active_layers].iter().enumerate()
+                {
+                    match build_layer(layer_idx, initial_seq) {
+                        Ok(le) => layers.push(le),
+                        Err(LayerBuildError::CreateFailed(msg)) => {
+                            for built in &layers {
+                                let _ = built.encoder.close();
+                            }
+                            stop_media_stream_tracks(&device);
+                            if let Some(cb) = &on_error {
+                                cb.emit(msg);
+                            }
+                            restart_count += 1;
+                            continue 'restart;
+                        }
+                        Err(LayerBuildError::ConfigureFatal) => {
+                            for built in &layers {
+                                let _ = built.encoder.close();
+                            }
+                            stop_media_stream_tracks(&device);
+                            restart_count += 1;
+                            continue 'restart;
+                        }
+                    }
                 }
 
                 let video_processor =
@@ -2208,6 +2284,52 @@ impl CameraEncoder {
                     // `local_bitrate` reflects the bitrate just applied this tick.
                     local_active_layers =
                         shared_active_layer_count.load(Ordering::Relaxed) as usize;
+
+                    // Lazy per-layer construction (issue #1204). If the AQ ramp /
+                    // restore raised the active count past the layers we have
+                    // built so far, construct the newly-activated rung(s) NOW,
+                    // before the reconfigure + encode passes below read
+                    // `layers[layer_id]`. The clamp keeps this in-bounds; in
+                    // single-stream mode `n_layers == 1` so the base is always
+                    // already present and this loop never runs. Each new layer is
+                    // seeded from its PERSISTED sequence number so a receiver that
+                    // picks up the freshly-earned rung sees a dense stream.
+                    if simulcast && layers.len() < encoders_to_build(local_active_layers, n_layers)
+                    {
+                        let want = encoders_to_build(local_active_layers, n_layers);
+                        let already_built = layers.len();
+                        let mut build_failed = false;
+                        for (offset, &initial_seq) in
+                            sequence_numbers[already_built..want].iter().enumerate()
+                        {
+                            let layer_idx = already_built + offset;
+                            match build_layer(layer_idx, initial_seq) {
+                                Ok(le) => {
+                                    log::info!(
+                                        "CameraEncoder: lazily constructed simulcast layer {} on first activation (#1204)",
+                                        layer_idx
+                                    );
+                                    layers.push(le);
+                                }
+                                Err(_) => {
+                                    // VideoEncoder::new or a fatal configure failed
+                                    // for the newly-activated rung. Restart the
+                                    // whole encode cycle (the normal 'encode
+                                    // cleanup persists already-built layers' seqs).
+                                    error!(
+                                        "CameraEncoder: failed to lazily construct simulcast layer {}, restarting",
+                                        layer_idx
+                                    );
+                                    build_failed = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if build_failed {
+                            restart_count += 1;
+                            break 'encode;
+                        }
+                    }
 
                     // Single-stream tier dims + shared bitrate (only meaningful
                     // when NOT simulcast — the adaptive single-stream resolution
@@ -2818,11 +2940,11 @@ impl CameraEncoder {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_simulcast_layers, clamp_layer_count, format_layer_transition, frame_is_healthy,
-        initial_active_layer_count, is_fatal_encoder_error_message, layer_ceiling_to_count,
-        next_single_layer_pin, shed_reason, should_pin_single_layer_low, LayerView,
-        SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
-        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
+        frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
+        layer_ceiling_to_count, next_single_layer_pin, shed_reason, should_pin_single_layer_low,
+        LayerView, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
 
@@ -3135,6 +3257,45 @@ mod tests {
         // frame healthy — byte-identical to the pre-fix `any_ok` behavior.
         let sole_layer_ok = true; // single-layer encode succeeded
         assert_eq!(frame_is_healthy(sole_layer_ok), sole_layer_ok);
+    }
+
+    #[test]
+    fn lazy_construction_builds_only_active_encoders_not_the_ceiling() {
+        // Issue #1204: the number of per-layer VideoEncoders CONSTRUCTED is the
+        // ACTIVE count (floored at 1, capped at the ceiling), NOT the ladder
+        // ceiling. This is the single source of truth used by BOTH the cold-start
+        // build loop and the in-loop lazy-build trigger, so testing it pins the
+        // lazy boundary without a live VideoEncoder.
+
+        // Cold start: active == 1 over a 3-rung ceiling builds ONLY the base
+        // encoder. The upper two rungs' encoders are NOT constructed — this is
+        // the core #1204 assertion (an un-earned layer has no encoder yet).
+        assert_eq!(
+            encoders_to_build(1, 3),
+            1,
+            "cold start must build only the base encoder, not the 3-rung ceiling"
+        );
+        // A mutation that built the ceiling at cold start (e.g. returning
+        // `ceiling`) would make this 3 and FAIL.
+        assert_ne!(
+            encoders_to_build(1, 3),
+            3,
+            "un-earned upper rungs must NOT be constructed at cold start"
+        );
+
+        // After the ramp earns the 2nd rung, exactly 2 encoders exist; the 3rd is
+        // still un-built until active rises to 3.
+        assert_eq!(encoders_to_build(2, 3), 2);
+        assert_eq!(encoders_to_build(3, 3), 3);
+
+        // Floor: a degenerate active 0 still builds the base (base is always
+        // present). Cap: active above the ceiling never builds more than the
+        // ladder has rungs.
+        assert_eq!(encoders_to_build(0, 3), 1, "base is always built");
+        assert_eq!(encoders_to_build(99, 3), 3, "never build past the ceiling");
+
+        // Single-stream ceiling (PR-A default): only ever the one base encoder.
+        assert_eq!(encoders_to_build(1, 1), 1);
     }
 
     #[test]

@@ -134,3 +134,7 @@ default = ["media-server-jwt-auth"]
 fake-peers = []
 oauth = []
 media-server-jwt-auth = []
+# Issue #1080: forward the network-condition simulator into videocall-client
+# so the e2e image build can enable per-client downlink impairment. Default
+# OFF — production builds are byte-for-byte unaffected.
+netsim = ["videocall-client/netsim"]

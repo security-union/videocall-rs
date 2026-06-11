@@ -40,6 +40,12 @@ mod netsim_hook;
 #[cfg(feature = "netsim")]
 mod netsim_url;
 
+// Issue #1080. Runtime JS control surface (`window.__vcNetsim`) so the
+// Playwright harness can install / clear netsim shaping mid-call. Same
+// compile-gate as the rest of the netsim plumbing.
+#[cfg(feature = "netsim")]
+mod netsim_control;
+
 pub use connection_controller::ConnectionController;
 pub use connection_lost_reason::ConnectionLostReason;
 #[allow(unused_imports)]
@@ -50,3 +56,10 @@ pub use connection_manager::{
     ConnectionManagerOptions, ConnectionState,
 };
 pub use webmedia::{ConnectOptions, MediaStreamKey};
+
+// Issue #1080: the runtime netsim control-surface installer, re-exported
+// so the UI crate (e.g. `dioxus-ui`) can register `window.__vcNetsim` at
+// app startup — before the first meeting join — so the e2e harness can
+// arm impairment pre-join and toggle it mid-call.
+#[cfg(feature = "netsim")]
+pub use netsim_control::install_window_hook as install_netsim_window_hook;

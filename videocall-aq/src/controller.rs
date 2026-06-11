@@ -1427,6 +1427,18 @@ mod tests {
         )
     }
 
+    /// Build a `TestClock`-backed SCREEN controller (issue #1199 / #1200). Uses
+    /// the screen ladder (`new_for_screen_with_clock`) so the per-layer state
+    /// mirrors the real `ScreenEncoder::set_encoder_control` path.
+    fn screen_controller_with_clock(clock: &Arc<TestClock>) -> EncoderBitrateController {
+        let target_fps = Arc::new(AtomicU32::new(10));
+        EncoderBitrateController::new_for_screen_with_clock(
+            target_fps,
+            SCREEN_QUALITY_TIERS,
+            Arc::clone(clock) as Arc<dyn crate::clock::Clock>,
+        )
+    }
+
     /// Advance the clock to `t_ms`, feed `depth`, and tick once.
     fn tick_at(
         controller: &mut EncoderBitrateController,
@@ -2429,6 +2441,137 @@ mod tests {
             controller.active_layer_count(),
             2,
             "force_video_step_down in simulcast mode must shed the top active layer"
+        );
+    }
+
+    // =====================================================================
+    // Screen-publisher network-congestion parity (issues #1199 / #1200).
+    //
+    // These pin the SCREEN controller's response to the three network signals
+    // the screen AQ loop now consumes (#1199) and the earn-up cold start
+    // (#1200). The screen AQ loop's signal CONSUMERS run in a wasm-only
+    // `spawn_local`, but each one ultimately calls exactly one of these two
+    // controller methods — so pinning them on the SCREEN controller variant is
+    // the host-testable proof that the wired signal produces a shed:
+    //   * server CONGESTION flag         -> force_congestion_cut()
+    //   * WS send-buffer drop burst       -> force_video_step_down()
+    //   * WT unistream drop burst (#1178) -> force_video_step_down()
+    // (The WS/WT drop-delta -> step_down DECISION is separately pinned by the
+    // `evaluate_self_congestion` tests in constants.rs.)
+    // =====================================================================
+
+    /// Helper: cold-start a screen controller at the base rung, then earn up to
+    /// 3 active layers via sustained-clear probe ticks, returning the controller
+    /// and the last timestamp used. Mirrors how the live screen ladder reaches a
+    /// multi-layer state before a congestion signal can shed one.
+    fn screen_controller_earned_to_three(
+        clock: &Arc<TestClock>,
+        base_ms: u64,
+    ) -> (EncoderBitrateController, f64) {
+        let mut controller = screen_controller_with_clock(clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        let mut t = warm_up(&mut controller, clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "precondition: screen ladder must earn up to 3 active layers before the shed test"
+        );
+        (controller, t)
+    }
+
+    /// #1200: a SCREEN controller configured via
+    /// `set_simulcast_ceiling_start_at_base` must COLD-START at exactly one
+    /// active layer (base rung), even though the ceiling permits 3 — the earn-up
+    /// ramp, NOT the all-active `set_simulcast_layers` the screen path used
+    /// before. Mirrors `test_camera_cold_start_is_one_active_layer`.
+    #[test]
+    fn test_screen_cold_start_is_one_active_layer() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = screen_controller_with_clock(&clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        assert!(
+            controller.is_simulcast(),
+            "ceiling > 1 must put the screen controller in simulcast mode so the ramp runs"
+        );
+        assert_eq!(
+            controller.simulcast_layer_count(),
+            3,
+            "the screen device ceiling must be configured to 3"
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "screen cold start must be a single active (base) rung, not the ceiling \
+             (regression guard: a revert to set_simulcast_layers would seed 3 here)"
+        );
+    }
+
+    /// #1199 signal 1 (server CONGESTION): a CONGESTION cut on the SCREEN
+    /// controller must shed the top active rung, exactly like the camera.
+    #[test]
+    fn test_screen_congestion_cut_sheds_top_layer() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, t) = screen_controller_earned_to_three(&clock, base_ms);
+
+        clock.set_ms((t + 1100.0) as u64);
+        controller.force_congestion_cut();
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "a server CONGESTION cut on the screen publisher must shed the top active rung (#1199)"
+        );
+    }
+
+    /// #1199 signals 2 & 3 (WS send-buffer drops / WT unistream drops): both
+    /// self-trigger `force_video_step_down` on the SCREEN controller, which must
+    /// shed the top active rung. One test covers both because the two drop
+    /// signals route through the identical controller call.
+    #[test]
+    fn test_screen_force_step_down_sheds_top_layer() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, t) = screen_controller_earned_to_three(&clock, base_ms);
+
+        clock.set_ms((t + 1100.0) as u64);
+        assert!(controller.force_video_step_down());
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "a WS/WT uplink-drop step-down on the screen publisher must shed the top active rung (#1199)"
+        );
+    }
+
+    /// #1199 requirement 4 (camera-off case): the screen controller's shed is
+    /// entirely self-contained — it depends on NO camera state. This standalone
+    /// screen controller (there is no camera in this test at all) still sheds on
+    /// a CONGESTION cut, proving the live egress (screen) reacts even when the
+    /// camera is off. The runtime wiring that delivers the signal to the screen
+    /// loop while the camera is off (the client sets a SEPARATE screen
+    /// congestion flag, and the screen AQ loop ticks independent of camera
+    /// `enabled`) is exercised end-to-end by the e2e suite; this pins the
+    /// controller-level invariant that the shed needs no camera.
+    #[test]
+    fn test_screen_sheds_with_no_camera_present() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, t) = screen_controller_earned_to_three(&clock, base_ms);
+        let active_before = controller.active_layer_count();
+
+        clock.set_ms((t + 1100.0) as u64);
+        controller.force_congestion_cut();
+        assert!(
+            controller.active_layer_count() < active_before,
+            "the screen publisher must shed on CONGESTION with no camera involved (camera-off path, #1199)"
         );
     }
 

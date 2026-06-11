@@ -56,60 +56,103 @@
  * netem on the client.
  *
  * ===========================================================================
- * WT (WebTransport / QUIC) PATH — BLOCKED for now (documented gap)
+ * WT (WebTransport / QUIC) PATH — now impairable via the CLIENT-SIDE netsim hook
  * ===========================================================================
  *
- * The same step-down would fire on the WT path too (relay-side overflow on the
- * per-receiver `unistream_tx` / `datagram_tx` channels, or genuine QUIC loss),
- * but we cannot impair ONE WT client from this Playwright harness:
+ * The toxiproxy mechanism above is RELAY-side overflow triggered by a TCP
+ * bandwidth limit, and it only works for WebSocket: toxiproxy is TCP-only and
+ * Playwright's `browser.newContext({ proxy })` only carries the browser's
+ * TCP/HTTP(S) traffic, so neither can shape the QUIC/UDP datagrams a WebTransport
+ * client uses. Per-client UDP `tc qdisc … netem` would need an isolated
+ * netns/veth, which the shared-netns Playwright harness does not provide.
  *
- *   - WebTransport is QUIC over UDP. toxiproxy is TCP-only and Playwright's
- *     `browser.newContext({ proxy })` only proxies the browser's TCP/HTTP(S)
- *     traffic — neither can carry or shape the QUIC/UDP datagrams.
- *   - Per-client UDP impairment would need `tc qdisc … netem` keyed to that
- *     client's 5-tuple in an isolated netns/veth. Playwright launches Chromium
- *     on the host in a SHARED netns, so a netem qdisc there would degrade EVERY
- *     context (sender + both receivers), not just the degraded one.
+ * Issue #1080's WT half solves this WITHOUT any proxy or network namespace by
+ * moving the impairment INTO the client. When the dioxus UI is built with the
+ * `netsim` cargo feature (the e2e docker image is), every page exposes at boot:
  *
- * Therefore the WT divergence case stays `test.fixme` with this concrete
- * blocker; the WS divergence case is the mergeable slice this helper enables.
- * (If/when the bots-app netsim orchestrator can drive a per-client veth, the WT
- * case can reuse the identical assertion against a UDP netem hook.)
+ *   window.__vcNetsim.install(profileName: string, direction: "up"|"down") -> boolean
+ *   window.__vcNetsim.clear() -> void
+ *
+ * `install("crushed_downlink", "down")` installs a per-TAB (thread-local, so
+ * per-Playwright-Page) inbound shim that DROPS a fraction of arriving media
+ * packets before the receive pipeline sees them. The `crushed_downlink` preset
+ * drops ~40% of inbound VIDEO/SCREEN packets — purpose-built so the receiver's
+ * `loss_per_sec` crosses the layer chooser's step-down threshold (>= 5 gaps/sec,
+ * `LOSS_STEP_DOWN_PER_SEC` in `videocall-client/src/decode/layer_chooser.rs`)
+ * within seconds:
+ *
+ *   dropped inbound media packet  =>  a real gap in that receiver's sequence
+ *   stream  =>  the receive-side `SequenceTracker` counts it once it shifts off
+ *   the reorder window  =>  `loss_per_sec` climbs above 5.0  =>  the chooser
+ *   steps THIS receiver DOWN.
+ *
+ * Crucial semantics (do NOT overstate them in test comments):
+ *   - It is LOSS-ONLY. The shim drops packets; it does NOT emulate bandwidth or
+ *     delay on the inbound path.
+ *   - It drops ONLY VIDEO/SCREEN media packets. AUDIO and ALL control/heartbeat/
+ *     RTT packets always pass, so the impairment cannot flap election or trigger
+ *     a reconnection — only the video layer chooser reacts.
+ *   - It is PER-TAB. The shim is installed on the degraded receiver's PAGE (the
+ *     tab that joined the meeting), NOT on the BrowserContext — so the helper
+ *     calls `page.evaluate`, and the sender + healthy receiver (separate tabs/
+ *     browsers) are untouched. => deterministic per-receiver divergence.
+ *   - It takes effect on the NEXT packet, so mid-call install/clear works: the
+ *     climb → impair → heal flow the WT divergence test needs.
+ *
+ * Because the loss is manufactured client-side, this hook works on BOTH
+ * transports and needs NO proxy, NO docker profile, and NO network namespace —
+ * it runs against a plain `make e2e-up` stack (provided the UI image carries the
+ * `netsim` feature). It is the ONLY per-client option for WebTransport/QUIC.
  *
  * ===========================================================================
- * USAGE (the exact hook the spec calls)
+ * WHICH MECHANISM TO USE
  * ===========================================================================
  *
- * Requires the `impair` compose profile (toxiproxy):
- *   make e2e-up-impair         # or COMPOSE_PROFILES=impair make e2e-up
+ *   - toxiproxy ({@link impairDownlink}) — relay-side outbound-channel overflow,
+ *     WebSocket ONLY (TCP). Exercises the relay's #1057 priority-drop shedding
+ *     path end-to-end. Requires the `impair` compose profile (toxiproxy):
+ *       make e2e-up-impair      # or COMPOSE_PROFILES=impair make e2e-up
+ *     Prefer it when the relay-side shedding behaviour is itself under test.
  *
- * In the spec, BEFORE the degraded context navigates:
+ *   - netsim ({@link impairDownlinkNetsim}) — client-side inbound packet loss,
+ *     works on BOTH WebSocket and WebTransport, no proxy/profile needed. The ONLY
+ *     per-client option for the WT/QUIC path. Prefer it when the goal is the
+ *     RECEIVER's chooser step-down (e.g. the WT per-receiver divergence test) and
+ *     a per-client UDP impairment is otherwise impossible.
+ *
+ * ===========================================================================
+ * USAGE
+ * ===========================================================================
+ *
+ * toxiproxy (WS), BEFORE the degraded context navigates:
  *
  *   import { routeDownlinkThroughProxy, impairDownlink, healDownlink }
  *     from "../helpers/downlink-impair";
  *
- *   // 1. Force the degraded receiver onto WebSocket (the impairable path) and
- *   //    route its WS connection through toxiproxy. Must run before goto().
- *   await routeDownlinkThroughProxy(degradedCtx);
- *
- *   // ... join all three peers, let layers climb ...
- *
- *   // 2. Clamp the degraded receiver's downlink hard enough to overflow the
- *   //    relay's 128-slot outbound channel (sheds video → loss → step down).
- *   await impairDownlink({ rateKb: 15 }); // ~120 kbps; default if omitted
- *
+ *   await routeDownlinkThroughProxy(degradedCtx);   // pins to WS + routes via proxy
+ *   // ... join all peers, let layers climb ...
+ *   await impairDownlink({ rateKb: 15 });           // ~120 kbps; default if omitted
  *   // ... assert degraded.layerIndex < healthy.layerIndex ...
- *
- *   // 3. (optional) remove the toxic to prove recovery / climb-back.
  *   await healDownlink();
+ *
+ * netsim (WS or WT), AFTER the degraded receiver's PAGE has joined:
+ *
+ *   import { impairDownlinkNetsim, healDownlinkNetsim }
+ *     from "../helpers/downlink-impair";
+ *
+ *   // ... join all peers, let layers climb ...
+ *   await impairDownlinkNetsim(degradedPage);       // crushed_downlink on the TAB
+ *   // ... assert degraded.layerIndex < healthy.layerIndex ...
+ *   await healDownlinkNetsim(degradedPage);
  *
  * `routeDownlinkThroughProxy` also pins the context to WebSocket (sets
  * `vc_transport_preference=websocket` in localStorage) because only the WS path
- * is impairable today; without that pin the client could elect WebTransport and
- * bypass the proxy entirely.
+ * is toxiproxy-impairable; without that pin the client could elect WebTransport
+ * and bypass the proxy entirely. The netsim hook needs NO such pin — it works on
+ * whichever transport the client elects.
  */
 
-import { BrowserContext } from "@playwright/test";
+import { BrowserContext, Page } from "@playwright/test";
 
 // ---------------------------------------------------------------------------
 // Topology constants (must match docker/docker-compose.e2e.yaml `toxiproxy`)
@@ -301,4 +344,97 @@ export async function healDownlink(): Promise<void> {
       `Failed to remove '${TOXIC_NAME}' toxic (HTTP ${res.status}): ${await res.text()}`,
     );
   }
+}
+
+// ---------------------------------------------------------------------------
+// netsim: client-side per-TAB inbound packet loss (WS + WT). See the header
+// "WT path" section for the full mechanism and semantics.
+// ---------------------------------------------------------------------------
+
+/**
+ * The default netsim downlink profile. `crushed_downlink` drops ~40% of inbound
+ * VIDEO/SCREEN packets (AUDIO + control/RTT always pass) so the receiver's
+ * `loss_per_sec` crosses the layer chooser's >= 5 gaps/sec step-down threshold
+ * within seconds. Defined Rust-side under the `netsim` cargo feature.
+ */
+export const DEFAULT_NETSIM_DOWNLINK_PROFILE = "crushed_downlink";
+
+/** Shape of the `window.__vcNetsim` hook the `netsim`-built UI exposes per tab. */
+interface VcNetsim {
+  install(profile: string, direction: "up" | "down"): boolean;
+  clear(): void;
+}
+
+declare global {
+  interface Window {
+    __vcNetsim?: VcNetsim;
+  }
+}
+
+/**
+ * Throw a clear, actionable error if `window.__vcNetsim` is absent on `page` —
+ * which means the dioxus UI image was built WITHOUT the `netsim` cargo feature.
+ * Call this before relying on the hook so a feature-less image fails loud with a
+ * rebuild instruction rather than a confusing `undefined.install` TypeError.
+ *
+ * MUST be called on the receiver's PAGE (the tab that joined), after navigation
+ * so the boot-time hook install has run.
+ */
+export async function assertNetsimAvailable(page: Page): Promise<void> {
+  const present = await page.evaluate(() => typeof window.__vcNetsim?.install === "function");
+  if (!present) {
+    throw new Error(
+      "window.__vcNetsim is not available on this page — the dioxus UI image was built " +
+        "WITHOUT the `netsim` cargo feature, so the client-side downlink-impairment hook " +
+        "does not exist. Rebuild the e2e UI image with the netsim feature wired in " +
+        "(`make e2e-build`) and re-run. (This hook is the per-client impairment the WT " +
+        "per-receiver divergence test depends on; see helpers/downlink-impair.ts header.)",
+    );
+  }
+}
+
+/**
+ * Install the client-side inbound packet-loss shim on a SINGLE receiver's PAGE
+ * (per-tab), so ONLY that receiver's downlink is degraded. Drops VIDEO/SCREEN
+ * media packets only; AUDIO and control/RTT always pass (see header). Takes
+ * effect on the next packet, so it is safe to call mid-call.
+ *
+ * @param page    The degraded receiver's Page (the tab that joined the meeting).
+ *                MUST be this page, NOT a BrowserContext — the shim is per-tab.
+ * @param profile The netsim profile to install; defaults to
+ *                {@link DEFAULT_NETSIM_DOWNLINK_PROFILE} (`crushed_downlink`).
+ */
+export async function impairDownlinkNetsim(
+  page: Page,
+  profile: string = DEFAULT_NETSIM_DOWNLINK_PROFILE,
+): Promise<void> {
+  await assertNetsimAvailable(page);
+  const installed = await page.evaluate((p) => window.__vcNetsim!.install(p, "down"), profile);
+  if (!installed) {
+    throw new Error(
+      `window.__vcNetsim.install("${profile}", "down") returned false — the UI rejected ` +
+        "the profile/direction (unknown netsim profile name?). Confirm the Rust `netsim` " +
+        `feature defines a "${profile}" downlink preset.`,
+    );
+  }
+}
+
+/**
+ * Clear the netsim impairment on a receiver's PAGE so its downlink recovers
+ * (used to assert climb-back, or in teardown). Clears BOTH directions, which is
+ * what we want for a receiver that only ever installed the downlink shim. No-op
+ * if the hook is absent (e.g. the page was closed or the image lacks `netsim`),
+ * so it is safe to call unconditionally in a `finally`.
+ */
+export async function healDownlinkNetsim(page: Page): Promise<void> {
+  // Tolerate a closed page / missing hook: this is teardown-safe by design.
+  await page
+    .evaluate(() => {
+      if (typeof window.__vcNetsim?.clear === "function") {
+        window.__vcNetsim.clear();
+      }
+    })
+    .catch(() => {
+      /* page closed or hook absent — nothing to heal */
+    });
 }

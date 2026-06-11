@@ -23,6 +23,7 @@ pub const PRESET_NAMES: &[&str] = &[
     "lossy_mobile",
     "satellite",
     "dialup",
+    "crushed_downlink",
 ];
 
 /// Expose the preset names in a stable order (for `--help`, error
@@ -83,6 +84,28 @@ pub fn resolve_profile(name: &str) -> Option<NetworkProfile> {
             downlink_kbps: Some(56),
             ..Default::default()
         }),
+        // Dedicated impairment for the issue #1080 e2e per-receiver
+        // simulcast-divergence test. The receive-side layer chooser steps
+        // DOWN on `loss_per_sec >= 5.0` (sequence gaps), NOT on raw
+        // bandwidth — and the shim's token bucket models a bandwidth
+        // shortfall as `Admission::Delay`, which the inbound shaping path
+        // maps to Pass (see `netsim_hook::shape_inbound`). So a tiny
+        // `downlink_kbps` alone would NOT produce the deterministic LOSS
+        // the test requires. This preset therefore drives step-down with a
+        // high Bernoulli `loss_pct` (40%): at a single video stream's
+        // typical packet rate (tens of pps) that clears >5 dropped
+        // packets/sec within a couple of seconds, reliably pushing the
+        // degraded receiver's chooser below a healthy co-receiver's. The
+        // `downlink_kbps` cap is included for realism but is not the
+        // step-down driver. Latency/jitter are kept modest so the loss
+        // signal — not delay — dominates.
+        "crushed_downlink" => Some(NetworkProfile {
+            latency_ms: 40,
+            jitter_ms: 10,
+            loss_pct: 40.0,
+            downlink_kbps: Some(500),
+            ..Default::default()
+        }),
         _ => None,
     }
 }
@@ -109,5 +132,29 @@ mod tests {
     #[test]
     fn unknown_preset_is_none() {
         assert!(resolve_profile("not-a-real-profile").is_none());
+    }
+
+    /// Issue #1080: `crushed_downlink` must resolve, validate, and carry a
+    /// loss rate high enough to drive the receive-side chooser's
+    /// `loss_per_sec >= 5.0` step-down within a few seconds at a single
+    /// video stream's packet rate. The chooser does NOT react to bandwidth
+    /// (the shim models that as Delay, which the inbound path passes), so a
+    /// meaningful `loss_pct` — not just `downlink_kbps` — is the contract
+    /// this test pins. Asserting `>= 20.0` would still fail loudly if a
+    /// future edit dropped the loss to a token value while leaving only the
+    /// (insufficient) bandwidth cap.
+    #[test]
+    fn crushed_downlink_has_step_down_grade_loss() {
+        let p = resolve_profile("crushed_downlink").expect("crushed_downlink must resolve");
+        p.validate().expect("crushed_downlink must validate");
+        assert!(
+            p.loss_pct >= 20.0,
+            "crushed_downlink loss_pct={} too low to drive chooser step-down via loss",
+            p.loss_pct
+        );
+        assert!(
+            !p.is_passthrough(),
+            "crushed_downlink must not be passthrough"
+        );
     }
 }

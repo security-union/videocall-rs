@@ -336,27 +336,23 @@ test.describe("Screen share right panel layout", () => {
       // Verify the screen share tile is visible on the left
       await expect(hostPage.locator(".split-screen-tile")).toBeVisible({ timeout: 10_000 });
 
-      // Verify the right panel has grid-template-columns with fixed-width
-      // tile-sized columns (HCL #3/#4 fix in PR #940). The right panel is
-      // the 3rd child: left + resize-handle + right.
-      //
-      // Pre-#940 form: `grid-template-columns: 1fr 1fr` (or `1fr` when
-      // narrow). That regex still appears in this codebase only as a
-      // negative assertion — the post-fix form is
-      // `repeat(2, <ss_tile_w>px)` (or `<ss_tile_w>px` when narrow) paired
-      // with `justify-content: start` so tiles pack to the left edge.
+      // Verify the right panel uses the .ss-peer-panel CSS class with
+      // flexbox layout. The right panel is the 3rd child: left +
+      // resize-handle + right.
       const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
-      const rightPanelStyle = await rightPanel.getAttribute("style");
-      expect(rightPanelStyle).toBeTruthy();
-      // 2-column (>=2 peers) or 1-column (1 peer) variant, both with
-      // fixed-width tile-sized tracks.
-      expect(rightPanelStyle).toMatch(/grid-template-columns:\s*(repeat\(2,\s*\d+px\)|\d+px)/);
-      // Bug #3: tiles must pack to the left edge (not stretch / center).
-      expect(rightPanelStyle).toContain("justify-content: start");
-      // Stale "1fr" tracks must never reappear (regression guard).
-      expect(rightPanelStyle).not.toMatch(/grid-template-columns:\s*1fr( 1fr)?[;\s]/);
+      // Layout is now CSS-class-driven (.ss-peer-panel) using flexbox.
+      // Verify the panel has the expected class and computed layout.
+      await expect(rightPanel).toHaveClass(/ss-peer-panel/);
+      const computedDisplay = await rightPanel.evaluate(
+        (el) => getComputedStyle(el).display,
+      );
+      expect(computedDisplay).toBe("flex");
+      const computedFlexWrap = await rightPanel.evaluate(
+        (el) => getComputedStyle(el).flexWrap,
+      );
+      expect(computedFlexWrap).toBe("wrap");
 
       // Verify peer tiles (.split-peer-tile) are rendered in the right panel
       const peerTiles = hostPage.locator(".split-peer-tile");
@@ -514,27 +510,12 @@ test.describe("Screen share right panel layout", () => {
   // 4. HCL bugs #3 + #4: side-strip tiles left-justify and hold 3:2 cap
   //    on a wide viewport.
   //
-  // Bug #3 (left-justification): pre-fix the right panel used `1fr 1fr`
-  // tracks with `place-self: center`, which centered each 3:2-capped
-  // `.split-peer-tile` in a viewport-wide cell → large left/right gaps,
-  // tiles visually "floating in the middle of the side-strip". Post-fix
-  // the panel uses fixed-width `(ss_tile_h * 1.5)px` tracks plus
-  // `justify-content: start` so tiles pack to the LEFT edge of the
-  // panel. Verifiable by computing the gap between the panel's left
-  // edge and each tile's left edge: it must be `padding-left` (~6px),
-  // NOT half the cell surplus.
+  // Bug #3+#4: the right panel now uses CSS class `.ss-peer-panel`
+  // with flexbox layout. Tiles pack to the left edge via flex-start
+  // alignment, and each tile preserves its 3:2 aspect ratio.
   //
-  // Bug #4 (3:2 cap on wide screens): same root cause as #3 — the
-  // stretched 1fr cell let `.split-peer-tile` honour its 3:2 cap, but
-  // the cell footprint itself wasn't 3:2, so the surrounding chrome
-  // looked stretched. Post-fix each cell IS exactly the 3:2 tile
-  // footprint (column width is `ss_tile_h * 1.5`), and the tile
-  // stretches to fill the cell. The resulting `.split-peer-tile`
-  // bounding-box aspect must be ~1.5 (3:2) even on a wide viewport.
-  //
-  // The test runs on a deliberately WIDE viewport (1600x900) so the
-  // pre-fix code path would distribute surplus into both cells —
-  // exactly the regression scenario the user reported.
+  // The test runs on a deliberately WIDE viewport (1600x900) to verify
+  // tiles stay left-justified and maintain proper aspect ratio.
   // ──────────────────────────────────────────────────────────────────────
   test("right panel left-justifies tiles with 3:2 footprint on wide viewport (HCL #3+#4) @bvt1", async ({
     baseURL,
@@ -568,13 +549,17 @@ test.describe("Screen share right panel layout", () => {
       const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
-      // ── Bug #3 STRUCTURAL: justify-content: start packs tiles left.
-      const rightPanelStyle = (await rightPanel.getAttribute("style")) || "";
-      expect(rightPanelStyle).toContain("justify-content: start");
-      // ── Bug #3 STRUCTURAL: fixed-width pixel tracks (NOT `1fr`).
-      expect(rightPanelStyle).toMatch(/grid-template-columns:\s*(repeat\(2,\s*\d+px\)|\d+px)/);
-      // ── Bug #3 REGRESSION GUARD: `1fr` tracks must not reappear.
-      expect(rightPanelStyle).not.toMatch(/grid-template-columns:\s*1fr( 1fr)?[;\s]/);
+      // ── Layout is CSS-class-driven (.ss-peer-panel) using flexbox.
+      // Verify the panel has the right class and computed flex layout.
+      await expect(rightPanel).toHaveClass(/ss-peer-panel/);
+      const computedDisplay = await rightPanel.evaluate(
+        (el) => getComputedStyle(el).display,
+      );
+      expect(computedDisplay).toBe("flex");
+      const computedFlexWrap = await rightPanel.evaluate(
+        (el) => getComputedStyle(el).flexWrap,
+      );
+      expect(computedFlexWrap).toBe("wrap");
 
       // ── Bug #3 GEOMETRIC: the first tile's LEFT edge must sit at the
       // panel's left edge plus its padding (~6px), not centered.

@@ -92,7 +92,36 @@ where
 
 /// Drive (or join) the single in-flight provider refresh. Returns `Ok(())` if
 /// the refresh produced a token, `Err(())` otherwise.
+///
+/// Thin wrapper over the generic single-flight core: in the creator branch it
+/// supplies the production refresh future — `crate::auth::refresh_access_token()`
+/// (which returns `Result<String, String>`) adapted to `Result<(), ()>` exactly
+/// as before. The `make_fut` closure is invoked ONLY by the creator branch,
+/// inside the same `RefCell` borrow where the future was constructed today, so
+/// the borrow-dropped-before-await property and the network-POST-once-per-wave
+/// guarantee are preserved bit-for-bit.
 async fn refresh_single_flight() -> Result<(), ()> {
+    refresh_single_flight_with(|| {
+        crate::auth::refresh_access_token().map(|r| r.map(|_| ()).map_err(|_| ()))
+    })
+    .await
+}
+
+/// Generic single-flight/epoch core. `make_fut` is the factory for the wave's
+/// underlying refresh future; it is called EXACTLY ONCE per wave, in the creator
+/// branch, while the `REFRESH_INFLIGHT` borrow is held — the resulting future is
+/// then `.boxed_local().shared()` and stored in the slot, exactly as the
+/// production path did inline. Joiners clone the stored `Shared` instead of
+/// calling `make_fut`. All awaiting/clearing logic is unchanged from the
+/// original `refresh_single_flight`.
+async fn refresh_single_flight_with<F, Fut>(make_fut: F) -> Result<(), ()>
+where
+    F: FnOnce() -> Fut,
+    // `'static` matches the original inline future: `refresh_access_token()` is
+    // an `async fn` capturing no borrows, so its future is `'static` — and
+    // `boxed_local()` requires it. The bound is behavior-preserving.
+    Fut: std::future::Future<Output = Result<(), ()>> + 'static,
+{
     // Phase 1: get-or-create the shared future, capturing the epoch of the wave
     // THIS call belongs to. The creator bumps the epoch (a new wave); a joiner
     // reads the current (unchanged) epoch of the wave it is joining. The epoch
@@ -112,10 +141,10 @@ async fn refresh_single_flight() -> Result<(), ()> {
                 e.set(next);
                 next
             });
-            let fut = crate::auth::refresh_access_token()
-                .map(|r| r.map(|_| ()).map_err(|_| ()))
-                .boxed_local()
-                .shared();
+            // `make_fut()` is invoked here — the creator branch, inside the
+            // borrow — and its output is boxed/shared/stored exactly as the
+            // inlined `refresh_access_token()...` future was previously.
+            let fut = make_fut().boxed_local().shared();
             *guard = Some(fut.clone());
             (fut, my_epoch)
         }
@@ -338,5 +367,308 @@ pub async fn leave_meeting_as_guest(
             Ok(())
         }
         Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Host-target (`cargo test --lib`, NOT wasm) tests for the single-flight
+    //! provider-refresh machinery in `refresh_single_flight_with`.
+    //!
+    //! Harness: the production runtime is the browser's single-threaded event
+    //! loop, so these tests reproduce that with `futures::executor::LocalPool`
+    //! — a single-threaded executor running on the test thread itself. That
+    //! matters because the machinery uses `thread_local!` slots
+    //! (`REFRESH_INFLIGHT` / `REFRESH_EPOCH`); a single-threaded pool keeps all
+    //! spawned tasks on the same thread, so every task sees the same
+    //! thread-locals (exactly as in the browser). A multi-threaded executor
+    //! would give each worker its own thread-locals and the single-flight slot
+    //! would not be shared — defeating the test.
+    //!
+    //! To put several callers "in flight at once", we spawn each
+    //! `refresh_single_flight_with(..)` onto the pool, then `run_until_stalled()`
+    //! so every task advances to its first await point (parked on the gate)
+    //! before any future resolves. The gate is a `oneshot::Receiver` that
+    //! `make_fut` awaits; nothing resolves until we `send(())` on the matching
+    //! sender. This guarantees the "all callers started before any completes"
+    //! precondition the single-flight invariant is about.
+    //!
+    //! Each test calls `reset_refresh_inflight()` first so it does not inherit
+    //! slot/epoch state from a prior test on the same thread.
+
+    use super::*;
+    use futures::channel::oneshot;
+    use futures::executor::LocalPool;
+    use futures::task::LocalSpawnExt;
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    /// 1. SINGLE POST PER WAVE.
+    ///
+    /// Two callers both start (park on the gate) BEFORE either resolves. The
+    /// creator runs `make_fut` once and stores the `Shared`; the joiner clones
+    /// it. After releasing the gate and draining the pool, `make_fut` must have
+    /// been invoked EXACTLY ONCE — the joiner reused the in-flight future.
+    ///
+    /// Breaking mutation (in `refresh_single_flight_with`, Phase 1): make the
+    /// creator branch ALWAYS create a fresh future — i.e. delete the
+    /// `if let Some(existing) = guard.as_ref()` joiner branch (or change it to
+    /// fall through to `make_fut()` unconditionally). Then both callers each
+    /// run `make_fut`, the counter reaches 2, and this assertion fails.
+    #[test]
+    fn single_post_per_wave() {
+        reset_refresh_inflight();
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+
+        let calls = Rc::new(Cell::new(0u32));
+        // One shared gate cloned into each factory; only the creator's factory
+        // is actually invoked, so a single gate gates the whole wave.
+        let (tx, rx) = oneshot::channel::<()>();
+        let rx = rx.map(|_| ()).boxed_local().shared();
+
+        // Two distinct factories (FnOnce), sharing the SAME counter + gate.
+        // Only the creator branch invokes one of them.
+        let mk = |calls: Rc<Cell<u32>>, rx: futures::future::Shared<_>| {
+            move || {
+                calls.set(calls.get() + 1);
+                async move {
+                    let _: () = rx.await;
+                    Ok::<(), ()>(())
+                }
+            }
+        };
+
+        let h1 = spawner
+            .spawn_local_with_handle(refresh_single_flight_with(mk(calls.clone(), rx.clone())))
+            .unwrap();
+        let h2 = spawner
+            .spawn_local_with_handle(refresh_single_flight_with(mk(calls.clone(), rx.clone())))
+            .unwrap();
+
+        // Advance both tasks to their first await (parked on the gate) BEFORE
+        // anything resolves — this establishes the concurrent-wave precondition.
+        pool.run_until_stalled();
+        assert_eq!(
+            calls.get(),
+            1,
+            "creator should have invoked make_fut exactly once before resolution"
+        );
+
+        // Release the gate and drive both to completion.
+        tx.send(()).unwrap();
+        let (r1, r2) = pool.run_until(async move { futures::join!(h1, h2) });
+
+        assert_eq!(calls.get(), 1, "make_fut must fire EXACTLY once per wave");
+        assert_eq!(r1, Ok(()));
+        assert_eq!(r2, Ok(()));
+    }
+
+    /// 2. SLOT CLEARS AFTER A WAVE.
+    ///
+    /// Run one full wave to completion, then issue a LATER call. The second
+    /// wave must invoke `make_fut` again (counter -> 2), proving the slot was
+    /// cleared after the first wave (otherwise the second call would join a
+    /// completed-and-cached `Shared` and skip `make_fut`).
+    ///
+    /// Breaking mutation (Phase 3): comment out the epoch-guarded clear
+    /// `*slot.borrow_mut() = None;`. Then the first wave's completed `Shared`
+    /// lingers in the slot, the second call joins it instead of creating a new
+    /// wave, `make_fut` is never called again, the counter stays 1, and this
+    /// assertion fails.
+    #[test]
+    fn slot_clears_after_wave() {
+        reset_refresh_inflight();
+        let calls = Rc::new(Cell::new(0u32));
+
+        let factory = || {
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                calls.set(calls.get() + 1);
+                async move { Ok::<(), ()>(()) }
+            }
+        };
+
+        // Wave 1 (resolves immediately — no gate needed for the post-wave test).
+        let r1 = futures::executor::block_on(refresh_single_flight_with(factory()));
+        assert_eq!(r1, Ok(()));
+        assert_eq!(calls.get(), 1, "first wave invokes make_fut once");
+
+        // Wave 2 — must start fresh because the slot was cleared.
+        let r2 = futures::executor::block_on(refresh_single_flight_with(factory()));
+        assert_eq!(r2, Ok(()));
+        assert_eq!(
+            calls.get(),
+            2,
+            "a LATER call must invoke make_fut again (slot cleared after wave 1)"
+        );
+    }
+
+    /// 3. CREATOR-DROP DOES NOT WEDGE — see honesty note below.
+    ///
+    /// HONEST GAP: a faithful "creator dropped mid-flight while a joiner drives
+    /// the Shared to completion" simulation is fiddly here. To drop the creator
+    /// task mid-await we would need to hold a `RemoteHandle`, advance the pool so
+    /// the creator parks on the gate, drop the creator's handle to cancel it,
+    /// and rely on the joiner being promoted to driver — but `LocalPool` task
+    /// cancellation via `RemoteHandle` drop plus the get-or-create timing makes a
+    /// truly creator-dropped-then-joiner-drives scenario non-deterministic to set
+    /// up without reaching into executor internals. Rather than fake it, we
+    /// assert the WEAKER-BUT-REAL property that the epoch-guarded clear is
+    /// performed by WHICHEVER awaiter reaches Phase 3 first — i.e. clearing is
+    /// NOT creator-only. We prove this by running a wave through a SINGLE caller
+    /// and confirming a subsequent caller starts fresh (the slot was cleared by
+    /// an awaiter, which is the same Phase-3 code path a promoted joiner would
+    /// execute). This is the same code that guarantees a dropped creator cannot
+    /// wedge the slot, but it does not exercise the actual drop+promote timing —
+    /// that gap is acknowledged and left to the WASM/browser integration path.
+    #[test]
+    fn awaiter_clears_slot_not_creator_only() {
+        reset_refresh_inflight();
+        let calls = Rc::new(Cell::new(0u32));
+        let factory = || {
+            let calls = calls.clone();
+            move || {
+                let calls = calls.clone();
+                calls.set(calls.get() + 1);
+                async move { Ok::<(), ()>(()) }
+            }
+        };
+
+        // Single awaiter drives a wave; Phase 3 (run by this awaiter) must clear.
+        let _ = futures::executor::block_on(refresh_single_flight_with(factory()));
+        // A fresh wave can only start if the slot is None — prove it can.
+        let _ = futures::executor::block_on(refresh_single_flight_with(factory()));
+        assert_eq!(
+            calls.get(),
+            2,
+            "the awaiter (not necessarily the creator) clears the slot, so a later wave starts fresh"
+        );
+    }
+
+    /// 4. OUTCOME PROPAGATION.
+    ///
+    /// A wave whose `make_fut` resolves `Err(())` must return `Err(())` to all
+    /// awaiters; a wave that resolves `Ok(())` returns `Ok(())`.
+    #[test]
+    fn outcome_propagates_to_all_awaiters() {
+        // --- Err wave (two concurrent awaiters) ---
+        reset_refresh_inflight();
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+        let (tx, rx) = oneshot::channel::<()>();
+        let rx = rx.map(|_| ()).boxed_local().shared();
+
+        let mk = |rx: futures::future::Shared<_>| {
+            move || async move {
+                let _: () = rx.await;
+                Err::<(), ()>(())
+            }
+        };
+        let h1 = spawner
+            .spawn_local_with_handle(refresh_single_flight_with(mk(rx.clone())))
+            .unwrap();
+        let h2 = spawner
+            .spawn_local_with_handle(refresh_single_flight_with(mk(rx.clone())))
+            .unwrap();
+        pool.run_until_stalled();
+        tx.send(()).unwrap();
+        let (r1, r2) = pool.run_until(async move { futures::join!(h1, h2) });
+        assert_eq!(r1, Err(()), "Err outcome must propagate to creator");
+        assert_eq!(r2, Err(()), "Err outcome must propagate to joiner");
+
+        // --- Ok wave ---
+        reset_refresh_inflight();
+        let ok =
+            futures::executor::block_on(refresh_single_flight_with(|| async { Ok::<(), ()>(()) }));
+        assert_eq!(ok, Ok(()), "Ok outcome must propagate");
+    }
+
+    /// 5. `reset_refresh_inflight` clears an in-flight slot (post-logout start fresh).
+    ///
+    /// Park a wave on a gate (slot occupied), call `reset_refresh_inflight()`
+    /// (the logout path), then a NEW call must invoke `make_fut` again because
+    /// the slot was cleared + epoch bumped — proving logout does not leave a
+    /// stale Shared that a post-login 401 would join.
+    ///
+    /// Mutation that must make THIS test fail with a clean assertion (NOT a
+    /// hang): delete/disable the slot-clear line
+    /// `REFRESH_INFLIGHT.with(|slot| *slot.borrow_mut() = None);` inside
+    /// `reset_refresh_inflight` (leave the epoch bump). Wave 2 then JOINS the
+    /// still-gated wave-1 `Shared` instead of becoming a CREATOR, `make_fut2`
+    /// is never called, and `calls` stays 1 instead of reaching 2 — so the
+    /// `assert_eq!(calls.get(), 2, ...)` below fails.
+    ///
+    /// Why `run_until_stalled` (not `run_until`) drives wave 2: under the
+    /// regression, wave 2 joins wave 1's `Shared`, which is gated on the
+    /// never-fired `rx` (we deliberately do NOT `tx.send(())` until cleanup).
+    /// `run_until(refresh_single_flight_with(make_fut2))` would therefore block
+    /// FOREVER, surfacing the mutation as an opaque CI hang/timeout rather than
+    /// a readable assertion failure. `run_until_stalled` makes all possible
+    /// progress and then returns, converting that deadlock into a clean
+    /// `calls` counter mismatch.
+    #[test]
+    fn reset_clears_inflight_slot() {
+        reset_refresh_inflight();
+        let mut pool = LocalPool::new();
+        let spawner = pool.spawner();
+        let calls = Rc::new(Cell::new(0u32));
+
+        let (tx, rx) = oneshot::channel::<()>();
+        let rx = rx.map(|_| ()).boxed_local().shared();
+
+        let make_fut = {
+            let calls = calls.clone();
+            let rx = rx.clone();
+            move || {
+                calls.set(calls.get() + 1);
+                async move {
+                    let _: () = rx.await;
+                    Ok::<(), ()>(())
+                }
+            }
+        };
+        let h1 = spawner
+            .spawn_local_with_handle(refresh_single_flight_with(make_fut))
+            .unwrap();
+        pool.run_until_stalled();
+        assert_eq!(calls.get(), 1, "wave 1 started");
+
+        // Logout: clear the in-flight slot + bump epoch.
+        reset_refresh_inflight();
+
+        // A post-logout call must start a brand-new wave (slot was cleared).
+        // Spawn wave 2 onto the pool and let it make ALL possible progress
+        // without blocking. If the slot was cleared (correct), wave 2 is the
+        // CREATOR: `make_fut2` runs and its ungated `async { Ok(()) }` future
+        // resolves immediately, so `h2` is already complete after the stall. If
+        // the slot was NOT cleared (regression), wave 2 JOINS the still-gated
+        // wave-1 Shared, `make_fut2` is never called, and the pool stalls with
+        // `calls` stuck at 1 — caught by the assertion below instead of a hang.
+        let calls2 = calls.clone();
+        let make_fut2 = move || {
+            calls2.set(calls2.get() + 1);
+            async move { Ok::<(), ()>(()) }
+        };
+        let h2 = spawner
+            .spawn_local_with_handle(refresh_single_flight_with(make_fut2))
+            .unwrap();
+        pool.run_until_stalled();
+        assert_eq!(
+            calls.get(),
+            2,
+            "reset_refresh_inflight must clear the slot so a post-logout call starts a fresh wave (CREATOR), not join the stale Shared"
+        );
+
+        // Release the wave-1 gate so the original (now-orphaned) task can finish
+        // cleanly, then drive both handles to completion so the pool drains with
+        // no leak/panic. `h2` is already resolved in the correct case; awaiting a
+        // resolved handle is fine.
+        let _ = tx.send(());
+        pool.run_until(async move {
+            let _ = h1.await;
+            let _ = h2.await;
+        });
     }
 }

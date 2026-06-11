@@ -1081,6 +1081,38 @@ html[data-theme="dark"] #diagnostics-sidebar {
   margin: 0;
 }
 
+/* Native `<details>` disclosure for the collapsed "Raw stats" and "Build info"
+   sections (iteration 3). The summary reads like a section heading; the marker
+   gives the open/closed affordance for free. (#1223) */
+.diag-disclosure > .diag-disclosure-summary {
+  cursor: pointer;
+  list-style: revert;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding: 4px 0;
+  /* ≥44px keyboard/touch target for the summary row. */
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+}
+.diag-disclosure[open] > .diag-disclosure-summary {
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--glass-bg-hover);
+  padding-bottom: 8px;
+}
+/* Each folded raw-stats block (Reception / Sending / Encoder / Media Status)
+   keeps its own sub-heading inside the one disclosure. */
+.diag-raw-block + .diag-raw-block {
+  margin-top: 12px;
+}
+.diag-raw-block h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
 /* Honour reduced-motion for the drawer slide on BOTH the desktop `right`
    transition (this rule, non-`!important`, wins by source order) AND the mobile
    `transform 0.3s ease !important` transition at the ≤639px breakpoint (style.css
@@ -1101,9 +1133,9 @@ html[data-theme="dark"] #diagnostics-sidebar {
   padding: 10px;
 }
 
-#diagnostics-sidebar .diagnostics-section {
-  margin-bottom: 20px;
-}
+/* Drawer sections no longer carry a bottom margin — `.sidebar-content` now
+   spaces them with a single flex `gap` (iteration 3 polish). Flex gap + child
+   margins are additive, so the per-section margin is removed here. */
 
 #diagnostics-sidebar .diagnostics-section h3 {
   color: var(--text-primary);
@@ -1113,17 +1145,16 @@ html[data-theme="dark"] #diagnostics-sidebar {
   border-bottom: 1px solid var(--glass-bg-hover);
 }
 
+/* Raw-stats monospace dumps use the build-info mono treatment (the theme mono
+   token on the surface) instead of the old #00ff00-on-black debug look
+   (iteration 3 polish). */
 #diagnostics-sidebar .diagnostics-data pre {
   font-family: monospace;
-  font-size: 14px;
+  font-size: 13px;
   white-space: pre-wrap;
-  color: #00ff00; /* @token-exempt: debug indicator, not a design token */
-  background-color: rgba(
-    0,
-    0,
-    0,
-    0.3
-  ); /* @token-exempt: dark translucent bg, no matching token */
+  color: var(--diag-mono-text);
+  background-color: var(--surface);
+  border: 1px solid var(--border);
   padding: 10px;
   border-radius: 5px;
   max-height: 40vh;
@@ -1176,6 +1207,13 @@ html[data-theme="dark"] #diagnostics-sidebar {
 
 #diagnostics-sidebar .sidebar-content {
   padding: 15px;
+  /* Single spacing rhythm: one flex `gap` between the group labels, sections,
+     panels and disclosures, instead of per-child bottom margins (iteration 3
+     polish). The removed margins are: `.diagnostics-section`, the drawer
+     `.perf-simulcast-strip` / `.perf-kind-card`. */
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .diagnostics-sidebar {
@@ -1242,8 +1280,9 @@ html[data-theme="dark"] #diagnostics-sidebar {
 .diagnostics-section h3 {
   margin: 0 0 10px 0;
   font-size: 1.2em;
-  color: var(--success);
-  border-bottom: 1px solid var(--success);
+  /* Drawer headings read as plain section titles (matching the perf-card
+     titles), not the old green-on-underline debug look (iteration 3 polish). */
+  color: var(--text-primary);
   padding-bottom: 5px;
 }
 
@@ -1348,79 +1387,114 @@ html[data-theme="dark"] #diagnostics-sidebar {
   padding: 20px;
 }
 
-.neteq-advanced-chart svg {
+/* The advanced charts are now a fixed-Y-axis + growing-width scrollable form
+   (`.neteq-chart-*` below), so the chart SVG width is DYNAMIC. Only style the
+   chart card chrome here — no fixed/max width, which would clip the timeline. */
+.neteq-advanced-chart {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 4px;
-  width: 100%;
-  height: auto;
-  max-width: 280px;
-  min-height: 220px;
-  display: block;
-  margin: 0 auto;
+  padding: 10px;
+}
+
+.neteq-advanced-chart .chart-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
 }
 
 .neteq-status {
   background: var(--surface-elevated);
   padding: 15px;
   border-radius: 8px;
-  margin-bottom: 20px;
   box-shadow: var(--shadow-sm);
 }
 
-.status-grid {
+/* Single-source `.status-*` tiles, NAMESPACED under `.neteq-status` (iteration 3
+   polish). This is now the ONLY definition — the inline `<style>` dup that lived
+   in `NetEqStatusDisplay` (and disagreed: 36px vs 18px) was deleted. The styled
+   36px-tile proportions are preserved here, using theme tokens. */
+.neteq-status .status-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 12px;
 }
 
-.status-item {
+.neteq-status .status-item {
   text-align: center;
-  padding: 10px;
+  padding: 16px 12px;
   background: var(--border);
-  border-radius: 4px;
+  border-radius: 8px;
+  min-height: 110px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
 }
 
-.status-value {
-  font-size: 18px;
-  font-weight: bold;
+.neteq-status .status-value {
+  font-size: 32px;
+  font-weight: 700;
+  line-height: 1;
   color: var(--text-primary);
-  margin-bottom: 5px;
+  white-space: nowrap;
+  margin: 0;
 }
 
-.status-value.warning {
+.neteq-status .status-value.warning {
   color: var(--error-text);
 }
 
-.status-value.good {
+.neteq-status .status-value.good {
   color: var(--success);
 }
 
-.status-label {
+.neteq-status .status-label {
   font-size: 11px;
+  font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.5px;
+  line-height: 1.2;
+}
+
+.neteq-status .status-subtitle {
+  font-size: 9px;
+  color: var(--text-tertiary);
+  line-height: 1.3;
 }
 
 .diagnostics-charts {
-  margin: 20px 0;
+  margin: 0;
 }
 
+/* NetEq charts are now 1-up, full drawer width, stacked vertically (iteration 3).
+   The four scrollable charts share one timeline and each fills the column. */
+.neteq-charts-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.neteq-charts-stack .chart-container {
+  min-height: 0;
+  width: 100%;
+}
+
+/* `.charts-grid` is no longer used for the NetEq charts (they stack 1-up). Kept
+   as an auto-fit grid in case any other surface references it. (iteration 3) */
 .charts-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 20px;
-  margin-bottom: 20px;
   padding: 0 10px;
 }
 
 .chart-container {
   background: var(--surface-elevated);
   border-radius: 8px;
-  overflow: hidden;
   box-shadow: var(--shadow-sm);
-  min-height: 300px;
   padding: 10px;
 }
 
@@ -1433,6 +1507,9 @@ html[data-theme="dark"] #diagnostics-sidebar {
   color: var(--text-primary);
   font-size: 14px;
   margin: 8px 0;
+  /* ≥44px tap target for the Peer Selection AND Transport Preference selects
+     (both use this class) on touch devices (iteration 3 polish). */
+  min-height: 44px;
 }
 
 .peer-selector:focus {
@@ -1481,17 +1558,20 @@ html[data-theme="dark"] #diagnostics-sidebar {
     grid-template-columns: 1fr;
     gap: 10px;
   }
-  .status-grid {
-    grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
-    gap: 5px;
+  /* Namespaced to match the single-source `.neteq-status .status-*` rules
+     (iteration 3) so the mobile tile sizing still wins by specificity. */
+  .neteq-status .status-grid {
+    grid-template-columns: repeat(auto-fit, minmax(100px, 1fr));
+    gap: 6px;
   }
-  .status-item {
-    padding: 8px;
+  .neteq-status .status-item {
+    padding: 10px 8px;
+    min-height: 0;
   }
-  .status-value {
-    font-size: 14px;
+  .neteq-status .status-value {
+    font-size: 22px;
   }
-  .status-label {
+  .neteq-status .status-label {
     font-size: 9px;
   }
   .neteq-advanced-chart {
@@ -6685,6 +6765,54 @@ html[data-theme="light"]
 .signal-chart-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-active);
 }
+
+/* ============================================================
+   NetEq scrollable charts (iteration 3) — mirrors `.signal-chart-*`.
+   Fixed external Y-axis SVG outside the scroll box + a growing inner SVG
+   inside `.neteq-chart-scroll`. The scrollbar IS the interaction (no drag-pan);
+   `onscroll` keeps the four stacked charts in lockstep on one timeline.
+   ============================================================ */
+.neteq-chart-wrapper {
+  display: flex;
+  align-items: flex-start;
+  position: relative;
+}
+.neteq-chart-y-axis {
+  flex-shrink: 0;
+}
+.neteq-chart-scroll {
+  position: relative;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 1;
+  min-width: 0;
+  scrollbar-width: auto;
+  scrollbar-color: rgba(255, 255, 255, 0.35) rgba(255, 255, 255, 0.08); /* @token-exempt: scrollbar custom rendering */
+}
+/* Always-visible classic (non-overlay) scrollbar when content overflows — same
+   rationale as `.signal-chart-scroll` above. */
+.neteq-chart-scroll::-webkit-scrollbar {
+  height: 10px;
+}
+.neteq-chart-scroll::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+  border-radius: 5px;
+}
+.neteq-chart-scroll::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb-strong);
+  border-radius: 5px;
+}
+.neteq-chart-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-active);
+}
+/* The 2-hour retention caption, shown only when a peer's deque is at cap. */
+.neteq-chart-cap-note {
+  margin-top: 6px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-tertiary);
+}
+
 .signal-chart-legend {
   display: flex;
   flex-wrap: wrap;
@@ -7613,16 +7741,10 @@ html[data-theme="light"] .settings-divider {
   container-type: inline-size;
 }
 
-/* Drawer-scoped spacing for the migrated Performance controls (#1131 review F4):
-   the `.sidebar-content` block has no flex `gap`, so space the strip + the three
-   per-kind cards explicitly, and leave room before the next group label. */
-#diagnostics-sidebar .perf-simulcast-strip {
-  margin-bottom: 14px;
-}
-
-#diagnostics-sidebar .perf-kind-card {
-  margin-bottom: 14px;
-}
+/* Drawer-scoped spacing for the migrated Performance controls: the strip + the
+   three per-kind cards are now spaced by `.sidebar-content`'s flex `gap`
+   (iteration 3 polish), so their explicit drawer bottom-margins were removed
+   here — flex gap + child margins are additive. */
 
 .perf-kind-card__title {
   font-size: 14px;

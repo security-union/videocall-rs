@@ -17,7 +17,8 @@
  */
 
 use crate::components::neteq_chart::{
-    AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart, NetEqStats, NetEqStatusDisplay,
+    push_capped, should_push, AdvancedChartType, ChartType, NetEqAdvancedChart, NetEqChart,
+    NetEqSample, NetEqStatusDisplay, NETEQ_SAMPLE_CAP,
 };
 use crate::components::performance_settings::{
     format_kbps_compact, format_mbps, format_peer_kind_line, format_send_header, format_send_layer,
@@ -30,7 +31,7 @@ use crate::context::{
 use dioxus::prelude::*;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::rc::Rc;
 use videocall_client::{PrefMediaKind, VideoCallClient};
 use videocall_diagnostics::{subscribe, MetricValue};
@@ -455,38 +456,6 @@ pub fn ConnectionManagerDisplay(connection_manager_state: Option<String>) -> Ele
     }
 }
 
-fn parse_neteq_stats_history(neteq_stats_str: &str) -> Vec<NetEqStats> {
-    let mut stats = Vec::new();
-    let lines: Vec<&str> = neteq_stats_str.lines().collect();
-    for (i, line) in lines.iter().enumerate() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        match serde_json::from_str::<crate::components::neteq_chart::RawNetEqStats>(trimmed) {
-            Ok(raw_stat) => {
-                let stat: NetEqStats = raw_stat.into();
-                stats.push(stat);
-            }
-            Err(e) => {
-                log::warn!("[parse_neteq_stats_history] Failed to parse line {i}: {e}");
-            }
-        }
-    }
-    if stats.is_empty() {
-        if let Ok(raw_stat) =
-            serde_json::from_str::<crate::components::neteq_chart::RawNetEqStats>(neteq_stats_str)
-        {
-            let stat: NetEqStats = raw_stat.into();
-            stats.push(stat);
-        }
-    }
-    if stats.len() > 60 {
-        stats.drain(0..stats.len() - 60);
-    }
-    stats
-}
-
 #[component]
 pub fn Diagnostics(
     is_open: bool,
@@ -512,7 +481,10 @@ pub fn Diagnostics(
     let mut diagnostics_data = use_signal(|| None::<String>);
     let mut sender_stats = use_signal(|| None::<String>);
     let mut connection_manager_state = use_signal(|| None::<String>);
-    let mut neteq_stats_per_peer = use_signal(HashMap::<String, Vec<String>>::new);
+    // Per-peer ring buffer of PARSED, compact NetEq samples (parse-once at
+    // arrival in the subscribe loop). Replaces the old `Vec<String>` of raw JSON
+    // that the render path re-parsed every event (#1223). Capped at 2 hours.
+    let mut neteq_stats_per_peer = use_signal(HashMap::<String, VecDeque<NetEqSample>>::new);
     let mut neteq_buffer_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut neteq_jitter_per_peer = use_signal(HashMap::<String, Vec<u64>>::new);
     let mut peer_transport_per_peer = use_signal(HashMap::<String, String>::new);
@@ -544,7 +516,12 @@ pub fn Diagnostics(
         let task = spawn(async move {
             let mut rx = subscribe();
             let mut connection_events = Vec::<SerializableDiagEvent>::new();
-            let mut neteq_stats = HashMap::<String, Vec<String>>::new();
+            // Parsed-once per-peer ring buffers (the heavy JSON decode happens
+            // HERE, not in the render path). Capped at 2 hours (#1223).
+            let mut neteq_stats = HashMap::<String, VecDeque<NetEqSample>>::new();
+            // Per-peer last-kept timestamp for the ≤1 Hz throttle. Different
+            // peers throttle independently (like `peer_transport` below).
+            let mut last_push_ms = HashMap::<String, u64>::new();
             let mut neteq_buffer = HashMap::<String, Vec<u64>>::new();
             let mut neteq_jitter = HashMap::<String, Vec<u64>>::new();
             // Per-peer transport label, locally cached. peer_status events
@@ -634,15 +611,36 @@ pub fn Diagnostics(
                             match m.name {
                                 "stats_json" => {
                                     if let MetricValue::Text(json) = &m.value {
-                                        let entry =
-                                            neteq_stats.entry(target_peer.to_string()).or_default();
-                                        entry.push(json.clone());
-                                        if entry.len() > 60 {
-                                            entry.remove(0);
+                                        // Throttle to ≤1 sample/sec PER PEER: skip
+                                        // if <1000ms since this peer's last kept
+                                        // sample. Different peers are independent.
+                                        let last = last_push_ms.get(target_peer).copied();
+                                        if should_push(last, evt.ts_ms) {
+                                            // Parse ONCE here (not in render). A
+                                            // malformed frame is dropped (None) so
+                                            // it can't poison the ring buffer.
+                                            if let Some(sample) =
+                                                NetEqSample::from_json(json, evt.ts_ms)
+                                            {
+                                                let entry = neteq_stats
+                                                    .entry(target_peer.to_string())
+                                                    .or_default();
+                                                // pop_front-then-push_back at the
+                                                // 2-hour cap (owner decision 2).
+                                                push_capped(entry, sample);
+                                                last_push_ms
+                                                    .insert(target_peer.to_string(), evt.ts_ms);
+                                                stats_dirty = true;
+                                            }
                                         }
-                                        stats_dirty = true;
                                     }
                                 }
+                                // `audio_buffer_ms` / `jitter_buffer_delay_ms` are
+                                // a SEPARATE per-peer feed (not derived from the
+                                // NetEq `stats_json` sample), so they keep their
+                                // own small 50-cap ring buffers that back the
+                                // Buffer/Jitter FALLBACK charts shown before any
+                                // full NetEq history exists. (#1223)
                                 "audio_buffer_ms" => {
                                     if let MetricValue::U64(v) = &m.value {
                                         let entry = neteq_buffer
@@ -752,10 +750,12 @@ pub fn Diagnostics(
     // The live "Simulcast layers" section runs its OWN 250 ms (≈4 Hz) refresh
     // tick, scoped to its child component `SimulcastLayersSection` (below), so the
     // tick re-renders ONLY that small subtree — NOT this top-level `Diagnostics`
-    // body, which re-executes the expensive NetEq prelude (clone + parse of up to
-    // 60×N JSON lines). Keeping the tick out of here avoids ~thousands of JSON
-    // parses/sec at scale on the main thread (perf review #1). The section's
-    // `is_open` gating + `use_drop` interval cleanup live in that child.
+    // body. Keeping the 4 Hz tick out of here matters because the body re-renders
+    // are meant to be at the throttled ≤1 Hz NetEq sample cadence (one re-render
+    // per kept sample); the heavy per-event JSON PARSE was moved to the subscribe
+    // loop (parse-once, #1223), so the body prelude only clones already-parsed
+    // samples. The section's `is_open` gating + `use_drop` interval cleanup live
+    // in that child.
 
     // Resolve numeric session IDs to display names via VideoCallClient context.
     let client = use_context::<VideoCallClient>();
@@ -775,24 +775,37 @@ pub fn Diagnostics(
         peers
     };
 
-    // Parse NetEQ stats based on selected peer
+    // Build the NetEq history for the selected peer by CLONING the already-parsed
+    // samples out of the ring buffer(s) — no JSON re-parse (the heavy decode
+    // happened once in the subscribe loop). "All Peers" concatenates every peer's
+    // deque; a specific peer uses just that deque. The drawer body re-renders at
+    // the throttled ≤1 Hz sample cadence (one re-render per KEPT sample), which is
+    // the existing accepted model — only the per-event PARSE was moved out. (#1223)
     let current_peer = selected_peer();
     let stats_map = neteq_stats_per_peer();
-    let neteq_stats_history = if current_peer == "All Peers" {
+    let neteq_stats_history: Vec<NetEqSample> = if current_peer == "All Peers" {
         let mut all = Vec::new();
         for stats in stats_map.values() {
-            all.extend(stats.clone());
+            all.extend(stats.iter().cloned());
         }
-        if all.is_empty() {
-            Vec::new()
-        } else {
-            parse_neteq_stats_history(&all.join("\n"))
-        }
+        all
     } else {
         stats_map
             .get(&current_peer)
-            .map(|peer_stats| parse_neteq_stats_history(&peer_stats.join("\n")))
+            .map(|peer_stats| peer_stats.iter().cloned().collect())
             .unwrap_or_default()
+    };
+
+    // Cap caption gates on len()==7200 (owner decision 2). For a specific peer
+    // that's the peer's deque length; for "All Peers" the concatenation can
+    // exceed the cap, so check whether ANY contributing peer is at the cap.
+    let neteq_capped = if current_peer == "All Peers" {
+        stats_map.values().any(|dq| dq.len() == NETEQ_SAMPLE_CAP)
+    } else {
+        stats_map
+            .get(&current_peer)
+            .map(|dq| dq.len() == NETEQ_SAMPLE_CAP)
+            .unwrap_or(false)
     };
 
     let latest_neteq_stats = neteq_stats_history.last().cloned();
@@ -832,6 +845,23 @@ pub fn Diagnostics(
     };
     let peer_info = format!("Showing statistics for: {current_peer_display}");
 
+    // Group order (owner decision 1, iteration 3): usage-frequency order —
+    // Quality controls → Live stream state → Connection & system. The `--first`
+    // modifier (no top border / extra top padding) must land on whichever group
+    // RENDERS FIRST. Quality controls is gated on `perf_controls`: when it's
+    // published, it leads and takes `--first`, so Live stream state takes the
+    // plain (bordered) label; when `perf_controls` is `None`, Quality controls
+    // does not render, so Live stream state becomes the first visible group and
+    // must take `--first` instead. This keeps the top divider off the actual
+    // first group in BOTH cases.
+    let has_quality = perf_controls.is_some();
+    let quality_label_class = "diag-group-label diag-group-label--first";
+    let live_label_class = if has_quality {
+        "diag-group-label"
+    } else {
+        "diag-group-label diag-group-label--first"
+    };
+
     rsx! {
         div {
             id: "diagnostics-sidebar",
@@ -853,18 +883,132 @@ pub fn Diagnostics(
                 }
             }
             div { class: "sidebar-content",
-                // Group order (#1131 iteration): Connection & system FIRST, then
-                // Quality controls, then Live stream state. This is the product
-                // owner's direct instruction for this iteration — it supersedes the
-                // earlier "controls first = user intent on opening" rationale. The
-                // FIRST group is now always "Connection & system", which renders
-                // unconditionally, so it always carries `--first` (no top border).
-                // The later two labels always carry the plain `.diag-group-label`
-                // (with a top border), so the `--first` decision no longer depends
-                // on whether `perf_controls` is published.
+                // ── GROUP 1 — Quality controls (the migrated Performance panel) ──
+                // Leads the body (owner decision 1: usage-frequency order). The
+                // label AND the panel render together: gating both on
+                // `perf_controls` avoids an orphaned group divider in the
+                // sub-second window before `Host` publishes the handle (#1131
+                // review F3). When present it is the FIRST group and carries
+                // `--first`; when absent, Live stream state below takes `--first`.
+                //
+                // The Performance controls (simulcast strip + per-kind cards with
+                // sliders / Auto / live meters / help) render inside their own
+                // child component so the panel's 250 ms refresh tick + rAF meter
+                // drivers re-render ONLY that subtree — NOT this top-level body.
+                // The child also reads the preference signals, keeping all
+                // reactive perf state out of this body. (#1131 unify, #1128)
+                if let Some(controls) = perf_controls.clone() {
+                    div { class: "{quality_label_class}", role: "presentation",
+                        "Quality controls"
+                    }
+                    DiagnosticsPerformancePanel { controls, audio_source_active: mic_enabled }
+                }
 
-                // ── GROUP A — Connection & system ──
-                div { class: "diag-group-label diag-group-label--first", role: "presentation",
+                // ── GROUP 2 — Live stream state ──
+                // Order (owner decision 1): Simulcast layers → Peer Selection
+                // (MOVED here — it scopes the NetEq sections below) → Per-Peer
+                // Summary (MOVED up — pick the bad peer BEFORE the detail) →
+                // Current Status tiles + scrollable NetEq charts.
+                div { class: "{live_label_class}", role: "presentation",
+                    "Live stream state"
+                }
+                // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
+                // per-peer RECEIVE breakdown. Extracted into its own child so its
+                // 4 Hz refresh tick re-renders ONLY this section, not the NetEq
+                // prelude / charts in this parent (perf review #1).
+                SimulcastLayersSection { is_open, reader: diagnostics_reader.clone() }
+                // Peer Selection (MOVED from the Connection group): it scopes the
+                // Per-Peer Summary + Current Status + charts that follow, so it
+                // belongs at the top of those sections. Reads `selected_peer` /
+                // `available_peers` / `current_peer` here in the parent — these
+                // are value-typed and do NOT tick per NetEq event.
+                if available_peers.len() > 1 {
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-selection",
+                        h3 { id: "diag-h-peer-selection", "Peer Selection" }
+                        select {
+                            class: "peer-selector",
+                            onchange: move |e: Event<FormData>| {
+                                selected_peer.set(e.value());
+                            },
+                            value: "{current_peer}",
+                            for peer in available_peers.iter() {
+                                {
+                                    let label = if peer == "All Peers" {
+                                        "All Peers".to_string()
+                                    } else {
+                                        peer_display_name(peer)
+                                    };
+                                    rsx! {
+                                        option {
+                                            value: "{peer}",
+                                            selected: peer == &current_peer,
+                                            "{label}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        p { class: "peer-info", "{peer_info}" }
+                    }
+                }
+                // Per-Peer Summary (MOVED up from last): a triage index — pick the
+                // bad peer before drilling into the detail. Keeps its >2-peers
+                // gate. Reads stats_map / buffer_map / jitter_map / peer_transport
+                // here in the parent (value-typed; no NetEq-event churn).
+                if available_peers.len() > 2 {
+                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-summary",
+                        h3 { id: "diag-h-peer-summary", "Per-Peer Summary" }
+                        div { class: "peer-summary",
+                            {
+                                let transport_map = peer_transport_per_peer();
+                                rsx! {
+                                    for (peer_id, _) in stats_map.iter() {
+                                        {
+                                            let display = peer_display_name(peer_id);
+                                            let latest_buffer = buffer_map.get(peer_id).and_then(|b| b.last()).unwrap_or(&0);
+                                            let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
+                                            let summary = format!("Buffer: {latest_buffer}ms, Jitter: {latest_jitter}ms");
+                                            let (badge_label, badge_class, badge_title) = match transport_map.get(peer_id).map(String::as_str) {
+                                                Some("webtransport") => ("WT", "connection-type type-webtransport", "WebTransport"),
+                                                Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
+                                                _ => ("\u{2014}", "connection-type", "Transport unknown"),
+                                            };
+                                            rsx! {
+                                                div { class: "peer-summary-item",
+                                                    strong { "{display}" }
+                                                    div {
+                                                        style: "display:flex; gap:8px; align-items:center;",
+                                                        span { class: "{badge_class}", title: "{badge_title}", "{badge_label}" }
+                                                        span { "{summary}" }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Current Status tiles + scrollable NetEq charts, with their two
+                // info-icon popovers, live in a child component so toggling a
+                // popover re-renders ONLY that subtree. The already-computed,
+                // value-typed history/latest/capped are passed in as props; no
+                // signal reads move into the child (#1128).
+                NetEqStatusAndCharts {
+                    latest_stats: latest_neteq_stats,
+                    stats_history: neteq_stats_history.clone(),
+                    buffer_history: buffer_history.clone(),
+                    jitter_history: jitter_history.clone(),
+                    capped: neteq_capped,
+                }
+
+                // ── GROUP 3 — Connection & system ──
+                // The incident-investigation group, demoted to last (owner
+                // decision 1). Order: Connection Manager → Transport Preference →
+                // collapsed Raw stats disclosure (Reception + Sending + Encoder +
+                // Media Status merged) → collapsed Build info at the very bottom.
+                div { class: "diag-group-label", role: "presentation",
                     "Connection & system"
                 }
                 section { class: "diagnostics-section", "aria-labelledby": "diag-h-connection-manager",
@@ -901,167 +1045,78 @@ pub fn Diagnostics(
                         "Changing protocol will reload the page."
                     }
                 }
-                if available_peers.len() > 1 {
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-selection",
-                        h3 { id: "diag-h-peer-selection", "Peer Selection" }
-                        select {
-                            class: "peer-selector",
-                            onchange: move |e: Event<FormData>| {
-                                selected_peer.set(e.value());
-                            },
-                            value: "{current_peer}",
-                            for peer in available_peers.iter() {
-                                {
-                                    let label = if peer == "All Peers" {
-                                        "All Peers".to_string()
-                                    } else {
-                                        peer_display_name(peer)
-                                    };
-                                    rsx! {
-                                        option {
-                                            value: "{peer}",
-                                            selected: peer == &current_peer,
-                                            "{label}"
-                                        }
-                                    }
+                // Raw stats: the four low-level pre-dumps (Reception + Sending +
+                // Encoder + Media Status) folded into ONE native `<details>`
+                // disclosure, COLLAPSED by default (owner decisions 3 & 4) —
+                // omitting the `open` attr keeps it closed. `<details>`/`<summary>`
+                // is keyboard-accessible without extra ARIA.
+                section { class: "diagnostics-section", "aria-labelledby": "diag-h-raw-stats",
+                    details { class: "diag-disclosure",
+                        summary { id: "diag-h-raw-stats", class: "diag-disclosure-summary",
+                            "Raw stats"
+                        }
+                        div { class: "diagnostics-data",
+                            div { class: "diag-raw-block",
+                                h4 { "Reception Stats" }
+                                if let Some(data) = &diag_data {
+                                    pre { "{data}" }
+                                } else {
+                                    p { "No reception data available." }
                                 }
                             }
+                            div { class: "diag-raw-block",
+                                h4 { "Sending Stats" }
+                                if let Some(data) = &send_stats {
+                                    pre { "{data}" }
+                                } else {
+                                    p { "No sending data available." }
+                                }
+                            }
+                            div { class: "diag-raw-block",
+                                h4 { "Encoder Settings" }
+                                if let Some(data) = &enc_settings {
+                                    pre { "{data}" }
+                                } else {
+                                    p { "No encoder settings available." }
+                                }
+                            }
+                            div { class: "diag-raw-block",
+                                h4 { "Media Status" }
+                                pre { "{media_status}" }
+                            }
                         }
-                        p { class: "peer-info", "{peer_info}" }
                     }
                 }
-                div { class: "diagnostics-data",
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-reception-stats",
-                        h3 { id: "diag-h-reception-stats", "Reception Stats" }
-                        if let Some(data) = &diag_data {
-                            pre { "{data}" }
-                        } else {
-                            p { "No reception data available." }
-                        }
-                    }
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-sending-stats",
-                        h3 { id: "diag-h-sending-stats", "Sending Stats" }
-                        if let Some(data) = &send_stats {
-                            pre { "{data}" }
-                        } else {
-                            p { "No sending data available." }
-                        }
-                    }
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-encoder-settings",
-                        h3 { id: "diag-h-encoder-settings", "Encoder Settings" }
-                        if let Some(data) = &enc_settings {
-                            pre { "{data}" }
-                        } else {
-                            p { "No encoder settings available." }
-                        }
-                    }
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-media-status",
-                        h3 { id: "diag-h-media-status", "Media Status" }
-                        pre { "{media_status}" }
-                    }
-                }
+                // Build info: once-per-session content, demoted to the very bottom
+                // inside a collapsed `<details>` (closed by default).
                 section { class: "diagnostics-section", "aria-labelledby": "diag-h-build-info",
-                    h3 { id: "diag-h-build-info", "Build Info" }
-                    div { class: "build-info-table",
-                        div { class: "build-info-header",
-                            span { class: "build-info-cell", "Component" }
-                            span { class: "build-info-cell", "Commit" }
-                            span { class: "build-info-cell", "Branch" }
+                    details { class: "diag-disclosure",
+                        summary { id: "diag-h-build-info", class: "diag-disclosure-summary",
+                            "Build info"
                         }
-                        div { class: "build-info-row",
-                            span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
-                            span { class: "build-info-cell monospace", "" }
-                            span { class: "build-info-cell", "" }
-                        }
-                        for comp in backend_versions() {
-                            {
-                                let svc = comp["service"].as_str().unwrap_or("?").to_string();
-                                let ver = comp["version"].as_str().unwrap_or("").to_string();
-                                let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
-                                let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
-                                let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
-                                rsx! {
-                                    div { class: "build-info-row",
-                                        span { class: "build-info-cell build-info-service", "{label}" }
-                                        span { class: "build-info-cell monospace", "{sha}" }
-                                        span { class: "build-info-cell", "{br}" }
-                                    }
-                                }
+                        div { class: "build-info-table",
+                            div { class: "build-info-header",
+                                span { class: "build-info-cell", "Component" }
+                                span { class: "build-info-cell", "Commit" }
+                                span { class: "build-info-cell", "Branch" }
                             }
-                        }
-                    }
-                }
-
-                // ── GROUP B — Quality controls (the migrated Performance panel) ──
-                // The label AND the panel render together: gating both on
-                // `perf_controls` avoids an orphaned group divider in the sub-second
-                // window before `Host` publishes the handle (#1131 review F3). The
-                // label carries the plain `.diag-group-label` (top border) — it is no
-                // longer the first group, so it never needs `--first`.
-                //
-                // The Performance controls (simulcast strip + per-kind cards with
-                // sliders / Auto / live meters / help) render inside their own
-                // child component so the panel's 250 ms refresh tick + rAF meter
-                // drivers re-render ONLY that subtree — NOT this top-level body
-                // (which re-runs the expensive NetEq prelude). The child also reads
-                // the preference signals, keeping all reactive perf state out of
-                // this body. (#1131 unify, tick-scoping #1128)
-                if let Some(controls) = perf_controls.clone() {
-                    div { class: "diag-group-label", role: "presentation",
-                        "Quality controls"
-                    }
-                    DiagnosticsPerformancePanel { controls, audio_source_active: mic_enabled }
-                }
-
-                // ── GROUP C — Live stream state ──
-                div { class: "diag-group-label", role: "presentation",
-                    "Live stream state"
-                }
-                // Simulcast layers (#1095 §6 MOVE): the per-layer SEND ladder + the
-                // per-peer RECEIVE breakdown. Extracted into its own child so its
-                // 4 Hz refresh tick re-renders ONLY this section, not the NetEq
-                // prelude / charts in this parent (perf review #1).
-                SimulcastLayersSection { is_open, reader: diagnostics_reader.clone() }
-                // Current Status tiles + NetEq charts, with their two info-icon
-                // popovers, live in a child component so toggling a popover
-                // re-renders ONLY that subtree — not this top-level body (which
-                // re-runs the expensive NetEq prelude). The already-computed,
-                // value-typed history/latest are passed in as props; no signal
-                // reads move into the child (tick-scoping #1128).
-                NetEqStatusAndCharts {
-                    latest_stats: latest_neteq_stats,
-                    stats_history: neteq_stats_history.clone(),
-                    buffer_history: buffer_history.clone(),
-                    jitter_history: jitter_history.clone(),
-                }
-                if available_peers.len() > 2 {
-                    section { class: "diagnostics-section", "aria-labelledby": "diag-h-peer-summary",
-                        h3 { id: "diag-h-peer-summary", "Per-Peer Summary" }
-                        div { class: "peer-summary",
-                            {
-                                let transport_map = peer_transport_per_peer();
-                                rsx! {
-                                    for (peer_id, _) in stats_map.iter() {
-                                        {
-                                            let display = peer_display_name(peer_id);
-                                            let latest_buffer = buffer_map.get(peer_id).and_then(|b| b.last()).unwrap_or(&0);
-                                            let latest_jitter = jitter_map.get(peer_id).and_then(|j| j.last()).unwrap_or(&0);
-                                            let summary = format!("Buffer: {latest_buffer}ms, Jitter: {latest_jitter}ms");
-                                            let (badge_label, badge_class, badge_title) = match transport_map.get(peer_id).map(String::as_str) {
-                                                Some("webtransport") => ("WT", "connection-type type-webtransport", "WebTransport"),
-                                                Some("websocket") => ("WS", "connection-type type-websocket", "WebSocket"),
-                                                _ => ("\u{2014}", "connection-type", "Transport unknown"),
-                                            };
-                                            rsx! {
-                                                div { class: "peer-summary-item",
-                                                    strong { "{display}" }
-                                                    div {
-                                                        style: "display:flex; gap:8px; align-items:center;",
-                                                        span { class: "{badge_class}", title: "{badge_title}", "{badge_label}" }
-                                                        span { "{summary}" }
-                                                    }
-                                                }
-                                            }
+                            div { class: "build-info-row",
+                                span { class: "build-info-cell build-info-service", "dioxus-ui (v{env!(\"CARGO_PKG_VERSION\")})" }
+                                span { class: "build-info-cell monospace", "" }
+                                span { class: "build-info-cell", "" }
+                            }
+                            for comp in backend_versions() {
+                                {
+                                    let svc = comp["service"].as_str().unwrap_or("?").to_string();
+                                    let ver = comp["version"].as_str().unwrap_or("").to_string();
+                                    let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
+                                    let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
+                                    let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
+                                    rsx! {
+                                        div { class: "build-info-row",
+                                            span { class: "build-info-cell build-info-service", "{label}" }
+                                            span { class: "build-info-cell monospace", "{sha}" }
+                                            span { class: "build-info-cell", "{br}" }
                                         }
                                     }
                                 }
@@ -1085,12 +1140,13 @@ const HELP_NETEQ_STATUS: &str = "A live snapshot of each peer's audio jitter buf
 /// sentence maps to one chart's real series — see `neteq_chart::ChartConfig`.
 const HELP_NETEQ_CHARTS: &str = "These charts trend the same audio-pipeline metrics over the most recent samples (the X axis is in seconds). Buffer Size vs Target: the live buffer tracking NetEq's target — they should track closely; the buffer dipping toward 0 signals starvation. Decode Operations: how the decoder spent each second — mostly Normal is healthy, while rising Expand (concealment) or Accelerate (catch-up) means the network is delivering audio late or in bursts. Packets Awaiting Decode: queue depth over time — steady is good, a sustained climb means decode can't keep up. Packet Reordering: how often packets arrive out of order (rate in ‱) and the largest sequence gap (in packets) — occasional reordering is normal on the public internet.";
 
-/// Current Status tiles + the NetEq charts grid, with one info-icon popover on
-/// each cluster header (#1131 cleanup). Pulled into its own child so opening a
-/// popover re-renders ONLY this subtree — never the parent [`Diagnostics`] body,
-/// which re-executes the expensive NetEq prelude. The history/latest are passed in
-/// as value-typed props (already computed once per tick by the parent), so no
-/// extra signal reads enter the parent body (tick-scoping #1128).
+/// Current Status tiles + the scrollable NetEq charts, with one info-icon
+/// popover on each cluster header (#1131 cleanup). Pulled into its own child so
+/// opening a popover (a per-subtree signal toggle) re-renders ONLY this subtree —
+/// not the parent [`Diagnostics`] body. The history/latest/capped are passed in
+/// as value-typed props (already-parsed samples cloned once by the parent prelude
+/// — the heavy JSON decode happens in the subscribe loop, not here), so no extra
+/// signal reads enter the parent body (tick-scoping #1128).
 ///
 /// The two popovers share one single-open signal keyed by the help id, so opening
 /// one closes the other — identical to the Performance panel's help behaviour
@@ -1098,10 +1154,13 @@ const HELP_NETEQ_CHARTS: &str = "These charts trend the same audio-pipeline metr
 /// + aria treatment). testids: `diag-status-help`, `diag-charts-help`.
 #[component]
 fn NetEqStatusAndCharts(
-    latest_stats: Option<NetEqStats>,
-    stats_history: Vec<NetEqStats>,
+    latest_stats: Option<NetEqSample>,
+    stats_history: Vec<NetEqSample>,
     buffer_history: Vec<u64>,
     jitter_history: Vec<u64>,
+    /// `true` only when the selected peer's deque is at the 2-hour cap — gates
+    /// each chart's "Showing last 2 hours" caption.
+    capped: bool,
 ) -> Element {
     // Single-open help signal shared by both popovers in this cluster.
     let open_help = use_signal(|| None::<&'static str>);
@@ -1133,22 +1192,21 @@ fn NetEqStatusAndCharts(
                         open_help,
                     }
                 }
-                div { class: "diagnostics-charts",
-                    div { class: "charts-grid",
-                        div { class: "chart-container",
-                            NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::BufferVsTarget, width: 290, height: 200 }
-                        }
-                        div { class: "chart-container",
-                            NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::DecodeOperations, width: 290, height: 200 }
-                        }
+                // Four scrollable charts, 1-up full drawer width, stacked. Each
+                // has a UNIQUE scroll id so the shared `onscroll` scroll-sync can
+                // copy scroll_left onto the other three siblings (one timeline).
+                div { class: "diagnostics-charts neteq-charts-stack",
+                    div { class: "chart-container",
+                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::BufferVsTarget, scroll_id: "neteq-chart-scroll-buffer".to_string(), capped }
                     }
-                    div { class: "charts-grid",
-                        div { class: "chart-container",
-                            NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::QualityMetrics, width: 290, height: 200 }
-                        }
-                        div { class: "chart-container",
-                            NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::ReorderingAnalysis, width: 290, height: 200 }
-                        }
+                    div { class: "chart-container",
+                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::DecodeOperations, scroll_id: "neteq-chart-scroll-decode".to_string(), capped }
+                    }
+                    div { class: "chart-container",
+                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::QualityMetrics, scroll_id: "neteq-chart-scroll-packets".to_string(), capped }
+                    }
+                    div { class: "chart-container",
+                        NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::ReorderingAnalysis, scroll_id: "neteq-chart-scroll-reorder".to_string(), capped }
                     }
                 }
             }
@@ -1169,8 +1227,8 @@ fn NetEqStatusAndCharts(
 /// preference-signal reads (`performance_preference()` / `receive_preference()`)
 /// and the panel's own 250 ms tick + rAF meter drivers are scoped to THIS child,
 /// never the top-level [`Diagnostics`] body — reading the prefs here subscribes
-/// only this subtree, and the panel re-renders here, so the parent's expensive
-/// NetEq prelude is not re-run on perf interactions (tick-scoping #1128).
+/// only this subtree, and the panel re-renders here, so the parent body is not
+/// re-run on perf interactions (tick-scoping #1128).
 ///
 /// All controls come from the `PerfControlsHandle` Host publishes; `audio_source_active`
 /// (the live mic-capture state) is forwarded from the drawer's `mic_enabled` prop.
@@ -1207,8 +1265,9 @@ fn DiagnosticsPerformancePanel(controls: PerfControlsHandle, audio_source_active
 
 /// The live "Simulcast layers" section, extracted into its OWN component so its
 /// 4 Hz refresh tick re-renders only this small subtree — NOT the parent
-/// [`Diagnostics`] body (which re-executes the expensive NetEq prelude). This is
-/// the scoped-subscription pattern the perf meters already use (perf review #1).
+/// [`Diagnostics`] body (which should re-render at the throttled ≤1 Hz NetEq
+/// sample cadence, not 4×/sec). This is the scoped-subscription pattern the perf
+/// meters already use (perf review #1).
 ///
 /// Owns the 250 ms `gloo` `Interval` (gated to `is_open`, dropped on unmount via
 /// `use_drop`) and the three live reads off the `DiagnosticsReader`. The reader's

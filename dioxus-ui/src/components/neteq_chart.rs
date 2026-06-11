@@ -1,62 +1,131 @@
 use dioxus::prelude::*;
+use gloo_timers::future::TimeoutFuture;
 pub use neteq::NetEqStats as RawNetEqStats;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 
 use crate::theme::color as theme_color;
 
-// UI-friendly structure for charts (keeping the old one)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub struct NetEqStats {
-    pub timestamp: u64,
+/// Hard per-peer retention cap for the scrollable NetEq time-series: 2 hours at
+/// ≤1 sample/sec (owner decision 2). At ~64 B/sample this is ~460 KB/peer.
+pub const NETEQ_SAMPLE_CAP: usize = 7200;
+
+/// X-axis density for the scrollable charts: pixels per elapsed second. Mirrors
+/// the signal-quality popup idiom (`px_per_sec`).
+pub const NETEQ_PX_PER_SEC: f64 = 8.0;
+
+/// Compact, parse-once NetEq sample stored in the per-peer ring buffer that
+/// backs the scrollable charts AND the Current Status tiles (one storage, no
+/// second path). Decoded from each incoming `stats_json` ONCE in the subscribe
+/// loop (`NetEqSample::from_json`) so the render path never re-parses retained
+/// JSON — the old O(n)-per-event `parse_neteq_stats_history` is gone (#1223).
+///
+/// ~64 B/sample → ~460 KB at the 2-hour cap, ~4.6 MB across 10 peers.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NetEqSample {
+    /// Wall-clock-ish event timestamp (`DiagEvent::ts_ms`) — the REAL sample
+    /// time, replacing the old hard-coded `timestamp: 0`. Drives the time-based
+    /// X axis (`neteq_x`) and the growing chart width (`neteq_chart_width`).
+    pub timestamp_ms: u64,
     pub buffer_ms: u32,
     pub target_ms: u32,
     pub packets_awaiting_decode: u32,
     pub packets_per_sec: u32,
-    pub expand_rate: f32,
-    pub accel_rate: f32,
-    pub reorder_rate: u32,
-    pub reordered_packets: u32,
-    pub max_reorder_distance: u32,
-    pub sequence_number: u32,
-    pub rtp_timestamp: u32,
-    // Operation counters per second
+    // The five DecodeOperations series (the surviving decode-ops chart plots
+    // exactly these five — see `ChartConfig::decode_operations`).
     pub normal_per_sec: f32,
     pub expand_per_sec: f32,
     pub accelerate_per_sec: f32,
-    pub fast_accelerate_per_sec: f32,
     pub preemptive_expand_per_sec: f32,
     pub merge_per_sec: f32,
-    pub comfort_noise_per_sec: f32,
-    pub dtmf_per_sec: f32,
-    pub undefined_per_sec: f32,
+    /// Per-mille (‰) — the `From<RawNetEqStats>` impl converts the Q14 raw via
+    /// `q14::to_per_mille`, and the status tiles render the ‰ unit. Kept in
+    /// per-mille here so the tile read needs no further conversion.
+    pub expand_rate: f32,
+    /// Per-mille (‰), same convention as `expand_rate`.
+    pub accel_rate: f32,
+    /// Per-myriad (‱), straight from `reorder_rate_permyriad` (a `u16`).
+    pub reorder_rate: u32,
+    pub reordered_packets: u32,
+    pub max_reorder_distance: u32,
 }
 
-impl From<RawNetEqStats> for NetEqStats {
-    fn from(raw: RawNetEqStats) -> Self {
+impl NetEqSample {
+    /// Parse one incoming `stats_json` line into a compact sample, ONCE, at
+    /// arrival. `ts_ms` is the diag event's real `ts_ms`. Malformed JSON →
+    /// `None` (no panic; a `log::warn!` records the parse error) so a single bad
+    /// frame can't poison the ring buffer.
+    pub fn from_json(json: &str, ts_ms: u64) -> Option<Self> {
+        match serde_json::from_str::<RawNetEqStats>(json) {
+            Ok(raw) => Some(Self::from_raw(raw, ts_ms)),
+            Err(e) => {
+                log::warn!("[NetEqSample::from_json] failed to parse stats_json: {e}");
+                None
+            }
+        }
+    }
+
+    /// Map a decoded `RawNetEqStats` into the compact sample, applying the
+    /// `q14::to_per_mille` conversion to the expand/accel rates so the tiles
+    /// (which render the ‰ unit) read the stored value directly.
+    fn from_raw(raw: RawNetEqStats, ts_ms: u64) -> Self {
         Self {
-            timestamp: 0,
+            timestamp_ms: ts_ms,
             buffer_ms: raw.current_buffer_size_ms,
             target_ms: raw.target_delay_ms,
             packets_awaiting_decode: raw.packets_awaiting_decode as u32,
             packets_per_sec: raw.packets_per_sec,
+            normal_per_sec: raw.network.operation_counters.normal_per_sec,
+            expand_per_sec: raw.network.operation_counters.expand_per_sec,
+            accelerate_per_sec: raw.network.operation_counters.accelerate_per_sec,
+            preemptive_expand_per_sec: raw.network.operation_counters.preemptive_expand_per_sec,
+            merge_per_sec: raw.network.operation_counters.merge_per_sec,
             expand_rate: neteq::q14::to_per_mille(raw.network.expand_rate),
             accel_rate: neteq::q14::to_per_mille(raw.network.accelerate_rate),
             reorder_rate: raw.network.reorder_rate_permyriad as u32,
             reordered_packets: raw.network.reordered_packets,
             max_reorder_distance: raw.network.max_reorder_distance as u32,
-            sequence_number: 0,
-            rtp_timestamp: 0,
-            normal_per_sec: raw.network.operation_counters.normal_per_sec,
-            expand_per_sec: raw.network.operation_counters.expand_per_sec,
-            accelerate_per_sec: raw.network.operation_counters.accelerate_per_sec,
-            fast_accelerate_per_sec: raw.network.operation_counters.fast_accelerate_per_sec,
-            preemptive_expand_per_sec: raw.network.operation_counters.preemptive_expand_per_sec,
-            merge_per_sec: raw.network.operation_counters.merge_per_sec,
-            comfort_noise_per_sec: raw.network.operation_counters.comfort_noise_per_sec,
-            dtmf_per_sec: raw.network.operation_counters.dtmf_per_sec,
-            undefined_per_sec: raw.network.operation_counters.undefined_per_sec,
         }
     }
+}
+
+/// Push a sample into the per-peer ring buffer, enforcing the 2-hour cap by
+/// dropping the OLDEST sample (`pop_front`) before appending. Extracted as a
+/// free fn so the retention behaviour is unit-testable without the subscribe
+/// loop. (#1223)
+pub fn push_capped(deque: &mut VecDeque<NetEqSample>, sample: NetEqSample) {
+    if deque.len() >= NETEQ_SAMPLE_CAP {
+        deque.pop_front();
+    }
+    deque.push_back(sample);
+}
+
+/// Throttle decision: keep at most one sample per second per peer. Returns
+/// `true` when there is no prior push (`None`) OR at least 1000 ms have elapsed
+/// since the last kept push. Extracted so the loop's per-peer throttle is
+/// unit-testable. (#1223)
+pub fn should_push(last_push_ms: Option<u64>, now_ms: u64) -> bool {
+    match last_push_ms {
+        None => true,
+        Some(last) => now_ms.saturating_sub(last) >= 1000,
+    }
+}
+
+/// Total chart width in px for the scrollable, growing SVG. Mirrors the
+/// signal-quality formula `(total_seconds * px_per_sec).max(min_width) + 10`.
+/// `total_seconds` is derived from the OLDEST RETAINED sample (`first_ts`) — NOT
+/// meeting start — so once the deque is capped the visible span honestly tracks
+/// what is actually retained (this differs from `signal_quality`, which anchors
+/// `first_ts` to `meeting_start_ms` for cross-peer comparability). (#1223)
+pub fn neteq_chart_width(first_ts: u64, last_ts: u64, px_per_sec: f64, min_width: f64) -> f64 {
+    let total_seconds = ((last_ts.saturating_sub(first_ts)) as f64 / 1000.0).max(1.0);
+    (total_seconds * px_per_sec).max(min_width) + 10.0
+}
+
+/// X coordinate (px) for a sample at `ts_ms`, relative to the oldest retained
+/// sample at `first_ts`, at `px_per_sec`. Mirrors signal_quality.rs:2338. (#1223)
+pub fn neteq_x(ts_ms: u64, first_ts: u64, px_per_sec: f64) -> f64 {
+    (ts_ms.saturating_sub(first_ts) as f64 / 1000.0) * px_per_sec
 }
 
 // Chart data series configuration
@@ -76,18 +145,28 @@ pub struct ChartConfig {
     pub max_value: f64,
 }
 
+/// Scrollable, time-based NetEq chart. Mirrors the signal-quality popup idiom
+/// (signal_quality.rs:2287-2522): a fixed external Y-axis `<svg>` OUTSIDE the
+/// scroll box, then a `.neteq-chart-scroll` div holding a growing inner SVG
+/// whose width tracks elapsed seconds. The four NetEq charts share one timeline
+/// (each has a unique scroll id; `onscroll` copies `scroll_left` to the sibling
+/// `.neteq-chart-scroll` elements). X-axis time labels live INSIDE the scrolling
+/// SVG (seconds from the OLDEST RETAINED sample); Y labels live in the fixed SVG.
 #[component]
-fn BaseChart(config: ChartConfig, data_len: usize, width: u32, height: u32) -> Element {
-    let chart_width = width as f64;
-    let chart_height = height as f64;
-    let margin_left = 60.0;
-    let margin_bottom = 40.0;
-    let margin_top = 30.0;
-    let margin_right = 20.0;
-    let plot_width = chart_width - margin_left - margin_right;
-    let plot_height = chart_height - margin_bottom - margin_top;
-
-    if data_len == 0 {
+fn BaseChart(
+    config: ChartConfig,
+    /// The samples backing this chart, index-aligned with every series'
+    /// `data_points`. Drives the time-based X (`first_ts` = oldest retained).
+    samples: Vec<NetEqSample>,
+    /// Unique scroll-container id (one per chart) so scroll-sync can target the
+    /// other three siblings without self-targeting.
+    scroll_id: String,
+    /// `true` only when the peer's deque is at the 2-hour cap — gates the
+    /// "Showing last 2 hours" caption (owner decision 2).
+    capped: bool,
+) -> Element {
+    // Empty → the "No data available" placeholder; never a mega-wide empty SVG.
+    if samples.is_empty() {
         return rsx! {
             div { class: "neteq-advanced-chart",
                 div { class: "chart-title", "{config.title}" }
@@ -96,7 +175,25 @@ fn BaseChart(config: ChartConfig, data_len: usize, width: u32, height: u32) -> E
         };
     }
 
-    // Generate polylines for each series
+    // Drawing geometry: fixed height; the draw band is height − top − bottom.
+    let chart_height: f64 = 160.0;
+    let padding_top: f64 = 24.0;
+    let padding_bottom: f64 = 22.0;
+    let draw_height = chart_height - padding_top - padding_bottom; // 114
+
+    // Time axis: first_ts is the OLDEST RETAINED sample (honest axis after cap),
+    // NOT meeting start. last_ts is the newest. The width grows with elapsed
+    // seconds and honours a min viewport so short meetings don't look squashed.
+    let first_ts = samples.first().map(|s| s.timestamp_ms).unwrap_or(0);
+    let last_ts = samples.last().map(|s| s.timestamp_ms).unwrap_or(first_ts);
+    // Min viewport so the chart fills the drawer before it needs to scroll.
+    let min_width = 600.0;
+    let chart_width = neteq_chart_width(first_ts, last_ts, NETEQ_PX_PER_SEC, min_width);
+    let total_seconds = ((last_ts.saturating_sub(first_ts)) as f64 / 1000.0).max(1.0);
+
+    let max_value = config.max_value.max(1.0);
+
+    // One polyline per series, x from real sample time, y normalized to max_value.
     let series_elements: Vec<Element> = config
         .series
         .iter()
@@ -106,96 +203,147 @@ fn BaseChart(config: ChartConfig, data_len: usize, width: u32, height: u32) -> E
                 .iter()
                 .enumerate()
                 .map(|(i, &value)| {
-                    let x = margin_left + (i as f64 / (data_len - 1).max(1) as f64 * plot_width);
-                    let y = margin_top + plot_height
-                        - (value.max(0.0) / config.max_value * plot_height);
-                    if y.is_finite() {
-                        format!("{x:.1},{y:.1}")
-                    } else {
-                        let height = margin_top + plot_height;
-                        format!("{x:.1},{height:.1}")
-                    }
+                    let ts = samples.get(i).map(|s| s.timestamp_ms).unwrap_or(first_ts);
+                    let x = neteq_x(ts, first_ts, NETEQ_PX_PER_SEC);
+                    let normalized = (value.max(0.0) / max_value).clamp(0.0, 1.0);
+                    let y = padding_top + draw_height * (1.0 - normalized);
+                    format!("{x:.1},{y:.1}")
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
             let color = series.color;
             rsx! {
-                polyline { points: "{points}", fill: "none", stroke: "{color}", stroke_width: "2" }
+                polyline {
+                    points: "{points}",
+                    fill: "none",
+                    stroke: "{color}",
+                    stroke_width: "1.5",
+                    stroke_linejoin: "round",
+                }
             }
         })
         .collect();
 
-    // Generate legend
+    // Legend: small colored labels pinned to the visible viewport via the fixed
+    // Y-axis svg is awkward; instead render them in the scrolling svg near the
+    // left edge so they ride with the start of the timeline.
     let legend_elements: Vec<Element> = config
         .series
         .iter()
         .enumerate()
         .map(|(i, series)| {
-            let y_pos = 15 + (i * 15) as i32;
+            let y_pos = 12 + (i as i32 * 13);
             let color = series.color;
             let label = series.label;
             rsx! {
-                text { x: "5", y: "{y_pos}", fill: "{color}", font_size: "10", "{label}" }
+                text { x: "4", y: "{y_pos}", fill: "{color}", font_size: "9", "{label}" }
             }
         })
         .collect();
 
-    let ml = margin_left.to_string();
-    let mt = margin_top.to_string();
-    let ph_mt = (plot_height + margin_top).to_string();
-    let cw_mr = (chart_width - margin_right).to_string();
-    let ml5 = (margin_left - 5.0).to_string();
-    let mid_y = (margin_top + plot_height / 2.0).to_string();
-    let ml_pw = (margin_left + plot_width).to_string();
-    let ph_mt5 = (plot_height + margin_top + 5.0).to_string();
-    let y_zero_label = (plot_height + margin_top + 4.0).to_string();
-    let y_mid_label = (margin_top + plot_height / 2.0 + 4.0).to_string();
-    let y_max_label = (margin_top + 4.0).to_string();
-    let ml10 = (margin_left - 10.0).to_string();
-    let ch10 = (chart_height - 10.0).to_string();
-    let mid_x = (margin_left + plot_width / 2.0).to_string();
-    let half_max = format!("{:.1}", config.max_value / 2.0);
-    let max_str = format!("{:.1}", config.max_value);
-    let mid_time = format!("{}s", data_len / 2);
-    let max_time = format!("{}s", data_len);
-    let rotate_transform = format!("rotate(-90, 5, {})", margin_top + plot_height / 2.0);
-    let view_box = format!("0 0 {width} {height}");
-    let cx2 = (chart_width / 2.0).to_string();
+    // X-axis tick labels every 10s, inside the scrolling SVG.
+    let tick_interval = 10.0_f64;
+    let num_ticks = (total_seconds / tick_interval).ceil() as usize + 1;
+
+    // Y-axis labels (fixed external svg): 0 / half / max.
+    let y_zero = padding_top + draw_height;
+    let y_mid = padding_top + draw_height * 0.5;
+    let half_max = format!("{:.1}", max_value / 2.0);
+    let max_str = format!("{max_value:.1}");
+
+    let chart_width_str = format!("{chart_width:.0}");
+    let chart_width_px = format!("{chart_width:.0}px");
+    let chart_height_str = format!("{chart_height:.0}");
+    let x_axis_y = chart_height - 6.0; // baseline for the time labels
+
+    // Auto-follow: after each render, stick to the right edge ONLY if the user
+    // is already within 20px of it (never interrupt a deliberate scroll-back).
+    // INSTANT `set_scroll_left` (no smooth behavior) — reduced-motion safe.
+    // `scroll_id` is read inside the spawned closure so the effect re-runs each
+    // render as the SVG grows. (mirror signal_quality.rs:2371-2384)
+    let scroll_id_for_follow = scroll_id.clone();
+    spawn(async move {
+        TimeoutFuture::new(0).await;
+        if let Some(el) = gloo_utils::document().get_element_by_id(&scroll_id_for_follow) {
+            let at_end = el.scroll_left() + el.client_width() >= el.scroll_width() - 20;
+            if at_end {
+                el.set_scroll_left(el.scroll_width());
+            }
+        }
+    });
 
     rsx! {
         div { class: "neteq-advanced-chart",
             div { class: "chart-title", "{config.title}" }
-            svg {
-                width: "{width}",
-                height: "{height}",
-                view_box: "{view_box}",
-                // Y-axis
-                line { x1: "{ml}", y1: "{mt}", x2: "{ml}", y2: "{ph_mt}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
-                // X-axis
-                line { x1: "{ml}", y1: "{ph_mt}", x2: "{cw_mr}", y2: "{ph_mt}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
-                // Y-axis tick marks
-                line { x1: "{ml5}", y1: "{mt}", x2: "{ml}", y2: "{mt}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
-                line { x1: "{ml5}", y1: "{mid_y}", x2: "{ml}", y2: "{mid_y}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
-                line { x1: "{ml5}", y1: "{ph_mt}", x2: "{ml}", y2: "{ph_mt}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
-                // X-axis tick marks
-                line { x1: "{ml}", y1: "{ph_mt}", x2: "{ml}", y2: "{ph_mt5}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
-                line { x1: "{ml_pw}", y1: "{ph_mt}", x2: "{ml_pw}", y2: "{ph_mt5}", stroke: "{theme_color::AXIS}", stroke_width: "1" }
-                // Data series
-                for elem in series_elements { {elem} }
-                // Legend
-                for elem in legend_elements { {elem} }
-                // Y-axis labels
-                text { x: "{ml10}", y: "{y_zero_label}", fill: "{theme_color::TEXT_MUTED}", font_size: "12", text_anchor: "end", "0" }
-                text { x: "{ml10}", y: "{y_mid_label}", fill: "{theme_color::TEXT_MUTED}", font_size: "12", text_anchor: "end", "{half_max}" }
-                text { x: "{ml10}", y: "{y_max_label}", fill: "{theme_color::TEXT_MUTED}", font_size: "12", text_anchor: "end", "{max_str}" }
-                // X-axis time labels
-                text { x: "{ml_pw}", y: "{ch10}", fill: "{theme_color::TEXT_MUTED}", font_size: "13", text_anchor: "middle", "0s" }
-                text { x: "{mid_x}", y: "{ch10}", fill: "{theme_color::TEXT_MUTED}", font_size: "13", text_anchor: "middle", "{mid_time}" }
-                text { x: "{ml}", y: "{ch10}", fill: "{theme_color::TEXT_MUTED}", font_size: "13", text_anchor: "middle", "{max_time}" }
-                // Y-axis unit label
-                text { x: "5", y: "{mid_y}", fill: "{theme_color::TEXT_MUTED}", font_size: "11", transform: "{rotate_transform}", "{config.y_axis_label}" }
-                // Chart title
-                text { x: "{cx2}", y: "15", fill: "{theme_color::TEXT_PRIMARY}", font_size: "14", text_anchor: "middle", font_weight: "bold", "{config.title}" }
+            div { class: "neteq-chart-wrapper",
+                // Fixed Y-axis overlay (outside the scroll box).
+                svg {
+                    class: "neteq-chart-y-axis",
+                    width: "48",
+                    height: "{chart_height_str}",
+                    view_box: "0 0 48 {chart_height_str}",
+                    // Y-axis labels
+                    text { x: "44", y: "{y_zero}", fill: "{theme_color::TEXT_MUTED}", font_size: "10", text_anchor: "end", dominant_baseline: "middle", "0" }
+                    text { x: "44", y: "{y_mid}", fill: "{theme_color::TEXT_MUTED}", font_size: "10", text_anchor: "end", dominant_baseline: "middle", "{half_max}" }
+                    text { x: "44", y: "{padding_top}", fill: "{theme_color::TEXT_MUTED}", font_size: "10", text_anchor: "end", dominant_baseline: "middle", "{max_str}" }
+                    // Y-axis unit label (rotated)
+                    text { x: "10", y: "{y_mid}", fill: "{theme_color::TEXT_MUTED}", font_size: "9", text_anchor: "middle", transform: "rotate(-90, 10, {y_mid})", "{config.y_axis_label}" }
+                }
+                // Scrollable chart area (growing inner SVG).
+                div {
+                    class: "neteq-chart-scroll",
+                    id: "{scroll_id}",
+                    onscroll: {
+                        let scroll_id = scroll_id.clone();
+                        move |_| {
+                            // Scroll-sync: copy this box's scroll_left onto the
+                            // other `.neteq-chart-scroll` siblings so the four
+                            // charts share one timeline. (signal_quality.rs:2501)
+                            let doc = gloo_utils::document();
+                            if let Some(src) = doc.get_element_by_id(&scroll_id) {
+                                let scroll_left = src.scroll_left();
+                                let els = doc.get_elements_by_class_name("neteq-chart-scroll");
+                                for i in 0..els.length() {
+                                    if let Some(el) = els.item(i) {
+                                        if el.id() != scroll_id {
+                                            el.set_scroll_left(scroll_left);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    svg {
+                        xmlns: "http://www.w3.org/2000/svg",
+                        width: "{chart_width_px}",
+                        height: "{chart_height_str}",
+                        view_box: "0 0 {chart_width_str} {chart_height_str}",
+                        // X/Y plot frame
+                        line { x1: "0", y1: "{y_zero}", x2: "{chart_width_str}", y2: "{y_zero}", stroke: "{theme_color::AXIS}", stroke_width: "0.5" }
+                        // X-axis ticks + time labels (every 10s)
+                        for tick_i in 0..num_ticks {
+                            {
+                                let t = tick_i as f64 * tick_interval;
+                                let x = t * NETEQ_PX_PER_SEC;
+                                let mins = (t / 60.0).floor() as u32;
+                                let secs = (t % 60.0).floor() as u32;
+                                let label = if mins > 0 { format!("{mins}m{secs:02}s") } else { format!("{secs}s") };
+                                rsx! {
+                                    line { x1: "{x}", y1: "{padding_top}", x2: "{x}", y2: "{y_zero}", stroke: "{theme_color::SIGNAL_GRID_MINOR}", stroke_width: "0.5" }
+                                    text { x: "{x}", y: "{x_axis_y}", fill: "{theme_color::TEXT_MUTED}", font_size: "9", text_anchor: "middle", "{label}" }
+                                }
+                            }
+                        }
+                        // Data series
+                        for elem in series_elements { {elem} }
+                        // Legend (rides the left of the timeline)
+                        for elem in legend_elements { {elem} }
+                    }
+                }
+            }
+            // 2-hour retention caption — ONLY at the cap (owner decision 2).
+            if capped {
+                div { class: "neteq-chart-cap-note", "Showing last 2 hours" }
             }
         }
     }
@@ -214,8 +362,8 @@ pub enum AdvancedChartType {
     QualityMetrics,
     ReorderingAnalysis,
     // `SystemPerformance` was removed (#1131 cleanup): its only two series
-    // (`calls_per_sec`, `avg_frames`) were never populated — the `From<RawNetEqStats>`
-    // impl hard-coded both to 0 — so the chart was a permanently flat line at zero.
+    // (`calls_per_sec`, `avg_frames`) were never populated — they are not part of
+    // `RawNetEqStats` at all — so the chart was a permanently flat line at zero.
 }
 
 impl ChartType {
@@ -315,7 +463,7 @@ pub fn NetEqChart(data: Vec<u64>, chart_type: ChartType, width: u32, height: u32
 
 // Helper functions to create chart configurations
 impl ChartConfig {
-    pub fn buffer_vs_target(stats_history: &[NetEqStats]) -> Self {
+    pub fn buffer_vs_target(stats_history: &[NetEqSample]) -> Self {
         let max_buffer = stats_history
             .iter()
             .map(|s| s.buffer_ms.max(s.target_ms))
@@ -345,18 +493,19 @@ impl ChartConfig {
         }
     }
 
-    pub fn decode_operations(stats_history: &[NetEqStats]) -> Self {
+    pub fn decode_operations(stats_history: &[NetEqSample]) -> Self {
+        // Y ceiling = the max across exactly the FIVE plotted series. The compact
+        // `NetEqSample` intentionally omits fast_accelerate / comfort_noise / dtmf
+        // (they were never plotted — only padded the old MAX), so the axis ceiling
+        // now matches the data on screen (#1223).
         let max_ops = stats_history
             .iter()
             .map(|s| {
                 s.normal_per_sec
                     .max(s.expand_per_sec)
                     .max(s.accelerate_per_sec)
-                    .max(s.fast_accelerate_per_sec)
                     .max(s.preemptive_expand_per_sec)
                     .max(s.merge_per_sec)
-                    .max(s.comfort_noise_per_sec)
-                    .max(s.dtmf_per_sec)
             })
             .fold(1.0f32, f32::max)
             .max(1.0) as f64;
@@ -414,7 +563,7 @@ impl ChartConfig {
         }
     }
 
-    pub fn quality_metrics(stats_history: &[NetEqStats]) -> Self {
+    pub fn quality_metrics(stats_history: &[NetEqSample]) -> Self {
         let max_packets = stats_history
             .iter()
             .map(|s| s.packets_awaiting_decode)
@@ -423,8 +572,9 @@ impl ChartConfig {
             .max(1) as f64;
         // Single real series: packets buffered but not yet decoded (queue depth).
         // The former "Underruns" series was dropped (#1131 cleanup) — `underruns`
-        // is never populated (hard-coded 0 in `From<RawNetEqStats>`), so it plotted
-        // a flat line at zero and the unexplained ×0.3 scale only confused the axis.
+        // was never populated (it isn't a `RawNetEqStats`/`NetEqSample` field), so
+        // it plotted a flat line at zero and the unexplained ×0.3 scale only
+        // confused the axis.
         Self {
             title: "Packets Awaiting Decode",
             y_axis_label: "Packets",
@@ -441,7 +591,7 @@ impl ChartConfig {
         }
     }
 
-    pub fn reordering_analysis(stats_history: &[NetEqStats]) -> Self {
+    pub fn reordering_analysis(stats_history: &[NetEqSample]) -> Self {
         let max_rate = stats_history
             .iter()
             .map(|s| s.reorder_rate)
@@ -488,10 +638,13 @@ impl ChartConfig {
 
 #[component]
 pub fn NetEqAdvancedChart(
-    stats_history: Vec<NetEqStats>,
+    stats_history: Vec<NetEqSample>,
     chart_type: AdvancedChartType,
-    width: u32,
-    height: u32,
+    /// Unique scroll-container id so the four stacked charts can scroll-sync
+    /// without self-targeting (see `BaseChart`).
+    scroll_id: String,
+    /// `true` only at the 2-hour cap → gates the "Showing last 2 hours" caption.
+    capped: bool,
 ) -> Element {
     if stats_history.is_empty() {
         return rsx! {
@@ -510,24 +663,16 @@ pub fn NetEqAdvancedChart(
     };
 
     rsx! {
-        BaseChart { config: config, data_len: stats_history.len(), width: width, height: height }
+        BaseChart { config, samples: stats_history, scroll_id, capped }
     }
 }
 
+/// Current Status tiles for the newest NetEq sample. Styling lives ONCE in
+/// `style.css` under `.neteq-status .status-*` (the inline `<style>` dup that
+/// disagreed with the global `.status-*` block was removed in iteration 3 — the
+/// drawer-scoped, namespaced rules are now the single source of truth).
 #[component]
-pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
-    let common_styles = r#"
-        .neteq-status { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
-        .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; padding: 8px; }
-        .status-item { background: rgba(255, 255, 255, 0.05); border-radius: 8px; padding: 20px 16px; text-align: center; border: 1px solid rgba(255, 255, 255, 0.1); transition: all 0.2s ease; min-height: 120px; display: flex; flex-direction: column; justify-content: flex-start; align-items: center; gap: 8px; }
-        .status-item:hover { background: rgba(255, 255, 255, 0.08); border-color: rgba(255, 255, 255, 0.2); }
-        .status-value { font-size: 36px; font-weight: 700; line-height: 1; color: #ffffff; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.3); white-space: nowrap; margin: 0; padding: 0; }
-        .status-value.good { color: #10b981; }
-        .status-value.warning { color: #f59e0b; }
-        .status-label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; color: #d1d5db; line-height: 1.2; text-align: center; max-width: 100%; margin: 0; padding: 0; width: 100%; }
-        .status-subtitle { font-size: 9px; color: #9ca3af; line-height: 1.3; font-weight: 400; text-align: center; max-width: 100%; margin: 0; padding: 0; width: 100%; }
-    "#;
-
+pub fn NetEqStatusDisplay(latest_stats: Option<NetEqSample>) -> Element {
     if let Some(stats) = latest_stats {
         let buffer_class = if stats.buffer_ms == 0 {
             "status-value warning"
@@ -546,7 +691,6 @@ pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
         let accel_str = format!("{:.1}\u{2030}", stats.accel_rate);
 
         rsx! {
-            style { "{common_styles}" }
             div { class: "neteq-status",
                 div { class: "status-grid",
                     div { class: "status-item", div { class: "{buffer_class}", "{stats.buffer_ms}" } div { class: "status-label", "BUFFER (MS)" } div { class: "status-subtitle", "Audio data buffered for playback" } }
@@ -563,7 +707,6 @@ pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
         }
     } else {
         rsx! {
-            style { "{common_styles}" }
             div { class: "neteq-status",
                 div { class: "status-grid",
                     div { class: "status-item", div { class: "status-value", "--" } div { class: "status-label", "BUFFER (MS)" } div { class: "status-subtitle", "Audio data buffered for playback" } }
@@ -584,18 +727,19 @@ pub fn NetEqStatusDisplay(latest_stats: Option<NetEqStats>) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
-    /// Build a chart `NetEqStats` from the raw NetEq stats via the real `From`
-    /// conversion, so the tests exercise the actual data path (not a hand-rolled
-    /// fixture that could drift from production mapping).
-    fn raw_with(
+    /// Build a compact `NetEqSample` from raw NetEq stats via the real
+    /// `from_raw` mapping, so the chart-config tests exercise the actual data
+    /// path (not a hand-rolled fixture that could drift from production mapping).
+    fn sample_with(
         buffer_ms: u16,
         target_ms: u32,
         packets_awaiting: usize,
         expand_q14: u16,
         reorder_permyriad: u16,
         max_reorder_distance: u16,
-    ) -> NetEqStats {
+    ) -> NetEqSample {
         let mut raw = RawNetEqStats {
             network: neteq::statistics::NetworkStatistics::default(),
             lifetime: neteq::statistics::LifetimeStatistics::default(),
@@ -607,7 +751,15 @@ mod tests {
         raw.network.expand_rate = expand_q14;
         raw.network.reorder_rate_permyriad = reorder_permyriad;
         raw.network.max_reorder_distance = max_reorder_distance;
-        raw.into()
+        NetEqSample::from_raw(raw, 0)
+    }
+
+    /// A minimal sample carrying only a timestamp — for the cap / time-axis
+    /// tests where only `timestamp_ms` matters.
+    fn sample_at(ts_ms: u64) -> NetEqSample {
+        let mut s = sample_with(0, 0, 0, 0, 0, 0);
+        s.timestamp_ms = ts_ms;
+        s
     }
 
     /// `AdvancedChartType` must hold exactly the four surviving charts —
@@ -643,7 +795,10 @@ mod tests {
     /// never populated; if it is re-added this length flips to 2 and fails.
     #[test]
     fn quality_metrics_has_single_packets_series() {
-        let stats = vec![raw_with(80, 100, 5, 0, 0, 0), raw_with(80, 100, 9, 0, 0, 0)];
+        let stats = vec![
+            sample_with(80, 100, 5, 0, 0, 0),
+            sample_with(80, 100, 9, 0, 0, 0),
+        ];
         let cfg = ChartConfig::quality_metrics(&stats);
         assert_eq!(cfg.series.len(), 1, "only the packets series should remain");
         assert_eq!(cfg.series[0].label, "Packets");
@@ -658,7 +813,7 @@ mod tests {
     /// the one Y axis — the old label was the ambiguous "Rate/Distance".
     #[test]
     fn reordering_analysis_labels_carry_units() {
-        let stats = vec![raw_with(80, 100, 5, 0, 30, 4)];
+        let stats = vec![sample_with(80, 100, 5, 0, 30, 4)];
         let cfg = ChartConfig::reordering_analysis(&stats);
         assert_eq!(cfg.series.len(), 2);
         assert!(
@@ -670,11 +825,178 @@ mod tests {
         assert_eq!(cfg.series[1].label, "Max distance (pkts)");
     }
 
-    /// The `From` conversion renders Q14 expand/accel fractions as per-mille (‰),
-    /// which is why the status tiles append the ‰ unit. 4096 Q14 = 250‰ (= 25%).
+    /// Parse-once: `NetEqSample::from_json` extracts the exact mapped fields and
+    /// renders the Q14 expand fraction as per-mille (4096 Q14 → 250‰), which is
+    /// why the status tiles append the ‰ unit. Catches a wrong field map or a
+    /// dropped q14 conversion. We serialize a REAL `RawNetEqStats` so the test
+    /// rides the production serde path (no hand-built JSON that could drift).
     #[test]
-    fn expand_rate_converts_q14_to_per_mille() {
-        let stats = raw_with(80, 100, 0, 4096, 0, 0);
-        assert!((stats.expand_rate - 250.0).abs() < 0.01);
+    fn from_json_maps_fields_and_converts_q14_to_per_mille() {
+        // 4096 Q14 = 250‰; buffer 80, target 100, packets 5, reorder 30‱.
+        let mut raw = RawNetEqStats {
+            network: neteq::statistics::NetworkStatistics::default(),
+            lifetime: neteq::statistics::LifetimeStatistics::default(),
+            current_buffer_size_ms: 80,
+            target_delay_ms: 100,
+            packets_awaiting_decode: 5,
+            packets_per_sec: 42,
+        };
+        raw.network.expand_rate = 4096;
+        raw.network.reorder_rate_permyriad = 30;
+        raw.network.reordered_packets = 7;
+        raw.network.max_reorder_distance = 4;
+        raw.network.operation_counters.normal_per_sec = 50.0;
+        let json = serde_json::to_string(&raw).expect("raw serializes");
+
+        let s = NetEqSample::from_json(&json, 12345).expect("valid json parses");
+        assert_eq!(s.timestamp_ms, 12345);
+        assert_eq!(s.buffer_ms, 80);
+        assert_eq!(s.target_ms, 100);
+        assert_eq!(s.packets_awaiting_decode, 5);
+        assert_eq!(s.packets_per_sec, 42);
+        assert_eq!(s.reorder_rate, 30);
+        assert_eq!(s.reordered_packets, 7);
+        assert_eq!(s.max_reorder_distance, 4);
+        assert!((s.normal_per_sec - 50.0).abs() < 0.001);
+        assert!(
+            (s.expand_rate - 250.0).abs() < 0.01,
+            "4096 Q14 must map to 250‰, got {}",
+            s.expand_rate
+        );
+
+        // Malformed JSON → None, no panic.
+        assert!(NetEqSample::from_json("{ not json", 1).is_none());
+    }
+
+    /// Retention cap: pushing 7201 samples leaves exactly 7200 and drops the
+    /// OLDEST. The first retained element must be the SECOND-pushed sample, not
+    /// the first. Catches `pop_back` instead of `pop_front`, or a wrong cap.
+    #[test]
+    fn push_capped_drops_oldest_at_cap() {
+        let mut dq: VecDeque<NetEqSample> = VecDeque::new();
+        // Push 7201 samples whose timestamp == push index, so identity is clear.
+        for i in 0..(NETEQ_SAMPLE_CAP as u64 + 1) {
+            push_capped(&mut dq, sample_at(i));
+        }
+        assert_eq!(dq.len(), NETEQ_SAMPLE_CAP, "deque must be capped at 7200");
+        // Sample 0 was dropped; the oldest retained is sample 1.
+        assert_eq!(
+            dq.front().unwrap().timestamp_ms,
+            1,
+            "oldest retained must be the 2nd-pushed sample (pop_front), not the 1st"
+        );
+        assert_eq!(
+            dq.back().unwrap().timestamp_ms,
+            NETEQ_SAMPLE_CAP as u64,
+            "newest retained must be the last-pushed sample"
+        );
+    }
+
+    /// Throttle decision (single peer): no prior push keeps; <1000ms skips;
+    /// exactly 1000ms keeps. Catches flipping `>=1000` to `>1000` (the 1000ms
+    /// case would then wrongly skip).
+    #[test]
+    fn should_push_respects_one_hz_throttle() {
+        assert!(should_push(None, 0), "first sample always kept");
+        assert!(
+            !should_push(Some(1000), 1500),
+            "500ms later must be skipped"
+        );
+        assert!(
+            !should_push(Some(1000), 1999),
+            "999ms later must be skipped"
+        );
+        assert!(
+            should_push(Some(1000), 2000),
+            "exactly 1000ms later must be kept"
+        );
+        assert!(should_push(Some(1000), 5000), "well past 1s is kept");
+    }
+
+    /// Throttle is per-peer independent: a fresh push for peer B is kept even
+    /// when peer A pushed <1s ago. Mimics the loop's per-peer last_push_ms map.
+    #[test]
+    fn should_push_is_per_peer_independent() {
+        let mut last_push: HashMap<&str, u64> = HashMap::new();
+        // Peer A pushes at t=1000 (kept — no prior).
+        assert!(should_push(last_push.get("A").copied(), 1000));
+        last_push.insert("A", 1000);
+        // Peer B's FIRST push at t=1200 is kept even though A pushed 200ms ago.
+        assert!(
+            should_push(last_push.get("B").copied(), 1200),
+            "peer B must not be throttled by peer A's recent push"
+        );
+        // Peer A again at t=1200 is throttled (only 200ms since its own push).
+        assert!(!should_push(last_push.get("A").copied(), 1200));
+    }
+
+    /// Time-axis math: `neteq_x` maps elapsed ms → px at px_per_sec=8, and
+    /// `neteq_chart_width` grows with elapsed seconds while honouring the
+    /// min-viewport `(total_seconds*8).max(min)+10`. Catches a wrong px_per_sec
+    /// scale or a dropped `+10`/min clamp.
+    #[test]
+    fn time_axis_math_x_and_width() {
+        // x: 5s after first_ts at 8 px/s = 40px.
+        assert!((neteq_x(6000, 1000, 8.0) - 40.0).abs() < 0.001);
+        // x at first_ts is 0.
+        assert!((neteq_x(1000, 1000, 8.0)).abs() < 0.001);
+
+        // Short span (10s) clamps to the min viewport: max(80, 600)+10 = 610.
+        let w_short = neteq_chart_width(0, 10_000, 8.0, 600.0);
+        assert!((w_short - 610.0).abs() < 0.001, "got {w_short}");
+
+        // Long span (200s) grows past the min: 200*8 + 10 = 1610.
+        let w_long = neteq_chart_width(0, 200_000, 8.0, 600.0);
+        assert!((w_long - 1610.0).abs() < 0.001, "got {w_long}");
+    }
+
+    /// Honest axis after cap: when the deque is capped, the chart origin
+    /// (`first_ts`) is the OLDEST RETAINED sample's timestamp — NOT 0 / meeting
+    /// start. Build a capped history whose first retained sample has a NONZERO
+    /// timestamp and assert the width reflects (last - first), not (last - 0).
+    /// Catches anyone re-anchoring first_ts to 0.
+    #[test]
+    fn honest_axis_uses_oldest_retained_sample() {
+        // The capped deque retains samples 1..=7200 (sample 0 dropped). Their
+        // timestamps are seconds: ts = i*1000. So first retained = 1000ms,
+        // last = 7_200_000ms. Honest span = 7,199,000ms ≈ 7199s.
+        let mut dq: VecDeque<NetEqSample> = VecDeque::new();
+        for i in 0..(NETEQ_SAMPLE_CAP as u64 + 1) {
+            push_capped(&mut dq, sample_at(i * 1000));
+        }
+        let first_ts = dq.front().unwrap().timestamp_ms;
+        let last_ts = dq.back().unwrap().timestamp_ms;
+        assert_eq!(first_ts, 1000, "origin must be the oldest RETAINED sample");
+
+        // Width from the honest origin: 7199 * 8 + 10 = 57602.
+        let honest = neteq_chart_width(first_ts, last_ts, 8.0, 600.0);
+        // Width if someone wrongly anchored to 0: 7200 * 8 + 10 = 57610.
+        let wrong = neteq_chart_width(0, last_ts, 8.0, 600.0);
+        assert!((honest - 57602.0).abs() < 0.001, "got {honest}");
+        assert_ne!(
+            honest, wrong,
+            "honest origin must differ from a 0-anchored origin"
+        );
+    }
+
+    /// Decode-operations Y ceiling is computed over exactly the FIVE plotted
+    /// series (normal/expand/accelerate/preemptive/merge) — the compact sample
+    /// omits the never-plotted fast_accelerate/comfort_noise/dtmf. Five series
+    /// are plotted; catches an accidental sixth.
+    #[test]
+    fn decode_operations_plots_five_series() {
+        let cfg = ChartConfig::decode_operations(&[sample_with(0, 0, 0, 0, 0, 0)]);
+        assert_eq!(cfg.series.len(), 5);
+        let labels: Vec<&str> = cfg.series.iter().map(|s| s.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Normal",
+                "Expand",
+                "Accelerate",
+                "Preemptive Expand",
+                "Merge"
+            ]
+        );
     }
 }

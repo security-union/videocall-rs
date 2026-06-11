@@ -61,9 +61,21 @@ import { enableSimulcastFlag } from "../helpers/simulcast-config";
  *
  *   #1131 RELOCATION: the whole panel MOVED out of the Settings → Performance
  *   modal tab into the right-side **Diagnostics drawer** (`#diagnostics-sidebar`),
- *   mounted as the "Quality controls" group. After the #1131 ITERATION the drawer
- *   group order is "Connection & system" FIRST, then "Quality controls" (this
- *   panel — the MIDDLE group), then "Live stream state" LAST.
+ *   mounted as the "Quality controls" group. After the #1131 ITERATION 3 the drawer
+ *   group order is usage-frequency: "Quality controls" (this panel) FIRST, then
+ *   "Live stream state" (the live/NetEq sections), then "Connection & system" LAST
+ *   (the incident-investigation group). Within "Connection & system" the four
+ *   low-level pre-dumps (Reception / Sending / Encoder / Media Status) were merged
+ *   into ONE collapsed `<details class="diag-disclosure">` "Raw stats" disclosure
+ *   (`#diag-h-raw-stats`), and "Build info" was demoted to a second collapsed
+ *   `<details>` at the very bottom — both CLOSED by default. Within "Live stream
+ *   state" the NetEq sections are now per-PEER: with the "All Peers" aggregate
+ *   selected (the solo-meeting default) a single placeholder section is shown
+ *   ("Select a specific peer to view time-series charts and current status.")
+ *   IN PLACE of the Current Status tiles + charts; selecting a specific peer
+ *   renders the Current Status tiles and the now-horizontally-scrollable NetEq
+ *   charts (`.neteq-chart-scroll` overflow-x box + a fixed `.neteq-chart-y-axis`
+ *   sibling, stacked 1-up via `.neteq-charts-stack`).
  *   The drawer title became "Performance & Diagnostics". The Settings modal now
  *   has exactly FOUR tabs (Audio / Video / Network / Appearance) and NO
  *   performance affordance at all: the transitional `settings-perf-moved` redirect
@@ -469,18 +481,19 @@ test.describe("Performance settings panel (#961)", () => {
   test("desktop layout: the Quality-controls perf cards stay contained in the drawer (#1208/#1213, adapted to the drawer)", async ({
     page,
   }) => {
-    // The drawer (#1131) is a SINGLE SCROLLING SURFACE by design. After the
-    // #1131 iteration the group order is: "Connection & system" FIRST, then
-    // "Quality controls" (the perf cards — now the MIDDLE group), then "Live
-    // stream state" LAST. The perf cards therefore sit MID-DRAWER (a connection
-    // section above them, the live-stream section below), the content is
-    // legitimately taller than the viewport, and the drawer scrolls vertically.
-    // The #1208/#1213 lesson: do NOT assert vertical overflow in either
-    // direction (a scrolling-by-design surface SHOULD overflow vertically). The
-    // stable contract is (a) NO horizontal overflow, and (b) the LAST perf card
-    // (.perf-kind-card) is reachable by scrolling the drawer's own scroll
-    // container — even though it is no longer the bottom-most content, since the
-    // explicit scrollIntoView below brings the mid-drawer card into view.
+    // The drawer (#1131) is a SINGLE SCROLLING SURFACE by design. After #1131
+    // iteration 3 the group order is usage-frequency: "Quality controls" (the
+    // perf cards — now the FIRST group) → "Live stream state" → "Connection &
+    // system" LAST. The perf cards therefore sit at the TOP of the drawer, the
+    // "Live stream state" + "Connection & system" groups sit below them, the
+    // content is legitimately taller than the viewport, and the drawer scrolls
+    // vertically. The #1208/#1213 lesson: do NOT assert vertical overflow in
+    // either direction (a scrolling-by-design surface SHOULD overflow
+    // vertically). The stable contract is (a) NO horizontal overflow, and (b)
+    // the LAST perf card (.perf-kind-card) is reachable by scrolling the
+    // drawer's own scroll container — the explicit scrollIntoView below brings
+    // the card into view from the bottom-most scroll position, proving it is not
+    // clipped on either fold of the over-tall surface.
     await page.setViewportSize({ width: 1280, height: 768 });
     await joinMeeting(page, "drawer_containment");
     await openPerformanceDrawer(page);
@@ -505,16 +518,16 @@ test.describe("Performance settings panel (#961)", () => {
     ).toBeLessThanOrEqual(1);
 
     // Scroll the drawer to the bottom, then explicitly bring the LAST perf card
-    // into view. After the reorder the perf cards are MID-DRAWER (above "Live
-    // stream state"), so scrolling all the way down would scroll PAST them; the
-    // scrollIntoView is what proves the card is reachable and not clipped on
-    // either fold of the over-tall surface.
+    // into view. After the reorder the perf cards are at the TOP of the drawer
+    // (above "Live stream state" + "Connection & system"), so scrolling all the
+    // way down scrolls PAST them; the scrollIntoView is what proves the card is
+    // reachable and not clipped on either fold of the over-tall surface.
     await scrollContainer.evaluate((el) => {
       el.scrollTop = el.scrollHeight;
     });
     await scrollContainer.evaluate((el) => {
-      // The last perf card sits between the connection + live-stream groups;
-      // scroll it into view from the bottom-most scroll position.
+      // The last perf card sits in the top "Quality controls" group; scroll it
+      // back into view from the bottom-most scroll position.
       const cards = el.querySelectorAll(".perf-kind-card");
       cards[cards.length - 1]?.scrollIntoView({ block: "center" });
     });
@@ -1305,9 +1318,9 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await openPerformanceDrawer(page);
     const sidebar = perfDrawer(page);
 
-    // QUALITY CONTROLS — the migrated Performance panel (the middle group after
-    // the #1131 reorder). Assert a perf control is visible INSIDE the drawer
-    // (relocation proof, not anywhere on the page).
+    // QUALITY CONTROLS — the migrated Performance panel (the FIRST group after
+    // the #1131 iteration-3 reorder). Assert a perf control is visible INSIDE the
+    // drawer (relocation proof, not anywhere on the page).
     await expect(
       sidebar.locator('[data-testid="perf-simulcast-strip"]'),
       "perf strip inside the drawer",
@@ -1465,15 +1478,15 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L0$/ })).toHaveCount(0);
   });
 
-  // ── NetEq help popovers + position:fixed viewport-clip regression (#1131) ──
+  // ── Drawer help popovers + position:fixed viewport-clip regression (#1131) ──
   //
-  // CHANGE #4: the "Live stream state" group's NetEq sections each grew a
-  // HelpPopover info ("?") icon — `diag-status-help` on the "Current Status"
-  // header and `diag-charts-help` on the "NetEQ charts" header. They share ONE
-  // single-open signal (opening one closes the other), use role="dialog", and
-  // wire aria-haspopup/aria-expanded/aria-controls — identical to the Performance
-  // panel's HelpPopover. Their popover ids are `diag-status-help-popover` /
-  // `diag-charts-help-popover`.
+  // CHANGE #4: the drawer's HelpPopover info ("?") icons share ONE single-open
+  // signal per cluster (opening one closes its sibling), use role="dialog", and
+  // wire aria-haspopup/aria-expanded/aria-controls. The "Live stream state"
+  // group's NetEq sections each grew one — `diag-status-help` on "Current Status"
+  // and `diag-charts-help` on "NetEQ charts" (popover ids `*-popover`). Identical
+  // mechanism (component, styles, clamp/flip) to the Quality-controls panel's
+  // per-kind help (`perf-{video,audio,screen}-help`).
   //
   // CHANGE #5 (the user-reported clipping bug): every `.perf-help-popover` is now
   // `position: fixed` with a JS clamp/flip (`use_help_popover_anchor` /
@@ -1481,19 +1494,28 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
   // right border and bottom fold because an `absolute` popover anchored INSIDE
   // `#diagnostics-sidebar { overflow-y: auto }` is clipped on BOTH axes.
   //
-  // MUTATION REASONING (why this test fails if the fix is reverted): the NetEq
-  // sections sit in the "Live stream state" group, which is now the LAST group in
-  // the drawer (#1131 reorder), so their "?" buttons are low in the DOM. We scroll
-  // the drawer to the bottom and open one of those popovers, then assert its
-  // boundingBox is fully inside the viewport (x ≥ 0, y ≥ 0, right ≤ innerWidth,
-  // bottom ≤ innerHeight) and that it is visible. Under the OLD `position:absolute`
-  // (top: calc(100% + 8px); anchored inside the scroll box), a popover opened at
-  // the bottom of the drawer extended past the bottom fold AND past the right
-  // border — its boundingBox bottom/right would exceed the viewport and this check
-  // would FAIL. The new fixed+clamp+flip keeps it on-screen, so the check passes.
-  // Revert `position: fixed` (or the clamp/flip in `compute_help_popover_position`)
-  // and this test goes red.
-  test("NetEq help popovers (diag-status-help / diag-charts-help): bottom-of-drawer popover stays within the viewport (position:fixed clamp/flip)", async ({
+  // ITERATION 3 reality (why this test no longer hard-targets the NetEq "?"):
+  // the NetEq Current-Status + charts sections (and so their "?" buttons) now
+  // render ONLY for a SINGLE selected peer. With the "All Peers" aggregate
+  // selected — the solo-meeting default this spec produces — those sections are
+  // replaced by a placeholder, so `diag-status-help`/`diag-charts-help` are
+  // ABSENT. The viewport-clip regression mechanism is shared by ALL drawer
+  // HelpPopovers, so the load-bearing regression guard below opens a
+  // Quality-controls help popover (`perf-screen-help`, low in the FIRST group
+  // after a full scroll) — always reachable in a solo meeting — and asserts its
+  // box stays inside the viewport. The NetEq-specific aria + single-open contract
+  // is then asserted CONDITIONALLY, only when a real peer made the NetEq "?"
+  // buttons render (a multi-peer runner). Both paths use the same fixed+clamp+flip
+  // code, so reverting `position: fixed` (or the clamp/flip in
+  // `compute_help_popover_position`) turns the guard red.
+  //
+  // MUTATION REASONING: we scroll the drawer to the bottom, open the target "?"
+  // near the bottom fold, then assert its boundingBox is fully inside the viewport
+  // (x ≥ 0, y ≥ 0, right ≤ innerWidth, bottom ≤ innerHeight). Under the OLD
+  // `position:absolute` (top: calc(100% + 8px); anchored inside the scroll box) a
+  // popover opened that low extended past the bottom fold AND past the right
+  // border — box.bottom/right would exceed the viewport and the check would FAIL.
+  test("Drawer help popovers (position:fixed clamp/flip): a bottom-of-drawer popover stays within the viewport (#1131)", async ({
     page,
   }) => {
     // Use a SHORT viewport so the bottom-of-drawer popover would clearly overflow
@@ -1507,41 +1529,28 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     const scrollContainer = sidebar.locator(".sidebar-content");
     await expect(scrollContainer).toBeVisible();
 
-    // The Current Status "?" (`diag-status-help`) ALWAYS renders. The NetEQ charts
-    // "?" (`diag-charts-help`) renders only once NetEq history exists (its section
-    // is gated on `has_history` in NetEqStatusAndCharts). Prefer the charts help —
-    // it is the bottom-MOST popover (the explicit target of the regression) — and
-    // fall back to the status help (still in the LAST group, near the bottom) when
-    // single-page has produced no history yet. Either way the popover is low in the
-    // drawer, which is the condition the old absolute positioning clipped.
-    const statusBtn = sidebar.locator('[data-testid="diag-status-help"]');
-    const chartsBtn = sidebar.locator('[data-testid="diag-charts-help"]');
-    await expect(statusBtn).toBeVisible({ timeout: 15_000 });
+    // ── Load-bearing regression guard: a Quality-controls help popover.
+    // `perf-screen-help` is the Content/screen card's "?", reliably present in a
+    // solo meeting (the Quality-controls panel renders once Host publishes the
+    // controls — `openPerformanceDrawer` already waited on its simulcast strip).
+    const guardBtn = sidebar.locator('[data-testid="perf-screen-help"]');
+    await expect(guardBtn).toBeVisible({ timeout: 15_000 });
+    const guardPopoverId = await guardBtn.getAttribute("aria-controls");
+    expect(guardPopoverId, "help button wires aria-controls to its popover id").not.toBeNull();
+    const guardPopover = page.locator(`#${guardPopoverId}`);
 
-    // Scroll the drawer all the way down so the NetEq help buttons sit near the
-    // bottom fold — the worst case for the reported clip.
+    // Scroll the drawer all the way down so the help button sits near the bottom
+    // fold — the worst case for the reported clip — then open it.
     await scrollContainer.evaluate((el) => {
       el.scrollTop = el.scrollHeight;
     });
-
-    const chartsPresent = (await chartsBtn.count()) > 0;
-    const targetBtn = chartsPresent ? chartsBtn : statusBtn;
-    const targetTestid = chartsPresent ? "diag-charts-help" : "diag-status-help";
-    const popoverId = `${targetTestid}-popover`;
-    const popover = page.locator(`#${popoverId}`);
-
-    // ── aria/role contract (CHANGE #4) ──
-    await targetBtn.scrollIntoViewIfNeeded();
-    await expect(targetBtn).toHaveAttribute("aria-haspopup", "dialog");
-    await expect(targetBtn).toHaveAttribute("aria-expanded", "false");
-    await expect(targetBtn).toHaveAttribute("aria-controls", popoverId);
-    await expect(popover).toHaveCount(0);
-
-    // Open the popover.
-    await targetBtn.click();
-    await expect(targetBtn).toHaveAttribute("aria-expanded", "true");
-    await expect(popover).toBeVisible();
-    await expect(popover).toHaveAttribute("role", "dialog");
+    await guardBtn.scrollIntoViewIfNeeded();
+    await expect(guardBtn).toHaveAttribute("aria-haspopup", "dialog");
+    await expect(guardBtn).toHaveAttribute("aria-expanded", "false");
+    await guardBtn.click();
+    await expect(guardBtn).toHaveAttribute("aria-expanded", "true");
+    await expect(guardPopover).toBeVisible();
+    await expect(guardPopover).toHaveAttribute("role", "dialog");
 
     // ── VIEWPORT-CLIP REGRESSION (CHANGE #5) ──
     // The popover's layout box must be fully inside the viewport. position:fixed +
@@ -1551,7 +1560,7 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     const viewport = page.viewportSize();
     expect(viewport, "viewport size is known").not.toBeNull();
     const vp = viewport as { width: number; height: number };
-    const box = await popover.boundingBox();
+    const box = await guardPopover.boundingBox();
     expect(box, "the open popover has a layout box").not.toBeNull();
     const b = box as { x: number; y: number; width: number; height: number };
     // Left/top edges on-screen…
@@ -1567,10 +1576,58 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
       b.y + b.height,
       "popover bottom edge ≤ viewport height (not clipped at the drawer's bottom fold)",
     ).toBeLessThanOrEqual(vp.height + 1);
+    // Close the guard popover so its open state doesn't bleed into the NetEq path.
+    await page.keyboard.press("Escape");
+    await expect(guardBtn).toHaveAttribute("aria-expanded", "false");
 
-    // ── Shared single-open behaviour (CHANGE #4) ──
-    // Only assertable when BOTH popovers render (history present). Opening the
-    // other "?" closes the first (they share one open_help signal).
+    // ── NetEq-specific aria + single-open contract (CHANGE #4) ──
+    // Only assertable when a real peer made the per-peer NetEq sections render
+    // (the "?" buttons are ABSENT under the solo "All Peers" placeholder). When
+    // present, exercise the same fixed+clamp+flip guarantee on the NetEq popover
+    // and the shared single-open behaviour.
+    const statusBtn = sidebar.locator('[data-testid="diag-status-help"]');
+    const chartsBtn = sidebar.locator('[data-testid="diag-charts-help"]');
+    const statusPresent = (await statusBtn.count()) > 0;
+    if (!statusPresent) {
+      // Solo / All-Peers runner: the NetEq help buttons legitimately do not
+      // render (placeholder shown). The regression guard above already covered
+      // the fixed-popover contract. Nothing more to assert here.
+      return;
+    }
+
+    const chartsPresent = (await chartsBtn.count()) > 0;
+    const neteqBtn = chartsPresent ? chartsBtn : statusBtn;
+    const neteqTestid = chartsPresent ? "diag-charts-help" : "diag-status-help";
+    const neteqPopoverId = `${neteqTestid}-popover`;
+    const neteqPopover = page.locator(`#${neteqPopoverId}`);
+
+    await neteqBtn.scrollIntoViewIfNeeded();
+    await expect(neteqBtn).toHaveAttribute("aria-haspopup", "dialog");
+    await expect(neteqBtn).toHaveAttribute("aria-expanded", "false");
+    await expect(neteqBtn).toHaveAttribute("aria-controls", neteqPopoverId);
+    await expect(neteqPopover).toHaveCount(0);
+
+    await neteqBtn.click();
+    await expect(neteqBtn).toHaveAttribute("aria-expanded", "true");
+    await expect(neteqPopover).toBeVisible();
+    await expect(neteqPopover).toHaveAttribute("role", "dialog");
+
+    // Same viewport-clip guarantee on the NetEq popover (it sits in the MIDDLE
+    // "Live stream state" group, still well down the drawer).
+    const neteqBox = await neteqPopover.boundingBox();
+    expect(neteqBox, "the open NetEq popover has a layout box").not.toBeNull();
+    const nb = neteqBox as { x: number; y: number; width: number; height: number };
+    expect(nb.x, "NetEq popover left edge ≥ 0").toBeGreaterThanOrEqual(0);
+    expect(nb.y, "NetEq popover top edge ≥ 0").toBeGreaterThanOrEqual(0);
+    expect(nb.x + nb.width, "NetEq popover right edge ≤ viewport width").toBeLessThanOrEqual(
+      vp.width + 1,
+    );
+    expect(nb.y + nb.height, "NetEq popover bottom edge ≤ viewport height").toBeLessThanOrEqual(
+      vp.height + 1,
+    );
+
+    // Shared single-open behaviour: assertable only when BOTH NetEq popovers
+    // render (history present). Opening the other "?" closes the first.
     if (chartsPresent) {
       const statusPopover = page.locator("#diag-status-help-popover");
       // The charts popover is currently open; opening the status "?" must close it.
@@ -1588,8 +1645,217 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     } else {
       // Single-popover path: Escape still closes it (keyboard-operable).
       await page.keyboard.press("Escape");
-      await expect(targetBtn).toHaveAttribute("aria-expanded", "false");
-      await expect(popover).toHaveCount(0);
+      await expect(neteqBtn).toHaveAttribute("aria-expanded", "false");
+      await expect(neteqPopover).toHaveCount(0);
+    }
+  });
+
+  // ── ITERATION 3 — group reorder (#1131) ──────────────────────────────────
+  //
+  // The drawer body's three top-level groups are `div.diag-group-label`
+  // elements. After iteration 3 their DOM order is usage-frequency:
+  //   "Quality controls" → "Live stream state" → "Connection & system".
+  // (Quality controls renders once Host publishes the perf controls, which
+  // `openPerformanceDrawer` already awaits via the simulcast strip.)
+  //
+  // OLD-STRUCTURE FAILURE: in iteration 2 the order was
+  //   ["Connection & system", "Quality controls", "Live stream state"].
+  // Asserting the exact ordered text array fails against that order (and against
+  // any future reshuffle), so this is a real sync guard, not a tautology.
+  test("group order: the three drawer groups render Quality controls → Live stream state → Connection & system (#1131 iter 3)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "group_order");
+    await openPerformanceDrawer(page);
+
+    const sidebar = perfDrawer(page);
+    const groupLabels = sidebar.locator(".diag-group-label");
+    // All three groups present (Quality controls is guaranteed by
+    // openPerformanceDrawer's simulcast-strip wait).
+    await expect(groupLabels).toHaveCount(3, { timeout: 15_000 });
+    await expect(groupLabels).toHaveText([
+      "Quality controls",
+      "Live stream state",
+      "Connection & system",
+    ]);
+  });
+
+  // ── ITERATION 3 — Raw stats + Build info collapsed disclosures (#1131) ────
+  //
+  // Inside "Connection & system" (now the LAST group) the four low-level
+  // pre-dumps (Reception / Sending / Encoder / Media Status) were merged into a
+  // single collapsed `<details class="diag-disclosure">` "Raw stats" disclosure
+  // (`summary#diag-h-raw-stats`), and "Build info" became a second collapsed
+  // `<details>` at the very bottom. Both are CLOSED by default (no `open` attr).
+  //
+  // OLD-STRUCTURE FAILURE: in iteration 2 the same four pre-dumps were ALWAYS
+  // visible as standalone `Reception Stats` / `Sending Stats` / `Encoder
+  // Settings` / `Media Status` `<section>`s (their `<pre>` content visible
+  // without any click), and Build info was an always-open `<section>`. Asserting
+  // the content is HIDDEN until the summary is clicked fails against that
+  // structure (the content would already be visible). Asserting all four blocks
+  // live inside ONE disclosure also fails (they were four separate sections).
+  test("Connection & system: Raw stats + Build info are collapsed <details> that expand on click (#1131 iter 3)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "raw_stats_disclosure");
+    await openPerformanceDrawer(page);
+
+    const sidebar = perfDrawer(page);
+
+    // ── Raw stats disclosure ──
+    const rawSummary = sidebar.locator("summary#diag-h-raw-stats");
+    await expect(rawSummary).toBeVisible({ timeout: 15_000 });
+    await expect(rawSummary).toHaveText(/Raw stats/);
+    // The chevron affordance (iteration 3) lives inside the summary.
+    await expect(rawSummary.locator(".diag-disclosure-chev")).toHaveCount(1);
+
+    // The enclosing <details> is the disclosure; its merged-blocks container.
+    const rawDetails = sidebar.locator("details.diag-disclosure", { has: rawSummary });
+    const rawBody = rawDetails.locator(".diagnostics-data");
+    const rawBlocks = rawBody.locator(".diag-raw-block");
+
+    // COLLAPSED BY DEFAULT: a closed <details> does not render its non-summary
+    // content, so the merged blocks are not visible until the summary is clicked.
+    await rawSummary.scrollIntoViewIfNeeded();
+    await expect(rawBody).toBeHidden();
+
+    // EXPAND: clicking the summary opens the disclosure and reveals the four
+    // merged blocks (Reception / Sending / Encoder / Media Status), each with its
+    // own sub-heading <h4>. (The standalone iteration-2 sections are gone.)
+    await rawSummary.click();
+    await expect(rawBody).toBeVisible();
+    await expect(rawBlocks).toHaveCount(4);
+    const rawHeadings = rawBlocks.locator("h4");
+    await expect(rawHeadings).toHaveText([
+      "Reception Stats",
+      "Sending Stats",
+      "Encoder Settings",
+      "Media Status",
+    ]);
+
+    // ── Build info disclosure (the second, bottom-most collapsed <details>) ──
+    const buildSummary = sidebar.locator("summary#diag-h-build-info");
+    await buildSummary.scrollIntoViewIfNeeded();
+    await expect(buildSummary).toBeVisible();
+    await expect(buildSummary).toHaveText(/Build info/);
+    const buildDetails = sidebar.locator("details.diag-disclosure", { has: buildSummary });
+    const buildTable = buildDetails.locator(".build-info-table");
+    // COLLAPSED BY DEFAULT (was an always-open section in iteration 2).
+    await expect(buildTable).toBeHidden();
+    await buildSummary.click();
+    await expect(buildTable).toBeVisible();
+  });
+
+  // ── ITERATION 3 — All-Peers placeholder vs single-peer NetEq charts (#1131) ─
+  //
+  // The NetEq Current-Status tiles + time-series charts are now per-PEER. With
+  // the "All Peers" aggregate selected (the solo-meeting default) a single
+  // placeholder section replaces them ("Select a specific peer to view
+  // time-series charts and current status."). Selecting a specific peer renders
+  // the Current Status tiles and the horizontally-scrollable charts: each chart
+  // is a fixed `.neteq-chart-y-axis` <svg> sibling + a `.neteq-chart-scroll`
+  // overflow-x box (stacked 1-up inside `.neteq-charts-stack`). The peer
+  // selector itself only appears with > 1 remote peer, so the single-peer arm
+  // runs only on a multi-peer runner; the placeholder arm always runs.
+  //
+  // OLD-STRUCTURE FAILURE: in iteration 2 the default "All Peers" selection
+  // showed Current Status tiles (concatenated history / "--" tiles) and the 2×2
+  // `.charts-grid`, never a "Select a specific peer…" placeholder. Asserting the
+  // placeholder text under All Peers fails against iteration 2. Asserting a
+  // `.neteq-chart-scroll` overflow-x box (not a fixed-width grid cell) fails
+  // against the old non-scrollable 2×2 grid.
+  test("Live stream state: NetEq shows the All-Peers placeholder, and a selected peer shows scrollable charts (#1131 iter 3)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "neteq_placeholder");
+    await openPerformanceDrawer(page);
+
+    const sidebar = perfDrawer(page);
+
+    // The Peer Selection dropdown only renders with > 1 entry in available_peers
+    // (i.e. at least one remote peer that emitted NetEq stats). In a solo meeting
+    // it is absent and "All Peers" is the implicit selection.
+    const peerSelect = sidebar.locator("select.peer-selector", {
+      has: page.locator('option:text-is("All Peers")'),
+    });
+    const placeholder = sidebar.locator(".diag-neteq-placeholder");
+
+    // ── All-Peers arm (always runs) ──
+    // Under the All-Peers aggregate the NetEq section is the single placeholder,
+    // and the per-peer Current-Status / charts help "?" buttons are ABSENT.
+    await expect(placeholder).toBeVisible({ timeout: 15_000 });
+    await expect(placeholder).toHaveText(
+      "Select a specific peer to view time-series charts and current status.",
+    );
+    await expect(sidebar.locator('[data-testid="diag-status-help"]')).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="diag-charts-help"]')).toHaveCount(0);
+    // No scrollable charts render under the placeholder.
+    await expect(sidebar.locator(".neteq-chart-scroll")).toHaveCount(0);
+
+    // ── Single-peer arm (multi-peer runner only) ──
+    const hasSelector = (await peerSelect.count()) > 0;
+    test.skip(
+      !hasSelector,
+      "solo meeting: no remote peer emitted NetEq stats, so the Peer Selection " +
+        "dropdown is absent and only the All-Peers placeholder can be exercised",
+    );
+
+    // Pick the first specific peer (the option after "All Peers").
+    const peerOptions = peerSelect.locator("option");
+    const optionCount = await peerOptions.count();
+    expect(optionCount, "peer selector lists All Peers + at least one peer").toBeGreaterThan(1);
+    const firstPeerValue = await peerOptions.nth(1).getAttribute("value");
+    expect(firstPeerValue, "first specific peer has a value").not.toBeNull();
+    await peerSelect.selectOption(firstPeerValue as string);
+
+    // Now the placeholder is gone and the Current Status cluster (with its "?"
+    // help) renders for the selected peer.
+    await expect(placeholder).toHaveCount(0);
+    await expect(sidebar.locator('[data-testid="diag-status-help"]')).toBeVisible({
+      timeout: 15_000,
+    });
+
+    // The charts section is gated on the peer having NetEq HISTORY. A fresh
+    // selection may legitimately have no samples yet → the "NetEQ Buffer / Jitter
+    // History" fallback (no scrollable charts) is shown instead. Handle BOTH:
+    //   - history present → `.neteq-chart-scroll` (overflow-x) + a fixed
+    //     `.neteq-chart-y-axis` sibling, stacked in `.neteq-charts-stack`;
+    //   - no history yet → the buffer/jitter fallback heading.
+    const chartScroll = sidebar.locator(".neteq-chart-scroll").first();
+    const fallbackHeading = sidebar.getByRole("heading", {
+      name: "NetEQ Buffer / Jitter History",
+    });
+    await expect(chartScroll.or(fallbackHeading).first()).toBeVisible({ timeout: 15_000 });
+
+    if ((await sidebar.locator(".neteq-chart-scroll").count()) > 0) {
+      // Scrollable charts present: assert the time-series structure.
+      const stack = sidebar.locator(".neteq-charts-stack");
+      await expect(stack).toBeVisible();
+      // Four charts stacked 1-up, each with its own scroll box and a fixed Y-axis.
+      await expect(sidebar.locator(".neteq-chart-scroll")).toHaveCount(4);
+      await expect(sidebar.locator(".neteq-chart-y-axis")).toHaveCount(4);
+
+      // The scroll box is a horizontal-overflow container (the iteration-3 change
+      // from the old fixed 2×2 grid). Assert computed overflow-x is scrollable —
+      // this is the load-bearing "now scrollable" contract; it does NOT assert a
+      // fixed direction "fits", honouring the #1208/#1213 lesson.
+      const overflowX = await chartScroll.evaluate((el) => getComputedStyle(el).overflowX);
+      expect(overflowX, "the NetEq chart container scrolls horizontally").toMatch(/auto|scroll/);
+
+      // The fixed Y-axis svg is a SIBLING of the scroll box inside the wrapper
+      // (rendered OUTSIDE the scroll container so it stays pinned while the
+      // timeline scrolls). Each `.neteq-chart-wrapper` holds exactly one of each.
+      const wrapper = sidebar.locator(".neteq-chart-wrapper").first();
+      await expect(wrapper.locator(".neteq-chart-y-axis")).toHaveCount(1);
+      await expect(wrapper.locator(".neteq-chart-scroll")).toHaveCount(1);
+      // Sibling proof: the y-axis is NOT a descendant of the scroll box (it would
+      // otherwise be clipped). The scroll box contains the growing SVG, not the
+      // fixed axis.
+      await expect(
+        wrapper.locator(".neteq-chart-scroll .neteq-chart-y-axis"),
+        "the fixed Y-axis must live OUTSIDE the scroll box (a sibling, not a child)",
+      ).toHaveCount(0);
     }
   });
 });

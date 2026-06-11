@@ -100,9 +100,9 @@ enum WtSendResult {
     /// priority-drop policy because the channel was approaching
     /// saturation. Distinct from `Dropped` so callers can keep both
     /// semantic paths in pattern matches even if today they take the
-    /// same action (fire CONGESTION feedback). The drop metric is
-    /// already incremented inside `send_auto` with the policy-
-    /// specific label (`priority_drop_video` / `priority_drop_audio`).
+    /// same action (record the drop through `on_outbound_drop`). The
+    /// drop metric is already incremented inside `send_auto` with the
+    /// policy-specific label (`priority_drop_video` / `priority_drop_audio`).
     PriorityDropped,
 }
 
@@ -560,9 +560,9 @@ impl Actor for WtChatSession {
         // `Handler<Message>` routes the bytes into `unistream_tx` /
         // `datagram_tx`. Under a bursty fan-out storm the 16-slot mailbox
         // overflows long before the outbound channels do, and the mailbox
-        // is a *dumb* queue: it drops indiscriminately and fires NO
-        // CONGESTION feedback, so the offending sender never throttles —
-        // the same room-wide-freeze failure mode described for WS.
+        // is a *dumb* queue: it drops indiscriminately and cannot feed the
+        // drop tracker — the same room-wide-freeze failure mode described
+        // for WS.
         //
         // The WT actor fronts TWO independent policy-aware outbound
         // channels — `unistream_tx` (cap `wt_outbound_channel_capacity()`,
@@ -583,8 +583,8 @@ impl Actor for WtChatSession {
         // Sizing the mailbox at the SUM of both channels (issue #1057, PR
         // #1060) relocates a *steady-state* overflow off the dumb mailbox onto
         // the policy-aware channels, which shed VIDEO/SCREEN first, protect
-        // AUDIO to ~95%, never preempt Critical lifecycle packets, and fire
-        // CONGESTION back to the sender via `on_outbound_drop`.
+        // AUDIO to ~95%, never preempt Critical lifecycle packets, and record
+        // drops via `on_outbound_drop`.
         //
         // A publisher-join fan-out BURST (issue #1144) can still overflow even
         // that sum, because the keyframe/join spike arrives in a tight window
@@ -775,11 +775,8 @@ impl Handler<Message> for WtChatSession {
             WtSendResult::Dropped | WtSendResult::PriorityDropped => {
                 // Either real channel-full or priority preempt — both
                 // are drops from the sender's perspective. Record the
-                // drop for the actual sender so we can fire CONGESTION
-                // feedback when the threshold is exceeded. This is what
-                // tells the offending sender to step its quality tier
-                // down; without it, the sender keeps sending the same
-                // volume of video and the receiver keeps shedding it.
+                // drop for the actual sender so metrics and the #979
+                // keyframe-relax path still see receiver-local overflow.
                 if sender_session_id != 0 {
                     self.logic
                         .on_outbound_drop(sender_session_id, &sender_user_id);

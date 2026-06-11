@@ -1468,6 +1468,78 @@ const _: () = assert!(
      blip on a lossy link) cannot shed a layer."
 );
 
+// ---------------------------------------------------------------------------
+// Client-Side WebTransport Uplink-SATURATION Self-Detection (#1219 prerequisite)
+// ---------------------------------------------------------------------------
+//
+// Why this is SEPARATE from the unistream-DROP detection above:
+//   The drop counter (`unistream_drop_count`) only increments on stream/
+//   connection TEARDOWN (STOP_SENDING / RESET_STREAM / session close). It does
+//   NOT move on a slow-but-alive uplink: a WHATWG WritableStream signals
+//   backpressure by leaving `writer.ready()` PENDING, not by rejecting the
+//   write, and the WT media send path is fully `.await`-blocking. So on a
+//   genuine BANDWIDTH cliff (link slow, ACKs still flowing, no reset) the drop
+//   counter stays flat and a WT publisher would never self-shed. The transport
+//   therefore also exposes a monotonic "slow-ready event" counter
+//   (`unistream_ready_stall_count`): it increments once each time a single
+//   `writer.ready().await` on an established media stream blocks longer than the
+//   producer-side `READY_STALL_THRESHOLD_MS`. This block consumes THAT counter
+//   the same way the drop block consumes the drop counter — a tumbling-window
+//   delta test via `evaluate_self_congestion`.
+//
+// This is the prerequisite that lets the relay's sender-keyed CONGESTION
+// behavior (which collapses a publisher's encoder for the WHOLE room when ONE
+// receiver's downlink overflows, bug #1219) be REMOVED: with this signal a WT
+// publisher detects its OWN uplink saturation directly, instead of leaning on
+// the relay's mis-scoped, room-wide signal.
+
+/// Number of client-side WebTransport slow-`ready()` (uplink-saturation) events
+/// (see `videocall_transport::webtransport::unistream_ready_stall_count`) within
+/// [`WT_SATURATION_WINDOW_MS`] that triggers a local AQ step-down.
+///
+/// Netsim-tunable. Set to 3 (matching the drop threshold, deliberately not 1):
+/// a single slow `ready()` can be a one-off — a reordered/retransmitted packet
+/// or a momentary congestion-window dip on a high-RTT link — so requiring 3
+/// crossings within the window raises the bar above one isolated stall.
+///
+/// IMPORTANT — what "3 events" actually means (see the increment mechanism in
+/// `webtransport.rs`): increments do NOT correspond to 3 separate stall episodes.
+/// Because frame sends are spawned concurrently and share one `ready()` promise,
+/// a SINGLE sustained stall that has K frames in flight produces ~K increments
+/// at once when the promise resolves. At 25-30 fps a stall ≥ ~350-400ms easily
+/// has ≥3 frames queued, so one fat-but-isolated stall episode WILL trip the
+/// shed. The dominant false-positive guard is therefore the producer-side
+/// `READY_STALL_THRESHOLD_MS` (250ms) — the wait must be genuinely long — NOT
+/// the count of 3. A bursty-but-recovering link that never parks a frame past
+/// 250ms will not shed; one that parks several frames past 250ms then recovers
+/// WILL shed one rung (arguably a correct early shed, but a real quality drop).
+/// VALIDATE the bursty-recovery case on the #1080 netsim before relying on this
+/// to replace the relay CONGESTION signal (#1219); the threshold may need to be
+/// frame-rate-aware.
+pub const WT_SATURATION_STALL_THRESHOLD: u64 = 3;
+
+/// Tumbling window (ms) for counting client-side WT slow-`ready()` events.
+///
+/// Netsim-tunable. Matches [`WT_SELF_CONGESTION_WINDOW_MS`] (2000ms): the
+/// evidence must persist across at least ~2 AQ ticks (`AQ_TICK_INTERVAL_MS` =
+/// 1000ms) before shedding, so a single tick that happened to catch one slow
+/// `ready()` cannot fire. Wider than the WS window for the same reason the WT
+/// drop window is: WT signals are harder-edged and must persist longer.
+pub const WT_SATURATION_WINDOW_MS: f64 = 2000.0;
+
+// --- Compile-time invariants (#1219 prerequisite) ---
+const _: () = assert!(
+    WT_SATURATION_WINDOW_MS >= WS_SELF_CONGESTION_WINDOW_MS,
+    "WT saturation window must be at least as wide as the WS window: a slow \
+     ready() is a coarse, sparse signal and must persist longer before shedding."
+);
+const _: () = assert!(
+    WT_SATURATION_STALL_THRESHOLD >= 2,
+    "WT saturation threshold must require more than one slow ready() so a single \
+     transient stall (a reordered packet / brief cwnd dip on a lossy link) \
+     cannot shed a layer."
+);
+
 /// Pure decision helper for the client-side self-congestion self-trigger
 /// (used by the WebTransport uplink-backpressure block; #1104).
 ///
@@ -1681,6 +1753,148 @@ mod tests {
     // checks next to the constants themselves (a runtime `assert!` on a
     // constant trips clippy's `assertions_on_constants`), matching the
     // convention used for the #1108 backpressure invariants above.
+
+    // =====================================================================
+    // Client-side WebTransport uplink-SATURATION self-trigger
+    // (#1219 prerequisite)
+    //
+    // These exercise the SAME pure helper (`evaluate_self_congestion`) but
+    // parameterised with the saturation constants, because the saturation
+    // consumer reuses that helper to do a tumbling-window delta test over the
+    // monotonic `unistream_ready_stall_count` (slow-ready events) instead of
+    // the drop counter. Each case maps to a Definition-of-Done requirement and
+    // is written to FAIL if the threshold/window logic is inverted or broken
+    // (mutation-verified — see the per-test mutation notes).
+    // =====================================================================
+
+    /// Sustained slow-ready() events at/above threshold within a CLOSED
+    /// saturation window MUST fire a step-down — the WT uplink is saturated but
+    /// alive (no stream reset, so the drop counter would be flat) and the
+    /// publisher must self-shed.
+    ///
+    /// Mutation check: if `evaluate_self_congestion` were mutated to
+    /// `delta < threshold` (inverted) or to always return `step_down=false`,
+    /// the `decision.step_down` assertion fails. If it ignored the threshold and
+    /// always fired, the boundary case below would still pass but the
+    /// `wt_saturation_below_threshold_does_not_fire` test fails.
+    #[test]
+    fn wt_saturation_above_threshold_fires_step_down() {
+        // 4 slow-ready events accrued since the snapshot, window fully elapsed.
+        let decision = evaluate_self_congestion(
+            /* current_stalls */ 4,
+            /* snapshot_stalls */ 0,
+            /* elapsed_ms */ WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            decision.step_down,
+            "delta 4 >= threshold {WT_SATURATION_STALL_THRESHOLD} in a closed window must step down"
+        );
+        assert!(decision.roll_window, "a closed window must roll");
+        assert_eq!(decision.new_snapshot, 4);
+
+        // Exactly-at-threshold is the firing boundary and MUST fire. Mutation
+        // check: a `delta > threshold` (strict) mutation makes this fail.
+        let at = evaluate_self_congestion(
+            WT_SATURATION_STALL_THRESHOLD,
+            0,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            at.step_down,
+            "delta == saturation threshold must step down (boundary)"
+        );
+    }
+
+    /// Sparse slow-ready() events BELOW threshold within the window MUST NOT
+    /// fire — a bursty-but-recovering link produces only a scatter of slow
+    /// `ready()`s as a transient burst drains, which must not shed a layer.
+    ///
+    /// Mutation check: if the threshold comparison were dropped (always fire),
+    /// the delta-2 and delta-1 assertions fail.
+    #[test]
+    fn wt_saturation_below_threshold_does_not_fire() {
+        // 2 slow-ready events < threshold (3), window closed.
+        let decision = evaluate_self_congestion(
+            2,
+            0,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            !decision.step_down,
+            "delta 2 < threshold {WT_SATURATION_STALL_THRESHOLD} must NOT step down"
+        );
+        assert!(decision.roll_window);
+        assert_eq!(decision.new_snapshot, 2);
+
+        // A single transient slow ready() (one reordered packet) must not fire.
+        let one = evaluate_self_congestion(
+            1,
+            0,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            !one.step_down,
+            "a single transient slow ready() must not step down"
+        );
+    }
+
+    /// While the saturation window is still OPEN, slow-ready() events must
+    /// accumulate without firing or rolling — even above threshold — so a burst
+    /// at the very start of a window is measured over the full window rather
+    /// than firing on the first tick.
+    ///
+    /// Mutation check: if the helper ignored `elapsed_ms < window_ms` it would
+    /// fire/roll early and both assertions fail.
+    #[test]
+    fn wt_saturation_open_window_does_not_fire_or_roll() {
+        let decision = evaluate_self_congestion(
+            100, // far above threshold
+            0,
+            WT_SATURATION_WINDOW_MS / 2.0, // window only half-elapsed
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            !decision.step_down,
+            "must not fire before the saturation window closes, even above threshold"
+        );
+        assert!(!decision.roll_window, "must not roll an open window");
+        assert_eq!(decision.new_snapshot, 0);
+    }
+
+    /// A WebSocket user (or a WT user on a healthy uplink that never crosses the
+    /// producer-side READY_STALL_THRESHOLD_MS) has a flat stall counter: delta
+    /// is 0 on every closed window and the trigger NEVER fires.
+    ///
+    /// Mutation check: if a zero delta were treated as a fire, this fails.
+    #[test]
+    fn wt_saturation_flat_counter_never_fires() {
+        let mut snapshot: u64 = 0;
+        for _ in 0..1000 {
+            let decision = evaluate_self_congestion(
+                0, // counter never moves: WS user or healthy WT uplink
+                snapshot,
+                WT_SATURATION_WINDOW_MS,
+                WT_SATURATION_WINDOW_MS,
+                WT_SATURATION_STALL_THRESHOLD,
+            );
+            assert!(
+                !decision.step_down,
+                "a flat-at-0 stall counter must never trigger a WT saturation step-down"
+            );
+            assert!(decision.roll_window);
+            snapshot = decision.new_snapshot;
+        }
+        assert_eq!(snapshot, 0);
+    }
 
     // =====================================================================
     // Video Quality Tier validation

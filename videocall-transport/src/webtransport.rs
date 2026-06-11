@@ -47,15 +47,95 @@ pub fn datagram_drop_count() -> u64 {
 /// The sender AQ self-congestion trigger (#1104) keys off THIS counter for
 /// that reason.
 ///
-/// Note: a unistream write fails on QUIC stream reset / fatal backpressure, not
-/// on every momentarily-full send buffer, so each increment is a meaningful
-/// "this frame did not make it out" event rather than a transient blip.
+/// Note: a unistream write does NOT fail on ordinary send-buffer backpressure.
+/// A WHATWG `WritableStream` applies backpressure by leaving `writer.ready()`
+/// PENDING (it does not reject); the write itself only rejects on stream /
+/// connection TEARDOWN — `STOP_SENDING`, `RESET_STREAM`, or session close. So
+/// each increment of this counter is a "the stream was torn down" event, NOT a
+/// "the uplink is merely saturated" event. On a genuine bandwidth cliff (link
+/// slow but ALIVE, ACKs still flowing) this counter stays FLAT — the slow path
+/// just blocks in `writer.ready().await`. That saturation case is detected by
+/// the separate time-to-`ready()` stall signal below
+/// ([`UNISTREAM_READY_STALL_COUNT`]); the two counters are complementary
+/// (teardown vs. saturation) and are consumed by independent AQ windows.
 static UNISTREAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
 
 /// Returns the total number of persistent-unistream frames dropped since
 /// process start. See [`UNISTREAM_DROP_COUNT`].
 pub fn unistream_drop_count() -> u64 {
     UNISTREAM_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Cumulative count of "slow `writer.ready()`" events on the persistent
+/// unidirectional media streams (`send_on_persistent_stream`): each time a
+/// single `JsFuture::from(writer.ready()).await` on an ESTABLISHED media stream
+/// takes longer than [`READY_STALL_THRESHOLD_MS`] to resolve, this counter is
+/// incremented once.
+///
+/// ## Why this exists (the gap [`UNISTREAM_DROP_COUNT`] cannot fill)
+///
+/// On WebTransport the media send path is fully `.await`-blocking and a
+/// `WritableStream` signals backpressure by leaving `writer.ready()` PENDING,
+/// not by rejecting the write. So when the uplink hits a BANDWIDTH cliff but the
+/// connection is still alive (ACKs flowing, no stream reset), no write ever
+/// fails and `UNISTREAM_DROP_COUNT` stays flat — the publisher would never
+/// self-shed. Measuring how long `ready()` blocks turns that otherwise-silent
+/// saturation into an observable, monotonic signal the encoder AQ loop can
+/// consume exactly like the drop counter (delta-over-window via
+/// `videocall_aq::evaluate_self_congestion`). This is the WebTransport analogue
+/// of the WebSocket `bufferedAmount`-based drop on the synchronous WS path,
+/// which WT lacks structurally.
+///
+/// Design choice — a monotonic COUNTER (of slow events), not an EWMA of
+/// latency: the existing #1178 consumer already keys off a monotonic
+/// `AtomicU64` via a tumbling-window delta test, so a sibling counter reuses
+/// that exact machinery (same `evaluate_self_congestion` helper, same
+/// independent-window pattern) with no new consumer shape, no decay-tuning, and
+/// no floating-point atomic. A counter is also self-evidently lock-free and
+/// allocation-free on the hot send path. We deliberately count only the
+/// THRESHOLD-CROSSING (one increment per slow `ready()`), so the consumer's
+/// "N events within the window" test reads as "the uplink was visibly
+/// backpressured at least N times in the last window" — the saturation
+/// equivalent of the drop counter's "N frames failed to send."
+static UNISTREAM_READY_STALL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of slow-`ready()` (uplink-saturation) events on the
+/// persistent media unistreams since process start. See
+/// [`UNISTREAM_READY_STALL_COUNT`]. Mirrors [`unistream_drop_count`]; consumed
+/// by the encoder AQ loop's WT uplink-saturation self-shed (#1219 prerequisite).
+pub fn unistream_ready_stall_count() -> u64 {
+    UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed)
+}
+
+/// Wall-clock threshold (ms) above which a single `writer.ready().await` on an
+/// established media unistream is counted as a saturation ("slow-ready") event.
+///
+/// Lives here (not in `videocall-aq`) because it parameterises the PRODUCER-side
+/// measurement, not the consumer's window/threshold decision. The consumer's
+/// "how many slow events trip a shed" threshold and window live in
+/// `videocall-aq` alongside the drop-counter constants.
+///
+/// Initial value rationale (netsim-tunable): the AQ loop ticks at
+/// `AQ_TICK_INTERVAL_MS` (1000 ms) and a healthy `ready()` on a live link
+/// resolves in well under a frame interval (sub-10 ms once the QUIC congestion
+/// window has room). 250 ms is ~8× a 30 fps frame interval (33 ms): long enough
+/// that an ordinary bursty-but-recovering link (a few queued frames draining)
+/// does NOT cross it, but short enough that a genuine bandwidth cliff — where
+/// `ready()` blocks for hundreds of ms to multiple seconds while the send buffer
+/// refuses to drain — crosses it on most frames. Combined with the consumer
+/// requiring SEVERAL such events within its window, an isolated 250 ms hiccup
+/// (one reordered/retransmitted packet on a high-RTT link) cannot shed a layer.
+const READY_STALL_THRESHOLD_MS: f64 = 250.0;
+
+/// Read a monotonic high-resolution timestamp (ms) from `performance.now()`.
+///
+/// Returns `None` when there is no `window` / no `Performance` object (e.g. a
+/// non-browser test target). We deliberately use `performance.now()` rather than
+/// `Date::now()`: it is monotonic (immune to wall-clock adjustments / NTP steps)
+/// and is the standard high-resolution timer for measuring elapsed durations on
+/// the hot path. It is two clock reads per frame with no allocation.
+fn perf_now_ms() -> Option<f64> {
+    web_sys::window()?.performance().map(|p| p.now())
 }
 
 /// Name of the JS global that, when set to a non-empty array of base64
@@ -857,11 +937,53 @@ impl WebTransportTask {
 
                 // --- Write the frame ----------------------------------------
                 // writer.ready() resolves when there is backpressure room.
-                // writer.write() returns immediately after enqueueing; the
-                // browser serialises chunks from this writer in call order.
+                // writer.write() returns immediately after enqueueing.
+                //
+                // Uplink-saturation observable (#1219 prerequisite): a slow link
+                // signals backpressure by leaving ready() PENDING (it does NOT
+                // reject — that only happens on teardown, which the drop counter
+                // catches). So we time how long ready() blocks: a wait beyond
+                // READY_STALL_THRESHOLD_MS means the uplink is saturated but
+                // alive, a case UNISTREAM_DROP_COUNT structurally cannot see.
+                //
+                // HOW THE COUNTER ACCUMULATES (do NOT serialise this!): each call
+                // to `send_on_persistent_stream` spawn_local's its OWN future and
+                // the map lock is released above (before this await), so during a
+                // stall there are MANY concurrent in-flight frame futures, each
+                // holding a clone of the same writer. `WritableStreamDefaultWriter
+                // .ready` returns the writer's single current `[[readyPromise]]`,
+                // so every concurrent future observes the SAME pending promise and
+                // they all resolve together when backpressure clears. Each future
+                // independently timed its own (staggered) `start`, so a multi-
+                // hundred-ms stall with K frames in flight produces ~K increments
+                // when the promise resolves — that is how the consumer's
+                // 3-in-2000ms window is reached. If this path is ever refactored
+                // into a single serialised send loop, the counter would cap at 1
+                // per stall and the saturation signal would silently break. NOTE:
+                // because increments are stamped at ready()-RESOLUTION (not stall
+                // onset), detection of a sustained cliff lags by up to ~one window.
+                //
+                // We only measure on the ESTABLISHED media path — `captured_token`
+                // is `Some` here because the writer was just acquired above (it
+                // is set unconditionally alongside `entry.writer.clone()`), so
+                // the gate mirrors the drop counter and excludes handshake /
+                // create-stream stalls. `perf_now_ms()` is monotonic
+                // (`performance.now()`); if it is unavailable we simply skip the
+                // measurement (the wait still happens, just unobserved).
+                let ready_wait_start_ms = perf_now_ms();
                 JsFuture::from(writer.ready())
                     .await
                     .map_err(|e| anyhow!("writer.ready() failed: {:?}", e))?;
+                // captured_token.is_some() is guaranteed true on this line, but
+                // assert the gate explicitly so the signal can never be polluted
+                // by a control/handshake stream if this code is later refactored.
+                if captured_token.is_some() {
+                    if let (Some(start), Some(end)) = (ready_wait_start_ms, perf_now_ms()) {
+                        if end - start > READY_STALL_THRESHOLD_MS {
+                            UNISTREAM_READY_STALL_COUNT.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                }
                 JsFuture::from(writer.write_with_chunk(&chunk))
                     .await
                     .map_err(|e| anyhow!("write_with_chunk failed: {:?}", e))?;

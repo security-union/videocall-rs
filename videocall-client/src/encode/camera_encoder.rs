@@ -967,6 +967,14 @@ impl CameraEncoder {
             let mut last_wt_drop_snapshot: u64 =
                 videocall_transport::webtransport::unistream_drop_count();
             let mut wt_drop_window_start_ms: f64 = js_sys::Date::now();
+            // Independent sliding window for the WebTransport uplink-SATURATION
+            // self-trigger (#1219 prerequisite). SEPARATE from the WT drop window
+            // above: the drop counter only moves on stream teardown, whereas this
+            // counts slow `writer.ready()` events (a slow-but-alive uplink). Both
+            // are WT-only and flat at 0 on WebSocket, so this is a no-op there.
+            let mut last_wt_stall_snapshot: u64 =
+                videocall_transport::webtransport::unistream_ready_stall_count();
+            let mut wt_stall_window_start_ms: f64 = js_sys::Date::now();
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
             // instead of waiting on receiver diagnostics. Runs for the lifetime
             // of the owning CameraEncoder: this `spawn_local` future is NOT bound
@@ -1145,6 +1153,62 @@ impl CameraEncoder {
                     if decision.roll_window {
                         last_wt_drop_snapshot = decision.new_snapshot;
                         wt_drop_window_start_ms = now;
+                    }
+                }
+
+                // Client-side WebTransport uplink-SATURATION detection
+                // (#1219 prerequisite). The WT DROP block above only fires on
+                // stream/connection TEARDOWN (STOP_SENDING / RESET_STREAM /
+                // close); it stays FLAT on a slow-but-alive uplink because the WT
+                // media send path is `.await`-blocking and a WritableStream
+                // signals backpressure by leaving `writer.ready()` PENDING, not
+                // by rejecting the write. So a genuine bandwidth cliff (link slow,
+                // ACKs flowing, no reset) would NEVER self-shed on the drop
+                // counter. The transport therefore also exposes
+                // `unistream_ready_stall_count()`, incremented once per slow
+                // `writer.ready().await` (> producer-side READY_STALL_THRESHOLD_MS)
+                // on the established media path. A SUSTAINED cluster of those
+                // within the window means the uplink is saturated, so we self-shed
+                // a layer — the same gentle, single-rung `force_video_step_down`
+                // the drop/WS blocks use (NOT `force_congestion_cut`): this is the
+                // publisher's OWN gradual uplink adaptation, where one rung per
+                // window is the right granularity; the hard multi-tier cut is
+                // reserved for the server-authored CONGESTION path, which is a
+                // stronger, externally-corroborated signal. Window/snapshot are
+                // INDEPENDENT of the WT drop, WS, and server-congestion paths;
+                // each axis sheds at most one layer per its own window, so they
+                // cannot compound into a runaway double step-down. WS users hold
+                // this counter flat at 0 → true no-op. This is the signal that
+                // lets the relay's room-wide sender-keyed CONGESTION (bug #1219)
+                // be removed: a WT publisher now sees its own uplink saturation
+                // directly.
+                {
+                    use crate::adaptive_quality_constants::{
+                        evaluate_self_congestion, WT_SATURATION_STALL_THRESHOLD,
+                        WT_SATURATION_WINDOW_MS,
+                    };
+                    let current_wt_stalls =
+                        videocall_transport::webtransport::unistream_ready_stall_count();
+                    let elapsed_ms = now - wt_stall_window_start_ms;
+                    let decision = evaluate_self_congestion(
+                        current_wt_stalls,
+                        last_wt_stall_snapshot,
+                        elapsed_ms,
+                        WT_SATURATION_WINDOW_MS,
+                        WT_SATURATION_STALL_THRESHOLD,
+                    );
+                    if decision.step_down {
+                        log::warn!(
+                            "CameraEncoder: client WT uplink saturation detected ({} slow ready() \
+                             events in {:.0}ms), forcing video step-down",
+                            current_wt_stalls.saturating_sub(last_wt_stall_snapshot),
+                            elapsed_ms,
+                        );
+                        encoder_control.force_video_step_down();
+                    }
+                    if decision.roll_window {
+                        last_wt_stall_snapshot = decision.new_snapshot;
+                        wt_stall_window_start_ms = now;
                     }
                 }
 

@@ -643,7 +643,15 @@ pub fn Diagnostics(
                     // from_peer is the local self-id and useless as a label).
                     "video" => {
                         if let Some(text) = format_reception_text(&evt) {
-                            diagnostics_data.set(Some(text));
+                            // Change-gate (mirrors the peer_status arm): the
+                            // producer fires per (peer × media kind) on every
+                            // 500ms heartbeat, and consecutive dumps are
+                            // usually byte-identical — skip the set() so the
+                            // drawer body doesn't re-render for no change.
+                            // `.peek()` reads without subscribing this loop.
+                            if diagnostics_data.peek().as_deref() != Some(text.as_str()) {
+                                diagnostics_data.set(Some(text));
+                            }
                         }
                     }
                     "sender" => {

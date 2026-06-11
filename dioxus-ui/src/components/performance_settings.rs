@@ -717,17 +717,16 @@ pub fn format_content_send_summary(snap: Option<&SimulcastSendSnapshot>) -> Stri
 }
 
 /// CONTENT (screen) RECEIVE summary. No peer sharing → `"Nobody is sharing"`;
-/// otherwise `"Pulling full quality · L{i} · {w}×{h}"` for the top-layer peer.
+/// otherwise `"Pulling full quality · {letter} · {w}×{h}"` for the top-layer
+/// peer, where the letter is the quality tier (L/M/H) of the received layer.
 /// `top` is the highest-layer peer snapshot currently received. Pure.
 pub fn format_content_receive_summary(top: Option<&ReceivedLayerSnapshot>) -> String {
     match top {
         None => "Nobody is sharing".to_string(),
-        Some(s) => format!(
-            "Pulling full quality · L{} · {}×{}",
-            s.layer_index + 1,
-            s.width,
-            s.height
-        ),
+        Some(s) => {
+            let q = layer_quality_label(s.layer_index, s.layer_count, true);
+            format!("Pulling full quality · {q} · {}×{}", s.width, s.height)
+        }
     }
 }
 
@@ -4660,7 +4659,17 @@ mod tests {
         };
         assert_eq!(
             format_content_receive_summary(Some(&top)),
-            "Pulling full quality · L3 · 1920×1080"
+            "Pulling full quality · H · 1920×1080"
+        );
+        // 2-layer ladder: index 0 is Low → compact "L".
+        let low = ReceivedLayerSnapshot {
+            layer_index: 0,
+            layer_count: 2,
+            ..top
+        };
+        assert_eq!(
+            format_content_receive_summary(Some(&low)),
+            "Pulling full quality · L · 1920×1080"
         );
     }
 

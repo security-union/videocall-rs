@@ -1074,23 +1074,75 @@ pub fn resolve_transport_config(
     }
 }
 
+/// Persist a transport-preference decision to storage, with no UI side effects.
+///
+/// This is the single source of truth for "given a chosen protocol and whether
+/// the user asked to remember it, what should each storage area end up
+/// holding". Both the settings-modal "Apply" button and
+/// [`confirm_transport_change`] call this so their persistence logic cannot
+/// drift. It deliberately does NOT prompt (`window.confirm`) or reload — those
+/// stay in the callers.
+///
+/// End-state per arm (`pref` is the chosen protocol, default is `WebTransport`):
+///
+/// - **default + not sticky** (`(true, false)`): clear every key
+///   (`vc_transport_sticky`, `vc_transport_preference`, `vc_transport_session`)
+///   so the next load resolves to the implicit default (`WebTransport`).
+/// - **any value + sticky** (`(_, true)`): write `vc_transport_preference` +
+///   `vc_transport_sticky=true` to `localStorage` so the choice persists across
+///   browser sessions.
+/// - **non-default + not sticky** (`(false, false)`): a session-scoped choice.
+///   Clear any pre-existing `localStorage` sticky pin
+///   (`vc_transport_sticky` + `vc_transport_preference`) FIRST, then write the
+///   value to `vc_transport_session`. Clearing the stale sticky pin is required:
+///   otherwise `load_transport_preference` would see `sticky == true` on the
+///   next load, read the stale `localStorage` value, and ignore the
+///   `sessionStorage` choice we just wrote (issue #1291 hazard C.3).
+pub fn apply_transport_decision(pref: TransportPreference, sticky: bool) {
+    let is_default = pref == TransportPreference::default();
+    match (is_default, sticky) {
+        // Default + not sticky: clear all storage — implicit default
+        // doesn't need to be remembered.
+        (true, false) => clear_transport_sticky_and_pref(),
+        (_, true) => {
+            save_transport_preference(pref);
+            save_transport_sticky(true);
+        }
+        (false, false) => {
+            // Session-scoped: survives the imminent reload but is forgotten on
+            // tab close. Clear any prior localStorage sticky pin first so a
+            // stale `vc_transport_sticky=true` can't shadow this session value
+            // on the next load.
+            if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten())
+            {
+                let _ = storage.remove_item(TRANSPORT_STICKY_KEY);
+                let _ = storage.remove_item(TRANSPORT_PREF_KEY);
+            }
+            save_transport_preference_session(pref);
+        }
+    }
+}
+
 /// Handle a transport preference change from transport selection controls.
 ///
 /// Shows a confirmation dialog. If the user confirms, persists the preference
-/// (sticky vs session-only depending on `sticky`) and reloads the page. If
-/// cancelled, attempts to reset a native `<select>` control (when present)
-/// back to the current value so it doesn't appear stale.
+/// via [`apply_transport_decision`] (sticky vs session-only depending on
+/// `sticky`) and reloads the page. If cancelled, attempts to reset a native
+/// `<select>` control (when present) back to the current value so it doesn't
+/// appear stale.
 ///
-/// Routing rules:
+/// Routing rules (delegated to [`apply_transport_decision`]):
 ///
 /// - The default (`WebTransport`) selected with `sticky == false`: clear every
 ///   transport-preference storage key so the next load resolves to the default
 ///   without needing a remembered choice.
 /// - Selecting any value with `sticky == true`: write to `localStorage` so the
 ///   choice persists across browser sessions.
-/// - Non-default selection with `sticky == false`: write to `sessionStorage`
-///   so the choice survives the imminent page reload but evaporates when the
-///   tab closes.
+/// - Non-default selection with `sticky == false`: clear any prior
+///   `localStorage` sticky pin, then write to `sessionStorage` so the choice
+///   survives the imminent page reload but evaporates when the tab closes. The
+///   stale-sticky clear is what lets a session-scoped WebSocket choice win over
+///   a previously pinned WebTransport on the next load (issue #1291).
 ///
 /// Custom controls (like the settings modal glass dropdown) are state-driven
 /// and naturally re-render with the current value when the user cancels.
@@ -1116,17 +1168,7 @@ pub fn confirm_transport_change(
         })
         .unwrap_or(false);
     if confirmed {
-        let is_default = pref == TransportPreference::default();
-        match (is_default, sticky) {
-            // Default + not sticky: clear all storage — implicit default
-            // doesn't need to be remembered.
-            (true, false) => clear_transport_sticky_and_pref(),
-            (_, true) => {
-                save_transport_preference(pref);
-                save_transport_sticky(true);
-            }
-            (false, false) => save_transport_preference_session(pref),
-        }
+        apply_transport_decision(pref, sticky);
         if let Some(w) = web_sys::window() {
             let _ = w.location().reload();
         }

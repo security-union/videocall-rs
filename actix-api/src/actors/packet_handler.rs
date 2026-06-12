@@ -332,6 +332,20 @@ impl WindowCounter {
             false
         }
     }
+
+    /// Non-consuming peek: would a [`try_consume`](Self::try_consume) admit right
+    /// now? Mirrors the window-roll logic (an elapsed window is effectively empty)
+    /// WITHOUT mutating, so the caller can ask "is there a free slot?" before
+    /// deciding to do work. Used to gate per-target bucket creation on the global
+    /// cap (issue #1303) without burning a slot.
+    fn has_capacity(&self, now: Instant, window: Duration, max: u32) -> bool {
+        if now.duration_since(self.window_start) > window {
+            // A try_consume would reset the count to 0 first, so the window is
+            // effectively empty: capacity exists iff the cap is non-zero.
+            return max > 0;
+        }
+        self.count < max
+    }
 }
 
 /// Per-receiver, per-target-sender rate limiter for KEYFRAME_REQUEST packets.
@@ -349,8 +363,13 @@ impl WindowCounter {
 ///    window. This bounds total fan-out from any single receiver as a
 ///    safety net against bursty or malicious behaviour.
 ///
-/// Memory bound: the per-pair table cleans up entries that have not been
-/// touched for `KEYFRAME_REQUEST_WINDOW_MS * 10` (10 seconds), running every
+/// Memory bound (two layers): (1) a NEW per-target bucket is only opened while
+/// the global per-receiver cap has a free slot this window (issue #1303) — a
+/// globally-rejected request cannot be forwarded, so it must not cost a map
+/// entry; this caps new-bucket creation at ~[`KEYFRAME_REQUEST_MAX_PER_SEC`] per
+/// window and closes the forged-`target_session_id` amplification vector. (2) The
+/// table additionally cleans up entries that have not been touched for
+/// `KEYFRAME_REQUEST_WINDOW_MS * 10` (10 seconds), running every
 /// [`KEYFRAME_LIMITER_CLEANUP_INTERVAL`] calls to amortize the O(n)
 /// `retain()` cost. This mirrors `CongestionTracker::record_drop` so the
 /// strategy is consistent across the relay.
@@ -504,6 +523,30 @@ impl KeyframeRequestLimiter {
         // clients are unaffected. The global per-receiver cap is unchanged.
         let key_layer = layer.min(KEYFRAME_REQUEST_MAX_LAYER_ID);
         let key = (target, kind, key_layer);
+
+        // #1303: forged-target memory-amplification guard. `or_insert_with` below
+        // opens a fresh bucket on every NEW key, and the global cap further down
+        // only bounds FORWARDING, not map growth — so a receiver spraying
+        // KEYFRAME_REQUESTs with distinct, client-controllable `target_session_id`s
+        // could open one bucket per forged target, none stale for 10s (a memory
+        // amplification vector, not a packet flood). Gate NEW-bucket creation on the
+        // global cap: if this receiver's global window is already saturated, the
+        // request cannot be forwarded regardless of target, so opening a bucket for
+        // it would cost memory and accomplish nothing. EXISTING buckets bypass this
+        // (so an established sender's strict/congested/#1297-still-waiting budgets
+        // and refund path are all untouched), and a legitimate FRESH sender is only
+        // refused a bucket while the receiver is already at its own
+        // KEYFRAME_REQUEST_MAX_PER_SEC ceiling — where its request would be denied
+        // forwarding anyway, and it opens a bucket on the next window. This bounds
+        // the map at ~KEYFRAME_REQUEST_MAX_PER_SEC new buckets per window.
+        if !self.per_target.contains_key(&key)
+            && !self
+                .global
+                .has_capacity(now, window, KEYFRAME_REQUEST_MAX_PER_SEC)
+        {
+            return false;
+        }
+
         let per_pair_entry = self
             .per_target
             .entry(key.clone())
@@ -1399,15 +1442,39 @@ mod tests {
         // When the global cap denies, the per-pair budget for the denied
         // target must be refunded so the legitimate next call (after the
         // global window elapses) is admitted.
+        //
+        // #1303: the new-bucket creation gate only applies to BRAND-NEW keys, so
+        // the refund path now protects an ESTABLISHED pair. Establish `pair` FIRST
+        // so the later globally-denied request is an existing key (bypasses the
+        // gate) and actually reaches the per-pair consume → refund — otherwise the
+        // gate would short-circuit before any per-pair slot is consumed.
         let mut limiter = KeyframeRequestLimiter::new();
-        // Fill the global cap with distinct targets.
-        for i in 0..KEYFRAME_REQUEST_MAX_PER_SEC {
+        let pair = user_target(b"t-victim");
+
+        // Establish the pair (consumes 1 global slot + its 1/window per-pair slot).
+        assert!(allow_v(&mut limiter, pair.clone(), 0));
+
+        // Fill the REST of the global cap with distinct targets (1 + (MAX-1) == MAX).
+        for i in 0..(KEYFRAME_REQUEST_MAX_PER_SEC - 1) {
             let target = format!("t-{}", i);
             assert!(allow_v(&mut limiter, user_target(target.as_bytes()), 0));
         }
-        // This pair's first request is denied by the global cap.
-        let pair = user_target(b"t-victim");
-        assert!(!allow_v(&mut limiter, pair.clone(), 0));
+
+        // Rewind ONLY the pair's per-pair window so it has fresh per-pair budget,
+        // while the global window stays full. The pair's next request admits
+        // per-pair but is denied by the (full) global cap → the per-pair slot it
+        // consumed must be refunded.
+        let entry = limiter
+            .per_target
+            .get_mut(&(pair.clone(), TEST_KIND, 0u32))
+            .unwrap();
+        entry.window_start =
+            Instant::now() - Duration::from_millis(KEYFRAME_REQUEST_WINDOW_MS + 500);
+
+        assert!(
+            !allow_v(&mut limiter, pair.clone(), 0),
+            "an established pair must be denied by the full global cap"
+        );
 
         // Manually expire only the global window (simulating ~1s passing
         // for the global cap while the per-pair entry was just refunded).
@@ -1419,6 +1486,47 @@ mod tests {
         assert!(
             allow_v(&mut limiter, pair, 0),
             "per-pair budget must be refunded when global cap denies"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_per_target_map_bounded_under_forged_target_spray() {
+        // #1303: forged-target memory amplification. A receiver sprays
+        // KEYFRAME_REQUESTs with MANY distinct, client-controllable target
+        // session-ids in ONE window. Each forged target is a NEW key; without the
+        // new-bucket creation gate each would open a fresh `per_target` entry (none
+        // stale for 10s) and the map would grow to the spray volume — a memory
+        // amplification vector (forwarding stays capped, so it is not a flood).
+        // The gate refuses to open a bucket once the global cap is saturated, so the
+        // map is bounded by the global cap regardless of how many targets are forged.
+        let mut limiter = KeyframeRequestLimiter::new();
+
+        const SPRAY: u64 = 1000;
+        let mut admitted = 0usize;
+        for i in 0..SPRAY {
+            // Distinct forged target session-ids, all within one window (no time
+            // passes between calls in a unit test).
+            if limiter.allow(KeyframeTarget::Session(i), TEST_KIND, 0) {
+                admitted += 1;
+            }
+        }
+
+        // Only the global cap's worth of requests are admitted (and forwarded)...
+        assert_eq!(
+            admitted, KEYFRAME_REQUEST_MAX_PER_SEC as usize,
+            "exactly the global cap's worth of distinct targets may be admitted in one window"
+        );
+        // ...and crucially the map did NOT grow with the spray: a globally-rejected
+        // request opens no bucket. The bound is the global cap, not SPRAY.
+        assert_eq!(
+            limiter.per_target.len(),
+            KEYFRAME_REQUEST_MAX_PER_SEC as usize,
+            "per_target map must stay bounded by the global cap under a forged-target \
+             spray, not grow to the spray volume"
+        );
+        assert!(
+            (limiter.per_target.len() as u64) < SPRAY,
+            "the map must not grow with the spray volume"
         );
     }
 

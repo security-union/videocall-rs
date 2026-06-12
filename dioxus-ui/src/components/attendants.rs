@@ -17,7 +17,8 @@
  */
 
 use crate::components::decode_budget::{
-    decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
+    decide_step, effective_cap, ios_decode_tile_ceiling, BudgetSample, BudgetState, BudgetStep,
+    MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
@@ -573,6 +574,22 @@ pub fn AttendantsComponent(
     // it with the live `total_tiles` on the first frame, after which the loop
     // seeds/tracks the cap up to it.
     let mut decode_budget_natural = use_signal(|| MIN_CAP);
+    // Device-class decode-tile ceiling (issue #1286 / #1289). Computed ONCE per
+    // mount (it depends only on the platform + core count, neither of which
+    // changes within a session) and reused by BOTH `effective_cap` call sites
+    // (render + telemetry) and the control loop's growth clamp. `Some(n)` on
+    // iOS (mobile WebKit) where the absence of any valid main-thread-saturation
+    // signal means an unbounded cap can collapse the device; `None` elsewhere
+    // (no extra ceiling). Gated on `is_ios()` specifically, NOT all WebKit:
+    // desktop Safari on capable hardware should not be clamped to a phone-class
+    // budget, and Part A's longtask-blind conservatism already prevents the
+    // unjustified growth there.
+    let device_decode_ceiling: Option<usize> = use_hook(|| {
+        ios_decode_tile_ceiling(
+            is_ios(),
+            videocall_client::utils::hardware_concurrency_cores(),
+        )
+    });
     // Last decode-budget snapshot published to the diagnostics bus (for the
     // HEALTH packet, #987 P3): (effective_cap, natural_capped, pressured,
     // is_fixed, fixed_n). Tracked so the publisher effect only emits a bus
@@ -2208,10 +2225,15 @@ pub fn AttendantsComponent(
             /// `fps+longtask_severe` combined label. Observation only.
             fn severe_label(samples: &[BudgetSample], median: Option<f64>) -> &'static str {
                 let fps_severe = median.map(|m| m <= FPS_SEVERE).unwrap_or(false);
+                // #1286: a `None` longtask (signal unavailable) maps to "not
+                // severe" per sample — consistent with the gate functions, which
+                // never let absence-of-evidence manufacture distress.
                 let longtask_severe = samples.len() >= SUSTAIN_SAMPLES
-                    && samples[samples.len() - SUSTAIN_SAMPLES..]
-                        .iter()
-                        .all(|s| s.longtask_ms_per_sec >= LONGTASK_SEVERE_MS_PER_SEC);
+                    && samples[samples.len() - SUSTAIN_SAMPLES..].iter().all(|s| {
+                        s.longtask
+                            .map(|lt| lt >= LONGTASK_SEVERE_MS_PER_SEC)
+                            .unwrap_or(false)
+                    });
                 match (fps_severe, longtask_severe) {
                     (true, true) => "fps+longtask_severe",
                     (true, false) => "fps_severe",
@@ -2233,6 +2255,28 @@ pub fn AttendantsComponent(
             let mut samples: Vec<BudgetSample> = Vec::with_capacity(WINDOW);
             // Sum of long-task durations observed in the *current* (open) bucket.
             let mut longtask_bucket_ms: f64 = 0.0;
+            // #1286: is the Long Tasks API available on THIS browser at all?
+            // Computed ONCE — it cannot change within a session. On WebKit
+            // (desktop Safari + ALL iOS browsers) the `"longtask"`
+            // PerformanceObserver entry type is unimplemented, so
+            // `long_tasks::LongTaskObserver::start` returns `None` and NO
+            // `client_longtask_duration_ms` events are ever emitted. There the
+            // open bucket stays a perpetual 0.0 — indistinguishable from a
+            // genuinely idle Chromium second. So we use the platform capability
+            // (NOT the bucket value) as the discriminator: when the observer is
+            // unsupported, every sample's `longtask` is `None` ("no telemetry"),
+            // and the gate functions treat that conservatively (never confirm
+            // idle / not-busy → never permit growth) instead of reading the
+            // blind 0.0 as healthy. On a supported browser we emit
+            // `Some(bucket_sum)` for every sample, including a legitimate idle
+            // 0.0.
+            //
+            // TODO(#1024/#1025/#1020): WebKit/iOS has NO main-thread-saturation
+            // signal today; the controller relies on FPS + the device-class
+            // tile ceiling (`ios_decode_tile_ceiling`) there. A real iOS-valid
+            // backpressure signal (decode-queue depth) is tracked by
+            // #1024/#1025/#1020 — wire it in when it lands.
+            let longtask_supported = !videocall_client::utils::is_webkit();
             // Controller-owned budget state. `cap` is seeded from the current
             // actuator value; switching the override Auto -> Fixed -> Auto
             // re-seeds it from whatever the cap is at that moment.
@@ -2274,9 +2318,19 @@ pub fn AttendantsComponent(
                 };
 
                 // Close the 1-second bucket into a sample and reset the bucket.
+                // #1286: emit `None` (signal unavailable) on browsers where the
+                // Long Tasks API is unsupported — NOT a blind `Some(0.0)`. The
+                // discriminator is platform capability (`longtask_supported`,
+                // computed once above), not the bucket value: an idle Chromium
+                // second also produces a 0.0 bucket, so the value cannot tell
+                // "no telemetry" from "idle".
                 let sample = BudgetSample {
                     render_fps: Some(fps),
-                    longtask_ms_per_sec: longtask_bucket_ms,
+                    longtask: if longtask_supported {
+                        Some(longtask_bucket_ms)
+                    } else {
+                        None
+                    },
                 };
                 longtask_bucket_ms = 0.0;
                 samples.push(sample);
@@ -2371,6 +2425,13 @@ pub fn AttendantsComponent(
                     // `direction_hold` book-keeping live so the strict-recovery
                     // gate is warm if we ever do step down then recover.
                     state.cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+                    // #1286 belt-and-suspenders: bind the device-class ceiling
+                    // on the loop-owned state too, so `decode_budget_cap` can
+                    // never internally ratchet above what `effective_cap` would
+                    // display on iOS. Floored at MIN_CAP.
+                    if let Some(ceiling) = device_decode_ceiling {
+                        state.cap = state.cap.min(ceiling.max(MIN_CAP));
+                    }
 
                     let qualifies = recovery_qualifying(&samples, SUSTAIN_SAMPLES);
                     if qualifies {
@@ -2386,9 +2447,16 @@ pub fn AttendantsComponent(
                     if let BudgetStep::Down(magnitude) = decide_step(&samples, &state, natural, now)
                     {
                         // Closing-sample rationale for the decision logs below.
+                        // Cheap `Option<f64>` copies only — each `format!` is
+                        // inlined lazily into the `log::info!` args, so it is
+                        // skipped when the log level is disabled. #1286: render a
+                        // `None` longtask (signal unavailable on WebKit/iOS) as
+                        // "none", mirroring how `median`/`cur_fps` render their
+                        // missing case, so the log never implies a healthy 0.0
+                        // where there is simply no telemetry.
                         let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
                         let cur_fps = samples.last().and_then(|s| s.render_fps);
-                        let longtask = samples.last().map(|s| s.longtask_ms_per_sec).unwrap_or(0.0);
+                        let longtask = samples.last().and_then(|s| s.longtask);
                         let prev_cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
 
                         decode_budget_pressured.set(true);
@@ -2400,10 +2468,10 @@ pub fn AttendantsComponent(
                         // Pressured-latch edge (false->true): the controller now
                         // owns the cap. Trigger is the first measured down-step.
                         log::info!(
-                            "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={} cap={}",
+                            "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={} natural={} cap={}",
                             median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
                             cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                            longtask,
+                            longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                             natural,
                             state.cap,
                         );
@@ -2414,22 +2482,22 @@ pub fn AttendantsComponent(
                         // signature.
                         if magnitude > 1 {
                             log::info!(
-                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={:.0}",
+                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
                                 magnitude,
                                 severe_label(&samples, median),
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                             );
                         }
                         // First cap transition (un-pressured -> pressured down-step).
                         log::info!(
-                            "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                            "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
                             prev_cap,
                             state.cap,
                             magnitude,
                             median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
                             cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                            longtask,
+                            longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                             natural,
                         );
                     }
@@ -2452,14 +2520,17 @@ pub fn AttendantsComponent(
                 }
 
                 // Closing-sample rationale shared by every decision log in this
-                // arm. Cheap copies only — the `format!` allocations are inlined
-                // lazily into each `log::info!` so they are skipped both on the
-                // steady-state Hold path (no log fires) AND when the log level is
-                // disabled. `median` is also read by the `magnitude > 1` severe
-                // check. Observation only.
+                // arm. Cheap `Option<f64>` copies only — the `format!`
+                // allocations are inlined lazily into each `log::info!` so they
+                // are skipped both on the steady-state Hold path (no log fires)
+                // AND when the log level is disabled. This holds for `median`,
+                // `cur_fps`, AND `longtask`. `median` is also read by the
+                // `magnitude > 1` severe check. Observation only.
                 let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
                 let cur_fps = samples.last().and_then(|s| s.render_fps);
-                let longtask = samples.last().map(|s| s.longtask_ms_per_sec).unwrap_or(0.0);
+                // #1286: render a `None` longtask (signal unavailable on
+                // WebKit/iOS) as "none" so logs don't imply a healthy 0.0.
+                let longtask = samples.last().and_then(|s| s.longtask);
 
                 // Apply the step: the controller owns cap + last_step_ms.
                 match step {
@@ -2484,22 +2555,22 @@ pub fn AttendantsComponent(
                         // change.
                         if magnitude > 1 {
                             log::info!(
-                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={:.0}",
+                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
                                 magnitude,
                                 severe_label(&samples, median),
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                             );
                         }
                         if state.cap != prev_cap {
                             log::info!(
-                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
                                 prev_cap,
                                 state.cap,
                                 magnitude,
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
                                 cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                                 natural,
                             );
                         }
@@ -2507,6 +2578,14 @@ pub fn AttendantsComponent(
                     BudgetStep::Up => {
                         let prev_cap = state.cap;
                         state.cap = (state.cap + 1).min(natural.max(MIN_CAP));
+                        // #1286 belt-and-suspenders: never grow past the
+                        // device-class ceiling. (On iOS the up-step gate
+                        // `recovery_qualifying` already returns false for the
+                        // blind longtask, so this rarely fires — but the clamp
+                        // guarantees the cap can't exceed the ceiling on any path.)
+                        if let Some(ceiling) = device_decode_ceiling {
+                            state.cap = state.cap.min(ceiling.max(MIN_CAP));
+                        }
                         state.last_step_ms = now;
                         // A consumed up-step resets the recovery streak so the
                         // next up-step must re-earn RECOVERY_HOLD samples.
@@ -2514,12 +2593,12 @@ pub fn AttendantsComponent(
                         decode_budget_cap.set(state.cap);
                         if state.cap != prev_cap {
                             log::info!(
-                                "DecodeBudget: cap {}->{} dir=up magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                "DecodeBudget: cap {}->{} dir=up magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
                                 prev_cap,
                                 state.cap,
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
                                 cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                                 natural,
                             );
                         }
@@ -2569,7 +2648,16 @@ pub fn AttendantsComponent(
                         // `non_distress_growth_qualifying` is the single source
                         // of truth for the non-distress condition (and returns
                         // false on a short/incomplete window, so no underflow).
-                        let target = natural.max(MIN_CAP);
+                        // #1286 belt-and-suspenders: lower the growth target to
+                        // the device-class ceiling so non-distress growth can
+                        // never push the cap past it. (On iOS the gate
+                        // `non_distress_growth_qualifying` already returns false
+                        // for the blind longtask, so this arm rarely runs there;
+                        // capping the target is the guarantee regardless.)
+                        let target = match device_decode_ceiling {
+                            Some(ceiling) => natural.max(MIN_CAP).min(ceiling.max(MIN_CAP)),
+                            None => natural.max(MIN_CAP),
+                        };
                         let up_cooldown_elapsed = (now - state.last_step_ms) >= STEP_UP_COOLDOWN_MS;
                         let not_distressed =
                             non_distress_growth_qualifying(&samples, SUSTAIN_SAMPLES);
@@ -2582,12 +2670,12 @@ pub fn AttendantsComponent(
                             // `decide_step` is Holding. dir=growth distinguishes this
                             // from the strict-recovery dir=up step above.
                             log::info!(
-                                "DecodeBudget: cap {}->{} dir=growth magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                "DecodeBudget: cap {}->{} dir=growth magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
                                 prev_cap,
                                 state.cap,
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
                                 cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                                 natural,
                             );
                         }
@@ -2754,8 +2842,16 @@ pub fn AttendantsComponent(
         let natural_capped = natural.min(CANVAS_LIMIT);
         // Shared three-mode actuator: identical to the render-side
         // `effective_cap` below, so reported telemetry can never drift from
-        // what is on screen (HCL #987 review FIX).
-        let effective = effective_cap(override_mode, pressured, natural, cap);
+        // what is on screen (HCL #987 review FIX). The SAME device-class
+        // ceiling (#1286) is passed so the reported cap matches the rendered
+        // (ceiling-clamped) one on iOS.
+        let effective = effective_cap(
+            override_mode,
+            pressured,
+            natural,
+            cap,
+            device_decode_ceiling,
+        );
 
         // Compact, comparable snapshot. Only emit on a real change so the
         // diagnostics bus (and the health packet) is not spammed per render.
@@ -2963,6 +3059,10 @@ pub fn AttendantsComponent(
         decode_budget_pressured(),
         total_tiles,
         decode_budget_cap(),
+        // #1286: device-class ceiling binds on every mode, including
+        // un-pressured Auto (which otherwise returns the raw natural). Computed
+        // once at mount above.
+        device_decode_ceiling,
     );
     let budget_cap = effective_cap;
     // Natural layout capacity (already bounded by CANVAS_LIMIT through

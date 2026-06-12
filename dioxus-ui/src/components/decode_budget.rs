@@ -492,6 +492,32 @@ pub fn decide_step(
     BudgetStep::Hold
 }
 
+/// Severe-tier label for a multi-tile (`magnitude > 1`) down-step, reproducing
+/// [`decide_step`]'s catastrophic-pressure test EXACTLY so a support-triage log
+/// is not misled by a single closing sample (issue #1000).
+///
+/// FPS uses the window median (`<= FPS_SEVERE`) and long-task uses the SUSTAINED
+/// window check via the SAME [`longtask_sustained_at_or_above`] predicate (with
+/// [`LONGTASK_SEVERE_MS_PER_SEC`]) that `decide_step` evaluates at its severity
+/// branch — so the label can never silently drift from the step magnitude. Both
+/// conditions may hold at once, hence the combined `fps+longtask_severe` label.
+///
+/// `(false, false)` is unreachable when called as intended (`decide_step` only
+/// returns `magnitude > 1` when at least one severe condition holds); it is
+/// labeled `unknown_severe` rather than asserted so logging can never panic. The
+/// `severe_label_matches_decide_step_severity` test pins this agreement.
+pub(crate) fn severe_label(samples: &[BudgetSample], median: Option<f64>) -> &'static str {
+    let fps_severe = median.map(|m| m <= FPS_SEVERE).unwrap_or(false);
+    let longtask_severe =
+        longtask_sustained_at_or_above(samples, SUSTAIN_SAMPLES, LONGTASK_SEVERE_MS_PER_SEC);
+    match (fps_severe, longtask_severe) {
+        (true, true) => "fps+longtask_severe",
+        (true, false) => "fps_severe",
+        (false, true) => "longtask_severe",
+        (false, false) => "unknown_severe",
+    }
+}
+
 /// Resolve the **effective decode cap**: the number of on-screen tiles that may
 /// actually decode video, given the current override mode and adaptive state.
 ///
@@ -646,6 +672,82 @@ mod tests {
             decide_step(&samples, &state, 9, PAST_COOLDOWN),
             BudgetStep::Down(3)
         );
+    }
+
+    /// #1000: `severe_label` must agree with `decide_step`'s ACTUAL severity
+    /// outcome for the same window. `severe_label` is only consulted on a
+    /// multi-tile down-step, so the contract is: it returns a concrete severe
+    /// tier IFF `decide_step` (under a down-eligible state) returns `Down(m)`
+    /// with `m > 1`, and the specific tier matches WHICH condition fired. Both
+    /// derive fps-severe / longtask-severe from the SAME `FPS_SEVERE` and
+    /// `longtask_sustained_at_or_above(LONGTASK_SEVERE_MS_PER_SEC)` inputs, so
+    /// this pins them together: changing `decide_step`'s severity
+    /// predicate/threshold OR `severe_label`'s branch logic in isolation breaks
+    /// the agreement and fails this test (the drift #1000 was filed to close).
+    #[test]
+    fn severe_label_matches_decide_step_severity() {
+        // Down-eligible: cap well above MIN_CAP, cooldown long elapsed, so the
+        // severity branch is reachable and `magnitude` reflects the true tier
+        // (mild = 1; severe = ceil(cap*0.25) > 1 at cap = 20).
+        let state = state_with_cap(20);
+        let natural = 9;
+
+        let catastrophic_fps = [
+            fps_sample(FPS_SEVERE - 1.0),
+            fps_sample(FPS_SEVERE),
+            fps_sample(FPS_SEVERE - 2.0),
+        ];
+        let extreme_longtask = [
+            longtask_sample(LONGTASK_SEVERE_MS_PER_SEC + 10.0),
+            longtask_sample(LONGTASK_SEVERE_MS_PER_SEC),
+            longtask_sample(LONGTASK_SEVERE_MS_PER_SEC + 5.0),
+        ];
+        let combined = [
+            BudgetSample {
+                render_fps: Some(FPS_SEVERE - 1.0),
+                longtask: Some(LONGTASK_SEVERE_MS_PER_SEC + 10.0),
+            },
+            BudgetSample {
+                render_fps: Some(FPS_SEVERE),
+                longtask: Some(LONGTASK_SEVERE_MS_PER_SEC),
+            },
+            BudgetSample {
+                render_fps: Some(FPS_SEVERE - 2.0),
+                longtask: Some(LONGTASK_SEVERE_MS_PER_SEC + 1.0),
+            },
+        ];
+        // Mild: FPS below step-down but ABOVE severe, main thread idle → Down(1).
+        let mild = (FPS_SEVERE + FPS_STEP_DOWN) / 2.0;
+        let mild_pressure = [fps_sample(mild), fps_sample(mild), fps_sample(mild)];
+        // Healthy: no pressure → Hold.
+        let healthy = [fps_sample(60.0), fps_sample(58.0), fps_sample(60.0)];
+
+        let cases: [(&str, &[BudgetSample], &str); 5] = [
+            ("catastrophic_fps", &catastrophic_fps, "fps_severe"),
+            ("extreme_longtask", &extreme_longtask, "longtask_severe"),
+            ("combined", &combined, "fps+longtask_severe"),
+            ("mild_pressure", &mild_pressure, "unknown_severe"),
+            ("healthy", &healthy, "unknown_severe"),
+        ];
+
+        for (name, samples, expected_label) in cases {
+            let median = median_render_fps(samples, SUSTAIN_SAMPLES);
+            let label = severe_label(samples, median);
+            assert_eq!(
+                label, expected_label,
+                "severe_label classification for {name}"
+            );
+
+            // Lock the boolean against decide_step's REAL magnitude: a severe
+            // (non-"unknown") label IFF decide_step returns a multi-tile down-step.
+            let step = decide_step(samples, &state, natural, PAST_COOLDOWN);
+            let decide_severe = matches!(step, BudgetStep::Down(m) if m > 1);
+            let label_severe = label != "unknown_severe";
+            assert_eq!(
+                decide_severe, label_severe,
+                "{name}: severe_label ({label}) disagrees with decide_step ({step:?})"
+            );
+        }
     }
 
     #[test]

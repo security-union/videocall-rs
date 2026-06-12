@@ -2264,39 +2264,9 @@ pub fn AttendantsComponent(
     use_effect(move || {
         let task = spawn(async move {
             use crate::components::decode_budget::{
-                median_render_fps, non_distress_growth_qualifying, recovery_qualifying, FPS_SEVERE,
-                LONGTASK_SEVERE_MS_PER_SEC, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
+                median_render_fps, non_distress_growth_qualifying, recovery_qualifying,
+                severe_label, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
             };
-
-            /// Severe-tier label for a multi-tile (`magnitude > 1`) down-step,
-            /// reproducing `decide_step`'s catastrophic-pressure test EXACTLY so
-            /// the log is not misled by a single closing sample. FPS uses the
-            /// window median (`<= FPS_SEVERE`); long-task uses the SUSTAINED
-            /// window check (every one of the last `SUSTAIN_SAMPLES` samples at or
-            /// above `LONGTASK_SEVERE_MS_PER_SEC`) — the same condition
-            /// `decide_step` evaluates. Both may be true at once, hence the
-            /// `fps+longtask_severe` combined label. Observation only.
-            fn severe_label(samples: &[BudgetSample], median: Option<f64>) -> &'static str {
-                let fps_severe = median.map(|m| m <= FPS_SEVERE).unwrap_or(false);
-                // #1286: a `None` longtask (signal unavailable) maps to "not
-                // severe" per sample — consistent with the gate functions, which
-                // never let absence-of-evidence manufacture distress.
-                let longtask_severe = samples.len() >= SUSTAIN_SAMPLES
-                    && samples[samples.len() - SUSTAIN_SAMPLES..].iter().all(|s| {
-                        s.longtask
-                            .map(|lt| lt >= LONGTASK_SEVERE_MS_PER_SEC)
-                            .unwrap_or(false)
-                    });
-                match (fps_severe, longtask_severe) {
-                    (true, true) => "fps+longtask_severe",
-                    (true, false) => "fps_severe",
-                    (false, true) => "longtask_severe",
-                    // Unreachable in practice: decide_step only returns magnitude>1
-                    // when at least one severe condition holds. Logged as `unknown`
-                    // rather than asserting, so logging can never panic.
-                    (false, false) => "unknown_severe",
-                }
-            }
             use videocall_diagnostics::{now_ms, MetricValue};
 
             /// Rolling window length (~5 s at 1 Hz). Must be >= SUSTAIN_SAMPLES so
@@ -2499,10 +2469,10 @@ pub fn AttendantsComponent(
                     // natural (the maximum the loop would ever grow to).
                     if let BudgetStep::Down(magnitude) = decide_step(&samples, &state, natural, now)
                     {
-                        // Closing-sample rationale for the decision logs below.
-                        // Cheap `Option<f64>` copies only — each `format!` is
-                        // inlined lazily into the `log::info!` args, so it is
-                        // skipped when the log level is disabled. #1286: render a
+                        // Telemetry for the decision logs below. Computed once on
+                        // this one-time pressured-latch edge (NOT per tick), so the
+                        // `median_render_fps` recompute cost is irrelevant here
+                        // (contrast the per-tick Auto path, #1001). #1286: render a
                         // `None` longtask (signal unavailable on WebKit/iOS) as
                         // "none", mirroring how `median`/`cur_fps` render their
                         // missing case, so the log never implies a healthy 0.0
@@ -2543,16 +2513,21 @@ pub fn AttendantsComponent(
                             );
                         }
                         // First cap transition (un-pressured -> pressured down-step).
-                        log::info!(
-                            "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
-                            prev_cap,
-                            state.cap,
-                            magnitude,
-                            median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                            cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                            longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                            natural,
-                        );
+                        // #1001: gate on an actual change (mirroring the steady
+                        // Auto arm) so a clamp-collapsed `prev_cap` can never log a
+                        // no-op `cap N->N`; the log always reflects real movement.
+                        if state.cap != prev_cap {
+                            log::info!(
+                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
+                                prev_cap,
+                                state.cap,
+                                magnitude,
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                natural,
+                            );
+                        }
                     }
                     continue;
                 }
@@ -2572,25 +2547,28 @@ pub fn AttendantsComponent(
                     state.direction_hold = 0;
                 }
 
-                // Closing-sample rationale shared by every decision log in this
-                // arm. Cheap `Option<f64>` copies only — the `format!`
-                // allocations are inlined lazily into each `log::info!` so they
-                // are skipped both on the steady-state Hold path (no log fires)
-                // AND when the log level is disabled. This holds for `median`,
-                // `cur_fps`, AND `longtask`. `median` is also read by the
-                // `magnitude > 1` severe check. Observation only.
-                let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
-                let cur_fps = samples.last().and_then(|s| s.render_fps);
-                // #1286: render a `None` longtask (signal unavailable on
-                // WebKit/iOS) as "none" so logs don't imply a healthy 0.0.
-                let longtask = samples.last().and_then(|s| s.longtask);
-
                 // Apply the step: the controller owns cap + last_step_ms.
+                //
+                // #1001: the decision-log telemetry (`median` / `cur_fps` /
+                // `longtask`) is computed INSIDE the Down / Up / growth branches
+                // that actually emit it — never before this `match`.
+                // `median_render_fps` is a `Vec`-alloc + sort (NOT a cheap copy),
+                // so hoisting it here would re-run it on every steady-state Hold
+                // tick for a value Hold never uses. Each branch computes it only
+                // when it is about to log. (`cur_fps` / `longtask` are cheap
+                // `Option<f64>` reads; they ride along for locality.)
                 match step {
                     BudgetStep::Down(magnitude) => {
                         // Proportional/multi-tile down-step (HCL #987 review
                         // FIX 4): `magnitude` is 1 under mild pressure, larger
                         // under catastrophic pressure. Floor at MIN_CAP.
+                        // #1001: telemetry computed here in the consuming branch.
+                        // A Down only fires when `cap > MIN_CAP` (decide_step
+                        // guard), so it always strictly lowers the cap and the cap
+                        // log below always fires — these are never unused.
+                        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                        let cur_fps = samples.last().and_then(|s| s.render_fps);
+                        let longtask = samples.last().and_then(|s| s.longtask);
                         let prev_cap = state.cap;
                         state.cap = state.cap.saturating_sub(magnitude).max(MIN_CAP);
                         state.last_step_ms = now;
@@ -2645,6 +2623,11 @@ pub fn AttendantsComponent(
                         state.direction_hold = 0;
                         decode_budget_cap.set(state.cap);
                         if state.cap != prev_cap {
+                            // #1001: telemetry computed only when the up-step
+                            // actually moves the cap (and thus logs).
+                            let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                            let cur_fps = samples.last().and_then(|s| s.render_fps);
+                            let longtask = samples.last().and_then(|s| s.longtask);
                             log::info!(
                                 "DecodeBudget: cap {}->{} dir=up magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
                                 prev_cap,
@@ -2719,6 +2702,12 @@ pub fn AttendantsComponent(
                             state.cap += 1;
                             state.last_step_ms = now;
                             decode_budget_cap.set(state.cap);
+                            // #1001: telemetry computed only on an actual growth
+                            // step; a steady-state Hold tick never reaches here, so
+                            // `median_render_fps` does not run when nothing changes.
+                            let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                            let cur_fps = samples.last().and_then(|s| s.render_fps);
+                            let longtask = samples.last().and_then(|s| s.longtask);
                             // Non-distress growth: cap re-grows toward natural while
                             // `decide_step` is Holding. dir=growth distinguishes this
                             // from the strict-recovery dir=up step above.

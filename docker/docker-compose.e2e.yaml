@@ -118,6 +118,15 @@ services:
       # (`RATE_LIMIT_EXCEEDED`) and the cascade times out downstream
       # `toBeVisible()` assertions. See issue #608.
       - DISPLAY_NAME_RATE_LIMIT_DISABLED=true
+      # Enable the console-log upload endpoint so the e2e suite can exercise its
+      # room_token auth contract (see e2e/tests/console-log-upload-auth.spec.ts).
+      # Without this the endpoint returns 404 for ALL requests, which would make
+      # the positive (200) and cross-meeting (403) assertions pass vacuously.
+      # CONSOLE_LOG_DIR points at a guaranteed-writable path inside the
+      # container (the default /data/console-logs is not provisioned in the e2e
+      # stack; the handler canonicalizes the base dir, so it must be writable).
+      - CONSOLE_LOG_UPLOAD_ENABLED=true
+      - CONSOLE_LOG_DIR=/tmp/console-logs
       - RUST_LOG=info
       - CARGO_TARGET_DIR=/app/meeting-api/target
       - CARGO_INCREMENTAL=1
@@ -273,6 +282,29 @@ services:
       # without spinning up N real browser contexts. This flag also gates the
       # test-only `window.__videocall_inject_render_fps` injection hook.
       - MOCK_PEERS_ENABLED=true
+      # Build the wasm client with the `netsim` cargo feature (issue #1080).
+      # The e2e UI is compiled at container startup by trunk (see
+      # docker/start-dioxus.sh — `trunk build` in static mode / `trunk serve`
+      # in dev mode), NOT at Docker image-build time. Trunk reads this env var
+      # (TRUNK_BUILD_FEATURES, equivalent to `--features netsim`) and applies
+      # it ONLY to the primary `rel="rust"` target in index.html — the
+      # videocall-ui app binary, which has no per-link `data-cargo-features`.
+      # The codecs/neteq worker targets set their own `data-cargo-features`
+      # (+ data-cargo-no-default-features) so they are unaffected (verified via
+      # `trunk build -v`: the codecs/neteq cargo invocations stay
+      # `--no-default-features --features wasm|web`, only videocall-ui gains
+      # `--features netsim`).
+      #
+      # WHY netsim is e2e-only and always-on here: it compiles in the
+      # `window.__vcNetsim` per-client downlink-impairment shim (dioxus-ui
+      # main.rs) used by the WT/WS simulcast-divergence spec to degrade ONE
+      # receiver's downlink in-process. With no profile installed at runtime
+      # the shim is a no-op fast path, so always-on for e2e keeps CI simple
+      # and the standard suite unaffected. Production builds NEVER set this
+      # env var (docker/docker-compose.yaml — the prod/dev stack — uses the
+      # same Dockerfile.dioxus.dev + start-dioxus.sh but omits it), so prod
+      # wasm stays byte-identical (the feature is fully compile-gated).
+      - TRUNK_BUILD_FEATURES=netsim
       - USERS_ALLOWED_TO_STREAM=
       - DIOXUS_SERVE_MODE=${DIOXUS_SERVE_MODE:-dev}
       - CARGO_TARGET_DIR=/app/dioxus-ui/target

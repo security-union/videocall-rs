@@ -8522,6 +8522,7 @@ dependencies = [
  "url",
  "urlencoding",
  "uuid 0.8.2",
+ "videocall-aq",
  "videocall-meeting-types",
  "videocall-types",
  "web-transport-quinn",

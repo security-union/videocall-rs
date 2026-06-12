@@ -23,7 +23,9 @@ use crate::clock::{default_clock, Clock};
 use crate::constants::{
     cap_layers_to_budget, screen_share_camera_ceiling_index, simulcast_layers, uplink_budget_kbps,
     AudioQualityTier, VideoQualityTier, ENCODER_BACKPRESSURE_SUSTAIN_MS,
-    ENCODER_QUEUE_BACKPRESSURE_CLEAR, ENCODER_QUEUE_BACKPRESSURE_HIGH,
+    ENCODER_QUEUE_BACKPRESSURE_CLEAR, ENCODER_QUEUE_BACKPRESSURE_HIGH, LAYER_PROBE_CLEAR_WINDOW_MS,
+    LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC, LAYER_PROBE_OSCILLATION_WINDOW_MS,
+    LAYER_PROBE_PENALTY_BACKOFF, LAYER_PROBE_PENALTY_BASE_MS, LAYER_PROBE_PENALTY_MAX_MS,
     STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_QUALITY_TIERS,
 };
 use crate::manager::{AdaptiveQualityManager, TierTransitionRecord};
@@ -165,6 +167,81 @@ pub struct EncoderBitrateController {
     /// what backpressure/budget allows, and never below 1 (the base layer is
     /// always published). No-op in single-stream mode (floored at 1).
     union_requested_layer_cap: usize,
+
+    // --- User SEND layer-ceiling cap (perf-panel "layers published" thumb) ---
+    /// Active-layer COUNT cap derived from the user's Sending "layers published"
+    /// selection in the performance panel. The control operates directly in
+    /// layer-count space: the perf panel's ceiling thumb position maps to a layer
+    /// count via the UI mappers (`performance_settings::thumb_pos_to_layer_ceiling`
+    /// → the persisted `{video,screen}_layers` count), the encoder stores that
+    /// count in a shared atomic and converts it for this controller via
+    /// `videocall-client`'s `camera_encoder::layer_ceiling_to_count` (the
+    /// `u32::MAX` Auto sentinel → the `usize::MAX` fail-open value), which is fed
+    /// in here via [`observe_user_layer_ceiling`](Self::observe_user_layer_ceiling).
+    ///
+    /// **Same shape as [`union_requested_layer_cap`]:** a FURTHER top-side `min`
+    /// in [`tick`](Self::tick), composed as
+    /// `min(backpressure_ceiling, union_cap, user_ceiling).max(1)`. It can only
+    /// LOWER active toward the base (lowering the user's ceiling drops the top
+    /// layer(s) at once, saving sender CPU + uplink) or RAISE it back toward the
+    /// backpressure/earned ceiling as the user re-raises it. It NEVER raises
+    /// active above what backpressure/budget allows, and NEVER below 1 (the base
+    /// layer is always published — this cap does not touch the floor).
+    ///
+    /// **Fail-open:** [`usize::MAX`] means "no user cap" (Auto / full quality).
+    /// This is the default and the value an absent/Auto selection maps to, so it
+    /// suppresses nothing until the user drags the thumb below full. No-op in
+    /// single-stream mode (floored at 1).
+    user_layer_ceiling_cap: usize,
+
+    // --- Runtime simulcast layer ramp-up (issue #1140 / #1141) ---
+    /// Timestamp (ms) at which the encoder queue depth most recently became
+    /// sustained-CLEAR (at/below [`ENCODER_QUEUE_BACKPRESSURE_CLEAR`]) and has
+    /// stayed there since. The layer-probe dwell timer: a headroom probe-add is
+    /// only allowed once this has been continuously armed for
+    /// [`LAYER_PROBE_CLEAR_WINDOW_MS`]. Reset to `None` the instant the depth
+    /// rises above CLEAR (any non-trivial queue interrupts the clear run) AND
+    /// after a successful probe-add (so the NEXT rung must earn a fresh dwell).
+    ///
+    /// This proves ENCODER-queue headroom — i.e. the encoder is comfortably
+    /// draining frames — NOT main-thread / longtask headroom. Main-thread-stall
+    /// risk is bounded separately by the device core-count CEILING
+    /// (`CORES_FOR_3_LAYERS` in the UI capability check; see #890 / #562), and a
+    /// dedicated longtask gate is a tracked follow-up. So a busy-but-not-encode-
+    /// bound main thread can still ramp here; that is intentional and safe given
+    /// the ceiling already caps how many layers a weak device may reach.
+    layer_probe_clear_since_ms: Option<f64>,
+
+    /// Timestamp (ms) of the most recent headroom probe-ADD (issue #1141). Used
+    /// only by the anti-flap penalty box: if a layer is shed by BACKPRESSURE
+    /// within [`LAYER_PROBE_OSCILLATION_WINDOW_MS`] of this marker, the add is
+    /// judged an oscillation and the penalty box is armed/escalated. `None` when
+    /// no probe-add is "in flight" (never added, or the last add already aged out
+    /// of the oscillation window / was shed).
+    last_probe_add_at_ms: Option<f64>,
+
+    /// Timestamp (ms) until which headroom probe-adds are suppressed by the
+    /// anti-flap penalty box (issue #1141). Armed when a probed-up layer is shed
+    /// by backpressure within the oscillation window. `0.0` means no penalty is
+    /// active (`now >= 0.0` is always true, so the gate is open).
+    layer_probe_penalty_until_ms: f64,
+
+    /// Current penalty-box backoff duration (ms) for the layer probe (issue
+    /// #1141). Starts at [`LAYER_PROBE_PENALTY_BASE_MS`], doubles via
+    /// [`LAYER_PROBE_PENALTY_BACKOFF`] on each repeat oscillation (capped at
+    /// [`LAYER_PROBE_PENALTY_MAX_MS`]), and resets to the base once a probed layer
+    /// survives past the oscillation window (a good bet clears the flap memory).
+    layer_probe_penalty_ms: f64,
+
+    /// The highest active-layer count this controller has EARNED at runtime and
+    /// is entitled to recover back to (issue #1140 / #1141). Distinct from the
+    /// device ceiling (`simulcast_layer_count`): the ramp starts active at 1 and
+    /// only raises this as headroom probes succeed. The backpressure union-restore
+    /// path clamps recovery to THIS earned ceiling rather than the full ladder, so
+    /// a transient clear cannot vault active straight back to the device max
+    /// without re-earning each rung. A legacy full-ladder `set_simulcast_layers`
+    /// sets this to the full active count (byte-identical to pre-ramp behavior).
+    earned_active_ceiling: usize,
 }
 
 impl EncoderBitrateController {
@@ -260,6 +337,21 @@ impl EncoderBitrateController {
             // until a LAYER_HINT arrives and observe_union_requested_layer() is
             // called. usize::MAX => inert (full ladder).
             union_requested_layer_cap: usize::MAX,
+            // User SEND layer-ceiling cap (perf-panel "layers published" thumb).
+            // Fail-open: no user cap until the panel writes one via
+            // observe_user_layer_ceiling(). usize::MAX => inert (full ladder).
+            user_layer_ceiling_cap: usize::MAX,
+            // Runtime simulcast layer ramp (issue #1140 / #1141). No clear dwell
+            // armed yet, no probe-add in flight, penalty box open, backoff at its
+            // base. `earned_active_ceiling` starts at 1 — every controller begins
+            // entitled only to the base layer and earns more via headroom probes.
+            // `set_simulcast_layers` (legacy full-ladder) raises it to the full
+            // active count; `set_simulcast_ceiling_start_at_base` keeps it at 1.
+            layer_probe_clear_since_ms: None,
+            last_probe_add_at_ms: None,
+            layer_probe_penalty_until_ms: 0.0,
+            layer_probe_penalty_ms: LAYER_PROBE_PENALTY_BASE_MS,
+            earned_active_ceiling: 1,
         }
     }
 
@@ -273,21 +365,153 @@ impl EncoderBitrateController {
     /// bot and all current callers get.
     ///
     /// Call once after construction, before the first tick.
+    ///
+    /// Legacy semantics (issue #989): all `n` layers start ACTIVE — the manager's
+    /// `set_simulcast_layers` seeds `active_layer_count == n`. The earned ceiling
+    /// is therefore the full active count, so behavior is byte-identical to the
+    /// pre-ramp path. The CAMERA encoder now uses
+    /// [`set_simulcast_ceiling_start_at_base`](Self::set_simulcast_ceiling_start_at_base)
+    /// instead (start at the base, earn up); screen share keeps these all-active
+    /// semantics.
     pub fn set_simulcast_layers(&mut self, n: usize) {
         // Clamp + configure the manager (single source of truth for the count).
         self.quality_manager.set_simulcast_layers(n);
-        let effective = self.quality_manager.simulcast_layer_count();
+        self.build_layer_tiers_for_ceiling();
+        // Legacy full-ladder: every active layer is already earned.
+        self.earned_active_ceiling = self.quality_manager.active_layer_count();
+    }
 
-        if effective <= 1 {
+    /// Configure the simulcast ladder CEILING to `n` but start the ACTIVE count
+    /// at the base layer (1), to be earned up at runtime (issue #1140 / #1141).
+    ///
+    /// Used by the CAMERA encoder path. Unlike
+    /// [`set_simulcast_layers`](Self::set_simulcast_layers) (all `n` layers active
+    /// immediately), this delegates to
+    /// [`AdaptiveQualityManager::set_simulcast_ceiling_start_at_base`] so the
+    /// publisher emits a single legacy-equivalent stream at startup; the headroom
+    /// probe in [`tick`](Self::tick) earns layers up to the ceiling only when
+    /// observed encoder-queue backpressure + uplink budget allow. The per-layer
+    /// tier table is built for the FULL ceiling (so a re-added layer resumes near
+    /// its tier ideal), but only the first `active_layer_count` are encoded.
+    ///
+    /// `earned_active_ceiling` starts at the active count (== 1), so recovery
+    /// cannot vault past the base until a probe actually earns the next rung.
+    /// Call once after construction, before the first tick.
+    pub fn set_simulcast_ceiling_start_at_base(&mut self, n: usize) {
+        self.quality_manager.set_simulcast_ceiling_start_at_base(n);
+        self.build_layer_tiers_for_ceiling();
+        // Start entitled only to the base layer (== active count, which the
+        // manager seeded to 1); the ramp earns the rest.
+        self.earned_active_ceiling = self.quality_manager.active_layer_count();
+    }
+
+    /// Build `layer_tiers` / `last_layer_target_bitrates_kbps` from the manager's
+    /// configured ladder CEILING (`simulcast_layer_count`), or clear them in
+    /// single-stream mode (issue #1140). Shared by both
+    /// [`set_simulcast_layers`](Self::set_simulcast_layers) and
+    /// [`set_simulcast_ceiling_start_at_base`](Self::set_simulcast_ceiling_start_at_base)
+    /// so the per-layer tier table is identical regardless of the starting active
+    /// count — the table is the full ladder; only the active count differs.
+    fn build_layer_tiers_for_ceiling(&mut self) {
+        let ceiling = self.quality_manager.simulcast_layer_count();
+        if ceiling <= 1 {
             // Single-stream mode: nothing to build, behave exactly as before.
             self.layer_tiers.clear();
             self.last_layer_target_bitrates_kbps.clear();
             return;
         }
-        let tiers = self.simulcast_ladder(effective);
+        let tiers = self.simulcast_ladder(ceiling);
         self.layer_tiers = tiers.iter().collect();
         self.last_layer_target_bitrates_kbps =
             tiers.iter().map(|t| t.ideal_bitrate_kbps as f64).collect();
+    }
+
+    /// Whether there is genuine UPLINK room to add one more simulcast layer
+    /// (issue #1141).
+    ///
+    /// `encode_queue_size()` backpressure detects CPU/encoder saturation, NOT "my
+    /// uplink cannot carry another rung even though my CPU is bored". This gate
+    /// closes that gap: a probe-up is permitted only when the uplink budget for
+    /// `active + 1` layers exceeds the budget for `active` layers by at least
+    /// [`LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC`] of the current budget — i.e. the
+    /// next rung's nominal cost genuinely fits. Returns `false` at the ceiling
+    /// (nothing to add) and in single-stream mode (`layer_tiers` empty).
+    fn uplink_precondition_for_add(&self) -> bool {
+        let active = self.quality_manager.active_layer_count();
+        let ceiling = self.quality_manager.simulcast_layer_count();
+        if active >= ceiling || self.layer_tiers.is_empty() {
+            return false;
+        }
+        // `layer_tiers` is the full ladder (lowest first); the budget is the sum
+        // of the first `active` tier ideals. Re-derive the &'static ladder for the
+        // pure budget fn rather than borrowing the Vec<&'static>.
+        let tiers = self.simulcast_ladder(self.layer_tiers.len());
+        let budget_now = uplink_budget_kbps(tiers, active);
+        let budget_next = uplink_budget_kbps(tiers, active + 1);
+        budget_next - budget_now > budget_now * LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC
+    }
+
+    /// Whether a headroom probe-add of one simulcast layer is allowed THIS tick
+    /// (issue #1141). ALL of the following gates must pass:
+    ///
+    /// 1. simulcast mode (a ceiling > 1 exists);
+    /// 2. `active_layer_count` is below the device ceiling (room to add);
+    /// 3. the relay layer-union cap (`max_layer + 1` count; `usize::MAX` =
+    ///    fail-open) permits another active layer — never probe a rung no
+    ///    receiver wants;
+    /// 4. NOT under a backpressure `degrade` this tick, and NOT inside a
+    ///    self-targeted CONGESTION drain hold (climbing mid-shed/mid-drain would
+    ///    immediately re-flap);
+    /// 5. past the anti-flap penalty box (`now >= layer_probe_penalty_until_ms`);
+    /// 6. the encoder queue has been sustained-CLEAR for at least
+    ///    [`LAYER_PROBE_CLEAR_WINDOW_MS`] (the dwell timer armed that long ago);
+    /// 7. the forced-transition guards (warmup + min-transition interval) are
+    ///    clear — reusing the same gate the force_* layer sheds use, so a probe
+    ///    cannot fire during warmup or back-to-back with another transition;
+    /// 8. there is genuine uplink headroom for the next rung
+    ///    ([`uplink_precondition_for_add`](Self::uplink_precondition_for_add)).
+    fn probe_add_allowed(&self, now: f64, degrade: bool) -> bool {
+        if !self.quality_manager.is_simulcast() {
+            return false;
+        }
+        let active = self.quality_manager.active_layer_count();
+        let ceiling = self.quality_manager.simulcast_layer_count();
+        if active >= ceiling {
+            return false;
+        }
+        // Within the relay layer-union cap (count == max_layer + 1). usize::MAX is
+        // fail-open: an absent hint never blocks the probe.
+        if self.union_requested_layer_cap != usize::MAX && active >= self.union_requested_layer_cap
+        {
+            return false;
+        }
+        // Within the user SEND layer-ceiling cap, same shape as the union cap:
+        // the headroom probe must NEVER climb a layer the user has explicitly
+        // capped off, otherwise the same-tick suppress→probe would re-add the very
+        // layer the user just dropped. usize::MAX is fail-open (Auto / no cap).
+        if self.user_layer_ceiling_cap != usize::MAX && active >= self.user_layer_ceiling_cap {
+            return false;
+        }
+        // Never probe-up while actively shedding or draining a congestion buffer.
+        if degrade || self.quality_manager.congestion_hold_active(now) {
+            return false;
+        }
+        // Anti-flap penalty box.
+        if now < self.layer_probe_penalty_until_ms {
+            return false;
+        }
+        // Sustained-CLEAR dwell: the clear timer must be armed and have aged at
+        // least the (deliberately long) probe clear window.
+        match self.layer_probe_clear_since_ms {
+            Some(since) if now - since >= LAYER_PROBE_CLEAR_WINDOW_MS => {}
+            _ => return false,
+        }
+        // Reuse the warmup + min-transition guard the force_* sheds use.
+        if !self.quality_manager.forced_transition_guards_clear(now) {
+            return false;
+        }
+        // Genuine uplink room for the next rung.
+        self.uplink_precondition_for_add()
     }
 
     /// The simulcast layer ladder for this controller: SCREEN ladder when this
@@ -371,6 +595,24 @@ impl EncoderBitrateController {
     pub fn tick(&mut self, now: f64) {
         let (degrade, recover) = self.backpressure_decision(now);
 
+        // --- Maintain the layer-probe sustained-CLEAR dwell timer (issue #1141)
+        // The probe-add gate keys off encoder-queue headroom: arm the dwell timer
+        // when the queue is at/below the CLEAR floor, and reset it the instant the
+        // queue rises above CLEAR (any non-trivial backlog interrupts the clear
+        // run). This is independent of the backpressure recover timer (which uses
+        // the longer step-up window) — the probe deliberately demands its own,
+        // longer, asymmetric dwell (LAYER_PROBE_CLEAR_WINDOW_MS).
+        if self.last_encoder_queue_depth <= ENCODER_QUEUE_BACKPRESSURE_CLEAR {
+            self.layer_probe_clear_since_ms.get_or_insert(now);
+        } else {
+            self.layer_probe_clear_since_ms = None;
+        }
+
+        // Active-layer count at the very start of the tick — the baseline against
+        // which we detect this tick's net shed/restore for the penalty box and
+        // probe (issue #1141).
+        let active_before_tick = self.quality_manager.active_layer_count();
+
         // Capture the tier index BEFORE update so we can translate the manager's
         // incident-hardened degrade/recover decision (which moves
         // video_tier_index) into a top-layer drop/add — reusing all the existing
@@ -414,60 +656,90 @@ impl EncoderBitrateController {
             );
         }
 
-        // --- Relay layer-union suppression cap (issue #1108, Stage 3) ---
+        // Active-layer count AFTER the backpressure shed/restore block but BEFORE
+        // the union block (issue #1141). The penalty box must distinguish a shed
+        // caused by BACKPRESSURE (a genuine "the device couldn't sustain the
+        // probed rung" oscillation, which should arm the anti-flap penalty) from a
+        // shed caused purely by the relay UNION cap shrinking (no receiver wants
+        // the rung — not a flap, must NOT penalize the probe). Comparing this to
+        // `active_before_tick` isolates the backpressure-driven portion of any net
+        // shed below.
+        let active_after_backpressure = self.quality_manager.active_layer_count();
+
+        // --- Top-side layer-cap suppression (relay union hint #1108 Stage 3 +
+        //     user SEND ceiling) ---
         //
         // The backpressure block above has just settled `active_layer_count()` to
-        // the backpressure axis's decision for THIS tick. The union cap is a
-        // FURTHER `min` restriction layered on top of that: the relay tells each
-        // publisher the MAX layer ANY receiver currently wants (the union), and we
-        // stop encoding layers above it so no CPU/uplink is spent on a top layer
-        // nobody will decode.
+        // the backpressure axis's decision for THIS tick. TWO independent top-side
+        // caps may further restrict it, and they compose as a single `min`:
         //
-        // INVARIANTS (see the field doc): the cap may only LOWER active below the
-        // backpressure ceiling (suppress) or RAISE it back toward that ceiling
-        // when the union grows (restore). It must NEVER raise active above what
-        // backpressure/budget allows (backpressure wins on the down side), and
-        // NEVER below 1 (the base layer is always published). The `usize::MAX`
-        // fail-open sentinel makes the whole block inert (no hint → full ladder,
-        // byte-identical to Stage 2).
+        //  * the RELAY UNION cap (`union_requested_layer_cap`): the relay tells
+        //    each publisher the MAX layer ANY receiver currently wants, so we stop
+        //    encoding layers above it (no CPU/uplink on a top layer nobody will
+        //    decode); and
+        //  * the USER SEND ceiling (`user_layer_ceiling_cap`): the performance
+        //    panel's "layers published" thumb — the user explicitly bounds how
+        //    many top layers this publisher emits (lowering it sheds the top
+        //    layer(s) at once to save the user's own uplink/CPU).
         //
-        // No second publisher-side debounce: the RELAY debounces the down
-        // direction, so we apply the union cap eagerly each tick (suppress-lazy /
-        // restore-eager). The restore reuses the SAME min-interval gate the
-        // explicit force_* layer-shed paths use (`forced_transition_guards_clear`).
-        // Because `add_top_layer` does not arm `last_transition_time_ms`, a pure
-        // union restore (no tier movement) keeps that gate clear, so it climbs one
-        // layer per qualifying tick (~1 Hz) — not one per
-        // `MIN_TIER_TRANSITION_INTERVAL_MS` — matching the `wanted_degrade_at_floor`
-        // precedent (see the inline note below). No parallel timer state.
+        // Both are top-side caps with identical semantics, so we take the tighter
+        // (`min`) of the two as a single `cap` and run ONE suppress/restore pass
+        // against it. `usize::MAX` is the fail-open sentinel for each; when BOTH
+        // are `usize::MAX` the combined cap is `usize::MAX` and the whole block is
+        // inert (full ladder, byte-identical to before this change).
+        //
+        // INVARIANTS (see both field docs): the combined cap may only LOWER active
+        // below the backpressure ceiling (suppress) or RAISE it back toward that
+        // ceiling when the cap grows (restore). It must NEVER raise active above
+        // what backpressure/budget allows (backpressure wins on the down side),
+        // and NEVER below 1 (the base layer is always published — neither cap
+        // touches the floor).
+        //
+        // No second publisher-side debounce: the RELAY debounces the union down
+        // direction, and the USER cap is a deliberate human action, so we apply
+        // the combined cap eagerly each tick (suppress-eager / restore-gated). The
+        // restore reuses the SAME min-interval gate the explicit force_* layer-
+        // shed paths use (`forced_transition_guards_clear`). Because
+        // `add_top_layer` does not arm `last_transition_time_ms`, a pure cap
+        // restore (no tier movement) keeps that gate clear, so it climbs one layer
+        // per qualifying tick (~1 Hz) — not one per `MIN_TIER_TRANSITION_INTERVAL_MS`
+        // — matching the `wanted_degrade_at_floor` precedent. No parallel timer
+        // state.
         let union_count = self.union_requested_layer_cap;
-        if self.quality_manager.is_simulcast() && union_count != usize::MAX {
+        let user_cap = self.user_layer_ceiling_cap;
+        let cap = union_count.min(user_cap);
+        if self.quality_manager.is_simulcast() && cap != usize::MAX {
             // The backpressure ceiling this tick: when backpressure is actively
             // shedding (`degrade`), it owns the down direction, so the ceiling is
-            // wherever it just left active (the union must not re-add against an
+            // wherever it just left active (the cap must not re-add against an
             // active degrade). Otherwise backpressure is healthy/recovering and
-            // would, over time, restore to the full ladder — so the union may
-            // restore up to the full ladder (still clamped by the union itself
-            // below). This keeps backpressure authoritative on the down side while
-            // letting a grown union climb back toward what backpressure permits.
+            // would, over time, restore — so the cap may restore up to the EARNED
+            // active ceiling (issue #1140 / #1141), NOT the full device ladder.
+            // Clamping to `earned_active_ceiling` is what keeps the cap restore
+            // from vaulting active straight to the device max without the headroom
+            // probe re-earning each rung: the cap can only re-fill layers the ramp
+            // has already proven this device can carry. This keeps backpressure
+            // authoritative on the down side while letting a grown cap climb back
+            // toward what has been earned.
             let backpressure_ceiling = if degrade {
                 self.quality_manager.active_layer_count()
             } else {
-                self.quality_manager.simulcast_layer_count()
+                self.earned_active_ceiling
             };
-            // desired = min(backpressure ceiling, union cap), floored at 1. Both
+            // desired = min(backpressure ceiling, combined cap), floored at 1. All
             // terms are ≤ the ladder, so the ladder is implicit. `desired` can
             // never exceed `backpressure_ceiling`, which is the invariant that
-            // keeps the union cap from raising active above backpressure.
-            let desired = backpressure_ceiling.min(union_count).max(1);
+            // keeps the cap from raising active above backpressure.
+            let desired = backpressure_ceiling.min(cap).max(1);
 
-            // Suppress (eager, ungated): drop the whole excess this tick. The
-            // relay already debounced the down direction, so there is no second
-            // publisher-side debounce. `drop_top_layer` floors at 1.
-            let mut union_acted = false;
+            // Suppress (eager, ungated): drop the whole excess this tick. Both the
+            // relay (union) and the human (user cap) are authoritative on the down
+            // direction, so there is no second publisher-side debounce.
+            // `drop_top_layer` floors at 1.
+            let mut cap_acted = false;
             while self.quality_manager.active_layer_count() > desired {
                 if self.quality_manager.drop_top_layer() {
-                    union_acted = true;
+                    cap_acted = true;
                 } else {
                     break;
                 }
@@ -477,18 +749,85 @@ impl EncoderBitrateController {
             // min-interval guard is clear — the same gate the force_* layer sheds
             // use. One layer per qualifying tick throttles the climb to the tier
             // transition cadence without any parallel timer (restore-eager: a
-            // grown union re-adds within ~1 eligible tick). Backpressure permits
-            // it because `desired ≤ backpressure_ceiling`.
+            // grown cap re-adds within ~1 eligible tick). Backpressure permits it
+            // because `desired ≤ backpressure_ceiling`.
             if self.quality_manager.active_layer_count() < desired
                 && self.quality_manager.forced_transition_guards_clear(now)
                 && self.quality_manager.add_top_layer()
             {
-                union_acted = true;
+                cap_acted = true;
             }
 
-            if union_acted {
+            if cap_acted {
                 self.tier_changed = true;
             }
+        }
+
+        // --- Layer-probe penalty box: detect oscillation (issue #1141) ---
+        //
+        // Runs AFTER the backpressure + union blocks (so `active_layer_count()` is
+        // this tick's final decision) but BEFORE the probe-add below (so a shed
+        // this tick can never be immediately followed by a probe in the same
+        // tick). If active DROPPED this tick relative to the start of the tick, we
+        // classify the shed and update the penalty box; if it held or grew while a
+        // probed layer aged out of the oscillation window, we clear the flap
+        // memory.
+        if self.quality_manager.active_layer_count() < active_before_tick {
+            // Was the shed driven by BACKPRESSURE (active fell in the backpressure
+            // block) or PURELY by the union cap (active was unchanged through the
+            // backpressure block, then dropped in the union block)? Only a
+            // backpressure shed of a freshly-probed layer is an oscillation — a
+            // union-only shed means no receiver wants the rung, which is not a flap
+            // and must NOT lengthen the backoff.
+            let backpressure_shed = active_after_backpressure < active_before_tick;
+            if backpressure_shed {
+                // A backpressure shed of a freshly-probed layer is an oscillation.
+                // The helper arms/escalates the penalty box iff this shed fell
+                // within the oscillation window of the last probe-add. Shared with
+                // `force_congestion_cut`'s out-of-band shed (issue #1159) so both
+                // flap paths classify identically and stay in lockstep.
+                self.arm_probe_penalty_if_oscillation(now, "backpressure");
+            }
+            // Any shed clears the in-flight probe marker: a union-only shed is not
+            // an oscillation (so we did not arm above), but the probed layer is
+            // gone either way, so there is nothing left to penalize on a later
+            // backpressure shed.
+            self.last_probe_add_at_ms = None;
+        } else if let Some(added) = self.last_probe_add_at_ms {
+            // Active held or grew. If the most recent probe survived past the
+            // oscillation window, it was a good bet: clear the marker and reset the
+            // backoff to its base so a future flap starts fresh rather than
+            // inheriting an old escalation.
+            if now - added >= LAYER_PROBE_OSCILLATION_WINDOW_MS {
+                self.last_probe_add_at_ms = None;
+                self.layer_probe_penalty_ms = LAYER_PROBE_PENALTY_BASE_MS;
+            }
+        }
+
+        // --- Headroom probe: earn one more simulcast layer (issue #1140 / #1141) ---
+        //
+        // The conservative, self-limiting ramp. When ALL the probe gates pass
+        // (sustained encoder-queue clear for the long dwell window, past the
+        // penalty box, genuine uplink headroom, within the union cap, not
+        // shedding/draining) add ONE layer and raise the earned ceiling. The next
+        // rung must earn its own fresh clear dwell (we reset the dwell timer), so
+        // the ramp climbs at most ~one rung per LAYER_PROBE_CLEAR_WINDOW_MS.
+        if self.probe_add_allowed(now, degrade) && self.quality_manager.add_top_layer() {
+            self.tier_changed = true;
+            self.last_probe_add_at_ms = Some(now);
+            // Raise the earned ceiling so the union-restore path may recover back
+            // to this newly-proven rung after a transient shed.
+            self.earned_active_ceiling = self
+                .earned_active_ceiling
+                .max(self.quality_manager.active_layer_count());
+            // Force the NEXT rung to earn a fresh clear dwell.
+            self.layer_probe_clear_since_ms = None;
+            log::info!(
+                "AQ_LAYER_PROBE: headroom probe ADDED a layer ({} -> {} active of {} ceiling)",
+                active_before_tick,
+                self.quality_manager.active_layer_count(),
+                self.quality_manager.simulcast_layer_count(),
+            );
         }
 
         // --- Per-layer (or single-stream) target bitrates ---
@@ -543,6 +882,51 @@ impl EncoderBitrateController {
                 union_cap_str,
             );
         }
+    }
+
+    /// Arm/escalate the anti-flap penalty box if the just-observed top-layer
+    /// shed is an oscillation of a recently-probed layer (issue #1141 / #1159).
+    ///
+    /// "Oscillation" = a layer the headroom probe ADDED was shed again within
+    /// [`LAYER_PROBE_OSCILLATION_WINDOW_MS`] of that add — the device proved it
+    /// cannot yet sustain the rung, so the next probe-up is suppressed for the
+    /// current (exponentially-escalating) backoff. Returns `true` iff the penalty
+    /// was armed this call.
+    ///
+    /// Callers MUST have already confirmed a shed happened (active dropped); this
+    /// only decides whether that shed counts as a flap. It does NOT clear
+    /// `last_probe_add_at_ms` — the caller owns that, because the `tick` path
+    /// clears it on ANY shed (backpressure or union) while the out-of-band
+    /// `force_congestion_cut` path clears it on the cut it just performed.
+    ///
+    /// Two call sites share this so they cannot drift apart (issue #1159):
+    /// 1. `tick`'s in-band backpressure shed, and
+    /// 2. `force_congestion_cut`'s OUT-OF-BAND top-layer drop. Before #1159 the
+    ///    cut path touched no `layer_probe_*` field, so an uplink-driven cut of a
+    ///    probed layer never escalated the backoff and re-flapped every
+    ///    ~`CONGESTION_HOLD_MS`; routing it here fixes that.
+    ///
+    /// `cause` is a short label for the log line (e.g. `"backpressure"` or
+    /// `"congestion_cut"`) identifying which path detected the flap.
+    fn arm_probe_penalty_if_oscillation(&mut self, now: f64, cause: &str) -> bool {
+        let is_oscillation = self
+            .last_probe_add_at_ms
+            .is_some_and(|added| now - added < LAYER_PROBE_OSCILLATION_WINDOW_MS);
+        if !is_oscillation {
+            return false;
+        }
+        // A layer we probed-up was shed within the oscillation window → arm/extend
+        // the penalty box and escalate the backoff (capped).
+        self.layer_probe_penalty_until_ms = now + self.layer_probe_penalty_ms;
+        log::info!(
+            "AQ_LAYER_PROBE: oscillation detected (probed layer shed by {} within {:.0}ms) — penalty box armed for {:.0}ms",
+            cause,
+            LAYER_PROBE_OSCILLATION_WINDOW_MS,
+            self.layer_probe_penalty_ms,
+        );
+        self.layer_probe_penalty_ms = (self.layer_probe_penalty_ms * LAYER_PROBE_PENALTY_BACKOFF)
+            .min(LAYER_PROBE_PENALTY_MAX_MS);
+        true
     }
 
     /// Compute and store per-layer target bitrates for the active simulcast
@@ -653,36 +1037,19 @@ impl EncoderBitrateController {
 
     // --- Telemetry accessors (issue #1108) ---
     //
-    // Receiver FPS no longer feeds the sender AQ, so the former fps_ratio /
-    // bitrate_ratio observability signals no longer exist. They are repointed to
-    // `f64::NAN` so the health reporter's `is_finite()` guard silently drops the
-    // corresponding (now-dead) proto fields — see the `// TODO(#1108 cleanup)`
-    // in the removed-fan-in comment at the top of this file. The
-    // `last_p75_peer_fps` accessor is REPOINTED to carry the new sender
-    // backpressure signal (encoder queue depth) so the existing host telemetry
-    // channel surfaces it with zero proto/Grafana churn.
+    // Receiver FPS no longer feeds the sender AQ. The former fps_ratio /
+    // bitrate_ratio observability signals and their dead proto fields were
+    // removed in issue #1184. The encoder-queue-depth signal that briefly reused
+    // the legacy `last_p75_peer_fps` channel now has a self-describing accessor,
+    // `encoder_queue_depth` (below).
 
-    /// Deprecated FPS-ratio telemetry — receiver FPS was removed from the sender
-    /// AQ (issue #1108). Returns `NaN` so the health reporter omits the field.
-    /// TODO(#1108 cleanup): remove this accessor + its proto field.
-    pub fn last_fps_ratio(&self) -> f64 {
-        f64::NAN
-    }
-
-    /// Repointed (issue #1108): now carries the sender's encoder backpressure
-    /// signal — the last sampled `encode_queue_size()` — reusing this telemetry
-    /// channel so the host panel can surface the new signal without a new proto
-    /// field. (Despite the legacy name, this is NOT a receiver FPS.)
-    /// TODO(#1108 cleanup): rename the field/proto to `encoder_queue_depth`.
-    pub fn last_p75_peer_fps(&self) -> f64 {
+    /// The sender's encoder backpressure signal — the last sampled
+    /// `encode_queue_size()`. Renamed from the legacy `last_p75_peer_fps`
+    /// (issue #1184): the accessor had been repointed off receiver FPS onto
+    /// encoder-queue depth (issue #1108) but kept the misleading name. The host
+    /// telemetry channel surfaces this with no proto/Grafana churn.
+    pub fn encoder_queue_depth(&self) -> f64 {
         self.last_encoder_queue_depth as f64
-    }
-
-    /// Deprecated bitrate-ratio telemetry — the receiver-FPS PID that produced it
-    /// was removed (issue #1108). Returns `NaN` so the health reporter omits the
-    /// field. TODO(#1108 cleanup): remove this accessor + its proto field.
-    pub fn last_bitrate_ratio(&self) -> f64 {
-        f64::NAN
     }
 
     /// Last emitted target bitrate (kbps). In simulcast mode this is the sum of
@@ -769,6 +1136,34 @@ impl EncoderBitrateController {
     /// Test/observability accessor.
     pub fn union_requested_layer_cap(&self) -> usize {
         self.union_requested_layer_cap
+    }
+
+    /// Set the user's SEND layer-ceiling cap from the performance panel (the
+    /// "layers published" thumb).
+    ///
+    /// `cap_count` is the maximum number of simulcast layers the user wants this
+    /// publisher to keep active, in layer-COUNT terms (1 = base only, 2 = base +
+    /// one, …). Pass [`usize::MAX`] for Auto / no user cap (fail-open). Out-of-
+    /// range values are tolerated: the `min` composition in [`tick`](Self::tick)
+    /// re-clamps against the device ceiling and floors at 1, so a `0` behaves as
+    /// 1 (base always published) and an oversized value is harmlessly capped by
+    /// the backpressure/earned ceiling.
+    ///
+    /// Applied by the next [`tick`](Self::tick) as a further `min` on the
+    /// backpressure decision, composed identically to the relay union cap (see
+    /// the [`user_layer_ceiling_cap`](Self::user_layer_ceiling_cap) field doc):
+    /// `active = min(backpressure_ceiling, union_cap, user_cap).max(1)`. It can
+    /// only suppress active toward the base or restore it back toward the
+    /// backpressure/earned ceiling — never above what backpressure allows, never
+    /// below 1.
+    pub fn observe_user_layer_ceiling(&mut self, cap_count: usize) {
+        self.user_layer_ceiling_cap = cap_count;
+    }
+
+    /// The current user SEND layer-ceiling cap (layer COUNT). [`usize::MAX`] =
+    /// fail-open (Auto / no user cap). Test/observability accessor.
+    pub fn user_layer_ceiling_cap(&self) -> usize {
+        self.user_layer_ceiling_cap
     }
 
     /// Force an immediate video quality step-down due to server congestion.
@@ -860,6 +1255,23 @@ impl EncoderBitrateController {
             // the tier floor). The next tick recomputes the per-layer bitrates
             // against the just-armed drain hold.
             self.tier_changed = true;
+
+            // Anti-flap penalty box (issue #1159): this is an OUT-OF-BAND top-layer
+            // shed — it bypasses `tick`'s backpressure block entirely, so without
+            // this the penalty box never saw it. If the layer we just dropped was
+            // one the headroom probe recently ADDED (within the oscillation
+            // window), classify it as an oscillation exactly as an in-band
+            // backpressure shed would: a self-targeted CONGESTION cut means the
+            // relay is dropping our packets, i.e. the uplink could not carry the
+            // probed rung — the same "device/path cannot sustain this layer yet"
+            // signal the backpressure path arms on. Routing it through the shared
+            // helper escalates the 15→30→60 s backoff so an uplink-driven flap that
+            // recurs every ~CONGESTION_HOLD_MS (2.5 s) backs off instead of
+            // re-probing on the same cadence forever. Mirror the `tick` path and
+            // clear the in-flight probe marker afterward: the probed layer is gone,
+            // so a LATER shed must not be penalized against this same add.
+            self.arm_probe_penalty_if_oscillation(now, "congestion_cut");
+            self.last_probe_add_at_ms = None;
         }
         if changed {
             self.tier_changed = true;
@@ -986,9 +1398,10 @@ mod tests {
     use crate::clock::{default_clock, TestClock};
     use crate::constants::{
         ENCODER_BACKPRESSURE_SUSTAIN_MS, ENCODER_QUEUE_BACKPRESSURE_CLEAR,
-        ENCODER_QUEUE_BACKPRESSURE_HIGH, MIN_TIER_TRANSITION_INTERVAL_MS, QUALITY_WARMUP_MS,
-        SCREEN_QUALITY_TIERS, STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS,
-        VIDEO_QUALITY_TIERS,
+        ENCODER_QUEUE_BACKPRESSURE_HIGH, LAYER_PROBE_CLEAR_WINDOW_MS,
+        LAYER_PROBE_OSCILLATION_WINDOW_MS, LAYER_PROBE_PENALTY_BASE_MS,
+        MIN_TIER_TRANSITION_INTERVAL_MS, QUALITY_WARMUP_MS, SCREEN_QUALITY_TIERS,
+        STEP_DOWN_REACTION_TIME_MS, STEP_UP_STABILIZATION_WINDOW_MS, VIDEO_QUALITY_TIERS,
     };
     use crate::manager::AdaptiveQualityManager;
     use std::sync::atomic::AtomicU32;
@@ -1010,6 +1423,18 @@ mod tests {
         EncoderBitrateController::with_clock(
             ideal,
             target_fps,
+            Arc::clone(clock) as Arc<dyn crate::clock::Clock>,
+        )
+    }
+
+    /// Build a `TestClock`-backed SCREEN controller (issue #1199 / #1200). Uses
+    /// the screen ladder (`new_for_screen_with_clock`) so the per-layer state
+    /// mirrors the real `ScreenEncoder::set_encoder_control` path.
+    fn screen_controller_with_clock(clock: &Arc<TestClock>) -> EncoderBitrateController {
+        let target_fps = Arc::new(AtomicU32::new(10));
+        EncoderBitrateController::new_for_screen_with_clock(
+            target_fps,
+            SCREEN_QUALITY_TIERS,
             Arc::clone(clock) as Arc<dyn crate::clock::Clock>,
         )
     }
@@ -1042,6 +1467,18 @@ mod tests {
             t += step_ms;
         }
         t - step_ms
+    }
+
+    /// Spacing between probe ticks that comfortably exceeds the layer-probe clear
+    /// dwell window AND the min-transition guard, so one qualifying CLEAR tick at
+    /// this spacing satisfies the dwell (the timer was armed on the PRIOR clear
+    /// tick) and the forced-transition guard. Built from the symbolic constant so
+    /// it tracks any retune of `LAYER_PROBE_CLEAR_WINDOW_MS`.
+    fn probe_step_ms() -> f64 {
+        LAYER_PROBE_CLEAR_WINDOW_MS
+            .max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)
+            .max(STEP_UP_STABILIZATION_WINDOW_MS as f64)
+            + 500.0
     }
 
     // =====================================================================
@@ -1576,6 +2013,235 @@ mod tests {
     }
 
     // =====================================================================
+    // tick(): user SEND layer-ceiling cap (perf-panel "layers published")
+    // =====================================================================
+
+    /// A user ceiling of 2 on a 3-layer controller must, after one tick, cap the
+    /// published set to 2 layers — eager suppress, floored at the device ladder.
+    /// This is the user's "decrease the number of layers I send" control.
+    #[test]
+    fn test_user_ceiling_caps_layer_count() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+        assert_eq!(controller.active_layer_count(), 3);
+
+        let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // User drags the "layers published" thumb to 2.
+        controller.observe_user_layer_ceiling(2);
+        tick_at(&mut controller, &clock, t + union_step_ms(), 0);
+
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "user ceiling 2 must cap the published set to 2 layers"
+        );
+    }
+
+    /// The user ceiling floors at 1 (never drops the base): even a ceiling of 0
+    /// leaves the base layer published. The base-present invariant from Option A.
+    #[test]
+    fn test_user_ceiling_never_below_one() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        controller.observe_user_layer_ceiling(0);
+        tick_at(&mut controller, &clock, t + union_step_ms(), 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "user ceiling 0 must floor at the base layer (count 1), never 0"
+        );
+    }
+
+    /// CORE COMPOSITION (the mandate): active settles at
+    /// `min(ramp/backpressure_ceiling, union_cap, user_cap).max(1)`. Here the
+    /// union allows 3 and backpressure is healthy (ceiling 3), but the USER cap of
+    /// 2 is the tighter bound, so active must settle at 2 — proving the user cap
+    /// composes as a further `min`, not as an override of the other two.
+    ///
+    /// MUTATION CHECK: drop `.min(user_cap)` (or `.min(cap)`) from `tick`'s
+    /// `desired` and this asserts 3 instead of 2 → fails. Confirmed by hand.
+    #[test]
+    fn test_user_ceiling_composes_as_min_with_union_and_ramp() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3); // ramp/backpressure ceiling = 3 (full)
+
+        let t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // Union allows the full ladder (count 3); user caps at 2. The tighter
+        // (min) of the two wins, and backpressure is healthy so the ramp ceiling
+        // is the full 3 — isolating the user cap as the binding constraint.
+        controller.observe_union_requested_layer(2); // count 3 (non-binding)
+        controller.observe_user_layer_ceiling(2); // the binding cap
+        tick_at(&mut controller, &clock, t + union_step_ms(), 0);
+
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "active must be min(ramp=3, union=3, user=2).max(1) == 2"
+        );
+
+        // And the symmetric case: a union TIGHTER than the user cap wins. Reset
+        // the user cap wide open, tighten the union to count 1.
+        controller.observe_user_layer_ceiling(usize::MAX);
+        controller.observe_union_requested_layer(0); // count 1
+        let t2 = t + union_step_ms() * 2.0;
+        tick_at(&mut controller, &clock, t2, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "active must be min(ramp=3, union=1, user=MAX).max(1) == 1 (union now tighter)"
+        );
+    }
+
+    /// Fail-open default: a fresh controller that NEVER receives
+    /// `observe_user_layer_ceiling` keeps its full ladder (the cap starts at the
+    /// `usize::MAX` sentinel = inert), exactly like the union cap default.
+    #[test]
+    fn test_user_ceiling_fail_open_default_full_ladder() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+        assert_eq!(
+            controller.user_layer_ceiling_cap(),
+            usize::MAX,
+            "a fresh controller must default to the fail-open (no user cap) sentinel"
+        );
+
+        let mut t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
+        for _ in 0..10 {
+            tick_at(&mut controller, &clock, t, 0);
+            t += union_step_ms();
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "with no user ceiling ever observed the full ladder must stay active"
+        );
+    }
+
+    /// Restore-eager: from a user-capped `active == 1`, RAISING the user ceiling
+    /// back to the full ladder must climb active back toward the backpressure/earned
+    /// ceiling over subsequent ticks. This is the user's "increase the number of
+    /// layers I send" direction.
+    #[test]
+    fn test_user_ceiling_restore_eager_climbs_back() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // User caps to the base.
+        controller.observe_user_layer_ceiling(1);
+        t += union_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "precondition: capped to base"
+        );
+
+        // User re-raises the ceiling to the full ladder.
+        controller.observe_user_layer_ceiling(3);
+        t += union_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert!(
+            controller.active_layer_count() > 1,
+            "a raised user ceiling must begin restoring within one eligible tick (got {})",
+            controller.active_layer_count()
+        );
+
+        let mut restored_full = controller.active_layer_count() == 3;
+        for _ in 0..6 {
+            t += union_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                restored_full = true;
+                break;
+            }
+        }
+        assert!(
+            restored_full,
+            "user-ceiling restore must climb back to the full ladder (active {})",
+            controller.active_layer_count()
+        );
+    }
+
+    /// The user ceiling must NEVER raise active above the backpressure ceiling:
+    /// with backpressure holding active at 2, a user ceiling of 3 must NOT re-add
+    /// the layer backpressure shed — AQ shedding stays authoritative downward.
+    #[test]
+    fn test_user_ceiling_never_raises_above_backpressure() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_layers(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        let down_step =
+            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 500.0;
+        for _ in 0..8 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            if controller.active_layer_count() <= 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "precondition: backpressure shed one layer (ceiling 2)"
+        );
+
+        // User ceiling allows the FULL ladder. While backpressure remains HIGH the
+        // user cap must NOT re-add the shed layer (shedding wins on the down side).
+        controller.observe_user_layer_ceiling(3);
+        for _ in 0..6 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            assert!(
+                controller.active_layer_count() <= 2,
+                "user ceiling 3 must not raise active above the backpressure ceiling of 2 \
+                 while backpressure is degrading (active {})",
+                controller.active_layer_count()
+            );
+        }
+    }
+
+    /// Single-stream mode is unaffected by the user ceiling: even ceiling 0 leaves
+    /// the sole (base) layer active (count 1, floored).
+    #[test]
+    fn test_user_ceiling_single_stream_unaffected() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        // No set_simulcast_layers → single-stream (count 1).
+        assert!(!controller.is_simulcast());
+
+        controller.observe_user_layer_ceiling(0);
+        let t = base_ms as f64 + QUALITY_WARMUP_MS + 1000.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "single-stream mode is floored at 1 and unaffected by the user ceiling"
+        );
+    }
+
+    // =====================================================================
     // compute_layer_bitrates: nominal-budget baseline (tier ideals, capped)
     // =====================================================================
 
@@ -1778,6 +2444,137 @@ mod tests {
         );
     }
 
+    // =====================================================================
+    // Screen-publisher network-congestion parity (issues #1199 / #1200).
+    //
+    // These pin the SCREEN controller's response to the three network signals
+    // the screen AQ loop now consumes (#1199) and the earn-up cold start
+    // (#1200). The screen AQ loop's signal CONSUMERS run in a wasm-only
+    // `spawn_local`, but each one ultimately calls exactly one of these two
+    // controller methods — so pinning them on the SCREEN controller variant is
+    // the host-testable proof that the wired signal produces a shed:
+    //   * server CONGESTION flag         -> force_congestion_cut()
+    //   * WS send-buffer drop burst       -> force_video_step_down()
+    //   * WT unistream drop burst (#1178) -> force_video_step_down()
+    // (The WS/WT drop-delta -> step_down DECISION is separately pinned by the
+    // `evaluate_self_congestion` tests in constants.rs.)
+    // =====================================================================
+
+    /// Helper: cold-start a screen controller at the base rung, then earn up to
+    /// 3 active layers via sustained-clear probe ticks, returning the controller
+    /// and the last timestamp used. Mirrors how the live screen ladder reaches a
+    /// multi-layer state before a congestion signal can shed one.
+    fn screen_controller_earned_to_three(
+        clock: &Arc<TestClock>,
+        base_ms: u64,
+    ) -> (EncoderBitrateController, f64) {
+        let mut controller = screen_controller_with_clock(clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        let mut t = warm_up(&mut controller, clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "precondition: screen ladder must earn up to 3 active layers before the shed test"
+        );
+        (controller, t)
+    }
+
+    /// #1200: a SCREEN controller configured via
+    /// `set_simulcast_ceiling_start_at_base` must COLD-START at exactly one
+    /// active layer (base rung), even though the ceiling permits 3 — the earn-up
+    /// ramp, NOT the all-active `set_simulcast_layers` the screen path used
+    /// before. Mirrors `test_camera_cold_start_is_one_active_layer`.
+    #[test]
+    fn test_screen_cold_start_is_one_active_layer() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = screen_controller_with_clock(&clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        assert!(
+            controller.is_simulcast(),
+            "ceiling > 1 must put the screen controller in simulcast mode so the ramp runs"
+        );
+        assert_eq!(
+            controller.simulcast_layer_count(),
+            3,
+            "the screen device ceiling must be configured to 3"
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "screen cold start must be a single active (base) rung, not the ceiling \
+             (regression guard: a revert to set_simulcast_layers would seed 3 here)"
+        );
+    }
+
+    /// #1199 signal 1 (server CONGESTION): a CONGESTION cut on the SCREEN
+    /// controller must shed the top active rung, exactly like the camera.
+    #[test]
+    fn test_screen_congestion_cut_sheds_top_layer() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, t) = screen_controller_earned_to_three(&clock, base_ms);
+
+        clock.set_ms((t + 1100.0) as u64);
+        controller.force_congestion_cut();
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "a server CONGESTION cut on the screen publisher must shed the top active rung (#1199)"
+        );
+    }
+
+    /// #1199 signals 2 & 3 (WS send-buffer drops / WT unistream drops): both
+    /// self-trigger `force_video_step_down` on the SCREEN controller, which must
+    /// shed the top active rung. One test covers both because the two drop
+    /// signals route through the identical controller call.
+    #[test]
+    fn test_screen_force_step_down_sheds_top_layer() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, t) = screen_controller_earned_to_three(&clock, base_ms);
+
+        clock.set_ms((t + 1100.0) as u64);
+        assert!(controller.force_video_step_down());
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "a WS/WT uplink-drop step-down on the screen publisher must shed the top active rung (#1199)"
+        );
+    }
+
+    /// #1199 requirement 4 (camera-off case): the screen controller's shed is
+    /// entirely self-contained — it depends on NO camera state. This standalone
+    /// screen controller (there is no camera in this test at all) still sheds on
+    /// a CONGESTION cut, proving the live egress (screen) reacts even when the
+    /// camera is off. The runtime wiring that delivers the signal to the screen
+    /// loop while the camera is off (the client sets a SEPARATE screen
+    /// congestion flag, and the screen AQ loop ticks independent of camera
+    /// `enabled`) is exercised end-to-end by the e2e suite; this pins the
+    /// controller-level invariant that the shed needs no camera.
+    #[test]
+    fn test_screen_sheds_with_no_camera_present() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let (mut controller, t) = screen_controller_earned_to_three(&clock, base_ms);
+        let active_before = controller.active_layer_count();
+
+        clock.set_ms((t + 1100.0) as u64);
+        controller.force_congestion_cut();
+        assert!(
+            controller.active_layer_count() < active_before,
+            "the screen publisher must shed on CONGESTION with no camera involved (camera-off path, #1199)"
+        );
+    }
+
     #[test]
     fn test_single_stream_force_paths_do_not_touch_layers() {
         let base_ms: u64 = 100_000;
@@ -1921,5 +2718,655 @@ mod tests {
     #[test]
     fn test_default_clock_is_available() {
         let _ = default_clock().now_ms();
+    }
+
+    // =====================================================================
+    // Runtime simulcast layer ramp-up (issue #1140 / #1141)
+    // =====================================================================
+
+    /// A camera controller configured via `set_simulcast_ceiling_start_at_base`
+    /// must COLD-START at exactly one active layer (the legacy single-stream
+    /// output), even though the ceiling permits more.
+    #[test]
+    fn test_camera_cold_start_is_one_active_layer() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        assert!(
+            controller.is_simulcast(),
+            "ceiling > 1 must put the controller in simulcast mode so the ramp runs"
+        );
+        assert_eq!(
+            controller.simulcast_layer_count(),
+            3,
+            "the device ceiling must be configured to 3"
+        );
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "cold start must be a single active (base) layer, not the ceiling"
+        );
+    }
+
+    /// After a sustained-CLEAR dwell longer than the probe clear window, a
+    /// cold-started controller must probe-ADD exactly one layer (1 -> 2).
+    #[test]
+    fn test_probe_adds_one_layer_after_clear_window() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        assert_eq!(controller.active_layer_count(), 1);
+
+        // Walk past warmup with clear ticks.
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // One clear tick arms the dwell timer; the next clear tick a full probe
+        // window later earns the layer.
+        let mut added = false;
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                added = true;
+                break;
+            }
+        }
+        assert!(
+            added,
+            "a sustained-clear encoder queue must earn a second layer (active now {})",
+            controller.active_layer_count()
+        );
+    }
+
+    /// The ramp must climb 1 -> 2 -> 3 over two probe windows, but never exceed
+    /// the device ceiling.
+    #[test]
+    fn test_probe_climbs_to_ceiling_over_two_windows() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "the ramp must climb to the full ceiling under sustained clear"
+        );
+
+        // Keep ticking clear — it must NOT exceed the ceiling.
+        for _ in 0..5 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "the ramp must never probe above the device ceiling"
+        );
+    }
+
+    /// A probe-add is blocked while a self-targeted CONGESTION drain hold is
+    /// active, even with a fully-clear encoder queue.
+    #[test]
+    fn test_probe_blocked_by_congestion_hold() {
+        use crate::constants::CONGESTION_HOLD_MS;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // Arm a congestion drain hold.
+        t += 1100.0;
+        clock.set_ms(t as u64);
+        controller.force_congestion_cut();
+        let after_cut_active = controller.active_layer_count();
+
+        // Tick clear repeatedly WHILE the hold is active — must not probe-add.
+        let cut_at = t;
+        while t + probe_step_ms() < cut_at + CONGESTION_HOLD_MS {
+            t += probe_step_ms();
+            // Spacing exceeds the hold; keep ticks small enough to stay inside it.
+            let inside = (cut_at + CONGESTION_HOLD_MS - 1.0).min(t);
+            tick_at(&mut controller, &clock, inside, 0);
+            if controller.quality_manager.congestion_hold_active(inside) {
+                assert!(
+                    controller.active_layer_count() <= after_cut_active,
+                    "probe must not add a layer while a congestion drain hold is active"
+                );
+            }
+            t = inside;
+            if !controller.quality_manager.congestion_hold_active(t + 1.0) {
+                break;
+            }
+        }
+    }
+
+    /// The relay layer-union cap bounds the probe: with the union pinned to a
+    /// count of 2 (max-layer id 1), the ramp must stop at 2 even under sustained
+    /// clear, then climb to 3 once the union grows.
+    #[test]
+    fn test_probe_blocked_by_union_cap() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        // Union allows at most 2 active layers (max-layer id 1 → count 2).
+        controller.observe_union_requested_layer(1);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "the union cap (count 2) must bound the probe ramp at 2 layers"
+        );
+
+        // Grow the union to the full ladder; the probe must now reach 3.
+        controller.observe_union_requested_layer(2); // count 3
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "once the union grows, the probe must climb to the full ceiling"
+        );
+    }
+
+    /// The anti-flap penalty box: a probed layer that is shed by backpressure
+    /// within the oscillation window must suppress the next probe (backoff), and
+    /// the backoff must escalate on repeat oscillation.
+    #[test]
+    fn test_probe_penalty_box_blocks_then_backs_off() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // Earn the second layer.
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "precondition: probed up"
+        );
+
+        // Immediately shed it via sustained HIGH backpressure within the
+        // oscillation window — this must arm the penalty box.
+        let down_step =
+            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 200.0;
+        for _ in 0..6 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            if controller.active_layer_count() == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "backpressure must shed the probed layer back to the base"
+        );
+        let shed_at = t;
+
+        // Now go clear. A probe is suppressed until the penalty window elapses:
+        // within LAYER_PROBE_PENALTY_BASE_MS of the shed, no re-add even though
+        // the clear dwell is satisfied.
+        t += probe_step_ms();
+        // Ensure we are still inside the penalty window for this assertion.
+        if t < shed_at + LAYER_PROBE_PENALTY_BASE_MS {
+            tick_at(&mut controller, &clock, t, 0);
+            assert_eq!(
+                controller.active_layer_count(),
+                1,
+                "the penalty box must suppress the probe right after an oscillation"
+            );
+        }
+
+        // Eventually, well past the penalty window, the probe is allowed again.
+        let mut recovered = false;
+        for _ in 0..40 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "after the penalty window the probe must be allowed to re-add a layer"
+        );
+    }
+
+    /// The probe composes with the union cap at 2: with the union allowing 2 and
+    /// the device ceiling at 3, sustained clear earns exactly 2 active layers and
+    /// holds there.
+    #[test]
+    fn test_probe_composes_with_union_cap_at_two() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        controller.observe_union_requested_layer(1); // count 2
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "probe + union(count 2) must settle at exactly 2"
+        );
+    }
+
+    /// Under SUSTAINED backpressure, the shed beats the probe: the controller
+    /// must not flap a layer up while the encoder queue is consistently HIGH.
+    #[test]
+    fn test_shed_beats_probe_under_sustained_backpressure() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        // Earn up to 2 first under clear.
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+
+        // Now sustained HIGH backpressure: active must trend DOWN to 1 and stay,
+        // never climbing back while backpressure persists.
+        let down_step =
+            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 200.0;
+        for _ in 0..20 {
+            t += down_step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            assert!(
+                controller.active_layer_count() <= 2,
+                "sustained backpressure must never let the probe climb"
+            );
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "sustained backpressure must shed to the base and the probe must not re-add"
+        );
+    }
+
+    /// The probe requires an UNINTERRUPTED clear run: a queue blip above CLEAR
+    /// resets the dwell timer, so a probe that would have fired is deferred.
+    #[test]
+    fn test_probe_requires_uninterrupted_clear_run() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+
+        // Arm the dwell with a clear tick, then ALMOST reach the window but
+        // interrupt with a single above-CLEAR sample just before it would fire.
+        t += 1000.0;
+        tick_at(&mut controller, &clock, t, 0); // arm
+        t += LAYER_PROBE_CLEAR_WINDOW_MS - 500.0; // not yet a full window
+        tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH); // interrupt → reset
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "an interrupted clear run must not have probed yet"
+        );
+
+        // A single clear tick right after the interruption re-arms but does NOT
+        // immediately satisfy the (fresh) window.
+        t += 500.0;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "the dwell timer must restart after an interruption, not carry over"
+        );
+
+        // Now a full fresh window of clear must earn the layer.
+        let mut added = false;
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                added = true;
+                break;
+            }
+        }
+        assert!(
+            added,
+            "after a fresh uninterrupted clear run the probe must add a layer"
+        );
+    }
+
+    /// The uplink precondition gates the probe at the ceiling: at the device
+    /// ceiling there is no next rung, so `uplink_precondition_for_add` is false
+    /// and the probe is a no-op (covered indirectly by the climb tests, asserted
+    /// directly here on the private helper).
+    #[test]
+    fn test_uplink_precondition_gates_at_ceiling() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        // At active == 1 with a ceiling of 3, there IS a next rung → precondition
+        // true (FRAC == 0.0 and the next tier ideal is positive).
+        assert!(
+            controller.uplink_precondition_for_add(),
+            "below the ceiling with ascending tiers the uplink precondition must hold"
+        );
+
+        // Drive the ramp to the ceiling, then the precondition must be false.
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 3 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            3,
+            "precondition: at ceiling"
+        );
+        assert!(
+            !controller.uplink_precondition_for_add(),
+            "at the ceiling there is no next rung, so the uplink precondition must be false"
+        );
+    }
+
+    /// Review-fix lock: the union-restore path must clamp recovery to the EARNED
+    /// active ceiling, not the full device ladder. After earning 2 layers then
+    /// shedding to 1 via the union, a grown union must restore only up to the
+    /// earned ceiling (2), NOT vault to the device max (3) without re-earning.
+    #[test]
+    fn test_union_restore_bounded_by_earned_ceiling_not_full_ladder() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        // Earn exactly 2 active layers via the headroom probe (earned ceiling 2).
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(controller.active_layer_count(), 2, "precondition: earned 2");
+
+        // Union shrinks to the base (count 1) → suppress to 1.
+        controller.observe_union_requested_layer(0);
+        t += probe_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "union suppressed to base"
+        );
+
+        // Union grows to the FULL device ladder (count 3). To isolate the
+        // union-RESTORE path from the headroom probe, feed a DEAD-BAND queue depth
+        // (strictly between CLEAR and HIGH): this neither sheds (not HIGH) nor arms
+        // the probe dwell timer (not CLEAR), so the ONLY lever that can move active
+        // is the union restore. It must climb back to — but never above — the
+        // EARNED ceiling (2), proving the restore clamps to `earned_active_ceiling`
+        // and not the full device ladder (3).
+        let dead_band = ENCODER_QUEUE_BACKPRESSURE_CLEAR + 1;
+        assert!(
+            dead_band < ENCODER_QUEUE_BACKPRESSURE_HIGH,
+            "test precondition: a dead-band depth must exist between CLEAR and HIGH"
+        );
+        controller.observe_union_requested_layer(2); // count 3 (full ladder)
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, dead_band);
+            assert!(
+                controller.active_layer_count() <= 2,
+                "union restore must never raise active above the EARNED ceiling (2) — got {}",
+                controller.active_layer_count()
+            );
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "union restore must recover up to the earned ceiling (2), not the device max (3)"
+        );
+    }
+
+    /// Review-fix lock: a layer shed PURELY by the union cap (no backpressure)
+    /// must NOT arm the penalty box. Otherwise a receiver leaving (shrinking the
+    /// union) would wrongly penalize the next legitimate probe.
+    #[test]
+    fn test_union_suppression_does_not_arm_penalty_box() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        // Earn 2 layers under clear.
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(controller.active_layer_count(), 2);
+
+        // Union shrinks to the base (count 1) → a UNION-ONLY shed (depth still
+        // clear, no backpressure). This must NOT arm the penalty box.
+        controller.observe_union_requested_layer(0);
+        t += probe_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "union suppressed to base"
+        );
+
+        // DIRECT source-of-truth assertion: the penalty box must be open. A
+        // union-only shed must leave `layer_probe_penalty_until_ms` un-advanced
+        // (no penalty armed) — if a backpressure-vs-union shed were conflated, this
+        // would be set to `t + LAYER_PROBE_PENALTY_BASE_MS` and the probe would be
+        // suppressed for 15s. We read the private field directly (same module).
+        assert!(
+            controller.layer_probe_penalty_until_ms <= t,
+            "a union-only shed must NOT arm the anti-flap penalty box \
+             (penalty_until={} should be <= now {})",
+            controller.layer_probe_penalty_until_ms,
+            t,
+        );
+
+        // Reopen the union to the full ladder. Because the penalty box was NOT
+        // armed by the union-only shed, the probe must re-earn the layer on the
+        // very FIRST eligible probe window — not after a 15s+ penalty backoff.
+        controller.observe_union_requested_layer(2); // count 3
+        let penalty_base_windows = (LAYER_PROBE_PENALTY_BASE_MS / probe_step_ms()).ceil() as usize;
+        assert!(
+            penalty_base_windows >= 2,
+            "test precondition: the base penalty must span >= 2 probe windows so a wrongly-armed \
+             penalty would be observable as a deferred re-climb"
+        );
+        // Allow exactly ONE window: the probe (composed with the union restore)
+        // must lift active OFF the base on the FIRST eligible window. A wrongly-
+        // armed base penalty (~>= 2 windows) would leave it stuck at 1.
+        t += probe_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert!(
+            controller.active_layer_count() >= 2,
+            "a union-only shed must not penalize the probe — it must re-climb on the FIRST \
+             eligible window (got {}), not wait out a (wrongly-armed) penalty backoff",
+            controller.active_layer_count(),
+        );
+    }
+
+    /// Issue #1159 regression: an OUT-OF-BAND `force_congestion_cut` shed of a
+    /// recently-probed layer must arm the anti-flap penalty box exactly like an
+    /// in-`tick` backpressure shed does, so an uplink-driven flap escalates the
+    /// 15→30→60 s backoff instead of re-probing every ~CONGESTION_HOLD_MS forever.
+    ///
+    /// `test_probe_blocked_by_congestion_hold` only covers suppression DURING the
+    /// 2.5 s drain hold; this covers the POST-hold re-flap. The fix is what wires
+    /// `force_congestion_cut`'s layer shed into the shared penalty helper — if
+    /// that wiring is removed, the cut touches no `layer_probe_*` field, the
+    /// penalty stays open, and BOTH assertions below fail.
+    #[test]
+    fn test_congestion_cut_of_probed_layer_arms_penalty() {
+        use crate::constants::CONGESTION_HOLD_MS;
+
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        // Earn the 2nd layer under sustained clear so `last_probe_add_at_ms` is set
+        // and we are inside the oscillation window when we cut below.
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            2,
+            "precondition: probe earned the 2nd layer"
+        );
+
+        // The cut must land WITHIN the oscillation window of the probe-add so it
+        // classifies as a flap. `probe_step_ms()` (>= the 6 s clear window) is
+        // smaller than the 8 s oscillation window, so the LAST probe-add (one
+        // `probe_step_ms()` before `t`) is still in-window. Pin that precondition
+        // so a future retune of either constant can't silently void this test.
+        assert!(
+            probe_step_ms() < LAYER_PROBE_OSCILLATION_WINDOW_MS,
+            "test precondition: the most-recent probe-add must still be inside the \
+             oscillation window when the cut fires (probe_step={} osc_window={})",
+            probe_step_ms(),
+            LAYER_PROBE_OSCILLATION_WINDOW_MS,
+        );
+
+        // OUT-OF-BAND congestion cut: the relay is dropping our packets. This
+        // drops the top layer without going through `tick`'s backpressure block.
+        t += 1100.0; // cut takes effect: last tier transition was the probe-add ~6.5s earlier (>MIN_TIER_TRANSITION_INTERVAL_MS), not because of this bump
+        clock.set_ms(t as u64);
+        controller.force_congestion_cut();
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "the congestion cut must shed the probed top layer to the base"
+        );
+        let cut_at = t;
+
+        // DIRECT source-of-truth assertion: the cut of a probed layer MUST have
+        // armed the penalty box. Mirrors `test_union_suppression_does_not_arm_...`
+        // but in the opposite direction. If the #1159 wiring is removed this field
+        // stays at its 0.0 default (<= now) and this fails.
+        assert!(
+            controller.layer_probe_penalty_until_ms > cut_at,
+            "a congestion cut of a recently-probed layer MUST arm the anti-flap penalty box \
+             (penalty_until={} should be > now {})",
+            controller.layer_probe_penalty_until_ms,
+            cut_at,
+        );
+        // The armed window must be the base backoff measured from the shed.
+        assert!(
+            (controller.layer_probe_penalty_until_ms - (cut_at + LAYER_PROBE_PENALTY_BASE_MS))
+                .abs()
+                < 1.0,
+            "penalty must be armed for the base backoff from the shed (got until={}, expected ~{})",
+            controller.layer_probe_penalty_until_ms,
+            cut_at + LAYER_PROBE_PENALTY_BASE_MS,
+        );
+
+        // BEHAVIORAL assertion: past the 2.5 s drain hold but still inside the 15 s
+        // penalty window, the probe must remain suppressed. Without the penalty the
+        // probe would re-add the layer as soon as the hold cleared (~2.5 s) — the
+        // exact ~CONGESTION_HOLD_MS re-flap #1159 fixes. Tick clear at a point that
+        // is past the hold yet before the penalty expires.
+        let probe_window = cut_at + CONGESTION_HOLD_MS + probe_step_ms();
+        assert!(
+            probe_window > cut_at + CONGESTION_HOLD_MS
+                && probe_window < cut_at + LAYER_PROBE_PENALTY_BASE_MS,
+            "test precondition: the probe attempt must sit AFTER the drain hold but BEFORE the \
+             penalty expires (probe_at={} hold_until={} penalty_until={})",
+            probe_window,
+            cut_at + CONGESTION_HOLD_MS,
+            cut_at + LAYER_PROBE_PENALTY_BASE_MS,
+        );
+        t = probe_window;
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "the penalty box must keep the probe suppressed after the drain hold clears — \
+             without it the probed layer would re-flap every ~CONGESTION_HOLD_MS"
+        );
+
+        // Finally, well past the penalty window, the probe is allowed again — the
+        // backoff is a delay, not a permanent lockout.
+        let mut recovered = false;
+        for _ in 0..40 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                recovered = true;
+                break;
+            }
+        }
+        assert!(
+            recovered,
+            "after the penalty window the probe must be allowed to re-add the layer"
+        );
     }
 }

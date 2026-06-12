@@ -21,7 +21,8 @@ use crate::components::device_settings_modal::DeviceSettingsModal;
 use crate::components::performance_settings::{
     load_performance_preference, load_receive_preference, preference_to_encoder_bounds,
     save_performance_preference, save_receive_preference, DiagnosticsReader, KindReceivePref,
-    PerformancePreference, ReceivedReader, ScreenSnapshotReader, SimulcastSummary, SnapshotReader,
+    PerfControlsHandle, PerformancePreference, ReceivedReader, ScreenSnapshotReader,
+    SimulcastSummary, SnapshotReader,
 };
 use crate::constants::*;
 use crate::context::{
@@ -82,6 +83,20 @@ pub fn Host(
     #[props(default)] device_settings_generation: u32,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
     reload_devices_counter: u32,
+    /// Sink the parent (attendants) reads to feed the Diagnostics drawer's
+    /// "Simulcast layers" section the live SEND simulcast snapshots. Host owns the
+    /// encoders, so it builds the `DiagnosticsReader` and publishes the handle here
+    /// once on mount; `None` until then. Optional so callers that don't need the
+    /// cross-component detail still compile. (#1095 §6 MOVE)
+    #[props(default)]
+    publish_diagnostics_reader: Option<Signal<Option<DiagnosticsReader>>>,
+    /// Sink the parent (attendants) reads to feed the Diagnostics drawer the
+    /// Performance controls (sliders/Auto/meters). The panel now lives in the
+    /// drawer — a sibling of `Host` that can't reach the encoders or the
+    /// preference signals — so `Host` bundles them into a [`PerfControlsHandle`]
+    /// and publishes it here once on mount; `None` until then. (#1131 unify)
+    #[props(default)]
+    publish_perf_controls: Option<Signal<Option<PerfControlsHandle>>>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
@@ -238,6 +253,11 @@ pub fn Host(
         camera.set_reelection_completed_signal(client.reelection_completed_signal());
         screen.set_force_keyframe_flag(client.force_screen_keyframe_flag());
         screen.set_reelection_completed_signal(client.reelection_completed_signal());
+        // Issue #1199: give the screen encoder its own CONGESTION step-down flag
+        // so it responds to server congestion in parity with the camera. The
+        // client sets both flags on a self-targeted CONGESTION; each AQ loop
+        // consumes its own (separate atoms avoid a swap race).
+        screen.set_congestion_step_down_flag(client.screen_congestion_step_down_flag());
 
         // Wire the relay layer-union hint atoms (issue #1108, Stage 3). Each
         // encoder OWNS its `shared_union_requested_layer` atom (initialized to the
@@ -257,9 +277,7 @@ pub fn Host(
 
         // Wire encoder decision inputs + screen tier to health reporter for metrics
         client.set_encoder_metric_sources(
-            camera.shared_encoder_fps_ratio(),
             camera.shared_encoder_p75_peer_fps(),
-            camera.shared_encoder_bitrate_ratio(),
             camera.shared_encoder_target_bitrate_kbps(),
             screen.shared_screen_tier_index(),
             camera.screen_sharing_flag(),
@@ -268,6 +286,9 @@ pub fn Host(
             screen.shared_tier_transitions(),
             camera.shared_climb_limiter_snapshot(),
             camera.shared_dwell_samples(),
+            // #1143: send-side simulcast layer counts (camera encoder atoms).
+            camera.shared_effective_layer_count(),
+            camera.shared_active_layer_count(),
         );
 
         // Wire up encoder controls. Issue #1108: the encoder AQ is now a
@@ -293,6 +314,19 @@ pub fn Host(
         );
         // Screen share bounds live on the separate ScreenEncoder (issue #961).
         screen.set_quality_tier_bounds(bounds.screen_best, bounds.screen_worst);
+        // User SEND layer-ceiling ("layers published" control): cap how many
+        // simulcast layers each publisher emits. None = Auto / full ladder. Like
+        // the bounds above, the value persists in the encoder's shared atomic and
+        // is re-read by the AQ control loop on every (re)start, so this single
+        // call survives camera/screen restarts + reconnect.
+        camera.set_user_layer_ceiling(perf_pref.video_layers);
+        screen.set_user_layer_ceiling(perf_pref.screen_layers);
+        // Audio's published layer count is adjustable too (runtime publish-gate in
+        // the mic encoder — no restart). Same persist/reapply contract: the value
+        // lives in the mic encoder's shared atomic (cloned into every layer's
+        // publish handler), so it survives reconnect and this re-applies it from
+        // the persisted preference on re-init.
+        microphone.set_user_layer_ceiling(perf_pref.audio_layers);
 
         // Create MediaDeviceList
         let media_devices = MediaDeviceList::new();
@@ -533,10 +567,21 @@ pub fn Host(
         }
         s.prev_device_settings_open = device_settings_open;
 
-        log::info!(
-            "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
-            s.prev_video_enabled, s.prev_mic_enabled, s.prev_share_screen,
-        );
+        // Edge-triggered: log only when video/mic/screen state actually CHANGES,
+        // not on every Host re-render. This component re-renders many times per
+        // second, so an unconditional log here was the dominant console-log line
+        // after the #1100/#1129 per-tick demotions (~65% of all lines in a
+        // captured preview session). The `prev_*` fields are still updated below
+        // (lines further down), so this comparison sees the prior render's state.
+        if video_enabled != s.prev_video_enabled
+            || mic_enabled != s.prev_mic_enabled
+            || share_screen != s.prev_share_screen
+        {
+            log::info!(
+                "Host render: video={video_enabled} prev={} mic={mic_enabled} prev={} screen={share_screen} prev={}",
+                s.prev_video_enabled, s.prev_mic_enabled, s.prev_share_screen,
+            );
+        }
 
         // Screen share
         if s.prev_share_screen != share_screen {
@@ -715,6 +760,18 @@ pub fn Host(
             // Screen share is a separate encoder object (issue #961).
             s.screen
                 .set_quality_tier_bounds(bounds.screen_best, bounds.screen_worst);
+            // User SEND layer-ceiling: apply LIVE as the user drags the "layers
+            // published" thumb. The encoder stores the count in a shared atomic
+            // the AQ control loop reads each tick (≤1s), composing it as a further
+            // `min` with the union hint + ramp — so lowering it sheds the top
+            // layer(s) at once and raising it re-earns them. None = Auto.
+            s.camera.set_user_layer_ceiling(pref.video_layers);
+            s.screen.set_user_layer_ceiling(pref.screen_layers);
+            // Audio layer ceiling applies LIVE too: the mic encoder's per-layer
+            // publish handlers read the shared atomic at publish time, so lowering
+            // it stops sending the top audio layer(s) on the next frame and raising
+            // it resumes them — no mic restart, no audio interruption.
+            s.microphone.set_user_layer_ceiling(pref.audio_layers);
         })
     };
 
@@ -854,6 +911,86 @@ pub fn Host(
         })
     };
 
+    // Publish the reader handle to the parent (attendants) so the Diagnostics
+    // panel — a sibling of Host that can't reach the encoders — can read the live
+    // SEND simulcast snapshots for its "Simulcast layers" section. The handle is a
+    // cheap `Rc`-closure bundle built once per mount; we publish it in a
+    // `use_effect` (post-render, so we never write a parent signal mid-render). The
+    // effect body has no reactive reads, so it runs once after first render.
+    // (#1095 §6 MOVE)
+    {
+        let reader = diagnostics_reader.clone();
+        use_effect(move || {
+            if let Some(mut sink) = publish_diagnostics_reader {
+                sink.set(Some(reader.clone()));
+            }
+        });
+    }
+
+    // Effective VIDEO/SCREEN simulcast ladder depth for the SEND layer-count
+    // sliders. Computed ONCE per Host mount via `use_hook` (not every render):
+    // `capability_max_simulcast_layers()` allocates a UA string + emits an info
+    // log, and the value is deterministic per session (runtime flag + CPU core
+    // count are stable), so a per-render recompute is pure waste. This is the same
+    // formula the encoder setup uses (host.rs ~L134); both kinds share the
+    // CPU-derived ceiling (each extra video encoder is ~N× main-thread cost).
+    let send_layer_max: usize = use_hook(|| {
+        experimental_simulcast_max_layers()
+            .min(crate::components::capability_check::capability_max_simulcast_layers())
+            as usize
+    });
+
+    // Effective AUDIO ladder depth for the SEND audio layer-count slider. UNLIKE
+    // video/screen this is NOT CPU-clamped: audio Opus encode runs off the main
+    // thread and is cheap, so the ceiling is just `min(flag, audio ladder size)`
+    // (`max_layers_for_kind(Audio)` == 3). So audio typically shows the full
+    // 3-layer ladder even on weak runners that clamp video to 1. Same formula as
+    // the mic encoder setup (host.rs ~L146). Computed once per mount.
+    let audio_layer_max: usize = use_hook(|| {
+        experimental_simulcast_max_layers()
+            .min(videocall_client::max_layers_for_kind(PrefMediaKind::Audio)) as usize
+    });
+
+    // Bundle the Performance controls into ONE handle and publish it to the parent
+    // (attendants) so the Diagnostics drawer — a sibling of `Host` that can't
+    // reach the encoders or the preference signals — can mount the
+    // `PerformanceSettingsPanel`. Built once per mount via `use_hook` so its
+    // closures/readers keep stable `Rc` identity and the handle stays
+    // `PartialEq`-stable; the two preference fields are the live `Signal`s (not
+    // values), so the drawer's sliders track edits reactively. (#1131 unify)
+    let perf_controls: PerfControlsHandle = {
+        let on_change = on_performance_change.clone();
+        let on_recv = on_receive_change.clone();
+        let read_snap = read_quality_snapshot.clone();
+        let read_screen_snap = read_screen_snapshot.clone();
+        let recv_reader = received_reader.clone();
+        let diag_reader = diagnostics_reader.clone();
+        use_hook(move || PerfControlsHandle {
+            performance_preference,
+            receive_preference,
+            on_change,
+            on_receive_change: on_recv,
+            read_snapshot: read_snap,
+            read_screen_snapshot: read_screen_snap,
+            received_reader: recv_reader,
+            diagnostics_reader: diag_reader,
+            // Video/screen share the CPU-derived effective ceiling; audio uses its
+            // own (non-CPU-clamped) ladder depth. Same values the modal used to
+            // forward before the panel moved into the drawer.
+            video_layer_max: send_layer_max,
+            screen_layer_max: send_layer_max,
+            audio_layer_max,
+        })
+    };
+    {
+        let handle = perf_controls.clone();
+        use_effect(move || {
+            if let Some(mut sink) = publish_perf_controls {
+                sink.set(Some(handle.clone()));
+            }
+        });
+    }
+
     // Get device data
     let s = state.borrow();
     let microphones = s.media_devices.audio_inputs.devices();
@@ -915,17 +1052,15 @@ pub fn Host(
              }
         }
 
-        // Mobile Device Settings Modal
+        // Device Settings Modal — Audio / Video / Network / Appearance only. The
+        // Performance tab moved into the Diagnostics drawer (#1131), so the modal
+        // no longer forwards any of the SEND/RECEIVE preference, snapshot-reader,
+        // diagnostics, layer-max, or mic-state props; those now flow through the
+        // published `PerfControlsHandle` (above) directly into the drawer.
         {
             let on_mic = on_mic_change.clone();
             let on_cam = on_cam_change.clone();
             let on_spk = on_speaker_change.clone();
-            let on_perf = on_performance_change.clone();
-            let read_snap = read_quality_snapshot.clone();
-            let read_screen_snap = read_screen_snapshot.clone();
-            let on_recv = on_receive_change.clone();
-            let recv_reader = received_reader.clone();
-            let diag_reader = diagnostics_reader.clone();
             rsx! {
                 DeviceSettingsModal {
                     key: "{device_settings_generation}",
@@ -942,14 +1077,6 @@ pub fn Host(
                     on_close: move |_| on_device_settings_toggle.call(()),
                     transport_preference: (transport_pref_ctx.0)(),
                     initial_section: device_settings_initial_section.clone(),
-                    performance_preference: performance_preference(),
-                    on_performance_change: move |p: PerformancePreference| on_perf(p),
-                    read_quality_snapshot: read_snap.clone(),
-                    read_screen_snapshot: read_screen_snap.clone(),
-                    receive_preference: receive_preference(),
-                    on_receive_change: move |c: (PrefMediaKind, KindReceivePref)| on_recv(c),
-                    received_reader: recv_reader.clone(),
-                    diagnostics_reader: diag_reader.clone(),
                 }
             }
         }

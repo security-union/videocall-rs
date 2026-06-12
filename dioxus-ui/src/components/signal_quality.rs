@@ -11,8 +11,21 @@ use std::collections::VecDeque;
 
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
+use videocall_client::{
+    max_layers_for_kind, quality_state, PeerReceiveDiag, PrefMediaKind, ReceivedLayerSnapshot,
+};
 use wasm_bindgen::JsCast;
 
+// Reuse the Performance dialog's per-peer row helpers + the receive-side
+// `index_label` so the popup's Layers section is consistent with the perf panel
+// by construction (issue: tile signal-meter popup ↔ perf dialog layer parity).
+// These are the SAME pure helpers the perf dialog's `PeerRow` calls, so the two
+// surfaces render identical quality dots / metric text / reason chips for the
+// same peer snapshot.
+use crate::components::performance_settings::{
+    format_send_layer_short, peer_row_aria_label, peer_row_metric, quality_state_glyph,
+    quality_state_modifier, reason_chip_modifier, reason_chip_text, reason_chip_title,
+};
 use crate::theme::color as theme_color;
 
 // ---------------------------------------------------------------------------
@@ -688,6 +701,15 @@ pub struct SignalInfo {
     /// tiles so the screen metric only renders in the dedicated
     /// shared-content popup).
     pub meter_mode: SignalMeterMode,
+    /// Per-peer RECEIVE simulcast diagnostics for THIS peer, sourced from the
+    /// SAME `VideoCallClient::per_peer_received_snapshots()` data path the
+    /// Performance dialog and Diagnostics panel consume. `Some` only while the
+    /// popup is open and this peer is receiving at least one media kind;
+    /// `None` otherwise (popup closed, peer not flowing, or not found). Drives
+    /// the popup's "Layers" section so it shows the SAME quality dot / metric /
+    /// reason chip the perf dialog's per-peer row shows for the same peer at the
+    /// same moment.
+    pub receive_diag: Option<PeerReceiveDiag>,
 }
 
 // ---------------------------------------------------------------------------
@@ -725,6 +747,14 @@ pub struct SignalQualityPopupProps {
     /// rendering every series.
     #[props(default)]
     meter_mode: SignalMeterMode,
+    /// Per-peer RECEIVE simulcast diagnostics for this peer (see
+    /// [`SignalInfo::receive_diag`]). Feeds the popup's "Layers" section. The
+    /// popup looks itself up by `session_id == peer_id` UPSTREAM in `peer_tile`
+    /// (so the closure that polls the client isn't re-run per popup); this prop
+    /// carries the already-resolved diag for THIS peer. `None` → the Layers
+    /// section is omitted (mirrors the perf dialog's empty state).
+    #[props(default)]
+    receive_diag: Option<PeerReceiveDiag>,
     /// HCL bug #9: when `Some`, position the popup at fixed viewport
     /// coordinates instead of anchoring to the tile. `None` re-engages
     /// the anchored-follow behaviour. Owned by the popup-state context
@@ -1908,6 +1938,153 @@ fn hide_body_tooltip() {
     }
 }
 
+/// Select the per-kind RECEIVE layer snapshots to render in the popup's
+/// "Layers" section, honoring the popup's [`SignalMeterMode`] scope.
+///
+/// Order is Audio, Video, Screen — matching the popup's chart-legend order so
+/// the Layers rows read top-to-bottom in the same sequence the user just saw in
+/// the legend above. Each entry is `(kind, snapshot)`; only kinds ACTUALLY
+/// flowing from this peer are included (the `Option` per-kind field on
+/// [`PeerReceiveDiag`] is `Some` only when that kind is being received), which
+/// mirrors the perf dialog's "omit empty kinds" behavior.
+///
+/// Mode scope (the SAME predicates the chart series obey):
+/// * [`SignalMeterMode::ScreenOnly`] → only the screen row.
+/// * [`SignalMeterMode::NoScreen`]   → audio + video, screen suppressed.
+/// * [`SignalMeterMode::Full`]       → every flowing kind.
+///
+/// Pure so the scope/ordering logic is host-tested without a DOM.
+fn selected_layer_rows(
+    diag: &PeerReceiveDiag,
+    mode: SignalMeterMode,
+) -> Vec<(PrefMediaKind, &ReceivedLayerSnapshot)> {
+    let mut rows = Vec::with_capacity(3);
+    if mode.shows_audio() {
+        if let Some(snap) = diag.audio.as_ref() {
+            rows.push((PrefMediaKind::Audio, snap));
+        }
+    }
+    if mode.shows_video() {
+        if let Some(snap) = diag.video.as_ref() {
+            rows.push((PrefMediaKind::Video, snap));
+        }
+    }
+    if mode.shows_screen() {
+        if let Some(snap) = diag.screen.as_ref() {
+            rows.push((PrefMediaKind::Screen, snap));
+        }
+    }
+    rows
+}
+
+/// The spoken kind noun used in a layer row's aria-label sentence
+/// ("video" / "audio" / "shared content"). Matches the `stream_noun` the perf
+/// dialog passes to [`peer_row_aria_label`] so the two aria sentences agree.
+/// Pure.
+fn layer_kind_noun(kind: PrefMediaKind) -> &'static str {
+    match kind {
+        PrefMediaKind::Video => "video",
+        PrefMediaKind::Audio => "audio",
+        PrefMediaKind::Screen => "shared content",
+    }
+}
+
+/// One row in the popup's "Layers" section, rendered IDENTICALLY to the
+/// Performance dialog's per-peer `PeerRow`: the quality dot
+/// (`perf-q-dot--{state}` + non-color glyph), the metric text from
+/// [`peer_row_metric`] ("540p · ~600k · M · 2/3", 1-based), and — only when the
+/// reception is below the full-ladder top — a tinted reason chip
+/// (`perf-reason-chip--{reason}`). The whole row carries the same
+/// full-sentence `aria-label` ([`peer_row_aria_label`]) so color is never the
+/// sole signal, and the dot/glyph are `aria-hidden`.
+///
+/// The `full_ladder_len` denominator and absolute quality both come from the
+/// client's [`quality_state`] / `max_layers_for_kind`, NOT the per-peer
+/// observed count — the SAME basis the perf dialog uses.
+#[component]
+fn SignalLayerRow(
+    /// DOM-id prefix for the popup (peer + meter mode), so testids are unique
+    /// across simultaneously-open popups.
+    id_prefix: String,
+    kind: PrefMediaKind,
+    snap: ReceivedLayerSnapshot,
+) -> Element {
+    let full_ladder_len = max_layers_for_kind(kind);
+    let q = quality_state(snap.layer_index, full_ladder_len);
+    let q_mod = quality_state_modifier(q);
+    let q_glyph = quality_state_glyph(q);
+    // Audio rung label for the metric ("low (24k)" / "mid (32k)" / "high (50k)")
+    // — the receive submodule owns this mapping, same as the perf dialog.
+    let audio_label = crate::components::performance_settings::receive::index_label(
+        PrefMediaKind::Audio,
+        snap.layer_index,
+    );
+    let metric = peer_row_metric(&snap, full_ladder_len, audio_label);
+    let kind_noun = layer_kind_noun(kind);
+    // The human res/bitrate detail used inside the aria sentence (mirrors the
+    // perf dialog's `res_or_bitrate`).
+    let res_or_bitrate = if matches!(kind, PrefMediaKind::Audio) {
+        format!("{}k", snap.kbps)
+    } else {
+        format_send_layer_short(snap.width, snap.height)
+    };
+    // The popup row's aria-label uses the peer's display name when known; the
+    // perf dialog passes the peer label here. The popup doesn't thread the
+    // display name into this child, so we lead with the spoken kind — the
+    // sentence still carries kind, quality, res/bitrate, layer fraction, and
+    // (when present) the reason clause, so color is never the sole signal.
+    let aria = peer_row_aria_label(
+        // Capitalized kind noun as the row subject (no peer-name available here).
+        match kind {
+            PrefMediaKind::Video => "Video",
+            PrefMediaKind::Audio => "Audio",
+            PrefMediaKind::Screen => "Shared content",
+        },
+        kind_noun,
+        q,
+        &res_or_bitrate,
+        snap.layer_index + 1,
+        full_ladder_len,
+        snap.reason,
+    );
+    let kind_id = match kind {
+        PrefMediaKind::Video => "video",
+        PrefMediaKind::Audio => "audio",
+        PrefMediaKind::Screen => "screen",
+    };
+
+    rsx! {
+        li {
+            class: "perf-peer-row signal-popup-layer-row",
+            "data-testid": "{id_prefix}-layer-{kind_id}",
+            "aria-label": "{aria}",
+            span {
+                class: "perf-q-dot perf-q-dot--{q_mod}",
+                "data-testid": "{id_prefix}-layer-{kind_id}-q",
+                "aria-hidden": "true",
+                "{q_glyph}"
+            }
+            span {
+                class: "perf-peer-row__label signal-popup-layer-row__kind",
+                "{kind_noun}"
+            }
+            span {
+                class: "perf-peer-row__metric",
+                "data-testid": "{id_prefix}-layer-{kind_id}-metric",
+                "{metric}"
+            }
+            if let Some(r) = snap.reason {
+                span {
+                    class: "perf-reason-chip perf-reason-chip--{reason_chip_modifier(r)}",
+                    "data-testid": "{id_prefix}-layer-{kind_id}-reason",
+                    title: "{reason_chip_title(r)}",
+                    "{reason_chip_text(r)}"
+                }
+            }
+        }
+    }
+}
+
 /// Popup overlay showing a scrollable SVG line chart of audio, video,
 /// screen share quality, and latency.
 #[component]
@@ -1918,6 +2095,10 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     let on_reanchor = props.on_reanchor;
     let meter_mode = props.meter_mode;
     let free_position = props.free_position;
+    // Per-peer RECEIVE layer diag for THIS peer (already looked up by
+    // `session_id == peer_id` in `peer_tile`). Owned (cloned out of props) so
+    // it can move into the rsx! layer-rows loop without borrowing `props`.
+    let receive_diag = props.receive_diag.clone();
     let popup_title = match meter_mode {
         SignalMeterMode::ScreenOnly => format!("Screen Share Quality - {}", props.peer_name),
         _ => format!("Signal Quality - {}", props.peer_name),
@@ -2209,6 +2390,21 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     // switch).
     let popup_id_for_reanchor = popup_id.clone();
     let popup_anchor_id_attr = props.anchor_id.clone();
+    // Per-peer RECEIVE layer rows for the "Layers" section, scoped by the
+    // popup's `meter_mode` and limited to kinds actually flowing. Cloned into
+    // owned `(kind, snapshot)` tuples so they move into the rsx loop. Same
+    // data source + same `quality_state`/`peer_row_metric`/reason helpers as the
+    // perf dialog's per-peer row, so the two surfaces match by construction.
+    let layer_rows: Vec<(PrefMediaKind, ReceivedLayerSnapshot)> = receive_diag
+        .as_ref()
+        .map(|d| {
+            selected_layer_rows(d, meter_mode)
+                .into_iter()
+                .map(|(k, s)| (k, *s))
+                .collect()
+        })
+        .unwrap_or_default();
+    let layers_id_prefix = popup_id.clone();
     rsx! {
         div {
             id: "{popup_id}",
@@ -2682,6 +2878,29 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             }
                         },
                         _ => rsx! {},
+                    }
+                }
+            }
+            // ── Layers section (per-peer simulcast RECEIVE breakdown) ──────
+            // Mirrors the Performance dialog's per-peer row for this peer: one
+            // row per kind being received (scoped by `meter_mode`), each with
+            // the SAME quality dot / metric / reason chip the perf dialog shows.
+            // Omitted entirely when nothing is flowing (mirrors the perf
+            // dialog's empty state — no "No senders" placeholder line).
+            if !layer_rows.is_empty() {
+                div {
+                    class: "signal-popup-layers",
+                    "data-testid": "{layers_id_prefix}-layers",
+                    div { class: "signal-popup-layers__head", "Layers" }
+                    ul { class: "signal-popup-layers__list", role: "list",
+                        for (kind, snap) in layer_rows.iter().cloned() {
+                            SignalLayerRow {
+                                key: "{kind:?}",
+                                id_prefix: layers_id_prefix.clone(),
+                                kind,
+                                snap,
+                            }
+                        }
                     }
                 }
             }
@@ -3934,5 +4153,155 @@ mod tests {
             top: 200.0,
         };
         assert!(p.is_free());
+    }
+
+    // -----------------------------------------------------------------
+    // Layers section: per-peer simulcast RECEIVE rows. These pin the
+    // mode-scoping + empty-kind omission + perf-dialog parity. The shared
+    // dot/glyph/metric/reason mapping itself is tested in
+    // `performance_settings` (the helpers are reused verbatim, not re-derived
+    // here), so these tests cover only the popup's selection/ordering and the
+    // fact that the popup feeds the helpers the SAME inputs.
+    // -----------------------------------------------------------------
+
+    // `max_layers_for_kind`, `quality_state`, `PeerReceiveDiag`, `PrefMediaKind`
+    // and `ReceivedLayerSnapshot` come in via `use super::*`; only the reason
+    // enum is net-new to these tests.
+    use videocall_client::DegradeReason;
+
+    fn snap(
+        kind: PrefMediaKind,
+        layer_index: u32,
+        reason: Option<DegradeReason>,
+    ) -> ReceivedLayerSnapshot {
+        ReceivedLayerSnapshot {
+            kind,
+            layer_index,
+            layer_count: 3,
+            width: if matches!(kind, PrefMediaKind::Audio) {
+                0
+            } else {
+                1280
+            },
+            height: if matches!(kind, PrefMediaKind::Audio) {
+                0
+            } else {
+                720
+            },
+            kbps: 600,
+            reason,
+        }
+    }
+
+    fn diag(
+        video: Option<ReceivedLayerSnapshot>,
+        screen: Option<ReceivedLayerSnapshot>,
+        audio: Option<ReceivedLayerSnapshot>,
+    ) -> PeerReceiveDiag {
+        PeerReceiveDiag {
+            session_id: 42,
+            label: "Alice".to_string(),
+            video,
+            screen,
+            audio,
+        }
+    }
+
+    #[test]
+    fn selected_layer_rows_full_mode_includes_all_flowing_kinds_in_legend_order() {
+        let d = diag(
+            Some(snap(PrefMediaKind::Video, 1, None)),
+            Some(snap(PrefMediaKind::Screen, 2, None)),
+            Some(snap(PrefMediaKind::Audio, 0, None)),
+        );
+        let rows = super::selected_layer_rows(&d, SignalMeterMode::Full);
+        // Audio, Video, Screen — the popup chart-legend order.
+        let kinds: Vec<PrefMediaKind> = rows.iter().map(|(k, _)| *k).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                PrefMediaKind::Audio,
+                PrefMediaKind::Video,
+                PrefMediaKind::Screen
+            ]
+        );
+    }
+
+    #[test]
+    fn selected_layer_rows_omits_not_flowing_kinds() {
+        // Only video is flowing; audio + screen are `None` (mirrors the perf
+        // dialog omitting empty kinds).
+        let d = diag(Some(snap(PrefMediaKind::Video, 1, None)), None, None);
+        let rows = super::selected_layer_rows(&d, SignalMeterMode::Full);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, PrefMediaKind::Video);
+    }
+
+    #[test]
+    fn selected_layer_rows_noscreen_suppresses_screen_row() {
+        let d = diag(
+            Some(snap(PrefMediaKind::Video, 1, None)),
+            Some(snap(PrefMediaKind::Screen, 2, None)),
+            Some(snap(PrefMediaKind::Audio, 0, None)),
+        );
+        let rows = super::selected_layer_rows(&d, SignalMeterMode::NoScreen);
+        let kinds: Vec<PrefMediaKind> = rows.iter().map(|(k, _)| *k).collect();
+        // Screen suppressed even though it is flowing.
+        assert_eq!(kinds, vec![PrefMediaKind::Audio, PrefMediaKind::Video]);
+    }
+
+    #[test]
+    fn selected_layer_rows_screenonly_shows_only_screen() {
+        let d = diag(
+            Some(snap(PrefMediaKind::Video, 1, None)),
+            Some(snap(PrefMediaKind::Screen, 2, None)),
+            Some(snap(PrefMediaKind::Audio, 0, None)),
+        );
+        let rows = super::selected_layer_rows(&d, SignalMeterMode::ScreenOnly);
+        let kinds: Vec<PrefMediaKind> = rows.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds, vec![PrefMediaKind::Screen]);
+    }
+
+    #[test]
+    fn selected_layer_rows_screenonly_without_screen_is_empty() {
+        // ScreenOnly popup, but the peer isn't sharing → no rows (the Layers
+        // section is omitted, matching the perf dialog's empty state).
+        let d = diag(Some(snap(PrefMediaKind::Video, 1, None)), None, None);
+        let rows = super::selected_layer_rows(&d, SignalMeterMode::ScreenOnly);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn layer_kind_noun_matches_perf_dialog_spoken_nouns() {
+        // Same spoken nouns the perf dialog's `stream_noun` uses for the aria
+        // sentence, so the two surfaces' aria-labels read consistently.
+        assert_eq!(super::layer_kind_noun(PrefMediaKind::Video), "video");
+        assert_eq!(super::layer_kind_noun(PrefMediaKind::Audio), "audio");
+        assert_eq!(
+            super::layer_kind_noun(PrefMediaKind::Screen),
+            "shared content"
+        );
+    }
+
+    #[test]
+    fn layer_row_uses_full_ladder_basis_like_perf_dialog() {
+        // A video stream pinned to the base layer (index 0) of a 3-rung ladder
+        // must read Low — the SAME `quality_state(layer_index, full_ladder_len)`
+        // basis the perf dialog uses (full ladder, NOT the per-peer observed
+        // count). This is the parity the feature promises: identical inputs →
+        // identical dot/metric/reason. The mapping itself is tested in
+        // `performance_settings`; here we assert the popup feeds the helper the
+        // full-ladder denominator.
+        let full = max_layers_for_kind(PrefMediaKind::Video);
+        assert_eq!(full, 3);
+        let q_base = quality_state(0, full);
+        let q_top = quality_state(full - 1, full);
+        assert_ne!(q_base, q_top);
+        // Metric is 1-based and uses the full-ladder denominator. After the
+        // Directive 4 layer-name rename (#1222) the visible chip is the quality
+        // LETTER + position/total: index 1 of a 3-rung ladder → "M · 2/3".
+        let s = snap(PrefMediaKind::Video, 1, None);
+        let metric = peer_row_metric(&s, full, "");
+        assert!(metric.contains("M · 2/3"), "metric was: {metric}");
     }
 }

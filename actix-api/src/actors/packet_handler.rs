@@ -28,7 +28,7 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 use crate::constants::{
-    KEYFRAME_LIMITER_CLEANUP_INTERVAL, KEYFRAME_REQUEST_MAX_PER_SEC,
+    KEYFRAME_LIMITER_CLEANUP_INTERVAL, KEYFRAME_REQUEST_MAX_LAYER_ID, KEYFRAME_REQUEST_MAX_PER_SEC,
     KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER, KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED,
     KEYFRAME_REQUEST_WINDOW_MS,
 };
@@ -53,12 +53,23 @@ pub enum PacketKind {
     /// malformed request, in which case the limiter still enforces a key (the
     /// empty target acts as a single bucket).
     ///
+    /// `target_session_id` is the inner `MediaPacket.target_session_id` (#1124)
+    /// — the specific publishing SESSION the receiver wants a keyframe from.
+    /// `0` means the requesting client is older / did not populate it, in which
+    /// case the limiter falls back to keying by `target_user_id` (preserving
+    /// the pre-#1124 behaviour). When non-zero it is the limiter key, so two
+    /// concurrent sessions of the same participant get independent budgets.
+    ///
     /// `layer` is the cleartext `PacketWrapper.simulcast_layer_id` (#989,
     /// Phase 1b) the request targets — 0 = base/unspecified. It is part of the
     /// limiter key so a receiver switching the simulcast layer it wants from a
     /// sender is not rate-limited as "already requested" (which would freeze
     /// the newly-selected layer's tile until the window elapsed).
-    KeyframeRequest { target_user_id: Vec<u8>, layer: u32 },
+    KeyframeRequest {
+        target_user_id: Vec<u8>,
+        target_session_id: u64,
+        layer: u32,
+    },
 }
 
 /// Classify a packet based on its contents.
@@ -109,10 +120,17 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
             if media_packet.media_type == MediaType::KEYFRAME_REQUEST.into() {
                 // The inner MediaPacket.user_id identifies the target peer
                 // (the sender whose video should produce a keyframe). The
-                // outer wrapper's session_id is unset by the client, so we
-                // key the per-pair limiter by the inner user_id. user_id is
-                // stable across reconnects of the same participant, so the
-                // limiter state survives transient drops correctly.
+                // inner MediaPacket.target_session_id (#1124) identifies the
+                // specific target SESSION; the limiter keys on it when present
+                // so two concurrent sessions of one participant do not collide
+                // into a single rate-limit bucket. The outer wrapper's
+                // session_id is the SOURCE (the requester) and must not be
+                // reused for the target, so the target session travels in the
+                // inner packet, which is sent in cleartext for KEYFRAME_REQUEST
+                // (relay-readable even under E2EE). When `target_session_id` is
+                // 0 (older client), the limiter falls back to keying by
+                // `user_id` — stable across reconnects of the same participant,
+                // preserving the pre-#1124 behaviour for those clients.
                 //
                 // The cleartext outer `simulcast_layer_id` (#989, Phase 1b)
                 // identifies which simulcast layer the receiver wants a
@@ -121,6 +139,7 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
                 // throttled as a duplicate request.
                 return PacketKind::KeyframeRequest {
                     target_user_id: media_packet.user_id,
+                    target_session_id: media_packet.target_session_id,
                     layer: packet_wrapper.simulcast_layer_id,
                 };
             }
@@ -134,6 +153,42 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
     }
 
     PacketKind::Data
+}
+
+/// Identity of the keyframe-request target, for the per-pair limiter key
+/// (#1124).
+///
+/// Preferred form is [`KeyframeTarget::Session`] — the specific publishing
+/// session the receiver wants a keyframe from — so two concurrent sessions of
+/// the SAME participant get independent rate-limit budgets. When the requesting
+/// client does not populate the target session (older client; inner
+/// `MediaPacket.target_session_id == 0`), we fall back to
+/// [`KeyframeTarget::User`], the participant's stable `user_id`, preserving the
+/// pre-#1124 behaviour for those clients. The two variants never alias: a
+/// session-keyed entry and a user-keyed entry for the same participant are
+/// distinct buckets, which is correct — a meeting is either all-new-clients or
+/// mixed, and a mixed pair simply double-budgets the same target briefly, which
+/// is harmless (it only ever ALLOWS slightly more, never throttles legit
+/// traffic).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum KeyframeTarget {
+    /// Target publishing session (#1124) — the preferred per-session key.
+    Session(u64),
+    /// Fallback: target participant's `user_id` (older clients that do not
+    /// send `target_session_id`).
+    User(Vec<u8>),
+}
+
+impl KeyframeTarget {
+    /// Build the target key from a `(target_user_id, target_session_id)` pair:
+    /// session when non-zero, else the user_id fallback (#1124).
+    pub fn from_request(target_user_id: &[u8], target_session_id: u64) -> Self {
+        if target_session_id != 0 {
+            KeyframeTarget::Session(target_session_id)
+        } else {
+            KeyframeTarget::User(target_user_id.to_vec())
+        }
+    }
 }
 
 /// Sliding-window counter for one rate-limit bucket.
@@ -193,14 +248,23 @@ impl WindowCounter {
 pub struct KeyframeRequestLimiter {
     /// Global counter across all target senders for this receiver.
     global: WindowCounter,
-    /// Per-(target-sender, layer) counters, keyed by the target's user_id bytes
-    /// and the simulcast layer the request targets (#989, Phase 1b). Keying on
-    /// the layer as well as the target means a receiver switching layers for
-    /// the same sender gets a fresh budget instead of being throttled as a
-    /// duplicate — otherwise the newly-selected layer's tile would stay frozen
-    /// until the window elapsed. The global per-receiver cap (below) is
+    /// Per-(target-sender, layer) counters, keyed by the target identity
+    /// ([`KeyframeTarget`]: the target's session_id when known, else its
+    /// user_id — #1124) and the simulcast layer the request targets (#989,
+    /// Phase 1b). Keying on the layer as well as the target means a receiver
+    /// switching layers for the same sender gets a fresh budget instead of
+    /// being throttled as a duplicate — otherwise the newly-selected layer's
+    /// tile would stay frozen until the window elapsed. Keying on the SESSION
+    /// (not the participant) means two concurrent sessions of one identity get
+    /// independent budgets (#1124). The global per-receiver cap (below) is
     /// unaffected, so total fan-out stays bounded (OSS #814).
-    per_target: HashMap<(Vec<u8>, u32), WindowCounter>,
+    ///
+    /// #1068: the `u32` layer component is CLAMPED to
+    /// `0..=KEYFRAME_REQUEST_MAX_LAYER_ID` before it becomes a key, so the
+    /// number of distinct per-layer buckets per target is bounded (an attacker
+    /// cycling out-of-ladder layer ids cannot open unbounded buckets). See
+    /// `allow_with_congestion`.
+    per_target: HashMap<(KeyframeTarget, u32), WindowCounter>,
     /// Total `allow()` calls since the last cleanup. Cleanup runs every
     /// [`KEYFRAME_LIMITER_CLEANUP_INTERVAL`] calls.
     calls_since_cleanup: u32,
@@ -221,15 +285,14 @@ impl KeyframeRequestLimiter {
         }
     }
 
-    /// Check whether a KEYFRAME_REQUEST aimed at `target_user_id` for simulcast
-    /// `layer` should be allowed through, using the strict steady-state per-pair
-    /// budget.
+    /// Check whether a KEYFRAME_REQUEST aimed at `target` for simulcast `layer`
+    /// should be allowed through, using the strict steady-state per-pair budget.
     ///
     /// Equivalent to [`KeyframeRequestLimiter::allow_with_congestion`] with
     /// `congested = false`. Retained as the simple entry point for callers
     /// (and tests) that have no congestion signal.
-    pub fn allow(&mut self, target_user_id: &[u8], layer: u32) -> bool {
-        self.allow_with_congestion(target_user_id, layer, false)
+    pub fn allow(&mut self, target: KeyframeTarget, layer: u32) -> bool {
+        self.allow_with_congestion(target, layer, false)
     }
 
     /// Check whether a KEYFRAME_REQUEST aimed at `target_user_id` should be
@@ -260,7 +323,7 @@ impl KeyframeRequestLimiter {
     /// [`KEYFRAME_LIMITER_CLEANUP_INTERVAL`] calls to bound memory.
     pub fn allow_with_congestion(
         &mut self,
-        target_user_id: &[u8],
+        target: KeyframeTarget,
         layer: u32,
         congested: bool,
     ) -> bool {
@@ -282,7 +345,20 @@ impl KeyframeRequestLimiter {
         // Per-(pair, layer) check first: this is the dimension that actually
         // discriminates a 16-sender fan-out — and a deliberate layer switch
         // (#989) — from sustained abuse.
-        let key = (target_user_id.to_vec(), layer);
+        //
+        // #1068: CLAMP the layer dimension of the key to the realistic ladder
+        // ceiling. `layer` is the cleartext, attacker-controllable
+        // `simulcast_layer_id` (an unbounded `u32`), so without this a malicious
+        // receiver could cycle DISTINCT ids against ONE sender to open unbounded
+        // fresh per-layer buckets — each with its own per-pair budget — and
+        // concentrate up to the global cap of keyframe pressure on that single
+        // victim. Clamping to `0..=KEYFRAME_REQUEST_MAX_LAYER_ID` bounds the
+        // buckets per target to `MAX + 1`; ids beyond the real ladder share the
+        // top bucket's budget rather than opening new ones. Every REAL layer
+        // switch (ids 0..=2 today) still gets its own bucket, so legitimate
+        // clients are unaffected. The global per-receiver cap is unchanged.
+        let key_layer = layer.min(KEYFRAME_REQUEST_MAX_LAYER_ID);
+        let key = (target, key_layer);
         let per_pair_entry = self
             .per_target
             .entry(key.clone())
@@ -510,6 +586,7 @@ mod tests {
         let media = MediaPacket {
             media_type: MediaType::KEYFRAME_REQUEST.into(),
             user_id: b"alice".to_vec(),
+            target_session_id: 7777,
             ..Default::default()
         };
         let wrapper = PacketWrapper {
@@ -522,6 +599,9 @@ mod tests {
             classify_packet(&bytes),
             PacketKind::KeyframeRequest {
                 target_user_id: b"alice".to_vec(),
+                // #1124: the inner target_session_id must flow through so the
+                // limiter can key per-session.
+                target_session_id: 7777,
                 // No simulcast_layer_id set on the wrapper → base/unspecified 0.
                 layer: 0,
             }
@@ -548,6 +628,7 @@ mod tests {
             classify_packet(&bytes),
             PacketKind::KeyframeRequest {
                 target_user_id: b"alice".to_vec(),
+                target_session_id: 0,
                 layer: 2,
             }
         );
@@ -572,6 +653,7 @@ mod tests {
             classify_packet(&bytes),
             PacketKind::KeyframeRequest {
                 target_user_id: Vec::new(),
+                target_session_id: 0,
                 layer: 0,
             }
         );
@@ -682,10 +764,17 @@ mod tests {
     // KeyframeRequestLimiter — per-pair behaviour
     // =====================================================================
 
+    /// Test helper: a user-keyed target (the older-client fallback path).
+    /// Most limiter-mechanics tests use this since they exercise the sliding
+    /// window / global cap / cleanup regardless of which key variant is used.
+    fn user_target(id: &[u8]) -> KeyframeTarget {
+        KeyframeTarget::User(id.to_vec())
+    }
+
     #[test]
     fn test_keyframe_limiter_allows_first_request_per_target() {
         let mut limiter = KeyframeRequestLimiter::new();
-        assert!(limiter.allow(b"sender-a", 0));
+        assert!(limiter.allow(user_target(b"sender-a"), 0));
     }
 
     #[test]
@@ -693,9 +782,9 @@ mod tests {
         // Same target, second request inside the window must be denied.
         // This is the classic per-pair throttle on a single relationship.
         let mut limiter = KeyframeRequestLimiter::new();
-        assert!(limiter.allow(b"sender-a", 0));
+        assert!(limiter.allow(user_target(b"sender-a"), 0));
         assert!(
-            !limiter.allow(b"sender-a", 0),
+            !limiter.allow(user_target(b"sender-a"), 0),
             "second request to the same sender within 1s must be denied"
         );
     }
@@ -709,7 +798,7 @@ mod tests {
         for i in 0..16 {
             let target = format!("sender-{}", i);
             assert!(
-                limiter.allow(target.as_bytes(), 0),
+                limiter.allow(user_target(target.as_bytes()), 0),
                 "first request to sender-{} should be allowed (i={})",
                 i,
                 i
@@ -723,14 +812,11 @@ mod tests {
         // the bucket's window_start. We avoid `tokio::time::sleep` so the
         // test stays cheap and deterministic.
         let mut limiter = KeyframeRequestLimiter::new();
-        let target = b"sender-x";
-        assert!(limiter.allow(target, 0));
+        let target = user_target(b"sender-x");
+        assert!(limiter.allow(target.clone(), 0));
 
         // Push the bucket's window_start ~1.5s into the past.
-        let entry = limiter
-            .per_target
-            .get_mut(&(target.to_vec(), 0u32))
-            .unwrap();
+        let entry = limiter.per_target.get_mut(&(target.clone(), 0u32)).unwrap();
         entry.window_start =
             Instant::now() - Duration::from_millis(KEYFRAME_REQUEST_WINDOW_MS + 500);
 
@@ -744,11 +830,82 @@ mod tests {
     fn test_keyframe_limiter_per_target_is_independent() {
         // Exhausting one (receiver, target) pair must not affect another.
         let mut limiter = KeyframeRequestLimiter::new();
-        assert!(limiter.allow(b"sender-a", 0));
-        assert!(!limiter.allow(b"sender-a", 0));
+        assert!(limiter.allow(user_target(b"sender-a"), 0));
+        assert!(!limiter.allow(user_target(b"sender-a"), 0));
 
         // sender-b is a fresh pair — must still admit its first request.
-        assert!(limiter.allow(b"sender-b", 0));
+        assert!(limiter.allow(user_target(b"sender-b"), 0));
+    }
+
+    // =====================================================================
+    // #1124: per-SESSION keying — the core acceptance proof
+    // =====================================================================
+
+    #[test]
+    fn test_keyframe_target_from_request_prefers_session_then_user() {
+        // The production builder (used at session_logic.rs's KEYFRAME_REQUEST
+        // branch): a non-zero target_session_id keys by Session; 0 (older
+        // client) falls back to User. Pins both branches directly.
+        assert_eq!(
+            KeyframeTarget::from_request(b"alice", 7),
+            KeyframeTarget::Session(7),
+            "a non-zero target_session_id must key by Session (#1124)"
+        );
+        assert_eq!(
+            KeyframeTarget::from_request(b"alice", 0),
+            KeyframeTarget::User(b"alice".to_vec()),
+            "target_session_id == 0 (older client) must fall back to User"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_concurrent_sessions_same_user_have_independent_budgets() {
+        // #1124: two concurrent publishing SESSIONS of the SAME participant
+        // must NOT collide into one rate-limit bucket. With per-session keying
+        // (KeyframeTarget::Session), exhausting session A's per-pair budget
+        // must leave session B's budget untouched.
+        //
+        // ADVERSARIAL (CLAUDE.md check #2): if the limiter reverted to keying
+        // by user_id, both sessions would map to the same bucket and the
+        // second assertion (session B admitted) would FAIL — so this test is
+        // pinned to the real per-session behaviour, not a tautology.
+        let mut limiter = KeyframeRequestLimiter::new();
+        let session_a = KeyframeTarget::Session(1001);
+        let session_b = KeyframeTarget::Session(1002);
+
+        // Session A: first request admitted, second within the window denied
+        // (strict per-pair budget) — exhausts A's bucket.
+        assert!(limiter.allow(session_a.clone(), 0));
+        assert!(
+            !limiter.allow(session_a, 0),
+            "session A's per-pair budget must be exhausted by its 2nd request"
+        );
+
+        // Session B (a DIFFERENT session of the same identity) must still be
+        // admitted — independent budget. This is exactly what #1124 fixes.
+        assert!(
+            limiter.allow(session_b, 0),
+            "a concurrent session of the same user must have an INDEPENDENT \
+             keyframe budget (#1124) — collision here means per-user keying"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_session_and_user_targets_are_distinct_buckets() {
+        // A session-keyed target and a user-keyed fallback are distinct keys,
+        // so a new-client request (Session) and an old-client request (User)
+        // for nominally the same participant do not share a bucket. This is
+        // the documented, harmless consequence of the fallback (it can only
+        // ever allow slightly more, never throttle legitimate traffic).
+        let mut limiter = KeyframeRequestLimiter::new();
+        assert!(limiter.allow(KeyframeTarget::Session(2001), 0));
+        // Exhaust the session bucket.
+        assert!(!limiter.allow(KeyframeTarget::Session(2001), 0));
+        // The user-keyed fallback bucket is independent.
+        assert!(
+            limiter.allow(user_target(b"some-user"), 0),
+            "user-keyed fallback must not share a bucket with a session key"
+        );
     }
 
     #[test]
@@ -760,21 +917,82 @@ mod tests {
         // tile frozen until the window elapsed.
         let mut limiter = KeyframeRequestLimiter::new();
         // Saturate layer 1 for sender-a.
-        assert!(limiter.allow(b"sender-a", 1));
+        assert!(limiter.allow(user_target(b"sender-a"), 1));
         assert!(
-            !limiter.allow(b"sender-a", 1),
+            !limiter.allow(user_target(b"sender-a"), 1),
             "second request for (sender-a, layer 1) within the window must be denied"
         );
         // A request for a DIFFERENT layer of the same sender is a fresh bucket.
         assert!(
-            limiter.allow(b"sender-a", 2),
+            limiter.allow(user_target(b"sender-a"), 2),
             "switching to layer 2 of the same sender must admit a fresh request \
              (not throttled as a duplicate)"
         );
         // Layer 0 (base) is also its own independent bucket.
         assert!(
-            limiter.allow(b"sender-a", 0),
+            limiter.allow(user_target(b"sender-a"), 0),
             "base layer 0 of the same sender must admit a fresh request"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_layer_clamp_bounds_per_victim_pressure() {
+        // #1068: a malicious receiver must NOT be able to cycle distinct
+        // out-of-ladder `simulcast_layer_id`s against ONE sender to open
+        // unbounded fresh per-layer buckets and drive per-victim keyframe
+        // pressure up toward the global cap. The layer dimension of the key is
+        // clamped to `0..=KEYFRAME_REQUEST_MAX_LAYER_ID`, so a single target has
+        // at most `KEYFRAME_REQUEST_MAX_LAYER_ID + 1` distinct buckets — well
+        // below the global cap of `KEYFRAME_REQUEST_MAX_PER_SEC` (~32).
+        //
+        // Sanity-check the test's own premise: without the clamp this attack
+        // WOULD reach the global cap, so the constants must leave headroom for
+        // the clamp to be the binding limit.
+        let realistic_buckets = KEYFRAME_REQUEST_MAX_LAYER_ID + 1;
+        assert!(
+            realistic_buckets < KEYFRAME_REQUEST_MAX_PER_SEC,
+            "clamp must bind BELOW the global cap, else this test proves nothing"
+        );
+
+        let mut limiter = KeyframeRequestLimiter::new();
+        let victim = user_target(b"victim-sender");
+
+        // Each distinct CLAMPED layer (0..=MAX) admits exactly one request in
+        // the window (per-pair budget is 1/sec). All of these are real ladder
+        // ids, so they map to distinct buckets and must all be admitted.
+        let mut admitted = 0u32;
+        for layer in 0..=KEYFRAME_REQUEST_MAX_LAYER_ID {
+            assert!(
+                limiter.allow(victim.clone(), layer),
+                "first request for clamped layer {layer} of the victim must be admitted"
+            );
+            admitted += 1;
+        }
+
+        // Now cycle MANY distinct OUT-OF-LADDER layer ids against the same
+        // victim. Every one of these clamps onto the top bucket
+        // (KEYFRAME_REQUEST_MAX_LAYER_ID), whose 1/sec budget was just consumed
+        // above — so they must ALL be denied. Without the clamp each distinct id
+        // would open a fresh bucket and admit, marching toward the global cap.
+        for forged_layer in
+            (KEYFRAME_REQUEST_MAX_LAYER_ID + 1)..=(KEYFRAME_REQUEST_MAX_LAYER_ID + 100)
+        {
+            assert!(
+                !limiter.allow(victim.clone(), forged_layer),
+                "forged out-of-ladder layer {forged_layer} must collapse onto the clamped \
+                 top bucket and be denied (no new per-layer budget)"
+            );
+        }
+
+        // Per-victim pressure is therefore bounded to the clamped bucket count,
+        // NOT the global cap.
+        assert_eq!(
+            admitted, realistic_buckets,
+            "exactly KEYFRAME_REQUEST_MAX_LAYER_ID + 1 distinct layer buckets may admit per victim"
+        );
+        assert!(
+            admitted < KEYFRAME_REQUEST_MAX_PER_SEC,
+            "per-victim keyframe pressure must stay well under the global per-receiver cap"
         );
     }
 
@@ -785,13 +1003,13 @@ mod tests {
         let mut limiter = KeyframeRequestLimiter::new();
         for i in 0..KEYFRAME_REQUEST_MAX_PER_SEC {
             let target = format!("t-{}", i);
-            assert!(limiter.allow(target.as_bytes(), 0));
+            assert!(limiter.allow(user_target(target.as_bytes()), 0));
         }
         // One more distinct target inside the same window must be denied
         // by the global cap.
         let extra = format!("t-{}", KEYFRAME_REQUEST_MAX_PER_SEC);
         assert!(
-            !limiter.allow(extra.as_bytes(), 0),
+            !limiter.allow(user_target(extra.as_bytes()), 0),
             "global per-receiver cap must clamp runaway fan-out"
         );
     }
@@ -805,11 +1023,11 @@ mod tests {
         // Fill the global cap with distinct targets.
         for i in 0..KEYFRAME_REQUEST_MAX_PER_SEC {
             let target = format!("t-{}", i);
-            assert!(limiter.allow(target.as_bytes(), 0));
+            assert!(limiter.allow(user_target(target.as_bytes()), 0));
         }
         // This pair's first request is denied by the global cap.
-        let pair = b"t-victim";
-        assert!(!limiter.allow(pair, 0));
+        let pair = user_target(b"t-victim");
+        assert!(!limiter.allow(pair.clone(), 0));
 
         // Manually expire only the global window (simulating ~1s passing
         // for the global cap while the per-pair entry was just refunded).
@@ -834,15 +1052,15 @@ mod tests {
         // the strict steady-state budget (1/sec) would reject must be
         // admitted when the requesting receiver is flagged congested.
         let mut limiter = KeyframeRequestLimiter::new();
-        let target = b"frozen-sender";
+        let target = user_target(b"frozen-sender");
 
         // First request always admitted under either budget.
-        assert!(limiter.allow_with_congestion(target, 0, false));
+        assert!(limiter.allow_with_congestion(target.clone(), 0, false));
 
         // Second request to the same target within the window is denied by
         // the strict per-pair budget...
         assert!(
-            !limiter.allow_with_congestion(target, 0, false),
+            !limiter.allow_with_congestion(target.clone(), 0, false),
             "strict per-pair budget must deny the 2nd request within the window"
         );
 
@@ -861,11 +1079,11 @@ mod tests {
         // KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED requests are
         // admitted within the window; the next is denied.
         let mut limiter = KeyframeRequestLimiter::new();
-        let target = b"sender-c";
+        let target = user_target(b"sender-c");
 
         for i in 0..KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED {
             assert!(
-                limiter.allow_with_congestion(target, 0, true),
+                limiter.allow_with_congestion(target.clone(), 0, true),
                 "congested request {i} within the relaxed budget must be admitted"
             );
         }
@@ -884,11 +1102,11 @@ mod tests {
         let mut limiter = KeyframeRequestLimiter::new();
         for i in 0..KEYFRAME_REQUEST_MAX_PER_SEC {
             let target = format!("g-{i}");
-            assert!(limiter.allow_with_congestion(target.as_bytes(), 0, true));
+            assert!(limiter.allow_with_congestion(user_target(target.as_bytes()), 0, true));
         }
         let extra = format!("g-{KEYFRAME_REQUEST_MAX_PER_SEC}");
         assert!(
-            !limiter.allow_with_congestion(extra.as_bytes(), 0, true),
+            !limiter.allow_with_congestion(user_target(extra.as_bytes()), 0, true),
             "global per-receiver cap must hold even under congestion (OSS #814)"
         );
     }
@@ -898,13 +1116,13 @@ mod tests {
         // `allow()` must behave identically to `allow_with_congestion(.., 0, false)`.
         let mut a = KeyframeRequestLimiter::new();
         let mut b = KeyframeRequestLimiter::new();
-        let target = b"sender-eq";
+        let target = user_target(b"sender-eq");
         assert_eq!(
-            a.allow(target, 0),
-            b.allow_with_congestion(target, 0, false)
+            a.allow(target.clone(), 0),
+            b.allow_with_congestion(target.clone(), 0, false)
         );
         assert_eq!(
-            a.allow(target, 0),
+            a.allow(target.clone(), 0),
             b.allow_with_congestion(target, 0, false)
         );
     }
@@ -919,14 +1137,14 @@ mod tests {
         let window = Duration::from_millis(KEYFRAME_REQUEST_WINDOW_MS);
 
         limiter.per_target.insert(
-            (b"stale".to_vec(), 0u32),
+            (KeyframeTarget::User(b"stale".to_vec()), 0u32),
             WindowCounter {
                 count: 0,
                 window_start: now - (window * 20),
             },
         );
         limiter.per_target.insert(
-            (b"fresh".to_vec(), 0u32),
+            (KeyframeTarget::User(b"fresh".to_vec()), 0u32),
             WindowCounter {
                 count: 0,
                 window_start: now,
@@ -935,20 +1153,24 @@ mod tests {
 
         // Force the next allow() call to trigger cleanup.
         limiter.calls_since_cleanup = KEYFRAME_LIMITER_CLEANUP_INTERVAL - 1;
-        assert!(limiter.allow(b"trigger", 0));
+        assert!(limiter.allow(user_target(b"trigger"), 0));
 
         assert!(
-            !limiter.per_target.contains_key(&(b"stale".to_vec(), 0u32)),
+            !limiter
+                .per_target
+                .contains_key(&(KeyframeTarget::User(b"stale".to_vec()), 0u32)),
             "stale entry must be removed by cleanup"
         );
         assert!(
-            limiter.per_target.contains_key(&(b"fresh".to_vec(), 0u32)),
+            limiter
+                .per_target
+                .contains_key(&(KeyframeTarget::User(b"fresh".to_vec()), 0u32)),
             "fresh entry must be retained by cleanup"
         );
         assert!(
             limiter
                 .per_target
-                .contains_key(&(b"trigger".to_vec(), 0u32)),
+                .contains_key(&(KeyframeTarget::User(b"trigger".to_vec()), 0u32)),
             "the active pair that triggered cleanup must remain"
         );
     }
@@ -963,7 +1185,7 @@ mod tests {
         let window = Duration::from_millis(KEYFRAME_REQUEST_WINDOW_MS);
 
         limiter.per_target.insert(
-            (b"active".to_vec(), 0u32),
+            (KeyframeTarget::User(b"active".to_vec()), 0u32),
             WindowCounter {
                 count: 1, // mid-window allowance already consumed
                 window_start: now - (window * 5),
@@ -971,11 +1193,11 @@ mod tests {
         );
 
         limiter.calls_since_cleanup = KEYFRAME_LIMITER_CLEANUP_INTERVAL - 1;
-        assert!(limiter.allow(b"unrelated", 0));
+        assert!(limiter.allow(user_target(b"unrelated"), 0));
 
         let entry = limiter
             .per_target
-            .get(&(b"active".to_vec(), 0u32))
+            .get(&(KeyframeTarget::User(b"active".to_vec()), 0u32))
             .expect("active pair must survive cleanup");
         assert_eq!(
             entry.count, 1,
@@ -993,7 +1215,7 @@ mod tests {
         let window = Duration::from_millis(KEYFRAME_REQUEST_WINDOW_MS);
 
         limiter.per_target.insert(
-            (b"stale".to_vec(), 0u32),
+            (KeyframeTarget::User(b"stale".to_vec()), 0u32),
             WindowCounter {
                 count: 0,
                 window_start: now - (window * 20),
@@ -1007,11 +1229,13 @@ mod tests {
             // Some calls will be denied by the global cap once it fills;
             // we don't care about return value, only that we drove the
             // call counter close to the boundary.
-            let _ = limiter.allow(target.as_bytes(), 0);
+            let _ = limiter.allow(user_target(target.as_bytes()), 0);
         }
 
         assert!(
-            limiter.per_target.contains_key(&(b"stale".to_vec(), 0u32)),
+            limiter
+                .per_target
+                .contains_key(&(KeyframeTarget::User(b"stale".to_vec()), 0u32)),
             "stale entry must persist below the cleanup threshold (amortized)"
         );
     }

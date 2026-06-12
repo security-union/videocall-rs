@@ -40,7 +40,7 @@ use tracing;
 
 use serde::Deserialize;
 
-use crate::auth::AuthUser;
+use crate::auth::RoomMember;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
 use crate::state::AppState;
@@ -48,9 +48,11 @@ use crate::state::AppState;
 /// Query parameters accepted as a fallback for `navigator.sendBeacon()` which
 /// cannot set custom request headers. The primary upload path uses headers;
 /// these are only used when headers are absent.
+///
+/// Identity is no longer carried here — it comes authoritatively from the
+/// room token's `sub` claim — so only the session timestamp remains.
 #[derive(Debug, Deserialize, Default)]
 pub struct ConsoleLogQuery {
-    pub user_id: Option<String>,
     pub session_ts: Option<String>,
 }
 
@@ -240,19 +242,31 @@ fn validate_id(value: &str, field_name: &str, re: &Regex) -> Result<(), AppError
 /// and writes it to disk. Each chunk is stored as a separate file to avoid
 /// race conditions between periodic flushes and `sendBeacon` uploads.
 ///
+/// # Authentication
+///
+/// - `Authorization: Bearer <room_token>` — **required**. The room-access JWT
+///   issued by the Meeting Backend (`generate_room_token`). Identity is derived
+///   from the token's `sub` claim; any `X-User-Id` header is **ignored**. The
+///   token's `room` claim MUST equal the `{meeting_id}` path segment, otherwise
+///   the request is rejected with 403. A missing, invalid, or observer-only
+///   token (which lacks room-join access) is rejected with 401.
+///
 /// # Headers
 ///
-/// - `X-User-Id` — identifies the participant (required)
-/// - `X-Session-Timestamp` — epoch ms timestamp unique to this join session (required)
+/// - `X-Session-Timestamp` — epoch ms timestamp unique to this join session
+///   (falls back to the `session_ts` query param, then to the current epoch ms)
+/// - `X-Chunk-Seq` — optional chunk sequence number (1..=99999) for ordered
+///   filenames
 ///
 /// # Gating
 ///
 /// Returns 404 unless `CONSOLE_LOG_UPLOAD_ENABLED` env var is `"true"`.
 pub async fn upload_console_logs(
-    AuthUser {
-        user_id: auth_user_id,
+    RoomMember {
+        user_id,
+        meeting_id: token_meeting_id,
         ..
-    }: AuthUser,
+    }: RoomMember,
     State(state): State<AppState>,
     Path(meeting_id): Path<String>,
     Query(query): Query<ConsoleLogQuery>,
@@ -272,16 +286,36 @@ pub async fn upload_console_logs(
         ));
     }
 
-    // --- Extract user_id and session_ts ---
-    // Primary: custom headers (used by fetch with keepalive). Optional: the
-    // sendBeacon fallback cannot set headers, so user_id falls back to the
-    // auth JWT identity and session_ts falls back to the current epoch ms.
-    let user_id = headers
-        .get("X-User-Id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
-        .or(query.user_id);
+    // --- Cross-meeting binding ---
+    // The room token's `room` claim must match the meeting being uploaded to.
+    // This stops an authenticated participant of meeting A from writing logs
+    // under meeting B's path. We return 403 (not 401): the caller IS
+    // authenticated — they simply lack authority over this meeting (an authz
+    // failure). This deliberately diverges from `get_guest_status`, which
+    // returns 401 for an analogous cross-meeting observer-token check; here the
+    // bearer holds a valid room credential, so 403 is the correct shape.
+    if token_meeting_id != meeting_id {
+        tracing::warn!(
+            token_meeting_id = %token_meeting_id,
+            path_meeting_id = %meeting_id,
+            user_id = %user_id,
+            "Console log upload rejected: room token meeting does not match path"
+        );
+        return Err(AppError::new(
+            StatusCode::FORBIDDEN,
+            videocall_meeting_types::APIError {
+                code: "FORBIDDEN".to_string(),
+                message: "Room token is not valid for this meeting".to_string(),
+                engineering_error: None,
+            },
+        ));
+    }
 
+    // --- Extract session_ts ---
+    // Identity comes from the room token's `sub` claim (`user_id`), so no
+    // X-User-Id header is consulted. `session_ts` falls back to the
+    // `session_ts` query param (sendBeacon cannot set headers), then to the
+    // current epoch ms.
     let session_ts = headers
         .get("X-Session-Timestamp")
         .and_then(|v| v.to_str().ok())
@@ -304,7 +338,7 @@ pub async fn upload_console_logs(
                 tracing::warn!(
                     chunk_seq = n,
                     meeting_id = %meeting_id,
-                    user_id = user_id.as_deref().unwrap_or("<unknown>"),
+                    user_id = %user_id,
                     "X-Chunk-Seq out of accepted range 1..=99999; falling back to UUIDv7 suffix"
                 );
                 false
@@ -327,44 +361,16 @@ pub async fn upload_console_logs(
         ));
     }
 
-    // --- Identity resolution ---
-    // Use the authenticated identity from the JWT when available. This
-    // prevents clients from self-asserting an arbitrary X-User-Id.
-    // When auth_user_id is non-empty, we use it as the canonical user_id
-    // for the filename and log any mismatch.
+    // --- Identity ---
+    // The canonical `user_id` is the room token's `sub` claim (from the
+    // `RoomMember` extractor) — authoritative and not client-spoofable. We
+    // still validate it for path-safety before using it in a filename.
     //
-    // Anonymous fallback: when auth_user_id is empty (anonymous/guest
-    // sessions using room-token-only auth), the client-supplied X-User-Id
-    // header is accepted. This is safe because the downstream membership
-    // check verifies the user_id has a participant row for this meeting —
-    // an attacker would need both a valid room token AND a participant row
-    // under the claimed identity.
-    let user_id = if !auth_user_id.is_empty() {
-        if let Some(ref header_uid) = user_id {
-            if *header_uid != auth_user_id {
-                tracing::warn!(
-                    auth_user_id = %auth_user_id,
-                    header_user_id = %header_uid,
-                    "Console log upload: using auth identity instead of X-User-Id header"
-                );
-            }
-        }
-        auth_user_id
-    } else {
-        user_id.ok_or_else(|| {
-            AppError::new(
-                StatusCode::BAD_REQUEST,
-                videocall_meeting_types::APIError {
-                    code: "MISSING_HEADER".to_string(),
-                    message: "X-User-Id header is required for unauthenticated sessions"
-                        .to_string(),
-                    engineering_error: None,
-                },
-            )
-        })?
-    };
-
-    // Validate the resolved user_id for path-safety.
+    // Known limitation (intentional): a guest's `sub` is `guest:{uuid}`, and
+    // the colon is not in `SAFE_USER_ID_RE`, so guest uploads return 400 here.
+    // Guest console-log capture is out of scope; the rejection is a clean 400
+    // (no crash, no security impact) and the guest collector simply drops the
+    // chunk. Authenticated participants (email `sub`) are unaffected.
     validate_id(&user_id, "user_id", &SAFE_USER_ID_RE)?;
 
     // --- Meeting membership check ---

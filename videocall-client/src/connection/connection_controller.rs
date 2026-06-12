@@ -332,6 +332,21 @@ impl ConnectionController {
         }
     }
 
+    /// Whether THIS client's currently-active connection is WebTransport.
+    ///
+    /// Forwards to [`ConnectionManager::active_is_webtransport`]. This is the
+    /// client-wide "am I on WebTransport" signal (the relay is a broadcast
+    /// relay: one elected transport per client), used by the #1179 early-seed
+    /// gate. Returns `false` when the manager is momentarily borrowed or no
+    /// connection is active yet — the safe default (no early seed).
+    pub fn active_is_webtransport(&self) -> bool {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.active_is_webtransport()
+        } else {
+            false
+        }
+    }
+
     /// Disconnect from the current connection and clean up resources
     pub fn disconnect(&self) -> anyhow::Result<()> {
         let mut mgr = self

@@ -251,9 +251,14 @@ fn spaced_ladder_positions(n: usize, len: usize) -> Vec<usize> {
 /// driven entirely by the ladder length — for the current 3-rung ladder:
 ///
 /// - `n == 1` → `[low]` (single base layer — used when simulcast is off or the
-///   device is too weak; the AQ controller treats this exactly like today's
-///   single-stream path, so this tier is *not* used to override the adaptive
-///   single-stream resolution — see `camera_encoder.rs`).
+///   device is too weak). The AQ controller still drives the single stream's
+///   resolution/bitrate ADAPTIVELY in the common case, so this `low` tier is not
+///   an unconditional override. **Exception (issue #1136):** when a single-layer
+///   publisher is in a call with **more than 3 other peers**, `camera_encoder.rs`
+///   pins the single stream to THIS `low` rung (640×360 / low ideal) as a
+///   ceiling — one adaptive medium-tier stream is too heavy on every receiver's
+///   decoder at that scale. With ≤3 peers the single stream stays fully
+///   adaptive. See the single-layer low-rung pin in `camera_encoder.rs`.
 /// - `n == 2` → `[low, hd]` (skip the middle `standard` tier so the two layers
 ///   are well separated in resolution/bitrate).
 /// - `n == 3` → `[low, standard, hd]` (full ladder).
@@ -767,6 +772,90 @@ pub const ENCODER_BACKPRESSURE_SUSTAIN_MS: f64 = 1500.0;
 /// their effective behavior.
 pub const AQ_TICK_INTERVAL_MS: u64 = 1000;
 
+// ---------------------------------------------------------------------------
+// Runtime simulcast layer ramp-up (issue #1140 / #1141)
+// ---------------------------------------------------------------------------
+// The cold CPU benchmark no longer gates simulcast layer count. Every camera
+// publisher starts at 1 active layer (the legacy single-stream path) and the
+// `EncoderBitrateController` *earns* additional layers up to the device ceiling
+// at runtime, based on observed encoder-queue backpressure headroom + uplink
+// budget. These constants govern that conservative, self-limiting probe.
+
+/// How long (milliseconds) the encoder queue depth must stay sustained-CLEAR
+/// (at/below [`ENCODER_QUEUE_BACKPRESSURE_CLEAR`]) before the controller probes
+/// adding ONE simulcast layer (issue #1141).
+///
+/// **Deliberately asymmetric**: this dwell is LONGER than both the shed sustain
+/// ([`ENCODER_BACKPRESSURE_SUSTAIN_MS`] = 1.5 s) and the tier step-up window
+/// ([`STEP_UP_STABILIZATION_WINDOW_MS`] = 5 s). Adding a layer is ~N× the encode
+/// CPU + uplink of a tier-bitrate step, so a wrong add is far more expensive to
+/// recover from than a wrong tier nudge — we want the device to prove it has
+/// been comfortably idle for a stable window before committing more CPU.
+/// 6 s is 4× the shed sustain (still add-slow / shed-fast) and exceeds the 5 s
+/// tier step-up window, while keeping the cold-start ramp brisk: ~one rung every
+/// 6 s rather than every 12 s, so a capable publisher reaches 2 layers in ~11 s
+/// and 3 in ~17 s instead of stalling on the base rung for ~half a minute.
+///
+/// **Provenance: REASONED, not measured (issue #1141 / #1159).** The 6 s value is
+/// derived from the constant-relationship invariants above (it must exceed the
+/// shed sustain and the tier step-up window), NOT from a multi-device capture of
+/// real ramp behavior on weak uplinks / low-power CPUs. Treat it as a first cut
+/// pending a performance-reviewer pass with field data; do not mistake the
+/// detailed rationale for empirical validation.
+pub const LAYER_PROBE_CLEAR_WINDOW_MS: f64 = 6_000.0;
+
+/// Headroom (fraction, 0.0–1.0) the summed active-layer uplink budget must have
+/// below the budget for the layer that would be ADDED before a probe-up is
+/// allowed (issue #1141).
+///
+/// `encode_queue_size()` backpressure detects CPU/encoder saturation, NOT "my
+/// uplink cannot carry another rung even though my CPU is bored". A probe-up is
+/// only permitted when the uplink budget for `active + 1` layers exceeds the
+/// budget for `active` layers by at least this fraction — i.e. there is genuine
+/// uplink room for the new rung. (The budget is the sum of active tier ideals;
+/// adding a layer raises it by that layer's ideal, so this is effectively
+/// "would the next rung's nominal cost fit".) See [`uplink_budget_kbps`].
+pub const LAYER_PROBE_MIN_UPLINK_HEADROOM_FRAC: f64 = 0.0;
+
+/// Window (milliseconds) after a probe-added layer within which a shed of that
+/// layer counts as an OSCILLATION, arming the anti-flap penalty box (issue
+/// #1141). A probe that survives longer than this is considered a good bet and
+/// does NOT lengthen the next backoff.
+///
+/// Sized just above the probe clear window (which is now 6 s) so "added, then
+/// almost immediately shed" is caught while a layer that held for a meaningful
+/// span is not penalized. A compile-time invariant below pins
+/// `LAYER_PROBE_OSCILLATION_WINDOW_MS >= LAYER_PROBE_CLEAR_WINDOW_MS` so the two
+/// can never drift apart silently if the clear window is retuned.
+///
+/// **Provenance: REASONED, not measured (issue #1141 / #1159).** The 8 s value is
+/// chosen relative to the clear window, not from a capture of real add-then-shed
+/// intervals. First-guess pending a performance-reviewer pass.
+pub const LAYER_PROBE_OSCILLATION_WINDOW_MS: f64 = 8_000.0;
+
+/// Initial penalty-box backoff (milliseconds) imposed after a probed-up layer
+/// is shed within [`LAYER_PROBE_OSCILLATION_WINDOW_MS`] (issue #1141). The next
+/// probe-up is suppressed until this long after the shed; each subsequent
+/// oscillation doubles it (capped at [`LAYER_PROBE_PENALTY_MAX_MS`]), so a
+/// device that flaps repeatedly settles low for the session.
+///
+/// **Provenance: REASONED, not measured (issue #1141 / #1159).** 15 s mirrors the
+/// climb-rate limiter's escalation shape (15→30→60 s) rather than a measured flap
+/// period; it is comfortably longer than the [`CONGESTION_HOLD_MS`] (2.5 s) drain
+/// hold so an uplink-driven cut backs off instead of re-flapping each hold.
+/// First-guess pending a performance-reviewer pass with field data.
+pub const LAYER_PROBE_PENALTY_BASE_MS: f64 = 15_000.0;
+
+/// Exponential backoff multiplier for the layer-probe penalty box on each repeat
+/// oscillation (issue #1141): 15 s → 30 s → 60 s (capped). Mirrors the
+/// climb-rate limiter's `CLIMB_COOLDOWN_BACKOFF`.
+pub const LAYER_PROBE_PENALTY_BACKOFF: f64 = 2.0;
+
+/// Maximum penalty-box backoff (milliseconds) for the layer probe (issue
+/// #1141). Caps the 15 → 30 → 60 s escalation so a flapping device retries at
+/// most once a minute rather than locking out forever.
+pub const LAYER_PROBE_PENALTY_MAX_MS: f64 = 60_000.0;
+
 // --- Compile-time invariants (issue #1108) ---
 // These relationships are load-bearing for the backpressure hysteresis and the
 // degrade-faster-than-recover asymmetry; assert them at COMPILE time so a bad
@@ -793,6 +882,39 @@ const _: () = assert!(
 const _: () = assert!(
     STEP_UP_STABILIZATION_WINDOW_MS > STEP_DOWN_REACTION_TIME_MS,
     "step-up stabilization window must exceed step-down reaction time"
+);
+
+/// Adding a simulcast layer must require a LONGER clear dwell than shedding one
+/// requires of sustained HIGH backpressure (issue #1141): the add is asymmetric
+/// — far more expensive to get wrong — so it must be the slower direction.
+const _: () = assert!(
+    LAYER_PROBE_CLEAR_WINDOW_MS > ENCODER_BACKPRESSURE_SUSTAIN_MS,
+    "layer-probe clear window must exceed the backpressure shed sustain (add slower than shed)"
+);
+
+/// A probe add must also dwell longer than a tier step-up (a layer add commits
+/// ~N× more CPU/uplink than a within-tier bitrate nudge), so it is the most
+/// conservative climb of all (issue #1141).
+const _: () = assert!(
+    LAYER_PROBE_CLEAR_WINDOW_MS >= STEP_UP_STABILIZATION_WINDOW_MS as f64,
+    "layer-probe clear window must be at least the tier step-up window"
+);
+
+/// The oscillation window must be at least the clear window (issue #1141): a
+/// probe that is shed before it even completed a fresh clear dwell is, by
+/// definition, an oscillation. Keeping OSCILLATION >= CLEAR ensures the two stay
+/// in the documented "oscillation window sits just above the clear window"
+/// relationship and cannot silently drift apart when either is retuned.
+const _: () = assert!(
+    LAYER_PROBE_OSCILLATION_WINDOW_MS >= LAYER_PROBE_CLEAR_WINDOW_MS,
+    "layer-probe oscillation window must be >= the clear window"
+);
+
+/// The penalty-box escalation must actually grow (issue #1141), and the base
+/// must not already exceed the cap.
+const _: () = assert!(
+    LAYER_PROBE_PENALTY_BACKOFF > 1.0 && LAYER_PROBE_PENALTY_BASE_MS <= LAYER_PROBE_PENALTY_MAX_MS,
+    "layer-probe penalty must escalate and start at/below its cap"
 );
 
 // --- Constant-relationship invariants (compile-time) ---
@@ -1272,9 +1394,507 @@ pub const WS_SELF_CONGESTION_DROP_THRESHOLD: u64 = 3;
 /// Tumbling window (ms) for counting client-side WS drops.
 pub const WS_SELF_CONGESTION_WINDOW_MS: f64 = 1000.0;
 
+// ---------------------------------------------------------------------------
+// Client-Side WebTransport Uplink-Backpressure Self-Detection (#1104)
+// ---------------------------------------------------------------------------
+//
+// Background (2026-06-09 meeting_sync analysis): the sender AQ already adapts
+// to producer-local signals — encode-queue backpressure, server CONGESTION,
+// and (on WebSocket) the client TCP send-buffer drop counter. The OWN-UPLINK
+// client-side trigger, however, was WebSocket-ONLY: `websocket_drop_count()`
+// returns 0 on WebTransport, so a WT sender whose uplink is saturated got no
+// proactive client-side shed and had to wait for the slower, indirect server
+// CONGESTION signal.
+//
+// Signal choice — why unistream drops, NOT datagram drops:
+//   On WebTransport the client sends audio/video/screen over PERSISTENT
+//   unidirectional QUIC streams (`send_on_persistent_stream`); datagrams carry
+//   ONLY periodic control traffic (heartbeats every 5s, RTT probes). So
+//   `datagram_drop_count()` is a sparse, indirect proxy that never observes a
+//   media frame. `unistream_drop_count()` increments when an actual media
+//   frame fails to leave the uplink (QUIC stream reset / fatal write error) —
+//   the true client-side WT analogue of the WS send-buffer drop. We key the
+//   trigger off the unistream counter for that reason.
+//
+// Threshold rationale (deliberately NOT a copy of the WS values):
+//   A unistream drop is a HARD event (stream reset / fatal write failure), not
+//   a soft "send buffer momentarily full" the way a WS `bufferedAmount`
+//   overflow is. On a lossy/high-latency link (200ms+ RTT, jitter) a single
+//   transient reset — or a reset during re-election / a brief network blip —
+//   must NOT shed a layer. We therefore require a SUSTAINED cluster of drops
+//   within the window before shedding. The window is widened to 2000ms so the
+//   evidence must persist across at least ~2 AQ ticks rather than a single
+//   spike, and the threshold is set so an isolated reset cannot trip it.
+//
+// Double-shed avoidance:
+//   A saturated WT uplink will eventually also raise the server CONGESTION
+//   signal (relay drops -> CONGESTION back to sender). The encoder maintains
+//   an INDEPENDENT window/snapshot for this counter (separate from the WS
+//   window and from the server-congestion flag), and each axis sheds at most
+//   one layer per window, so the paths cannot compound into a runaway
+//   double step-down within a single window.
+
+/// Number of client-side WebTransport persistent-unistream media-frame drops
+/// (see `videocall_transport::webtransport::unistream_drop_count`) within
+/// [`WT_SELF_CONGESTION_WINDOW_MS`] that triggers a local AQ step-down.
+///
+/// Set to 3 (not 1): a unistream drop is a hard stream-reset/write-failure
+/// event, so a single one can be a transient glitch or a re-election artifact
+/// on a lossy link. Requiring 3 within the window means only a SUSTAINED
+/// inability to push media out trips the self-shed, leaving isolated resets to
+/// the stream's own auto-reopen path.
+pub const WT_SELF_CONGESTION_DROP_THRESHOLD: u64 = 3;
+
+/// Tumbling window (ms) for counting client-side WT unistream drops.
+///
+/// Wider than the WS window (1000ms) because unistream drops are sparser and
+/// harder-edged than WS send-buffer overflows; a 2000ms window requires the
+/// drops to persist across multiple AQ ticks before shedding, which suppresses
+/// false triggers from jitter / momentary loss on high-latency links.
+pub const WT_SELF_CONGESTION_WINDOW_MS: f64 = 2000.0;
+
+// --- Compile-time invariants (#1104) ---
+// Checked on every build (clippy-clean, unlike a runtime assert on a const).
+const _: () = assert!(
+    WT_SELF_CONGESTION_WINDOW_MS >= WS_SELF_CONGESTION_WINDOW_MS,
+    "WT self-congestion window must be at least as wide as the WS window: WT \
+     unistream drops are harder-edged and sparser than WS send-buffer overflows, \
+     so they must persist longer before shedding."
+);
+const _: () = assert!(
+    WT_SELF_CONGESTION_DROP_THRESHOLD >= 2,
+    "WT self-congestion threshold must require more than one drop so a single \
+     transient stream reset (e.g. a re-election artifact or a brief network \
+     blip on a lossy link) cannot shed a layer."
+);
+
+// ---------------------------------------------------------------------------
+// Client-Side WebTransport Uplink-SATURATION Self-Detection (#1219 prerequisite)
+// ---------------------------------------------------------------------------
+//
+// Why this is SEPARATE from the unistream-DROP detection above:
+//   The drop counter (`unistream_drop_count`) only increments on stream/
+//   connection TEARDOWN (STOP_SENDING / RESET_STREAM / session close). It does
+//   NOT move on a slow-but-alive uplink: a WHATWG WritableStream signals
+//   backpressure by leaving `writer.ready()` PENDING, not by rejecting the
+//   write, and the WT media send path is fully `.await`-blocking. So on a
+//   genuine BANDWIDTH cliff (link slow, ACKs still flowing, no reset) the drop
+//   counter stays flat and a WT publisher would never self-shed. The transport
+//   therefore also exposes a monotonic "slow-ready event" counter
+//   (`unistream_ready_stall_count`): it increments once each time a single
+//   `writer.ready().await` on an established media stream blocks longer than the
+//   producer-side `READY_STALL_THRESHOLD_MS`. This block consumes THAT counter
+//   the same way the drop block consumes the drop counter — a tumbling-window
+//   delta test via `evaluate_self_congestion`.
+//
+// This is the prerequisite that lets the relay's sender-keyed CONGESTION
+// behavior (which collapses a publisher's encoder for the WHOLE room when ONE
+// receiver's downlink overflows, bug #1219) be REMOVED: with this signal a WT
+// publisher detects its OWN uplink saturation directly, instead of leaning on
+// the relay's mis-scoped, room-wide signal.
+
+/// Number of client-side WebTransport slow-`ready()` (uplink-saturation) events
+/// (see `videocall_transport::webtransport::unistream_ready_stall_count`) within
+/// [`WT_SATURATION_WINDOW_MS`] that triggers a local AQ step-down.
+///
+/// Netsim-tunable. Set to 3 (matching the drop threshold, deliberately not 1):
+/// a single slow `ready()` can be a one-off — a reordered/retransmitted packet
+/// or a momentary congestion-window dip on a high-RTT link — so requiring 3
+/// crossings within the window raises the bar above one isolated stall.
+///
+/// IMPORTANT — what "3 events" actually means (see the increment mechanism in
+/// `webtransport.rs`): increments do NOT correspond to 3 separate stall episodes.
+/// Because frame sends are spawned concurrently and share one `ready()` promise,
+/// a SINGLE sustained stall that has K frames in flight produces ~K increments
+/// at once when the promise resolves. At 25-30 fps a stall ≥ ~350-400ms easily
+/// has ≥3 frames queued, so one fat-but-isolated stall episode WILL trip the
+/// shed. The dominant false-positive guard is therefore the producer-side
+/// `READY_STALL_THRESHOLD_MS` (250ms) — the wait must be genuinely long — NOT
+/// the count of 3. A bursty-but-recovering link that never parks a frame past
+/// 250ms will not shed; one that parks several frames past 250ms then recovers
+/// WILL shed one rung (arguably a correct early shed, but a real quality drop).
+/// VALIDATE the bursty-recovery case on the #1080 netsim before relying on this
+/// to replace the relay CONGESTION signal (#1219); the threshold may need to be
+/// frame-rate-aware.
+pub const WT_SATURATION_STALL_THRESHOLD: u64 = 3;
+
+/// Tumbling window (ms) for counting client-side WT slow-`ready()` events.
+///
+/// Netsim-tunable. Matches [`WT_SELF_CONGESTION_WINDOW_MS`] (2000ms): the
+/// evidence must persist across at least ~2 AQ ticks (`AQ_TICK_INTERVAL_MS` =
+/// 1000ms) before shedding, so a single tick that happened to catch one slow
+/// `ready()` cannot fire. Wider than the WS window for the same reason the WT
+/// drop window is: WT signals are harder-edged and must persist longer.
+pub const WT_SATURATION_WINDOW_MS: f64 = 2000.0;
+
+// --- Compile-time invariants (#1219 prerequisite) ---
+const _: () = assert!(
+    WT_SATURATION_WINDOW_MS >= WS_SELF_CONGESTION_WINDOW_MS,
+    "WT saturation window must be at least as wide as the WS window: a slow \
+     ready() is a coarse, sparse signal and must persist longer before shedding."
+);
+const _: () = assert!(
+    WT_SATURATION_STALL_THRESHOLD >= 2,
+    "WT saturation threshold must require more than one slow ready() so a single \
+     transient stall (a reordered packet / brief cwnd dip on a lossy link) \
+     cannot shed a layer."
+);
+
+/// Pure decision helper for the client-side self-congestion self-trigger
+/// (used by the WebTransport uplink-backpressure block; #1104).
+///
+/// Implements the tumbling-window delta test in one testable place so the
+/// encoder's inline block (which depends on wasm-only `js_sys::Date::now()`)
+/// stays thin and the threshold/window/delta logic can be unit-tested off-wasm.
+///
+/// Given the monotonic cumulative drop counter (`current_drops`), the snapshot
+/// taken at the start of the current window (`snapshot_drops`), how long the
+/// window has been open (`elapsed_ms`), and the configured `window_ms` /
+/// `threshold`, returns a [`SelfCongestionDecision`] telling the caller whether
+/// to (a) step down now and (b) roll the window snapshot forward.
+///
+/// The window only "closes" (and thus can fire / roll) once `elapsed_ms >=
+/// window_ms`; before that the caller keeps accumulating. The delta uses
+/// `saturating_sub` so a counter that somehow appears to go backwards (it
+/// should not — the counters are monotonic `AtomicU64`) can never underflow
+/// into a spurious huge delta.
+#[inline]
+pub fn evaluate_self_congestion(
+    current_drops: u64,
+    snapshot_drops: u64,
+    elapsed_ms: f64,
+    window_ms: f64,
+    threshold: u64,
+) -> SelfCongestionDecision {
+    if elapsed_ms < window_ms {
+        // Window still open — keep accumulating, do not roll or fire.
+        return SelfCongestionDecision {
+            step_down: false,
+            roll_window: false,
+            new_snapshot: snapshot_drops,
+        };
+    }
+    let delta = current_drops.saturating_sub(snapshot_drops);
+    SelfCongestionDecision {
+        step_down: delta >= threshold,
+        roll_window: true,
+        new_snapshot: current_drops,
+    }
+}
+
+/// Outcome of [`evaluate_self_congestion`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelfCongestionDecision {
+    /// True when the drop delta met or exceeded the threshold within the
+    /// closed window — the caller should force a video step-down.
+    pub step_down: bool,
+    /// True when the window has closed and the caller should reset its window
+    /// start time and adopt `new_snapshot` as the new baseline.
+    pub roll_window: bool,
+    /// The snapshot value the caller should store for the next window. Equals
+    /// the input snapshot while the window is still open, or the current drop
+    /// count once the window rolls.
+    pub new_snapshot: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // =====================================================================
+    // Client-side self-congestion self-trigger (#1104)
+    //
+    // These exercise the WT uplink-backpressure decision helper. Each case
+    // maps directly to a Definition-of-Done requirement and is written so it
+    // FAILS if the helper logic is broken (verified by mutation).
+    // =====================================================================
+
+    /// (a) Sustained WT drops at/above threshold within a CLOSED window must
+    /// fire a step-down. Mutation check: if the helper dropped the
+    /// `delta >= threshold` comparison (e.g. always returned step_down=false),
+    /// this fails.
+    #[test]
+    fn wt_sustained_drops_above_threshold_fire_step_down() {
+        // 4 drops accumulated since the snapshot, window has fully elapsed.
+        let decision = evaluate_self_congestion(
+            /* current_drops */ 4,
+            /* snapshot_drops */ 0,
+            /* elapsed_ms */ WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_DROP_THRESHOLD,
+        );
+        assert!(
+            decision.step_down,
+            "delta 4 >= threshold {WT_SELF_CONGESTION_DROP_THRESHOLD} in a closed window must step down"
+        );
+        assert!(decision.roll_window, "a closed window must roll");
+        assert_eq!(
+            decision.new_snapshot, 4,
+            "rolled snapshot must adopt the current drop count"
+        );
+
+        // Exactly-at-threshold must also fire (boundary).
+        let at = evaluate_self_congestion(
+            WT_SELF_CONGESTION_DROP_THRESHOLD,
+            0,
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_DROP_THRESHOLD,
+        );
+        assert!(at.step_down, "delta == threshold must step down");
+    }
+
+    /// (b) Sparse/transient drops BELOW threshold within the window must NOT
+    /// fire — a few resets on a lossy/high-latency link cannot shed a layer.
+    /// Mutation check: if the threshold were ignored, a below-threshold delta
+    /// would wrongly fire and this fails.
+    #[test]
+    fn wt_sparse_drops_below_threshold_do_not_fire() {
+        // 2 drops < threshold (3), window closed.
+        let decision = evaluate_self_congestion(
+            2,
+            0,
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_DROP_THRESHOLD,
+        );
+        assert!(
+            !decision.step_down,
+            "delta 2 < threshold {WT_SELF_CONGESTION_DROP_THRESHOLD} must NOT step down"
+        );
+        // Window still rolls so the next window starts fresh from the new count.
+        assert!(decision.roll_window);
+        assert_eq!(decision.new_snapshot, 2);
+
+        // A single transient drop also must not fire.
+        let one = evaluate_self_congestion(
+            1,
+            0,
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_DROP_THRESHOLD,
+        );
+        assert!(!one.step_down, "a single transient drop must not step down");
+    }
+
+    /// While the window is still OPEN, drops must accumulate without firing or
+    /// rolling — even if the delta already exceeds the threshold — so a burst
+    /// at the very start of a window is still measured over the full window
+    /// rather than firing on the first tick. Mutation check: if the helper
+    /// ignored `elapsed_ms < window_ms` it would fire/roll early and this
+    /// fails.
+    #[test]
+    fn wt_open_window_does_not_fire_or_roll() {
+        let decision = evaluate_self_congestion(
+            100, // far above threshold
+            0,
+            WT_SELF_CONGESTION_WINDOW_MS / 2.0, // window only half-elapsed
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_DROP_THRESHOLD,
+        );
+        assert!(
+            !decision.step_down,
+            "must not fire before the window closes, even above threshold"
+        );
+        assert!(!decision.roll_window, "must not roll an open window");
+        assert_eq!(
+            decision.new_snapshot, 0,
+            "snapshot must be preserved while the window is open"
+        );
+    }
+
+    /// (c) A WebSocket user has zero unistream sends, so the WT counter stays
+    /// flat at 0 forever: snapshot == current on every closed window, delta is
+    /// 0, and the trigger NEVER fires no matter how many windows elapse.
+    /// Mutation check: if the helper treated a zero delta as a fire, or read
+    /// the absolute count instead of the delta, this fails.
+    #[test]
+    fn wt_flat_counter_ws_user_never_fires() {
+        let mut snapshot: u64 = 0;
+        // Simulate many consecutive closed windows with a counter pinned at 0.
+        for _ in 0..1000 {
+            let decision = evaluate_self_congestion(
+                0, // counter never moves for a WS user
+                snapshot,
+                WT_SELF_CONGESTION_WINDOW_MS,
+                WT_SELF_CONGESTION_WINDOW_MS,
+                WT_SELF_CONGESTION_DROP_THRESHOLD,
+            );
+            assert!(
+                !decision.step_down,
+                "a flat-at-0 counter (WS user) must never trigger a WT step-down"
+            );
+            assert!(decision.roll_window);
+            snapshot = decision.new_snapshot;
+        }
+        assert_eq!(snapshot, 0, "snapshot must remain pinned at 0");
+    }
+
+    /// A monotonic counter that appears to go backwards (must not happen, but
+    /// guard anyway) must saturate to a zero delta rather than underflow into
+    /// a huge delta that spuriously fires.
+    #[test]
+    fn wt_backwards_counter_saturates_to_no_fire() {
+        let decision = evaluate_self_congestion(
+            5,  // current
+            10, // snapshot somehow larger
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_WINDOW_MS,
+            WT_SELF_CONGESTION_DROP_THRESHOLD,
+        );
+        assert!(
+            !decision.step_down,
+            "saturating_sub must yield 0, not underflow into a firing delta"
+        );
+    }
+
+    // NOTE(#1104): the "WT window >= WS window" and "WT threshold > 1"
+    // invariants are enforced as COMPILE-TIME `const _: () = assert!(…)`
+    // checks next to the constants themselves (a runtime `assert!` on a
+    // constant trips clippy's `assertions_on_constants`), matching the
+    // convention used for the #1108 backpressure invariants above.
+
+    // =====================================================================
+    // Client-side WebTransport uplink-SATURATION self-trigger
+    // (#1219 prerequisite)
+    //
+    // These exercise the SAME pure helper (`evaluate_self_congestion`) but
+    // parameterised with the saturation constants, because the saturation
+    // consumer reuses that helper to do a tumbling-window delta test over the
+    // monotonic `unistream_ready_stall_count` (slow-ready events) instead of
+    // the drop counter. Each case maps to a Definition-of-Done requirement and
+    // is written to FAIL if the threshold/window logic is inverted or broken
+    // (mutation-verified — see the per-test mutation notes).
+    // =====================================================================
+
+    /// Sustained slow-ready() events at/above threshold within a CLOSED
+    /// saturation window MUST fire a step-down — the WT uplink is saturated but
+    /// alive (no stream reset, so the drop counter would be flat) and the
+    /// publisher must self-shed.
+    ///
+    /// Mutation check: if `evaluate_self_congestion` were mutated to
+    /// `delta < threshold` (inverted) or to always return `step_down=false`,
+    /// the `decision.step_down` assertion fails. If it ignored the threshold and
+    /// always fired, the boundary case below would still pass but the
+    /// `wt_saturation_below_threshold_does_not_fire` test fails.
+    #[test]
+    fn wt_saturation_above_threshold_fires_step_down() {
+        // 4 slow-ready events accrued since the snapshot, window fully elapsed.
+        let decision = evaluate_self_congestion(
+            /* current_stalls */ 4,
+            /* snapshot_stalls */ 0,
+            /* elapsed_ms */ WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            decision.step_down,
+            "delta 4 >= threshold {WT_SATURATION_STALL_THRESHOLD} in a closed window must step down"
+        );
+        assert!(decision.roll_window, "a closed window must roll");
+        assert_eq!(decision.new_snapshot, 4);
+
+        // Exactly-at-threshold is the firing boundary and MUST fire. Mutation
+        // check: a `delta > threshold` (strict) mutation makes this fail.
+        let at = evaluate_self_congestion(
+            WT_SATURATION_STALL_THRESHOLD,
+            0,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            at.step_down,
+            "delta == saturation threshold must step down (boundary)"
+        );
+    }
+
+    /// Sparse slow-ready() events BELOW threshold within the window MUST NOT
+    /// fire — a bursty-but-recovering link produces only a scatter of slow
+    /// `ready()`s as a transient burst drains, which must not shed a layer.
+    ///
+    /// Mutation check: if the threshold comparison were dropped (always fire),
+    /// the delta-2 and delta-1 assertions fail.
+    #[test]
+    fn wt_saturation_below_threshold_does_not_fire() {
+        // 2 slow-ready events < threshold (3), window closed.
+        let decision = evaluate_self_congestion(
+            2,
+            0,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            !decision.step_down,
+            "delta 2 < threshold {WT_SATURATION_STALL_THRESHOLD} must NOT step down"
+        );
+        assert!(decision.roll_window);
+        assert_eq!(decision.new_snapshot, 2);
+
+        // A single transient slow ready() (one reordered packet) must not fire.
+        let one = evaluate_self_congestion(
+            1,
+            0,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            !one.step_down,
+            "a single transient slow ready() must not step down"
+        );
+    }
+
+    /// While the saturation window is still OPEN, slow-ready() events must
+    /// accumulate without firing or rolling — even above threshold — so a burst
+    /// at the very start of a window is measured over the full window rather
+    /// than firing on the first tick.
+    ///
+    /// Mutation check: if the helper ignored `elapsed_ms < window_ms` it would
+    /// fire/roll early and both assertions fail.
+    #[test]
+    fn wt_saturation_open_window_does_not_fire_or_roll() {
+        let decision = evaluate_self_congestion(
+            100, // far above threshold
+            0,
+            WT_SATURATION_WINDOW_MS / 2.0, // window only half-elapsed
+            WT_SATURATION_WINDOW_MS,
+            WT_SATURATION_STALL_THRESHOLD,
+        );
+        assert!(
+            !decision.step_down,
+            "must not fire before the saturation window closes, even above threshold"
+        );
+        assert!(!decision.roll_window, "must not roll an open window");
+        assert_eq!(decision.new_snapshot, 0);
+    }
+
+    /// A WebSocket user (or a WT user on a healthy uplink that never crosses the
+    /// producer-side READY_STALL_THRESHOLD_MS) has a flat stall counter: delta
+    /// is 0 on every closed window and the trigger NEVER fires.
+    ///
+    /// Mutation check: if a zero delta were treated as a fire, this fails.
+    #[test]
+    fn wt_saturation_flat_counter_never_fires() {
+        let mut snapshot: u64 = 0;
+        for _ in 0..1000 {
+            let decision = evaluate_self_congestion(
+                0, // counter never moves: WS user or healthy WT uplink
+                snapshot,
+                WT_SATURATION_WINDOW_MS,
+                WT_SATURATION_WINDOW_MS,
+                WT_SATURATION_STALL_THRESHOLD,
+            );
+            assert!(
+                !decision.step_down,
+                "a flat-at-0 stall counter must never trigger a WT saturation step-down"
+            );
+            assert!(decision.roll_window);
+            snapshot = decision.new_snapshot;
+        }
+        assert_eq!(snapshot, 0);
+    }
 
     // =====================================================================
     // Video Quality Tier validation

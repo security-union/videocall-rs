@@ -18,10 +18,10 @@
 
 use crate::{
     constants::{
-        LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_SUPPRESS_DEBOUNCE_MS,
-        LAYER_PREFERENCE_MAX_ENTRIES, LAYER_PREFERENCE_MAX_LAYER_ID,
-        LAYER_PREFERENCE_MIN_UPDATE_INTERVAL, RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS,
-        VIEWPORT_MIN_UPDATE_INTERVAL,
+        LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_RECOMPUTE_COALESCE_MS,
+        LAYER_HINT_SUPPRESS_DEBOUNCE_MS, LAYER_PREFERENCE_MAX_ENTRIES,
+        LAYER_PREFERENCE_MAX_LAYER_ID, LAYER_PREFERENCE_MIN_UPDATE_INTERVAL,
+        RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL,
     },
     messages::{
         server::{
@@ -38,6 +38,10 @@ use actix::{
     Actor, Addr, AsyncContext, Context, Handler, Message as ActixMessage, MessageResult, Recipient,
     SpawnHandle,
 };
+// `SendError` is re-exported only from `actix::prelude`, not the crate root, so
+// it needs its own import. We match on it (`Full` vs `Closed`) at the fan-out
+// hop to distinguish transient backpressure (a shed) from a gone receiver.
+use actix::prelude::SendError;
 use futures::StreamExt;
 use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
@@ -46,8 +50,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::task::JoinHandle;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
-    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
+    RELAY_CONGESTION_FILTERED_TOTAL, RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
+    RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
     RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
     RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE, RELAY_VIEWPORT_UPDATES_TOTAL,
@@ -354,6 +360,28 @@ fn normalize_pref_media_kind(raw: i32) -> i32 {
     }
 }
 
+/// Bucket a wire `simulcast_layer_id` into the BOUNDED label set used by the
+/// per-layer forwarded counter (`relay_layer_forwarded_by_layer_total`, #1105).
+///
+/// The wire `simulcast_layer_id` is a forgeable `u32` that lives OUTSIDE the
+/// AEAD seal (#993), so it MUST NOT be used as a metric label verbatim — a
+/// malicious or buggy client could otherwise emit arbitrary ids and explode the
+/// series count. Today every kind ships at most three layers (ids 0..=2; see
+/// `LAYER_PREFERENCE_MAX_LAYER_ID`), so we map 0/1/2 to their own bucket and
+/// collapse EVERYTHING else (3..=u32::MAX) into a single `"other"` bucket. This
+/// caps the `layer_id` label to EXACTLY 4 distinct values regardless of what
+/// arrives on the wire — the cardinality bound is enforced HERE, not merely
+/// asserted in a comment. `"other"` doubles as the early-warning signal that a
+/// real >3-layer ladder has shipped without this bucketer being widened.
+fn layer_id_bucket(layer_id: u32) -> &'static str {
+    match layer_id {
+        0 => "0",
+        1 => "1",
+        2 => "2",
+        _ => "other",
+    }
+}
+
 /// Per-session layer-preference state, shared between the session's NATS
 /// subscription task and [`ChatServer`].
 ///
@@ -468,6 +496,18 @@ struct RecomputeLayerHints {
     room: String,
     source: Option<SessionId>,
 }
+
+/// Trailing-debounce flush for coalesced DEPARTURE-driven recomputes (#1203).
+///
+/// Self-sent via `notify_later` exactly [`LAYER_HINT_RECOMPUTE_COALESCE_MS`]
+/// after the FIRST departure of a burst arms the timer (see
+/// [`ChatServer::schedule_coalesced_recompute`]). The handler drains
+/// [`ChatServer::pending_recompute_rooms`] and runs ONE room-wide recompute per
+/// distinct room that saw a departure during the window, collapsing an O(n)
+/// per-connection storm into O(distinct rooms) work over settled membership.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct FlushPendingRecomputes;
 
 /// Per-`(room, source, media_kind)` emit/debounce state for LAYER_HINT (#1108).
 ///
@@ -787,6 +827,28 @@ pub struct ChatServer {
     /// lock needed). Entries are reaped when the publisher leaves (its
     /// `(room, source, _)` keys are dropped in `leave_rooms` / `forget_session`).
     layer_hint_state: HashMap<(String, SessionId, i32), LayerHintEmitState>,
+    /// Rooms with a DEPARTURE-driven (leave/evict) room-wide LAYER_HINT recompute
+    /// pending behind the coalescing debounce window (#1203).
+    ///
+    /// Departures fire one room-wide recompute per disconnecting connection
+    /// (`leave_rooms` / `forget_session`). A reconnection wave or a meeting
+    /// ending disconnects many sessions in a burst → an O(n) recompute storm in
+    /// the single-threaded actor (each recompute is itself O(publishers ×
+    /// receivers)). Instead of `do_send`-ing a recompute per departure, we record
+    /// the affected room HERE and arm a single trailing
+    /// [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] timer ([`recompute_coalesce_handle`]);
+    /// when it fires, [`Handler<FlushPendingRecomputes>`] drains this set and runs
+    /// exactly ONE room-wide recompute per affected room over the FINAL settled
+    /// membership. JOIN and per-LAYER_PREFERENCE recomputes intentionally bypass
+    /// this set (they are restore-eager / latency-sensitive — see the constant).
+    pending_recompute_rooms: std::collections::HashSet<String>,
+    /// Single in-flight coalescing timer handle for [`pending_recompute_rooms`]
+    /// (#1203). `Some` while a trailing flush is armed; `None` otherwise. Only one
+    /// timer is ever outstanding — re-arming while pending is a no-op (the
+    /// existing trailing deadline still fires), which is what makes the debounce
+    /// TRAILING (dedups the whole burst) rather than per-event. Cancelled in
+    /// [`Actor::stopping`] so a stopped actor leaks no `SpawnHandle`.
+    recompute_coalesce_handle: Option<SpawnHandle>,
 }
 
 impl ChatServer {
@@ -808,6 +870,8 @@ impl ChatServer {
             session_layer_prefs: HashMap::new(),
             session_room: HashMap::new(),
             layer_hint_state: HashMap::new(),
+            pending_recompute_rooms: std::collections::HashSet::new(),
+            recompute_coalesce_handle: None,
         }
     }
 
@@ -908,12 +972,18 @@ impl ChatServer {
             //      while the recompute mutates `layer_hint_state`. This is
             //      already excluded from the union scan above (the member was
             //      retained-out), so the recompute sees post-departure demand.
+            //
+            //      #1203: this DEPARTURE recompute is COALESCED behind a trailing
+            //      debounce instead of fired immediately. A departure only ever
+            //      RAISES a remaining publisher's fail-open union (restore) and
+            //      nobody is actively waiting on it, so collapsing a reconnection
+            //      / meeting-end disconnect burst into ONE recompute over settled
+            //      membership avoids the O(n) per-connection storm. (JOINs stay
+            //      immediate — a real viewer waits on their tile.)
             self.forget_layer_hint_state_for_source(room_id, *session_id);
             if !room_became_empty {
-                actor_ctx.address().do_send(RecomputeLayerHints {
-                    room: room_id.to_string(),
-                    source: None,
-                });
+                let room_owned = room_id.to_string();
+                self.schedule_coalesced_recompute(&room_owned, actor_ctx);
             }
         }
 
@@ -1189,12 +1259,15 @@ impl ChatServer {
             if members.is_empty() {
                 self.room_members.remove(room);
                 self.room_policy.remove(room);
-                // Drop the per-room viewport set-size gauge series (HCL #988).
-                // GaugeVec series persist until explicitly removed; without
-                // this a drained room would read its last set size forever.
-                // `remove_label_values` errors only when no series exists, so
-                // the unused-result is intentionally discarded.
-                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+                // Bound room-labeled relay series to LIVE rooms (issue #996):
+                // remove every `{room=...}` CounterVec/GaugeVec series for this
+                // drained room (was previously just the #988 viewport gauge).
+                // CounterVec series otherwise persist for the process lifetime,
+                // so each distinct meeting would leak a permanent series. We
+                // keep the `room` label (the meeting-investigation dashboard and
+                // RelayPacketDrops alert depend on it) and instead expire it on
+                // room drain — see `metrics::forget_room_metrics`.
+                crate::metrics::forget_room_metrics(room);
             }
         }
     }
@@ -1229,10 +1302,10 @@ impl ChatServer {
             members.retain(|m| m.session != session_id);
             if members.is_empty() {
                 self.room_members.remove(room);
-                // Mirror forget_room_if_empty: release the per-room viewport
-                // set-size gauge series so the eviction teardown path also
-                // cannot leak a stale series for a drained room (HCL #988).
-                let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+                // Mirror forget_room_if_empty: release ALL per-room relay series
+                // so the eviction teardown path also cannot leak room-labeled
+                // series for a drained room (HCL #988 + #996).
+                crate::metrics::forget_room_metrics(room);
             } else {
                 room_still_populated = true;
             }
@@ -1261,12 +1334,13 @@ impl ChatServer {
         // replacement session re-joins under a fresh session_id and re-sends its
         // LAYER_PREFERENCE, which independently re-triggers a recompute; this
         // path additionally covers a pure eviction with no replacement.
+        //
+        // #1203: COALESCED behind the trailing debounce, same as the
+        // `leave_rooms` departure trigger above — eviction is a departure and a
+        // reconnection wave evicts many stale sessions in a burst.
         self.forget_layer_hint_state_for_source(room, session_id);
         if room_still_populated {
-            ctx.address().do_send(RecomputeLayerHints {
-                room: room.to_string(),
-                source: None,
-            });
+            self.schedule_coalesced_recompute(room, ctx);
         }
 
         // Cancel any deferred PARTICIPANT_LEFT for this session's tab. If we
@@ -1530,6 +1604,33 @@ impl ChatServer {
         self.layer_hint_state
             .retain(|(r, s, _kind), _| !(r == room && *s == source));
     }
+
+    /// Coalesce a DEPARTURE-driven (leave/evict) room-wide LAYER_HINT recompute
+    /// for `room` behind the [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] trailing
+    /// debounce (#1203), instead of `do_send`-ing a recompute immediately.
+    ///
+    /// Records `room` in [`pending_recompute_rooms`] and arms ONE
+    /// [`FlushPendingRecomputes`] timer if none is already in flight. A re-arm
+    /// while a timer is pending is a deliberate NO-OP: the existing trailing
+    /// deadline still fires and will drain whatever rooms accumulated, so a burst
+    /// of N departures across the window produces exactly ONE flush (and one
+    /// recompute per distinct affected room) — TRAILING coalescing, not
+    /// per-event. This is the correct direction for departures: a departure can
+    /// only RAISE a remaining publisher's fail-open union (restore), and nobody is
+    /// actively waiting on it, so computing the FINAL union once the burst settles
+    /// is both cheaper and more correct than recomputing over transient
+    /// intermediate membership. See [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] for why
+    /// JOIN / per-LAYER_PREFERENCE recomputes intentionally bypass this path.
+    fn schedule_coalesced_recompute(&mut self, room: &str, ctx: &mut Context<Self>) {
+        self.pending_recompute_rooms.insert(room.to_string());
+        if self.recompute_coalesce_handle.is_none() {
+            let handle = ctx.notify_later(
+                FlushPendingRecomputes,
+                std::time::Duration::from_millis(LAYER_HINT_RECOMPUTE_COALESCE_MS),
+            );
+            self.recompute_coalesce_handle = Some(handle);
+        }
+    }
 }
 
 impl Actor for ChatServer {
@@ -1616,6 +1717,18 @@ impl Actor for ChatServer {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
         });
+    }
+
+    /// Cancel the in-flight #1203 coalescing timer on actor stop so a stopping
+    /// `ChatServer` leaks no `SpawnHandle` (mirrors the `pending_departures`
+    /// `cancel_future` cleanup elsewhere). Dropping any not-yet-flushed pending
+    /// rooms is correct: a stopping relay has no publishers left to hint.
+    fn stopping(&mut self, ctx: &mut Self::Context) -> actix::Running {
+        if let Some(handle) = self.recompute_coalesce_handle.take() {
+            ctx.cancel_future(handle);
+        }
+        self.pending_recompute_rooms.clear();
+        actix::Running::Stop
     }
 }
 
@@ -2131,10 +2244,20 @@ impl Handler<UpdateMemberDisplayName> for ChatServer {
 /// the ONLY producer of LAYER_HINT, and it is driven exclusively by trusted
 /// relay lifecycle events (subject-authoritative LAYER_PREFERENCE recording, and
 /// join/leave). It never parses or trusts a client-sent LAYER_HINT.
+/// Test-only counter of how many times `Handler<RecomputeLayerHints>` has been
+/// entered (#1203). Lets the coalescing tests assert "N departures → exactly ONE
+/// recompute" by counting real handler invocations rather than a mock. Compiled
+/// only under `cfg(test)`, so there is zero production cost.
+#[cfg(test)]
+pub(crate) static RECOMPUTE_LAYER_HINTS_INVOCATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 impl Handler<RecomputeLayerHints> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: RecomputeLayerHints, ctx: &mut Self::Context) -> Self::Result {
+        #[cfg(test)]
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match msg.source {
             Some(source) => self.recompute_layer_hints_for_source(&msg.room, source, ctx),
             None => {
@@ -2150,6 +2273,85 @@ impl Handler<RecomputeLayerHints> for ChatServer {
                 }
             }
         }
+    }
+}
+
+/// Trailing-debounce flush for coalesced DEPARTURE-driven recomputes (#1203).
+///
+/// Drains [`ChatServer::pending_recompute_rooms`] and runs ONE room-wide
+/// recompute per distinct room that saw a departure during the coalesce window,
+/// then clears the in-flight timer handle so the NEXT departure burst arms a
+/// fresh trailing timer. Reusing the existing `RecomputeLayerHints { source:
+/// None }` room-wide branch keeps the union computation in one place; the only
+/// thing #1203 changes is WHEN/HOW OFTEN that branch runs for departures.
+///
+/// A room whose membership drained to empty during the window self-clears: the
+/// room-wide branch returns early when `room_members` has no entry, so a stale
+/// pending room id costs at most one no-op map lookup, never a leaked recompute.
+impl Handler<FlushPendingRecomputes> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, _msg: FlushPendingRecomputes, ctx: &mut Self::Context) -> Self::Result {
+        // Clear the in-flight handle FIRST so a recompute-triggered re-arm (none
+        // today, but defensive) would schedule a fresh timer rather than no-op
+        // against a handle we are about to consume.
+        self.recompute_coalesce_handle = None;
+        let rooms: Vec<String> = self.pending_recompute_rooms.drain().collect();
+        for room in rooms {
+            // Reuse the room-wide recompute path (source: None). It is a no-op if
+            // the room drained to empty during the window (early return on a
+            // missing `room_members` entry).
+            self.handle(RecomputeLayerHints { room, source: None }, ctx);
+        }
+    }
+}
+
+/// Test-only message driving the REAL #1203 departure-coalescing path through
+/// the REAL `schedule_coalesced_recompute` + `notify_later` timer. Returns the
+/// `(pending_rooms_len, timer_armed)` state immediately after scheduling so a
+/// test can assert dedup (one timer for N calls) WITHOUT reaching into private
+/// fields from outside the module.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "(usize, bool)")]
+struct TestScheduleCoalescedRecompute {
+    room: String,
+}
+
+#[cfg(test)]
+impl Handler<TestScheduleCoalescedRecompute> for ChatServer {
+    type Result = MessageResult<TestScheduleCoalescedRecompute>;
+
+    fn handle(
+        &mut self,
+        msg: TestScheduleCoalescedRecompute,
+        ctx: &mut Self::Context,
+    ) -> Self::Result {
+        self.schedule_coalesced_recompute(&msg.room, ctx);
+        MessageResult((
+            self.pending_recompute_rooms.len(),
+            self.recompute_coalesce_handle.is_some(),
+        ))
+    }
+}
+
+/// Test-only message reporting the current coalescing state
+/// (`pending_rooms_len`, `timer_armed`) so a test can assert the flush has
+/// drained everything after the debounce window elapsed.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "(usize, bool)")]
+struct TestCoalesceState;
+
+#[cfg(test)]
+impl Handler<TestCoalesceState> for ChatServer {
+    type Result = MessageResult<TestCoalesceState>;
+
+    fn handle(&mut self, _msg: TestCoalesceState, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult((
+            self.pending_recompute_rooms.len(),
+            self.recompute_coalesce_handle.is_some(),
+        ))
     }
 }
 
@@ -2806,8 +3008,16 @@ impl Handler<JoinRoom> for ChatServer {
                     "Sending existing PARTICIPANT_JOINED for {} (display={}) to new joiner {}",
                     member.user_id, member.display_name, user_id_clone
                 );
+                // Priority attribution (#1145) deliberately NOT applied: this
+                // forwards a single PARTICIPANT_JOINED (`PacketType::MEETING`,
+                // Critical) during join setup — never a sheddable-media drop.
+                // (It also predates the mailbox-drop counters and intentionally
+                // stays a plain warn on this one-shot setup path.)
                 if let Err(e) = new_joiner_recipient.try_send(Message {
-                    msg: existing_bytes,
+                    // `build_peer_joined_packet` returns an owned `Vec<u8>`;
+                    // wrap it in `Bytes` (a one-time move into the refcounted
+                    // buffer, no copy) to match `Message.msg`'s type (#1063).
+                    msg: bytes::Bytes::from(existing_bytes),
                     session: member.session,
                 }) {
                     warn!(
@@ -3232,6 +3442,16 @@ fn try_intercept_layer_preference(
                 ))
             })
             .collect();
+        // These two SHAPING-step outcomes are emitted BEFORE the rate-limit /
+        // write-lock decision below, so they record malformed-shape *attempts*
+        // and are NOT conditioned on the packet being applied (#1069). A packet
+        // can therefore record `truncated`/`layer_id_out_of_bound` and then be
+        // `rate_limited` rather than `accepted` — the metric doc on
+        // `RELAY_LAYER_PREFERENCE_UPDATES_TOTAL` spells out this co-occurrence.
+        // Left here (rather than moved into the accepted branch) deliberately:
+        // relocating them onto the post-lock path would change behaviour on a
+        // DoS-sensitive hot path for no observability gain, and "attempt rate"
+        // is the more useful guard signal.
         if raw_len > LAYER_PREFERENCE_MAX_ENTRIES {
             RELAY_LAYER_PREFERENCE_UPDATES_TOTAL
                 .with_label_values(&[room, "truncated"])
@@ -3499,10 +3719,23 @@ fn try_intercept_display_name_change(
     match forwarded {
         Ok(sanitized) => {
             let message = Message {
-                msg: sanitized,
+                // `sanitized` is a freshly-serialized `Vec<u8>` (rare rename
+                // path); move it into `Bytes` to match `Message.msg` (#1063).
+                msg: bytes::Bytes::from(sanitized),
                 session,
             };
             if let Err(e) = recipient.try_send(message) {
+                // PRIORITY ATTRIBUTION DELIBERATELY NOT APPLIED HERE (#1145).
+                // Unlike the main fan-out hop (`handle_msg`), this sibling
+                // `try_send` site forwards exactly ONE packet type — a
+                // sanitized PARTICIPANT_DISPLAY_NAME_CHANGED, which is a
+                // `PacketType::MEETING` packet. `MEETING` is Critical in the
+                // shed taxonomy (`priority_drop::OutboundPriority::classify_*`),
+                // so it is NEVER a sheddable-media drop: running the classifier
+                // here would always return Critical and the `drop_reason` would
+                // always be `mailbox_full`. The label is therefore left as the
+                // constant `mailbox_full` rather than adding a provably-constant
+                // classify call on this rare (rename-only) path.
                 RELAY_PACKET_DROPS_TOTAL
                     .with_label_values(&[room_id, "nats_delivery", "mailbox_full"])
                     .inc();
@@ -3574,6 +3807,15 @@ fn handle_msg(
             .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
             .unwrap_or(false);
 
+        // LAYER_HINT is, like CONGESTION, a RELAY-authored self-addressed
+        // control packet: the relay emits it on the publisher's OWN self-subject
+        // (`room.{room}.{publisher}`) with the publisher's `session_id` stamped
+        // (see `emit_layer_hint`). It must survive the self-echo guard below for
+        // the same reason CONGESTION does. (#1108 delivery gap.)
+        let is_layer_hint = parsed
+            .map(|pw| pw.packet_type == PacketType::LAYER_HINT.into())
+            .unwrap_or(false);
+
         let is_meeting = parsed
             .as_ref()
             .map(|pw| pw.packet_type == PacketType::MEETING.into())
@@ -3596,12 +3838,30 @@ fn handle_msg(
         // meeting — the reporter received 5224 self-DIAGNOSTICS packets
         // back from the relay despite the subject-only filter being in
         // place. Applying the filter uniformly to every packet type
-        // (with the CONGESTION carve-out below) closes the leak.
+        // (with the CONGESTION and LAYER_HINT carve-outs below) closes the
+        // leak.
         //
-        // CONGESTION signals are intentionally exempted: a congested
-        // receiver publishes them onto the throttled sender's own subject
-        // with the sender's session_id embedded, and they MUST still
-        // reach the sender so the client can step down its quality tier.
+        // CONGESTION and LAYER_HINT are intentionally exempted: both are
+        // RELAY-authored, self-ADDRESSED control packets. The relay's
+        // per-source layer aggregator (LAYER_HINT, `emit_layer_hint`) publishes
+        // onto the target publisher's OWN subject with that publisher's
+        // session_id embedded, and the hint MUST still reach the publisher so
+        // the client can cap its encoded simulcast ladder. The CONGESTION
+        // carve-out is the same self-echo exemption: historically a congested
+        // receiver's downlink overflow drove the relay to author a sender-keyed
+        // CONGESTION here, but #1219 removed that emit (it collapsed the
+        // publisher's encoder for the WHOLE room on a single slow receiver).
+        // The carve-out itself stays — it still must pass any legitimately
+        // relay-authored CONGESTION through to the target.
+        // Without the LAYER_HINT carve-out the publish-side layer suppression
+        // built in #1108 is inert: the hint is generated but the self-echo
+        // guard drops it before it leaves the relay (the #1108 delivery gap).
+        //
+        // NOTE: the carve-out below trusts the packet TYPE only because the
+        // relay authors these packets itself. Hardening against a *forged*
+        // client-sent CONGESTION/LAYER_HINT (anti-reflection) is a separate,
+        // still-open concern tracked in #1119 and is orthogonal to delivery —
+        // do not conflate the two here.
         let subject_self = msg.subject == format!("room.{room}.{session}").replace(' ', "_").into();
         // N.B. `session_id` inside the packet is partially attacker-controlled;
         // this field is only safe for self-echo suppression, not for identity verification.
@@ -3621,7 +3881,7 @@ fn handle_msg(
         } else {
             subject_self || inner_session_self
         };
-        if drop_self_echo && !is_congestion {
+        if drop_self_echo && !is_congestion && !is_layer_hint {
             return Ok(());
         }
 
@@ -3642,6 +3902,43 @@ fn handle_msg(
             if targets_other_session {
                 return Ok(());
             }
+        }
+
+        // Unicast CONGESTION filter (#1220). Historically, relay-authored
+        // CONGESTION was a self-addressed control packet published onto the
+        // target sender's OWN per-session subject (`room.{room}.{sender_sid}`)
+        // with that sender's `session_id` embedded. It was meaningful to
+        // exactly ONE session — the targeted sender — yet the NATS room
+        // wildcard (`room.{room}.*`) delivered it to EVERY session in the
+        // room. Before this filter, every NON-target receiver forwarded
+        // CONGESTION all the way to its transport, where the client discarded
+        // it (`video_call_client.rs`: the client matches `session_id` against
+        // its own and ignores otherwise). For a 20-person room that was
+        // ~19/20 = 95% of CONGESTION deliveries wasted on the relay→transport
+        // hop (serialize + channel enqueue + wire bytes) only to be dropped
+        // client-side. The sender-keyed relay emit was removed in #1219, but
+        // the filter remains valid defense-in-depth for any injected or
+        // transitional CONGESTION packets.
+        //
+        // Model: the MEETING-unicast filter directly above. We drop CONGESTION
+        // here unless this session is the target. "Target" is `subject_self ||
+        // inner_session_self` — the SAME two conditions the self-echo carve-out
+        // at line ~3708 relies on to let CONGESTION reach the targeted sender:
+        //   * `subject_self`: normal case — the packet is on our own subject.
+        //   * `inner_session_self`: post-reconnect case — the subject points at a
+        //     stale session but the embedded `session_id` (stamped by the relay
+        //     to `sender_sid`) still belongs to this connection.
+        // Both are subject/relay-authoritative for delivery scoping (the
+        // self-echo note above documents that `session_id` is safe for self-skip,
+        // which is exactly the scoping decision made here — NOT identity auth).
+        //
+        // This does NOT touch the LAYER_HINT self-echo carve-out (the hard-won
+        // #1108 delivery fix); LAYER_HINT is intentionally left alone (#1220).
+        if is_congestion && !subject_self && !inner_session_self {
+            RELAY_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[&room])
+                .inc();
+            return Ok(());
         }
 
         // PEER_EVENT packets are unicast at the application layer: the
@@ -3911,27 +4208,125 @@ fn handle_msg(
                     .with_label_values(&[&room])
                     .inc();
             }
+
+            // Per-LAYER distribution (#1105). Counts EVERY filterable media
+            // packet that SURVIVED both filters above — i.e. every drop path
+            // (`viewport`, `layer`) has already `return`ed, so reaching here
+            // means this packet is about to be forwarded. Unlike
+            // RELAY_LAYER_FORWARDED_TOTAL (the non-base, has-prefs denominator),
+            // this covers ALL forwarded layers including base 0 and the
+            // no-prefs fail-open case, giving the true layer MIX per room.
+            //
+            // `layer_id_bucket` clamps the forgeable wire `simulcast_layer_id`
+            // (#993) into one of exactly 4 bounded buckets (0|1|2|other) BEFORE
+            // it becomes a label — the cardinality bound is enforced there.
+            if is_layer_filterable {
+                RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                    .with_label_values(&[&room, layer_id_bucket(pw.simulcast_layer_id)])
+                    .inc();
+            }
         }
 
         let message = Message {
-            msg: msg.payload.to_vec(),
+            // FAN-OUT HOT PATH (#1063): `msg.payload` is an `async_nats`
+            // `bytes::Bytes`. Cloning the handle is an O(1) atomic refcount
+            // bump that SHARES the single NATS payload allocation across every
+            // receiver in this room's fan-out — replacing the previous
+            // `.to_vec()` that deep-copied the multi-KB frame once per
+            // recipient. The per-receiver materialization back to owned bytes
+            // (for the outbound channel) still happens at most once, later, in
+            // `SessionLogic::handle_outbound`; delivery is byte-identical.
+            msg: msg.payload.clone(),
             session,
         };
 
         if let Err(e) = session_recipient.try_send(message) {
+            // PRIORITY-AWARE ATTRIBUTION on inbound fan-out overflow (#1145).
+            //
+            // HONEST CONTRACT — read before "improving" this: the actix
+            // mailbox exposes NO capacity/length probe and NO preemption API
+            // on `Recipient<Message>` (only `try_send`/`do_send`, verified
+            // against actix 0.13.5). So when `try_send` returns `Full` the
+            // packet simply CANNOT be enqueued — we do NOT, and CANNOT, evict
+            // a queued packet to make room for a higher-priority one. The
+            // value this block adds is therefore (a) correct ATTRIBUTION of
+            // WHICH KIND was sacrificed on overflow (video vs audio vs
+            // lifecycle), so dashboards/alerts see "video shed under fan-out
+            // burst" rather than an undifferentiated `mailbox_full`, and
+            // (b) it pairs with the mailbox HEADROOM bump (#1144) that gives
+            // the burst room to land in the mailbox and then spill onto the
+            // policy-aware outbound channel (which DOES shed video-first and
+            // record drops for metrics / keyframe-relax). Shedding alone
+            // can't save a critical packet on a full mailbox; the headroom is
+            // what actually prevents the drop.
+            //
+            // We classify off the OUTER cleartext wrapper that was already
+            // parsed ONCE per packet (`parsed`) — `packet_type` + the outer
+            // `media_kind` (field 5) — NEVER the inner `MediaPacket`, which is
+            // AES-sealed under E2EE. This is the SAME data the #988/#989
+            // filters above already read, so the added per-receiver work here
+            // is O(1): two enum reads on already-decoded fields, no parse, no
+            // allocation, no lock. Fail-open: an unparseable wrapper
+            // (`parsed == None`) or UNSPECIFIED/unknown media_kind classifies
+            // as Control and is attributed `mailbox_full` (never preferentially
+            // blamed as a media shed).
+            //
+            // We also distinguish `Full` (transient backpressure — the fan-out
+            // burst case) from `Closed` (the receiver actor is gone). Only
+            // `Full` is a shed scenario; a `Closed` drop keeps the plain
+            // `mailbox_full` label and the warn, exactly as before.
+            let is_full = matches!(e, SendError::Full(_));
+            let priority = match parsed {
+                Some(pw) => OutboundPriority::classify_outer(
+                    true,
+                    pw.packet_type
+                        .enum_value()
+                        .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
+                    pw.media_kind.enum_value().unwrap_or(
+                        videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED,
+                    ),
+                ),
+                // Unparseable outer wrapper → fail-open Control (never a media shed).
+                None => OutboundPriority::Control,
+            };
+
+            // Pick the per-room `drop_reason` label. On a `Full` mailbox a
+            // droppable media kind (VIDEO/SCREEN → `priority_drop_video`,
+            // AUDIO → `priority_drop_audio`) attributes the sacrifice to that
+            // kind; everything else (Critical/Control, or a `Closed` mailbox)
+            // keeps the legacy `mailbox_full` label. The labels mirror the
+            // OUTBOUND taxonomy documented on `OUTBOUND_CHANNEL_DROPS_TOTAL`
+            // (`metrics.rs`), so a single dashboard query spans both hops.
+            let drop_reason = match (is_full, priority.priority_drop_label()) {
+                (true, Some(label)) => label,
+                _ => "mailbox_full",
+            };
+
             // Room-tagged forensic series (kept for per-room drill-down). The
             // `transport="nats_delivery"` here is the publish-side identity, not
             // the receiver's transport.
             RELAY_PACKET_DROPS_TOTAL
-                .with_label_values(&[&room, "nats_delivery", "mailbox_full"])
+                .with_label_values(&[&room, "nats_delivery", drop_reason])
                 .inc();
             // Low-cardinality fleet-alerting sibling (Tier B #2 / #1057): the
             // room-wide-freeze signature, labeled by the RECEIVER's transport so
             // an SRE can rate() it without scraping per-room series and can tell
-            // which transport's mailbox is overflowing.
+            // which transport's mailbox is overflowing. This counts EVERY
+            // inbound-mailbox drop regardless of attributed kind, so the #1057
+            // freeze signature (sum over transport) is unchanged by the new
+            // per-room `drop_reason` split.
             RELAY_INBOUND_MAILBOX_DROPS_TOTAL
                 .with_label_values(&[&transport])
                 .inc();
+            // The `Dropping inbound message for session <id> ... (mailbox full)`
+            // line is a STABLE CONTRACT consumed by
+            // `scripts/parse_meeting_console_logs.sh` (`--relay-ws`), which
+            // greps it per session to reconstruct mailbox-drop counts. It is
+            // kept VERBATIM (same text + WARN level) for every drop so the
+            // analyzer is not silently corrupted — the priority attribution
+            // added by this change lives entirely on the `drop_reason` metric
+            // label above, not in the log line. Do NOT edge-trigger or demote
+            // this line without updating the parse script in lock-step.
             warn!(
                 "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
                 session, e
@@ -4540,10 +4935,12 @@ mod tests {
 
         let chat_server = ChatServer::new(nats_client).await.start();
 
-        let received: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        // `Message.msg` is now `bytes::Bytes` (#1063); capture the shared
+        // handles directly. `&Bytes` derefs to `&[u8]` for the parse below.
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
 
         struct CapturingSession {
-            received: Arc<Mutex<Vec<Vec<u8>>>>,
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
         }
         impl Actor for CapturingSession {
             type Context = actix::Context<Self>;
@@ -5805,9 +6202,13 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_handle_msg_congestion_passes_self_filter_via_subject() {
-        // CONGESTION carve-out: a congested receiver publishes onto the
-        // throttled sender's own subject so the sender can step down its
-        // quality tier. The subject match must NOT block CONGESTION.
+        // CONGESTION carve-out: a relay-authored, self-addressed CONGESTION
+        // packet rides the throttled sender's own subject so the sender can
+        // step down its quality tier; the subject-self match must NOT block
+        // it. (Historically the relay AUTHORED that packet on the
+        // receiver-downlink-overflow path; #1219 removed that sender-keyed
+        // emit. The carve-out itself stays — it still must pass any
+        // legitimately relay-authored CONGESTION through to the target.)
         let count = Arc::new(AtomicUsize::new(0));
         let actor = RecordingSession {
             count: count.clone(),
@@ -5843,9 +6244,8 @@ mod tests {
     #[actix_rt::test]
     async fn test_handle_msg_congestion_passes_self_filter_via_inner_session_id() {
         // CONGESTION carve-out applied to the new inner-session check too.
-        // session_logic.rs:488-494 stamps `session_id = sender_sid` (the
-        // throttled sender's session) onto the CONGESTION packet so the
-        // receiver can correlate it. The inner-session self-skip must NOT
+        // Legacy relay-authored CONGESTION stamped the throttled sender's
+        // session into the packet. The inner-session self-skip must NOT
         // suppress CONGESTION just because the inner session_id matches.
         let count = Arc::new(AtomicUsize::new(0));
         let actor = RecordingSession {
@@ -5877,6 +6277,205 @@ mod tests {
             1,
             "CONGESTION must pass the inner-session-id self-filter so the \
              throttle signal still reaches the sender after a reconnect"
+        );
+    }
+
+    /// #1220 — a NON-target receiver must NOT have CONGESTION forwarded to its
+    /// transport. CONGESTION is published on the TARGET sender's own subject
+    /// (`room.{room}.{sender_sid}`); the NATS room wildcard delivers it to every
+    /// session, but only the targeted sender should actually receive it on its
+    /// transport. A bystander session (different subject, different inner
+    /// session_id) must drop it at the relay AND bump
+    /// `relay_congestion_filtered_total`.
+    ///
+    /// MUTATION PROOF: reverting #1220 (removing the
+    /// `if is_congestion && !subject_self && !inner_session_self { return }`
+    /// filter) forwards the packet to the bystander → `count` becomes 1 and the
+    /// `== 0` assert FAILS (and the metric-delta assert also fails, since the
+    /// filter never ran).
+    #[actix_rt::test]
+    async fn test_handle_msg_congestion_dropped_for_non_target_receiver() {
+        let room = "congestion-nontarget-room-1220";
+        let before = RELAY_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // This receiver is session 7777. The CONGESTION targets sender 5555
+        // (published on `room.{room}.5555` with inner session_id 5555).
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            7777, // bystander receiver — NOT the target
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.congestion-nontarget-room-1220.5555",
+            make_packet_bytes_with_session(PacketType::CONGESTION, 5555),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "#1220: CONGESTION targeting sender 5555 must NOT be forwarded to \
+             bystander receiver 7777"
+        );
+
+        let after = RELAY_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            1.0,
+            "#1220: dropping a non-target CONGESTION must increment \
+             relay_congestion_filtered_total exactly once"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_layer_hint_passes_self_filter_via_subject() {
+        // #1108 delivery-gap carve-out. `emit_layer_hint` publishes the
+        // relay-authored LAYER_HINT onto the publisher's OWN self-subject
+        // (`room.{room}.{publisher}`) so the publisher can cap its encoded
+        // simulcast ladder. The subject-self match must NOT block it — exactly
+        // like CONGESTION. Before the `&& !is_layer_hint` carve-out this packet
+        // was dropped as a self-echo, leaving the #1108 publish-side suppression
+        // inert.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "layerhint-room".to_string(),
+            5151,
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Subject == the receiver's own self-subject, mirroring the real
+        // `emit_layer_hint` publish target (`room.{room}.{publisher}`).
+        let nats_msg = make_nats_message(
+            "room.layerhint-room.5151",
+            make_packet_bytes(PacketType::LAYER_HINT),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "LAYER_HINT must pass the subject-self filter so the relay-authored \
+             hint reaches the publisher (#1108 delivery gap)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_layer_hint_passes_self_filter_via_inner_session_id() {
+        // #1108 carve-out applied to the inner-session check too.
+        // `emit_layer_hint` stamps `wrapper.session_id = publisher` (the
+        // publisher's own session) onto the LAYER_HINT packet. The
+        // inner-session self-skip must NOT suppress it just because the inner
+        // session_id matches — otherwise a post-reconnect window (stale
+        // subscription whose subject differs from the current session) would
+        // swallow the hint even though the embedded session_id targets us.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "layerhint-inner-room".to_string(),
+            6161,
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Subject points at a DIFFERENT session id; embedded session_id is ours
+        // (the publisher the relay addressed). Must still be delivered.
+        let nats_msg = make_nats_message(
+            "room.layerhint-inner-room.424242",
+            make_packet_bytes_with_session(PacketType::LAYER_HINT, 6161),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "LAYER_HINT must pass the inner-session-id self-filter so the \
+             relay-authored hint still reaches the publisher after a reconnect"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_self_media_still_dropped_alongside_layer_hint() {
+        // Regression guard paired with the two LAYER_HINT carve-out tests
+        // above: the carve-out must be TYPE-scoped. A self-addressed plain
+        // MEDIA packet — same self-subject AND same embedded session_id as the
+        // LAYER_HINT cases — must STILL be dropped as a self-echo. If this ever
+        // forwards, the carve-out has leaked into ordinary media traffic
+        // (re-opening the 2026-05-08 self-echo leak).
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "layerhint-room".to_string(),
+            5151,
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // Identical addressing to test_handle_msg_layer_hint_passes_self_filter_*
+        // (self-subject + own embedded session_id) but packet_type == MEDIA.
+        let nats_msg = make_nats_message(
+            "room.layerhint-room.5151",
+            make_packet_bytes_with_session(PacketType::MEDIA, 5151),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "Self-addressed MEDIA must STILL be dropped — the LAYER_HINT \
+             carve-out must not leak into ordinary media traffic"
         );
     }
 
@@ -10524,6 +11123,198 @@ mod tests {
         );
     }
 
+    // ===== Per-layer forwarded distribution counter (#1105) =====
+
+    /// `layer_id_bucket` MUST clamp the forgeable wire id into EXACTLY the four
+    /// bounded label values 0|1|2|other. This is the cardinality guarantee — if
+    /// it ever returns anything else (or stops collapsing large ids), the
+    /// counter's series count becomes unbounded. The asserts pin the real
+    /// boundaries (2 stays "2", 3 and u32::MAX both collapse to "other"), so the
+    /// test fails if the match arms are widened or the catch-all is removed.
+    #[test]
+    fn test_layer_id_bucket_is_bounded() {
+        assert_eq!(layer_id_bucket(0), "0");
+        assert_eq!(layer_id_bucket(1), "1");
+        assert_eq!(layer_id_bucket(2), "2");
+        // The whole point: everything above the real 0..=2 ladder — including
+        // the next ladder rung (3) and a forged u32::MAX — collapses to ONE
+        // bucket, so the label set can never exceed 4 distinct values.
+        assert_eq!(layer_id_bucket(3), "other");
+        assert_eq!(layer_id_bucket(7), "other");
+        assert_eq!(layer_id_bucket(u32::MAX), "other");
+
+        // The complete set of buckets the function can EVER emit is exactly 4.
+        // Sample a wide range and prove no fifth value appears.
+        let mut seen: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for id in 0u32..1000 {
+            seen.insert(layer_id_bucket(id));
+        }
+        seen.insert(layer_id_bucket(u32::MAX));
+        assert_eq!(
+            seen.len(),
+            4,
+            "layer_id_bucket must emit exactly 4 bounded label values, got {seen:?}"
+        );
+    }
+
+    /// A forwarded media packet increments the per-layer distribution counter on
+    /// the bucket matching its `simulcast_layer_id`. Uses a UNIQUE room so the
+    /// process-global lazy_static counter is isolated from other tests (we read
+    /// the absolute value of a freshly-created series).
+    #[actix_rt::test]
+    async fn test_handle_msg_per_layer_counter_records_forwarded_layer() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Unique room → fresh, isolated counter series.
+        let room = "per-layer-room-l2";
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            // Receiver wants layer 2 from source 999 → a layer-2 packet matches
+            // and is forwarded.
+            layer_prefs_with(&[(999, 2)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.999"),
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "matching-layer VIDEO must be forwarded"
+        );
+        // The forwarded packet was layer 2 → the "2" bucket is incremented once,
+        // and the other buckets stay at zero for this room.
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "2"])
+                .get() as u64,
+            1,
+            "forwarding a layer-2 packet must increment the layer_id=2 bucket"
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "1"])
+                .get() as u64,
+            0,
+            "layer-2 forward must NOT touch the layer_id=1 bucket"
+        );
+    }
+
+    /// A LAYER-FILTERED (dropped) packet must NOT increment the per-layer
+    /// distribution counter — the counter reflects only what is actually
+    /// forwarded. This pins the increment to the post-filter forward path: if
+    /// the increment were moved BEFORE the layer drop gate, the dropped layer's
+    /// bucket would wrongly read 1 and this test would fail.
+    #[actix_rt::test]
+    async fn test_handle_msg_per_layer_counter_skips_filtered_layer() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let room = "per-layer-room-drop";
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            // Receiver wants layer 0 from source 999, so a layer-2 packet is
+            // DROPPED by the layer filter.
+            layer_prefs_with(&[(999, 0)]),
+            "websocket".to_string(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.999"),
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "non-matching-layer VIDEO must be dropped"
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "2"])
+                .get() as u64,
+            0,
+            "a layer-FILTERED packet must NOT increment any forwarded-by-layer bucket"
+        );
+    }
+
+    /// A forwarded packet whose wire layer id is ABOVE the real 0..=2 ladder
+    /// (here a forged large id) lands in the bounded "other" bucket, never in a
+    /// per-id series. This is the runtime proof of the cardinality clamp on the
+    /// real forwarding path (not just the unit test of `layer_id_bucket`). The
+    /// receiver has no prefs (fail-open forward), so the high-id packet is
+    /// forwarded and counted.
+    #[actix_rt::test]
+    async fn test_handle_msg_per_layer_counter_buckets_forged_layer_into_other() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let room = "per-layer-room-other";
+        let handler = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            // No recorded preference → fail-open: every layer forwards, so the
+            // forged-id packet reaches the per-layer counter.
+            empty_layer_prefs(),
+            "websocket".to_string(),
+        );
+
+        // A forged layer id well above the real ladder.
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.999"),
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, u32::MAX),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "no-prefs fail-open must forward the packet"
+        );
+        assert_eq!(
+            RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL
+                .with_label_values(&[room, "other"])
+                .get() as u64,
+            1,
+            "a forged out-of-ladder layer id must land in the bounded \"other\" bucket"
+        );
+    }
+
     #[actix_rt::test]
     async fn test_handle_msg_drops_non_matching_screen_layer() {
         // Phase 3: SCREEN is layer-filtered like VIDEO. Receiver wants screen
@@ -10712,6 +11503,163 @@ mod tests {
             count.load(Ordering::Relaxed),
             1,
             "a source with no recorded layer preference MUST fail open (forward)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_screen_not_filtered_by_video_preference() {
+        // #1070: per-kind independence (Phase 3). A SCREEN packet whose layer
+        // does NOT match must STILL be forwarded when the receiver's only
+        // recorded preference is VIDEO-keyed for the same source — the layer
+        // filter keys on (source, media_kind), so a (999, VIDEO) preference can
+        // never drop a (999, SCREEN) packet. (Mirrors the AUDIO-vs-VIDEO test;
+        // proves SCREEN is not collaterally filtered by a camera preference. A
+        // SCREEN packet IS filtered only by a SCREEN-keyed preference, which is
+        // covered by `test_handle_msg_drops_non_matching_screen_layer`.)
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO) only
+            "websocket".to_string(),
+        );
+
+        // SCREEN layer 2 with only a VIDEO preference for 999 → forward (the
+        // (999, SCREEN) key has no entry, so the SCREEN packet fails open). If
+        // SCREEN were ever filtered by the VIDEO key this would drop (count 0).
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::SCREEN, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "SCREEN must not be filtered by a VIDEO-kind preference (per-kind key)"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_desired_layer_zero_is_base_only() {
+        // #1070: a recorded preference of `desired_layer = 0` for a source means
+        // "base layer only" — any NON-zero layer from that source is dropped,
+        // and the layer-0 (base) packet is forwarded. This pins the exact
+        // base-only contract: it is the recorded preference VALUE (0), not the
+        // absence of a preference, that drives the drop of higher layers.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            layer_prefs_with(&[(999, 0)]), // (999, VIDEO) → desired layer 0 (base only)
+            "websocket".to_string(),
+        );
+
+        // Layer 2 from 999 must be DROPPED (preference selects base 0, layer 2 != 0).
+        let layer2_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let l2parsed = parse_pw(&layer2_msg);
+        handler(layer2_msg, l2parsed.as_ref()).expect("handler should not return Err");
+
+        // Layer 0 from 999 must be FORWARDED (base is always forwarded; the
+        // non-zero-layer gate excludes it before the preference is even read).
+        let layer0_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 0),
+        );
+        let l0parsed = parse_pw(&layer0_msg);
+        handler(layer0_msg, l0parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "desired_layer=0 must drop the layer-2 packet and forward only the base (layer-0) packet"
+        );
+    }
+
+    #[actix_rt::test]
+    async fn test_handle_msg_poisoned_layer_prefs_lock_fails_open() {
+        // #1070: a POISONED LayerPrefs RwLock must FAIL OPEN — a video packet
+        // that the recorded preference would otherwise DROP is forwarded
+        // instead, because the read-lock `.map(...).unwrap_or(false)` on the
+        // forwarding path treats a lock error as "do not drop". The fast-path
+        // hint (`has_any()`) is still `true` (it is a separate AtomicBool, not
+        // affected by poisoning), so the forwarding path DOES take the read
+        // lock — exercising exactly the `unwrap_or(false)` fail-open arm.
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver wants layer 1 from 999 → a layer-2 packet would normally drop.
+        let prefs = layer_prefs_with(&[(999, 1)]);
+
+        // Poison the prefs lock by panicking while holding the write guard.
+        let poison_target = prefs.clone();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = poison_target.state.write().unwrap();
+            panic!("intentional panic to poison the LayerPrefs lock");
+        }));
+        assert!(
+            prefs.state.read().is_err(),
+            "precondition: the LayerPrefs lock must be poisoned"
+        );
+        assert!(
+            prefs.has_any(),
+            "precondition: the non_empty hint must still be true so the forwarding \
+             path takes the read lock and exercises the fail-open arm"
+        );
+
+        let handler = handle_msg(
+            actor.recipient(),
+            "lp-room".to_string(),
+            100,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            prefs,
+            "websocket".to_string(),
+        );
+
+        // Layer 2 from 999: the preference selects layer 1, so WITHOUT the
+        // poison this packet would be dropped. With the lock poisoned it must
+        // fail open and be forwarded.
+        let nats_msg = make_nats_message(
+            "room.lp-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "a poisoned LayerPrefs lock MUST fail open (forward the packet it would otherwise drop)"
         );
     }
 
@@ -11679,5 +12627,176 @@ mod tests {
         assert_eq!(layer_hint_media_kind(3), HintKind::SCREEN);
         assert_eq!(layer_hint_media_kind(0), HintKind::MEDIA_KIND_UNSPECIFIED);
         assert_eq!(layer_hint_media_kind(99), HintKind::MEDIA_KIND_UNSPECIFIED);
+    }
+
+    // =====================================================================
+    // #1203 — DEPARTURE-recompute coalescing (trailing debounce)
+    // =====================================================================
+    //
+    // These tests start a real `ChatServer` (NATS-backed) and drive the REAL
+    // `schedule_coalesced_recompute` + `notify_later` timer + flush path. They
+    // count actual `Handler<RecomputeLayerHints>` invocations via the
+    // test-only `RECOMPUTE_LAYER_HINTS_INVOCATIONS` counter.
+
+    async fn connect_nats_or_skip() -> Option<async_nats::client::Client> {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        match async_nats::connect(&nats_url).await {
+            Ok(c) => Some(c),
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                None
+            }
+        }
+    }
+
+    /// #1203: N DEPARTURE-driven coalesced recomputes for the SAME room within
+    /// the window collapse into exactly ONE timer and ONE recompute; two
+    /// distinct rooms produce exactly TWO recomputes. After the window the
+    /// pending set is drained and the timer handle is cleared.
+    ///
+    /// MUTATION PROOF: revert #1203 (point `leave_rooms`/`forget_session` back
+    /// at `do_send(RecomputeLayerHints { source: None })`, i.e. make
+    /// `schedule_coalesced_recompute` recompute immediately per call instead of
+    /// arming one trailing timer) and this asserts BOTH (a) the dedup state
+    /// `(pending_len, armed)` after repeated same-room calls — which would no
+    /// longer be `(1, true)` — and (b) `recomputes == 2`, which would balloon to
+    /// 6 (5 same-room + 1 other). Either breaks the test.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1203_departures_coalesce_into_single_recompute() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room_a = "coalesce-room-a-1203".to_string();
+        let room_b = "coalesce-room-b-1203".to_string();
+
+        // 5 departure-driven schedules for room A: all should dedup behind ONE
+        // timer (pending_len stays 1, timer stays armed). No recompute yet.
+        for i in 0..5 {
+            let (pending_len, armed) = chat
+                .send(TestScheduleCoalescedRecompute {
+                    room: room_a.clone(),
+                })
+                .await
+                .expect("message delivery should succeed");
+            assert_eq!(
+                pending_len, 1,
+                "call {i}: same-room departures must dedup to ONE pending room"
+            );
+            assert!(armed, "call {i}: the single trailing timer must be armed");
+        }
+
+        // One departure-driven schedule for room B: pending grows to 2, still
+        // ONE timer (the existing trailing deadline covers both rooms).
+        let (pending_len, armed) = chat
+            .send(TestScheduleCoalescedRecompute {
+                room: room_b.clone(),
+            })
+            .await
+            .expect("message delivery should succeed");
+        assert_eq!(
+            pending_len, 2,
+            "a distinct room adds a second pending entry"
+        );
+        assert!(
+            armed,
+            "still exactly one trailing timer for the whole burst"
+        );
+
+        // Before the window elapses, NO recompute has run yet (debounced).
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "departure recomputes must be DEFERRED until the coalesce window elapses"
+        );
+
+        // Wait out the coalesce window + slack for the flush to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 250,
+        ))
+        .await;
+
+        // Exactly one recompute per distinct room (2), NOT one per call (6).
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            2,
+            "the 6 coalesced departure schedules must yield exactly 2 recomputes \
+             (one per distinct room)"
+        );
+
+        // The flush drained the set and cleared the timer handle.
+        let (pending_after, armed_after) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("message delivery should succeed");
+        assert_eq!(pending_after, 0, "flush must drain the pending set");
+        assert!(
+            !armed_after,
+            "flush must clear the in-flight timer so the next burst re-arms fresh"
+        );
+    }
+
+    /// #1203: a JOIN-style recompute (`RecomputeLayerHints { source: None }`
+    /// sent directly, exactly as the join site does) runs IMMEDIATELY — it is
+    /// NOT subject to the departure coalesce window. Contrast: a coalesced
+    /// departure schedule does NOT bump the recompute counter immediately.
+    ///
+    /// MUTATION PROOF: if someone routed the JOIN path through
+    /// `schedule_coalesced_recompute` (the thing #1203 deliberately does NOT do
+    /// for joins), the immediate-after-yield count would be 0, failing the
+    /// `== 1` assert.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1203_join_recompute_is_immediate_not_coalesced() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        // First: a coalesced DEPARTURE schedule does NOT recompute immediately.
+        let _ = chat
+            .send(TestScheduleCoalescedRecompute {
+                room: "join-immediate-departure-room".to_string(),
+            })
+            .await
+            .expect("message delivery should succeed");
+        // Round-trip a state probe to ensure the schedule was processed; the
+        // counter must still be 0 (departure is debounced).
+        let _ = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("message delivery should succeed");
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "a coalesced departure must NOT recompute synchronously"
+        );
+
+        // Now: a JOIN-style direct recompute. The join site uses
+        // `do_send(RecomputeLayerHints { room, source: None })`; we replicate
+        // that exact message. It must run immediately (no debounce wait).
+        chat.send(RecomputeLayerHints {
+            room: "join-immediate-room".to_string(),
+            source: None,
+        })
+        .await
+        .expect("message delivery should succeed");
+
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "a JOIN-style recompute must run IMMEDIATELY (one invocation), not be \
+             held behind the departure coalesce window"
+        );
     }
 }

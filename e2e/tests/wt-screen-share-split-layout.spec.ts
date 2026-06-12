@@ -80,13 +80,48 @@
  *     a descriptive message rather than reporting a false green.
  */
 
-import { test, expect, chromium, Page, BrowserContext, Browser } from "@playwright/test";
+import {
+  test,
+  expect,
+  chromium,
+  Page,
+  BrowserContext,
+  Browser,
+  APIRequestContext,
+} from "@playwright/test";
+import { generateSessionToken } from "../helpers/auth";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
 type TransportMode = "webtransport" | "websocket";
 
+const API_BASE_URL = process.env.API_BASE_URL || "http://localhost:8081";
 const SPLIT_LAYOUT_ACTIVATION_TIMEOUT_MS = 15_000;
+
+async function createMeetingViaApi(
+  request: APIRequestContext,
+  hostEmail: string,
+  hostName: string,
+  meetingId: string,
+): Promise<void> {
+  const token = generateSessionToken(hostEmail, hostName);
+  const res = await request.post(`${API_BASE_URL}/api/v1/meetings`, {
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: `session=${token}`,
+    },
+    data: {
+      meeting_id: meetingId,
+      attendees: [],
+      allow_guests: true,
+      waiting_room_enabled: false,
+      admitted_can_admit: false,
+      end_on_host_leave: false,
+    },
+  });
+  expect([201, 409]).toContain(res.status());
+}
 
 /**
  * Seed `localStorage` with the given sticky transport preference so the
@@ -176,12 +211,15 @@ async function joinMeetingFromPage(
   const waitingForMeeting = page.getByText("Waiting for meeting to start");
   const grid = page.locator("#grid-container");
 
-  const result = await Promise.race([
-    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
-    waitingRoom.waitFor({ timeout: 30_000 }).then(() => "waiting" as const),
-    waitingForMeeting.waitFor({ timeout: 30_000 }).then(() => "waiting-for-meeting" as const),
-    grid.waitFor({ timeout: 30_000 }).then(() => "auto-joined" as const),
-  ]);
+  const result = await waitForVisibleState(
+    [
+      { name: "join", locator: joinButton },
+      { name: "waiting", locator: waitingRoom },
+      { name: "waiting-for-meeting", locator: waitingForMeeting },
+      { name: "auto-joined", locator: grid },
+    ] as const,
+    30_000,
+  );
 
   if (result === "waiting" || result === "waiting-for-meeting") {
     return result;
@@ -215,10 +253,13 @@ async function admitGuestIfNeeded(
     const guestJoinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
     const guestGrid = guestPage.locator("#grid-container");
 
-    const postAdmit = await Promise.race([
-      guestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),
-      guestGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
-    ]);
+    const postAdmit = await waitForVisibleState(
+      [
+        { name: "join-button", locator: guestJoinButton },
+        { name: "grid", locator: guestGrid },
+      ] as const,
+      20_000,
+    );
 
     if (postAdmit === "join-button") {
       await guestPage.waitForTimeout(1000);
@@ -292,6 +333,7 @@ interface MeetingFixture {
 }
 
 async function setupTwoUserMeetingWithTransport(
+  request: APIRequestContext,
   uiURL: string,
   meetingId: string,
   hostName: string,
@@ -300,19 +342,13 @@ async function setupTwoUserMeetingWithTransport(
 ): Promise<MeetingFixture> {
   const browser1 = await chromium.launch({ args: BROWSER_ARGS });
   const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+  const hostEmail = `${hostName.toLowerCase()}@videocall.rs`;
+  const guestEmail = `${guestName.toLowerCase()}@videocall.rs`;
 
-  const hostCtx = await createAuthenticatedContext(
-    browser1,
-    `${hostName.toLowerCase()}@videocall.rs`,
-    hostName,
-    uiURL,
-  );
-  const guestCtx = await createAuthenticatedContext(
-    browser2,
-    `${guestName.toLowerCase()}@videocall.rs`,
-    guestName,
-    uiURL,
-  );
+  await createMeetingViaApi(request, hostEmail, hostName, meetingId);
+
+  const hostCtx = await createAuthenticatedContext(browser1, hostEmail, hostName, uiURL);
+  const guestCtx = await createAuthenticatedContext(browser2, guestEmail, guestName, uiURL);
 
   // Force transport for BOTH contexts before any page loads the wasm.
   await forceTransportSticky(hostCtx, transport, uiURL);
@@ -437,12 +473,13 @@ test.describe("WT-vs-WS asymmetry: screen-share split-layout (issue #942)", () =
    * with the WS case still green = the heartbeat-vs-media race fix in
    * PR #940 regressed.
    */
-  test("wt_viewer_sees_split_layout_when_publisher_shares_screen", async ({ baseURL }) => {
+  test("wt_viewer_sees_split_layout_when_publisher_shares_screen", async ({ baseURL, request }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_wt_split_${Date.now()}`;
 
     const fixture = await setupTwoUserMeetingWithTransport(
+      request,
       uiURL,
       meetingId,
       "WtSplitHost",
@@ -501,12 +538,13 @@ test.describe("WT-vs-WS asymmetry: screen-share split-layout (issue #942)", () =
    * If WT and WS produce different layouts, the asymmetry will surface
    * here vs. the WT test.
    */
-  test("ws_viewer_sees_split_layout_when_publisher_shares_screen", async ({ baseURL }) => {
+  test("ws_viewer_sees_split_layout_when_publisher_shares_screen", async ({ baseURL, request }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:3001";
     const meetingId = `e2e_ws_split_${Date.now()}`;
 
     const fixture = await setupTwoUserMeetingWithTransport(
+      request,
       uiURL,
       meetingId,
       "WsSplitHost",

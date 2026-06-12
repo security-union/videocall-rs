@@ -39,7 +39,7 @@ use std::{fmt::Display, sync::Arc};
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, TransportType};
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::peer_event::PeerEvent;
 use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};
@@ -956,6 +956,153 @@ impl Peer {
         desired
     }
 
+    /// Early-seed this peer's per-kind choosers from a sample taken OUTSIDE the
+    /// 5s monitor tick (issue #1179, Part B).
+    ///
+    /// Runs the pure [`LayerChooser::observe_early_congestion`] for VIDEO, SCREEN
+    /// and AUDIO using the SAME inputs the normal tick would
+    /// ([`Self::tick_layer_chooser`] et al.): each kind's most-recent windowed
+    /// downlink sample + its empirically-learned availability cap, AND the SAME
+    /// post-process the tick applies — the chooser's raw output is clamped to the
+    /// user's per-kind receive [`KindLayerBounds`] (issue #1179, PR #1192 review)
+    /// before it is written to the decode guard, so a bandwidth-conscious user who
+    /// set a manual receive `max` never decodes (nor, via
+    /// [`Self::collect_desired_preferences`], advertises) a layer above their cap
+    /// even on the fast early-seed path. Open (default) bounds are an identity
+    /// clamp, so an unbounded user sees behavior identical to before.
+    ///
+    /// Because the early-seed primitive only acts while a chooser is still
+    /// UNCONSTRAINED and only on a congested sample, this is a no-op for a healthy
+    /// cold-start join (M2 preserved) and a no-op once the 5s loop has already
+    /// constrained — the 5s loop then owns adaptation.
+    ///
+    /// Unlike `tick_layer_chooser`, this does NOT advance the chooser's hysteresis
+    /// (`choose`/clean-window/score/sticky are untouched): the only state it can
+    /// change is flipping an unconstrained chooser to constrained + one step down,
+    /// exactly mirroring the unconstrained-congested arm of `choose`. The bounds
+    /// clamp is a pure post-process (same as the tick's `bounds.clamp(raw)`) — it
+    /// touches no hysteresis state. On an actual seed it re-anchors the matching
+    /// sequence tracker and updates the decode guard so decode follows the
+    /// (clamped) seeded layer immediately (same as the tick).
+    ///
+    /// Returns `true` if ANY kind was seeded (so the caller can log it); the
+    /// caller still emits the resulting preference via the normal sender path.
+    ///
+    /// NOTE on availability: like the tick this calls `highest_available`, which
+    /// prunes the rolling availability map. That is a read of "what layers exist
+    /// right now", NOT chooser-hysteresis state, and it is exactly what the next
+    /// tick would do anyway — it does not advance any clean-window / sticky state.
+    pub fn seed_early_congestion(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> bool {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        let mut seeded = false;
+
+        // VIDEO — same inputs as `tick_layer_chooser`.
+        let vh = self.video_layer_availability.highest_available(now_ms);
+        if self
+            .video_layer_chooser
+            .observe_early_congestion(self.last_video_downlink, vh, now_ms)
+        {
+            // Clamp to the user's receive bounds BEFORE writing the decode guard
+            // and the change-detection, exactly as the tick does (P4 invariant:
+            // the post-clamp selected layer can never exceed the user's `max`).
+            let layer = bounds
+                .for_kind(PrefMediaKind::Video)
+                .clamp(self.video_layer_chooser.current());
+            if layer != self.selected_video_layer {
+                self.video_seq_tracker.reanchor_for_layer_switch();
+            }
+            self.selected_video_layer = layer;
+            seeded = true;
+        }
+
+        // SCREEN — same inputs as `tick_screen_layer_chooser`.
+        let sh = self.screen_layer_availability.highest_available(now_ms);
+        if self
+            .screen_layer_chooser
+            .observe_early_congestion(self.last_screen_downlink, sh, now_ms)
+        {
+            let layer = bounds
+                .for_kind(PrefMediaKind::Screen)
+                .clamp(self.screen_layer_chooser.current());
+            if layer != self.selected_screen_layer {
+                self.screen_seq_tracker.reanchor_for_layer_switch();
+            }
+            self.selected_screen_layer = layer;
+            seeded = true;
+        }
+
+        // AUDIO — proxied by the VIDEO downlink, same as `tick_audio_layer_chooser`.
+        let ah = self.audio_layer_availability.highest_available(now_ms);
+        if self
+            .audio_layer_chooser
+            .observe_early_congestion(self.last_video_downlink, ah, now_ms)
+        {
+            self.selected_audio_layer = bounds
+                .for_kind(PrefMediaKind::Audio)
+                .clamp(self.audio_layer_chooser.current());
+            seeded = true;
+        }
+
+        seeded
+    }
+
+    /// Snapshot of the layer this peer would advertise for each kind RIGHT NOW,
+    /// without advancing any chooser hysteresis (issue #1179, Part B; clamp/gate
+    /// added in PR #1192 review).
+    ///
+    /// Mirrors what [`PeerDecodeManager::tick_layer_choosers`] would emit, applying
+    /// the SAME two post-processes the tick applies — but WITHOUT calling
+    /// `choose` / `tick_*` (so no clean-window/score/sticky/last-change hysteresis
+    /// advances):
+    ///   1. it reads each chooser's [`LayerChooser::desired_preference`] (which is
+    ///      `Some(layer)` only while the chooser is actively constrained, `None`
+    ///      otherwise), then
+    ///   2. clamps that layer to the user's per-kind receive [`KindLayerBounds`]
+    ///      and advertises it ONLY when the clamped layer is `< highest_available`
+    ///      for that kind — byte-identical to the tick's advertise predicate
+    ///      (`if clamped < highest_available { insert }`). This is what keeps the
+    ///      advertised preference at or below the user's `max`, and what suppresses
+    ///      a spurious `Some(0)` for a source whose only learned layer is the base
+    ///      (`highest_available == 0`), matching the tick (NIT 1).
+    ///
+    /// `highest_available(now_ms)` PRUNES the rolling availability map; that is a
+    /// read of "what layers exist right now" (exactly what the next tick would do),
+    /// NOT chooser-hysteresis state — so this still advances no clean-window /
+    /// sticky / score / last-change state and the read-only guarantee the early
+    /// seed relies on is preserved. Pushes each advertised `(kind, layer)` into
+    /// `out`.
+    fn collect_desired_preferences(
+        &mut self,
+        session_id: u64,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+        out: &mut HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32>,
+    ) {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        if let Some(raw) = self.video_layer_chooser.desired_preference() {
+            let layer = bounds.for_kind(PrefMediaKind::Video).clamp(raw);
+            if layer < self.video_layer_availability.highest_available(now_ms) {
+                out.insert((session_id, PrefMediaKind::Video), layer);
+            }
+        }
+        if let Some(raw) = self.screen_layer_chooser.desired_preference() {
+            let layer = bounds.for_kind(PrefMediaKind::Screen).clamp(raw);
+            if layer < self.screen_layer_availability.highest_available(now_ms) {
+                out.insert((session_id, PrefMediaKind::Screen), layer);
+            }
+        }
+        if let Some(raw) = self.audio_layer_chooser.desired_preference() {
+            let layer = bounds.for_kind(PrefMediaKind::Audio).clamp(raw);
+            if layer < self.audio_layer_availability.highest_available(now_ms) {
+                out.insert((session_id, PrefMediaKind::Audio), layer);
+            }
+        }
+    }
+
     /// The simulcast layer this receiver currently decodes for this peer's audio
     /// stream.
     pub fn selected_audio_layer(&self) -> u32 {
@@ -1114,6 +1261,92 @@ impl Peer {
         // boundary call (which ran even with simulcast off).
         let now = now_ms();
 
+        // ---- CLEARTEXT layer gate, BEFORE AES-decrypt (#1066) -----------------
+        //
+        // The simulcast layer-drop decision needs only CLEARTEXT envelope fields
+        // (`media_kind` field 6 and `simulcast_layer_id` field 5 on the outer
+        // `PacketWrapper`), both of which live OUTSIDE the AEAD seal. Deciding the
+        // drop here — before `aes.decrypt(...)` and `parse_media_packet(...)`
+        // below — means a receiver that has narrowed to one layer pays NO
+        // AES-decrypt and NO protobuf-parse cost on the layers it discards, so a
+        // receiver's CPU stops scaling with the publisher's layer count (the
+        // perf goal of #1066). Previously this guard keyed on the DECRYPTED inner
+        // `media_type`, so every non-selected layer was decrypted and parsed only
+        // to be dropped a few lines later.
+        //
+        // This is PERF-ONLY — NOT a trust/authz change. `media_kind` and
+        // `simulcast_layer_id` were already trusted, un-sealed routing hints (the
+        // relay filters on the very same fields); a forged value only changes
+        // which layer the FORGER's own receiver decodes. A non-key-holder still
+        // cannot decrypt anything: the drop returns SKIPPED without ever touching
+        // `self.aes`, and a kept packet still goes through the unchanged decrypt
+        // path below.
+        //
+        // N=1 INERT (preserved exactly): pre-simulcast / single-layer publishers
+        // send `simulcast_layer_id == 0`, and every `selected_*_layer` defaults to
+        // 0, so `incoming_video_layer != selected` is false → nothing is dropped
+        // and we fall through to the identical decrypt+decode path. The
+        // availability `observe` records layer 0, exactly as before.
+        //
+        // FALL-THROUGH for UNSPECIFIED: a packet whose cleartext `media_kind` is
+        // UNSPECIFIED (older client that predates field 6 — which also predates
+        // simulcast, so its layer id is always 0) is NOT gated here; it falls
+        // through and the per-arm observe+drop below runs against the decrypted
+        // `media_type` exactly as it did before this change.
+        let cleartext_kind = packet
+            .media_kind
+            .enum_value()
+            .unwrap_or(MediaKind::MEDIA_KIND_UNSPECIFIED);
+        // True once the cleartext gate has taken ownership of the observe+drop
+        // for this kind, so the matching post-decrypt arm skips its now-redundant
+        // (and otherwise double-counting) observe+drop.
+        let mut cleartext_gate_handled = false;
+        match cleartext_kind {
+            MediaKind::VIDEO => {
+                self.video_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Video,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
+                if incoming_video_layer != self.selected_video_layer {
+                    return Ok((MediaType::VIDEO, DecodeStatus::SKIPPED, None));
+                }
+                cleartext_gate_handled = true;
+            }
+            MediaKind::SCREEN => {
+                self.screen_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Screen,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
+                if incoming_video_layer != self.selected_screen_layer {
+                    return Ok((MediaType::SCREEN, DecodeStatus::SKIPPED, None));
+                }
+                cleartext_gate_handled = true;
+            }
+            MediaKind::AUDIO => {
+                self.audio_layer_availability.observe(
+                    crate::decode::layer_chooser::clamp_observed_layer_id(
+                        crate::decode::layer_chooser::PrefMediaKind::Audio,
+                        incoming_video_layer,
+                    ),
+                    now,
+                );
+                if incoming_video_layer != self.selected_audio_layer {
+                    return Ok((MediaType::AUDIO, DecodeStatus::SKIPPED, None));
+                }
+                cleartext_gate_handled = true;
+            }
+            MediaKind::MEDIA_KIND_UNSPECIFIED => {
+                // Older / non-layered client: fall through to the post-decrypt
+                // per-arm observe+drop, unchanged.
+            }
+        }
+
         let packet = match self.aes {
             Some(aes) => {
                 let data = aes
@@ -1130,39 +1363,43 @@ impl Peer {
             .map_err(|_| PeerDecodeError::NoMediaType)?;
         match media_type {
             MediaType::VIDEO => {
-                // Phase 2 (#989): learn which layers this source produces from
-                // EVERY arriving VIDEO packet — including ones we are about to
-                // drop below — so the chooser knows how high it may climb. This
-                // MUST run before the drop guard, otherwise we would only ever
-                // observe the layer we already selected and could never learn a
-                // higher layer exists. Observing a non-selected layer here costs
-                // a hashmap insert; the packet is still dropped below.
+                // Phase 2 (#989): learn which layers this source produces and
+                // drop non-selected layers. NOTE (#1066): when the CLEARTEXT gate
+                // above already handled this kind (the common path for current
+                // clients that stamp `media_kind`), the observe+drop ran there
+                // BEFORE decrypt, so a surviving packet here is guaranteed to be
+                // the selected layer. We therefore skip this redundant block to
+                // avoid a double `observe`. This per-arm path now runs ONLY for
+                // the cleartext-UNSPECIFIED fall-through (older clients), for
+                // which it behaves exactly as before.
                 //
                 // Security (#989): clamp the raw, attacker-controllable
                 // (un-sealed) layer id to the ladder range BEFORE observing, so a
                 // malicious publisher cycling unbounded unique ids cannot inflate
                 // availability cardinality between prunes.
-                self.video_layer_availability.observe(
-                    crate::decode::layer_chooser::clamp_observed_layer_id(
-                        crate::decode::layer_chooser::PrefMediaKind::Video,
-                        incoming_video_layer,
-                    ),
-                    now,
-                );
+                if !cleartext_gate_handled {
+                    self.video_layer_availability.observe(
+                        crate::decode::layer_chooser::clamp_observed_layer_id(
+                            crate::decode::layer_chooser::PrefMediaKind::Video,
+                            incoming_video_layer,
+                        ),
+                        now,
+                    );
 
-                // Simulcast layer-select guard (issue #989). Drop any VIDEO
-                // packet that is not the layer this receiver is decoding for
-                // this peer — BEFORE sequence tracking and BEFORE decode.
-                //
-                // This MUST run before `track_sequence`: each simulcast layer
-                // carries an independent dense sequence, so feeding a
-                // non-selected layer's sequence into our single per-peer
-                // `video_seq_tracker` would manufacture phantom loss
-                // (~(N-1)/N) and trigger spurious PLI storms. For
-                // pre-simulcast publishers `incoming_video_layer` is 0 and
-                // `selected_video_layer` defaults to 0, so nothing is dropped.
-                if incoming_video_layer != self.selected_video_layer {
-                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    // Simulcast layer-select guard (issue #989). Drop any VIDEO
+                    // packet that is not the layer this receiver is decoding for
+                    // this peer — BEFORE sequence tracking and BEFORE decode.
+                    //
+                    // This MUST run before `track_sequence`: each simulcast layer
+                    // carries an independent dense sequence, so feeding a
+                    // non-selected layer's sequence into our single per-peer
+                    // `video_seq_tracker` would manufacture phantom loss
+                    // (~(N-1)/N) and trigger spurious PLI storms. For
+                    // pre-simulcast publishers `incoming_video_layer` is 0 and
+                    // `selected_video_layer` defaults to 0, so nothing is dropped.
+                    if incoming_video_layer != self.selected_video_layer {
+                        return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    }
                 }
 
                 // Track sequence numbers for gap detection (PLI) and windowed
@@ -1222,28 +1459,30 @@ impl Peer {
                 ))
             }
             MediaType::AUDIO => {
-                // Phase 3 (#989): learn AUDIO layer availability from arriving
-                // audio packets' layer ids. Audio simulcast is a small ladder
-                // (low/high); the chooser uses this to know whether a higher
-                // audio layer even exists before climbing. Single-layer audio
-                // publishers send 0, so availability stays {0} and the chooser
-                // never climbs — a no-op for them. Must run before any drop.
+                // Phase 3 (#989): learn AUDIO layer availability and drop
+                // non-selected audio layers. Skipped here when the CLEARTEXT gate
+                // (#1066) already handled this kind before decrypt — see the
+                // VIDEO arm for the full rationale; this per-arm block now runs
+                // only for the cleartext-UNSPECIFIED fall-through.
                 //
                 // Security (#989): clamp the raw (un-sealed) layer id to the
                 // audio ladder range before observing (see the VIDEO arm).
-                self.audio_layer_availability.observe(
-                    crate::decode::layer_chooser::clamp_observed_layer_id(
-                        crate::decode::layer_chooser::PrefMediaKind::Audio,
-                        incoming_video_layer,
-                    ),
-                    now,
-                );
+                if !cleartext_gate_handled {
+                    self.audio_layer_availability.observe(
+                        crate::decode::layer_chooser::clamp_observed_layer_id(
+                            crate::decode::layer_chooser::PrefMediaKind::Audio,
+                            incoming_video_layer,
+                        ),
+                        now,
+                    );
 
-                // Phase 3 (#989): AUDIO simulcast layer-select guard. Drop audio
-                // packets whose layer != the selected audio layer. Default
-                // selected_audio_layer is 0, matching single-layer publishers.
-                if incoming_video_layer != self.selected_audio_layer {
-                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    // Phase 3 (#989): AUDIO simulcast layer-select guard. Drop
+                    // audio packets whose layer != the selected audio layer.
+                    // Default selected_audio_layer is 0, matching single-layer
+                    // publishers.
+                    if incoming_video_layer != self.selected_audio_layer {
+                        return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    }
                 }
 
                 // HCL bug #1: stamp audio freshness regardless of the
@@ -1272,29 +1511,33 @@ impl Peer {
                 ))
             }
             MediaType::SCREEN => {
-                // Phase 3 (#989): learn SCREEN layer availability from EVERY
-                // arriving screen packet (incl. ones about to be dropped) so the
-                // screen chooser knows how high it may climb — independent of the
-                // camera VIDEO availability. Must run before the drop guard.
+                // Phase 3 (#989): learn SCREEN layer availability and drop
+                // non-selected screen layers. Skipped here when the CLEARTEXT
+                // gate (#1066) already handled this kind before decrypt — see the
+                // VIDEO arm for the full rationale; this per-arm block now runs
+                // only for the cleartext-UNSPECIFIED fall-through.
                 //
                 // Security (#989): clamp the raw (un-sealed) layer id to the
                 // screen ladder range before observing (see the VIDEO arm).
-                self.screen_layer_availability.observe(
-                    crate::decode::layer_chooser::clamp_observed_layer_id(
-                        crate::decode::layer_chooser::PrefMediaKind::Screen,
-                        incoming_video_layer,
-                    ),
-                    now,
-                );
+                if !cleartext_gate_handled {
+                    self.screen_layer_availability.observe(
+                        crate::decode::layer_chooser::clamp_observed_layer_id(
+                            crate::decode::layer_chooser::PrefMediaKind::Screen,
+                            incoming_video_layer,
+                        ),
+                        now,
+                    );
 
-                // Phase 3 (#989): SCREEN simulcast layer-select guard. Drop any
-                // SCREEN packet that is not the layer this receiver selected for
-                // this peer's screen — BEFORE sequence tracking and decode, for
-                // the same phantom-loss reason as the VIDEO guard. Pre-simulcast
-                // / single-layer screen publishers send layer 0 and the default
-                // selected_screen_layer is 0, so nothing is dropped for them.
-                if incoming_video_layer != self.selected_screen_layer {
-                    return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    // Phase 3 (#989): SCREEN simulcast layer-select guard. Drop
+                    // any SCREEN packet that is not the layer this receiver
+                    // selected for this peer's screen — BEFORE sequence tracking
+                    // and decode, for the same phantom-loss reason as the VIDEO
+                    // guard. Pre-simulcast / single-layer screen publishers send
+                    // layer 0 and the default selected_screen_layer is 0, so
+                    // nothing is dropped for them.
+                    if incoming_video_layer != self.selected_screen_layer {
+                        return Ok((media_type, DecodeStatus::SKIPPED, None));
+                    }
                 }
 
                 // Track sequence numbers for gap detection (PLI) and windowed
@@ -1615,6 +1858,31 @@ impl Peer {
     }
 }
 
+/// Issue #1183: decide whether a peer's video/screen canvas must be cleared on
+/// a decode-visibility transition.
+///
+/// The canvas backing bitmap must be wiped exactly on the decode-stop EDGE —
+/// when a peer leaves the active decode set, i.e. `visible` goes `true -> false`.
+/// At that moment `Peer::decode` begins returning `SKIPPED` for VIDEO and
+/// SCREEN, so no further frame is painted; the stale last frame would otherwise
+/// linger on the canvas until Dioxus eventually unmounts the tile (deferred,
+/// and not guaranteed to happen promptly under render pressure).
+///
+/// Must return `false` for every other transition:
+/// * `false -> true` (becoming visible — the decoder will repaint; clearing
+///   here would needlessly blank a tile that's about to show live frames)
+/// * `true -> true` (still visible — no-op, never blank a live tile)
+/// * `false -> false` (still hidden — no-op; clearing repeatedly every pass
+///   would waste work and is already handled by the first edge)
+///
+/// Extracted as a pure function so the edge logic is host-testable without the
+/// wasm-only `CanvasRenderingContext2d`; the actual clear (`clear_canvas`) lives
+/// in the wasm path and is gated on this returning `true`.
+#[inline]
+fn should_clear_canvas(prev_visible: bool, new_visible: bool) -> bool {
+    prev_visible && !new_visible
+}
+
 fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> {
     Ok(Arc::new(
         MediaPacket::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)?,
@@ -1757,8 +2025,10 @@ impl PeerDecodeManager {
     /// and screen decode. Audio remains decoded for all peers.
     pub fn set_active_decode_set(&mut self, active_session_ids: &HashSet<u64>) {
         let session_ids = self.connected_peers.ordered_keys().clone();
-        let mut screen_keyframe_requests: Vec<String> = Vec::new();
-        let mut video_keyframe_requests: Vec<String> = Vec::new();
+        // Carry (user_id, session_id) so the KEYFRAME_REQUEST can target the
+        // specific session for per-session rate limiting (#1124).
+        let mut screen_keyframe_requests: Vec<(String, u64)> = Vec::new();
+        let mut video_keyframe_requests: Vec<(String, u64)> = Vec::new();
         for session_id in session_ids {
             let visible = active_session_ids.contains(&session_id);
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
@@ -1770,7 +2040,7 @@ impl PeerDecodeManager {
                     session_id, peer.visible, visible
                 );
                 if visible && peer.screen_enabled {
-                    screen_keyframe_requests.push(peer.user_id.clone());
+                    screen_keyframe_requests.push((peer.user_id.clone(), session_id));
                 }
                 // Send a proactive video PLI when a video tile becomes visible
                 // so the decoder gets a keyframe immediately instead of waiting
@@ -1778,16 +2048,30 @@ impl PeerDecodeManager {
                 // Gated on video_enabled so we don't send spurious PLIs for
                 // peers that have their camera off.
                 if visible && peer.video_enabled {
-                    video_keyframe_requests.push(peer.user_id.clone());
+                    video_keyframe_requests.push((peer.user_id.clone(), session_id));
+                }
+                // Issue #1183: on the decode-stop edge (visible true -> false)
+                // wipe the stale last frame out of both the camera and screen
+                // canvas backing bitmaps NOW, synchronously, rather than relying
+                // on Dioxus to later unmount the tile. `decode()` is about to
+                // start returning SKIPPED for this peer's VIDEO and SCREEN (see
+                // the `!self.visible` guards), so nothing else will repaint
+                // these canvases; without this clear the tile freezes on its
+                // last frame until the (deferred, pressure-stallable) DOM
+                // unmount. The clear goes through the same cached 2D context the
+                // painter draws into, so it targets the exact backing bitmap.
+                if should_clear_canvas(peer.visible, visible) {
+                    peer.video.clear_canvas();
+                    peer.screen.clear_canvas();
                 }
                 peer.visible = visible;
             }
         }
-        for user_id in &screen_keyframe_requests {
-            self.send_keyframe_request(user_id, MediaType::SCREEN);
+        for (user_id, session_id) in &screen_keyframe_requests {
+            self.send_keyframe_request(user_id, *session_id, MediaType::SCREEN);
         }
-        for user_id in &video_keyframe_requests {
-            self.send_keyframe_request(user_id, MediaType::VIDEO);
+        for (user_id, session_id) in &video_keyframe_requests {
+            self.send_keyframe_request(user_id, *session_id, MediaType::VIDEO);
         }
     }
 
@@ -1858,7 +2142,8 @@ impl PeerDecodeManager {
         if let Some(peer) = self.connected_peers.get(&peer_id) {
             peer.screen.set_canvas(canvas)?;
             if peer.screen_enabled {
-                self.send_keyframe_request(&peer.user_id, MediaType::SCREEN);
+                // `peer_id` is the target's relay session_id (#1124).
+                self.send_keyframe_request(&peer.user_id, peer_id, MediaType::SCREEN);
             }
             Ok(())
         } else {
@@ -1959,6 +2244,92 @@ impl PeerDecodeManager {
                 if audio < ah {
                     desired.insert((session_id, PrefMediaKind::Audio), audio);
                 }
+            }
+        }
+        desired
+    }
+
+    /// Early-seed congestion across every peer showing an early-congested sample
+    /// (issue #1179, Part B).
+    ///
+    /// Drives [`Peer::seed_early_congestion`] for each connected peer; the
+    /// primitive is itself a no-op on a clean sample, so a peer healthy at join
+    /// is seeded nothing. The early-seed primitive's `observe_early_congestion`
+    /// congestion gate is the only thing deciding whether a given peer flips to
+    /// constrained.
+    ///
+    /// NOTE — the WebTransport gate is NOT here. #1179's root cause is THIS
+    /// client's own downlink being WebTransport (reliable-unistream flow-control
+    /// pinning), which is a single client-wide boolean — NOT a per-peer property.
+    /// A peer's announced `transport_type` describes that *remote sender's*
+    /// uplink and is the wrong signal for a downlink-pinning bug. The local-WT
+    /// decision is therefore made ONCE by the caller
+    /// ([`crate::client::video_call_client`]'s early-seed timer tick) on the
+    /// client's active connection transport, and this loop is only ever reached
+    /// when that gate has passed. Keeping the gate at the call site makes the
+    /// WT-only semantics explicit and removes any per-peer transport read here.
+    ///
+    /// Returns `true` if any peer was actually seeded (a congested early sample
+    /// flipped it to constrained). The caller still emits the resulting
+    /// preference through the normal [`LayerPreferenceSender`] path via
+    /// [`Self::current_desired_preferences`].
+    ///
+    /// `bounds` is the user's GLOBAL receive-layer bounds, threaded through to
+    /// [`Peer::seed_early_congestion`] so the seeded decode layer is clamped to
+    /// the user's per-kind `max`/`min` exactly as the 5s tick clamps its output
+    /// (PR #1192 review). Open (default) bounds are an identity clamp.
+    pub fn seed_early_congestion_for_wt_peers(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> bool {
+        let mut seeded = false;
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                if peer.seed_early_congestion(now_ms, bounds) {
+                    seeded = true;
+                }
+            }
+        }
+        seeded
+    }
+
+    /// Per-(peer, kind) desired-layer map that mirrors what the 5s tick would
+    /// advertise, WITHOUT advancing any chooser hysteresis (issue #1179, Part B;
+    /// clamp/gate added in PR #1192 review).
+    ///
+    /// Mirrors the shape AND the advertise semantics of
+    /// [`Self::tick_layer_choosers`]'s return value but does NOT call
+    /// `choose` / `tick_*`: per peer it reads each chooser's
+    /// [`LayerChooser::desired_preference`], clamps it to the user's per-kind
+    /// receive `bounds`, and advertises it only when the clamped layer is
+    /// `< highest_available` for that kind — the SAME post-clamp + advertise gate
+    /// the tick applies (see [`Peer::collect_desired_preferences`]). It therefore
+    /// never advertises above the user's `max`, and never advertises `Some(0)` for
+    /// a base-only source — matching the tick exactly.
+    ///
+    /// It advances no clean-window / score / sticky / last-change hysteresis. The
+    /// only mutation it performs is the lazy prune inside `highest_available`,
+    /// which reflects "what layers exist right now" (exactly what the next tick
+    /// would do) and is NOT chooser-hysteresis state — so feeding its result to
+    /// the [`LayerPreferenceSender`] after an early seed cannot perturb what the
+    /// next 5s monitor tick computes (the early-seed `observe_early_congestion`
+    /// mutation on a genuinely-congested WT peer is the ONLY chooser state change
+    /// in the seed path). Used to publish the early seed through the existing
+    /// sender so `last_sent` / `last_sent_ms` stay coherent and the next tick does
+    /// not re-send a redundant packet.
+    ///
+    /// `now_ms` is supplied by the caller (one clock per cycle) for the
+    /// availability gate; `bounds` is the user's GLOBAL receive-layer bounds.
+    pub fn current_desired_preferences(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> HashMap<(u64, crate::decode::layer_chooser::PrefMediaKind), u32> {
+        let mut desired = HashMap::new();
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                peer.collect_desired_preferences(session_id, now_ms, bounds, &mut desired);
             }
         }
         desired
@@ -2066,8 +2437,21 @@ impl PeerDecodeManager {
     /// `.retain()` to evict stale per-layer observations. The eviction is benign
     /// here (≤3 entries, and the decode path evicts on its own cadence anyway),
     /// but callers must hold `&mut self`.
-    pub fn per_peer_received_snapshots(&mut self, now_ms: u64) -> Vec<PeerReceiveDiag> {
-        use crate::decode::layer_chooser::{received_layer_snapshot, PrefMediaKind};
+    ///
+    /// `bounds` is the client's GLOBAL per-kind receive-layer preference (the
+    /// user's `max` caps). It is passed in rather than re-read here so the
+    /// degradation-reason attribution (issue #1131) uses the SAME persisted bound
+    /// the decode path clamps with — no duplicated/stale copy. The user `max` of
+    /// `None` (Auto) means "uncapped" for the `Setting` attribution.
+    pub fn per_peer_received_snapshots(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> Vec<PeerReceiveDiag> {
+        use crate::decode::layer_chooser::{received_layer_snapshot_with_reason, PrefMediaKind};
+        let video_max = bounds.for_kind(PrefMediaKind::Video).max;
+        let screen_max = bounds.for_kind(PrefMediaKind::Screen).max;
+        let audio_max = bounds.for_kind(PrefMediaKind::Audio).max;
         let keys = self.connected_peers.ordered_keys().clone();
         let mut out = Vec::with_capacity(keys.len());
         for sid in keys {
@@ -2076,18 +2460,46 @@ impl PeerDecodeManager {
             };
             // Resolve each kind's snapshot only when that kind is enabled for the
             // peer; otherwise the panel would show stale base-layer rows for
-            // streams that aren't flowing.
+            // streams that aren't flowing. The per-kind `reason` is attributed
+            // from the live availability + this peer's chooser-constrained flag +
+            // the user's `max` bound (issue #1131).
+            //
+            // IMPORTANT (issue #1131 follow-up B): the reason is derived from the
+            // CLAMPED decoded layer (`min(selected, avail_top)`), not the raw
+            // `selected_*_layer` — otherwise a receive `min` above a base-only
+            // sender's offering would render a Low/red dot (clamped index) with NO
+            // reason chip (raw sel >= full top → None), a self-contradictory row.
+            // `received_layer_snapshot_with_reason` (host-tested) does the clamp +
+            // reason from ONE consistent layer.
             let video = peer.video_enabled.then(|| {
-                let count = peer.video_layer_availability.highest_available(now_ms) + 1;
-                received_layer_snapshot(PrefMediaKind::Video, peer.selected_video_layer, count)
+                let avail_top = peer.video_layer_availability.highest_available(now_ms);
+                received_layer_snapshot_with_reason(
+                    PrefMediaKind::Video,
+                    peer.selected_video_layer,
+                    avail_top,
+                    video_max,
+                    peer.video_layer_chooser.is_constrained(),
+                )
             });
             let screen = peer.screen_enabled.then(|| {
-                let count = peer.screen_layer_availability.highest_available(now_ms) + 1;
-                received_layer_snapshot(PrefMediaKind::Screen, peer.selected_screen_layer, count)
+                let avail_top = peer.screen_layer_availability.highest_available(now_ms);
+                received_layer_snapshot_with_reason(
+                    PrefMediaKind::Screen,
+                    peer.selected_screen_layer,
+                    avail_top,
+                    screen_max,
+                    peer.screen_layer_chooser.is_constrained(),
+                )
             });
             let audio = peer.audio_enabled.then(|| {
-                let count = peer.audio_layer_availability.highest_available(now_ms) + 1;
-                received_layer_snapshot(PrefMediaKind::Audio, peer.selected_audio_layer, count)
+                let avail_top = peer.audio_layer_availability.highest_available(now_ms);
+                received_layer_snapshot_with_reason(
+                    PrefMediaKind::Audio,
+                    peer.selected_audio_layer,
+                    avail_top,
+                    audio_max,
+                    peer.audio_layer_chooser.is_constrained(),
+                )
             });
             // Skip peers with nothing flowing so the list stays compact.
             if video.is_none() && screen.is_none() && audio.is_none() {
@@ -2175,8 +2587,14 @@ impl PeerDecodeManager {
                     }
 
                     // Now we can immutably borrow self for sending.
+                    // `peer_session_id` is the target peer's relay session (the
+                    // map key above) — the per-session limiter key (#1124).
                     if let Some((peer_uid, requested_media_type)) = kf_info {
-                        self.send_keyframe_request(&peer_uid, requested_media_type);
+                        self.send_keyframe_request(
+                            &peer_uid,
+                            peer_session_id,
+                            requested_media_type,
+                        );
                     }
 
                     Ok(())
@@ -2204,9 +2622,16 @@ impl PeerDecodeManager {
 
     /// Send a KEYFRAME_REQUEST packet to a specific peer.
     ///
-    /// The packet is a `MediaPacket` with `media_type = KEYFRAME_REQUEST`
-    /// and `user_id` set to the target peer. The `data` field encodes
-    /// which stream (VIDEO or SCREEN) needs the keyframe.
+    /// The packet is a `MediaPacket` with `media_type = KEYFRAME_REQUEST`,
+    /// `user_id` set to the target participant, and `target_session_id` set to
+    /// the target's relay session (#1124). The `data` field encodes which
+    /// stream (VIDEO or SCREEN) needs the keyframe.
+    ///
+    /// `target_session_id` lets the relay's keyframe rate-limiter key per
+    /// SESSION rather than per participant, so two concurrent publishing
+    /// sessions of the same identity get independent budgets (#1124). The relay
+    /// still routes by `user_id`; the session_id is purely the limiter key, and
+    /// the relay falls back to `user_id` when it is 0 (older clients).
     ///
     /// IMPORTANT: This uses `send_packet` (reliable stream), NOT
     /// `send_media_packet` (datagrams). KEYFRAME_REQUEST is a control
@@ -2214,8 +2639,14 @@ impl PeerDecodeManager {
     ///
     /// The packet is sent unencrypted (raw MediaPacket, not AES-encrypted)
     /// because this is a signaling/control packet, not user media data.
-    /// The server needs to read the target `user_id` to route it correctly.
-    fn send_keyframe_request(&self, peer_user_id: &str, requested_media_type: MediaType) {
+    /// The server needs to read the target `user_id` / `target_session_id` to
+    /// route and rate-limit it correctly.
+    fn send_keyframe_request(
+        &self,
+        peer_user_id: &str,
+        target_session_id: u64,
+        requested_media_type: MediaType,
+    ) {
         let Some(send_packet) = &self.send_packet else {
             debug!("Cannot send KEYFRAME_REQUEST: no send_packet callback");
             return;
@@ -2230,6 +2661,7 @@ impl PeerDecodeManager {
         let media_packet = MediaPacket {
             media_type: MediaType::KEYFRAME_REQUEST.into(),
             user_id: peer_user_id.as_bytes().to_vec(),
+            target_session_id,
             data: media_type_byte,
             ..Default::default()
         };
@@ -2251,8 +2683,9 @@ impl PeerDecodeManager {
 
         KEYFRAME_REQUESTS_SENT.fetch_add(1, Ordering::Relaxed);
         log::info!(
-            "Sending KEYFRAME_REQUEST to {} for {:?}",
+            "Sending KEYFRAME_REQUEST to {} (session {}) for {:?}",
             peer_user_id,
+            target_session_id,
             requested_media_type
         );
         send_packet.emit(wrapper);
@@ -3164,11 +3597,13 @@ mod tests {
     #[test]
     fn apply_hb_flag_5000ms_window_covers_heartbeat_cadence() {
         // The constant itself must be ≥ 5000ms.
-        assert!(
-            MEDIA_FRESH_WINDOW_MS >= 5_000,
-            "MEDIA_FRESH_WINDOW_MS must be ≥ HEARTBEAT_KEEPALIVE_INTERVAL_MS (5000ms) — \
-             a shorter window lets a stale heartbeat clobber live media on lossy WT"
-        );
+        const {
+            assert!(
+                MEDIA_FRESH_WINDOW_MS >= 5_000,
+                "MEDIA_FRESH_WINDOW_MS must be ≥ HEARTBEAT_KEEPALIVE_INTERVAL_MS (5000ms) — \
+                 a shorter window lets a stale heartbeat clobber live media on lossy WT"
+            );
+        }
 
         let now = 10_000_u64;
 
@@ -3245,17 +3680,19 @@ mod tests {
     /// audio/video" regression — the exact bug this fixes — fails loudly.
     #[test]
     fn live_stream_fresh_window_is_sub_second_and_shorter_than_media() {
-        assert!(
-            LIVE_STREAM_FRESH_WINDOW_MS <= 1_000,
-            "LIVE_STREAM_FRESH_WINDOW_MS must be sub-second so a mute / \
-             camera-off reflects within ~1 heartbeat, not after the ~5s \
-             screen window"
-        );
-        assert!(
-            LIVE_STREAM_FRESH_WINDOW_MS < MEDIA_FRESH_WINDOW_MS,
-            "the audio/video window must be strictly shorter than the screen \
-             window — reusing the screen window re-introduces the ~5s lag"
-        );
+        const {
+            assert!(
+                LIVE_STREAM_FRESH_WINDOW_MS <= 1_000,
+                "LIVE_STREAM_FRESH_WINDOW_MS must be sub-second so a mute / \
+                 camera-off reflects within ~1 heartbeat, not after the ~5s \
+                 screen window"
+            );
+            assert!(
+                LIVE_STREAM_FRESH_WINDOW_MS < MEDIA_FRESH_WINDOW_MS,
+                "the audio/video window must be strictly shorter than the screen \
+                 window — reusing the screen window re-introduces the ~5s lag"
+            );
+        }
     }
 
     /// (a) A mute heartbeat (`audio_enabled = false`) arriving just after
@@ -3603,7 +4040,7 @@ mod tests {
         peer.audio_level = 0.75;
         manager.connected_peers.insert(101, peer);
 
-        let level = manager.peer_audio_level(&"101".to_string());
+        let level = manager.peer_audio_level("101");
         assert!(
             (level - 0.75).abs() < f32::EPSILON,
             "peer_audio_level should return 0.75, got {level}"
@@ -3614,7 +4051,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_peer_audio_level_unknown_peer_returns_zero() {
         let manager = PeerDecodeManager::new();
-        let level = manager.peer_audio_level(&"99999".to_string());
+        let level = manager.peer_audio_level("99999");
         assert!(
             (level - 0.0).abs() < f32::EPSILON,
             "peer_audio_level for unknown peer should return 0.0, got {level}"
@@ -3625,7 +4062,7 @@ mod tests {
     #[wasm_bindgen_test]
     fn test_peer_audio_level_invalid_key_returns_zero() {
         let manager = PeerDecodeManager::new();
-        let level = manager.peer_audio_level(&"not-a-number".to_string());
+        let level = manager.peer_audio_level("not-a-number");
         assert!(
             (level - 0.0).abs() < f32::EPSILON,
             "peer_audio_level for invalid key should return 0.0, got {level}"
@@ -4265,6 +4702,97 @@ mod tests {
         );
     }
 
+    /// #1066: build a MEDIA `PacketWrapper` with a CLEARTEXT outer `media_kind`
+    /// and `simulcast_layer_id`, but with `data` that is NOT validly AES-encrypted
+    /// (raw bytes). When the peer has an enabled AES key, `aes.decrypt` of this
+    /// `data` FAILS — so reaching the decrypt step at all surfaces as
+    /// `Err(AesDecryptError)`. Tests use this to prove the cleartext layer gate
+    /// early-returns BEFORE decrypt for dropped layers.
+    fn cleartext_kind_wrap(
+        media_kind: MediaKind,
+        layer_id: u32,
+        session_id: u64,
+    ) -> Arc<PacketWrapper> {
+        Arc::new(PacketWrapper {
+            // Deliberately NOT a valid ciphertext: short, non-block-aligned bytes
+            // so an enabled-AES `decrypt` errors if it is ever attempted.
+            data: vec![1u8, 2, 3, 4, 5],
+            user_id: "test@test.com".into(),
+            packet_type: PacketType::MEDIA.into(),
+            session_id,
+            simulcast_layer_id: layer_id,
+            media_kind: media_kind.into(),
+            ..Default::default()
+        })
+    }
+
+    /// #1066: a non-selected simulcast layer must be DROPPED on the CLEARTEXT
+    /// envelope BEFORE AES-decrypt. With an enabled AES key and intentionally
+    /// invalid ciphertext, a layer the gate drops returns `Ok(SKIPPED)` (decrypt
+    /// never ran); if the drop had keyed on the DECRYPTED inner media_type as
+    /// before, the same packet would have hit `aes.decrypt` first and returned
+    /// `Err(AesDecryptError)`. This is the regression that pins the perf fix.
+    #[wasm_bindgen_test]
+    fn cleartext_layer_gate_drops_before_decrypt() {
+        let (mut peer, _muted) = make_test_peer(970);
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        // Enabled AES: any decrypt attempt on the invalid ciphertext below errors.
+        peer.aes = Some(Aes128State::new(true));
+        // Receiver decodes only the base layer (the N=1 default), so layer 2 is
+        // a non-selected layer that must be dropped.
+        assert_eq!(peer.selected_video_layer(), 0);
+
+        let dropped = cleartext_kind_wrap(MediaKind::VIDEO, 2, 970);
+        let result = peer.decode(&dropped, "local@test.com");
+
+        // The gate fired BEFORE decrypt: a clean SKIPPED, not an AES error.
+        match result {
+            Ok((MediaType::VIDEO, status, kf)) => {
+                assert!(!status.rendered, "dropped layer must not render");
+                assert!(kf.is_none(), "dropped layer must not request a keyframe");
+            }
+            Ok(other) => panic!("expected Ok((VIDEO, SKIPPED, None)), got {other:?}"),
+            Err(e) => panic!(
+                "non-selected layer must be dropped on the cleartext envelope BEFORE \
+                 decrypt — reaching decrypt produced {e:?}"
+            ),
+        }
+
+        // Availability was still observed pre-decrypt (the chooser must learn a
+        // higher layer exists even though we dropped this packet).
+        assert_eq!(
+            peer.video_layer_availability.highest_available(now_ms()),
+            2,
+            "the dropped layer's id must still be observed for the chooser"
+        );
+    }
+
+    /// #1066: at the N=1 default (selected layer 0, publisher layer 0) the gate
+    /// must be INERT — a layer-0 packet is NOT dropped pre-decrypt, so it
+    /// proceeds to the (here intentionally failing) decrypt. With an enabled AES
+    /// key and invalid ciphertext that surfaces as `Err(AesDecryptError)`,
+    /// proving the gate did NOT short-circuit the base layer.
+    #[wasm_bindgen_test]
+    fn cleartext_layer_gate_is_inert_for_base_layer() {
+        let (mut peer, _muted) = make_test_peer(971);
+        peer.video_enabled = true;
+        peer.has_received_heartbeat = true;
+        peer.aes = Some(Aes128State::new(true));
+        assert_eq!(peer.selected_video_layer(), 0);
+
+        // Layer 0 == selected layer 0 → the gate forwards (does NOT drop), so the
+        // packet reaches decrypt. The invalid ciphertext then errors, which is
+        // exactly the signal that the base layer was NOT short-circuited.
+        let base = cleartext_kind_wrap(MediaKind::VIDEO, 0, 971);
+        let result = peer.decode(&base, "local@test.com");
+        assert!(
+            matches!(result, Err(PeerDecodeError::AesDecryptError)),
+            "base layer (N=1) must fall through the gate to decrypt unchanged \
+             (got {result:?})"
+        );
+    }
+
     /// Different peers should have independent sequence tracking.
     #[wasm_bindgen_test]
     fn different_peers_independent_sequence_tracking() {
@@ -4580,6 +5108,49 @@ mod tests {
         );
     }
 
+    /// Issue #1183: the canvas backing bitmap must be cleared on EXACTLY the
+    /// decode-stop edge (`visible: true -> false`) and on no other transition.
+    ///
+    /// This is a plain `#[test]` (host-run, not `#[wasm_bindgen_test]`) on
+    /// purpose: the wasm-browser harness on this box silently no-ops
+    /// `#[wasm_bindgen_test]`, so a wasm-only assertion would be a false green.
+    /// The pure `should_clear_canvas` function carries the load-bearing edge
+    /// logic; the actual `CanvasRenderingContext2d::clear_rect` lives in the
+    /// wasm-only `VideoPeerDecoder::clear_canvas` and is gated on this function.
+    ///
+    /// Mutating the edge condition (e.g. clearing on every invisible frame, or
+    /// never clearing) flips one of these assertions, so this test fails if the
+    /// fix regresses.
+    #[test]
+    fn should_clear_canvas_only_on_decode_stop_edge() {
+        // The ONLY transition that clears: the peer was being decoded and is
+        // now leaving the active decode set.
+        assert!(
+            should_clear_canvas(true, false),
+            "decode-stop edge (true -> false) MUST clear the stale frame"
+        );
+
+        // Becoming visible: the decoder will repaint live frames, so clearing
+        // here would needlessly blank a tile that's about to show video.
+        assert!(
+            !should_clear_canvas(false, true),
+            "becoming visible (false -> true) must NOT clear"
+        );
+
+        // Still visible: never blank a live tile.
+        assert!(
+            !should_clear_canvas(true, true),
+            "staying visible (true -> true) must NOT clear"
+        );
+
+        // Still hidden: the clear already happened on the first edge; doing it
+        // every pass would waste work.
+        assert!(
+            !should_clear_canvas(false, false),
+            "staying hidden (false -> false) must NOT clear"
+        );
+    }
+
     /// Peers added after a layout update stay inactive until a subsequent
     /// active-decode-set push explicitly enables them.
     #[wasm_bindgen_test]
@@ -4858,6 +5429,323 @@ mod tests {
             "fresh peers must advertise no preference (cold start = forward all): {desired:?}"
         );
         let _ = PrefMediaKind::Video; // keep the import used regardless of asserts
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1179, Part B: early-seed wiring (manager level)
+    //
+    // These exercise the two glue methods the early-seed timer drives:
+    //   * seed_early_congestion_for_wt_peers — WT-ONLY, and a no-op on a
+    //     clean WT join (M2 preserved);
+    //   * current_desired_preferences — READ-ONLY (advances no hysteresis).
+    // -----------------------------------------------------------------
+
+    /// Mark a peer's VIDEO downlink congested and learn a 3-layer ladder so a
+    /// constrain has somewhere to step down to. Mirrors the inputs the decode
+    /// path would have populated for a real congested WT join.
+    fn make_congested_top_peer(session_id: u64, transport: TransportType) -> Peer {
+        let (mut peer, _muted) = make_test_peer(session_id);
+        peer.transport_type = transport;
+        // Learn layers 0,1,2 so highest_available == 2 (room to drop to 1).
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, 1000);
+            peer.screen_layer_availability.observe(layer, 1000);
+            peer.audio_layer_availability.observe(layer, 1000);
+        }
+        // A congested video window (over the loss step-down threshold). Screen has
+        // its own window; leave it clean so only VIDEO/AUDIO can seed for this peer
+        // (audio is proxied by the video downlink).
+        peer.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: crate::decode::layer_chooser::LOSS_STEP_DOWN_PER_SEC + 1.0,
+            kf_per_sec: 0.0,
+        };
+        peer
+    }
+
+    /// The early seed constrains EVERY congested peer regardless of the peer's
+    /// announced (remote-uplink) `transport_type`. The WebTransport gate is NOT
+    /// per-peer — it lives at the call site (the early-seed timer tick), keyed on
+    /// THIS client's LOCAL active transport. So at this layer a congested WS- or
+    /// UNKNOWN-announcing peer must be seeded exactly like a WT-announcing one.
+    ///
+    /// MUTATION CHECK: fails if a per-peer `transport_type` gate is (re)introduced
+    /// into `seed_early_congestion_for_wt_peers` — then the WS/UNKNOWN peers would
+    /// NOT be seeded and their desired entries would be missing.
+    #[wasm_bindgen_test]
+    fn early_seed_constrains_congested_peers_regardless_of_peer_transport() {
+        use crate::decode::layer_chooser::PrefMediaKind;
+        let mut manager = PeerDecodeManager::new();
+        manager.connected_peers.insert(
+            100,
+            make_congested_top_peer(100, TransportType::TRANSPORT_WEBTRANSPORT),
+        );
+        manager.connected_peers.insert(
+            200,
+            make_congested_top_peer(200, TransportType::TRANSPORT_WEBSOCKET),
+        );
+        manager.connected_peers.insert(
+            300,
+            make_congested_top_peer(300, TransportType::TRANSPORT_UNKNOWN),
+        );
+
+        // Open (default) bounds — these tests cover the unbounded user; the bounds
+        // clamp is exercised separately in `early_seed_respects_user_receive_max`.
+        let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
+        let seeded = manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        assert!(seeded, "the congested peers' samples must seed a constrain");
+
+        let desired = manager.current_desired_preferences(2000, &bounds);
+        // Every congested peer (any announced transport): video constrained from
+        // top (2) down to 1, audio proxied by the same congested video window.
+        for sid in [100u64, 200, 300] {
+            assert_eq!(
+                desired.get(&(sid, PrefMediaKind::Video)),
+                Some(&1),
+                "peer {sid} must be constrained to layer 1 by the early seed \
+                 (per-peer transport must NOT gate the seed): {desired:?}"
+            );
+            assert_eq!(
+                desired.get(&(sid, PrefMediaKind::Audio)),
+                Some(&1),
+                "peer {sid} audio (video-proxied) must also constrain: {desired:?}"
+            );
+        }
+    }
+
+    /// M2 non-regression: a HEALTHY WT joiner (clean downlink) must be seeded
+    /// NOTHING — no constrain, no preference, no HD dip.
+    ///
+    /// MUTATION CHECK: fails if `observe_early_congestion` ever constrains on a
+    /// clean sample (the `!sample.is_congested()` guard in the primitive).
+    #[wasm_bindgen_test]
+    fn early_seed_noop_on_clean_wt_join() {
+        let mut manager = PeerDecodeManager::new();
+        // Clean WT peer: top layers learned, but downlink is the default clean
+        // sample (loss 0 / kf 0).
+        let (mut peer, _muted) = make_test_peer(101);
+        peer.transport_type = TransportType::TRANSPORT_WEBTRANSPORT;
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, 1000);
+        }
+        manager.connected_peers.insert(101, peer);
+
+        let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
+        let seeded = manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        assert!(!seeded, "a clean WT join must seed nothing (M2)");
+        let desired = manager.current_desired_preferences(2000, &bounds);
+        assert!(
+            desired.is_empty(),
+            "clean WT join advertises no preference: {desired:?}"
+        );
+    }
+
+    /// READ-ONLY: `current_desired_preferences` must not advance ANY chooser
+    /// state. After seeding a WT peer (constrained at layer 1, clean-window streak
+    /// reset to 0 by the step-down), we call the accessor 50 times with a CLEAN
+    /// downlink loaded — the exact condition under which a real `choose`/`tick`
+    /// WOULD accumulate clean windows and eventually climb. The peer's decode
+    /// layer and advertised preference must be byte-for-byte unchanged across all
+    /// 50 reads, AND the map each read returns must be identical (idempotent).
+    ///
+    /// This is mutation-sensitive WITHOUT relying on top-convergence: the seeded
+    /// state is held at layer 1, so any climb (which a `choose` mutation would
+    /// eventually cause once the streak/dwell are met) moves it OFF 1 and the
+    /// assertion fires. It is also belt-and-suspenders to the compile-time
+    /// guarantee that `current_desired_preferences`/`collect_desired_preferences`
+    /// take `&self` (a `choose` call needs `&mut self` and would not compile).
+    ///
+    /// MUTATION CHECK: fails if the accessor is changed to drive `choose`/`tick_*`
+    /// (the seeded layer would climb away from 1 / the returned map would change),
+    /// or to clear `constrained` (the preference would vanish).
+    #[wasm_bindgen_test]
+    fn current_desired_preferences_is_read_only() {
+        use crate::decode::layer_chooser::PrefMediaKind;
+
+        let mut mgr = PeerDecodeManager::new();
+        mgr.connected_peers.insert(
+            1,
+            make_congested_top_peer(1, TransportType::TRANSPORT_WEBTRANSPORT),
+        );
+        // Open (default) bounds — the read-only guarantee is independent of the
+        // user's clamp; the clamp itself is covered by
+        // `early_seed_respects_user_receive_max`.
+        let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
+        // Seed: constrains video 2 -> 1 (and audio, video-proxied).
+        assert!(mgr.seed_early_congestion_for_wt_peers(2000, &bounds));
+
+        // Load a CLEAN downlink so that IF the accessor (incorrectly) advanced the
+        // chooser, the clean-window streak would build and eventually climb.
+        if let Some(p) = mgr.connected_peers.get_mut(&1) {
+            p.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            };
+        }
+
+        // Snapshot the post-seed state, then hammer the read-only accessor.
+        let baseline = mgr.current_desired_preferences(2000, &bounds);
+        assert_eq!(
+            baseline.get(&(1, PrefMediaKind::Video)),
+            Some(&1),
+            "seeded WT peer advertises layer 1 before any reads"
+        );
+        let baseline_layer = mgr.connected_peers.get(&1).unwrap().selected_video_layer();
+        assert_eq!(baseline_layer, 1, "seeded decode layer is 1");
+
+        for i in 0..50 {
+            let map = mgr.current_desired_preferences(2000, &bounds);
+            assert_eq!(
+                map, baseline,
+                "read #{i}: current_desired_preferences must be idempotent (read-only)"
+            );
+            let layer = mgr.connected_peers.get(&1).unwrap().selected_video_layer();
+            assert_eq!(
+                layer, baseline_layer,
+                "read #{i}: the accessor must not advance the chooser — decode layer \
+                 moved from {baseline_layer} to {layer} (hysteresis advanced off-cadence)"
+            );
+        }
+    }
+
+    /// BLOCKER (PR #1192 review): the EARLY-SEED path must clamp to the user's
+    /// receive bounds exactly as the 5s tick does. A bandwidth-conscious user who
+    /// set a manual receive `max` BELOW `highest-1`, joining on WebTransport into
+    /// early congestion, must never (even transiently) decode or advertise a layer
+    /// above their cap.
+    ///
+    /// Setup: a peer with a learned 3-layer ladder (`highest_available == 2`, so
+    /// `highest-1 == 1`) and a congested video downlink. The unclamped seed would
+    /// step the chooser down from 2 to 1 and write `selected_video_layer = 1` +
+    /// advertise `Some(1)`. The user caps video at `max = 0` (below `highest-1`),
+    /// so the clamped result must be `selected_video_layer == 0` and the advertised
+    /// preference must be `0` (≤ max), never `1`.
+    ///
+    /// This is a HOST `#[test]` (not `#[wasm_bindgen_test]`) so it actually runs
+    /// under `cargo test -p videocall-client --lib` — the wasm-only seed tests do
+    /// not execute on the host harness.
+    ///
+    /// MUTATION CHECK: delete either `bounds.for_kind(...).clamp(...)` in
+    /// `Peer::seed_early_congestion` (decode guard) or in
+    /// `Peer::collect_desired_preferences` (advertised layer) and this test fails —
+    /// `selected_video_layer` becomes 1 (> max) and/or the advertised entry becomes
+    /// `Some(1)` (> max). Confirmed by hand-mutating both clamp sites.
+    #[test]
+    fn early_seed_respects_user_receive_max() {
+        use crate::decode::layer_chooser::{DownlinkSample, PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        // Congested WT peer with a learned 3-layer ladder (highest_available == 2).
+        manager.connected_peers.insert(
+            900,
+            make_congested_top_peer(900, TransportType::TRANSPORT_WEBTRANSPORT),
+        );
+
+        // Bring the (unconstrained) chooser up to the TOP (current == 2) the way a
+        // healthy join would, via one CLEAN unclamped tick — so the subsequent
+        // congested seed steps DOWN from 2 to highest-1 (==1), the value that
+        // would land ABOVE the user's cap without the clamp. (The seed primitive
+        // steps down from `current`, so `current` must be at the top first.)
+        let open = ReceiveLayerBounds::default();
+        if let Some(p) = manager.connected_peers.get_mut(&900) {
+            p.last_video_downlink = DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0,
+            };
+        }
+        assert_eq!(
+            manager
+                .tick_layer_choosers(1500, &open)
+                .get(&(900, PrefMediaKind::Video)),
+            None,
+            "clean unconstrained tick tracks the top and advertises nothing"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&900)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "chooser climbed to the top before the congested seed"
+        );
+        // Restore the congested window so the early seed sees congestion.
+        if let Some(p) = manager.connected_peers.get_mut(&900) {
+            p.last_video_downlink = DownlinkSample {
+                loss_per_sec: crate::decode::layer_chooser::LOSS_STEP_DOWN_PER_SEC + 1.0,
+                kf_per_sec: 0.0,
+            };
+        }
+
+        // User caps received VIDEO at layer 0 — BELOW highest-1 (==1). Screen/audio
+        // left open so the clamp is exercised on VIDEO specifically.
+        let mut bounds = ReceiveLayerBounds::default();
+        bounds.set_kind(PrefMediaKind::Video, None, Some(0));
+
+        let seeded = manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        assert!(
+            seeded,
+            "the congested sample must still seed a constrain (clamp is a pure \
+             post-process, it does not gate the seed)"
+        );
+
+        // Decode guard must NOT exceed the user's max (0). Unclamped this is 1.
+        let selected = manager
+            .connected_peers
+            .get(&900)
+            .unwrap()
+            .selected_video_layer();
+        assert!(
+            selected == 0,
+            "early-seed decode guard {selected} must be clamped to user video max 0 \
+             (== 0; unclamped it would be highest-1 == 1)"
+        );
+
+        // Advertised preference must NOT exceed the user's max (0). Unclamped this
+        // is Some(1) — ABOVE the user's cap, the exact invariant violation.
+        let desired = manager.current_desired_preferences(2000, &bounds);
+        let advertised = desired.get(&(900, PrefMediaKind::Video)).copied();
+        assert_eq!(
+            advertised,
+            Some(0),
+            "early-seed must advertise the clamped layer 0 (≤ user max), never \
+             {advertised:?} above the user's cap"
+        );
+    }
+
+    /// NIT 1 (PR #1192 review): a source whose ONLY learned layer is the base
+    /// (`highest_available == 0`) must advertise NOTHING from the early-seed path,
+    /// matching the tick's `clamped < highest_available` gate — never `Some(0)`.
+    ///
+    /// MUTATION CHECK: drop the `< highest_available` gate in
+    /// `Peer::collect_desired_preferences` (advertise unconditionally on
+    /// `desired_preference()`) and this test fails — the base-only constrained
+    /// chooser would advertise `Some(0)`.
+    #[test]
+    fn early_seed_base_only_source_advertises_nothing() {
+        use crate::decode::layer_chooser::{DownlinkSample, PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        let (mut peer, _muted) = make_test_peer(950);
+        peer.transport_type = TransportType::TRANSPORT_WEBTRANSPORT;
+        // Only the BASE layer is ever observed → highest_available == 0.
+        peer.video_layer_availability.observe(0, 1000);
+        // Congested video window so the chooser would still try to constrain.
+        peer.last_video_downlink = DownlinkSample {
+            loss_per_sec: crate::decode::layer_chooser::LOSS_STEP_DOWN_PER_SEC + 1.0,
+            kf_per_sec: 0.0,
+        };
+        manager.connected_peers.insert(950, peer);
+
+        let bounds = ReceiveLayerBounds::default();
+        manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+
+        let desired = manager.current_desired_preferences(2000, &bounds);
+        assert_eq!(
+            desired.get(&(950, PrefMediaKind::Video)),
+            None,
+            "a base-only source (highest_available == 0) must advertise nothing — \
+             the `< highest_available` gate suppresses a spurious Some(0): {desired:?}"
+        );
     }
 
     /// Phase 4 (#989): the user's receive-layer bounds clamp each peer's chosen
@@ -5649,8 +6537,8 @@ mod tests {
         // Clear the send counter baseline.
         let baseline = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
 
-        // Manually invoke send_keyframe_request for a specific peer.
-        manager.send_keyframe_request("alice@example.com", MediaType::VIDEO);
+        // Manually invoke send_keyframe_request for a specific peer + session.
+        manager.send_keyframe_request("alice@example.com", 4242, MediaType::VIDEO);
 
         // One PLI should have been sent.
         assert_eq!(
@@ -5681,6 +6569,13 @@ mod tests {
             inner.user_id,
             b"me@example.com".to_vec(),
             "PLI must not target the local user"
+        );
+        // #1124: the target session_id must be stamped so the relay can key its
+        // keyframe limiter per-session (not per-user). Pins the fix: a revert
+        // that stops setting target_session_id makes this assertion fail.
+        assert_eq!(
+            inner.target_session_id, 4242,
+            "PLI must carry the target peer's session_id for per-session rate limiting"
         );
         drop(collector);
     }

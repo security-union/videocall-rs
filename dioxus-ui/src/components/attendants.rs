@@ -19,6 +19,7 @@
 use crate::components::decode_budget::{
     decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
+use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
@@ -31,6 +32,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
+    performance_settings::{DiagnosticsReader, PerfControlsHandle},
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
@@ -38,7 +40,9 @@ use crate::components::{
         MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
     },
 };
-use crate::console_log_collector::{flush_console_logs, set_console_log_context};
+use crate::console_log_collector::{
+    flush_console_logs, set_console_log_auth_token, set_console_log_context,
+};
 use crate::constants::actix_websocket_base;
 use crate::constants::{
     mock_peers_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
@@ -327,6 +331,9 @@ fn schedule_reconnect(
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
+                    // Keep console-log uploads authenticated after a reconnect
+                    // (the token rotated). O(1); token value is never logged.
+                    set_console_log_auth_token(&new_token);
                     let latest_display_name = current_display_name();
 
                     // Re-evaluate `webtransport_enabled()` at reconnect time —
@@ -431,6 +438,29 @@ use super::attendants_layout::{
 };
 use super::density::{DensityMode, DENSITY_MODES};
 
+/// Where a settings deep link should land. The Performance controls moved out of
+/// the Settings modal into the Diagnostics drawer (#1131 unify), so an incoming
+/// `"performance"` section opens the DRAWER, not the modal; every other section
+/// (or none) opens the modal as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsDeepLink {
+    /// Open the right-side Diagnostics drawer (the new home of the Performance
+    /// controls). Do NOT open the Settings modal.
+    Drawer,
+    /// Open the Settings modal (optionally on a requested tab).
+    Modal,
+}
+
+/// Classify a requested settings-section string into where it should open. Pure
+/// so the routing contract is host-testable. The match is case-sensitive,
+/// mirroring `DeviceSettingsModal`'s own `initial_section` mapping.
+pub(crate) fn classify_settings_deep_link(section: Option<&str>) -> SettingsDeepLink {
+    match section {
+        Some("performance") => SettingsDeepLink::Drawer,
+        _ => SettingsDeepLink::Modal,
+    }
+}
+
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
@@ -471,6 +501,9 @@ pub fn AttendantsComponent(
     let mut dock_menu_open = use_signal(|| false);
     let mut autohide_enabled = use_signal(load_dock_autohide);
     let encoder_settings = use_signal(|| None::<String>);
+    // Last peer count logged by the meeting-view render log below — lets that
+    // log fire only on changes (edge-trigger) instead of every re-render.
+    let mut last_logged_peer_count = use_signal(|| None::<usize>);
     let mut debug_peer_count = use_signal(|| 0u32);
     // Per-peer speech priority: session_id → last-spoke timestamp (ms).
     // Peers that spoke recently sort higher in the grid.
@@ -713,6 +746,32 @@ pub fn AttendantsComponent(
     let mut device_settings_open = use_signal(|| false);
     let mut device_settings_initial_section: Signal<Option<String>> = use_signal(|| None);
     let mut device_settings_generation = use_signal(|| 0u32);
+    // Host publishes its live diagnostics reader handle here once on mount, so the
+    // Diagnostics sidebar (a sibling of Host that can't reach the encoders) can
+    // render the "Simulcast layers" section from the live SEND snapshots. (#1095)
+    let diagnostics_reader_sink: Signal<Option<DiagnosticsReader>> = use_signal(|| None);
+    // Host also publishes its Performance controls handle here, so the Diagnostics
+    // drawer can mount the `PerformanceSettingsPanel` (sliders/Auto/meters) — the
+    // panel moved out of the Settings modal into the drawer (#1131 unify).
+    let perf_controls_sink: Signal<Option<PerfControlsHandle>> = use_signal(|| None);
+
+    // Deep-link interception (#1131 unify): a requested `"performance"` section no
+    // longer has a Settings tab — the Performance controls live in the Diagnostics
+    // drawer now. Catch it BEFORE the modal opens: route to the drawer and clear
+    // the requested section so the (closed) modal doesn't keep a dangling
+    // "performance" target. Other sections fall through untouched. The classifier
+    // is the pure `classify_settings_deep_link` (host-tested); this effect only
+    // applies its verdict to the open-state signals.
+    use_effect(move || {
+        if classify_settings_deep_link(device_settings_initial_section().as_deref())
+            == SettingsDeepLink::Drawer
+        {
+            device_settings_open.set(false);
+            device_settings_initial_section.set(None);
+            diagnostics_open.set(true);
+        }
+    });
+
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let mut display_name_modal_open = use_signal(|| false);
@@ -894,6 +953,13 @@ pub fn AttendantsComponent(
             enable_webtransport: effective_wt_enabled,
             on_connected: {
                 let meeting_id_for_log = id.clone();
+                // Initial room_token for console-log upload auth. The collector
+                // re-receives a fresh token on every refresh via
+                // refresh_room_token_callback below, so this only needs to seed
+                // the value at connect time. Empty only in non-JWT dev builds:
+                // the collector treats "" as no token, so the upload is then
+                // unauthenticated — the server has no cookie fallback.
+                let room_token_for_logs = room_token.clone();
                 // Slugify the fallback display name so it passes SAFE_USER_ID_RE
                 // on the server (spaces and other chars would cause a 400).
                 let user_id_for_log = user_id.clone().unwrap_or_else(|| {
@@ -942,6 +1008,11 @@ pub fn AttendantsComponent(
                             .unwrap_or(log::LevelFilter::Debug);
                         log::set_max_level(effective_level);
                         let dn = current_display_name();
+                        // Hand the collector the room_token BEFORE setContext:
+                        // setContext starts the upload timer, so the token must
+                        // already be in place for the very first upload to carry
+                        // `Authorization: Bearer`. Never log the token value.
+                        set_console_log_auth_token(&room_token_for_logs);
                         set_console_log_context(&meeting_id_for_log, &user_id_for_log, &dn);
                     }
                 })
@@ -1504,6 +1575,10 @@ pub fn AttendantsComponent(
                     async move {
                         match crate::meeting_api::refresh_room_token(&meeting_id).await {
                             Ok(new_token) => {
+                                // Keep console-log uploads authenticated across
+                                // token refreshes on long calls. O(1), and the
+                                // token value is never logged.
+                                set_console_log_auth_token(&new_token);
                                 let dn = display_name_signal();
                                 let (ws, wt) = build_lobby_urls(&new_token, &dn, &meeting_id);
                                 // Apply the user's transport preference so
@@ -3380,7 +3455,20 @@ pub fn AttendantsComponent(
     // self until the assignment arrives.
     let my_session_id: Option<String> = client.get_own_session_id();
 
-    info!("Rendering meeting view with {} peers", display_peers.len());
+    // Edge-triggered: log only when the peer count CHANGES, not on every render.
+    // This component re-renders many times per second (signals, speech priority,
+    // layout), so an unconditional log here emitted ~44k lines in an 8-min
+    // meeting — the single largest console-log contributor after the #1100/#1129
+    // per-tick demotions. Logging on transitions preserves the documented
+    // `Rendering meeting view with 0 peers` failure signature (the drop to zero
+    // is still emitted) while cutting volume to a handful of lines.
+    {
+        let peer_count = display_peers.len();
+        if last_logged_peer_count() != Some(peer_count) {
+            last_logged_peer_count.set(Some(peer_count));
+            info!("Rendering meeting view with {peer_count} peers");
+        }
+    }
 
     // Clear stale pin: if the pinned peer left the meeting, reset to None so
     // that is_speaking_suppressed() no longer suppresses glow for everyone.
@@ -3722,6 +3810,20 @@ pub fn AttendantsComponent(
                             ss_resizing.set(false);
                         }
                     },
+
+                    // Meeting-level decode-budget banner (#1142 Phase 1). It owns
+                    // its own anti-flap damper, so it is mounted UNCONDITIONALLY —
+                    // it self-gates on `pressured`/`avatar_count` and the sustain /
+                    // dwell / back-off policy. `natural` is the uncapped layout
+                    // tile count (`total_tiles`); "Show all videos" pins the
+                    // override to `Fixed(natural)`, which `effective_cap` clamps to
+                    // `min(natural, CANVAS_LIMIT)` on the next render. Reading
+                    // `decode_budget_pressured()` reactively keeps the props live.
+                    DecodeBudgetBanner {
+                        pressured: decode_budget_pressured(),
+                        avatar_count: avatar_tile_count,
+                        natural: total_tiles,
+                    }
 
                     if has_screen_share {
                         // ---- Split layout: active screen share (left) + peer videos (right) ----
@@ -4339,6 +4441,20 @@ pub fn AttendantsComponent(
                                                 diagnostics_open.set(opening);
                                                 if opening {
                                                     peer_list_open.set(false);
+                                                    // Close Device Settings as a UX
+                                                    // choice — don't stack a modal
+                                                    // over the drawer (symmetry with
+                                                    // the reverse at
+                                                    // DeviceSettingsButton). The old
+                                                    // "two 4Hz loops can't coexist"
+                                                    // rationale is moot since the
+                                                    // Performance panel moved into
+                                                    // this drawer (#1131): there is
+                                                    // now ONE surface, with two
+                                                    // tick-scoped child components
+                                                    // (the panel + SimulcastLayers)
+                                                    // by design.
+                                                    device_settings_open.set(false);
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);
@@ -4516,6 +4632,11 @@ pub fn AttendantsComponent(
                                         }
                                     },
                                     reload_devices_counter: reload_devices_counter(),
+                                    publish_diagnostics_reader: diagnostics_reader_sink,
+                                    // Host publishes its Performance controls handle
+                                    // here so the Diagnostics drawer can mount the
+                                    // panel (sliders/Auto/meters). (#1131 unify)
+                                    publish_perf_controls: perf_controls_sink,
                                 }
                             }
                             if is_guest {
@@ -4624,6 +4745,13 @@ pub fn AttendantsComponent(
                         mic_enabled: mic_enabled(),
                         share_screen: screen_share_state().is_sharing(),
                         encoder_settings: encoder_settings(),
+                        // Live SEND simulcast reader (published by Host on mount),
+                        // for the "Simulcast layers" section. (#1095 §6)
+                        diagnostics_reader: diagnostics_reader_sink(),
+                        // Performance controls handle (published by Host on mount),
+                        // for the migrated Performance panel in the drawer's
+                        // "Quality controls" group. (#1131 unify)
+                        perf_controls: perf_controls_sink(),
                     }
                 }
 
@@ -4810,6 +4938,39 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    // ── Settings deep-link routing (#1131 unify) ──
+    // Plain host `#[test]`s (not browser tests): the classifier is pure.
+
+    /// "performance" must route to the Diagnostics DRAWER (its new home), NOT the
+    /// Settings modal. If this reverts to `Modal`, the migration regresses: the
+    /// old Performance tab no longer exists, so the modal would land on a missing
+    /// section. This is the load-bearing assertion of the deep-link repurpose.
+    #[test]
+    fn deep_link_performance_opens_drawer() {
+        assert_eq!(
+            classify_settings_deep_link(Some("performance")),
+            SettingsDeepLink::Drawer
+        );
+    }
+
+    /// Every other section — and `None` — opens the Settings modal as before.
+    #[test]
+    fn deep_link_other_sections_open_modal() {
+        for s in ["audio", "video", "network", "appearance"] {
+            assert_eq!(
+                classify_settings_deep_link(Some(s)),
+                SettingsDeepLink::Modal,
+                "section {s:?} should open the modal"
+            );
+        }
+        assert_eq!(classify_settings_deep_link(None), SettingsDeepLink::Modal);
+        // An unknown section also falls through to the modal (default tab).
+        assert_eq!(
+            classify_settings_deep_link(Some("bogus")),
+            SettingsDeepLink::Modal
+        );
+    }
 
     /// attempt=0 should return Some(d) where d is in the base range.
     /// base = 1000, jitter in [-25%, +25%), so delay in [750, 1250).

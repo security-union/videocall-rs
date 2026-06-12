@@ -16,14 +16,35 @@
  * conditions.
  */
 
-//! Simulcast layer-capability ceiling (issue #989 / #1082).
+//! Simulcast layer-capability *ceiling* (issue #989 / #1082 / #1140 / #1141).
 //!
-//! This module is **only** a publisher-side encode-CPU budget: it derives the
-//! maximum number of simulcast layers a device should encode, given its CPU
-//! core count, UA platform, and the synthetic capability benchmark. Encoding N
-//! layers is ~N× the encode CPU, so a weak publisher that overcommits to 3
-//! layers would stall its own main thread (the failure mode discussion #890 /
-//! #562 documents on 2-core Intel Macs).
+//! This module derives the maximum number of simulcast layers a device is
+//! **allowed** to encode, from cheap, stable device facts only: CPU core count
+//! and UA platform. Encoding N layers is ~N× the encode CPU, so a weak publisher
+//! that overcommits to 3 layers would stall its own main thread (the failure
+//! mode discussion #890 / #562 documents on 2-core Intel Macs).
+//!
+//! ## #1140 / #1141: the cold CPU benchmark no longer gates layer count
+//!
+//! Historically [`max_simulcast_layers`] also consumed
+//! `videocall_capability_score()` — a 100 ms `f64` multiply-add microbenchmark —
+//! and thresholded it against fixed cross-device constants (`SCORE_FOR_2_LAYERS`,
+//! `SCORE_FOR_3_LAYERS`) to pick 1/2/3 layers. That was a category error: the
+//! score measures scalar FP throughput in the wasm main thread, but running 2–3
+//! WebCodecs `VideoEncoder`s is bound by the hardware encode block, GPU/VRAM, and
+//! memory bandwidth — none of which the loop touches. Worse, the score's run-to-
+//! run noise band (~±1500 on the same machine) was *wider* than the decision
+//! boundary at 5000, so 87% of the fleet latched to a single layer on a coin
+//! flip (issue #1140).
+//!
+//! The score is now **observability-only** (a log-once preamble breadcrumb +
+//! the `client_capability_score` health field). It MUST NOT be read by any layer
+//! decision. The ceiling is `f(cores, platform)`; the *operating point* (how many
+//! layers are actually encoded) is earned at runtime by the `videocall-aq`
+//! control loop, which observes real encoder-queue backpressure + uplink budget
+//! and ramps up one layer at a time from a base of 1 (issue #1141). A generous
+//! ceiling is therefore safe — the runtime loop, not this function, realizes
+//! layers, and it sheds fast under backpressure.
 //!
 //! It is **not** a join gate. Per product decision (issue #1054) every client
 //! joins regardless of capabilities — there is no pre-join block or warning.
@@ -47,6 +68,21 @@ const MIN_CORES_FOR_MULTILAYER: u32 = 6;
 /// Cap for the `macOS 15*` older-Intel rule. Above this, modern Intel /
 /// Apple-Silicon Macs are typically fine.
 const OLDER_INTEL_MAC_15_CORE_CEILING: u32 = 8;
+
+/// At or above this core count the device is allowed the full 3-layer ladder
+/// (issue #1140 / #1141). Below it (but `>= MIN_CORES_FOR_MULTILAYER`) the
+/// ceiling is 2.
+///
+/// Chosen from stable, cheap device facts rather than the (now-removed) CPU
+/// microbenchmark: 10+ *logical* cores reliably distinguishes a genuinely
+/// capable publisher (modern Apple-Silicon M-series report 8–12, high-end
+/// desktops 12–16+) from the 6–8-core older-Intel laptops that the
+/// [`is_older_intel_mac`] rule already pins to a single layer. The bar is a
+/// *ceiling*, not an operating point: the `videocall-aq` runtime ramp earns the
+/// third layer only when observed backpressure headroom + uplink budget allow,
+/// and sheds it fast otherwise — so erring slightly generous here is safe (a
+/// false-high core-count bet is caught by the backpressure shed, never latched).
+const CORES_FOR_3_LAYERS: u32 = 10;
 
 /// Heuristic: does this look like an older Intel Mac that we should
 /// warn about for large meetings?
@@ -117,57 +153,106 @@ pub fn parse_platform_from_ua(user_agent: &str) -> String {
     String::new()
 }
 
-/// Simulcast capability ceiling (issue #989), derived from raw device inputs.
+/// Simulcast capability *ceiling* (issue #989 / #1140 / #1141), derived from
+/// cheap, stable device facts only: CPU `cores` and the UA `platform` token.
 ///
-/// Maps a device's CPU `cores`, UA `platform` token, its
-/// `videocall_capability_score()` (a synthetic per-device benchmark; higher =
-/// faster — see `videocall-client/src/capability.rs`), to the maximum number of
-/// simulcast layers the publisher should encode.
+/// **The CPU microbenchmark (`videocall_capability_score()`) is deliberately
+/// NOT a parameter** (issue #1140). It measured the wrong subsystem (scalar wasm
+/// FP throughput, not the HW encode block that actually runs the layers) and its
+/// run-to-run noise was wider than its old decision boundary, so it gated the
+/// fleet on a coin flip. The score remains a log-once observability breadcrumb
+/// (see `videocall-client/src/capability.rs`) but never reaches this decision.
 ///
-/// Encoding N layers is ~N× the encode CPU, so this is deliberately
-/// conservative — a weak publisher that overcommits to 3 layers would stall its
-/// own main thread (the exact failure mode discussion #890 / #562 documents on
-/// 2-core Intel Macs). Rules:
+/// Rules (a `ceiling`, not an operating point — see the module docs):
 ///
 /// * **1 layer** (single stream, byte-identical to pre-simulcast) when the
-///   device is at all marginal: `cores < 6` (this absorbs the old StrongWarn
-///   floor, and the old Block floor of `cores < 4` / unknown cores `== 0`
-///   collapses into it), OR an older Intel Mac (see [`is_older_intel_mac`]), OR
-///   a benchmark `score < 5000`.
-/// * **2 layers** for a non-marginal device with `5000 <= score < 30000`.
-/// * **3 layers** for a non-marginal device with `score >= 30000`.
+///   device is marginal: `cores < 6` (this absorbs the old StrongWarn floor, and
+///   the old Block floor of `cores < 4` / unknown cores `== 0` collapses into
+///   it, since `cores == 0` < 6), OR an older Intel Mac (see
+///   [`is_older_intel_mac`]).
+/// * **3 layers** for a non-marginal device with `cores >= 10`
+///   ([`CORES_FOR_3_LAYERS`]).
+/// * **2 layers** for any other non-marginal device (`6 <= cores < 10`).
 ///
-/// Note this is only the *capability ceiling*. The effective layer count the
-/// encoder uses is `min(this, experimentalSimulcastMaxLayers runtime flag)`,
-/// and the flag now defaults to 3 (feature ON, #1082) — so a high-end device
-/// emits up to 3 layers by default while a weak device is still gated down to 1
-/// (or 2) here regardless of the flag.
+/// This is only the ceiling; the *operating point* starts at 1 layer for
+/// everyone and is ramped up at runtime by the `videocall-aq` control loop
+/// (issue #1141) based on observed encoder-queue backpressure headroom + uplink
+/// budget. The effective ceiling the encoder is configured with is
+/// `min(this, experimentalSimulcastMaxLayers runtime flag)` (flag defaults to 3,
+/// #1082). Because the runtime loop realizes layers and sheds fast under
+/// backpressure, a generous ceiling here is safe — a false-high core-count bet
+/// is caught by the shed, never latched at load.
 ///
 /// The only non-test caller is the wasm32-gated `capability_max_simulcast_layers`
 /// below, so a native non-test build (e.g. `cargo clippy --all`) sees this as
 /// dead code; the `allow` keeps that build warning-free without hiding genuine
 /// dead code on wasm or in the host test build.
 #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
-pub fn max_simulcast_layers(cores: u32, platform: &str, score: u32) -> u32 {
-    const SCORE_FOR_2_LAYERS: u32 = 5000;
-    const SCORE_FOR_3_LAYERS: u32 = 30000;
-
+pub fn max_simulcast_layers(cores: u32, platform: &str) -> u32 {
     // `cores == 0` means navigator.hardwareConcurrency was unavailable /
-    // spoofed; treat unknown as marginal. `cores < 6` then also covers the old
-    // hard-block floor of `cores < 4`.
-    let marginal = cores < MIN_CORES_FOR_MULTILAYER
-        || is_older_intel_mac(platform, cores)
-        || score < SCORE_FOR_2_LAYERS;
+    // spoofed; treat unknown as marginal (`0 < 6`). `cores < 6` then also covers
+    // the old hard-block floor of `cores < 4`.
+    let marginal = cores < MIN_CORES_FOR_MULTILAYER || is_older_intel_mac(platform, cores);
 
     if marginal {
         return 1;
     }
 
-    if score >= SCORE_FOR_3_LAYERS {
+    if cores >= CORES_FOR_3_LAYERS {
         3
     } else {
-        // Not marginal, 5000 <= score < 30000.
+        // Non-marginal, 6 <= cores < 10.
         2
+    }
+}
+
+/// Apply the **TEST-ONLY** capability-ceiling override (issue #1093) to a sniffed
+/// ceiling.
+///
+/// `sniffed` is the device-derived ceiling from [`max_simulcast_layers`] (cores +
+/// platform). `override_layers` is `Some(n)` only when `config.js` explicitly set
+/// `testCapabilityMaxLayersOverride` (see
+/// [`crate::constants::test_capability_max_layers_override`]); it is `None` in
+/// every production / default-docker deployment. `ladder_depth` is the real
+/// simulcast ladder depth (`SIMULCAST_MAX_LAYERS`, currently 3) — passed in rather
+/// than referenced directly so this helper stays a pure function with no crate
+/// dependency, host-testable without a browser.
+///
+/// Semantics:
+///
+/// * `override_layers == None` → return `sniffed` **unchanged**. This is the only
+///   path taken when the key is absent, which is the only path that can run in
+///   production (the key is never shipped). The sniffed ceiling is the source of
+///   truth here.
+/// * `override_layers == Some(n)` → the override **REPLACES** `sniffed`, clamped
+///   into `[1, ladder_depth]`. A `0` (or any value below 1) becomes `1` — we never
+///   return a `0` ceiling, since `min(flag, 0)` would silently disable all video
+///   layers including the base stream. A value above `ladder_depth` is clamped
+///   down so a bogus config can't request more layers than the ladder defines.
+///
+/// This is deliberately the ONLY place the override is interpreted, so the clamp
+/// and 0-handling have a single host-tested definition. The caller
+/// ([`capability_max_simulcast_layers`]) is responsible for emitting the `warn!`
+/// when an override is active (it has the live context to log cores/platform); the
+/// `Some` arm here is what makes that warning fire.
+///
+/// Like [`max_simulcast_layers`], the only non-test caller is the wasm32-gated
+/// [`capability_max_simulcast_layers`], so the native non-test build sees this as
+/// dead code; the `allow` keeps that build warning-free.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn apply_capability_override(
+    sniffed: u32,
+    override_layers: Option<u32>,
+    ladder_depth: u32,
+) -> u32 {
+    match override_layers {
+        // No override configured (the only production-reachable path): the sniffed
+        // ceiling is authoritative.
+        None => sniffed,
+        // Override active: REPLACE the sniffed ceiling, clamped to a real layer
+        // count. `clamp(1, ladder_depth)` maps 0 → 1 (never disable the base
+        // stream) and any over-large value → ladder_depth.
+        Some(n) => n.clamp(1, ladder_depth.max(1)),
     }
 }
 
@@ -177,22 +262,27 @@ pub fn max_simulcast_layers(cores: u32, platform: &str, score: u32) -> u32 {
 // the host build (used by `cargo test --lib`) gets a conservative stub.
 // ---------------------------------------------------------------------------
 
-/// Device-capability ceiling on simulcast layers (issue #989), sniffed from
-/// the live browser environment.
+/// Device-capability ceiling on simulcast layers (issue #989 / #1140), sniffed
+/// from the live browser environment.
 ///
-/// Sniffs `navigator.hardwareConcurrency` + UA platform exactly once, reads the
-/// publisher CPU benchmark via
-/// `videocall_client::capability::videocall_capability_score()`, then applies
-/// [`max_simulcast_layers`]. Returns a conservative **1** if the browser
-/// globals are unreachable.
+/// Sniffs `navigator.hardwareConcurrency` + UA platform exactly once, then
+/// applies the pure [`max_simulcast_layers`] (cores + platform only). Returns a
+/// conservative **1** if the browser globals are unreachable.
 ///
-/// This is only the capability ceiling; the encoder uses
-/// `min(this, experimentalSimulcastMaxLayers runtime flag)`, and the flag now
-/// defaults to 3 (feature ON, #1082) — this ceiling is the weak-device safety floor.
+/// The CPU benchmark `videocall_capability_score()` is still *read and logged*
+/// here as an observability breadcrumb (issue #1140 keeps it alive as a
+/// log-once signal + the `client_capability_score` health field), but it is
+/// **NOT** passed to [`max_simulcast_layers`] — it no longer gates the layer
+/// count. Do not reintroduce a score threshold here or in any dashboard.
+///
+/// This is only the capability ceiling; the *operating point* starts at 1 layer
+/// and is ramped up at runtime by `videocall-aq` (issue #1141). The encoder is
+/// configured with `min(this, experimentalSimulcastMaxLayers runtime flag)`, and
+/// the flag now defaults to 3 (feature ON, #1082).
 ///
 /// wasm32-only: it sniffs `web_sys` navigator and calls
-/// `videocall_client::capability::videocall_capability_score()`, which is
-/// itself `#[cfg(target_arch = "wasm32")]`. The pure-logic
+/// `videocall_client::capability::videocall_capability_score()` (for the log
+/// only), which is itself `#[cfg(target_arch = "wasm32")]`. The pure-logic
 /// [`max_simulcast_layers`] above is available on host for unit testing.
 #[cfg(target_arch = "wasm32")]
 pub fn capability_max_simulcast_layers() -> u32 {
@@ -211,13 +301,46 @@ pub fn capability_max_simulcast_layers() -> u32 {
     let user_agent = navigator.user_agent().unwrap_or_default();
     let platform = parse_platform_from_ua(&user_agent);
 
+    // Observability breadcrumb ONLY (issue #1140): read + log the score, but do
+    // not feed it to the layer decision. Keeping the read here documents at the
+    // call site that the score is intentionally NOT a gate.
     let score = videocall_client::capability::videocall_capability_score();
     let older_intel = is_older_intel_mac(&platform, cores);
 
-    let layers = max_simulcast_layers(cores, &platform, score);
-    log::info!(
-        "simulcast capability ceiling: {layers} layer(s) (cores={cores} platform={platform:?} score={score} older_intel={older_intel})"
-    );
+    let sniffed = max_simulcast_layers(cores, &platform);
+
+    // TEST-ONLY override (issue #1093): if `config.js` set
+    // `testCapabilityMaxLayersOverride`, REPLACE the sniffed ceiling with the
+    // clamped override so the containerized e2e runner (low core count → sniffed
+    // == 1) can still exercise multi-layer SEND paths. The key is absent in every
+    // production / default-docker `config.js`, so `test_capability_max_layers_override()`
+    // returns `None` there and `apply_capability_override` is a pass-through.
+    //
+    // `SIMULCAST_MAX_LAYERS` is the real video ladder depth (the override is
+    // clamped to it so a bogus config can't request more layers than exist).
+    let override_layers = crate::constants::test_capability_max_layers_override();
+    let ladder_depth = videocall_client::adaptive_quality_constants::SIMULCAST_MAX_LAYERS as u32;
+    let layers = apply_capability_override(sniffed, override_layers, ladder_depth);
+
+    if let Some(requested) = override_layers {
+        // WARN (never info): an active capability override is a test-only affordance
+        // that must NEVER silently take effect in a real deployment. Surfacing it at
+        // warn! means that if this key ever leaks into a production `config.js` it is
+        // visible in the console / log pipeline rather than masquerading as a normal
+        // capability decision (issue #1093).
+        log::warn!(
+            "simulcast capability ceiling is TEST-OVERRIDDEN to {layers} layer(s) \
+             (requested testCapabilityMaxLayersOverride={requested}, clamped to \
+             [1, {ladder_depth}]); the device-sniffed ceiling was {sniffed} \
+             (cores={cores} platform={platform:?} older_intel={older_intel}). This is an \
+             e2e-only hook (issue 1093) and MUST NOT be set in production config.js."
+        );
+    } else {
+        log::info!(
+            "simulcast capability ceiling: {layers} layer(s) (cores={cores} platform={platform:?} \
+             older_intel={older_intel}); capability_score={score} (observability only — NOT a layer gate, issue 1140)"
+        );
+    }
     layers
 }
 
@@ -347,18 +470,22 @@ mod tests {
         assert_eq!(parse_platform_from_ua(""), "");
     }
 
-    // --- max_simulcast_layers (issue #989) ------------------------------
+    // --- max_simulcast_layers (issue #989 / #1140 / #1141) --------------
     //
-    // Boundary cases spanning every branch and both score thresholds. Inputs
-    // are now raw (cores, platform, score) rather than a precomputed verdict.
+    // The ceiling is a pure function of (cores, platform). The CPU benchmark
+    // score was REMOVED as a parameter in #1140 (it measured the wrong
+    // subsystem and gated on noise), so these boundary cases span only the
+    // cores/platform branches. There is intentionally no score argument: a
+    // reviewer mutating the function to re-add one would break compilation
+    // here and at every call site (compile-level pin).
 
     #[test]
     fn simulcast_low_cores_is_one_layer() {
         // The old hard-block floor (cores < 4 / unknown) collapses into the
-        // marginal `cores < 6` rule — both pin to 1 even with a huge score.
-        assert_eq!(max_simulcast_layers(0, "Windows 10", 99_999), 1);
-        assert_eq!(max_simulcast_layers(2, "Windows 10", 99_999), 1);
-        assert_eq!(max_simulcast_layers(3, "Windows 10", 99_999), 1);
+        // marginal `cores < 6` rule — both pin to 1.
+        assert_eq!(max_simulcast_layers(0, "Windows 10"), 1);
+        assert_eq!(max_simulcast_layers(2, "Windows 10"), 1);
+        assert_eq!(max_simulcast_layers(3, "Windows 10"), 1);
     }
 
     #[test]
@@ -366,7 +493,7 @@ mod tests {
         // The old StrongWarn floor (4 <= cores < 6) also pins to 1.
         for cores in 4..MIN_CORES_FOR_MULTILAYER {
             assert_eq!(
-                max_simulcast_layers(cores, "Windows 10", 99_999),
+                max_simulcast_layers(cores, "Windows 10"),
                 1,
                 "cores={cores} should pin to 1 layer"
             );
@@ -375,75 +502,198 @@ mod tests {
 
     #[test]
     fn simulcast_older_intel_is_one_layer() {
-        // Older Intel Mac pins to 1 even with plenty of cores + a high score.
-        // macOS 14 always, macOS 15 at/under the 8-core ceiling.
-        assert_eq!(max_simulcast_layers(8, "macOS 14", 99_999), 1);
-        assert_eq!(max_simulcast_layers(8, "macOS 15", 99_999), 1);
+        // Older Intel Mac pins to 1 even with plenty of cores: macOS 14 always,
+        // macOS 15 at/under the 8-core ceiling. (8 cores would otherwise be a
+        // 2-layer device, so this proves the older-Intel rule overrides the
+        // core bar.)
+        assert_eq!(max_simulcast_layers(8, "macOS 14"), 1);
+        assert_eq!(max_simulcast_layers(8, "macOS 15"), 1);
+        // Even a high core count on macOS 14 is pinned (macOS 14 always trips
+        // the rule), so the older-Intel guard beats the 3-layer core bar too.
+        assert_eq!(max_simulcast_layers(12, "macOS 14"), 1);
     }
 
     #[test]
-    fn simulcast_low_score_is_one_layer() {
-        // Capable cores but score just below the 2-layer threshold → 1.
-        assert_eq!(max_simulcast_layers(8, "Windows 10", 4999), 1);
+    fn simulcast_min_multilayer_cores_is_two_layers() {
+        // Exactly MIN_CORES_FOR_MULTILAYER (6) on a non-marginal platform is the
+        // lower boundary of the 2-layer band.
+        assert_eq!(
+            max_simulcast_layers(MIN_CORES_FOR_MULTILAYER, "Windows 10"),
+            2
+        );
+        // Just below the 3-layer core bar stays at 2.
+        assert_eq!(
+            max_simulcast_layers(CORES_FOR_3_LAYERS - 1, "Windows 10"),
+            2
+        );
     }
 
     #[test]
-    fn simulcast_mid_score_is_two_layers() {
-        // Lower boundary of the 2-layer band (inclusive).
-        assert_eq!(max_simulcast_layers(8, "Windows 10", 5000), 2);
-        // Just below the 3-layer threshold stays at 2.
-        assert_eq!(max_simulcast_layers(8, "Windows 10", 29_999), 2);
+    fn simulcast_high_core_count_is_three_layers() {
+        // Lower boundary of the 3-layer band (inclusive) and above.
+        assert_eq!(max_simulcast_layers(CORES_FOR_3_LAYERS, "Windows 10"), 3);
+        assert_eq!(max_simulcast_layers(16, "Windows 10"), 3);
+        // A modern (non-older-Intel) high-core Mac also gets 3.
+        assert_eq!(max_simulcast_layers(12, "macOS 26"), 3);
     }
 
     #[test]
-    fn simulcast_high_score_is_three_layers() {
-        // Lower boundary of the 3-layer band (inclusive).
-        assert_eq!(max_simulcast_layers(8, "Windows 10", 30_000), 3);
+    fn simulcast_ceiling_is_stable_for_same_inputs() {
+        // #1140: the same (cores, platform) must always yield the same ceiling
+        // — the old benchmark made this flip run-to-run on noise. The ceiling
+        // is now a pure function with no hidden input, so repeated calls are
+        // identical by construction; this pins that contract.
+        for _ in 0..100 {
+            assert_eq!(max_simulcast_layers(8, "Windows 10"), 2);
+            assert_eq!(max_simulcast_layers(12, "Windows 10"), 3);
+            assert_eq!(max_simulcast_layers(4, "Windows 10"), 1);
+        }
     }
 
-    /// Issue #1082: with simulcast now ON BY DEFAULT (flag = 3), the device
-    /// capability ceiling is the safety floor for weak devices. The effective
-    /// layer count the encoder uses is `min(flag, capability_ceiling)`, so a weak
-    /// device must still end up at 1 layer even though the flag default is 3.
-    /// This models that `min` at the host call site without a browser.
+    /// Issue #1082 / #1140: the device capability ceiling is the safety bound;
+    /// the effective layer count the encoder is configured with is
+    /// `min(flag, capability_ceiling)`. A weak device must end up at a ceiling
+    /// of 1 even though the flag default is 3. (The runtime ramp then governs
+    /// how many of the allowed layers are actually encoded — issue #1141.)
     #[test]
     fn default_on_still_gates_weak_device_to_one_layer() {
         const DEFAULT_FLAG: u32 = 3; // experimentalSimulcastMaxLayers default (issue 1082)
 
         // Unknown / very low cores (old Block floor) → ceiling 1 → effective 1.
-        let weak_block = max_simulcast_layers(0, "Windows 10", 0);
-        assert_eq!(DEFAULT_FLAG.min(weak_block), 1, "no-core device gated to 1");
+        assert_eq!(
+            DEFAULT_FLAG.min(max_simulcast_layers(0, "Windows 10")),
+            1,
+            "no-core device gated to 1"
+        );
 
         // Marginal cores (old StrongWarn floor) → ceiling 1 → effective 1.
-        let weak_warn = max_simulcast_layers(4, "Windows 10", 0);
         assert_eq!(
-            DEFAULT_FLAG.min(weak_warn),
+            DEFAULT_FLAG.min(max_simulcast_layers(4, "Windows 10")),
             1,
             "marginal-core device gated to 1"
         );
 
-        // Older Intel Mac (plenty of cores + high score) → ceiling 1 → effective 1.
-        let older_intel = max_simulcast_layers(8, "macOS 14", 99_999);
+        // Older Intel Mac (plenty of cores) → ceiling 1 → effective 1.
         assert_eq!(
-            DEFAULT_FLAG.min(older_intel),
+            DEFAULT_FLAG.min(max_simulcast_layers(8, "macOS 14")),
             1,
             "older Intel Mac gated to 1"
         );
 
-        // Low-benchmark capable device → ceiling 1 → effective 1.
-        let low_score = max_simulcast_layers(8, "Windows 10", 4999);
+        // Mid device → ceiling 2 → effective 2 (default flag does not force 3).
         assert_eq!(
-            DEFAULT_FLAG.min(low_score),
-            1,
-            "low-score device gated to 1"
+            DEFAULT_FLAG.min(max_simulcast_layers(8, "Windows 10")),
+            2,
+            "mid device runs 2 layers"
         );
 
-        // Mid device → ceiling 2 → effective 2 (default flag does not force 3).
-        let mid = max_simulcast_layers(8, "Windows 10", 5000);
-        assert_eq!(DEFAULT_FLAG.min(mid), 2, "mid device runs 2 layers");
-
         // Capable device → ceiling 3 → effective 3 (default-ON delivers full ladder).
-        let strong = max_simulcast_layers(8, "Windows 10", 30_000);
-        assert_eq!(DEFAULT_FLAG.min(strong), 3, "capable device runs 3 layers");
+        assert_eq!(
+            DEFAULT_FLAG.min(max_simulcast_layers(12, "Windows 10")),
+            3,
+            "capable device runs 3 layers"
+        );
+    }
+
+    // --- apply_capability_override (issue #1093, TEST-ONLY hook) ---------
+    //
+    // These pin the four behaviours the e2e override hook promises:
+    //   1. absent override  → sniffed ceiling unchanged (the production path),
+    //   2. present override → REPLACES the sniffed ceiling,
+    //   3. over-ladder      → clamped DOWN to the ladder depth,
+    //   4. zero             → clamped UP to 1 (never disable the base stream).
+    //
+    // The ladder depth used in the real call site is
+    // `videocall_client::adaptive_quality_constants::SIMULCAST_MAX_LAYERS`. The
+    // tests reference that SAME constant (not a literal `3`) so they track the real
+    // source of truth — if the ladder ever grows to 4, the clamp tests follow it
+    // automatically and a mutation that hardcodes the clamp bound would be caught.
+
+    /// The real ladder depth the production call site clamps to. Referencing the
+    /// crate constant (not a literal) keeps the override tests honest if the ladder
+    /// size changes.
+    const LADDER_DEPTH: u32 =
+        videocall_client::adaptive_quality_constants::SIMULCAST_MAX_LAYERS as u32;
+
+    #[test]
+    fn override_absent_passes_through_sniffed_ceiling() {
+        // The ONLY path reachable in production: no override key → return the
+        // sniffed ceiling verbatim, for every possible sniffed value.
+        for sniffed in 0..=LADDER_DEPTH + 2 {
+            assert_eq!(
+                apply_capability_override(sniffed, None, LADDER_DEPTH),
+                sniffed,
+                "absent override must not alter the sniffed ceiling {sniffed}"
+            );
+        }
+    }
+
+    #[test]
+    fn override_present_replaces_sniffed_ceiling() {
+        // The override REPLACES the sniffed value — it does not min/max/add to it.
+        // Sniffed 1 (the containerized-runner reality) + override 3 must yield 3,
+        // which is the whole point of the hook. Prove replacement (not min) by also
+        // checking the override can RAISE above the sniffed value.
+        assert_eq!(
+            apply_capability_override(1, Some(3), LADDER_DEPTH),
+            3,
+            "override 3 must raise a sniffed-1 ceiling to 3 (replace, not min)"
+        );
+        assert_eq!(
+            apply_capability_override(1, Some(2), LADDER_DEPTH),
+            2,
+            "override 2 replaces sniffed 1"
+        );
+        // And it can LOWER below the sniffed value too (pure replacement).
+        assert_eq!(
+            apply_capability_override(3, Some(1), LADDER_DEPTH),
+            1,
+            "override 1 replaces sniffed 3 (replace, not max)"
+        );
+    }
+
+    #[test]
+    fn override_above_ladder_depth_is_clamped_down() {
+        // A bogus config can't request more layers than the ladder defines.
+        assert_eq!(
+            apply_capability_override(1, Some(LADDER_DEPTH + 1), LADDER_DEPTH),
+            LADDER_DEPTH,
+            "override above ladder depth clamps to ladder depth"
+        );
+        assert_eq!(
+            apply_capability_override(1, Some(99), LADDER_DEPTH),
+            LADDER_DEPTH,
+            "absurd override clamps to ladder depth"
+        );
+        // Exactly at the ladder depth is allowed unchanged.
+        assert_eq!(
+            apply_capability_override(1, Some(LADDER_DEPTH), LADDER_DEPTH),
+            LADDER_DEPTH,
+            "override exactly at ladder depth is the max allowed"
+        );
+    }
+
+    #[test]
+    fn override_zero_is_clamped_to_one() {
+        // A `0` override must NEVER produce a 0 ceiling: `min(flag, 0)` would
+        // silently disable every video layer including the base stream. Treat 0 as
+        // "force single layer" (decided/documented in the helper + config doc).
+        assert_eq!(
+            apply_capability_override(2, Some(0), LADDER_DEPTH),
+            1,
+            "override 0 clamps UP to 1 (never disable the base stream)"
+        );
+    }
+
+    #[test]
+    fn override_one_forces_single_layer_even_on_capable_sniff() {
+        // Symmetric to the e2e force-multi case: an override of 1 must pin a capable
+        // device (sniffed 3) down to a single layer — useful for an OFF-path test
+        // that wants the single-stream behaviour on a beefy CI runner.
+        assert_eq!(
+            apply_capability_override(3, Some(1), LADDER_DEPTH),
+            1,
+            "override 1 forces single layer regardless of sniffed capability"
+        );
     }
 }

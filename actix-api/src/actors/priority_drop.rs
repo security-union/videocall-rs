@@ -61,12 +61,18 @@
 //! ### Behaviour on dropped packets
 //!
 //! When this module returns [`PriorityDropDecision::Drop`], the caller
-//! must still invoke `SessionLogic::on_outbound_drop` so the existing
-//! per-sender CONGESTION feedback path fires — otherwise senders whose
-//! video gets dropped will never be told to step down their tier.
+//! must still invoke `SessionLogic::on_outbound_drop`. Post-#1219 that no
+//! longer emits a sender-keyed CONGESTION signal (one slow receiver must not
+//! collapse the publisher's encode for the whole room); the publisher's own
+//! uplink distress is now detected client-side. What `on_outbound_drop` still
+//! does is call `CongestionTracker::record_drop`, which updates the
+//! per-RECEIVER `last_congestion` timestamp that relaxes this receiver's
+//! KEYFRAME_REQUEST rate limiter (#979) so its own frozen video can recover
+//! faster. So the preempt-drop here still feeds a per-receiver response — it
+//! just no longer drives the removed sender-keyed CONGESTION path.
 
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 
 /// Channel-fill ratio at which VIDEO and SCREEN media packets begin
 /// being dropped to make room for higher-priority audio and control.
@@ -120,16 +126,101 @@ impl OutboundPriority {
             return OutboundPriority::Control;
         }
         match packet_type {
+            // Media is the bulk of traffic. Refine on inner MediaType.
+            PacketType::MEDIA => match media_type {
+                Some(MediaType::AUDIO) => OutboundPriority::Audio,
+                Some(MediaType::VIDEO) => OutboundPriority::Video,
+                Some(MediaType::SCREEN) => OutboundPriority::Screen,
+                // HEARTBEAT, RTT echo replays, KEYFRAME_REQUEST relayed
+                // to senders, encrypted/unparseable inner — treat as
+                // control: low-volume, valuable, never preemptively
+                // dropped. (RTT echo never reaches Handler<Message>; it
+                // is handled inline in the inbound path. We include it
+                // here for completeness in case the classification is
+                // ever reused on that hot path.)
+                _ => OutboundPriority::Control,
+            },
+            // Non-media wrappers share their Critical/Control split with
+            // `classify_outer` (single source of truth for the Critical
+            // set).
+            other => Self::classify_non_media(other),
+        }
+    }
+
+    /// Map an outer [`PacketType`] plus the OUTER cleartext [`MediaKind`]
+    /// (`PacketWrapper.media_kind`, wire field 5) to an [`OutboundPriority`],
+    /// WITHOUT parsing the inner [`MediaPacket`].
+    ///
+    /// This is the variant used at the relay's **inbound NATS fan-out hop**
+    /// (`chat_server.rs` `handle_msg`), where the only thing available for
+    /// free is the already-parsed outer wrapper. Crucially, the inner
+    /// `MediaPacket.media_type` is AES-sealed when E2EE is enabled, so the
+    /// fan-out path MUST NOT depend on it — it classifies off the cleartext
+    /// outer `media_kind` the relay already reads for the #988/#989 filters.
+    ///
+    /// Fail-open contract (matches the #988/#989 filter convention):
+    /// * `parsed = false` (outer wrapper failed to decode) → `Control`
+    ///   (never preemptively shed something we could not classify).
+    /// * `media_kind` `UNSPECIFIED` or any unknown value → `Control`
+    ///   (older clients / non-discriminated packets are never shed).
+    /// * any non-`MEDIA` packet type → the SAME Critical/Control split as
+    ///   [`classify`] (so lifecycle/E2EE/CONGESTION packets are never shed
+    ///   at the fan-out hop either).
+    ///
+    /// Only `MEDIA` packets carrying a concrete VIDEO / AUDIO / SCREEN
+    /// `media_kind` map to the droppable [`OutboundPriority::Video`] /
+    /// [`OutboundPriority::Audio`] / [`OutboundPriority::Screen`] buckets.
+    ///
+    /// NOTE: this maps the OUTER `MediaKind` (VIDEO/AUDIO/SCREEN) onto the
+    /// same `OutboundPriority` variants `classify` derives from the INNER
+    /// `MediaType` — the two enums share VIDEO/AUDIO/SCREEN semantics, so a
+    /// well-formed publisher's outer `media_kind` agrees with its inner
+    /// `media_type`. The priority is only ever used to decide *which kind to
+    /// sacrifice first*; a (malicious) mismatch can only mis-bucket the
+    /// FORGER's own packet, never another peer's (same trust boundary as the
+    /// #989 layer filter).
+    pub fn classify_outer(parsed: bool, packet_type: PacketType, media_kind: MediaKind) -> Self {
+        if !parsed {
+            return OutboundPriority::Control;
+        }
+        match packet_type {
+            // Media is the bulk of traffic. Refine on the OUTER media_kind
+            // (cleartext, E2EE-safe) — never the inner MediaType.
+            PacketType::MEDIA => match media_kind {
+                MediaKind::AUDIO => OutboundPriority::Audio,
+                MediaKind::VIDEO => OutboundPriority::Video,
+                MediaKind::SCREEN => OutboundPriority::Screen,
+                // UNSPECIFIED (0) or any future/unknown kind → fail-open
+                // Control. A MEDIA packet without a usable discriminator is
+                // never preemptively sacrificed (matches the #988 viewport
+                // filter, which fails OPEN on UNSPECIFIED media_kind).
+                MediaKind::MEDIA_KIND_UNSPECIFIED => OutboundPriority::Control,
+            },
+            // Non-media wrappers: identical Critical/Control split to
+            // `classify` via the shared helper.
+            other => Self::classify_non_media(other),
+        }
+    }
+
+    /// Critical/Control classification for every NON-`MEDIA` [`PacketType`].
+    ///
+    /// Shared by [`classify`] and [`classify_outer`] so the Critical set is
+    /// defined in exactly ONE place: a future packet type promoted to (or
+    /// demoted from) Critical changes both the outbound-channel policy and
+    /// the inbound fan-out policy together, with no risk of drift.
+    fn classify_non_media(packet_type: PacketType) -> Self {
+        match packet_type {
             // SESSION_ASSIGNED is sent at most once per session at
             // start-up, but losing it would deny the client its session
             // identifier and break reconnection logic — keep it
             // protected even though it normally never collides with
             // outbound saturation.
             PacketType::SESSION_ASSIGNED => OutboundPriority::Critical,
-            // CONGESTION feedback is how a sender learns to back off;
-            // dropping it during saturation is exactly the wrong thing
-            // (the receiver is congested precisely because the sender
-            // does not yet know to slow down).
+            // CONGESTION remains a Critical control packet for
+            // compatibility with client-originated or externally injected
+            // packets. The relay no longer emits sender-keyed CONGESTION
+            // from receiver-downlink overflow, but if such a packet exists
+            // it must not be shed by the priority policy.
             PacketType::CONGESTION => OutboundPriority::Critical,
             // RSA_PUB_KEY and AES_KEY are both halves of the E2EE
             // handshake — RSA_PUB_KEY initiates the asymmetric step and
@@ -146,24 +237,11 @@ impl OutboundPriority {
             // HOST_MUTE_PARTICIPANT, …). Losing them desyncs the
             // host/participant UI from the server's authoritative state.
             PacketType::MEETING => OutboundPriority::Critical,
-            // Media is the bulk of traffic. Refine on inner MediaType.
-            PacketType::MEDIA => match media_type {
-                Some(MediaType::AUDIO) => OutboundPriority::Audio,
-                Some(MediaType::VIDEO) => OutboundPriority::Video,
-                Some(MediaType::SCREEN) => OutboundPriority::Screen,
-                // HEARTBEAT, RTT echo replays, KEYFRAME_REQUEST relayed
-                // to senders, encrypted/unparseable inner — treat as
-                // control: low-volume, valuable, never preemptively
-                // dropped. (RTT echo never reaches Handler<Message>; it
-                // is handled inline in the inbound path. We include it
-                // here for completeness in case the classification is
-                // ever reused on that hot path.)
-                _ => OutboundPriority::Control,
-            },
             // Remaining wrappers: CONNECTION, DIAGNOSTICS, HEALTH,
-            // PACKET_TYPE_UNKNOWN. Treated as Control: never preemptively
-            // dropped, only fail on actual channel overflow. This matches
-            // the prior uniform behaviour for these types.
+            // PEER_EVENT, KEYFRAME_REQUEST, PACKET_TYPE_UNKNOWN, … Treated
+            // as Control: never preemptively dropped, only fail on actual
+            // overflow. This matches the prior uniform behaviour for these
+            // types.
             _ => OutboundPriority::Control,
         }
     }
@@ -187,8 +265,8 @@ pub enum PriorityDropDecision {
     Admit,
     /// Drop the packet before enqueuing. The caller is responsible for
     /// incrementing the drop metrics with the embedded reason label and
-    /// for invoking `on_outbound_drop` so CONGESTION feedback still
-    /// fires for the sender.
+    /// for invoking `on_outbound_drop` so the drop is recorded for metrics
+    /// and the #979 keyframe-relax path.
     Drop {
         /// Stable metric label suitable for the
         /// `videocall_outbound_channel_drops_total{drop_reason=…}`
@@ -378,6 +456,170 @@ mod tests {
             OutboundPriority::classify(true, PacketType::DIAGNOSTICS, None),
             OutboundPriority::Control,
         );
+    }
+
+    // ----- classify_outer() coverage (inbound fan-out hop, #1145) ---------
+    //
+    // `classify_outer` keys off the OUTER cleartext `media_kind`, never the
+    // (E2EE-sealed) inner MediaType. These tests pin the shed taxonomy used
+    // at the relay's NATS fan-out hop. Each asserts a CONCRETE expected
+    // priority (not `X == X`), so flipping any single classification in the
+    // source (e.g. VIDEO → Control "never shed") makes the matching test
+    // fail loudly.
+
+    #[test]
+    fn classify_outer_video_kind_is_video_droppable() {
+        // VIDEO media is the first thing shed under fan-out pressure.
+        assert_eq!(
+            OutboundPriority::classify_outer(true, PacketType::MEDIA, MediaKind::VIDEO),
+            OutboundPriority::Video,
+        );
+        // ...and it carries a priority-drop label (is actually droppable).
+        assert_eq!(
+            OutboundPriority::classify_outer(true, PacketType::MEDIA, MediaKind::VIDEO)
+                .priority_drop_label(),
+            Some("priority_drop_video"),
+        );
+    }
+
+    #[test]
+    fn classify_outer_screen_kind_is_screen_droppable() {
+        // SCREEN shares the droppable video band (same label).
+        assert_eq!(
+            OutboundPriority::classify_outer(true, PacketType::MEDIA, MediaKind::SCREEN),
+            OutboundPriority::Screen,
+        );
+        assert_eq!(
+            OutboundPriority::classify_outer(true, PacketType::MEDIA, MediaKind::SCREEN)
+                .priority_drop_label(),
+            Some("priority_drop_video"),
+        );
+    }
+
+    #[test]
+    fn classify_outer_audio_kind_is_audio_protected_band() {
+        // AUDIO classifies to the Audio band — droppable only as a last
+        // resort (95% on the outbound channel); at the inbound hop it is
+        // still attributed distinctly from video so audio loss is alertable.
+        assert_eq!(
+            OutboundPriority::classify_outer(true, PacketType::MEDIA, MediaKind::AUDIO),
+            OutboundPriority::Audio,
+        );
+        assert_eq!(
+            OutboundPriority::classify_outer(true, PacketType::MEDIA, MediaKind::AUDIO)
+                .priority_drop_label(),
+            Some("priority_drop_audio"),
+        );
+    }
+
+    #[test]
+    fn classify_outer_unspecified_kind_fails_open_to_control() {
+        // UNSPECIFIED media_kind (older clients / no discriminator) must
+        // NEVER be preemptively shed — fail OPEN to Control, matching the
+        // #988 viewport filter convention. A Control priority has no
+        // priority-drop label (it is never preemptively dropped).
+        assert_eq!(
+            OutboundPriority::classify_outer(
+                true,
+                PacketType::MEDIA,
+                MediaKind::MEDIA_KIND_UNSPECIFIED
+            ),
+            OutboundPriority::Control,
+        );
+        assert_eq!(
+            OutboundPriority::classify_outer(
+                true,
+                PacketType::MEDIA,
+                MediaKind::MEDIA_KIND_UNSPECIFIED
+            )
+            .priority_drop_label(),
+            None,
+        );
+    }
+
+    #[test]
+    fn classify_outer_parse_fail_is_control() {
+        // Unparseable outer wrapper (`parsed=false`) → Control: never shed
+        // something we could not classify. The `media_kind` arg is ignored
+        // when `parsed=false`, but we pass VIDEO to prove the parse-fail
+        // guard wins over the media_kind (it would otherwise be droppable).
+        assert_eq!(
+            OutboundPriority::classify_outer(false, PacketType::MEDIA, MediaKind::VIDEO),
+            OutboundPriority::Control,
+        );
+    }
+
+    #[test]
+    fn classify_outer_keyframe_request_is_never_shed() {
+        // KEYFRAME_REQUEST is an INNER MediaType wrapped in a MEDIA packet
+        // (there is no `PacketType::KEYFRAME_REQUEST`). On the wire it is a
+        // MEDIA wrapper whose OUTER `media_kind` is UNSPECIFIED (keyframe
+        // requests carry no media_kind discriminator). Since classify_outer
+        // never parses the inner type, it sees `MEDIA + UNSPECIFIED` and must
+        // fail OPEN to Control — a dropped keyframe request leaves a receiver
+        // frozen, so it must never be preemptively shed. This is the
+        // E2EE-safe behaviour: even when the inner MediaType is sealed, the
+        // outer UNSPECIFIED kind protects it.
+        assert_eq!(
+            OutboundPriority::classify_outer(
+                true,
+                PacketType::MEDIA,
+                MediaKind::MEDIA_KIND_UNSPECIFIED
+            ),
+            OutboundPriority::Control,
+        );
+    }
+
+    #[test]
+    fn classify_outer_lifecycle_and_e2ee_packets_are_critical() {
+        // The Critical set must be IDENTICAL between classify_outer (inbound
+        // hop) and classify (outbound channel). Dropping any of these at the
+        // fan-out hop would break reconnection (SESSION_ASSIGNED), congestion
+        // control (CONGESTION), E2EE (RSA_PUB_KEY / AES_KEY), or host/UI state
+        // (MEETING). Pin each to Critical; a demotion to Control breaks this.
+        for pt in [
+            PacketType::SESSION_ASSIGNED,
+            PacketType::CONGESTION,
+            PacketType::RSA_PUB_KEY,
+            PacketType::AES_KEY,
+            PacketType::MEETING,
+        ] {
+            assert_eq!(
+                OutboundPriority::classify_outer(true, pt, MediaKind::MEDIA_KIND_UNSPECIFIED),
+                OutboundPriority::Critical,
+                "{pt:?} must be Critical at the inbound fan-out hop",
+            );
+        }
+    }
+
+    #[test]
+    fn classify_outer_critical_set_matches_classify() {
+        // Lockstep: classify_outer and classify share `classify_non_media`,
+        // so for every NON-media packet type they MUST agree. This guards
+        // the refactor — if a future edit forks the two Critical sets, this
+        // fails. We sweep the lifecycle/handshake/control types explicitly
+        // (comparing the two FUNCTIONS against each other, not a literal).
+        for pt in [
+            PacketType::SESSION_ASSIGNED,
+            PacketType::CONGESTION,
+            PacketType::RSA_PUB_KEY,
+            PacketType::AES_KEY,
+            PacketType::MEETING,
+            PacketType::DIAGNOSTICS,
+            PacketType::HEALTH,
+            PacketType::CONNECTION,
+            PacketType::PEER_EVENT,
+            PacketType::VIEWPORT,
+            PacketType::LAYER_PREFERENCE,
+            PacketType::LAYER_HINT,
+            PacketType::PACKET_TYPE_UNKNOWN,
+        ] {
+            assert_eq!(
+                OutboundPriority::classify_outer(true, pt, MediaKind::MEDIA_KIND_UNSPECIFIED),
+                OutboundPriority::classify(true, pt, None),
+                "classify_outer and classify disagree on non-media {pt:?}",
+            );
+        }
     }
 
     // ----- evaluate(): video / screen drop at 80% -------------------------

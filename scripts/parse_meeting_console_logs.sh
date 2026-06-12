@@ -68,6 +68,7 @@
 # | CameraEncoder: forcing keyframe             | pli_received_count  | videocall-client/src/encode/camera_encoder.rs          |
 # | AdaptiveQuality: video stepped DOWN         | aq_step_down_count  | videocall-aq/src/controller.rs                         |
 # | FPS: target=N received=N                    | pid_received_fps    | videocall-aq/src/controller.rs                         |
+# | Simulcast layer change: active N->M (reason=...) | simulcast_layer shed/restore counts + timeline | videocall-client/src/encode/camera_encoder.rs |
 # | network=                                    | net_downlink, net_rtt | preamble (Navigator.connection API)                  |
 # | battery=                                    | battery_state       | preamble (Navigator.getBattery API)                    |
 #
@@ -309,6 +310,35 @@ for key in "${ALL_KEYS[@]}"; do
       }
     }' 2>/dev/null || echo '{"n":0,"median_ms":null,"n_nonzero":0,"median_nonzero_ms":null}')
 
+  # Pass 3d: simulcast layer transitions — count shed (reason=shed-under-load)
+  # vs restore (reason=restore) events and capture the active-layer-count
+  # timeline from the event-driven "Simulcast layer change: active N->M
+  # (reason=...)" log (issues #1106 / #1107, emitter
+  # videocall-client/src/encode/camera_encoder.rs). This is a NEW, independent
+  # extraction — it does NOT touch the speaking/audio/FPS passes that feed
+  # median/n stats. A session with no layer changes (the common case: clean
+  # single-stream meetings, or simulcast meetings where the active count never
+  # moved) yields shed=0, restore=0, timeline="" — never an error.
+  simulcast_layer_stats=$(zcat "${files[@]}" 2>/dev/null | \
+    grep -oE 'active [0-9]+->[0-9]+ \(reason=(shed-under-load|restore)\)' 2>/dev/null | \
+    $AWK 'BEGIN { shed=0; restore=0; n=0 }
+    {
+      # $0 like: active 3->2 (reason=shed-under-load)
+      match($0, /active ([0-9]+)->([0-9]+)/, m)
+      if (m[1] != "" && m[2] != "") { tl[n++] = m[1] "->" m[2] }
+      if ($0 ~ /reason=shed-under-load/) { shed++ }
+      else if ($0 ~ /reason=restore/)    { restore++ }
+    }
+    END {
+      # JSON-safe: counts are ints; timeline is a comma-joined string of N->M
+      # transitions (empty string when there were none).
+      timeline = ""
+      for (i = 0; i < n; i++) {
+        timeline = (i == 0) ? tl[i] : timeline ", " tl[i]
+      }
+      printf "{\"shed\":%d,\"restore\":%d,\"timeline\":\"%s\"}\n", shed+0, restore+0, timeline
+    }' 2>/dev/null || echo '{"shed":0,"restore":0,"timeline":""}')
+
   # Pass 5: Keyframe requests sent, PLIs received, AQ step-downs, PID received FPS
   # Single zcat pass to avoid decompressing 150+ files multiple times
   read -r keyframe_requests pli_received aq_step_downs pid_received_median < <(
@@ -397,6 +427,7 @@ for key in "${ALL_KEYS[@]}"; do
     --argjson error_count "$error_count" \
     --argjson speaking_transitions "$speaking_transitions" \
     --argjson audio_buffer "$audio_buffer_stats" \
+    --argjson simulcast_layer "$simulcast_layer_stats" \
     --argjson keyframe_requests "$keyframe_requests" \
     --argjson pli_received "$pli_received" \
     --argjson aq_step_downs "$aq_step_downs" \
@@ -435,6 +466,7 @@ for key in "${ALL_KEYS[@]}"; do
       error_count: $error_count,
       speaking_transitions: $speaking_transitions,
       audio_buffer: $audio_buffer,
+      simulcast_layer: $simulcast_layer,
       keyframe_requests: $keyframe_requests,
       pli_received: $pli_received,
       aq_step_downs: $aq_step_downs,
@@ -650,6 +682,7 @@ if [[ "$OUTPUT_FORMAT" == "verify" ]]; then
     "KEYFRAME_REQUEST"
     "CameraEncoder: forcing keyframe"
     "stepped DOWN"
+    "Simulcast layer change:"
   )
 
   verify_failed=0
@@ -945,6 +978,30 @@ for email in "${!EMAIL_MAX_CONCURRENT[@]}"; do
   fi
 done
 [[ $has_concurrent -eq 0 ]] && echo "_None._"
+echo ""
+
+echo "### Simulcast Layer Changes (publisher shed/restore)"
+echo ""
+echo "_Event-driven \`Simulcast layer change: active N->M (reason=...)\` from the publisher's camera encoder (issue #1106, emitter \`videocall-client/src/encode/camera_encoder.rs\`). **shed** = active-layer count fell under load (\`reason=shed-under-load\`); **restore** = it rose again (\`reason=restore\`). Only simulcast publishers (n_layers > 1) emit this; single-stream sessions never do, so an empty section is normal. A high shed count with few restores = a publisher repeatedly losing its top layer under congestion._"
+echo ""
+has_simulcast_change=0
+for s in "${session_jsons[@]}"; do
+  sc_shed=$(echo "$s" | jq -r '.simulcast_layer.shed // 0')
+  sc_restore=$(echo "$s" | jq -r '.simulcast_layer.restore // 0')
+  # Only surface sessions that actually had at least one transition.
+  [[ "$sc_shed" == "0" && "$sc_restore" == "0" ]] && continue
+  has_simulcast_change=1
+  name=$(echo "$s" | jq -r '.display_name')
+  email=$(echo "$s" | jq -r '.email')
+  start=$(echo "$s" | jq -r '.start_human')
+  ttype=$(echo "$s" | jq -r '.transport_type')
+  timeline=$(echo "$s" | jq -r '.simulcast_layer.timeline // ""')
+  shed_flag=""
+  [[ "$sc_shed" -gt 3 ]] 2>/dev/null && shed_flag=" ⚠"
+  echo "- **${name} (${email}) @${start} [${ttype}]:** ${sc_shed} shed${shed_flag} / ${sc_restore} restore"
+  [[ -n "$timeline" ]] && echo "  - Timeline: ${timeline}"
+done
+[[ $has_simulcast_change -eq 0 ]] && echo "_None._"
 echo ""
 
 if [[ -n "$RELAY_WT" ]]; then

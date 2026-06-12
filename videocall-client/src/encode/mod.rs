@@ -50,6 +50,15 @@ pub trait MicrophoneEncoderTrait {
     fn select(&mut self, device_id: String) -> bool;
     fn set_enabled(&mut self, enabled: bool) -> bool;
     fn set_error_callback(&mut self, on_error: Callback<String>);
+    /// Set the user's SEND audio layer-ceiling (the perf-panel "layers published"
+    /// control). `ceiling` is a layer COUNT (`None` = Auto / full ladder). Applied
+    /// LIVE with no mic-encoder restart — see
+    /// [`MicrophoneEncoder::set_user_layer_ceiling`]. `&self` (interior mutability
+    /// via a shared atomic) so it can be called through the trait object the
+    /// `Host` holds.
+    fn set_user_layer_ceiling(&self, ceiling: Option<u32>);
+    /// The current user SEND audio layer-ceiling (layer COUNT), or `None` for Auto.
+    fn user_layer_ceiling(&self) -> Option<u32>;
 }
 
 // Implement trait for Safari microphone encoder
@@ -72,6 +81,14 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
     fn set_error_callback(&mut self, on_error: Callback<String>) {
         self.set_error_callback(on_error)
+    }
+
+    fn set_user_layer_ceiling(&self, ceiling: Option<u32>) {
+        self.set_user_layer_ceiling(ceiling)
+    }
+
+    fn user_layer_ceiling(&self) -> Option<u32> {
+        self.user_layer_ceiling()
     }
 }
 

@@ -40,5 +40,7 @@ pub mod color {
     pub const NETEQ_ORANGE: &str = "#fd7e14";
     pub const NETEQ_PURPLE: &str = "#6f42c1";
     pub const NETEQ_TEAL: &str = "#17a2b8";
-    pub const NETEQ_AMBER: &str = "#ffc107";
+    // `NETEQ_AMBER` was removed (#1131 cleanup): its only consumer was the
+    // SystemPerformance chart's "Avg Frames" series, which was deleted (the data
+    // was never populated). Re-add here if a new chart needs an amber series.
 }

@@ -79,6 +79,14 @@ const ID_TOKEN_KEY: &str = "vc_id_token";
 /// (display name, user ID) — the access token is treated as opaque.
 const ACCESS_TOKEN_KEY: &str = "vc_access_token";
 
+/// Session-storage key for the provider refresh token.
+///
+/// Like the access/id tokens this is session-scoped (browser `sessionStorage`
+/// on web; in-memory on native) and is **never persisted to disk**. It is only
+/// present on PKCE deployments where the IdP grants `offline_access`; on
+/// server-side-OAuth (cookie) deployments it is never set or read.
+const REFRESH_TOKEN_KEY: &str = "vc_refresh_token";
+
 /// Session-storage key for the user's canonical identifier extracted from the
 /// validated id_token payload (email if present, otherwise `sub`).
 const PROFILE_USER_ID_KEY: &str = "vc_profile_user_id";
@@ -130,6 +138,8 @@ pub fn store_id_token(token: &str) {
 /// Clear the stored id_token from session-scoped storage.
 pub fn clear_id_token() {
     SessionStorage::set(ID_TOKEN_KEY.to_string(), &None::<String>);
+    // Invalidate any in-flight refresh so its result is not written back.
+    bump_auth_clear_epoch();
 }
 
 // ---------------------------------------------------------------------------
@@ -163,6 +173,151 @@ pub fn store_access_token(token: &str) {
 /// even before the browser navigation to the logout endpoint completes.
 pub fn clear_access_token() {
     SessionStorage::set(ACCESS_TOKEN_KEY.to_string(), &None::<String>);
+    // Invalidate any in-flight refresh so its result is not written back.
+    bump_auth_clear_epoch();
+}
+
+// ---------------------------------------------------------------------------
+// Auth clear-epoch (logout-resurrection guard)
+// ---------------------------------------------------------------------------
+
+thread_local! {
+    static AUTH_CLEAR_EPOCH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn auth_clear_epoch() -> u64 {
+    AUTH_CLEAR_EPOCH.with(|e| e.get())
+}
+
+/// Invalidate any in-flight [`refresh_access_token`] so a refresh POST that
+/// resolves AFTER a token-clear/logout does NOT write tokens back into
+/// sessionStorage.
+///
+/// `refresh_access_token` snapshots this epoch before its network POST and
+/// compares it again after the POST resolves; a mismatch means a token-clear
+/// (logout calls `clear_*_token`, each of which bumps this) raced the in-flight
+/// refresh, so the result is discarded instead of being persisted. Without this,
+/// a logout that races an in-flight refresh would silently re-authenticate the
+/// user (the logout-resurrection hazard) until a hard reload.
+pub fn bump_auth_clear_epoch() {
+    AUTH_CLEAR_EPOCH.with(|e| e.set(e.get().wrapping_add(1)));
+}
+
+// ---------------------------------------------------------------------------
+// Refresh-token storage (PKCE flow only)
+// ---------------------------------------------------------------------------
+
+/// Read the stored provider refresh token from session-scoped storage.
+///
+/// Returns `None` when the IdP did not grant `offline_access`, when no OAuth
+/// exchange has been completed in this session, or when it was cleared.
+pub fn get_stored_refresh_token() -> Option<String> {
+    SessionStorage::get::<Option<String>>(&REFRESH_TOKEN_KEY.to_string())
+        .flatten()
+        .filter(|t| !t.is_empty())
+}
+
+/// Store the provider refresh token in session-scoped storage.
+///
+/// Called by the OAuth callback page after a successful exchange and on each
+/// successful refresh that rotates the token.
+pub fn store_refresh_token(token: &str) {
+    SessionStorage::set(REFRESH_TOKEN_KEY.to_string(), &Some(token.to_string()));
+}
+
+/// Clear the stored refresh token from session-scoped storage.
+pub fn clear_refresh_token() {
+    SessionStorage::set(REFRESH_TOKEN_KEY.to_string(), &None::<String>);
+    // Invalidate any in-flight refresh so its result is not written back.
+    bump_auth_clear_epoch();
+}
+
+/// Attempt to refresh the provider access/id token using the stored refresh
+/// token (PKCE flow only).
+///
+/// On success the new access token (and rotated id/refresh tokens, when the
+/// provider returns them) are written back to session storage, and the new
+/// Bearer credential is returned. Mirrors the access-token-preferred,
+/// id-token-fallback ordering used by
+/// [`meeting_api_client`](crate::constants::meeting_api_client).
+///
+/// No token VALUE is ever logged — only attempt/success/failure markers and
+/// the provider's (token-free) error string on failure.
+pub async fn refresh_access_token() -> Result<String, String> {
+    let refresh_token =
+        get_stored_refresh_token().ok_or_else(|| "no refresh token stored".to_string())?;
+    let token_endpoint = crate::constants::oauth_token_url()
+        .ok_or_else(|| "OAUTH_TOKEN_URL not configured".to_string())?;
+    let client_id = crate::constants::oauth_client_id()
+        .ok_or_else(|| "OAUTH_CLIENT_ID not configured".to_string())?;
+
+    log::info!("PKCE token refresh attempt");
+
+    // Snapshot the clear-epoch BEFORE the network POST. The matching compare
+    // happens strictly AFTER the await resolves (see the logout-resurrection
+    // guard below) — there is no RefCell borrow held across this await.
+    let start_epoch = auth_clear_epoch();
+
+    let resp = match pkce::refresh_with_provider(&token_endpoint, &refresh_token, &client_id).await
+    {
+        Ok(r) => r,
+        // `e` in both arms is the inner pkce-layer error string, which never
+        // contains the refresh_token value (verified: only the redacted
+        // status/length and the token-free provider error message are formatted
+        // into it).
+        Err(crate::pkce::RefreshError::Rejected(e)) => {
+            // Definitive provider rejection (invalid_grant / 4xx with error body):
+            // the refresh token is dead. Clear it so subsequent 401 waves skip
+            // straight to the login redirect instead of re-POSTing a doomed grant.
+            log::warn!("PKCE token refresh rejected by provider: {e}");
+            clear_refresh_token();
+            return Err(e);
+        }
+        Err(crate::pkce::RefreshError::Transient(e)) => {
+            // Network / CORS / 5xx / parse failure: the token may still be valid.
+            // Do NOT clear it — this request falls through to NotAuthenticated (login
+            // redirect for THIS request), but the token survives so the next 401 wave
+            // can retry. Important on the flaky-network profile this app targets.
+            log::warn!("PKCE token refresh failed (transient); token retained: {e}");
+            return Err(e);
+        }
+    };
+
+    // Logout-resurrection guard: if any token-clear (logout calls clear_*_token,
+    // each of which bumps the epoch) happened while this refresh POST was in
+    // flight, DROP the result instead of writing live tokens back into
+    // sessionStorage — otherwise a logout that races an in-flight refresh would
+    // silently re-authenticate the user until a hard reload.
+    if auth_clear_epoch() != start_epoch {
+        return Err("auth cleared during refresh; discarding result".into());
+    }
+
+    let new_access = resp.access_token.filter(|s| !s.is_empty());
+    // Bind the id_token (if any) before any move so it can serve as the Bearer
+    // fallback in the return value below.
+    let new_id = resp.id_token.filter(|s| !s.is_empty());
+    if let Some(ref it) = new_id {
+        store_id_token(it);
+    }
+    if let Some(ref at) = new_access {
+        store_access_token(at);
+    }
+    // Token rotation: providers (e.g. Okta) may return a new refresh_token that
+    // supersedes the old one. Persist it so the next refresh uses the current
+    // credential.
+    if let Some(rt) = resp.refresh_token.filter(|s| !s.is_empty()) {
+        store_refresh_token(&rt);
+    }
+
+    log::info!("PKCE token refresh succeeded");
+
+    if let Some(at) = new_access {
+        Ok(at)
+    } else if let Some(it) = new_id {
+        Ok(it)
+    } else {
+        Err("refresh response contained no token".to_string())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +470,7 @@ async fn resolve_oauth_params() -> Result<OAuthParams, String> {
             .unwrap_or_default()
     });
 
-    let scopes = oauth_scopes();
+    let scopes = ensure_offline_access(oauth_scopes());
 
     // Fast path: both values present in config.js.
     if let (Some(auth_url), Some(client_id)) = (oauth_auth_url(), oauth_client_id()) {
@@ -340,11 +495,13 @@ async fn resolve_oauth_params() -> Result<OAuthParams, String> {
         );
     }
 
-    let scopes = if !cfg.scopes.is_empty() {
+    // Re-apply the PKCE offline_access append: the backend-provided scopes have
+    // not passed through `ensure_offline_access` yet.
+    let scopes = ensure_offline_access(if !cfg.scopes.is_empty() {
         cfg.scopes
     } else {
         scopes
-    };
+    });
 
     Ok(OAuthParams {
         auth_url: cfg.auth_url,
@@ -352,6 +509,52 @@ async fn resolve_oauth_params() -> Result<OAuthParams, String> {
         redirect_url,
         scopes,
     })
+}
+
+/// Append `offline_access` to the OAuth scopes when running the PKCE flow, so
+/// the IdP issues a refresh_token enabling [`refresh_access_token`].
+///
+/// The append is **unconditional for PKCE** — an operator cannot opt out via
+/// `OAUTH_SCOPES`. This is deliberate: refresh support is required for PKCE
+/// deployments to survive a mid-meeting bearer expiry. If the IdP ignores or
+/// rejects `offline_access`, no refresh_token is issued and the flow degrades
+/// GRACEFULLY to the existing login-redirect on 401 — that is acceptable.
+///
+/// For cookie (server-side OAuth) mode this is a no-op: `resolve_oauth_params`
+/// is only reached in PKCE mode (do_login/redirect_to_login gate
+/// `start_oauth_flow` on `is_pkce_flow()`), so the inner guard is
+/// belt-and-suspenders.
+fn ensure_offline_access(scopes: String) -> String {
+    if !crate::constants::is_pkce_flow() {
+        return scopes;
+    }
+    append_offline_access(scopes)
+}
+
+/// Pure helper: append `offline_access` to a space-delimited scope string
+/// unless it is already present as a whole-word element.
+///
+/// Factored out of [`ensure_offline_access`] so the dedup/append/empty logic
+/// can be unit-tested on the host target without the runtime
+/// `is_pkce_flow()` config read. This is the entire body of the former
+/// PKCE-true branch — moving it here is behavior-preserving.
+///
+/// - empty input -> `"offline_access"`
+/// - already present (whole word) -> returned unchanged (no duplicate)
+/// - otherwise -> ` offline_access` appended
+///
+/// Membership is word-boundary, not substring: `offline_access_extra` does
+/// NOT count as present, so the scope is still appended.
+fn append_offline_access(scopes: String) -> String {
+    // Word-boundary membership: split on whitespace and look for an exact
+    // `offline_access` element, not a substring.
+    if scopes.split_whitespace().any(|s| s == "offline_access") {
+        scopes
+    } else if scopes.is_empty() {
+        "offline_access".to_string()
+    } else {
+        format!("{scopes} offline_access")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -591,4 +794,58 @@ pub fn load_pkce_state() -> Option<SavedPkceState> {
 /// Delegates to [`pkce::clear_pkce_state`].
 pub fn clear_pkce_state() {
     pkce::clear_pkce_state();
+}
+
+// ---------------------------------------------------------------------------
+// Tests (host-target, pure-Rust parts only)
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // `append_offline_access` is the pure dedup/append/empty body factored out
+    // of `ensure_offline_access` (which gates on the runtime `is_pkce_flow()`
+    // config read and so cannot be unit-tested in isolation on the host).
+
+    #[test]
+    fn append_offline_access_on_empty_string() {
+        // Empty input must yield exactly the scope, with no leading space.
+        // FAILS if the `is_empty()` branch is removed (the `format!` arm would
+        // produce " offline_access" with a leading space).
+        assert_eq!(append_offline_access(String::new()), "offline_access");
+    }
+
+    #[test]
+    fn append_offline_access_appends_when_absent() {
+        // FAILS if the append arm is broken (e.g. returns scopes unchanged).
+        assert_eq!(
+            append_offline_access("openid email profile".to_string()),
+            "openid email profile offline_access"
+        );
+    }
+
+    #[test]
+    fn append_offline_access_dedups_when_present() {
+        // Already present as a whole word -> returned unchanged, no duplicate.
+        // FAILS if the dedup guard is removed: the append arm would produce
+        // "openid offline_access email offline_access".
+        assert_eq!(
+            append_offline_access("openid offline_access email".to_string()),
+            "openid offline_access email"
+        );
+    }
+
+    #[test]
+    fn append_offline_access_word_boundary_not_substring() {
+        // `offline_access_extra` contains the substring but is NOT a whole-word
+        // match, so the scope must still be appended.
+        // FAILS if membership is changed to a substring check (e.g.
+        // `scopes.contains("offline_access")`), which would wrongly skip the
+        // append and return the input unchanged.
+        assert_eq!(
+            append_offline_access("openid offline_access_extra".to_string()),
+            "openid offline_access_extra offline_access"
+        );
+    }
 }

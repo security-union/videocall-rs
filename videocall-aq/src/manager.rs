@@ -1220,6 +1220,29 @@ impl AdaptiveQualityManager {
         self.active_layer_count = clamped;
     }
 
+    /// Configure the simulcast ladder CEILING to `n` but start the active count
+    /// at the BASE layer (1), to be earned up at runtime (issue #1140 / #1141).
+    ///
+    /// Unlike [`set_simulcast_layers`](Self::set_simulcast_layers) (which starts
+    /// all `n` layers active), this seeds `active_layer_count = 1` so the
+    /// publisher emits a single, legacy-equivalent stream at startup and the
+    /// `videocall-aq` headroom-probe ramp (see the controller's `tick`) adds
+    /// layers up to the ceiling only when observed backpressure + uplink budget
+    /// allow. Used by the CAMERA encoder path; screen share keeps the
+    /// all-layers-active semantics of `set_simulcast_layers`.
+    ///
+    /// `n` is clamped to `[1, SIMULCAST_MAX_LAYERS]`. A ceiling of `1` (or `0`)
+    /// leaves the manager in single-stream mode (active is already 1), inert.
+    /// Call once after construction, before the first tick.
+    pub fn set_simulcast_ceiling_start_at_base(&mut self, n: usize) {
+        let clamped = n.clamp(1, crate::constants::SIMULCAST_MAX_LAYERS);
+        self.simulcast_layer_count = clamped;
+        // Start at the base layer regardless of the ceiling; the ramp earns the
+        // rest. `min(clamped)` guards the degenerate ceiling==0→1 clamp case so
+        // active can never exceed the ceiling.
+        self.active_layer_count = 1.min(clamped);
+    }
+
     /// Number of simulcast layers in this session's ladder (the ceiling for
     /// [`active_layer_count`](Self::active_layer_count)).
     pub fn simulcast_layer_count(&self) -> usize {
@@ -1576,10 +1599,19 @@ mod tests {
     // as a proxy for "degrade" / "recover". This shim translates those FPS/bitrate
     // arguments into the new boolean decision using the HISTORICAL thresholds so
     // those tests keep their meaning without touching the production API. The
-    // `_effective_peer_count` arg is ignored on purpose: the small-peer-count
-    // lenient threshold was removed (a receiver's link no longer affects the
-    // sender), so the dedicated lenient/peer-count tests were deleted rather than
-    // shimmed.
+    // `_effective_peer_count` arg is ignored on purpose: the old small-peer-count
+    // *lenient backpressure threshold* was removed (a receiver's link no longer
+    // affects the sender's degrade/recover decision), so the dedicated
+    // lenient/peer-count tests were deleted rather than shimmed.
+    //
+    // NOTE (issue #1136): peer count IS used again as a publisher signal, but for
+    // a different decision and in a different place — the single-layer "pin to the
+    // `low` rung when >3 other peers" gate. That gate lives in
+    // `videocall-client`'s `camera_encoder.rs` (its AQ control loop reads the LIVE
+    // peer count from the client each tick), NOT in this manager: it caps the
+    // single stream's resolution/bitrate, it does not feed the tier state machine.
+    // So this manager still takes no peer count in production, and this shim's
+    // `_effective_peer_count` remains deliberately unused.
     impl AdaptiveQualityManager {
         fn update(
             &mut self,
@@ -3028,6 +3060,47 @@ mod tests {
             crate::constants::SIMULCAST_MAX_LAYERS,
             "over-large request clamps to ladder max"
         );
+    }
+
+    #[test]
+    fn test_set_simulcast_ceiling_start_at_base_starts_at_one() {
+        // Issue #1140/#1141: the camera path configures the CEILING but starts
+        // active at the base layer (1), to be earned up at runtime.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.set_simulcast_ceiling_start_at_base(3);
+        assert_eq!(
+            mgr.simulcast_layer_count(),
+            3,
+            "the ceiling must be configured to the requested count"
+        );
+        assert_eq!(
+            mgr.active_layer_count(),
+            1,
+            "active must START at the base layer, not the ceiling (start-at-base)"
+        );
+        assert!(
+            mgr.is_simulcast(),
+            "is_simulcast() must key off the CEILING (>1) so the ramp can run \
+             even at 1 active layer"
+        );
+        // The ramp can climb from the base up to the ceiling.
+        assert!(mgr.add_top_layer());
+        assert_eq!(mgr.active_layer_count(), 2);
+        assert!(mgr.add_top_layer());
+        assert_eq!(mgr.active_layer_count(), 3);
+        assert!(!mgr.add_top_layer(), "capped at the ceiling");
+    }
+
+    #[test]
+    fn test_set_simulcast_ceiling_start_at_base_one_is_single_stream() {
+        // A ceiling of 1 (or 0) is single-stream, exactly like set_simulcast_layers(1).
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.set_simulcast_ceiling_start_at_base(1);
+        assert!(!mgr.is_simulcast());
+        assert_eq!(mgr.active_layer_count(), 1);
+        mgr.set_simulcast_ceiling_start_at_base(0);
+        assert!(!mgr.is_simulcast(), "0 clamps to 1 (single-stream)");
+        assert_eq!(mgr.active_layer_count(), 1);
     }
 
     #[test]

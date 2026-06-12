@@ -189,12 +189,8 @@ pub struct HealthReporter {
     adaptive_video_tier: Rc<RefCell<Rc<AtomicU32>>>,
     /// Adaptive audio tier index from CameraEncoder (0=high, 3=emergency).
     adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
-    /// Encoder fps_ratio (f32 bits in AtomicU32). Wrapped in RefCell for late binding.
-    encoder_fps_ratio: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder p75 peer FPS (f32 bits in AtomicU32).
     encoder_p75_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
-    /// Encoder bitrate_ratio (f32 bits in AtomicU32).
-    encoder_bitrate_ratio: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder PID target bitrate kbps (f32 bits in AtomicU32).
     encoder_target_bitrate_kbps: Rc<RefCell<Rc<AtomicU32>>>,
     /// Screen share quality tier index.
@@ -203,6 +199,14 @@ pub struct HealthReporter {
     screen_sharing_active: Rc<RefCell<Rc<AtomicBool>>>,
     /// Encoder output FPS (camera).
     encoder_output_fps: Rc<RefCell<Arc<AtomicU32>>>,
+    /// #1143: camera encoder EFFECTIVE simulcast layer count (ladder depth the
+    /// publisher is configured to encode/send). Wrapped for late binding like the
+    /// other encoder sources; swapped in by `set_encoder_metric_sources`. Reads as
+    /// 0 (field omitted) until the encoder atom is wired.
+    effective_video_layers: Rc<RefCell<Rc<AtomicU32>>>,
+    /// #1143: camera encoder ACTIVE simulcast layer count (layers presently
+    /// encoded + sent; `<=` effective, the gap being AQ-shed layers).
+    active_video_layers: Rc<RefCell<Rc<AtomicU32>>>,
     /// Shared tier transition buffers (camera + screen, drained each health packet).
     tier_transitions: TierTransitionBuffers,
     /// Climb-rate limiter snapshot, updated by the encoder each tick.
@@ -398,15 +402,15 @@ impl HealthReporter {
             connection_controller: Rc::new(RefCell::new(None)),
             adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            encoder_fps_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(f32::NAN.to_bits())))),
             encoder_p75_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            encoder_bitrate_ratio: Rc::new(RefCell::new(Rc::new(AtomicU32::new(
-                f32::NAN.to_bits(),
-            )))),
             encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
             encoder_output_fps: Rc::new(RefCell::new(Arc::new(AtomicU32::new(0)))),
+            // #1143: 0 until the encoder atoms are wired by
+            // `set_encoder_metric_sources`; a 0 effective count omits the field.
+            effective_video_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            active_video_layers: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             tier_transitions: Rc::new(RefCell::new(Vec::new())),
             climb_limiter_snapshot: Rc::new(RefCell::new(Rc::new(RefCell::new(
                 ClimbLimiterSnapshot::default(),
@@ -509,9 +513,7 @@ impl HealthReporter {
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &mut self,
-        fps_ratio: Rc<AtomicU32>,
         p75_peer_fps: Rc<AtomicU32>,
-        bitrate_ratio: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
@@ -520,10 +522,10 @@ impl HealthReporter {
         screen_transitions: Rc<RefCell<Vec<TierTransitionRecord>>>,
         climb_limiter_snapshot: Rc<RefCell<ClimbLimiterSnapshot>>,
         dwell_samples: Rc<RefCell<Vec<(String, f64)>>>,
+        effective_video_layers: Rc<AtomicU32>,
+        active_video_layers: Rc<AtomicU32>,
     ) {
-        *self.encoder_fps_ratio.borrow_mut() = fps_ratio;
         *self.encoder_p75_peer_fps.borrow_mut() = p75_peer_fps;
-        *self.encoder_bitrate_ratio.borrow_mut() = bitrate_ratio;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
         *self.adaptive_screen_tier.borrow_mut() = screen_tier;
         *self.screen_sharing_active.borrow_mut() = screen_active;
@@ -531,6 +533,8 @@ impl HealthReporter {
         *self.tier_transitions.borrow_mut() = vec![camera_transitions, screen_transitions];
         *self.climb_limiter_snapshot.borrow_mut() = climb_limiter_snapshot;
         *self.dwell_samples.borrow_mut() = dwell_samples;
+        *self.effective_video_layers.borrow_mut() = effective_video_layers;
+        *self.active_video_layers.borrow_mut() = active_video_layers;
     }
 
     /// Start subscribing to real diagnostics events via videocall_diagnostics
@@ -729,6 +733,17 @@ impl HealthReporter {
                         }
                         "audio_buffer_ms" => {
                             if let MetricValue::U64(buffer_ms) = &metric.value {
+                                // NOTE: kept as a PERIODIC sample (logged every ~1 Hz
+                                // NetEQ tick per peer), NOT edge-triggered. The meeting
+                                // analyzer (`scripts/parse_meeting_console_logs.sh`)
+                                // computes n_samples / n_nonzero / median / median_nonzero
+                                // from this line as a uniform sample stream — change-point
+                                // logging would bias all four (a stable 150ms buffer would
+                                // report n=1, median=150 instead of the true distribution).
+                                // The large per-tick offenders demoted in this PR are
+                                // elsewhere (MEDIA receive, heartbeat, ConnectionManager,
+                                // Rendering-meeting-view, Host-render); this analyzer-
+                                // critical sample is left intact at debug!.
                                 debug!(
                                     "Updated audio health (buffer: {buffer_ms}ms) for peer: {target_peer} (from {reporting_peer})"
                                 );
@@ -1034,13 +1049,14 @@ impl HealthReporter {
         let connection_controller = Rc::downgrade(&self.connection_controller);
         let adaptive_video_tier = self.adaptive_video_tier.clone();
         let adaptive_audio_tier = self.adaptive_audio_tier.clone();
-        let encoder_fps_ratio = self.encoder_fps_ratio.clone();
         let encoder_p75_peer_fps = self.encoder_p75_peer_fps.clone();
-        let encoder_bitrate_ratio = self.encoder_bitrate_ratio.clone();
         let encoder_target_bitrate_kbps = self.encoder_target_bitrate_kbps.clone();
         let adaptive_screen_tier = self.adaptive_screen_tier.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
         let encoder_output_fps = self.encoder_output_fps.clone();
+        // #1143: send-side simulcast layer counts (camera encoder).
+        let effective_video_layers = self.effective_video_layers.clone();
+        let active_video_layers = self.active_video_layers.clone();
         let tier_transitions = self.tier_transitions.clone();
         let climb_limiter_snapshot = self.climb_limiter_snapshot.clone();
         let dwell_samples = self.dwell_samples.clone();
@@ -1119,14 +1135,8 @@ impl HealthReporter {
                             };
 
                         // Read encoder decision inputs from shared atomics (f32 bits → f64).
-                        let fps_ratio_val =
-                            f32::from_bits(encoder_fps_ratio.borrow().load(Ordering::Relaxed))
-                                as f64;
                         let p75_peer_fps_val =
                             f32::from_bits(encoder_p75_peer_fps.borrow().load(Ordering::Relaxed))
-                                as f64;
-                        let bitrate_ratio_val =
-                            f32::from_bits(encoder_bitrate_ratio.borrow().load(Ordering::Relaxed))
                                 as f64;
                         let target_bitrate_kbps_val = f32::from_bits(
                             encoder_target_bitrate_kbps.borrow().load(Ordering::Relaxed),
@@ -1135,6 +1145,11 @@ impl HealthReporter {
                         let screen_active_val =
                             screen_sharing_active.borrow().load(Ordering::Relaxed);
                         let output_fps_val = encoder_output_fps.borrow().load(Ordering::Relaxed);
+                        // #1143: live send-side simulcast layer counts.
+                        let effective_layers_val =
+                            effective_video_layers.borrow().load(Ordering::Relaxed);
+                        let active_layers_val =
+                            active_video_layers.borrow().load(Ordering::Relaxed);
 
                         // Drain tier transitions from all encoder buffers.
                         let mut drained_transitions = Vec::new();
@@ -1208,13 +1223,13 @@ impl HealthReporter {
                             videocall_transport::webtransport::datagram_drop_count(),
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
-                            fps_ratio_val,
                             p75_peer_fps_val,
-                            bitrate_ratio_val,
                             target_bitrate_kbps_val,
                             screen_tier_val,
                             screen_active_val,
                             output_fps_val,
+                            effective_layers_val,
+                            active_layers_val,
                             drained_transitions,
                             limiter_snap,
                             drained_dwells,
@@ -1235,7 +1250,12 @@ impl HealthReporter {
 
                         if let Some(packet) = health_packet {
                             send_callback.emit(packet);
-                            debug!("Sent health packet for session: {session_id_val}");
+                            // PER-TICK hot path: fires on every health-report
+                            // interval (~1 Hz per session). Demoted debug!->trace!
+                            // so it stays off even when console-log collection
+                            // bumps to Debug (#1100 follow-up). Not on the analyzer
+                            // keep-list.
+                            trace!("Sent health packet for session: {session_id_val}");
                         }
                     }
                 } else {
@@ -1267,13 +1287,14 @@ impl HealthReporter {
         datagram_drops_total: u64,
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
-        encoder_fps_ratio: f64,
         encoder_p75_peer_fps: f64,
-        encoder_bitrate_ratio: f64,
         encoder_target_bitrate_kbps: f64,
         adaptive_screen_tier: u32,
         screen_sharing_active: bool,
         encoder_output_fps: u32,
+        // #1143: send-side simulcast layer counts (camera). 0 = unwired/omitted.
+        effective_video_layers: u32,
+        active_video_layers: u32,
         tier_transitions: Vec<TierTransitionRecord>,
         climb_limiter: ClimbLimiterSnapshot,
         dwell_samples: Vec<(String, f64)>,
@@ -1342,9 +1363,6 @@ impl HealthReporter {
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
         // Encoder decision inputs (P0)
-        if encoder_fps_ratio.is_finite() {
-            pb.encoder_fps_ratio = Some(encoder_fps_ratio);
-        }
         if encoder_p75_peer_fps.is_finite() {
             pb.encoder_p75_peer_fps = Some(encoder_p75_peer_fps);
         }
@@ -1358,11 +1376,20 @@ impl HealthReporter {
         if encoder_output_fps > 0 {
             pb.encoder_output_fps = Some(encoder_output_fps);
         }
+
+        // #1143: send-side simulcast layer counts (camera). Gated on > 0 (same
+        // convention as encoder_output_fps): 0 means the encoder atoms have not
+        // been wired yet, which is not diagnostic — omit rather than emit a
+        // misleading 0. A wired single-stream publisher reports 1 (the
+        // inert-simulcast signal the dashboard alerts on). active is clamped to
+        // effective defensively so the gap can never read negative.
+        if effective_video_layers > 0 {
+            pb.effective_video_layers = Some(effective_video_layers);
+            pb.active_video_layers = Some(active_video_layers.min(effective_video_layers));
+        }
+
         if encoder_target_bitrate_kbps.is_finite() {
             pb.encoder_target_bitrate_kbps = Some(encoder_target_bitrate_kbps);
-        }
-        if encoder_bitrate_ratio.is_finite() {
-            pb.encoder_bitrate_ratio = Some(encoder_bitrate_ratio);
         }
 
         // Tier transition events (P2)
@@ -1516,6 +1543,12 @@ impl HealthReporter {
             if db.override_mode == 2 {
                 pb_db.override_fixed_n = db.override_fixed_n;
             }
+            // #1143: tiles ACTUALLY being decoded right now. `effective_cap` is
+            // the budget ceiling and `natural` is the unconstrained layout count;
+            // the realized decode set is the smaller of the two (a 10-tile cap
+            // with only 3 peers decodes 3, not 10). This is the per-client
+            // "videos showing" signal the observability issue asks for.
+            pb_db.active_set = db.effective_cap.min(db.natural);
             pb.decode_budget = ::protobuf::MessageField::some(pb_db);
         }
 
@@ -2021,13 +2054,13 @@ mod tests {
             0,
             0,
             0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
             0,
             false,
             0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -2099,13 +2132,13 @@ mod tests {
             0,
             0,
             0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
             0,
             false,
             0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -2153,13 +2186,13 @@ mod tests {
             0,
             0,
             0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
             0,
             false,
             0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),
@@ -2220,13 +2253,13 @@ mod tests {
             0,
             0,
             0,
-            0.0,
-            0.0,
-            0.0,
-            0.0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
             0,
             false,
             0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
             Vec::new(),
             ClimbLimiterSnapshot::default(),
             Vec::new(),

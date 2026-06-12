@@ -43,9 +43,10 @@
 //! * Both transport adapters are thin: they delegate to
 //!   `self.logic.handle_inbound(...)` and contain no observer/allowlist logic.
 //!
-//! A refactor that moves filtering into a transport-specific path would need to
-//! verify (or add) a WT-path test here.  Until then, WS coverage exercises the
-//! same enforcement code that a WT observer hits.
+//! A companion test file (`waiting_room_isolation_wt_tests.rs`) exercises the
+//! same isolation guarantees over WebTransport, covering both the UniStream and
+//! Datagram inbound paths as a regression guard for the transport-parity
+//! invariant.
 
 use actix::Actor;
 use actix_web::{web, App, HttpServer};
@@ -636,11 +637,18 @@ async fn test_observer_unparseable_packet_dropped() {
 
     // Alice should not receive anything from this
     let packets = collect_packets_for(&mut ws_a, Duration::from_secs(2)).await;
+    // LAYER_HINT is excluded: a lone admitted publisher triggers a relay-authored,
+    // self-addressed LAYER_HINT (a Suppress(0) recheck after the suppress debounce
+    // when there are no receivers). Post-#1108 this self-echo is intentionally
+    // delivered to the publisher's own subject, so it can land in this window on a
+    // slow runner. It is relay-authored control traffic, not the observer's garbage
+    // being forwarded, so it does not violate this test's intent.
     let non_meeting: Vec<_> = packets
         .iter()
         .filter(|p| {
             p.packet_type != PacketType::MEETING.into()
                 && p.packet_type != PacketType::SESSION_ASSIGNED.into()
+                && p.packet_type != PacketType::LAYER_HINT.into()
         })
         .collect();
     assert!(

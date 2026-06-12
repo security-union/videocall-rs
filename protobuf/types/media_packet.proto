@@ -19,6 +19,21 @@ message MediaPacket {
   AudioMetadata audio_metadata = 7;
   VideoMetadata video_metadata = 8;
   HeartbeatMetadata heartbeat_metadata = 9;
+  // Target relay session_id for a KEYFRAME_REQUEST (#1124). The inner
+  // `user_id` (field 2) names the target PARTICIPANT, but a single participant
+  // may have multiple concurrent publishing sessions; this names the specific
+  // target SESSION so the relay's keyframe rate-limiter can key per-session
+  // instead of per-user (two devices of one identity get independent budgets).
+  //
+  // Set by the requesting client (which knows each peer's relay session_id)
+  // ONLY on KEYFRAME_REQUEST packets, which are sent in cleartext (never
+  // E2EE-sealed — the relay must read the routing fields), so the relay can
+  // read this even when E2EE is on. Default 0 = unset: older clients omit it,
+  // and the relay then falls back to keying by `user_id` (preserving today's
+  // behaviour for them). Distinct from the OUTER `PacketWrapper.session_id`,
+  // which the relay stamps with the SOURCE session and must not be reused for
+  // a target.
+  uint64 target_session_id = 10;
 }
 
 message AudioMetadata {

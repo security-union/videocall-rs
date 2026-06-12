@@ -25,7 +25,7 @@ use std::sync::Arc;
 use futures::channel::mpsc::{self, Receiver, Sender};
 use futures::StreamExt;
 use js_sys::Date;
-use log::{debug, error, trace};
+use log::{error, trace};
 use videocall_types::Callback;
 use wasm_bindgen::JsValue;
 
@@ -420,8 +420,11 @@ impl DiagnosticWorker {
                 self.maybe_report_stats_to_ui();
             }
             DiagnosticEvent::HeartbeatTick => {
-                // Log heartbeat for debugging
-                debug!("Diagnostics heartbeat tick");
+                // PER-TICK hot path: fires on every diagnostics heartbeat (~1 Hz
+                // per stream). Demoted debug!->trace! so it stays off even when
+                // console-log collection bumps the ceiling to Debug (#1100
+                // follow-up). Not on the analyzer keep-list.
+                trace!("Diagnostics heartbeat tick");
 
                 // Always report stats on heartbeat
                 self.maybe_report_stats_to_ui();
@@ -502,12 +505,10 @@ impl DiagnosticWorker {
 
                     if *media_type == MediaType::AUDIO {
                         let mut audio_metrics = AudioMetrics::new();
-                        audio_metrics.fps_received = fps as f32;
                         audio_metrics.bitrate_kbps = bitrate as u32;
                         packet.audio_metrics = ::protobuf::MessageField::some(audio_metrics);
                     } else {
                         let mut video_metrics = VideoMetrics::new();
-                        video_metrics.fps_received = fps as f32;
                         video_metrics.bitrate_kbps = bitrate as u32;
                         packet.video_metrics = ::protobuf::MessageField::some(video_metrics);
                     }

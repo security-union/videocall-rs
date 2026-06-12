@@ -35,7 +35,7 @@ use crate::client::RefreshRoomTokenCallback;
 use crate::crypto::aes::Aes128State;
 use anyhow::{anyhow, Result};
 use gloo::timers::callback::Interval;
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use protobuf::Message;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1185,7 +1185,11 @@ impl ConnectionManager {
         // packets_received already counts inbound RTT echoes; excluding probes from
         // packets_sent made the two rates incomparable (ratio was meaningless).
         self.packets_sent.set(self.packets_sent.get() + 1);
-        debug!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
+        // PER-PROBE hot path: fires on every RTT probe (~1 Hz per connection,
+        // O(connections) during election). Demoted debug!->trace! (#1100/#1129
+        // follow-up); not on the meeting-analyzer keep-list (the analyzer reads
+        // the "RTT response received ..." line, not this send-side probe log).
+        trace!("Sent RTT probe to {connection_id} at timestamp {timestamp}");
         Ok(())
     }
 
@@ -3037,7 +3041,11 @@ impl ConnectionManager {
 
     /// Trigger diagnostics reporting (to be called externally at 1Hz)
     pub fn trigger_diagnostics_report(&mut self) {
-        debug!(
+        // PER-TICK hot path: fires once per connection on every 1 Hz diagnostics
+        // report (O(connections) churn during reconnection waves). Demoted
+        // debug!->trace! so it stays off even when console-log collection bumps
+        // the ceiling to Debug (#1100 follow-up). Not on the analyzer keep-list.
+        trace!(
             "ConnectionManager::trigger_diagnostics_report called - state: {:?}",
             self.election_state
         );
@@ -3185,7 +3193,9 @@ impl ConnectionManager {
 
     /// Report RTT metrics to diagnostics system
     fn report_diagnostics(&self) {
-        debug!(
+        // PER-TICK hot path: fires on every 1 Hz diagnostics report. Demoted
+        // debug!->trace! (#1100 follow-up) — see trigger_diagnostics_report.
+        trace!(
             "ConnectionManager::report_diagnostics - Active: {:?}, Election State: {:?}",
             self.active_connection_id.borrow(),
             self.election_state
@@ -3194,7 +3204,7 @@ impl ConnectionManager {
         let metrics = self.build_main_diagnostic_metrics();
 
         // Send overall connection manager state
-        debug!(
+        trace!(
             "ConnectionManager: Prepared {} metrics for main event: {:?}",
             metrics.len(),
             metrics
@@ -3207,12 +3217,12 @@ impl ConnectionManager {
                 metrics,
             };
 
-            debug!(
+            trace!(
                 "ConnectionManager: Sending main connection manager diagnostics event: {event:?}"
             );
             match global_sender().try_broadcast(event) {
                 Ok(_) => {
-                    debug!("ConnectionManager: Successfully sent main connection manager diagnostics event");
+                    trace!("ConnectionManager: Successfully sent main connection manager diagnostics event");
                 }
                 Err(e) => {
                     error!(
@@ -3283,7 +3293,7 @@ impl ConnectionManager {
 
             match global_sender().try_broadcast(event) {
                 Ok(_) => {
-                    debug!(
+                    trace!(
                         "ConnectionManager: Successfully sent server diagnostics for {}",
                         measurement.connection_id
                     );
@@ -3506,6 +3516,24 @@ impl ConnectionManager {
     pub fn is_connected(&self) -> bool {
         self.active_connection_id.borrow().is_some()
             && matches!(self.election_state, ElectionState::Elected { .. })
+    }
+
+    /// Whether THIS client's currently-active connection is WebTransport.
+    ///
+    /// In a broadcast relay each client elects exactly ONE transport for its
+    /// own uplink/downlink, so "am I on WebTransport" is a single client-wide
+    /// boolean — NOT a per-peer property. This reads the elected/active
+    /// `Connection` (the same one [`Self::get_active_connection`] resolves: the
+    /// winner in `connections`, or the preserved `old_active_connection` during
+    /// re-election) and reports its transport.
+    ///
+    /// Returns `false` when no connection is active yet (pre-election cold
+    /// start) — the safe default: no early-seed runs until a WebTransport
+    /// winner is actually elected.
+    pub fn active_is_webtransport(&self) -> bool {
+        self.get_active_connection()
+            .map(|conn| conn.is_webtransport())
+            .unwrap_or(false)
     }
 
     pub fn disconnect(&mut self) -> anyhow::Result<()> {
@@ -4165,7 +4193,7 @@ mod tests {
         // First call (attempt 1): base = 500*2 = 1000, jitter in [0, 500) -> delay in [1000, 1500)
         delay = next_backoff_delay(delay, RECONNECT_BACKOFF_MULTIPLIER, 1);
         assert!(
-            delay >= 1000 && delay < 1500,
+            (1000..1500).contains(&delay),
             "expected [1000, 1500), got {delay}"
         );
 
@@ -4214,7 +4242,7 @@ mod tests {
         // -> delay in [1000, 1500), capped at phase1 max (2000)
         let delay = next_backoff_delay(1000, 1.0, 1);
         assert!(
-            delay >= 1000 && delay <= RECONNECT_MAX_DELAY_PHASE1_MS,
+            (1000..=RECONNECT_MAX_DELAY_PHASE1_MS).contains(&delay),
             "expected [1000, {}], got {delay}",
             RECONNECT_MAX_DELAY_PHASE1_MS
         );
@@ -4775,10 +4803,12 @@ mod tests {
     #[test]
     fn rtt_degradation_minimum_floor_value() {
         // Verify the minimum floor constant is reasonable.
-        assert!(
-            REELECTION_RTT_MIN_THRESHOLD_MS >= 10.0,
-            "Minimum threshold should be at least 10ms to avoid localhost false positives"
-        );
+        const {
+            assert!(
+                REELECTION_RTT_MIN_THRESHOLD_MS >= 10.0,
+                "Minimum threshold should be at least 10ms to avoid localhost false positives"
+            );
+        }
     }
 
     // ===================================================================
@@ -4808,7 +4838,9 @@ mod tests {
         assert_eq!(RECONNECT_PHASE2_MAX_ATTEMPTS, 15);
         assert_eq!(RECONNECT_BACKOFF_MULTIPLIER, 2.0);
         // fast-fail limit tolerates network transitions but still catches auth failures
-        assert!(RECONNECT_CONSECUTIVE_ZERO_LIMIT <= 15);
+        const {
+            assert!(RECONNECT_CONSECUTIVE_ZERO_LIMIT <= 15);
+        }
     }
 
     // ===================================================================
@@ -5171,14 +5203,16 @@ mod tests {
 
     #[test]
     fn rtt_sanity_max_constant_is_reasonable() {
-        assert!(
-            RTT_SANITY_MAX_MS >= 5000.0,
-            "Sanity max should be at least 5s to allow legitimate slow connections"
-        );
-        assert!(
-            RTT_SANITY_MAX_MS <= 30_000.0,
-            "Sanity max should not exceed 30s"
-        );
+        const {
+            assert!(
+                RTT_SANITY_MAX_MS >= 5000.0,
+                "Sanity max should be at least 5s to allow legitimate slow connections"
+            );
+            assert!(
+                RTT_SANITY_MAX_MS <= 30_000.0,
+                "Sanity max should not exceed 30s"
+            );
+        }
     }
 
     // ===================================================================
@@ -5522,21 +5556,23 @@ mod tests {
         // generous enough to ignore normal scheduling jitter (which is
         // typically <50 ms on healthy machines) but small enough to catch
         // genuine stalls before they trip the existing detectors.
-        assert!(
-            CPU_OVERLOAD_DRIFT_THRESHOLD_MS >= 100.0,
-            "drift threshold must tolerate normal scheduling jitter"
-        );
-        assert!(
-            CPU_OVERLOAD_DRIFT_THRESHOLD_MS <= 2_000.0,
-            "drift threshold must catch stalls before REELECTION_CONSECUTIVE_SAMPLES (5s)"
-        );
-        // Suppression duration covers at least one full elevated-RTT cycle
-        // (REELECTION_CONSECUTIVE_SAMPLES at 1 Hz = ~5 s) so the post-stall
-        // RTT-probe backlog has time to drain.
-        assert!(
-            CPU_OVERLOADED_DURATION_MS >= 3_000.0,
-            "suppression must outlast at least one re-election sample window"
-        );
+        const {
+            assert!(
+                CPU_OVERLOAD_DRIFT_THRESHOLD_MS >= 100.0,
+                "drift threshold must tolerate normal scheduling jitter"
+            );
+            assert!(
+                CPU_OVERLOAD_DRIFT_THRESHOLD_MS <= 2_000.0,
+                "drift threshold must catch stalls before REELECTION_CONSECUTIVE_SAMPLES (5s)"
+            );
+            // Suppression duration covers at least one full elevated-RTT cycle
+            // (REELECTION_CONSECUTIVE_SAMPLES at 1 Hz = ~5 s) so the post-stall
+            // RTT-probe backlog has time to drain.
+            assert!(
+                CPU_OVERLOADED_DURATION_MS >= 3_000.0,
+                "suppression must outlast at least one re-election sample window"
+            );
+        }
         // Liveness window is roughly 2× the 1 Hz probe cadence — wide
         // enough for jitter, narrow enough to detect genuine silence.
         assert!(
@@ -5593,6 +5629,90 @@ mod tests {
             elected_at: 0.0,
         };
         assert!(mgr.is_connected());
+    }
+
+    // ===================================================================
+    // 7b. active_is_webtransport (#1179 local-transport early-seed gate)
+    // ===================================================================
+    //
+    // The early seed must gate on THIS client's LOCAL active transport, not on
+    // any peer's announced transport. These tests pin the accessor across the
+    // three lifecycle phases the gate can be evaluated in.
+
+    /// Pre-election (or fully disconnected): no active connection exists, so the
+    /// accessor reports NOT WebTransport — the safe default (no early seed runs).
+    ///
+    /// MUTATION CHECK: fails if the accessor's `unwrap_or(false)` is flipped to
+    /// `unwrap_or(true)` (cold start would falsely report WT).
+    #[test]
+    fn active_is_webtransport_false_pre_election() {
+        let mgr = make_test_manager();
+        assert!(!mgr.active_is_webtransport());
+    }
+
+    /// Active phase: the elected winner lives in `connections`. The accessor must
+    /// report THAT connection's transport — WS winner → false, WT winner → true.
+    ///
+    /// MUTATION CHECK: fails if the accessor reads anything other than the active
+    /// connection's transport (both arms pin opposite truth values).
+    #[test]
+    fn active_is_webtransport_reads_elected_winner_transport() {
+        // WebSocket winner.
+        let mut mgr = make_test_manager();
+        mgr.connections.insert(
+            "ws_0".to_string(),
+            Connection::new_for_test_with_transport(false),
+        );
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "ws_0".to_string(),
+            elected_at: 0.0,
+        };
+        assert!(
+            !mgr.active_is_webtransport(),
+            "elected WS winner → local transport is NOT WebTransport"
+        );
+
+        // WebTransport winner.
+        let mut mgr = make_test_manager();
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_with_transport(true),
+        );
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "wt_0".to_string(),
+            elected_at: 0.0,
+        };
+        assert!(
+            mgr.active_is_webtransport(),
+            "elected WT winner → local transport IS WebTransport"
+        );
+    }
+
+    /// Re-election phase: the current winner has been moved out of `connections`
+    /// into `old_active_connection` for media continuity, while
+    /// `active_connection_id` still points at it. The accessor must follow the
+    /// SAME resolution as `get_active_connection` and report the preserved
+    /// connection's transport (here: WebTransport).
+    ///
+    /// MUTATION CHECK: fails if the accessor stops consulting
+    /// `old_active_connection` (it would find nothing in `connections` and fall
+    /// back to `false`, contradicting the WT assertion).
+    #[test]
+    fn active_is_webtransport_reads_old_connection_during_reelection() {
+        let mut mgr = make_test_manager();
+        // Winner preserved during re-election: not in `connections`, lives in
+        // `old_active_connection`; `active_connection_id` still points at it.
+        mgr.old_active_connection = Some((
+            "wt_old".to_string(),
+            Connection::new_for_test_with_transport(true),
+        ));
+        *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
+        assert!(
+            mgr.active_is_webtransport(),
+            "during re-election the preserved WT connection's transport is read"
+        );
     }
 
     // ===================================================================

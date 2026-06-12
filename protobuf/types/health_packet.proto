@@ -121,8 +121,10 @@ message HealthPacket {
   optional uint64 keyframe_requests_sent_total = 23; // Cumulative keyframe requests sent (PLI)
   optional uint64 websocket_drops_total = 24; // Cumulative WebSocket packets dropped (backpressure)
 
-  // Encoder decision inputs (P0: exposes the adaptive quality controller's reasoning)
-  optional double encoder_fps_ratio = 25;          // Ratio of received FPS to target FPS driving tier decisions
+  // Field 25 (encoder_fps_ratio) removed in #1184: dead encoder-decision telemetry.
+  // The NaN-guarded atomic was a dead control input — only ever written, never read.
+  reserved 25;
+  reserved "encoder_fps_ratio";
   reserved 26;                                     // Was: encoder_worst_peer_fps. Replaced by encoder_p75_peer_fps (field 67) in PR #658; legacy emitters/readers removed in #366.
   reserved "encoder_worst_peer_fps";
   optional uint32 adaptive_screen_tier = 27;       // Screen share quality tier index (0=high, 1=medium, 2=low)
@@ -131,7 +133,10 @@ message HealthPacket {
   // Encoder outputs (P1: completes the encoder decision chain)
   optional uint32 encoder_output_fps = 29;         // Actual frames/sec the camera encoder is producing
   optional double encoder_target_bitrate_kbps = 30; // PID controller computed target bitrate in kbps
-  optional double encoder_bitrate_ratio = 31;      // Ratio of current bitrate to ideal bitrate for tier
+  // Field 31 (encoder_bitrate_ratio) removed in #1184: dead encoder-decision
+  // telemetry. The NaN-guarded atomic was a dead control input — never read.
+  reserved 31;
+  reserved "encoder_bitrate_ratio";
 
   // P2: Tier transition events since last health packet
   repeated TierTransition tier_transitions = 32;
@@ -227,6 +232,25 @@ message HealthPacket {
   optional uint64 reelection_aborted_total = 72;
   optional uint64 reelection_preserved_total = 73;
   optional uint64 reelection_failed_total = 74;
+
+  // Send-side simulcast layer counts (#1143). Today the "is simulcast actually
+  // engaging?" question is answerable only from console logs; these surface the
+  // publisher's live layer state so a dashboard can alert when p90==1 (inert
+  // simulcast). Mirrors the SimulcastSendSnapshot the #1095 UI panel already
+  // reads from the camera encoder's shared atomics. Camera/screen are folded
+  // into one number per kind via media_kind on the server gauge; the camera is
+  // the primary signal so these report the CAMERA encoder's state. Absent in
+  // single-stream builds is fine — a value of 1 is itself the inert signal.
+  //
+  // effective_video_layers = the number of simulcast video layers the publisher
+  // is currently configured to encode/send (the ladder depth, min(flag,
+  // capability)). Stable across PR #1135/#1136's threshold retune, which changes
+  // WHEN this is >1, not its meaning.
+  optional uint32 effective_video_layers = 75;
+  // active_video_layers = how many of those layers are CURRENTLY active
+  // (encoded + sent). The AQ controller sheds the top layer(s) under congestion,
+  // so this can be < effective_video_layers. The gap is the shed depth.
+  optional uint32 active_video_layers = 76;
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the
@@ -240,6 +264,14 @@ message DecodeBudget {
   OverrideMode override_mode = 4;  // Auto vs Fixed
   // Set only when override_mode == OVERRIDE_MODE_FIXED: the user's hard tile cap.
   uint32 override_fixed_n = 5;
+
+  // Tiles actually being decoded right now = min(effective_cap, natural)
+  // (#1143). `effective_cap` is the BUDGET ceiling and `natural` is what the
+  // layout WOULD show unconstrained; neither alone answers "how many videos is
+  // this client actually decoding?" when the layout has fewer tiles than the
+  // cap allows. This is that number — the per-client "videos showing" signal the
+  // observability issue asks for.
+  uint32 active_set = 6;
 
   // Manual override mode for the controller.
   enum OverrideMode {

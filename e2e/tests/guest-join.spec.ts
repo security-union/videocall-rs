@@ -1,6 +1,11 @@
 import { test, expect, chromium, Page, Locator } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
-import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import {
+  BROWSER_ARGS,
+  DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT,
+  createAuthenticatedContext,
+} from "../helpers/auth-context";
+import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
@@ -89,6 +94,18 @@ async function ensureJoinedFromTransition(joinButton: Locator, grid: Locator): P
   await expect(grid).toBeVisible({ timeout: 15_000 });
 }
 
+async function createGuestContext(
+  browser: Awaited<ReturnType<typeof chromium.launch>>,
+  uiURL: string,
+) {
+  const context = await browser.newContext({
+    baseURL: uiURL,
+    ignoreHTTPSErrors: true,
+  });
+  await context.addInitScript(DEFAULT_WEBSOCKET_TRANSPORT_INIT_SCRIPT);
+  return context;
+}
+
 test.describe("Guest join flow", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -111,10 +128,7 @@ test.describe("Guest join flow", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
       // Open the guest join page in a new context (no auth cookie)
-      const guestCtx = await browser.newContext({
-        baseURL: uiURL,
-        ignoreHTTPSErrors: true,
-      });
+      const guestCtx = await createGuestContext(browser, uiURL);
       const guestPage = await guestCtx.newPage();
       await guestPage.goto(`/meeting/${meetingId}/guest`);
       await guestPage.waitForTimeout(1500);
@@ -142,10 +156,7 @@ test.describe("Guest join flow", () => {
 
     const browser = await chromium.launch({ args: BROWSER_ARGS });
     try {
-      const guestCtx = await browser.newContext({
-        baseURL: uiURL,
-        ignoreHTTPSErrors: true,
-      });
+      const guestCtx = await createGuestContext(browser, uiURL);
       const guestPage = await guestCtx.newPage();
       await guestPage.goto(`/meeting/${meetingId}/guest`);
       await guestPage.waitForTimeout(1500);
@@ -182,10 +193,7 @@ test.describe("Guest join flow", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
       // Open guest join page
-      const guestCtx = await browser.newContext({
-        baseURL: uiURL,
-        ignoreHTTPSErrors: true,
-      });
+      const guestCtx = await createGuestContext(browser, uiURL);
       const guestPage = await guestCtx.newPage();
       await guestPage.goto(`/meeting/${meetingId}/guest`);
       await guestPage.waitForTimeout(1500);
@@ -202,10 +210,13 @@ test.describe("Guest join flow", () => {
       const joinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
       const grid = guestPage.locator("#grid-container");
 
-      const guestResult = await Promise.race([
-        joinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),
-        grid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
-      ]);
+      const guestResult = await waitForVisibleState(
+        [
+          { name: "join-button", locator: joinButton },
+          { name: "grid", locator: grid },
+        ],
+        20_000,
+      );
 
       if (guestResult === "join-button") {
         await guestPage.waitForTimeout(1000);
@@ -239,10 +250,7 @@ test.describe("Guest join flow", () => {
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
       // Open guest join page in a separate browser
-      const guestCtx = await browser2.newContext({
-        baseURL: uiURL,
-        ignoreHTTPSErrors: true,
-      });
+      const guestCtx = await createGuestContext(browser2, uiURL);
       const guestPage = await guestCtx.newPage();
       await guestPage.goto(`/meeting/${meetingId}/guest`);
       await guestPage.waitForTimeout(1500);
@@ -267,10 +275,13 @@ test.describe("Guest join flow", () => {
       const guestJoinButton = guestPage.getByRole("button", { name: /Join Meeting|Start Meeting/ });
       const guestGrid = guestPage.locator("#grid-container");
 
-      const postAdmit = await Promise.race([
-        guestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join-button" as const),
-        guestGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
-      ]);
+      const postAdmit = await waitForVisibleState(
+        [
+          { name: "join-button", locator: guestJoinButton },
+          { name: "grid", locator: guestGrid },
+        ],
+        20_000,
+      );
 
       if (postAdmit === "join-button") {
         await guestPage.waitForTimeout(1000);
@@ -347,10 +358,13 @@ test.describe("Guest join flow", () => {
         name: /Join Meeting|Start Meeting/,
       });
       const admittedGuestGrid = admittedGuestPage.locator("#grid-container");
-      const admittedTransition = await Promise.race([
-        admittedGuestJoinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
-        admittedGuestGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
-      ]);
+      const admittedTransition = await waitForVisibleState(
+        [
+          { name: "join", locator: admittedGuestJoinButton },
+          { name: "grid", locator: admittedGuestGrid },
+        ],
+        20_000,
+      );
 
       if (admittedTransition === "join") {
         await ensureJoinedFromTransition(admittedGuestJoinButton, admittedGuestGrid);
@@ -399,10 +413,13 @@ test.describe("Guest join flow", () => {
         name: /Join Meeting|Start Meeting/,
       });
       const waitingGuestGrid = waitingGuestPage.locator("#grid-container");
-      const waitingTransition = await Promise.race([
-        waitingGuestJoinButton.waitFor({ timeout: 60_000 }).then(() => "join" as const),
-        waitingGuestGrid.waitFor({ timeout: 60_000 }).then(() => "grid" as const),
-      ]);
+      const waitingTransition = await waitForVisibleState(
+        [
+          { name: "join", locator: waitingGuestJoinButton },
+          { name: "grid", locator: waitingGuestGrid },
+        ],
+        60_000,
+      );
 
       if (waitingTransition === "join") {
         await ensureJoinedFromTransition(waitingGuestJoinButton, waitingGuestGrid);
@@ -421,10 +438,7 @@ test.describe("Guest join flow", () => {
 
     const browser = await chromium.launch({ args: BROWSER_ARGS });
     try {
-      const guestCtx = await browser.newContext({
-        baseURL: uiURL,
-        ignoreHTTPSErrors: true,
-      });
+      const guestCtx = await createGuestContext(browser, uiURL);
       const guestPage = await guestCtx.newPage();
       await guestPage.goto(`/meeting/${meetingId}/guest`);
       await guestPage.waitForTimeout(1500);
@@ -462,10 +476,7 @@ test.describe("Guest join flow", () => {
 
     const browser = await chromium.launch({ args: BROWSER_ARGS });
     try {
-      const guestCtx = await browser.newContext({
-        baseURL: uiURL,
-        ignoreHTTPSErrors: true,
-      });
+      const guestCtx = await createGuestContext(browser, uiURL);
       const guestPage = await guestCtx.newPage();
       await guestPage.goto(`/meeting/${meetingId}/guest`);
       await guestPage.waitForTimeout(1500);

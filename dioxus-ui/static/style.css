@@ -506,6 +506,40 @@ h3 {
   background-color: var(--surface);
 }
 
+/* #1142 Phase 1, Part C: device-paused avatar polish. A subtle dim + a small
+   pause-glyph badge distinguish "paused by your device" (decode budget) from a
+   normal camera-off tile. The dim is applied to the placeholder content only
+   (not the whole tile chrome) so the name, mic indicator, and signal meter stay
+   at full contrast — audio affordances must remain legible. */
+.placeholder-content.placeholder-content--paused {
+  position: relative;
+  opacity: 0.82;
+}
+
+.decode-paused-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  width: 22px;
+  height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-pill, 999px);
+  background: var(--btn-warning-bg);
+  color: var(--warning);
+  box-shadow: 0 0 0 1px var(--btn-warning-border);
+  pointer-events: none;
+}
+
+/* Override the generic `.placeholder-content svg` sizing/tint for the badge
+   glyph: it is a small amber pause icon, not the large tertiary PeerIcon. */
+.decode-paused-badge svg {
+  width: 14px;
+  height: 14px;
+  fill: currentColor;
+}
+
 /* ============================================================
    Mobile: narrower gap/padding
    Keep breakpoint + values in sync with attendants.rs (vw < 568.0)
@@ -607,7 +641,9 @@ h3 {
     padding: 0 15px !important;
   }
   #diagnostics-sidebar .diagnostics-section {
-    margin-bottom: 25px !important;
+    /* Zero the additive margin — `.sidebar-content` flex `gap` spaces sections
+       (Fix A). Padding / background / radius keep the mobile card look. */
+    margin-bottom: 0 !important;
     padding: 15px !important;
     background-color: var(--field-bg) !important;
     border-radius: 8px !important;
@@ -982,16 +1018,148 @@ select {
 
 #diagnostics-sidebar {
   position: fixed;
-  right: -650px;
+  /* Widened 650 → 720 so the two-column per-kind perf cards stay 2-col at this
+     width (card container ~662px → ~315px/col). Closed offset matches the
+     width. (#1131 unify) */
+  right: -720px;
   top: 0;
   height: 100%;
-  width: 650px;
+  width: 720px;
   background-color: var(--surface-elevated);
-  color: white;
+  /* Use the theme text token (not hard-coded white) so the migrated perf text +
+     the drawer body read correctly in BOTH themes. Dark theme additionally
+     remaps --text-* to the settings-modal tokens below. (#1131 §5) */
+  color: var(--text-primary);
   transition: right 0.3s ease;
   z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
+}
+
+/* Theme compliance (#1131 §5): the `.perf-*` text uses --text-primary/-secondary/
+   -tertiary. Inside the settings modal those are remapped to the white
+   settings-modal tokens for dark theme; mirror that remap for the drawer so the
+   migrated controls read identically. Light theme defines no settings-modal text
+   tokens (the light modal uses the default light --text-* tokens), so the drawer
+   inherits the correct light tokens via `color: var(--text-primary)` above — no
+   light remap needed (a remap to the undefined dark tokens would break it). */
+html[data-theme="dark"] #diagnostics-sidebar {
+  --text-primary: var(--settings-modal-text-primary);
+  --text-secondary: var(--settings-modal-text-secondary);
+  --text-tertiary: var(--settings-modal-text-tertiary);
+}
+
+/* Lightweight, non-interactive group dividers between the three IA groups
+   (Quality controls / Live stream state / Connection & system). NOT headings —
+   the per-section <h3>s are the real headings. (#1131 §5) */
+.diag-group-label {
+  margin: 20px 0 8px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* The first group needs no top border/extra top padding (it leads the body). */
+.diag-group-label--first {
+  margin-top: 4px;
+  padding-top: 0;
+  border-top: none;
+}
+
+/* Section header row that carries an inline "?" help popover next to its <h3>
+   (e.g. "Current Status", "NetEQ charts"). The popover itself is `position: fixed`
+   and positioned by `use_help_popover_anchor` (see `.perf-help-popover`), so this
+   row only needs to lay out the <h3> + button. (#1131) */
+.diag-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.diag-section-head h3 {
+  margin: 0;
+}
+
+/* Native `<details>` disclosure for the collapsed "Raw stats" and "Build info"
+   sections (iteration 3). The summary reads like a section heading; the marker
+   gives the open/closed affordance for free. (#1223) */
+.diag-disclosure > .diag-disclosure-summary {
+  cursor: pointer;
+  /* Hide the default disclosure marker — we render an explicit chevron SVG
+     (`.diag-disclosure-chev`) inside the summary so the open/closed affordance
+     is consistent across browsers (Fix B), mirroring `.perf-peers__summary`. */
+  list-style: none;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding: 4px 0;
+  /* ≥44px keyboard/touch target for the summary row. */
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+}
+/* WebKit/Blink draw their own marker even with `list-style:none`; remove it. */
+.diag-disclosure-summary::-webkit-details-marker {
+  display: none;
+}
+/* Subtle hover affordance on the clickable summary row. */
+.diag-disclosure-summary:hover {
+  background: var(--glass-bg-hover);
+  border-radius: 6px;
+}
+/* The explicit chevron points right when closed, rotates to point down when the
+   `<details>` is open. Mirrors the `.perf-peers__chev` pattern. */
+.diag-disclosure-chev {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+}
+details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
+  transform: rotate(90deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .diag-disclosure-chev {
+    transition: none;
+  }
+}
+.diag-disclosure[open] > .diag-disclosure-summary {
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--glass-bg-hover);
+  padding-bottom: 8px;
+}
+/* "Select a specific peer…" placeholder shown for the NetEq section when the
+   "All Peers" aggregate is selected (S2). */
+.diag-neteq-placeholder {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+/* Each folded raw-stats block (Reception / Sending / Encoder / Media Status)
+   keeps its own sub-heading inside the one disclosure. */
+.diag-raw-block + .diag-raw-block {
+  margin-top: 12px;
+}
+.diag-raw-block h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* Honour reduced-motion for the drawer slide on BOTH the desktop `right`
+   transition (this rule, non-`!important`, wins by source order) AND the mobile
+   `transform 0.3s ease !important` transition at the ≤639px breakpoint (style.css
+   mobile block) — which is itself `!important`, so this override MUST also be
+   `!important` to beat it. (#1131 §5, review REQUIRED 2) */
+@media (prefers-reduced-motion: reduce) {
+  #diagnostics-sidebar {
+    transition: none !important;
+  }
 }
 
 #diagnostics-sidebar.visible {
@@ -1003,8 +1171,13 @@ select {
   padding: 10px;
 }
 
+/* Drawer sections no longer carry a bottom margin — `.sidebar-content` now
+   spaces them with a single flex `gap` (iteration 3 polish). Flex gap + child
+   margins are additive, so the global `.diagnostics-section { margin-bottom }`
+   leaks an extra gap inside the drawer; zero it here (the global rule body is
+   unchanged so non-drawer sections keep their margin). */
 #diagnostics-sidebar .diagnostics-section {
-  margin-bottom: 20px;
+  margin-bottom: 0;
 }
 
 #diagnostics-sidebar .diagnostics-section h3 {
@@ -1015,17 +1188,16 @@ select {
   border-bottom: 1px solid var(--glass-bg-hover);
 }
 
+/* Raw-stats monospace dumps use the build-info mono treatment (the theme mono
+   token on the surface) instead of the old #00ff00-on-black debug look
+   (iteration 3 polish). */
 #diagnostics-sidebar .diagnostics-data pre {
   font-family: monospace;
-  font-size: 14px;
+  font-size: 13px;
   white-space: pre-wrap;
-  color: #00ff00; /* @token-exempt: debug indicator, not a design token */
-  background-color: rgba(
-    0,
-    0,
-    0,
-    0.3
-  ); /* @token-exempt: dark translucent bg, no matching token */
+  color: var(--diag-mono-text);
+  background-color: var(--surface);
+  border: 1px solid var(--border);
   padding: 10px;
   border-radius: 5px;
   max-height: 40vh;
@@ -1049,6 +1221,12 @@ select {
   padding: 15px;
   background-color: var(--surface);
   border-bottom: 1px solid var(--glass-bg-hover);
+  /* Sticky so the title + close stay reachable while the single scroll surface
+     scrolls. The opaque --surface background lets content scroll cleanly beneath
+     it. (#1131 §2) */
+  position: sticky;
+  top: 0;
+  z-index: 2;
 }
 
 #diagnostics-sidebar .sidebar-header h2 {
@@ -1072,6 +1250,13 @@ select {
 
 #diagnostics-sidebar .sidebar-content {
   padding: 15px;
+  /* Single spacing rhythm: one flex `gap` between the group labels, sections,
+     panels and disclosures, instead of per-child bottom margins (iteration 3
+     polish). The removed margins are: `.diagnostics-section`, the drawer
+     `.perf-simulcast-strip` / `.perf-kind-card`. */
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .diagnostics-sidebar {
@@ -1138,8 +1323,9 @@ select {
 .diagnostics-section h3 {
   margin: 0 0 10px 0;
   font-size: 1.2em;
-  color: var(--success);
-  border-bottom: 1px solid var(--success);
+  /* Drawer headings read as plain section titles (matching the perf-card
+     titles), not the old green-on-underline debug look (iteration 3 polish). */
+  color: var(--text-primary);
   padding-bottom: 5px;
 }
 
@@ -1244,79 +1430,185 @@ select {
   padding: 20px;
 }
 
-.neteq-advanced-chart svg {
+/* The advanced charts are now a fixed-Y-axis + growing-width scrollable form
+   (`.neteq-chart-*` below), so the chart SVG width is DYNAMIC. Only style the
+   chart card chrome here — no fixed/max width, which would clip the timeline. */
+.neteq-advanced-chart {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 4px;
-  width: 100%;
-  height: auto;
-  max-width: 280px;
-  min-height: 220px;
-  display: block;
-  margin: 0 auto;
+  padding: 10px;
 }
 
+.neteq-advanced-chart .chart-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+/* Current Status — two-tier compact layout (iteration 4). Replaces the 9 uniform
+   110px tiles. Quality classes (.is-good/.is-warn/.is-poor) tint the VALUE only;
+   each colored state also carries a text reason (.status-stat__reason or title)
+   so meaning never depends on color alone (WCAG 1.4.1). Uses var(--text-*): the
+   drawer is bi-theme — under dark theme --text-* resolves to the settings-modal
+   dark tokens remapped inside #diagnostics-sidebar, and under light theme it
+   inherits the default light --text-* (the light drawer is intentionally NOT
+   remapped). No .settings-modal ancestor dependency either way. */
 .neteq-status {
   background: var(--surface-elevated);
-  padding: 15px;
+  padding: 16px;
   border-radius: 8px;
-  margin-bottom: 20px;
   box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.status-grid {
+/* Tier 1 — primary stats (Buffer | Target) */
+.neteq-status .status-primary {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
 }
-
-.status-item {
-  text-align: center;
-  padding: 10px;
+.neteq-status .status-stat {
   background: var(--border);
-  border-radius: 4px;
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
-
-.status-value {
-  font-size: 18px;
-  font-weight: bold;
+.neteq-status .status-stat__value {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.1;
   color: var(--text-primary);
-  margin-bottom: 5px;
+  font-variant-numeric: tabular-nums;
 }
-
-.status-value.warning {
-  color: var(--error-text);
+.neteq-status .status-stat__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
 }
-
-.status-value.good {
-  color: var(--success);
-}
-
-.status-label {
+.neteq-status .status-stat__unit {
   font-size: 11px;
+  color: var(--text-tertiary);
+}
+.neteq-status .status-stat__reason {
+  font-size: 11px;
+  line-height: 1.3;
+  margin-top: 2px;
+  color: var(--text-secondary);
+}
+
+/* Tier 2 — flow group, label-left / value-right rows */
+.neteq-status .status-secondary {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px 16px;
+}
+.neteq-status .status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.neteq-status .status-row__label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.neteq-status .status-row__value {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tier 3 — reordering, demoted muted micro-row */
+.neteq-status .status-reorder {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding-top: 4px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.neteq-status .status-reorder__head {
+  font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.4px;
+  font-size: 11px;
+}
+
+/* Quality tinting — VALUE color only; canonical tokens (Directive 5) */
+.neteq-status .is-good   .status-stat__value,
+.neteq-status .is-good   .status-row__value,
+.neteq-status .status-reorder__item.is-good  { color: var(--diag-q-good); }
+.neteq-status .is-warn   .status-stat__value,
+.neteq-status .is-warn   .status-row__value,
+.neteq-status .status-reorder__item.is-warn  { color: var(--diag-q-warn); }
+.neteq-status .is-poor   .status-stat__value,
+.neteq-status .is-poor   .status-row__value,
+.neteq-status .status-reorder__item.is-poor  { color: var(--diag-q-poor); }
+.neteq-status .is-warn   .status-stat__reason { color: var(--diag-q-warn); }
+.neteq-status .is-poor   .status-stat__reason { color: var(--diag-q-poor); }
+
+/* Mobile: primary stacks, secondary single column */
+@media (max-width: 639px) {
+  .neteq-status .status-primary,
+  .neteq-status .status-secondary { grid-template-columns: 1fr; }
 }
 
 .diagnostics-charts {
-  margin: 20px 0;
+  margin: 0;
 }
 
+/* NetEq charts are now 1-up, full drawer width, stacked vertically (iteration 3).
+   The four scrollable charts share one timeline and each fills the column. */
+.neteq-charts-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.neteq-charts-stack .chart-container {
+  min-height: 0;
+  width: 100%;
+}
+
+/* Per-chart heading row (title + ⓘ) for the four NetEq charts (iteration 4).
+   Replaces the single section-level charts help popover; each chart now carries
+   its own explanation where the user is looking. */
+.neteq-charts-stack .diag-chart-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.neteq-charts-stack .diag-chart-head__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* `.charts-grid` is no longer used for the NetEq charts (they stack 1-up). Kept
+   as an auto-fit grid in case any other surface references it. (iteration 3) */
 .charts-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 20px;
-  margin-bottom: 20px;
   padding: 0 10px;
 }
 
 .chart-container {
   background: var(--surface-elevated);
   border-radius: 8px;
-  overflow: hidden;
   box-shadow: var(--shadow-sm);
-  min-height: 300px;
   padding: 10px;
 }
 
@@ -1329,6 +1621,9 @@ select {
   color: var(--text-primary);
   font-size: 14px;
   margin: 8px 0;
+  /* ≥44px tap target for the Peer Selection AND Transport Preference selects
+     (both use this class) on touch devices (iteration 3 polish). */
+  min-height: 44px;
 }
 
 .peer-selector:focus {
@@ -1372,24 +1667,22 @@ select {
   font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
 }
 
+/* Per-peer Buffer/Jitter value color-coding (iteration 4, Directive 5). Tints
+   the value span only; the `title` attribute carries the text reason so meaning
+   never depends on color alone (WCAG 1.4.1). */
+.peer-summary .peer-stat.is-good { color: var(--diag-q-good); }
+.peer-summary .peer-stat.is-warn { color: var(--diag-q-warn); }
+.peer-summary .peer-stat.is-poor { color: var(--diag-q-poor); }
+
 @media (max-width: 37.5em) {
   .charts-grid {
     grid-template-columns: 1fr;
     gap: 10px;
   }
-  .status-grid {
-    grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
-    gap: 5px;
-  }
-  .status-item {
-    padding: 8px;
-  }
-  .status-value {
-    font-size: 14px;
-  }
-  .status-label {
-    font-size: 9px;
-  }
+  /* The old `.neteq-status .status-grid/item/value/label` mobile overrides were
+     removed with the two-tier Current Status redesign (iteration 4); the new
+     `.status-primary` / `.status-secondary` mobile collapse lives in its own
+     `@media (max-width: 639px)` block above. */
   .neteq-advanced-chart {
     padding: 10px;
   }
@@ -3914,6 +4207,167 @@ select {
   stroke: currentColor;
 }
 
+/* ── Decode-budget "tiles paused" banner (#1142 Phase 1) ─────────────
+   A slim, dismissible glass bar pinned top-centre of the grid area. It is
+   NOT a modal: it overlays the grid (absolute within #grid-container) and
+   does not block interaction with the tiles below. The glass treatment
+   mirrors `.peer-toast` (backdrop blur, near-opaque dark surface) and the
+   accent is the shared amber `--warning` token.
+
+   The banner surface is ALWAYS dark (it hardcodes rgba(30,30,30,0.9) in both
+   themes), so its foreground colours MUST be literal light-on-dark — NOT the
+   `--text-on-glass-strong` token, which flips to near-black under
+   html[data-theme="light"] and would render the text + ✕ invisible on the dark
+   surface. We therefore use literal rgba(255,255,255,0.95) for body text and the
+   dismiss glyph, matching how the amber accent is already a literal. Contrast on
+   the composited dark surface: white text ≈ 11–16:1, amber #ff9f0a ≈ 6–8:1
+   (range = page background showing through the ~0.9-opacity surface) — both well
+   past 4.5:1, in BOTH themes. */
+.decode-budget-banner {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: min(560px, calc(100% - 24px));
+  padding: 8px 10px 8px 14px;
+  background: rgba(30, 30, 30, 0.9)
+    /* @token-exempt: dark near-opaque banner surface, matches .peer-toast */;
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  border: 1px solid var(--btn-warning-border);
+  border-radius: var(--radius-lg, 14px);
+  box-shadow: 0 8px 32px var(--shadow-card-deep);
+  /* @token-exempt: literal light-on-dark; the surface is hardcoded dark in both
+     themes, so the theme-flipping --text-on-glass-strong token must NOT be used
+     here (it would go near-black in light mode -> invisible). ≈14.5:1 on the
+     dark surface. */
+  color: rgba(255, 255, 255, 0.95);
+  font-family:
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
+    sans-serif;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.3;
+  animation: decode-banner-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.decode-budget-banner-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--warning);
+}
+
+.decode-budget-banner-text {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The compact mobile count is hidden on wider viewports. */
+.decode-budget-banner-count {
+  display: none;
+  flex: 1;
+  font-weight: 600;
+}
+
+.decode-budget-banner-action,
+.decode-budget-banner-dismiss {
+  flex-shrink: 0;
+  /* a11y: real ≥44px hit targets even though the visual chrome is smaller. */
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md, 10px);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.decode-budget-banner-action {
+  padding: 0 14px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--warning);
+  background: var(--btn-warning-bg);
+  border: 1px solid var(--btn-warning-border);
+}
+
+.decode-budget-banner-action:hover {
+  background: var(--btn-warning-bg-hover);
+  border-color: var(--btn-warning-border-hover);
+}
+
+.decode-budget-banner-dismiss {
+  min-width: 44px;
+  padding: 0;
+  /* @token-exempt: literal light-on-dark to stay visible on the hardcoded dark
+     banner surface in light mode (see the banner's color note above). */
+  color: rgba(255, 255, 255, 0.95);
+  background: transparent;
+  border: 1px solid transparent;
+}
+
+.decode-budget-banner-dismiss:hover {
+  background: var(--glass-bg-hover);
+}
+
+.decode-budget-banner-action:focus-visible,
+.decode-budget-banner-dismiss:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
+}
+
+@keyframes decode-banner-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(-10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* Reduced motion: fade only, no vertical slide. */
+@media (prefers-reduced-motion: reduce) {
+  .decode-budget-banner {
+    animation: decode-banner-enter-reduced 0.15s ease-out;
+  }
+  @keyframes decode-banner-enter-reduced {
+    from {
+      opacity: 0;
+    }
+    to {
+      opacity: 1;
+    }
+  }
+}
+
+/* Mobile ≤639px: icon + "N paused" + actions only (hide the long message). The
+   compact phrase keeps minimal context since the tooltip is hover-only. */
+@media (max-width: 639px) {
+  .decode-budget-banner {
+    gap: 8px;
+    padding: 6px 8px 6px 12px;
+    font-size: 12px;
+  }
+  .decode-budget-banner-text {
+    display: none;
+  }
+  .decode-budget-banner-count {
+    display: inline-block;
+  }
+  .decode-budget-banner-action {
+    padding: 0 10px;
+    font-size: 12px;
+  }
+}
+
 /* ── Participant join/leave toast notifications ─────────────────────── */
 
 .peer-toasts {
@@ -4313,6 +4767,11 @@ select {
   gap: 14px;
   padding-top: 6px;
 }
+
+/* (The Performance tab's no-scroll `:has(.perf-header-row)` override was removed
+   in #1131: the panel moved into the Diagnostics drawer, which is a single
+   scrolling surface by design — the no-scroll budget no longer applies, and the
+   `.perf-header-row` it keyed off was deleted.) */
 
 .appearance-section-title,
 .settings-section-title,
@@ -6415,6 +6874,54 @@ html[data-theme="light"]
 .signal-chart-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-active);
 }
+
+/* ============================================================
+   NetEq scrollable charts (iteration 3) — mirrors `.signal-chart-*`.
+   Fixed external Y-axis SVG outside the scroll box + a growing inner SVG
+   inside `.neteq-chart-scroll`. The scrollbar IS the interaction (no drag-pan);
+   `onscroll` keeps the four stacked charts in lockstep on one timeline.
+   ============================================================ */
+.neteq-chart-wrapper {
+  display: flex;
+  align-items: flex-start;
+  position: relative;
+}
+.neteq-chart-y-axis {
+  flex-shrink: 0;
+}
+.neteq-chart-scroll {
+  position: relative;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 1;
+  min-width: 0;
+  scrollbar-width: auto;
+  scrollbar-color: rgba(255, 255, 255, 0.35) rgba(255, 255, 255, 0.08); /* @token-exempt: scrollbar custom rendering */
+}
+/* Always-visible classic (non-overlay) scrollbar when content overflows — same
+   rationale as `.signal-chart-scroll` above. */
+.neteq-chart-scroll::-webkit-scrollbar {
+  height: 10px;
+}
+.neteq-chart-scroll::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+  border-radius: 5px;
+}
+.neteq-chart-scroll::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb-strong);
+  border-radius: 5px;
+}
+.neteq-chart-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-active);
+}
+/* The 2-hour retention caption, shown only when a peer's deque is at cap. */
+.neteq-chart-cap-note {
+  margin-top: 6px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-tertiary);
+}
+
 .signal-chart-legend {
   display: flex;
   flex-wrap: wrap;
@@ -6488,6 +6995,38 @@ html[data-theme="light"]
 }
 .legend-help-text p {
   margin: 3px 0;
+}
+/* ── Per-peer simulcast RECEIVE "Layers" section ──────────────────────────
+   Renders the SAME per-peer rows as the Performance dialog (the `.perf-peer-row`
+   / `.perf-q-dot` / `.perf-reason-chip` classes are shared verbatim, so the
+   quality dot, metric, and reason chip look identical across both surfaces).
+   Only the section wrapper + header are popup-specific layout. All color comes
+   from the reused classes' `--perf-q-*` / `--text-*` tokens — no raw literals. */
+.signal-popup-layers {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--signal-popup-border);
+}
+.signal-popup-layers__head {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.signal-popup-layers__list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+/* The kind label ("video" / "audio" / "shared content") sits where the perf
+   dialog puts the peer name; capitalize the first letter for readability. */
+.signal-popup-layer-row__kind {
+  text-transform: capitalize;
 }
 .signal-chart-tooltip {
   position: fixed;
@@ -7249,315 +7788,404 @@ html[data-theme="light"] .settings-divider {
 
 /* ──────────────────────────────────────────────────────────────────
    Unified Performance settings panel — SEND quality bounds (#961) AND
-   RECEIVE layer bounds (#989 simulcast): per-kind sections with a Send
-   row + a Receive row, dual-thumb range sliders, "Sending"/"Receiving"
-   VU needles, Auto toggle + "?" help. All colors are design tokens
-   (see global.css) — no literals.
+   RECEIVE layer bounds (issue 989 simulcast): per-kind CARDS each split into a
+   Sending column + a Receiving column, dual-thumb range sliders,
+   "Sending"/"Receiving" inline bar-meters (level-driven via data-level),
+   Auto toggle + "?" help. All colors are design tokens (see global.css).
    ────────────────────────────────────────────────────────────────── */
 
-/* Segmented Receive | Send direction toggle (top of the panel). Only the
-   selected direction's 3 rows render at a time, so the panel shows 3 rows, not
-   6, and fits without excessive vertical scroll (the #961 "fit" requirement). */
-.perf-direction-toggle {
-  display: flex;
-  gap: 2px;
-  margin: 14px 0 16px;
-  padding: 3px;
-  background: var(--field-bg);
-  border: 1px solid var(--border-emphasis);
-  border-radius: var(--radius-pill);
-}
+/* (The transitional "Performance moved to Diagnostics" settings-sidebar row and
+   its `.settings-perf-moved*` rules were removed in the #1131 iteration: the
+   redirect link is no longer offered. The "performance" deep link is still
+   intercepted in attendants and routed to the Diagnostics drawer.) */
 
-.perf-direction-segment {
-  flex: 1 1 0;
-  min-height: 34px;
-  padding: 6px 14px;
-  font-size: 14px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  background: transparent;
-  border: none;
-  border-radius: var(--radius-pill);
-  cursor: pointer;
-}
-
-.perf-direction-segment:hover {
-  color: var(--text-primary);
-  background: var(--field-bg-hover);
-}
-
-.perf-direction-segment:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-}
-
-/* Active segment: filled with the accent surface. aria-checked also conveys
-   selection to AT, so color is not the sole signal. */
-.perf-direction-segment.is-active {
-  color: var(--accent);
-  background: var(--surface-elevated);
-  box-shadow: var(--shadow-sm);
-}
-
-/* Inline "your download" / "your upload" consequence beside each row title, so
-   the meaning is legible without opening the "?" popover (#1078 UX C1). */
+/* Inline "your upload" / "from N peers" consequence beside each side title, so
+   the meaning is legible without opening the "?" popover. */
+.perf-side__consequence,
 .perf-stream-consequence {
   font-size: 12px;
   font-weight: 500;
   color: var(--text-secondary);
 }
 
-/* Receive / Send emphasis in the intro paragraph — bold + direction accent
-   instead of ALL-CAPS (caps reads as shouting; #1078 UX C1). */
-.perf-emph-recv,
-.perf-emph-send {
-  font-weight: 700;
-}
+/* (The `.perf-emph-recv` / `.perf-emph-send` intro-emphasis rules were removed
+   when the always-visible intro paragraph was collapsed behind the header `(i)`
+   info popover — the plain-text popover body carries the wording instead.) */
 
-.perf-emph-recv {
-  color: var(--accent);
-}
+/* ── Live simulcast effective-setting strip (issue #1095 redesign). The
+   expandable per-layer detail moved to the Diagnostics panel's "Simulcast
+   layers" section. No new tokens; accents via descendant selectors. ── */
 
-.perf-emph-send {
-  color: var(--success);
-}
-
-/* ── Live simulcast diagnostics (issue #1095 redesign) — embedded per row +
-   one global strip. No new tokens; accents via descendant selectors. ── */
-
-/* Global effective-setting strip: one slim line directly under the toggle. */
+/* Global effective-setting strip: one slim line under the intro, with an (i)
+   tooltip holding the full flag×cap text (#1095 redesign). */
 .perf-simulcast-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   padding: 6px 2px;
   font-size: 12px;
   color: var(--text-tertiary);
   border-bottom: 1px solid var(--border);
 }
 
-/* Per-row diagnostics footer — last child of .perf-stream-controls, so it
-   left-aligns with the slider (not the gauge). */
-.perf-diag {
-  margin-top: 6px;
-  font-size: 12px;
-  font-variant-numeric: tabular-nums;
-}
+/* (`.perf-simulcast-strip__info` — the decorative `ⓘ` glyph — was removed in
+   #1131 review F2: it duplicated the strip's `(i)` HelpPopover. The simulcast
+   framing it held now rides the strip text span's title/aria; the full per-layer
+   detail lives in the "Simulcast layers" section.) */
 
-/* (1) Always-visible summary. As a button it is the disclosure trigger; the
-   static variants (single-layer / 1-peer / empty) reuse the same line metrics. */
-.perf-diag-summary {
-  display: flex;
-  align-items: center;
-  width: 100%;
-  gap: 6px;
-  color: var(--text-secondary);
-}
-
-.perf-diag-trigger {
-  padding: 2px 2px;
-  background: transparent;
-  border: none;
-  cursor: pointer;
-  text-align: left;
-}
-
-.perf-diag-trigger:hover {
-  color: var(--text-primary);
-}
-
-.perf-diag-trigger:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-  border-radius: var(--radius-sm);
-}
-
-.perf-diag-static {
-  padding: 2px 2px;
-  color: var(--text-tertiary);
-  font-style: italic;
-}
-
-.perf-diag-summary-text {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.perf-diag-chevron {
-  margin-left: auto;
-  flex: 0 0 auto;
-  color: var(--text-tertiary);
-}
-
-/* (2) Expandable detail region. */
-.perf-diag-detail {
-  margin-top: 6px;
-}
-
-/* SEND ladder: flex row of per-layer chips, lowest layer left. */
-.perf-diag-ladder {
-  display: flex;
-  gap: 4px;
-  align-items: stretch;
-}
-
-.perf-diag-rung {
-  flex: 1 1 auto;
-  min-width: 44px;
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  gap: 1px;
-  /* Horizontal 4px (was 2px) so a 4-char res like "1080p" doesn't kiss the chip
-     edge at the 540px breakpoint with 3 chips at the 44px min-width (#1095). */
-  padding: 4px 4px 6px;
-  position: relative;
-  background: var(--field-bg);
+/* ── Per-kind cards (Video / Audio / Content), each split Send | Receive
+   (#1095 redesign). A card is a glass surface; its two columns share the
+   `.perf-card-cols` grid that collapses to one column on narrow widths. ── */
+.perf-kind-card {
+  /* Base: no vertical margin. The drawer adds explicit inter-card spacing via the
+     `#diagnostics-sidebar` rule below (the `.sidebar-content` is a plain padded
+     block, NOT a flex container with a `gap`, so the cards would otherwise render
+     flush — #1131 review F4). */
+  padding: 10px 14px;
+  background: var(--surface-elevated);
   border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border-radius: 12px;
+  /* Enable container queries so the columns collapse based on the card's own
+     width (independent of the viewport). */
+  container-type: inline-size;
 }
 
-/* Active layer: solid accent border + a 2px bottom strip. */
-.perf-diag-rung.is-active {
-  background: var(--field-bg);
-  border: 1px solid var(--success-border-vivid);
-}
+/* Drawer-scoped spacing for the migrated Performance controls: the strip + the
+   three per-kind cards are now spaced by `.sidebar-content`'s flex `gap`
+   (iteration 3 polish), so their explicit drawer bottom-margins were removed
+   here — flex gap + child margins are additive. */
 
-.perf-diag-rung.is-active::after {
-  content: "";
-  position: absolute;
-  left: 0;
-  right: 0;
-  bottom: 0;
-  height: 2px;
-  background: var(--success);
-  border-bottom-left-radius: var(--radius-sm);
-  border-bottom-right-radius: var(--radius-sm);
-}
-
-/* Shed (inactive) layer: dimmed + dashed, no strip. */
-.perf-diag-rung.is-shed {
-  opacity: 0.4;
-  border-style: dashed;
-}
-
-.perf-diag-rung-id {
-  font-size: 10px;
-  color: var(--text-tertiary);
-}
-
-.perf-diag-rung-res {
-  font-size: 11px;
-  color: var(--text-secondary);
-}
-
-.perf-diag-rung-kbps {
-  font-size: 12px;
+.perf-kind-card__title {
+  font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
+  margin-bottom: 4px;
 }
 
-/* RECEIVE per-peer detail rows. */
-.perf-diag-peers {
+/* Two side-by-side columns (Send | Receive). Collapses to one column below the
+   card-width threshold (Send on top), driven PURELY by the card's own width via
+   the `@container` query — the redundant viewport `@media (max-width: 639px)`
+   collapse was dropped in issue 1131 so the columns track the card (now in the wider
+   720px drawer), not the viewport. `.perf-kind-card` sets `container-type:
+   inline-size`, so this resolves correctly. */
+.perf-card-cols {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+@container (max-width: 560px) {
+  .perf-card-cols {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* One column (Send or Receive). Subtle left accent distinguishes direction
+   (color is not the sole cue — each column is labelled "Sending"/"Receiving"). */
+.perf-side {
   display: flex;
   flex-direction: column;
-  gap: 3px;
+  gap: 4px;
+  padding-left: 10px;
+  border-left: 3px solid var(--border);
+  min-width: 0;
 }
 
-.perf-diag-peer {
+.perf-side--recv {
+  border-left-color: var(--accent);
+}
+
+.perf-side--send {
+  border-left-color: var(--success-border-vivid);
+}
+
+.perf-side__head {
   display: flex;
   align-items: center;
-  gap: 6px;
-  min-width: 0;
+  gap: 8px;
+  flex-wrap: wrap;
 }
 
-.perf-diag-pip {
-  flex: 0 0 auto;
+.perf-side__title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
   display: inline-flex;
-  gap: 2px;
+  align-items: center;
 }
 
-.perf-diag-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: var(--radius-pill);
-  background: var(--border);
-}
-
-.perf-diag-dot.is-on {
-  background: var(--text-secondary);
-}
-
-.perf-diag-peer-name {
-  flex: 1 1 auto;
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-secondary);
-}
-
-.perf-diag-peer-meta {
+/* §1 directional arrow prefixed on each side title. aria-hidden; inherits its
+   color per side (SEND green, RECV blue). */
+.perf-dir-arrow {
   flex: 0 0 auto;
-  color: var(--text-tertiary);
+  vertical-align: -2px;
+  margin-right: 4px;
 }
-
-.perf-diag-more {
-  color: var(--text-tertiary);
-  font-style: italic;
+.perf-side--send .perf-dir-arrow {
+  color: var(--success);
 }
-
-/* ── Direction accenting via descendant selectors ONLY (text stays neutral). ── */
-.perf-recv-row .perf-diag-chevron {
+.perf-side--recv .perf-dir-arrow {
   color: var(--accent);
 }
 
-.perf-recv-row .perf-diag-dot.is-on {
+/* ── Inline bar-meter (replaces the VU needle). Four vertical bars + a one-line
+   readout; the container carries data-level and CSS lights the first N bars. It
+   sits INLINE in `.perf-side__head` now (#2d), so it center-aligns with the row
+   and the readout may shrink/ellipsize rather than push the row taller. ── */
+.perf-meter-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.perf-meter {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  width: 24px;
+  height: 16px;
+  flex: 0 0 auto;
+}
+
+.perf-meter__bar {
+  flex: 1 1 0;
+  width: 3px;
+  /* Unlit bars: a faint, theme-aware track so an at-rest (level 0) meter still
+     reads as "a meter", not an empty gap (#9). Token resolves to translucent
+     white on dark / translucent black on light (see global.css). */
+  background: var(--perf-meter-track);
+  border-radius: 1px;
+  transition: background 0.2s ease;
+}
+
+/* Staggered heights ▂▄▆█ so the meter reads as a rising ramp. */
+.perf-meter__bar:nth-child(1) {
+  height: 40%;
+}
+.perf-meter__bar:nth-child(2) {
+  height: 60%;
+}
+.perf-meter__bar:nth-child(3) {
+  height: 80%;
+}
+.perf-meter__bar:nth-child(4) {
+  height: 100%;
+}
+
+/* Light the first N bars per the container's data-level. Receive uses the
+   primary accent; send a green accent (matched to the column). */
+.perf-side--recv .perf-meter[data-level="1"] .perf-meter__bar:nth-child(-n + 1),
+.perf-side--recv .perf-meter[data-level="2"] .perf-meter__bar:nth-child(-n + 2),
+.perf-side--recv .perf-meter[data-level="3"] .perf-meter__bar:nth-child(-n + 3),
+.perf-side--recv .perf-meter[data-level="4"] .perf-meter__bar:nth-child(-n + 4) {
   background: var(--accent);
 }
 
-.perf-send-row .perf-diag-chevron {
-  color: var(--success);
+.perf-side--send .perf-meter[data-level="1"] .perf-meter__bar:nth-child(-n + 1),
+.perf-side--send .perf-meter[data-level="2"] .perf-meter__bar:nth-child(-n + 2),
+.perf-side--send .perf-meter[data-level="3"] .perf-meter__bar:nth-child(-n + 3),
+.perf-side--send .perf-meter[data-level="4"] .perf-meter__bar:nth-child(-n + 4) {
+  background: var(--success);
 }
 
-.perf-stream-group {
-  margin: 18px 0;
-  padding: 14px 16px;
-  background: var(--surface-elevated);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
+.perf-meter__readout {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-secondary);
+  line-height: 1.2;
+  min-width: 0;
+  /* Don't break mid-word (#11): truncate with an ellipsis if the head row is
+     tight rather than wrapping a "1280x720·30fps" token across two lines. */
+  overflow-wrap: normal;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* Subtle left accent to distinguish the two directions at a glance (color is
-   not the sole cue — each row is labelled "Receive" / "Send"). */
-.perf-recv-row {
-  border-left: 3px solid var(--accent);
+/* The slider range readout + the live summary share ONE flex row per side (#2e)
+   so the two captions cost one line, not two. Wraps to two lines only when the
+   column is too narrow (mobile, where a small scroll is acceptable). */
+.perf-side__caption {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 4px 10px;
 }
 
-.perf-send-row {
-  border-left: 3px solid var(--success-border-vivid);
+/* The always-visible per-card summary line (the §3 live copy). */
+.perf-summary-line {
+  margin: 0;
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
 }
 
-.perf-stream-header {
+/* ── §2 SEND rung strip (issue #1131). One pip per effective layer,
+   lowest→highest. Active = filled green; shed (bitrate 0) = dashed + dimmed
+   label (non-color cue). ── */
+.perf-rungs {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  margin-top: 2px;
+  min-height: 16px;
+}
+.perf-rung {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+}
+.perf-rung__bar {
+  width: 18px;
+  height: 6px;
+  border-radius: 2px;
+  background: var(--success);
+}
+.perf-rung.is-shed .perf-rung__bar {
+  background: transparent;
+  border: 1px dashed var(--border-emphasis);
+}
+.perf-rung__label {
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.perf-rung.is-shed .perf-rung__label {
+  opacity: 0.55;
+}
+
+/* ── §3 RECEIVE per-peer expandable section. Native <details>/<summary>;
+   collapsed by default to protect the no-scroll budget. ── */
+.perf-peers {
+  margin-top: 2px;
+}
+.perf-peers__summary {
   display: flex;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 12px;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+  cursor: pointer;
+  list-style: none;
+  padding: 2px 0;
+  min-height: 20px;
 }
-
-.perf-stream-title {
-  font-size: 15px;
-  font-weight: 600;
+.perf-peers__summary::-webkit-details-marker {
+  display: none;
+}
+.perf-peers__summary:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+.perf-peers__chev {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  transition: transform 0.15s ease;
+}
+details.perf-peers[open] .perf-peers__chev {
+  transform: rotate(90deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .perf-peers__chev {
+    transition: none;
+  }
+}
+.perf-peers__list {
+  margin: 4px 0 0;
+  padding: 0;
+  list-style: none;
+  max-height: 168px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.perf-peer-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  line-height: 1.4;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+.perf-peer-row__label {
+  flex: 1 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text-primary);
 }
+.perf-peer-row__metric {
+  flex: 0 0 auto;
+  color: var(--text-secondary);
+}
 
-/* "?" help button + its popover, anchored next to the section title. */
+/* ── §4 quality dot: color + non-color glyph (●/◐/○). aria-hidden. ── */
+.perf-q-dot {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+}
+.perf-q-dot--optimal {
+  color: var(--perf-q-optimal);
+}
+.perf-q-dot--medium {
+  color: var(--perf-q-medium);
+}
+.perf-q-dot--low {
+  color: var(--perf-q-low);
+}
+
+/* ── §5 reason chips. Pill; TEXT is --text-primary (AA-safe), tinted
+   border-color + faint background from the per-state quality var. ── */
+.perf-reason-chip {
+  flex: 0 0 auto;
+  font-size: 11px;
+  line-height: 1.3;
+  font-weight: 500;
+  padding: 0 6px;
+  border-radius: 999px;
+  color: var(--text-primary);
+  border: 1px solid;
+  white-space: nowrap;
+}
+.perf-reason-chip--network {
+  border-color: var(--perf-q-low);
+  background: color-mix(in srgb, var(--perf-q-low) 14%, transparent);
+}
+.perf-reason-chip--setting,
+.perf-reason-chip--sender {
+  border-color: var(--perf-q-medium);
+  background: color-mix(in srgb, var(--perf-q-medium) 14%, transparent);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .perf-meter__bar {
+    transition: none;
+  }
+}
+
+/* "?" help button + its popover, anchored next to the side title. */
 .perf-help {
   position: relative;
   display: inline-flex;
 }
 
 .perf-help-button {
+  position: relative;
   width: 22px;
   height: 22px;
   display: inline-flex;
@@ -7571,6 +8199,20 @@ html[data-theme="light"] .settings-divider {
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-pill);
   cursor: pointer;
+}
+
+/* Expand the HIT AREA to 44×44 without enlarging the 22px visual glyph or
+   disturbing layout (#3): a transparent, centered, absolutely-positioned
+   pseudo-element that overflows the button. The wrapper `.perf-help` is
+   position:relative, so this does not affect sibling flow. */
+.perf-help-button::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
 }
 
 .perf-help-button:hover {
@@ -7591,13 +8233,26 @@ html[data-theme="light"] .settings-divider {
   background: transparent;
 }
 
+/* `position: fixed` so the popover escapes the Diagnostics drawer's scroll-clip
+   on EVERY edge: `#diagnostics-sidebar { overflow-y: auto }` makes the box clip
+   both axes (CSS overflow propagation), and an `absolute` popover anchored to a
+   wrapper INSIDE that scroll box was clipped at the right border (horizontal) and
+   the bottom fold (vertical). `fixed` anchors to the viewport (no transformed
+   ancestor on desktop), and `use_help_popover_anchor` writes the live `left/top`
+   each open + on scroll(capture)/resize, flipping the popover ABOVE the button
+   when there isn't room below. The inline `left/top` overrides the safe defaults
+   below (off-screen-left until the first reposition tick, so no flash at 0,0).
+   `max-height` + `overflow:auto` keep a tall popover usable on short viewports.
+   (#1131 scroll-clip fix) */
 .perf-help-popover {
-  position: absolute;
+  position: fixed;
   z-index: 1001;
-  top: calc(100% + 8px);
-  left: 0;
+  left: -9999px;
+  top: 0;
   width: 260px;
-  max-width: 80vw;
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   padding: 12px 14px;
   background: var(--surface-overlay);
   border: 1px solid var(--border-emphasis);
@@ -7624,51 +8279,51 @@ html[data-theme="light"] .settings-divider {
   border: 1px solid var(--border-emphasis);
 }
 
-/* "Auto" toggle, pinned to the right of the stream header. */
-.perf-auto-button {
+/* "Reset" utility button, pinned to the right of the stream header (#1131 §D).
+   Conditionally rendered — only present once the stream is CONSTRAINED (a thumb
+   off the extremes) — so it always reads as a LIVE control (accent text, no
+   muted/disabled state). Compact and SHORT: its box height (≈22px, matching the
+   "?" help button) is ≤ the existing head-row content, so showing/hiding it
+   causes NO vertical reflow of `.perf-side__head`. The 44px touch target is
+   provided by a non-layout `::before` overlay (same technique as
+   `.perf-help-button`), so a11y is met without inflating the row. */
+.perf-reset-button {
+  position: relative;
   margin-left: auto;
-  min-height: 32px;
-  padding: 4px 14px;
-  font-size: 13px;
-  font-weight: 600;
+  display: inline-flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 8px;
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1;
   color: var(--accent);
-  background: var(--field-bg);
+  background: transparent;
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-pill);
   cursor: pointer;
 }
 
-.perf-auto-button:hover {
-  background: var(--field-bg-hover);
+/* 44×44 hit area without affecting sibling flow (#3) — mirrors
+   `.perf-help-button::before`. */
+.perf-reset-button::before {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 44px;
+  height: 44px;
+  transform: translate(-50%, -50%);
 }
 
-.perf-auto-button:focus-visible {
+.perf-reset-button:hover {
+  background: var(--field-bg-hover);
+  border-color: var(--accent);
+}
+
+.perf-reset-button:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
-}
-
-/* Auto ACTIVE (toggle pressed): green/active. The aria-pressed state + label
-   convey this to AT, so color is not the sole signal. */
-.perf-auto-button.is-active {
-  color: var(--success);
-  background: var(--success-bg-soft);
-  border-color: var(--success-border-vivid);
-}
-
-.perf-auto-button.is-active:hover {
-  background: var(--success-bg-soft-hover);
-}
-
-/* Per-section body: the VU needle gauge beside the slider + range text. */
-.perf-stream-body {
-  display: flex;
-  align-items: center;
-  gap: 16px;
-}
-
-.perf-stream-controls {
-  flex: 1 1 auto;
-  min-width: 0;
 }
 
 /* ── Dual-thumb range slider ── */
@@ -7713,6 +8368,31 @@ html[data-theme="light"] .settings-divider {
   background: var(--accent);
   border-radius: var(--radius-pill);
   transition: left 0.3s ease, right 0.3s ease;
+}
+
+/* ── Discrete tick marks (decorative notches at each step stop) ──
+   Rendered INSIDE .perf-range-track and BEFORE .perf-range-fill in the DOM, so
+   the fill (and the input thumbs, which sit in higher layers) paint OVER the
+   ticks. CRITICAL: `pointer-events: none` (+ aria-hidden in markup) so they
+   never intercept a pointer-down meant for a thumb — this preserves the WebKit
+   pinned-floor drag fix (commit 603c7354): nothing over the track may swallow
+   thumb drags. A theme-token notch in --text-secondary (theme-aware light+dark,
+   clearly contrasting against the --border track) that protrudes past the 6px
+   track height so the step stops read at a glance; centred on its `left:%`
+   offset. */
+.perf-range-ticks {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+.perf-range-tick {
+  position: absolute;
+  top: 50%;
+  width: 3px;
+  height: 14px;
+  transform: translate(-50%, -50%);
+  background: var(--text-secondary);
+  border-radius: 1.5px;
 }
 
 .perf-range-input {
@@ -7787,9 +8467,63 @@ html[data-theme="light"] .settings-divider {
   outline-offset: 2px;
 }
 
+/* ── SEND layer-count slider (video/screen): distinct from the Receive slider ──
+   The SEND control publishes layers; its MOVING (ceiling/max) thumb and fill use
+   the semantic --success (green) treatment so it reads as a different widget from
+   the full-range --accent Receive slider beside it. The FLOOR (min) thumb is
+   pinned at the base layer and styled as a fixed dot (see .is-pinned below). */
+.perf-range--send-layer .perf-range-fill {
+  background: var(--success);
+}
+.perf-range--send-layer .perf-range-input-max::-webkit-slider-thumb {
+  border-color: var(--success);
+}
+.perf-range--send-layer .perf-range-input-max::-moz-range-thumb {
+  border-color: var(--success);
+}
+
+/* ── Pinned floor thumb (the always-on base layer) ──
+   A visibly FIXED end: a small filled --success dot, default cursor, no shadow
+   and no hover/focus grow. The distinct shape (small filled dot vs. the large
+   hollow accent ring of a movable thumb) is the non-color "this can't move"
+   cue, so the affordance reads correctly regardless of color perception.
+
+   WEBKIT HIT-TEST: this input must NOT sit above the max input, or — even with
+   pointer-events:none — WebKit can intercept the pointer-down meant for the max
+   thumb. The default `.perf-range-input-min { z-index: 2 }` puts the min ON TOP
+   (correct for the Receive/tier slider where the min is a real draggable thumb);
+   in pinned mode we OVERRIDE it to `z-index: 0` (below `.perf-range-input-max`'s
+   z-index 1). `.perf-range-input.is-pinned` (two classes, specificity 0,2,0)
+   beats `.perf-range-input-min` (0,1,0), so this override wins. Result: the max
+   (ceiling) thumb is the topmost interactive layer and always grabbable. The
+   Receive slider (no `.is-pinned`) is unaffected. This is the belt-and-suspenders
+   companion to dropping the HTML `disabled` attribute in the Rust markup. */
+.perf-range-input.is-pinned {
+  pointer-events: none; /* the floor never accepts drags */
+  z-index: 0; /* below .perf-range-input-max (z-index 1) — max stays on top */
+}
+.perf-range-input.is-pinned::-webkit-slider-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--success);
+  border: none;
+  box-shadow: none;
+  cursor: default;
+  pointer-events: none;
+}
+.perf-range-input.is-pinned::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  background: var(--success);
+  border: none;
+  box-shadow: none;
+  cursor: default;
+  pointer-events: none;
+}
+
 .perf-range-value {
-  margin: 10px 0 0;
-  font-size: 13px;
+  margin: 0;
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
@@ -7800,73 +8534,113 @@ html[data-theme="light"] .settings-divider {
   }
 }
 
-/* ── Per-section VU needle gauge (sits beside each Send/Receive slider) ── */
+/* ── Diagnostics panel: "Simulcast layers" section (#1095 §6 MOVE — the
+   per-layer SEND ladder + per-peer RECEIVE breakdown relocated from the
+   Performance panel's expandable footers). ── */
+.simulcast-effective {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
 
-.perf-vu-gauge {
-  flex: 0 0 auto;
-  width: 150px;
+.simulcast-note {
+  margin: 0 0 8px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-quaternary);
+}
+
+.simulcast-send {
   display: flex;
   flex-direction: column;
-  align-items: center;
-  padding: 12px 10px 10px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-md);
-  box-shadow: var(--shadow-sm);
+  gap: 4px;
+  margin-bottom: 10px;
 }
 
-.perf-vu-svg {
-  width: 120px;
-  height: 78px;
-}
-
-.perf-vu-arc {
-  stroke: var(--border-emphasis);
-}
-
-.perf-vu-tick {
-  stroke: var(--text-quaternary);
-}
-
-.perf-vu-needle {
-  stroke: var(--accent);
-  /* Pivot at the hub so rotation looks like an analog needle. */
-  transform-origin: 60px 64px;
-  transition: transform 0.35s cubic-bezier(0.22, 1, 0.36, 1);
-}
-
-.perf-vu-hub {
-  fill: var(--accent);
-}
-
-.perf-vu-label {
-  margin-top: 4px;
-  font-size: 13px;
+.simulcast-send-title {
+  font-size: 12px;
   font-weight: 600;
-  color: var(--text-primary);
-}
-
-.perf-vu-readout {
-  margin-top: 2px;
-  font-size: 13px;
-  font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
 
-@media (prefers-reduced-motion: reduce) {
-  .perf-vu-needle {
-    transition: none;
-  }
+.simulcast-send-static,
+.simulcast-send-header {
+  font-size: 12px;
+  color: var(--text-tertiary);
 }
 
-/* On narrow widths stack the needle above the slider instead of beside it. */
-@media (max-width: 540px) {
-  .perf-stream-body {
-    flex-direction: column;
-    align-items: stretch;
-  }
-
-  .perf-vu-gauge {
-    width: 100%;
-  }
+.simulcast-send-ladder {
+  display: flex;
+  gap: 4px;
+  margin-top: 2px;
 }
+
+.simulcast-rung {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  flex: 1 1 0;
+  min-width: 44px;
+  padding: 4px 6px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.simulcast-rung.is-active {
+  border-color: var(--success-border-vivid);
+  background: var(--success-bg-soft);
+}
+
+.simulcast-rung.is-shed {
+  opacity: 0.5;
+}
+
+.simulcast-rung-id {
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.simulcast-rung-res,
+.simulcast-rung-kbps {
+  color: var(--text-tertiary);
+}
+
+.simulcast-recv {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.simulcast-recv-title {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.simulcast-recv-kind {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.simulcast-recv-kind-head {
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.simulcast-recv-peer {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  padding-left: 8px;
+}
+
+.simulcast-recv-more {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-tertiary);
+  padding-left: 8px;
+}
+

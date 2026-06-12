@@ -32,6 +32,154 @@ pub fn datagram_drop_count() -> u64 {
     DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// Cumulative count of frames dropped on the persistent unidirectional QUIC
+/// streams (`send_on_persistent_stream`) because the write failed and the
+/// stream had to be evicted.
+///
+/// This is the client-side WebTransport analogue of
+/// [`crate::websocket::websocket_drop_count`]: on WebTransport, audio / video /
+/// screen — and the Control stream — all ride persistent unistreams (see
+/// `videocall-client/src/connection/webtransport.rs::send_bytes`), so a write
+/// failure here means a real frame (overwhelmingly media, since media frames
+/// dominate the uplink) was dropped — the genuine uplink-saturation signal.
+/// Datagrams, by contrast, carry only periodic control traffic (heartbeats /
+/// RTT probes), so [`datagram_drop_count`] is a far sparser, indirect signal.
+/// The sender AQ self-congestion trigger (#1104) keys off THIS counter for
+/// that reason.
+///
+/// Note: a unistream write does NOT fail on ordinary send-buffer backpressure.
+/// A WHATWG `WritableStream` applies backpressure by leaving `writer.ready()`
+/// PENDING (it does not reject); the write itself only rejects on stream /
+/// connection TEARDOWN — `STOP_SENDING`, `RESET_STREAM`, or session close. So
+/// each increment of this counter is a "the stream was torn down" event, NOT a
+/// "the uplink is merely saturated" event. On a genuine bandwidth cliff (link
+/// slow but ALIVE, ACKs still flowing) this counter stays FLAT — the slow path
+/// just blocks in `writer.ready().await`. That saturation case is detected by
+/// the separate time-to-`ready()` stall signal below
+/// ([`UNISTREAM_READY_STALL_COUNT`]); the two counters are complementary
+/// (teardown vs. saturation) and are consumed by independent AQ windows.
+static UNISTREAM_DROP_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of persistent-unistream frames dropped since
+/// process start. See [`UNISTREAM_DROP_COUNT`].
+pub fn unistream_drop_count() -> u64 {
+    UNISTREAM_DROP_COUNT.load(Ordering::Relaxed)
+}
+
+/// Cumulative count of "slow `writer.ready()`" events on the persistent
+/// unidirectional media streams (`send_on_persistent_stream`): each time a
+/// single `JsFuture::from(writer.ready()).await` on an ESTABLISHED media stream
+/// takes longer than [`READY_STALL_THRESHOLD_MS`] to resolve, this counter is
+/// incremented once.
+///
+/// ## Why this exists (the gap [`UNISTREAM_DROP_COUNT`] cannot fill)
+///
+/// On WebTransport the media send path is fully `.await`-blocking and a
+/// `WritableStream` signals backpressure by leaving `writer.ready()` PENDING,
+/// not by rejecting the write. So when the uplink hits a BANDWIDTH cliff but the
+/// connection is still alive (ACKs flowing, no stream reset), no write ever
+/// fails and `UNISTREAM_DROP_COUNT` stays flat — the publisher would never
+/// self-shed. Measuring how long `ready()` blocks turns that otherwise-silent
+/// saturation into an observable, monotonic signal the encoder AQ loop can
+/// consume exactly like the drop counter (delta-over-window via
+/// `videocall_aq::evaluate_self_congestion`). This is the WebTransport analogue
+/// of the WebSocket `bufferedAmount`-based drop on the synchronous WS path,
+/// which WT lacks structurally.
+///
+/// Design choice — a monotonic COUNTER (of slow events), not an EWMA of
+/// latency: the existing #1178 consumer already keys off a monotonic
+/// `AtomicU64` via a tumbling-window delta test, so a sibling counter reuses
+/// that exact machinery (same `evaluate_self_congestion` helper, same
+/// independent-window pattern) with no new consumer shape, no decay-tuning, and
+/// no floating-point atomic. A counter is also self-evidently lock-free and
+/// allocation-free on the hot send path. We deliberately count only the
+/// THRESHOLD-CROSSING (one increment per slow `ready()`), so the consumer's
+/// "N events within the window" test reads as "the uplink was visibly
+/// backpressured at least N times in the last window" — the saturation
+/// equivalent of the drop counter's "N frames failed to send."
+static UNISTREAM_READY_STALL_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Returns the total number of slow-`ready()` (uplink-saturation) events on the
+/// persistent media unistreams since process start. See
+/// [`UNISTREAM_READY_STALL_COUNT`]. Mirrors [`unistream_drop_count`]; consumed
+/// by the encoder AQ loop's WT uplink-saturation self-shed (#1219 prerequisite).
+pub fn unistream_ready_stall_count() -> u64 {
+    UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed)
+}
+
+/// Wall-clock threshold (ms) above which a single `writer.ready().await` on an
+/// established media unistream is counted as a saturation ("slow-ready") event.
+///
+/// Lives here (not in `videocall-aq`) because it parameterises the PRODUCER-side
+/// measurement, not the consumer's window/threshold decision. The consumer's
+/// "how many slow events trip a shed" threshold and window live in
+/// `videocall-aq` alongside the drop-counter constants.
+///
+/// Initial value rationale (netsim-tunable): the AQ loop ticks at
+/// `AQ_TICK_INTERVAL_MS` (1000 ms) and a healthy `ready()` on a live link
+/// resolves in well under a frame interval (sub-10 ms once the QUIC congestion
+/// window has room). 250 ms is ~8× a 30 fps frame interval (33 ms): long enough
+/// that an ordinary bursty-but-recovering link (a few queued frames draining)
+/// does NOT cross it, but short enough that a genuine bandwidth cliff — where
+/// `ready()` blocks for hundreds of ms to multiple seconds while the send buffer
+/// refuses to drain — crosses it on most frames. Combined with the consumer
+/// requiring SEVERAL such events within its window, an isolated 250 ms hiccup
+/// (one reordered/retransmitted packet on a high-RTT link) cannot shed a layer.
+const READY_STALL_THRESHOLD_MS: f64 = 250.0;
+
+/// Pure threshold predicate for the uplink-saturation signal: returns `true`
+/// when a single `writer.ready().await` that took `elapsed_ms` to resolve
+/// qualifies as a "slow-ready" (saturation) event.
+///
+/// Extracted from the `send_on_persistent_stream` hot path so the threshold
+/// decision — the one piece of the saturation signal that is pure arithmetic
+/// rather than JS-bound I/O — can be unit-tested on the NATIVE host target,
+/// sidestepping the `#[wasm_bindgen_test]` browser harness entirely. The
+/// surrounding async machinery (`performance.now()` reads bracketing the real
+/// `JsFuture::from(writer.ready()).await`) stays at the call site; only this
+/// comparison moved. Behaviour is identical: the call site computes
+/// `elapsed = end - start` exactly as before and passes it here.
+///
+/// The comparison is strictly `>` (NOT `>=`): a wait of EXACTLY the threshold
+/// is not yet a stall. This boundary is pinned by unit tests.
+#[inline]
+fn is_ready_stall(elapsed_ms: f64) -> bool {
+    elapsed_ms > READY_STALL_THRESHOLD_MS
+}
+
+/// Record one `writer.ready()` measurement against the saturation threshold:
+/// if `elapsed_ms` qualifies as a stall ([`is_ready_stall`]), increment
+/// [`UNISTREAM_READY_STALL_COUNT`] once and return `true`; otherwise leave the
+/// counter untouched and return `false`.
+///
+/// This is the exact increment that previously lived inline at the
+/// `send_on_persistent_stream` ready-stall site. The caller is still
+/// responsible for the two conditions that depend on JS / `Rc` runtime state
+/// and therefore cannot be made pure: (1) the established-media-writer gate
+/// (`captured_token.is_some()`), and (2) timer availability
+/// (`perf_now_ms()` returning `Some` at both ends). When both hold, the caller
+/// invokes this with the measured elapsed and the counter behaves identically
+/// to the original inline `fetch_add`.
+fn record_ready_stall(elapsed_ms: f64) -> bool {
+    if is_ready_stall(elapsed_ms) {
+        UNISTREAM_READY_STALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// Read a monotonic high-resolution timestamp (ms) from `performance.now()`.
+///
+/// Returns `None` when there is no `window` / no `Performance` object (e.g. a
+/// non-browser test target). We deliberately use `performance.now()` rather than
+/// `Date::now()`: it is monotonic (immune to wall-clock adjustments / NTP steps)
+/// and is the standard high-resolution timer for measuring elapsed durations on
+/// the hot path. It is two clock reads per frame with no allocation.
+fn perf_now_ms() -> Option<f64> {
+    web_sys::window()?.performance().map(|p| p.now())
+}
+
 /// Name of the JS global that, when set to a non-empty array of base64
 /// strings BEFORE the wasm boots, opts the WebTransport constructor into the
 /// `serverCertificateHashes` path (W3C WebTransport spec).
@@ -831,11 +979,53 @@ impl WebTransportTask {
 
                 // --- Write the frame ----------------------------------------
                 // writer.ready() resolves when there is backpressure room.
-                // writer.write() returns immediately after enqueueing; the
-                // browser serialises chunks from this writer in call order.
+                // writer.write() returns immediately after enqueueing.
+                //
+                // Uplink-saturation observable (#1219 prerequisite): a slow link
+                // signals backpressure by leaving ready() PENDING (it does NOT
+                // reject — that only happens on teardown, which the drop counter
+                // catches). So we time how long ready() blocks: a wait beyond
+                // READY_STALL_THRESHOLD_MS means the uplink is saturated but
+                // alive, a case UNISTREAM_DROP_COUNT structurally cannot see.
+                //
+                // HOW THE COUNTER ACCUMULATES (do NOT serialise this!): each call
+                // to `send_on_persistent_stream` spawn_local's its OWN future and
+                // the map lock is released above (before this await), so during a
+                // stall there are MANY concurrent in-flight frame futures, each
+                // holding a clone of the same writer. `WritableStreamDefaultWriter
+                // .ready` returns the writer's single current `[[readyPromise]]`,
+                // so every concurrent future observes the SAME pending promise and
+                // they all resolve together when backpressure clears. Each future
+                // independently timed its own (staggered) `start`, so a multi-
+                // hundred-ms stall with K frames in flight produces ~K increments
+                // when the promise resolves — that is how the consumer's
+                // 3-in-2000ms window is reached. If this path is ever refactored
+                // into a single serialised send loop, the counter would cap at 1
+                // per stall and the saturation signal would silently break. NOTE:
+                // because increments are stamped at ready()-RESOLUTION (not stall
+                // onset), detection of a sustained cliff lags by up to ~one window.
+                //
+                // We only measure on the ESTABLISHED media path — `captured_token`
+                // is `Some` here because the writer was just acquired above (it
+                // is set unconditionally alongside `entry.writer.clone()`), so
+                // the gate mirrors the drop counter and excludes handshake /
+                // create-stream stalls. `perf_now_ms()` is monotonic
+                // (`performance.now()`); if it is unavailable we simply skip the
+                // measurement (the wait still happens, just unobserved).
+                let ready_wait_start_ms = perf_now_ms();
                 JsFuture::from(writer.ready())
                     .await
                     .map_err(|e| anyhow!("writer.ready() failed: {:?}", e))?;
+                // captured_token.is_some() is guaranteed true on this line, but
+                // assert the gate explicitly so the signal can never be polluted
+                // by a control/handshake stream if this code is later refactored.
+                if captured_token.is_some() {
+                    if let (Some(start), Some(end)) = (ready_wait_start_ms, perf_now_ms()) {
+                        // Pure threshold + increment lives in `record_ready_stall`
+                        // so the saturation decision is unit-testable natively.
+                        record_ready_stall(end - start);
+                    }
+                }
                 JsFuture::from(writer.write_with_chunk(&chunk))
                     .await
                     .map_err(|e| anyhow!("write_with_chunk failed: {:?}", e))?;
@@ -844,6 +1034,27 @@ impl WebTransportTask {
             .await;
 
             if let Err(e) = result {
+                // A media frame just failed to go out on this uplink. Count it
+                // so the sender AQ can self-trigger a step-down on WebTransport
+                // (#1104) — the unistream analogue of the WebSocket send-buffer
+                // drop counter.
+                //
+                // ONLY count failures at the write stage (`writer.ready()` /
+                // `write_with_chunk`), i.e. after a writer was acquired
+                // (`captured_token.is_some()`). Failures BEFORE the writer
+                // existed (`transport.ready()` or
+                // `create_unidirectional_stream()`) are transport teardown /
+                // re-election artifacts, NOT uplink saturation: during a WT
+                // reconnect the old session enters QUIC draining while frames
+                // are still dispatched, and counting those would spuriously
+                // trip the self-shed right after a reconnect on flaky /
+                // high-latency links. Gating on `captured_token` keeps the
+                // signal to genuine send-path backpressure/reset events.
+                // Incremented before eviction so the count reflects the dropped
+                // frame regardless of the eviction race outcome below.
+                if captured_token.is_some() {
+                    UNISTREAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                }
                 // Stream is broken — remove it from the map so the next
                 // send for this key opens a fresh stream.  We compare
                 // identity tokens to defeat the concurrent-eviction race
@@ -1366,5 +1577,182 @@ mod framing_tests {
         assert!(!remove_if_token_matches(&mut map, KEY, &captured_by_a));
         assert!(map.contains_key(&KEY));
         assert!(Rc::ptr_eq(&map.get(&KEY).unwrap().token, &e2_token));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // WebTransport uplink-saturation signal (#1219 prerequisite).
+    //
+    // These tests pin the INCREMENT side of the signal: the threshold→count
+    // decision that the encoder AQ self-shed depends on. The counterpart
+    // DECISION side (consumer window/threshold) is pinned by the existing
+    // `videocall-aq` `evaluate_self_congestion` tests. Together they cover
+    // both halves of the WT self-shed that replaces the relay's room-wide
+    // CONGESTION cut (#1219).
+    //
+    // Why NATIVE `#[test]` and not `#[wasm_bindgen_test]`: the increment is
+    // pure arithmetic over an elapsed-ms `f64` once the producer-side seam
+    // (`is_ready_stall` / `record_ready_stall`) is extracted, so it runs on
+    // the host target with no JS. This deliberately avoids the browser wasm
+    // harness, which is known to silently no-op `#[wasm_bindgen_test]` on
+    // this dev box (false-green). The real `writer.ready().await` and the
+    // `performance.now()` reads bracketing it remain at the WASM-only call
+    // site and are unchanged by this seam.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// Serialises the tests that mutate the process-global
+    /// `UNISTREAM_READY_STALL_COUNT` so their before/after deltas are not
+    /// corrupted by parallel test execution (the default for `cargo test`).
+    /// The pure `is_ready_stall` boundary tests do not touch the counter and
+    /// do not need this guard.
+    static STALL_COUNTER_GUARD: Mutex<()> = Mutex::new(());
+
+    // --- Pure threshold predicate: the mutation target ---------------------
+    // The single source of truth for the boundary is `READY_STALL_THRESHOLD_MS`
+    // (250.0). Mutating either the `>` (to `>=`) or the constant must break at
+    // least one of the boundary tests below — proven in the agent report.
+
+    #[test]
+    fn ready_stall_just_below_threshold_is_not_a_stall() {
+        // One frame interval under the threshold: an ordinary
+        // bursty-but-recovering link must NOT register as saturation.
+        assert!(
+            !is_ready_stall(READY_STALL_THRESHOLD_MS - 1.0),
+            "a wait below the threshold must not count as a stall",
+        );
+    }
+
+    #[test]
+    fn ready_stall_exactly_at_threshold_is_not_a_stall() {
+        // Boundary pin: the comparison is strictly `>`, so a wait of EXACTLY
+        // the threshold is not yet a stall. Flipping `>` to `>=` flips this.
+        assert!(
+            !is_ready_stall(READY_STALL_THRESHOLD_MS),
+            "a wait of exactly the threshold must NOT count (strict `>`)",
+        );
+    }
+
+    #[test]
+    fn ready_stall_just_above_threshold_is_a_stall() {
+        // One millisecond over the threshold: the smallest wait that must
+        // register. Flipping the constant up (or the `>` away) flips this.
+        assert!(
+            is_ready_stall(READY_STALL_THRESHOLD_MS + 1.0),
+            "a wait just above the threshold must count as a stall",
+        );
+    }
+
+    #[test]
+    fn ready_stall_well_above_threshold_is_a_stall() {
+        // A multi-second cliff — the case the signal exists to catch.
+        assert!(
+            is_ready_stall(2_000.0),
+            "a multi-second wait must count as a stall",
+        );
+    }
+
+    #[test]
+    fn ready_stall_boundary_is_pinned_to_250ms_absolute() {
+        // The relative tests above track `READY_STALL_THRESHOLD_MS`, so they
+        // cannot catch a change to the constant's VALUE. This test pins the
+        // 250 ms boundary in ABSOLUTE terms, matching the constant's documented
+        // contract ("250 ms is ~8x a 30 fps frame interval"). It is the
+        // mutation guard for the constant itself: changing 250.0 to any other
+        // value breaks exactly one of these three assertions.
+        assert!(
+            !is_ready_stall(249.0),
+            "249 ms must NOT be a stall (just under the 250 ms boundary)",
+        );
+        assert!(
+            !is_ready_stall(250.0),
+            "exactly 250 ms must NOT be a stall (strict `>` at the boundary)",
+        );
+        assert!(
+            is_ready_stall(251.0),
+            "251 ms must be a stall (just over the 250 ms boundary)",
+        );
+    }
+
+    // --- Increment side effect on the process-global counter ---------------
+
+    #[test]
+    fn record_ready_stall_increments_counter_once_above_threshold() {
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS + 50.0);
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert!(
+            counted,
+            "an above-threshold wait must report that it counted"
+        );
+        assert_eq!(
+            after - before,
+            1,
+            "an above-threshold wait must increment the counter exactly once",
+        );
+        // The public accessor (the AQ consumer's entry point) must observe the
+        // same value, proving the seam writes the counter the consumer reads.
+        assert_eq!(
+            unistream_ready_stall_count(),
+            after,
+            "public accessor must reflect the recorded stall",
+        );
+    }
+
+    #[test]
+    fn record_ready_stall_leaves_counter_untouched_below_threshold() {
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS - 50.0);
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert!(
+            !counted,
+            "a below-threshold wait must report that it did not count",
+        );
+        assert_eq!(
+            after, before,
+            "a below-threshold wait must NOT touch the counter",
+        );
+    }
+
+    #[test]
+    fn record_ready_stall_does_not_count_exactly_at_threshold() {
+        // The increment must obey the same strict `>` boundary as the
+        // predicate: a wait of exactly the threshold leaves the counter flat.
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS);
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert!(!counted, "exactly-at-threshold must not count");
+        assert_eq!(after, before, "exactly-at-threshold must not increment");
+    }
+
+    #[test]
+    fn record_ready_stall_accumulates_across_repeated_stalls() {
+        // The consumer's window test reads "N events in the window," so K
+        // distinct above-threshold waits must produce exactly K increments —
+        // the property the inline-vs-extracted refactor must preserve.
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        const K: u64 = 5;
+        for _ in 0..K {
+            assert!(record_ready_stall(READY_STALL_THRESHOLD_MS + 10.0));
+        }
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            K,
+            "K above-threshold stalls must produce exactly K increments",
+        );
     }
 }

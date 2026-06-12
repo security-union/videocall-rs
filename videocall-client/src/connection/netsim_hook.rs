@@ -58,9 +58,20 @@ use super::task::Task;
 use super::webmedia::MediaStreamKey;
 
 thread_local! {
-    /// Single per-tab hook slot. `RefCell` so we can hand out an
-    /// `Arc` clone without taking ownership.
+    /// Per-tab UPLINK hook slot. `RefCell` so we can hand out an
+    /// `Arc` clone without taking ownership. Consulted by the send
+    /// paths via [`shape_uplink_reliable`] / [`shape_uplink_datagram`].
     static NETSIM_HOOK: RefCell<Option<Arc<NetSimShim>>> = const { RefCell::new(None) };
+
+    /// Per-tab DOWNLINK hook slot (issue #1080). A separate slot from
+    /// [`NETSIM_HOOK`] so an Up shim and a Down shim can be installed
+    /// independently (e.g. the e2e divergence test impairs only the
+    /// downlink, leaving the uplink untouched). Consulted by the
+    /// shared inbound seam via [`shape_inbound`]. Kept as a distinct
+    /// slot — rather than making the existing slot per-direction —
+    /// because the two directions have independent lifecycles and the
+    /// Option-A "one thread-local per concern" shape stays simplest.
+    static NETSIM_HOOK_DOWN: RefCell<Option<Arc<NetSimShim>>> = const { RefCell::new(None) };
 
     /// Weak reference back into the owning `Rc<Task>` (see
     /// `Connection::connect`). Used only by the async `Delay` /
@@ -76,13 +87,34 @@ thread_local! {
     static NETSIM_BYPASS: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Install the shim for the current tab, replacing any previously
-/// installed hook. Pass `None` to clear (see [`clear_hook`] for the
-/// convenience form).
+/// Install the UPLINK shim for the current tab, replacing any
+/// previously installed uplink hook. Pass `None` to clear (see
+/// [`clear_hook`] for the convenience form).
 pub(super) fn install_hook(hook: Option<Arc<NetSimShim>>) {
     NETSIM_HOOK.with(|slot| {
         *slot.borrow_mut() = hook;
     });
+}
+
+/// Install the DOWNLINK shim for the current tab (issue #1080),
+/// replacing any previously installed downlink hook. Pass `None` to
+/// clear just the downlink slot.
+pub(super) fn install_hook_down(hook: Option<Arc<NetSimShim>>) {
+    NETSIM_HOOK_DOWN.with(|slot| {
+        *slot.borrow_mut() = hook;
+    });
+}
+
+/// Install a shim into the slot matching its own [`NetSimShim::direction`].
+/// Used by the runtime control surface and the URL plumbing so the
+/// caller doesn't have to pick the slot by hand. A passthrough shim is
+/// still stored (so a subsequent `clear` is symmetric), but
+/// [`consult`]/[`consult_down`] short-circuit it.
+pub(super) fn install_hook_for_direction(hook: Arc<NetSimShim>) {
+    match hook.direction() {
+        Direction::Up => install_hook(Some(hook)),
+        Direction::Down => install_hook_down(Some(hook)),
+    }
 }
 
 /// Register the `Weak<Task>` used by the async-delay path to re-enter
@@ -95,26 +127,28 @@ pub(super) fn install_task(task: Option<Weak<Task>>) {
     });
 }
 
-/// Clear the per-tab hook + task pointer. Currently unused by
-/// `videocall-client` itself but exposed for symmetry — phase 3c
-/// or the bot harness may want it for clean teardown.
-#[allow(dead_code)]
+/// Clear BOTH per-tab hook slots (uplink + downlink) and the task
+/// pointer. Used by the runtime control surface's `clear()` and for
+/// clean teardown. The task pointer only powers the uplink async-delay
+/// re-entry path, so clearing it here is correct: with no uplink shim
+/// installed nothing consults it.
 pub(super) fn clear_hook() {
     install_hook(None);
+    install_hook_down(None);
     install_task(None);
 }
 
-/// Consult the installed shim for an outbound packet of `size_bytes`
-/// bytes. Returns `None` when:
-/// - no shim is installed (the production fast path), or
+/// Consult the installed UPLINK shim for an outbound packet of
+/// `size_bytes` bytes. Returns `None` when:
+/// - no uplink shim is installed (the production fast path), or
 /// - the installed shim's profile is passthrough, or
 /// - the [`NETSIM_BYPASS`] re-entrancy flag is currently set, or
-/// - the shim's direction does not match the call site.
+/// - the shim's direction is not [`Direction::Up`].
 ///
-/// `direction` is always [`Direction::Up`] for the client send paths
-/// — the client is the uplink side. [`Direction::Down`] is reserved
-/// for future receive-side integration.
-fn consult(size_bytes: usize, direction: Direction) -> Option<Admission> {
+/// The direction check is belt-and-suspenders: the uplink slot is only
+/// ever populated with an Up shim, but verifying it here guarantees an
+/// accidentally-misrouted Down shim can never shape outbound traffic.
+fn consult(size_bytes: usize) -> Option<Admission> {
     if NETSIM_BYPASS.with(|c| c.get()) {
         return None;
     }
@@ -126,7 +160,27 @@ fn consult(size_bytes: usize, direction: Direction) -> Option<Admission> {
         if shim.is_passthrough() {
             return None;
         }
-        if shim.direction() != direction {
+        if shim.direction() != Direction::Up {
+            return None;
+        }
+        Some(shim.admit(size_bytes))
+    })
+}
+
+/// Consult the installed DOWNLINK shim for an inbound packet of
+/// `size_bytes` bytes (issue #1080). Returns `None` when no downlink
+/// shim is installed, the profile is passthrough, or — defensively —
+/// the slot somehow holds a non-Down shim. There is no re-entrancy
+/// flag for the inbound path because inbound shaping never re-enters
+/// the dispatch (see [`shape_inbound`]).
+fn consult_down(size_bytes: usize) -> Option<Admission> {
+    NETSIM_HOOK_DOWN.with(|slot| {
+        let borrow = slot.borrow();
+        let shim = borrow.as_ref()?;
+        if shim.is_passthrough() {
+            return None;
+        }
+        if shim.direction() != Direction::Down {
             return None;
         }
         Some(shim.admit(size_bytes))
@@ -212,7 +266,7 @@ pub(super) fn shape_uplink_datagram(bytes: &[u8]) -> ShapeOutcome {
 }
 
 fn shape_uplink(bytes: &[u8], route: RawRoute) -> ShapeOutcome {
-    let admission = match consult(bytes.len(), Direction::Up) {
+    let admission = match consult(bytes.len()) {
         Some(a) => a,
         None => return false,
     };
@@ -274,6 +328,46 @@ fn shape_uplink(bytes: &[u8], route: RawRoute) -> ShapeOutcome {
     }
 }
 
+/// Apply the netsim admission decision for an INBOUND packet of
+/// `size_bytes` bytes (issue #1080). Returns `true` when the caller
+/// should DISCARD the packet (i.e. not deliver it to the decoder),
+/// `false` when it should be delivered normally.
+///
+/// ## Inbound admission semantics (loss/bandwidth-only)
+///
+/// - [`Admission::Drop`] → `true`. This is the whole point: a dropped
+///   inbound media packet is a real gap in the receiver's sequence
+///   stream, which the receive-side `SequenceTracker` counts as
+///   `loss_per_sec`, which drives the simulcast `LayerChooser` to step
+///   DOWN. This is the client-side equivalent of the relay-side overflow
+///   the WS half of #1080 manufactures via toxiproxy, and it works for
+///   BOTH transports (it operates on the already-parsed packet, above
+///   the transport).
+/// - [`Admission::Pass`] → `false`. Deliver normally.
+/// - [`Admission::Delay`] / [`Admission::DelayAndDuplicate`] → `false`
+///   (delivered immediately, NOT delayed). Unlike the uplink path, there
+///   is no clean way to re-enter the inbound dispatch after a timer: the
+///   inbound callback this seam wraps performs election / RTT /
+///   SESSION_ASSIGNED side effects (see
+///   `connection_manager::create_inbound_media_callback`), so deferring
+///   and replaying a packet through it later risks double-processing or
+///   reordering control packets. Rather than build a fragile re-entry
+///   mechanism, inbound shaping is deliberately LOSS-ONLY. A consequence
+///   is that a bandwidth shortfall — which the shim models as
+///   `Admission::Delay` (see `shim::admit` / `TokenBucket::consume`) —
+///   produces NO inbound effect on its own; the e2e test therefore drives
+///   step-down with `loss_pct` (the `crushed_downlink` preset), not with
+///   `downlink_kbps` alone.
+pub(super) fn shape_inbound(size_bytes: usize) -> ShapeOutcome {
+    match consult_down(size_bytes) {
+        Some(Admission::Drop) => true,
+        // Pass, Delay, DelayAndDuplicate, or no shim installed: deliver
+        // now. Delay variants are intentionally treated as Pass on the
+        // inbound path — see this fn's doc comment.
+        _ => false,
+    }
+}
+
 /// Saturating cast from `Duration` to `u32` milliseconds. A profile
 /// that asks for more than ~49 days of delay is nonsensical for a
 /// realtime call, but clamping keeps `TimeoutFuture::new(u32)` safe.
@@ -310,6 +404,12 @@ fn sample_dup_jitter_ms() -> u32 {
 #[cfg(test)]
 pub(super) fn hook_is_installed_for_tests() -> bool {
     NETSIM_HOOK.with(|slot| slot.borrow().is_some())
+}
+
+/// Test-only inspector: `true` iff the DOWNLINK hook slot is populated.
+#[cfg(test)]
+pub(super) fn down_hook_is_installed_for_tests() -> bool {
+    NETSIM_HOOK_DOWN.with(|slot| slot.borrow().is_some())
 }
 
 // Compile-only marker confirming the feature gate links cleanly,
@@ -388,6 +488,144 @@ mod tests {
     // wasm-bindgen test module below — it depends on
     // `js_sys::Math::random()`, which is only available under
     // wasm32. See `wasm_tests::dup_jitter_ms_in_range`.
+
+    /// Build a Down shim from a heavy-loss profile (deterministic seed).
+    #[allow(clippy::arc_with_non_send_sync)]
+    fn down_lossy_shim(seed: u64) -> Arc<NetSimShim> {
+        Arc::new(NetSimShim::new(
+            NetworkProfile {
+                loss_pct: 40.0,
+                seed: Some(seed),
+                ..NetworkProfile::passthrough()
+            },
+            Direction::Down,
+        ))
+    }
+
+    /// Issue #1080: the downlink slot is independent of the uplink slot —
+    /// installing/clearing one must not touch the other. Mutating either
+    /// `install_hook` or `install_hook_down` to write the wrong slot would
+    /// fail this.
+    #[test]
+    fn down_slot_install_and_clear_is_independent_of_up() {
+        clear_hook();
+        assert!(!hook_is_installed_for_tests());
+        assert!(!down_hook_is_installed_for_tests());
+
+        install_hook_down(Some(down_lossy_shim(1)));
+        assert!(
+            down_hook_is_installed_for_tests(),
+            "install_hook_down must populate the downlink slot"
+        );
+        assert!(
+            !hook_is_installed_for_tests(),
+            "installing the downlink shim must NOT populate the uplink slot"
+        );
+
+        clear_hook();
+        assert!(!down_hook_is_installed_for_tests());
+    }
+
+    /// Issue #1080: a Down shim must drive `shape_inbound` (Drop) but must
+    /// NOT shape the uplink (`shape_uplink_*` consults only the Up slot).
+    /// If `consult`/`consult_down` read the wrong slot, one of these
+    /// assertions fails.
+    #[test]
+    fn down_shim_shapes_inbound_not_outbound() {
+        clear_hook();
+        // 100% loss so every admit is a Drop — removes flakiness.
+        #[allow(clippy::arc_with_non_send_sync)]
+        let shim = Arc::new(NetSimShim::new(
+            NetworkProfile {
+                loss_pct: 100.0,
+                seed: Some(2),
+                ..NetworkProfile::passthrough()
+            },
+            Direction::Down,
+        ));
+        install_hook_down(Some(shim));
+
+        // Inbound: a Down shim at 100% loss must instruct the caller to
+        // discard.
+        assert!(
+            shape_inbound(1200),
+            "Down shim must DROP inbound media (true)"
+        );
+
+        // Outbound: the uplink seam consults only the Up slot, which is
+        // empty — so no shaping, caller does the normal send.
+        assert!(
+            !shape_uplink_datagram(&[0u8; 1200]),
+            "Down shim must NOT shape the uplink send path"
+        );
+
+        clear_hook();
+    }
+
+    /// Issue #1080: symmetric direction guard — an Up shim must NOT shape
+    /// inbound. `shape_inbound` reads only the downlink slot, so an Up shim
+    /// (even at 100% loss) installed via `install_hook` leaves inbound
+    /// untouched.
+    #[test]
+    fn up_shim_does_not_shape_inbound() {
+        clear_hook();
+        #[allow(clippy::arc_with_non_send_sync)]
+        let up = Arc::new(NetSimShim::new(
+            NetworkProfile {
+                loss_pct: 100.0,
+                seed: Some(3),
+                ..NetworkProfile::passthrough()
+            },
+            Direction::Up,
+        ));
+        install_hook(Some(up));
+
+        assert!(
+            !shape_inbound(1200),
+            "an Up shim must never cause inbound packets to be dropped"
+        );
+
+        clear_hook();
+    }
+
+    /// `install_hook_for_direction` must route by the shim's own direction,
+    /// not by argument order. A Down shim lands in the down slot; an Up
+    /// shim lands in the up slot.
+    #[test]
+    fn install_for_direction_routes_by_shim_direction() {
+        clear_hook();
+        install_hook_for_direction(down_lossy_shim(4));
+        assert!(down_hook_is_installed_for_tests());
+        assert!(!hook_is_installed_for_tests());
+        clear_hook();
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let up = Arc::new(NetSimShim::new(
+            NetworkProfile {
+                latency_ms: 10,
+                seed: Some(5),
+                ..NetworkProfile::passthrough()
+            },
+            Direction::Up,
+        ));
+        install_hook_for_direction(up);
+        assert!(hook_is_installed_for_tests());
+        assert!(!down_hook_is_installed_for_tests());
+        clear_hook();
+    }
+
+    /// No downlink shim installed → `shape_inbound` is the production fast
+    /// path and never drops. Pins the "passthrough when absent" contract.
+    #[test]
+    fn shape_inbound_passes_when_no_down_shim() {
+        clear_hook();
+        for _ in 0..256 {
+            assert!(
+                !shape_inbound(1500),
+                "no downlink shim must mean no inbound drops"
+            );
+        }
+    }
 }
 
 // wasm-bindgen-test counterpart: same survival assertion, but
@@ -447,5 +685,40 @@ mod wasm_tests {
                 "sample_dup_jitter_ms() returned {v}, expected [5, 50]"
             );
         }
+    }
+
+    /// Issue #1080: in the real browser-shaped wasm runtime, a Down shim at
+    /// 100% loss must drop inbound packets (`shape_inbound` → true) while
+    /// leaving the uplink slot — and therefore `shape_uplink_*` — untouched.
+    /// Mutating `consult_down` to read the wrong slot, or `shape_inbound` to
+    /// return `false` on Drop, fails this.
+    #[wasm_bindgen_test]
+    #[allow(clippy::arc_with_non_send_sync)] // wasm32 NetSimShim is !Sync; single-threaded runtime — see NetSimShim doc.
+    fn down_shim_drops_inbound_in_wasm() {
+        clear_hook();
+        assert!(!down_hook_is_installed_for_tests());
+
+        let shim = Arc::new(NetSimShim::new(
+            NetworkProfile {
+                loss_pct: 100.0,
+                seed: Some(11),
+                ..NetworkProfile::passthrough()
+            },
+            Direction::Down,
+        ));
+        install_hook_down(Some(shim));
+        assert!(
+            down_hook_is_installed_for_tests(),
+            "install_hook_down must populate the downlink slot in wasm"
+        );
+
+        assert!(shape_inbound(1200), "Down 100%-loss shim must drop inbound");
+        assert!(
+            !shape_uplink_datagram(&[0u8; 1200]),
+            "Down shim must not shape the uplink path"
+        );
+
+        clear_hook();
+        assert!(!down_hook_is_installed_for_tests());
     }
 }

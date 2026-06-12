@@ -1,5 +1,6 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
+import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
@@ -40,11 +41,14 @@ async function navigateAndJoin(page: Page, meetingId: string, username: string):
   const waiting = page.getByText("Waiting to be admitted");
   const grid = page.locator("#grid-container");
 
-  const r = await Promise.race([
-    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
-    waiting.waitFor({ timeout: 30_000 }).then(() => "waiting" as const),
-    grid.waitFor({ timeout: 30_000 }).then(() => "grid" as const),
-  ]);
+  const r = await waitForVisibleState(
+    [
+      { name: "join", locator: joinButton },
+      { name: "waiting", locator: waiting },
+      { name: "grid", locator: grid },
+    ],
+    30_000,
+  );
 
   if (r === "join") {
     await page.waitForTimeout(1000);
@@ -66,10 +70,13 @@ async function admitFromHost(hostPage: Page, guestPage: Page): Promise<void> {
 
     const guestJoin = guestPage.getByRole("button", { name: /Start Meeting|Join Meeting/ });
     const guestGrid = guestPage.locator("#grid-container");
-    const r = await Promise.race([
-      guestJoin.waitFor({ timeout: 20_000 }).then(() => "join" as const),
-      guestGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
-    ]);
+    const r = await waitForVisibleState(
+      [
+        { name: "join", locator: guestJoin },
+        { name: "grid", locator: guestGrid },
+      ],
+      20_000,
+    );
     if (r === "join") {
       await guestPage.waitForTimeout(800);
       await guestJoin.click();

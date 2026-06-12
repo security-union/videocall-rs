@@ -378,6 +378,29 @@ pub fn PeerTile(
         None
     };
 
+    // Per-peer RECEIVE simulcast diagnostics for THIS peer, for the popup's
+    // "Layers" section. Sourced from the SAME `per_peer_received_snapshots`
+    // reader the Performance dialog / Diagnostics panel use (via
+    // `VideoCallClient`), so the popup and the perf dialog render identical
+    // quality dots / metric / reason for the same peer at the same moment.
+    //
+    // Computed ONLY while the popup is open and re-evaluated on the popup's
+    // existing ~1 Hz refresh (`sample_counter` is already read above when
+    // `show_signal_popup`), so we add no new high-frequency poll on the hot
+    // path. The popup looks itself up by `session_id == peer_id` (the tile key
+    // is the peer's session_id rendered via `u64::to_string`), so we parse the
+    // id and match here rather than threading every peer's diag down.
+    let sig_receive_diag = if show_signal_popup {
+        peer_id.parse::<u64>().ok().and_then(|sid| {
+            client
+                .per_peer_received_snapshots()
+                .into_iter()
+                .find(|d| d.session_id == sid)
+        })
+    } else {
+        None
+    };
+
     let appearance = use_context::<AppearanceSettingsCtx>().0();
 
     // Only show mute button when: viewer is host, peer is not self, peer is unmuted.
@@ -507,6 +530,7 @@ pub fn PeerTile(
             },
             transport: sig_transport,
             meter_mode,
+            receive_diag: sig_receive_diag,
         },
         SignalPopupHandlers {
             show: show_signal_popup,

@@ -4404,7 +4404,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--glass-bg-hover);
   border-radius: var(--radius-lg);
   padding: 10px 16px;
-  color: var(--text-primary);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes (rgba(30,30,30,0.88) above), so the theme-flipping --text-primary
+     token must NOT be used here — it goes near-black under
+     html[data-theme="light"] and would render the toast text invisible on the
+     dark surface. This literal equals --text-primary's dark value (opaque white)
+     so dark mode is byte-identical; white on rgb(30,30,30) ≈ 16:1, well past
+     4.5:1. */
+  color: #ffffff;
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
@@ -4442,7 +4449,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-left .toast-icon svg {
-  color: var(--toast-action-neutral);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes, so --toast-action-neutral must NOT be used — it flips near-black
+     (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this icon glyph
+     invisible on the dark chip. Literal equals the token's dark value so dark mode
+     is unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
+     ≈ 6-7:1, past 4.5:1. */
+  color: rgba(255, 255, 255, 0.5);
 }
 
 .peer-toast .toast-text {
@@ -4452,7 +4465,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .peer-toast .toast-name {
   font-weight: 600;
-  color: var(--text-on-glass-strong);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes, so --text-on-glass-strong must NOT be used — it flips near-black
+     (rgba(0,0,0,0.92)) under html[data-theme="light"], rendering the participant
+     name invisible on the dark surface (the reported issue 1189 bug). Literal
+     equals the token's dark value so dark mode is unchanged; white 0.95 on
+     rgb(30,30,30) ≈ 14.5:1, well past 4.5:1. */
+  color: rgba(255, 255, 255, 0.95);
 }
 
 .peer-toast.toast-joined .toast-action {
@@ -4461,7 +4480,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-left .toast-action {
-  color: var(--text-on-glass-faint);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes, so --text-on-glass-faint must NOT be used — it flips near-black
+     (rgba(0,0,0,0.44)) under html[data-theme="light"], rendering this faint
+     secondary text invisible on the dark surface. Literal equals the token's dark
+     value so dark mode is unchanged; preserves the dimmer secondary weight. White
+     0.5 on rgb(30,30,30) ≈ 6-7:1, still past 4.5:1. */
+  color: rgba(255, 255, 255, 0.5);
   font-weight: 400;
 }
 
@@ -4483,7 +4508,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-loading .toast-icon svg {
-    color: var(--toast-action-neutral);
+    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+       both themes, so --toast-action-neutral must NOT be used — it flips near-black
+       (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this loading
+       glyph invisible on the dark chip. Literal equals the token's dark value so
+       dark mode is unchanged; preserves the dim neutral weight. White 0.5 on
+       rgb(30,30,30) ≈ 6-7:1, past 4.5:1. */
+    color: rgba(255, 255, 255, 0.5);
     animation: screen-share-spin 1s linear infinite;
 }
 
@@ -4500,7 +4531,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-error .toast-icon svg {
-    color: var(--danger, var(--toast-action-neutral));
+    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+       both themes. --danger is UNDEFINED in this codebase, so this fell through to
+       --toast-action-neutral, which flips near-black (rgba(0,0,0,0.45)) under
+       html[data-theme="light"], rendering the error glyph invisible on the dark
+       chip. Literal equals the (fallen-through) token's dark value so dark mode is
+       unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
+       ≈ 6-7:1, past 4.5:1. */
+    color: rgba(255, 255, 255, 0.5);
 }
 
 @keyframes screen-share-spin {

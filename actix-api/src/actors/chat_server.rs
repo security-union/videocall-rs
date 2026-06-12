@@ -3842,12 +3842,17 @@ fn handle_msg(
         // leak.
         //
         // CONGESTION and LAYER_HINT are intentionally exempted: both are
-        // RELAY-authored, self-ADDRESSED control packets. A congested receiver
-        // (CONGESTION) or the relay's per-source layer aggregator (LAYER_HINT,
-        // `emit_layer_hint`) publishes them onto the target publisher's OWN
-        // subject with that publisher's session_id embedded, and they MUST
-        // still reach the publisher so the client can step down its quality
-        // tier (CONGESTION) or cap its encoded simulcast ladder (LAYER_HINT).
+        // RELAY-authored, self-ADDRESSED control packets. The relay's
+        // per-source layer aggregator (LAYER_HINT, `emit_layer_hint`) publishes
+        // onto the target publisher's OWN subject with that publisher's
+        // session_id embedded, and the hint MUST still reach the publisher so
+        // the client can cap its encoded simulcast ladder. The CONGESTION
+        // carve-out is the same self-echo exemption: historically a congested
+        // receiver's downlink overflow drove the relay to author a sender-keyed
+        // CONGESTION here, but #1219 removed that emit (it collapsed the
+        // publisher's encoder for the WHOLE room on a single slow receiver).
+        // The carve-out itself stays — it still must pass any legitimately
+        // relay-authored CONGESTION through to the target.
         // Without the LAYER_HINT carve-out the publish-side layer suppression
         // built in #1108 is inert: the hint is generated but the self-echo
         // guard drops it before it leaves the relay (the #1108 delivery gap).
@@ -3899,18 +3904,21 @@ fn handle_msg(
             }
         }
 
-        // Unicast CONGESTION filter (#1220). CONGESTION is a relay-authored,
-        // self-ADDRESSED control packet: `on_outbound_drop` publishes it onto the
+        // Unicast CONGESTION filter (#1220). Historically, relay-authored
+        // CONGESTION was a self-addressed control packet published onto the
         // target sender's OWN per-session subject (`room.{room}.{sender_sid}`)
-        // with that sender's `session_id` embedded. It is meaningful to exactly
-        // ONE session — the targeted sender — yet the NATS room wildcard
-        // (`room.{room}.*`) delivers it to EVERY session in the room. Before this
-        // filter, every NON-target receiver forwarded CONGESTION all the way to
-        // its transport, where the client discarded it (`video_call_client.rs`:
-        // the client matches `session_id` against its own and ignores otherwise).
-        // For a 20-person room that is ~19/20 = 95% of CONGESTION deliveries
-        // wasted on the relay→transport hop (serialize + channel enqueue + wire
-        // bytes) only to be dropped client-side.
+        // with that sender's `session_id` embedded. It was meaningful to
+        // exactly ONE session — the targeted sender — yet the NATS room
+        // wildcard (`room.{room}.*`) delivered it to EVERY session in the
+        // room. Before this filter, every NON-target receiver forwarded
+        // CONGESTION all the way to its transport, where the client discarded
+        // it (`video_call_client.rs`: the client matches `session_id` against
+        // its own and ignores otherwise). For a 20-person room that was
+        // ~19/20 = 95% of CONGESTION deliveries wasted on the relay→transport
+        // hop (serialize + channel enqueue + wire bytes) only to be dropped
+        // client-side. The sender-keyed relay emit was removed in #1219, but
+        // the filter remains valid defense-in-depth for any injected or
+        // transitional CONGESTION packets.
         //
         // Model: the MEETING-unicast filter directly above. We drop CONGESTION
         // here unless this session is the target. "Target" is `subject_self ||
@@ -4248,8 +4256,9 @@ fn handle_msg(
             // (b) it pairs with the mailbox HEADROOM bump (#1144) that gives
             // the burst room to land in the mailbox and then spill onto the
             // policy-aware outbound channel (which DOES shed video-first and
-            // fire CONGESTION). Shedding alone can't save a critical packet on
-            // a full mailbox; the headroom is what actually prevents the drop.
+            // record drops for metrics / keyframe-relax). Shedding alone
+            // can't save a critical packet on a full mailbox; the headroom is
+            // what actually prevents the drop.
             //
             // We classify off the OUTER cleartext wrapper that was already
             // parsed ONCE per packet (`parsed`) — `packet_type` + the outer
@@ -6193,9 +6202,13 @@ mod tests {
 
     #[actix_rt::test]
     async fn test_handle_msg_congestion_passes_self_filter_via_subject() {
-        // CONGESTION carve-out: a congested receiver publishes onto the
-        // throttled sender's own subject so the sender can step down its
-        // quality tier. The subject match must NOT block CONGESTION.
+        // CONGESTION carve-out: a relay-authored, self-addressed CONGESTION
+        // packet rides the throttled sender's own subject so the sender can
+        // step down its quality tier; the subject-self match must NOT block
+        // it. (Historically the relay AUTHORED that packet on the
+        // receiver-downlink-overflow path; #1219 removed that sender-keyed
+        // emit. The carve-out itself stays — it still must pass any
+        // legitimately relay-authored CONGESTION through to the target.)
         let count = Arc::new(AtomicUsize::new(0));
         let actor = RecordingSession {
             count: count.clone(),
@@ -6231,9 +6244,8 @@ mod tests {
     #[actix_rt::test]
     async fn test_handle_msg_congestion_passes_self_filter_via_inner_session_id() {
         // CONGESTION carve-out applied to the new inner-session check too.
-        // session_logic.rs:488-494 stamps `session_id = sender_sid` (the
-        // throttled sender's session) onto the CONGESTION packet so the
-        // receiver can correlate it. The inner-session self-skip must NOT
+        // Legacy relay-authored CONGESTION stamped the throttled sender's
+        // session into the packet. The inner-session self-skip must NOT
         // suppress CONGESTION just because the inner session_id matches.
         let count = Arc::new(AtomicUsize::new(0));
         let actor = RecordingSession {

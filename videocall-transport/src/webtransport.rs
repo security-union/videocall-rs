@@ -127,6 +127,48 @@ pub fn unistream_ready_stall_count() -> u64 {
 /// (one reordered/retransmitted packet on a high-RTT link) cannot shed a layer.
 const READY_STALL_THRESHOLD_MS: f64 = 250.0;
 
+/// Pure threshold predicate for the uplink-saturation signal: returns `true`
+/// when a single `writer.ready().await` that took `elapsed_ms` to resolve
+/// qualifies as a "slow-ready" (saturation) event.
+///
+/// Extracted from the `send_on_persistent_stream` hot path so the threshold
+/// decision — the one piece of the saturation signal that is pure arithmetic
+/// rather than JS-bound I/O — can be unit-tested on the NATIVE host target,
+/// sidestepping the `#[wasm_bindgen_test]` browser harness entirely. The
+/// surrounding async machinery (`performance.now()` reads bracketing the real
+/// `JsFuture::from(writer.ready()).await`) stays at the call site; only this
+/// comparison moved. Behaviour is identical: the call site computes
+/// `elapsed = end - start` exactly as before and passes it here.
+///
+/// The comparison is strictly `>` (NOT `>=`): a wait of EXACTLY the threshold
+/// is not yet a stall. This boundary is pinned by unit tests.
+#[inline]
+fn is_ready_stall(elapsed_ms: f64) -> bool {
+    elapsed_ms > READY_STALL_THRESHOLD_MS
+}
+
+/// Record one `writer.ready()` measurement against the saturation threshold:
+/// if `elapsed_ms` qualifies as a stall ([`is_ready_stall`]), increment
+/// [`UNISTREAM_READY_STALL_COUNT`] once and return `true`; otherwise leave the
+/// counter untouched and return `false`.
+///
+/// This is the exact increment that previously lived inline at the
+/// `send_on_persistent_stream` ready-stall site. The caller is still
+/// responsible for the two conditions that depend on JS / `Rc` runtime state
+/// and therefore cannot be made pure: (1) the established-media-writer gate
+/// (`captured_token.is_some()`), and (2) timer availability
+/// (`perf_now_ms()` returning `Some` at both ends). When both hold, the caller
+/// invokes this with the measured elapsed and the counter behaves identically
+/// to the original inline `fetch_add`.
+fn record_ready_stall(elapsed_ms: f64) -> bool {
+    if is_ready_stall(elapsed_ms) {
+        UNISTREAM_READY_STALL_COUNT.fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
 /// Read a monotonic high-resolution timestamp (ms) from `performance.now()`.
 ///
 /// Returns `None` when there is no `window` / no `Performance` object (e.g. a
@@ -979,9 +1021,9 @@ impl WebTransportTask {
                 // by a control/handshake stream if this code is later refactored.
                 if captured_token.is_some() {
                     if let (Some(start), Some(end)) = (ready_wait_start_ms, perf_now_ms()) {
-                        if end - start > READY_STALL_THRESHOLD_MS {
-                            UNISTREAM_READY_STALL_COUNT.fetch_add(1, Ordering::Relaxed);
-                        }
+                        // Pure threshold + increment lives in `record_ready_stall`
+                        // so the saturation decision is unit-testable natively.
+                        record_ready_stall(end - start);
                     }
                 }
                 JsFuture::from(writer.write_with_chunk(&chunk))
@@ -1535,5 +1577,182 @@ mod framing_tests {
         assert!(!remove_if_token_matches(&mut map, KEY, &captured_by_a));
         assert!(map.contains_key(&KEY));
         assert!(Rc::ptr_eq(&map.get(&KEY).unwrap().token, &e2_token));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // WebTransport uplink-saturation signal (#1219 prerequisite).
+    //
+    // These tests pin the INCREMENT side of the signal: the threshold→count
+    // decision that the encoder AQ self-shed depends on. The counterpart
+    // DECISION side (consumer window/threshold) is pinned by the existing
+    // `videocall-aq` `evaluate_self_congestion` tests. Together they cover
+    // both halves of the WT self-shed that replaces the relay's room-wide
+    // CONGESTION cut (#1219).
+    //
+    // Why NATIVE `#[test]` and not `#[wasm_bindgen_test]`: the increment is
+    // pure arithmetic over an elapsed-ms `f64` once the producer-side seam
+    // (`is_ready_stall` / `record_ready_stall`) is extracted, so it runs on
+    // the host target with no JS. This deliberately avoids the browser wasm
+    // harness, which is known to silently no-op `#[wasm_bindgen_test]` on
+    // this dev box (false-green). The real `writer.ready().await` and the
+    // `performance.now()` reads bracketing it remain at the WASM-only call
+    // site and are unchanged by this seam.
+    // ─────────────────────────────────────────────────────────────────────
+
+    use std::sync::atomic::Ordering;
+    use std::sync::Mutex;
+
+    /// Serialises the tests that mutate the process-global
+    /// `UNISTREAM_READY_STALL_COUNT` so their before/after deltas are not
+    /// corrupted by parallel test execution (the default for `cargo test`).
+    /// The pure `is_ready_stall` boundary tests do not touch the counter and
+    /// do not need this guard.
+    static STALL_COUNTER_GUARD: Mutex<()> = Mutex::new(());
+
+    // --- Pure threshold predicate: the mutation target ---------------------
+    // The single source of truth for the boundary is `READY_STALL_THRESHOLD_MS`
+    // (250.0). Mutating either the `>` (to `>=`) or the constant must break at
+    // least one of the boundary tests below — proven in the agent report.
+
+    #[test]
+    fn ready_stall_just_below_threshold_is_not_a_stall() {
+        // One frame interval under the threshold: an ordinary
+        // bursty-but-recovering link must NOT register as saturation.
+        assert!(
+            !is_ready_stall(READY_STALL_THRESHOLD_MS - 1.0),
+            "a wait below the threshold must not count as a stall",
+        );
+    }
+
+    #[test]
+    fn ready_stall_exactly_at_threshold_is_not_a_stall() {
+        // Boundary pin: the comparison is strictly `>`, so a wait of EXACTLY
+        // the threshold is not yet a stall. Flipping `>` to `>=` flips this.
+        assert!(
+            !is_ready_stall(READY_STALL_THRESHOLD_MS),
+            "a wait of exactly the threshold must NOT count (strict `>`)",
+        );
+    }
+
+    #[test]
+    fn ready_stall_just_above_threshold_is_a_stall() {
+        // One millisecond over the threshold: the smallest wait that must
+        // register. Flipping the constant up (or the `>` away) flips this.
+        assert!(
+            is_ready_stall(READY_STALL_THRESHOLD_MS + 1.0),
+            "a wait just above the threshold must count as a stall",
+        );
+    }
+
+    #[test]
+    fn ready_stall_well_above_threshold_is_a_stall() {
+        // A multi-second cliff — the case the signal exists to catch.
+        assert!(
+            is_ready_stall(2_000.0),
+            "a multi-second wait must count as a stall",
+        );
+    }
+
+    #[test]
+    fn ready_stall_boundary_is_pinned_to_250ms_absolute() {
+        // The relative tests above track `READY_STALL_THRESHOLD_MS`, so they
+        // cannot catch a change to the constant's VALUE. This test pins the
+        // 250 ms boundary in ABSOLUTE terms, matching the constant's documented
+        // contract ("250 ms is ~8x a 30 fps frame interval"). It is the
+        // mutation guard for the constant itself: changing 250.0 to any other
+        // value breaks exactly one of these three assertions.
+        assert!(
+            !is_ready_stall(249.0),
+            "249 ms must NOT be a stall (just under the 250 ms boundary)",
+        );
+        assert!(
+            !is_ready_stall(250.0),
+            "exactly 250 ms must NOT be a stall (strict `>` at the boundary)",
+        );
+        assert!(
+            is_ready_stall(251.0),
+            "251 ms must be a stall (just over the 250 ms boundary)",
+        );
+    }
+
+    // --- Increment side effect on the process-global counter ---------------
+
+    #[test]
+    fn record_ready_stall_increments_counter_once_above_threshold() {
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS + 50.0);
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert!(
+            counted,
+            "an above-threshold wait must report that it counted"
+        );
+        assert_eq!(
+            after - before,
+            1,
+            "an above-threshold wait must increment the counter exactly once",
+        );
+        // The public accessor (the AQ consumer's entry point) must observe the
+        // same value, proving the seam writes the counter the consumer reads.
+        assert_eq!(
+            unistream_ready_stall_count(),
+            after,
+            "public accessor must reflect the recorded stall",
+        );
+    }
+
+    #[test]
+    fn record_ready_stall_leaves_counter_untouched_below_threshold() {
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS - 50.0);
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert!(
+            !counted,
+            "a below-threshold wait must report that it did not count",
+        );
+        assert_eq!(
+            after, before,
+            "a below-threshold wait must NOT touch the counter",
+        );
+    }
+
+    #[test]
+    fn record_ready_stall_does_not_count_exactly_at_threshold() {
+        // The increment must obey the same strict `>` boundary as the
+        // predicate: a wait of exactly the threshold leaves the counter flat.
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS);
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert!(!counted, "exactly-at-threshold must not count");
+        assert_eq!(after, before, "exactly-at-threshold must not increment");
+    }
+
+    #[test]
+    fn record_ready_stall_accumulates_across_repeated_stalls() {
+        // The consumer's window test reads "N events in the window," so K
+        // distinct above-threshold waits must produce exactly K increments —
+        // the property the inline-vs-extracted refactor must preserve.
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        const K: u64 = 5;
+        for _ in 0..K {
+            assert!(record_ready_stall(READY_STALL_THRESHOLD_MS + 10.0));
+        }
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            K,
+            "K above-threshold stalls must produce exactly K increments",
+        );
     }
 }

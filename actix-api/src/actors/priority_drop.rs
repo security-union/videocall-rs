@@ -61,9 +61,15 @@
 //! ### Behaviour on dropped packets
 //!
 //! When this module returns [`PriorityDropDecision::Drop`], the caller
-//! must still invoke `SessionLogic::on_outbound_drop` so the existing
-//! per-sender CONGESTION feedback path fires — otherwise senders whose
-//! video gets dropped will never be told to step down their tier.
+//! must still invoke `SessionLogic::on_outbound_drop`. Post-#1219 that no
+//! longer emits a sender-keyed CONGESTION signal (one slow receiver must not
+//! collapse the publisher's encode for the whole room); the publisher's own
+//! uplink distress is now detected client-side. What `on_outbound_drop` still
+//! does is call `CongestionTracker::record_drop`, which updates the
+//! per-RECEIVER `last_congestion` timestamp that relaxes this receiver's
+//! KEYFRAME_REQUEST rate limiter (#979) so its own frozen video can recover
+//! faster. So the preempt-drop here still feeds a per-receiver response — it
+//! just no longer drives the removed sender-keyed CONGESTION path.
 
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
@@ -210,10 +216,11 @@ impl OutboundPriority {
             // protected even though it normally never collides with
             // outbound saturation.
             PacketType::SESSION_ASSIGNED => OutboundPriority::Critical,
-            // CONGESTION feedback is how a sender learns to back off;
-            // dropping it during saturation is exactly the wrong thing
-            // (the receiver is congested precisely because the sender
-            // does not yet know to slow down).
+            // CONGESTION remains a Critical control packet for
+            // compatibility with client-originated or externally injected
+            // packets. The relay no longer emits sender-keyed CONGESTION
+            // from receiver-downlink overflow, but if such a packet exists
+            // it must not be shed by the priority policy.
             PacketType::CONGESTION => OutboundPriority::Critical,
             // RSA_PUB_KEY and AES_KEY are both halves of the E2EE
             // handshake — RSA_PUB_KEY initiates the asymmetric step and
@@ -258,8 +265,8 @@ pub enum PriorityDropDecision {
     Admit,
     /// Drop the packet before enqueuing. The caller is responsible for
     /// incrementing the drop metrics with the embedded reason label and
-    /// for invoking `on_outbound_drop` so CONGESTION feedback still
-    /// fires for the sender.
+    /// for invoking `on_outbound_drop` so the drop is recorded for metrics
+    /// and the #979 keyframe-relax path.
     Drop {
         /// Stable metric label suitable for the
         /// `videocall_outbound_channel_drops_total{drop_reason=…}`

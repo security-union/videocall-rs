@@ -12,6 +12,10 @@ on:
       - 'protobuf/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      # Trigger this workflow when it (or its CI guard script) changes, so the
+      # change is validated and the flake guard (#1267) self-tests in real CI.
+      - '.github/workflows/pr-check-dioxus-ui-hcl.yaml'
+      - 'scripts/ci/**'
 
 concurrency:
   group: pr-check-dioxus-ui-${{ github.event.pull_request.number }}
@@ -32,7 +36,11 @@ jobs:
   component-tests:
     name: Dioxus UI component tests
     runs-on: [self-hosted, linux, x64, hcl-ci]
-    timeout-minutes: 15
+    # Bumped 15 -> 20 for flake-guard retry headroom. The guard caps each attempt
+    # at WASM_TEST_TIMEOUT_SECS (150s) and retries the harness flake up to 3x; the
+    # realistic success path is 11 normal passes + one test recovering after 1-2
+    # wasted ~150s attempts. A genuine failure fails fast and adds nothing.
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4.2.0
         with:
@@ -46,92 +54,79 @@ jobs:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo test --target wasm32-unknown-unknown --no-run
 
-      # Run each test binary in its own step with a Chrome cleanup between them.
-      # This prevents renderer state from accumulating across sessions and causing
-      # the 5-minute "Timed out receiving message from renderer" flake.
+      # Run each test binary in its own step via the flake guard
+      # (scripts/ci/retry-wasm-component-test.sh). The guard adds a per-attempt
+      # wall-clock timeout, a bounded retry on the headless-Chrome harness flake
+      # ONLY (timeout/renderer-timeout signature), and a fail-fast on any genuine
+      # assertion failure. It also performs the Chrome/chromedriver cleanup
+      # between attempts and after success, so the previous inline pkill is gone.
+      # From working-directory dioxus-ui-repo/dioxus-ui the guard lives one level
+      # up at ../scripts/ci/...; cargo still runs in the dioxus-ui dir (the guard
+      # does not change cwd). The "Build test binaries" step above prebuilt all
+      # binaries, so the guard's cargo invocations will not recompile.
 
       - name: test lib (unit tests)
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --lib
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --lib
 
       - name: test context_unit
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --test context_unit
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --test context_unit
 
       - name: test device_selector
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --test device_selector
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --test device_selector
 
       - name: test device_integration
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --test device_integration
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --test device_integration
 
       - name: test home_integration
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --test home_integration
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --test home_integration
 
       - name: test login_provider_logo
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --test login_provider_logo
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --test login_provider_logo
 
       - name: test meeting_ended_overlay
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --test meeting_ended_overlay
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --test meeting_ended_overlay
 
       - name: test meetings_list_owner_gating
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --test meetings_list_owner_gating
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --test meetings_list_owner_gating
 
       - name: test screen_share_state
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --test screen_share_state
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --test screen_share_state
 
       - name: test speaking_indicators
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: |
-          cargo test --target wasm32-unknown-unknown --test speaking_indicators
-          pkill -f chromedriver || true; pkill -f chrome || true; sleep 1
+        run: ../scripts/ci/retry-wasm-component-test.sh --test speaking_indicators
 
       - name: test video_control_buttons
         working-directory: dioxus-ui-repo/dioxus-ui
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: cargo test --target wasm32-unknown-unknown --test video_control_buttons
+        run: ../scripts/ci/retry-wasm-component-test.sh --test video_control_buttons

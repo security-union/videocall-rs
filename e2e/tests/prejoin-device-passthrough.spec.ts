@@ -545,4 +545,178 @@ test.describe("Pre-join device passthrough (#1295)", () => {
     await expect(cameraControl).toHaveClass(/\bactive\b/, { timeout: 15_000 });
     await expect(cameraControl).not.toHaveClass(/\boff\b/);
   });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // 5. JOIN-WITH-CAMERA-ON CONVERGENCE under a forced post-permission
+  //    `devicechange` DOUBLE-START.  @camera
+  //
+  // ─── WHAT THIS PINS (and, crucially, what it does NOT) ──────────────────────
+  // The #1295 working-tree fix (camera_encoder.rs) targets a "dark square on
+  // initial join": joining with the camera ON showed `<video id="webcam">` with
+  // NO live feed until a manual OFF→ON. Root cause: a post-permission
+  // `devicechange` fires a SECOND camera start() whose `select()`-while-enabled
+  // raises the `switching` flag; on the BUGGY encoder the acquire-phase and
+  // per-frame supersede guards READ `switching` and aborted the loop that should
+  // bind (acquire bail BEFORE `set_src_object`, or per-frame `track.stop()` on a
+  // just-bound track), so no live track survived. The fix makes `epoch` (not
+  // `switching`) the sole supersede authority and clears `switching` at the
+  // loop-commit, so exactly one loop binds and stays live.
+  //
+  // THIS TEST IS A CONVERGENCE / "permanent-dark" GUARD, *NOT* a regression
+  // guard that fails on the pre-fix encoder. It is deliberately NOT claimed to
+  // pin the fix, because — verified against the buggy source at HEAD
+  // (75cb1a88, `git show HEAD:videocall-client/src/encode/camera_encoder.rs`) —
+  // the buggy dark square is *self-healing in this harness* and cannot be made to
+  // fail deterministically with JS injection alone:
+  //
+  //   • The post-permission `devicechange` handler (host.rs on_devices_changed,
+  //     L505-549) both raises `switching` (via `select()` at L521) AND schedules
+  //     a healing `camera.start()` 1000ms later (L544). On the buggy encoder the
+  //     stale loop self-aborts (acquire bail HEAD L2152-2180 / per-frame stop
+  //     HEAD L2565-2571) but ALWAYS clears `switching` on the way out
+  //     (HEAD L2172 / L2569). ~1s later the scheduled start() spawns a FRESH loop
+  //     into a clean `switching==false` / new-epoch state, so it binds a LIVE
+  //     track and HEALS. With fake devices `getUserMedia` resolves in ms, so the
+  //     dark interval is sub-second and the end-state is LIVE on buggy too.
+  //   • The only JS lever that could park the heal — delaying `getUserMedia` —
+  //     ALSO darkens the FIXED build: on a same-device `devicechange` the
+  //     start() running-guard takes `self.stop()` + respawn on BOTH builds
+  //     (camera_encoder.rs L1911-1925, identical buggy/fixed: `switch_requested`
+  //     is true so the same-device early-return is skipped), so the fixed loop is
+  //     also torn down and must re-`getUserMedia` to rebind. A parked
+  //     `getUserMedia` therefore leaves BOTH builds dark in the same window —
+  //     the delay cannot separate them. The faithful, deterministic dark-square
+  //     regression guard therefore lives in Rust, not here: the native unit test
+  //     `camera_encoder::tests::loop_is_not_superseded_when_only_switching_is_raised`
+  //     asserts the extracted supersede predicate (`loop_is_superseded`, the SAME
+  //     one both encode-loop guards call) does NOT mark a loop superseded when
+  //     only `switching` is raised (enabled, matching epoch) — i.e. the loop that
+  //     should bind keeps going instead of bailing before `set_src_object`. That
+  //     test FAILS if the pre-fix `switching` term is reintroduced into the
+  //     predicate (verified by mutation), so it pins the dark-square fix
+  //     deterministically and headlessly. The wrong-device facet of #1295 is
+  //     pinned deterministically by test 2 above.
+  //
+  // ─── WHAT THIS TEST DOES CATCH (its load-bearing invariant) ─────────────────
+  // It FORCES the app's real double-start path that test 4 cannot reach. Test 4
+  // only ever exercises the SINGLE-start cold path because fake-device
+  // `enumerateDevices()` returns an IDENTICAL id list on every call, so the app's
+  // `MediaDeviceList` list-diff (media_device_list.rs L377-404) never fires
+  // `on_devices_changed`, so no `select()`-while-enabled → `switching` → second
+  // start() ever happens. Here we install a passthrough `enumerateDevices` stub
+  // that, ONLY after we arm it post-join, returns the REAL device list with one
+  // NON-selected video input dropped — a genuinely different id list whose
+  // SELECTED camera still exists. Dispatching `devicechange` then drives the app
+  // through `on_devices_changed` → same-device `select()` (raises `switching`) →
+  // scheduled second `camera.start()` — the exact interleaving the dark square
+  // lived in. The invariant asserted is the user-facing contract: after that
+  // double-start, `#webcam` CONVERGES to a live bound track (a real, non-empty
+  // deviceId). This fails if a future regression makes the double-start path
+  // leave the camera PERMANENTLY dark (e.g. the heal never rebinds, or
+  // on_devices_changed stops rebinding), which is a real and distinct robustness
+  // property. It is NOT vacuous (`X==X`): mutate the heal so the second start()
+  // never rebinds and this poll times out null.
+  //
+  // ─── ADVERSARIAL SELF-CHECK (per CLAUDE.md, stated honestly) ────────────────
+  // Check 2 — "does this fail on the buggy encoder?": NO, and that is reported,
+  // not hidden. The buggy encoder self-heals within ~1s (walked above), so this
+  // test PASSES on buggy HEAD. It is therefore explicitly a convergence /
+  // permanent-dark guard, NOT the dark-square fix-pin, and makes no claim to be
+  // one. The dark-square fix IS pinned deterministically — by the Rust unit test
+  // named above (`loop_is_not_superseded_when_only_switching_is_raised`), which
+  // fails on the pre-fix predicate — so the suite satisfies Check 2 for #1295
+  // without relying on this e2e test to do it. This test's distinct, load-bearing
+  // job is the one the Rust unit cannot reach: driving the app's REAL
+  // double-start path end-to-end and proving it CONVERGES (never goes permanently
+  // dark). No-shared-meeting-id: this test uses its own Date.now()-suffixed id, so
+  // it cannot make test 2 or test 4 flaky.
+  // ──────────────────────────────────────────────────────────────────────────
+  test("join with camera ON converges to a live track after a forced devicechange double-start @camera", async ({
+    page,
+  }) => {
+    // Arm a passthrough enumerateDevices stub BEFORE the app boots. While
+    // `window.__vcDropVideoId` is unset (the whole lobby phase) it is a pure
+    // passthrough — the lobby preview, permission grant, and select population
+    // behave exactly as in every other test. Only after we set an explicit
+    // drop-id post-join does a subsequent enumerate return the REAL list minus
+    // that one video input, producing a different id list (so the app's
+    // list-diff fires on_devices_changed). We set the drop-id to a video input
+    // that is NOT the live-captured camera, so the SELECTED camera always
+    // survives → a genuine SAME-device restart (the production dark-square
+    // trigger), built from real MediaDeviceInfo objects (no synthesized shapes).
+    await page.addInitScript(() => {
+      const md = navigator.mediaDevices;
+      const realEnumerate = md.enumerateDevices.bind(md);
+      md.enumerateDevices = async () => {
+        const devices = await realEnumerate();
+        const w = window as unknown as { __vcDropVideoId?: string };
+        if (typeof w.__vcDropVideoId !== "string") return devices;
+        return devices.filter((d) => d.deviceId !== w.__vcDropVideoId);
+      };
+    });
+
+    const actionButton = await gotoPreJoin(page, `e2e_1295_join_converge_${Date.now()}`);
+    await grantMediaAccess(page);
+
+    // Mirror test 4's join: default devices, camera ON, no selector changes.
+    const cameraToggle = page.locator(CAMERA_TOGGLE);
+    await cameraToggle.click();
+    await expect(cameraToggle).toHaveAttribute("aria-pressed", "true");
+
+    await actionButton.click();
+    await expect(page.getByText(MEETING_READY)).toBeVisible({ timeout: 30_000 });
+
+    // Baseline: the cold-start loop binds a live track first (single-start path).
+    await expect.poll(async () => capturedCameraDeviceId(page), { timeout: 30_000 }).not.toBeNull();
+    const baselineCameraId = await capturedCameraDeviceId(page);
+    expect(baselineCameraId, "baseline join must capture a live camera").toBeTruthy();
+
+    // Arm the stub to drop a video input that is NOT the live-captured camera on
+    // the NEXT enumerate (so the changed list still contains the selected camera
+    // → SAME-device restart), then dispatch devicechange so the app
+    // re-enumerates, sees a changed id list, and runs on_devices_changed →
+    // same-device select() (raises `switching`) → scheduled second
+    // camera.start(). This is the forced DOUBLE-START. If there is no other video
+    // input to drop, the list cannot be made to differ and the forcing function
+    // is a no-op — fail loudly rather than assert a vacuous convergence.
+    const dropId = await page.evaluate(async (selectedId) => {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const other = devices.find((d) => d.kind === "videoinput" && d.deviceId !== selectedId);
+      if (!other) return null;
+      (window as unknown as { __vcDropVideoId?: string }).__vcDropVideoId = other.deviceId;
+      navigator.mediaDevices.dispatchEvent(new Event("devicechange"));
+      return other.deviceId;
+    }, baselineCameraId);
+    expect(
+      dropId,
+      "device-count=3 must expose a second video input to drop so on_devices_changed can fire",
+    ).toBeTruthy();
+
+    // CONVERGENCE INVARIANT: after the forced double-start the camera must end up
+    // with a live bound track and a real deviceId. On the fixed encoder the bind
+    // is held throughout; on the buggy encoder it self-heals within ~1s (see the
+    // header) — both converge live, which is why this is a convergence guard, not
+    // a fix-pinning guard. The window covers the on_devices_changed Timeout(1000)
+    // + a fast getUserMedia rebind with generous margin.
+    await expect.poll(async () => capturedCameraDeviceId(page), { timeout: 30_000 }).not.toBeNull();
+    const captured = await capturedCameraDeviceId(page);
+    expect(
+      captured,
+      "camera must converge to a non-empty deviceId after the double-start",
+    ).toBeTruthy();
+
+    // Settle guard: re-read after a short delay to ensure the converged live
+    // track is not transient (no late loop clobbers it back to dark).
+    await page.waitForTimeout(2_000);
+    const settled = await capturedCameraDeviceId(page);
+    expect(
+      settled,
+      "converged live track must remain bound (no late clobber to dark)",
+    ).toBeTruthy();
+
+    // The in-meeting camera control still reflects the enabled/publishing state.
+    const cameraControl = page.locator(CAMERA_CONTROL).nth(1);
+    await expect(cameraControl).toHaveClass(/\bactive\b/, { timeout: 15_000 });
+    await expect(cameraControl).not.toHaveClass(/\boff\b/);
+  });
 });

@@ -3656,7 +3656,7 @@ select {
    160px). `aspect-ratio: 3 / 2` derives height from width. Off-budget
    tiles render with `force_avatar: true` (avatar placeholder, no
    decode) — the decode budget caps live decoders just as the normal
-   grid does (issue #987). */
+   grid does (issue 987). */
 .split-peer-tile {
   position: relative;
   flex: 1 1 160px;

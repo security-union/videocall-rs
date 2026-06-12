@@ -28,6 +28,7 @@ use crate::components::performance_settings::{
 };
 use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -615,6 +616,21 @@ pub fn Diagnostics(
     /// nothing. (#1131 unify)
     #[props(default)]
     perf_controls: Option<PerfControlsHandle>,
+    /// Current drawer width in px, owned by the parent so it can persist + reflow
+    /// the tile grid. (#1296)
+    width: f64,
+    /// Whether this drawer is pinned (reflows the tile grid). (#1296)
+    pinned: bool,
+    /// Fired when the user toggles pin/overlay mode. (#1296)
+    on_toggle_pin: EventHandler<()>,
+    /// Fired on resize-handle pointerdown so the parent can begin a drag. (#1296)
+    on_resize_start: EventHandler<()>,
+    /// Fired on each resize-handle pointermove, carrying the pointer's `client_x`.
+    /// The parent owns the width signals + clamp, so the math lives there. (#1296)
+    on_resize_move: EventHandler<f64>,
+    /// Fired on resize-handle pointerup so the parent can persist + end the drag.
+    /// (#1296)
+    on_resize_end: EventHandler<()>,
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut selected_peer = use_signal(|| "All Peers".to_string());
@@ -1030,10 +1046,13 @@ pub fn Diagnostics(
     // Performance handle hasn't been published yet, because the always-present
     // Connection & system group owns it.
 
+    let pin_label = if pinned { "Unpin panel" } else { "Pin panel" };
+
     rsx! {
         div {
             id: "diagnostics-sidebar",
-            class: if is_open { "visible" } else { "" },
+            class: if is_open { if pinned { "visible pinned" } else { "visible" } } else { "" },
+            style: format!("width: {}px", width),
             // Non-modal drawer: a labelled region (the modal-trap behaviour stays
             // off — the call UI behind it remains interactive). (#1131 §5 a11y)
             role: "region",
@@ -1043,6 +1062,27 @@ pub fn Diagnostics(
                 // Spacer keeps the × rightmost (the cross-nav button was removed
                 // when the Performance panel merged into this drawer; #1131).
                 div { style: "flex: 1 1 auto;" }
+                button {
+                    class: "pin-button",
+                    aria_pressed: pinned,
+                    aria_label: pin_label,
+                    title: pin_label,
+                    onclick: move |_| on_toggle_pin.call(()),
+                    svg {
+                        xmlns: "http://www.w3.org/2000/svg",
+                        width: "20",
+                        height: "20",
+                        view_box: "0 0 24 24",
+                        fill: "none",
+                        stroke: "currentColor",
+                        stroke_width: "2",
+                        stroke_linecap: "round",
+                        stroke_linejoin: "round",
+                        // Pushpin / map-pin icon
+                        path { d: "M12 17v5" }
+                        path { d: "M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" }
+                    }
+                }
                 button {
                     class: "close-button",
                     "aria-label": "Close panel",
@@ -1338,6 +1378,43 @@ pub fn Diagnostics(
                     capped: neteq_capped,
                     single_peer,
                 }
+            }
+            div {
+                class: "drawer-resize-handle",
+                role: "separator",
+                aria_orientation: "vertical",
+                tabindex: "0",
+                // keyboard resize is a follow-up
+                // Pointer capture: capturing the pointer on pointerdown routes every
+                // subsequent pointermove/up to THIS handle even when the pointer moves
+                // over the drawer body or a tile — required for shrink to work. The
+                // width math + persistence live in the parent (attendants.rs), which
+                // owns the width signals; this handle only forwards pointer coords.
+                onpointerdown: move |evt| {
+                    evt.prevent_default();
+                    on_resize_start.call(());
+                    let native = evt.as_web_event();
+                    if let Some(t) = native.target() {
+                        use wasm_bindgen::JsCast;
+                        if let Ok(el) = t.dyn_into::<web_sys::Element>() {
+                            let _ = el.set_pointer_capture(native.pointer_id());
+                        }
+                    }
+                },
+                onpointermove: move |evt| {
+                    on_resize_move.call(evt.as_web_event().client_x() as f64);
+                },
+                onpointerup: move |evt| {
+                    evt.prevent_default();
+                    on_resize_end.call(());
+                },
+                // Reuse on_resize_end on cancel: its parent closure resets
+                // resizing_drawer to None (the only cleanup needed here) and
+                // persists the already-clamped width. Pointer stream cancellation
+                // (OS gesture, touch interruption, lost capture) thus can't latch.
+                onpointercancel: move |_| {
+                    on_resize_end.call(());
+                },
             }
         }
     }

@@ -81,3 +81,26 @@ where
         }
     }
 }
+
+/// Read an `f64` preference from `localStorage`. Returns `default` if storage is
+/// unavailable, the key is missing, the value no longer parses, or the parsed
+/// value is non-finite (NaN or ±infinity). The non-finite guard prevents a
+/// tampered or corrupt stored value (e.g. `"NaN"`) from propagating into layout
+/// math where `NaN` would silently collapse the grid (`avail_w = vw - NaN = NaN
+/// → .max(0.0) = 0.0`). Call sites may additionally clamp the returned value
+/// to enforce domain-specific bounds.
+pub fn load_f64(key: &str, default: f64) -> f64 {
+    web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .and_then(|storage| storage.get_item(key).ok().flatten())
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(default)
+}
+
+/// Persist an `f64` preference to `localStorage`. Silently ignores failures.
+pub fn save_f64(key: &str, value: f64) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.set_item(key, &value.to_string());
+    }
+}

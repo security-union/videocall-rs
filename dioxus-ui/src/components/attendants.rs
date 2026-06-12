@@ -62,6 +62,7 @@ use crate::context::{
     PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
     TransportPreferenceCtx,
 };
+use crate::local_storage::{load_bool, load_f64, save_bool, save_f64};
 use crate::types::DeviceInfo;
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -85,6 +86,27 @@ use videocall_client::{RefreshRoomTokenCallback, RefreshedTokens};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
+
+/// Minimum width (px) a drawer can be dragged to. Below this the panel chrome
+/// (headers, controls) stops being usable. (#1296)
+const DRAWER_MIN_WIDTH: f64 = 240.0;
+/// Absolute maximum drawer width (px). The per-side cap is the smaller of this
+/// and 50% of the viewport (see `max_for_side` in the render body). (#1296)
+const DRAWER_MAX_ABS: f64 = 720.0;
+
+/// Which drawer (if any) is currently being resized by a pointer drag. Tracked
+/// at the meeting-view level because the width signals live here; the pointer
+/// listeners (onpointerdown/move/up) live on each drawer's own
+/// `.drawer-resize-handle` and use pointer capture (`set_pointer_capture`) so
+/// pointermove/up route to the handle even when the cursor is over the drawer
+/// body or the video tiles. The `#grid-container` onmousemove/up/leave handlers
+/// only drive the screen-share split (`ss_resizing`), NOT drawer resize. (#1296)
+#[derive(Clone, Copy, PartialEq)]
+enum ResizingDrawer {
+    None,
+    Left,
+    Right,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
@@ -495,6 +517,43 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    // Drawer pin + width state (#1296). Pinned drawers reflow the tile grid
+    // (carve out horizontal space); unpinned drawers overlay the tiles. Widths
+    // are clamped on load in case a value persisted by an older/incompatible
+    // release no longer satisfies the current min/max.
+    let mut left_pinned = use_signal(|| load_bool("vc_drawer_left_pinned", false));
+    let mut left_width = use_signal(|| {
+        load_f64("vc_drawer_left_width", 320.0).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS)
+    });
+    let mut right_pinned = use_signal(|| load_bool("vc_drawer_right_pinned", false));
+    let mut right_width = use_signal(|| {
+        load_f64("vc_drawer_right_width", 560.0).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS)
+    });
+    let mut resizing_drawer = use_signal(|| ResizingDrawer::None);
+    // Viewport width snapshotted at drag-start so the move handler does NOT
+    // re-read `window().inner_width()` on every mousemove. (#1296)
+    let mut drag_start_vw = use_signal(|| 0.0f64);
+    // Non-reactive rAF coalescing stash for drawer resize (#1296 perf).
+    // Holds the latest pointer client_x and a "rAF scheduled" flag so a fast
+    // drag writes the width signal at most ONCE per painted frame instead of
+    // once per coalesced pointermove (each width write re-runs the whole
+    // meeting-view body + every keyed PeerTile, stealing the wasm main thread
+    // from live video decode). use_hook => one stable instance across renders;
+    // a signal here would defeat the throttle by triggering a re-render itself.
+    let left_raf_x: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
+    let left_raf_pending: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
+    let right_raf_x: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
+    let right_raf_pending: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
+    // Per-drawer "a real move happened this drag" flag. Reset to false on
+    // pointerdown / on_resize_start; set true the first time a pointermove
+    // arrives. The pointerup / on_resize_end flush is GATED on this so a
+    // no-move interaction (accidental click or focus tap on the handle) does
+    // NOT overwrite the current width with the default stash value (0.0 → min
+    // on the left, vw*0.5 on the right) and does NOT persist that bogus value.
+    // Resetting on drag-start also stops a PRIOR drag's stash from leaking into
+    // a later no-move click. (#1296 regression fix)
+    let left_raf_valid: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
+    let right_raf_valid: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     let mut mock_peers_open = use_signal(|| false);
     let mut controls_visible = use_signal(|| true);
     let mut controls_expanded = use_signal(|| true);
@@ -2993,7 +3052,49 @@ pub fn AttendantsComponent(
             }
         }
     };
-    let avail_w = (vw - pad_left - pad_right).max(0.0);
+    let mobile = vw < 568.0;
+    // Pinned drawers carve out horizontal space from the tile area; overlay (unpinned)
+    // drawers float over tiles so contribute 0 inset. Mobile ignores pinning entirely.
+    let mut left_inset = if left_pinned() && !mobile {
+        left_width()
+    } else {
+        0.0
+    };
+    let mut right_inset = if right_pinned() && !mobile {
+        right_width()
+    } else {
+        0.0
+    };
+    // Cap combined pinned insets so tiles always keep >= ~40% of viewport width;
+    // scale both down proportionally if their sum would exceed 60% of vw.
+    let max_insets = vw * 0.6;
+    let inset_sum = left_inset + right_inset;
+    if inset_sum > max_insets && inset_sum > 0.0 {
+        let scale = max_insets / inset_sum;
+        left_inset *= scale;
+        right_inset *= scale;
+    }
+    // A pinned drawer RENDERS at its (possibly down-scaled) carved-out inset, so its
+    // visible width never exceeds the space reserved for it and it can't overlap
+    // tiles above the 60%-of-vw cap. Overlay/mobile drawers render at the raw width
+    // signal. The width signal stays the source of truth (clamped + persisted); only
+    // the render width is capped — keeping render width and avail_w in lockstep.
+    let left_render_w = if left_pinned() && !mobile {
+        left_inset
+    } else {
+        left_width()
+    };
+    let right_render_w = if right_pinned() && !mobile {
+        right_inset
+    } else {
+        right_width()
+    };
+    // Per-side resize cap reused by the drag handler below. The smaller of the
+    // absolute max and half the viewport. The DRAWER_MIN_WIDTH lower bound here is
+    // inert above the mobile gate (vw >= 568 always yields >= 284), but kept for
+    // safety if the breakpoint ever changes. (#1296)
+    let max_for_side = (vw * 0.5).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS);
+    let avail_w = (vw - pad_left - pad_right - left_inset - right_inset).max(0.0);
     let avail_h = (vh - pad_top - pad_bottom).max(0.0);
 
     // --- Count active speakers for auto-density escalation ---
@@ -3380,12 +3481,14 @@ pub fn AttendantsComponent(
 
     let container_style = if has_screen_share {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
-        "position: absolute; inset: 0; width: 100%; height: 100%; \
+        // Inset the screen-share container box so pinned drawers reflow even while sharing — flex children use % of the container, so shrinking the container makes the share/peer split occupy the freed area.
+        format!(
+            "position: absolute; left: {left_inset:.0}px; right: {right_inset:.0}px; top: 0; bottom: 0; height: 100%; \
          display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
          padding: 16px 16px 80px 16px; \
          align-items: center; box-sizing: border-box; \
          grid-template-columns: none; grid-template-rows: none;"
-            .to_string()
+        )
     } else {
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
         // Explicitly reset all flex properties so the transition from
@@ -3423,12 +3526,12 @@ pub fn AttendantsComponent(
         };
         format!(
             "display: grid; \
-             position: absolute; inset: 0; \
+             position: absolute; top: 0; bottom: 0; left: {left_inset:.0}px; right: {right_inset:.0}px; \
              gap: {gap:.0}px; \
              padding: {pad_top:.0}px {pad_right:.0}px {pad_bottom:.0}px {pad_left:.0}px; \
              box-sizing: border-box; overflow: hidden; \
              flex-direction: unset; flex-wrap: unset; align-items: unset; \
-             width: 100%; height: 100%; \
+             height: 100%; \
              grid-template-columns: {track_cols}; grid-template-rows: {track_rows}; \
              {pack} \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
@@ -4821,7 +4924,10 @@ pub fn AttendantsComponent(
                 // Peer list sidebar
                 div {
                     id: "peer-list-container",
-                    class: if peer_list_open() { "visible" } else { "" },
+                    class: if peer_list_open() { if left_pinned() && !mobile { "visible pinned" } else { "visible" } } else { "" },
+                    // Pinned drawers render at the (scaled) carved-out inset so they never
+                    // overlap tiles above the 60%-of-vw cap; overlay drawers use the raw width.
+                    style: format!("width: {}px", left_render_w),
                     if peer_list_open() {
                         PeerList {
                             peers: peers_for_display.clone(),
@@ -4846,6 +4952,141 @@ pub fn AttendantsComponent(
                             on_edit_self_name: {
                                 move |_| {
                                     display_name_modal_open.set(true);
+                                }
+                            },
+                            pinned: left_pinned() && vw >= 568.0,
+                            on_toggle_pin: move |_| {
+                                let v = !left_pinned();
+                                left_pinned.set(v);
+                                save_bool("vc_drawer_left_pinned", v);
+                            },
+                        }
+                        div {
+                            class: "drawer-resize-handle",
+                            role: "separator",
+                            aria_orientation: "vertical",
+                            tabindex: "0",
+                            // keyboard resize is a follow-up
+                            // Pointer capture: on pointerdown the handle captures the
+                            // pointer so every subsequent pointermove/up is delivered HERE
+                            // even when the pointer is over the drawer body or a tile — that
+                            // is what makes shrink (drag left, over the drawer) work at all.
+                            onpointerdown: {
+                                let lv = left_raf_valid.clone();
+                                move |evt: PointerEvent| {
+                                    evt.prevent_default();
+                                    resizing_drawer.set(ResizingDrawer::Left);
+                                    // Start a fresh drag with no valid stash yet: the flush in
+                                    // pointerup is skipped until a real pointermove sets this.
+                                    lv.set(false);
+                                    // No start-vw cache: the left edge sits at viewport x=0, so
+                                    // the move handler reads client_x directly. drag_start_vw is
+                                    // only needed by the right drawer.
+                                    let native = evt.as_web_event();
+                                    if let Some(t) = native.target() {
+                                        use wasm_bindgen::JsCast;
+                                        if let Ok(el) = t.dyn_into::<web_sys::Element>() {
+                                            let _ = el.set_pointer_capture(native.pointer_id());
+                                        }
+                                    }
+                                }
+                            },
+                            // rAF-coalesced move: stash the latest client_x and schedule
+                            // at most ONE animation-frame callback per painted frame. The
+                            // callback does the single width.set() — so a fast drag that
+                            // delivers many coalesced pointermoves still causes only one
+                            // re-render per frame, keeping the wasm main thread available
+                            // for live video decode. localStorage is persisted ONLY on
+                            // pointerup (below) to avoid write churn. (#1296 perf)
+                            //
+                            // Each `move` closure takes ownership of its captured Rcs, so
+                            // we pre-clone a dedicated handle for every handler below.
+                            onpointermove: {
+                                let lx = left_raf_x.clone();
+                                let lp = left_raf_pending.clone();
+                                let lv = left_raf_valid.clone();
+                                move |evt: PointerEvent| {
+                                    if resizing_drawer() == ResizingDrawer::Left {
+                                        let client_x = evt.as_web_event().client_x() as f64;
+                                        lx.set(client_x);
+                                        // A real move occurred: the stash now holds a genuine
+                                        // pointer position, so the pointerup flush may apply it.
+                                        lv.set(true);
+                                        if !lp.get() {
+                                            lp.set(true);
+                                            let x_cell = lx.clone();
+                                            let pending_cell = lp.clone();
+                                            let cb = Closure::once_into_js(move |_ts: f64| {
+                                                // Guard: if drag ended before this frame fires,
+                                                // the resizing-state is already None — skip.
+                                                if resizing_drawer() == ResizingDrawer::Left {
+                                                    let x = x_cell.get();
+                                                    left_width.set(
+                                                        x.clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                    );
+                                                }
+                                                pending_cell.set(false);
+                                            });
+                                            let _ = window().request_animation_frame(
+                                                cb.as_ref().unchecked_ref(),
+                                            );
+                                        }
+                                    }
+                                }
+                            },
+                            onpointerup: {
+                                let lx = left_raf_x.clone();
+                                let lp = left_raf_pending.clone();
+                                let lv = left_raf_valid.clone();
+                                move |evt: PointerEvent| {
+                                    if resizing_drawer() == ResizingDrawer::Left {
+                                        evt.prevent_default();
+                                        // Always clear pending so any in-flight rAF callback is
+                                        // a no-op (the resizing-state guard also protects it).
+                                        lp.set(false);
+                                        // Flush ONLY if a real move happened this drag: apply the
+                                        // last MOVED position so the drawer settles exact (not one
+                                        // frame stale) and persist it. A no-move interaction
+                                        // (click / focus tap on the handle) leaves left_width and
+                                        // the persisted value untouched — the stash still holds
+                                        // its default and must not overwrite the current width.
+                                        if lv.get() {
+                                            left_width.set(
+                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                            );
+                                            // Persist on drag-end only; value is already clamped.
+                                            save_f64("vc_drawer_left_width", left_width());
+                                        }
+                                        resizing_drawer.set(ResizingDrawer::None);
+                                    }
+                                }
+                            },
+                            // Pointer stream cancelled (OS gesture, touch interruption,
+                            // lost capture): always clear the pending flag (so any in-flight
+                            // rAF callback sees ResizingDrawer::None and skips the write —
+                            // belt-and-suspenders over the resizing-state guard) and reset
+                            // drag state so it can't latch. The flush+persist applies ONLY
+                            // the last MOVED position and is skipped entirely when no move
+                            // occurred this drag, so a no-move cancel cannot overwrite the
+                            // current width with the default stash. When a real move did
+                            // happen we persist the (already clamped) cancelled width,
+                            // keeping left/right cancel semantics identical.
+                            onpointercancel: {
+                                let lx = left_raf_x.clone();
+                                let lp = left_raf_pending.clone();
+                                let lv = left_raf_valid.clone();
+                                move |_: PointerEvent| {
+                                    if resizing_drawer() == ResizingDrawer::Left {
+                                        lp.set(false);
+                                        if lv.get() {
+                                            left_width.set(
+                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                            );
+                                            // Persist on cancel; value is already clamped.
+                                            save_f64("vc_drawer_left_width", left_width());
+                                        }
+                                        resizing_drawer.set(ResizingDrawer::None);
+                                    }
                                 }
                             },
                         }
@@ -4914,6 +5155,100 @@ pub fn AttendantsComponent(
                         // for the migrated Performance panel in the drawer's
                         // "Quality controls" group. (#1131 unify)
                         perf_controls: perf_controls_sink(),
+                        // Pinned drawers render at the (scaled) carved-out inset so they
+                        // never overlap tiles above the cap; overlay drawers use raw width.
+                        width: right_render_w,
+                        pinned: right_pinned() && vw >= 568.0,
+                        on_toggle_pin: move |_| {
+                            let v = !right_pinned();
+                            right_pinned.set(v);
+                            save_bool("vc_drawer_right_pinned", v);
+                        },
+                        // The right handle lives in diagnostics.rs (no access to the width
+                        // signals), so it forwards pointer events here where the math runs.
+                        on_resize_start: {
+                            let rv = right_raf_valid.clone();
+                            move |_| {
+                                resizing_drawer.set(ResizingDrawer::Right);
+                                // Cache start-of-drag viewport width (not re-read per move).
+                                drag_start_vw.set(vw);
+                                // Start a fresh drag with no valid stash yet: the flush in
+                                // on_resize_end is skipped until a real on_resize_move sets it.
+                                rv.set(false);
+                            }
+                        },
+                        // rAF-coalesced move: stash the raw client_x and schedule at most
+                        // ONE animation-frame callback per painted frame. The callback
+                        // computes the clamped width from the latest stashed x and the
+                        // drag_start_vw captured at drag start — so a fast drag still
+                        // causes only one re-render per frame. inner_width is NOT re-read
+                        // per move (cached in drag_start_vw at on_resize_start). (#1296 perf)
+                        //
+                        // Each `move` closure takes ownership of its captured Rcs, so we
+                        // pre-clone a dedicated handle for each handler below.
+                        on_resize_move: {
+                            let rx = right_raf_x.clone();
+                            let rp = right_raf_pending.clone();
+                            let rv = right_raf_valid.clone();
+                            move |client_x: f64| {
+                                if resizing_drawer() == ResizingDrawer::Right {
+                                    rx.set(client_x);
+                                    // A real move occurred: the stash now holds a genuine
+                                    // pointer position, so the on_resize_end flush may apply it.
+                                    rv.set(true);
+                                    if !rp.get() {
+                                        rp.set(true);
+                                        let x_cell = rx.clone();
+                                        let pending_cell = rp.clone();
+                                        let start_vw = drag_start_vw;
+                                        let cb = Closure::once_into_js(move |_ts: f64| {
+                                            // Guard: if drag ended before this frame fires,
+                                            // the resizing-state is already None — skip.
+                                            if resizing_drawer() == ResizingDrawer::Right {
+                                                let x = x_cell.get();
+                                                right_width.set(
+                                                    (start_vw() - x)
+                                                        .clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                );
+                                            }
+                                            pending_cell.set(false);
+                                        });
+                                        let _ = window().request_animation_frame(
+                                            cb.as_ref().unchecked_ref(),
+                                        );
+                                    }
+                                }
+                            }
+                        },
+                        on_resize_end: {
+                            let rx = right_raf_x.clone();
+                            let rp = right_raf_pending.clone();
+                            let rv = right_raf_valid.clone();
+                            move |_| {
+                                if resizing_drawer() == ResizingDrawer::Right {
+                                    // Always clear pending so any in-flight rAF callback is a
+                                    // no-op (the resizing-state guard also protects it).
+                                    rp.set(false);
+                                    // Flush ONLY if a real move happened this drag: apply the
+                                    // last MOVED position so the drawer settles exact (not one
+                                    // frame stale) and persist it. A no-move interaction
+                                    // (click / focus tap on the handle) leaves right_width and
+                                    // the persisted value untouched — the stash still holds its
+                                    // default and must not overwrite the current width.
+                                    // Note: on_resize_end is also called from diagnostics.rs
+                                    // onpointercancel, so cancel + end share this flush path.
+                                    if rv.get() {
+                                        right_width.set(
+                                            (drag_start_vw() - rx.get())
+                                                .clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                        );
+                                        // Persist on drag-end only; value is already clamped.
+                                        save_f64("vc_drawer_right_width", right_width());
+                                    }
+                                    resizing_drawer.set(ResizingDrawer::None);
+                                }
+                            }
+                        },
                     }
                 }
 

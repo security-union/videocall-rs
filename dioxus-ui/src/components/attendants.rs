@@ -3106,6 +3106,26 @@ pub fn AttendantsComponent(
             );
         }
 
+        // --- SS pin-swap (mirrors the normal grid's pin-swap at lines above) ---
+        // If the pinned peer is ranked beyond `ss_budget`, swap it into the
+        // last decoded slot so it renders with live video instead of avatar.
+        // Without this, a pinned off-budget SS peer gets force-added to
+        // `active_decode_set` (phase 3) which silently exceeds budget_cap,
+        // AND renders as avatar despite being decoded (wasted decode +
+        // misleading UI).
+        if ss_budget > 0 && ss_budget < ss_all.len() {
+            if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
+                let pinned_idx = ss_all.iter().position(|tile_id| {
+                    client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
+                });
+                if let Some(idx) = pinned_idx {
+                    if idx >= ss_budget {
+                        ss_all.swap(ss_budget - 1, idx);
+                    }
+                }
+            }
+        }
+
         // Split: first ss_budget tiles get video decode, rest get avatars.
         let decoded: Vec<String> = ss_all.iter().take(ss_budget).cloned().collect();
         let avatars: Vec<String> = ss_all.iter().skip(ss_budget).cloned().collect();

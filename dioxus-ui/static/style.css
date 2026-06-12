@@ -3651,12 +3651,12 @@ select {
 
 /* Screen share split-layout — right-panel peer video tile.
    The parent `.ss-peer-panel` is a flex-wrap container; each tile gets
-   `flex: 0 1 calc(50% - 5px)` so two tiles fit per row when there's
-   room, collapsing to one column when the panel is narrow (min-width
-   160px). `aspect-ratio: 3 / 2` derives height from width. Off-budget
-   tiles render with `force_avatar: true` (avatar placeholder, no
-   decode) — the decode budget caps live decoders just as the normal
-   grid does (issue 987). */
+   `flex: 1 1 160px` so tiles grow to fill available width with a 160px
+   flex basis, collapsing to one column when the panel is narrow.
+   `aspect-ratio: 3 / 2` derives height from width. Off-budget tiles
+   render with `force_avatar: true` (avatar placeholder, no decode) —
+   the decode budget caps live decoders just as the normal grid does
+   (issue 987). */
 .split-peer-tile {
   position: relative;
   flex: 1 1 160px;

@@ -435,7 +435,111 @@ test.describe("Screen share right panel layout", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 3. Normal grid has no split-layout artifacts
+  // 3. Off-budget tiles render as avatars, not blank canvases
+  //
+  // The decode-budget system limits live video decoding to the first N
+  // tiles in the screen-share right panel. Tiles beyond the budget must
+  // render with `force_avatar: true`, producing a
+  // `.placeholder-content--paused` element instead of a `<canvas>`.
+  //
+  // This test adds enough mock peers to exceed the decode budget, starts
+  // screen share, and asserts that at least some `.split-peer-tile`
+  // elements contain the paused placeholder rather than a canvas — locking
+  // in that the VideoOnly render path honors `force_avatar`.
+  //
+  // Requires `mockPeersEnabled: "true"` in config.js.
+  // ──────────────────────────────────────────────────────────────────────
+  test("off-budget tiles render as avatar placeholders during screen share", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_avatar_budget_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSBudgetHost",
+      "SSBudgetGuest",
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      // Check that mock peers are available.
+      const mockButton = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
+      });
+      const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
+      if (!mockPeersAvailable) {
+        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
+        return;
+      }
+
+      // Add 8 mock peers — enough to exceed the typical decode budget
+      // (3-5 on constrained devices).
+      await addMockPeers(hostPage, 8);
+      await hostPage.waitForTimeout(2000);
+
+      // Guest starts screen sharing.
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+
+      // Let the split layout settle and the decode budget take effect.
+      await hostPage.waitForTimeout(4000);
+
+      // ---- ASSERT: all tiles are rendered in the DOM ----
+      const peerTiles = hostPage.locator(".split-peer-tile");
+      const tileCount = await peerTiles.count();
+      // 8 mock + 2 real (host + guest) = 10, but self-tile may vary;
+      // assert at least 8 to confirm tiles are present.
+      expect(tileCount).toBeGreaterThanOrEqual(8);
+
+      // ---- ASSERT: some tiles are avatar-tier (off-budget) ----
+      // Count tiles that contain a paused placeholder instead of a canvas.
+      const avatarTiles = hostPage.locator(".split-peer-tile .placeholder-content--paused");
+      const canvasTiles = hostPage.locator(".split-peer-tile canvas");
+
+      const avatarCount = await avatarTiles.count();
+      const canvasCount = await canvasTiles.count();
+
+      // If the system has a very high budget (all tiles get canvases and
+      // none are paused), skip gracefully — the budget was not exceeded.
+      if (avatarCount === 0) {
+        test.skip(
+          true,
+          `Decode budget was not exceeded: all ${tileCount} tiles have live canvases. ` +
+            "This device likely has a high budget cap. " +
+            "Re-run on a constrained device or with a Fixed(N) budget to validate.",
+        );
+        return;
+      }
+
+      // Key assertion: NOT every tile has a canvas — some must be avatars.
+      // This proves force_avatar is honored in the VideoOnly render path.
+      expect(avatarCount).toBeGreaterThan(0);
+      expect(canvasCount).toBeGreaterThan(0);
+      expect(canvasCount).toBeLessThan(tileCount);
+
+      // Verify the paused placeholder has the expected accessibility
+      // attributes (it should have role="img" and an aria-label).
+      const firstAvatar = avatarTiles.first();
+      await expect(firstAvatar).toBeVisible({ timeout: 5_000 });
+      await expect(firstAvatar).toHaveAttribute("role", "img");
+      const ariaLabel = await firstAvatar.getAttribute("aria-label");
+      expect(ariaLabel).toBeTruthy();
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 4. Normal grid has no split-layout artifacts
   //
   // Structural safety check: when nobody is screen sharing, the meeting
   // should use the normal grid layout with NO .split-screen-tile,

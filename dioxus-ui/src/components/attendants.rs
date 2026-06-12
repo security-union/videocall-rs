@@ -1005,7 +1005,7 @@ pub fn AttendantsComponent(
                         // the genuine per-packet spam now lives at trace!, off by
                         // default even when collecting.
                         let effective_level = crate::constants::log_level_explicit()
-                            .unwrap_or(log::LevelFilter::Debug);
+                            .unwrap_or(crate::constants::COLLECTION_LOG_LEVEL_FALLBACK);
                         log::set_max_level(effective_level);
                         let dn = current_display_name();
                         // Hand the collector the room_token BEFORE setContext:

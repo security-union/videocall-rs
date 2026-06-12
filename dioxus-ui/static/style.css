@@ -63,21 +63,34 @@ canvas {
 
 #peer-list-container {
   position: fixed;
-  left: -400px;
+  left: 0;
   top: 0;
   height: 100%;
   width: 400px;
+  /* Slide via transform so any custom (dragged) width still slides fully out of
+     view in the closed state — a fixed negative `left` could not. (issue 1296) */
+  transform: translateX(-100%);
   background-color: var(--color-surface-elevated);
   color: var(--text-primary);
-  transition: left 0.3s ease;
+  transition: transform 0.3s ease;
   z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
 }
 
 #peer-list-container.visible {
-  left: 0;
+  transform: translateX(0);
   visibility: visible;
+}
+
+/* Pinned drawer: anchored inside #main-container (position:relative) rather than
+   fixed-over-viewport. The LOAD-BEARING reflow is the Rust grid inset in
+   attendants.rs (avail_w + #grid-container left/right), NOT this CSS — this rule
+   only changes the drawer's own positioning + chrome. */
+#peer-list-container.pinned {
+  position: absolute;
+  box-shadow: none;
+  border-right: 1px solid var(--border);
 }
 
 /* Shared sidebar styles */
@@ -603,6 +616,12 @@ h3 {
     visibility: visible !important;
   }
 
+  /* Hide the resize grip on mobile: drawers are forced full-width (width:100%
+     !important) here, so the handle is a no-op affordance. (issue 1296) */
+  .drawer-resize-handle {
+    display: none !important;
+  }
+
   #peer-list-container .sidebar-header,
   #diagnostics-sidebar .sidebar-header {
     padding: 20px !important;
@@ -1019,21 +1038,34 @@ select {
 #diagnostics-sidebar {
   position: fixed;
   /* Widened 650 → 720 so the two-column per-kind perf cards stay 2-col at this
-     width (card container ~662px → ~315px/col). Closed offset matches the
-     width. (#1131 unify) */
-  right: -720px;
+     width (card container ~662px → ~315px/col). The closed state slides off-screen
+     via transform: translateX(100%) below, not a negative offset. (issue 1131 unify) */
+  right: 0;
   top: 0;
   height: 100%;
   width: 720px;
+  /* Slide via transform so any custom (dragged) width still slides fully out of
+     view in the closed state — a fixed negative `right` could not. (issue 1296) */
+  transform: translateX(100%);
   background-color: var(--surface-elevated);
   /* Use the theme text token (not hard-coded white) so the migrated perf text +
      the drawer body read correctly in BOTH themes. Dark theme additionally
      remaps --text-* to the settings-modal tokens below. (#1131 §5) */
   color: var(--text-primary);
-  transition: right 0.3s ease;
+  transition: transform 0.3s ease;
   z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
+}
+
+/* Pinned drawer: anchored inside #main-container (position:relative) rather than
+   fixed-over-viewport. The LOAD-BEARING reflow is the Rust grid inset in
+   attendants.rs (avail_w + #grid-container left/right), NOT this CSS — this rule
+   only changes the drawer's own positioning + chrome. */
+#diagnostics-sidebar.pinned {
+  position: absolute;
+  box-shadow: none;
+  border-left: 1px solid var(--border);
 }
 
 /* Theme compliance (#1131 §5): the `.perf-*` text uses --text-primary/-secondary/
@@ -1163,7 +1195,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 #diagnostics-sidebar.visible {
-  right: 0;
+  transform: translateX(0);
   visibility: visible;
 }
 
@@ -1845,6 +1877,77 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .menu-button:active {
   transform: scale(0.95);
+}
+
+/* Drawer pin/overlay toggle button (issue 1296). Visually matches .menu-button. */
+.pin-button {
+  background: var(--glass-bg-hover);
+  border: none;
+  border-radius: 8px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  color: var(--text-primary);
+}
+
+.pin-button:hover {
+  background: var(--scrollbar-thumb-active);
+  transform: scale(1.05);
+}
+
+.pin-button:active {
+  transform: scale(0.95);
+}
+
+.pin-button[aria-pressed="true"] {
+  color: var(--accent);
+}
+
+.pin-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Drawer resize grip (issue 1296). One per drawer, positioned on the drawer's inner
+   edge. Drag is driven by pointer listeners on each drawer's
+   .drawer-resize-handle, using pointer capture (attendants.rs / diagnostics.rs).
+   The #grid-container handlers only drive the screen-share split, not resize. */
+.drawer-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+  cursor: ew-resize;
+  z-index: 9310;
+  background: var(--border);
+  opacity: 0.35;
+  transition: opacity 0.15s ease, background 0.15s ease;
+  /* Suppress browser touch panning and text selection during a capture drag. */
+  touch-action: none;
+  user-select: none;
+}
+
+.drawer-resize-handle:hover,
+.drawer-resize-handle:focus {
+  opacity: 1;
+  background: var(--accent);
+}
+
+.drawer-resize-handle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+#peer-list-container .drawer-resize-handle {
+  right: 0;
+}
+
+#diagnostics-sidebar .drawer-resize-handle {
+  left: 0;
 }
 
 .context-menu {

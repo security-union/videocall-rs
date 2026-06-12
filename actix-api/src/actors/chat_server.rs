@@ -21,7 +21,8 @@ use crate::{
         LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_RECOMPUTE_COALESCE_MS,
         LAYER_HINT_SUPPRESS_DEBOUNCE_MS, LAYER_PREFERENCE_MAX_ENTRIES,
         LAYER_PREFERENCE_MAX_LAYER_ID, LAYER_PREFERENCE_MIN_UPDATE_INTERVAL,
-        RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL,
+        LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS,
+        VIEWPORT_MIN_UPDATE_INTERVAL,
     },
     messages::{
         server::{
@@ -54,9 +55,10 @@ use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
     RELAY_CONGESTION_FILTERED_TOTAL, RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
     RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
-    RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
-    RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
-    RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE, RELAY_VIEWPORT_UPDATES_TOTAL,
+    RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
+    RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
+    RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE,
+    RELAY_VIEWPORT_UPDATES_TOTAL,
 };
 use videocall_types::protos::layer_hint_packet::layer_hint_packet::Entry as LayerHintEntry;
 use videocall_types::protos::layer_hint_packet::LayerHintPacket;
@@ -382,6 +384,55 @@ fn layer_id_bucket(layer_id: u32) -> &'static str {
     }
 }
 
+/// The media kinds that carry a simulcast ladder, as `(normalized preference-map
+/// discriminant, gauge `kind` label)` pairs, for the DEMAND-side gauge
+/// `relay_layer_preference_sessions` (#1170).
+///
+/// VIDEO(1) and SCREEN(3) only — AUDIO(2) has no simulcast layers, so a receiver
+/// never expresses a per-layer preference for it and it is excluded. The string
+/// here is the EXACT `kind` label and MUST stay in lockstep with
+/// [`crate::metrics::RELAY_LAYER_PREFERENCE_KINDS`] (the room-drain GC iterates
+/// that array; this one drives the sweep — a mismatch would leak series for any
+/// kind present in one but not the other). The unit test
+/// `layer_preference_gauge_kinds_match_metrics_taxonomy` pins them together.
+const LAYER_PREFERENCE_GAUGE_KINDS: [(i32, &str); 2] = [(1, "video"), (3, "screen")];
+
+/// Classify ONE receiver's recorded layer preferences into a per-kind MAX-layer
+/// bucket, for the demand-side gauge (#1170).
+///
+/// For each kind in [`LAYER_PREFERENCE_GAUGE_KINDS`] (VIDEO, SCREEN) this finds
+/// the MAX `desired_layer` the receiver has requested across ALL sources for
+/// that kind, then buckets it via [`layer_id_bucket`] (so a forged id collapses
+/// to `"other"`). The max is the right reduction because the relay must
+/// forward/produce up to the highest layer the receiver asked for, so that
+/// single layer characterizes the session's demand for the kind.
+///
+/// The return is parallel to [`LAYER_PREFERENCE_GAUGE_KINDS`] by index:
+/// `result[i]` is `Some(bucket)` when the receiver has at least one preference
+/// entry for that kind, or `None` when it has expressed NO preference for the
+/// kind. `None` means FAIL-OPEN (wants the full ladder) and the caller MUST NOT
+/// count it — absence of demand is not a request for the top layer.
+///
+/// Free function (takes the layers map by reference, no `&self`) so it is
+/// unit-testable without constructing a NATS-backed actor.
+fn classify_session_max_layer_buckets(
+    layers: &HashMap<(u64, i32), u32>,
+) -> [Option<&'static str>; LAYER_PREFERENCE_GAUGE_KINDS.len()] {
+    let mut out: [Option<&'static str>; LAYER_PREFERENCE_GAUGE_KINDS.len()] =
+        [None; LAYER_PREFERENCE_GAUGE_KINDS.len()];
+    for (idx, (kind, _label)) in LAYER_PREFERENCE_GAUGE_KINDS.iter().enumerate() {
+        // Max desired_layer over every (source, this-kind) entry the receiver
+        // recorded. `None` (no entry for the kind) stays fail-open / uncounted.
+        let max_for_kind = layers
+            .iter()
+            .filter(|((_, k), _)| k == kind)
+            .map(|(_, &layer)| layer)
+            .max();
+        out[idx] = max_for_kind.map(layer_id_bucket);
+    }
+    out
+}
+
 /// Per-session layer-preference state, shared between the session's NATS
 /// subscription task and [`ChatServer`].
 ///
@@ -508,6 +559,19 @@ struct RecomputeLayerHints {
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct FlushPendingRecomputes;
+
+/// Periodic self-tick that refreshes the DEMAND-side simulcast gauge
+/// `relay_layer_preference_sessions{room, kind, layer_id}` (#1170 item 2).
+///
+/// Sent by the [`LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL`] `run_interval`
+/// armed in [`Actor::started`]. The handler is a READ-ONLY pass over the live
+/// rooms (`RwLock::read()` on each session's prefs, bounded by
+/// [`LAYER_HINT_MAX_RECEIVERS_SCANNED`] per room) that re-SETs every active
+/// room's gauge cells. It never takes a write lock and never mutates actor
+/// state, so it cannot block the forwarding hot path or starve the mailbox.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct SweepLayerPreferenceGauge;
 
 /// Per-`(room, source, media_kind)` emit/debounce state for LAYER_HINT (#1108).
 ///
@@ -1631,6 +1695,70 @@ impl ChatServer {
             self.recompute_coalesce_handle = Some(handle);
         }
     }
+
+    /// Refresh the DEMAND-side gauge `relay_layer_preference_sessions{room, kind,
+    /// layer_id}` for every live room (#1170 item 2).
+    ///
+    /// READ-ONLY: takes each session's `LayerPrefs` read lock and never a write
+    /// lock; mutates no actor state. Cost is O(rooms × min(sessions, 256)) —
+    /// per-room session scans are bounded by [`LAYER_HINT_MAX_RECEIVERS_SCANNED`]
+    /// exactly as the union scan is, so a pathological room cannot stall the
+    /// actor. For each active room it SETs all
+    /// `LAYER_PREFERENCE_GAUGE_KINDS.len() × RELAY_LAYER_ID_BUCKETS.len()` cells
+    /// (explicit zeros included) so a bucket whose demand vanished reads `0`
+    /// rather than a stale count. Drained rooms are not iterated here (they are
+    /// gone from `room_members`); their series are removed by
+    /// [`crate::metrics::forget_room_metrics`] at drain time.
+    fn sweep_layer_preference_gauge(&self) {
+        for (room, members) in &self.room_members {
+            // Tally counts: [kind_idx][bucket_idx]. Indexed parallel to
+            // LAYER_PREFERENCE_GAUGE_KINDS and RELAY_LAYER_ID_BUCKETS.
+            let mut counts =
+                [[0u64; RELAY_LAYER_ID_BUCKETS.len()]; LAYER_PREFERENCE_GAUGE_KINDS.len()];
+
+            for member in members.iter().take(LAYER_HINT_MAX_RECEIVERS_SCANNED) {
+                let Some(prefs) = self.session_layer_prefs.get(&member.session) else {
+                    // No prefs handle for this session at all = fail-open
+                    // (expressed no demand) → contributes nothing, like an empty
+                    // map. Matches the union scan's `None` arm.
+                    continue;
+                };
+                // Lock-free short-circuit: an empty prefs map (no LAYER_PREFERENCE
+                // recorded yet) expresses no demand for any kind, so skip the read
+                // lock entirely — keeps the simulcast-off / no-prefs case free.
+                if !prefs.has_any() {
+                    continue;
+                }
+                // Poisoned lock = fail-open (uncounted), mirroring the forward
+                // filter's `unwrap_or`.
+                let Ok(guard) = prefs.state.read() else {
+                    continue;
+                };
+                let buckets = classify_session_max_layer_buckets(&guard.layers);
+                drop(guard);
+                for (kind_idx, bucket) in buckets.iter().enumerate() {
+                    // `None` = no preference for this kind = fail-open, not counted.
+                    if let Some(bucket) = bucket {
+                        let bucket_idx = RELAY_LAYER_ID_BUCKETS
+                            .iter()
+                            .position(|b| b == bucket)
+                            .expect("layer_id_bucket only returns RELAY_LAYER_ID_BUCKETS values");
+                        counts[kind_idx][bucket_idx] += 1;
+                    }
+                }
+            }
+
+            // SET every cell for this active room, including zeros, so a bucket
+            // that lost all demand since the last sweep reads 0 not a stale value.
+            for (kind_idx, (_, kind_label)) in LAYER_PREFERENCE_GAUGE_KINDS.iter().enumerate() {
+                for (bucket_idx, bucket_label) in RELAY_LAYER_ID_BUCKETS.iter().enumerate() {
+                    RELAY_LAYER_PREFERENCE_SESSIONS
+                        .with_label_values(&[room, kind_label, bucket_label])
+                        .set(counts[kind_idx][bucket_idx] as f64);
+                }
+            }
+        }
+    }
 }
 
 impl Actor for ChatServer {
@@ -1716,6 +1844,18 @@ impl Actor for ChatServer {
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
+        });
+
+        // Arm the periodic DEMAND-side gauge sweep (#1170 item 2). `run_interval`
+        // invokes the closure inside the actor with `&mut self` access, so the
+        // sweep runs on the actor thread and reads `room_members` /
+        // `session_layer_prefs` directly — no cross-thread snapshot needed. We
+        // delegate to a `do_send` of `SweepLayerPreferenceGauge` (rather than
+        // inlining) so the sweep body lives in one Handler that is reachable from
+        // tests and keeps each tick a discrete, short mailbox message rather than
+        // work spliced into the timer driver.
+        ctx.run_interval(LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, |_act, ctx| {
+            ctx.address().do_send(SweepLayerPreferenceGauge);
         });
     }
 
@@ -2303,6 +2443,18 @@ impl Handler<FlushPendingRecomputes> for ChatServer {
             // missing `room_members` entry).
             self.handle(RecomputeLayerHints { room, source: None }, ctx);
         }
+    }
+}
+
+impl Handler<SweepLayerPreferenceGauge> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        _msg: SweepLayerPreferenceGauge,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        self.sweep_layer_preference_gauge();
     }
 }
 
@@ -12096,6 +12248,115 @@ mod tests {
     }
 
     const VIDEO_KIND: i32 = 1;
+
+    /// Build a `(source, kind) -> desired_layer` map for the demand-gauge
+    /// classifier (#1170), mirroring `LayerPrefsState.layers`.
+    fn layers_map(entries: &[(u64, i32, u32)]) -> HashMap<(u64, i32), u32> {
+        entries.iter().map(|&(s, k, l)| ((s, k), l)).collect()
+    }
+
+    /// Resolve a kind's classified bucket from the parallel-indexed result of
+    /// `classify_session_max_layer_buckets`, by the kind's gauge label.
+    fn bucket_for_kind<'a>(
+        classified: &[Option<&'a str>; LAYER_PREFERENCE_GAUGE_KINDS.len()],
+        kind_label: &str,
+    ) -> Option<&'a str> {
+        let idx = LAYER_PREFERENCE_GAUGE_KINDS
+            .iter()
+            .position(|(_, label)| *label == kind_label)
+            .expect("kind_label must be a known gauge kind");
+        classified[idx]
+    }
+
+    /// Pins the #1170 demand-gauge aggregation: each receiver is classified by
+    /// its MAX requested layer PER KIND, an empty map contributes nothing, and a
+    /// forged layer id buckets to "other". This is the source-of-truth reduction
+    /// the gauge depends on — it must fail if the max is swapped for min, if the
+    /// per-kind split is broken, or if fail-open exclusion regresses.
+    #[test]
+    fn test_classify_session_max_layer_buckets() {
+        const SCREEN_KIND: i32 = 3;
+
+        // Receiver wants {(srcA,VIDEO):0, (srcB,VIDEO):2, (srcC,SCREEN):1}.
+        // MAX over VIDEO is 2 → bucket "2"; SCREEN has a single entry 1 → "1".
+        let m = layers_map(&[
+            (10, VIDEO_KIND, 0),
+            (11, VIDEO_KIND, 2),
+            (12, SCREEN_KIND, 1),
+        ]);
+        let classified = classify_session_max_layer_buckets(&m);
+        assert_eq!(
+            bucket_for_kind(&classified, "video"),
+            Some("2"),
+            "VIDEO must classify by the MAX requested layer (2), not the min (0) or first-seen"
+        );
+        assert_eq!(
+            bucket_for_kind(&classified, "screen"),
+            Some("1"),
+            "SCREEN is classified independently of VIDEO"
+        );
+
+        // Empty map = no demand expressed for any kind → every kind is None
+        // (uncounted / fail-open), contributing nothing to the gauge.
+        let empty = layers_map(&[]);
+        let classified_empty = classify_session_max_layer_buckets(&empty);
+        assert_eq!(bucket_for_kind(&classified_empty, "video"), None);
+        assert_eq!(bucket_for_kind(&classified_empty, "screen"), None);
+
+        // A receiver with only VIDEO prefs is fail-open (None) for SCREEN, not
+        // counted as some default bucket.
+        let video_only = layers_map(&[(10, VIDEO_KIND, 1)]);
+        let classified_vo = classify_session_max_layer_buckets(&video_only);
+        assert_eq!(bucket_for_kind(&classified_vo, "video"), Some("1"));
+        assert_eq!(
+            bucket_for_kind(&classified_vo, "screen"),
+            None,
+            "no SCREEN entry = fail-open = uncounted, NOT a default bucket"
+        );
+
+        // A forged / out-of-ladder layer id (9) must collapse to "other" so it
+        // cannot create an unbounded label series. Use it as the MAX so the
+        // bucketing of the chosen max is what is under test.
+        let forged = layers_map(&[(10, VIDEO_KIND, 0), (11, VIDEO_KIND, 9)]);
+        let classified_forged = classify_session_max_layer_buckets(&forged);
+        assert_eq!(
+            bucket_for_kind(&classified_forged, "video"),
+            Some("other"),
+            "a forged/out-of-ladder layer id (9) must bucket to \"other\""
+        );
+
+        // AUDIO has no simulcast ladder: even a (bogus) AUDIO entry must not
+        // appear as a tracked kind (only VIDEO+SCREEN are gauge kinds).
+        const AUDIO_KIND: i32 = 2;
+        assert!(
+            !LAYER_PREFERENCE_GAUGE_KINDS
+                .iter()
+                .any(|(k, _)| *k == AUDIO_KIND),
+            "AUDIO must NOT be a demand-gauge kind (no simulcast layers)"
+        );
+    }
+
+    /// The sweep's kind taxonomy ([`LAYER_PREFERENCE_GAUGE_KINDS`]) and the
+    /// room-drain GC's taxonomy ([`crate::metrics::RELAY_LAYER_PREFERENCE_KINDS`])
+    /// MUST list the exact same `kind` label set — otherwise the sweep would
+    /// write a series the GC never removes (a leak) or vice versa. This fails if
+    /// either array drifts.
+    #[test]
+    fn layer_preference_gauge_kinds_match_metrics_taxonomy() {
+        let sweep_labels: std::collections::BTreeSet<&str> = LAYER_PREFERENCE_GAUGE_KINDS
+            .iter()
+            .map(|(_, label)| *label)
+            .collect();
+        let gc_labels: std::collections::BTreeSet<&str> =
+            crate::metrics::RELAY_LAYER_PREFERENCE_KINDS
+                .iter()
+                .copied()
+                .collect();
+        assert_eq!(
+            sweep_labels, gc_labels,
+            "the sweep's kind labels and the room-drain GC's kind labels must match exactly"
+        );
+    }
 
     #[test]
     fn test_union_max_over_receivers() {

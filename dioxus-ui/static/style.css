@@ -3650,18 +3650,13 @@ select {
 }
 
 /* Screen share split-layout — right-panel peer video tile.
-   Height-driven sizing mirrors `.grid-item`: the tile fills the grid-auto-row
-   height set by the parent right-panel, derives its width from
-   `aspect-ratio: 3 / 2` (the max ratio we accept), and is clamped by
-   `max-width: 100%` so narrow grid cells (2-column layout) still fill their
-   full width.
-   HCL issues #3 + #4: the parent right-panel now sizes columns to
-   `ss_tile_h * 1.5` px instead of `1fr`, so each grid cell is exactly the
-   tile's natural 3:2 footprint. With `place-self: stretch` (not the prior
-   `center`) the tile fills its cell edge-to-edge, leaving the inter-tile
-   gap exactly `8px` and packing all tiles to the left edge of the panel.
-   The dominant shared-content tile (`.split-screen-tile`) intentionally
-   does NOT get this cap — it stays as a large, dominant display. */
+   The parent `.ss-peer-panel` is a flex-wrap container; each tile gets
+   `flex: 0 1 calc(50% - 5px)` so two tiles fit per row when there's
+   room, collapsing to one column when the panel is narrow (min-width
+   160px). `aspect-ratio: 3 / 2` derives height from width. Off-budget
+   tiles render with `force_avatar: true` (avatar placeholder, no
+   decode) — the decode budget caps live decoders just as the normal
+   grid does (issue #987). */
 .split-peer-tile {
   position: relative;
   flex: 1 1 160px;
@@ -3701,15 +3696,15 @@ select {
 }
 
 /* ── Screen-share right panel ─────────────────────────────────────────
-   CSS-driven auto-fill grid. Tiles auto-wrap into as many columns as
-   fit; scrolls vertically when rows exceed height. */
+   CSS flex-wrap panel. Tiles auto-wrap into as many columns as fit;
+   scrolls vertically when rows exceed height. */
 .ss-peer-panel {
   min-width: 0;
   height: 100%;
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  padding: 10px;
+  padding: 14px;
   align-content: flex-start;
   overflow-y: auto;
   overflow-x: hidden;

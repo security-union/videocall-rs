@@ -7,10 +7,11 @@ import { waitForServices } from "../helpers/wait-for-services";
  *
  * When a participant shares their screen the meeting switches to a split
  * layout: the shared screen fills the left 2/3 of #grid-container while
- * peer video tiles are arranged in a 2-column grid on the right 1/3.
- *
- * If the number of peers exceeds the right panel's capacity a
- * `.grid-overflow-badge` element is rendered showing "+N more in meeting".
+ * peer video tiles are arranged in a flex-wrap panel (.ss-peer-panel)
+ * on the right 1/3. All participants are rendered (no cap); the panel
+ * scrolls vertically when tiles overflow. Off-budget peers render as
+ * avatar-tier tiles (no video decode) per the decode-budget system
+ * (issue #987).
  *
  * LIMITATION: `getDisplayMedia()` opens a system-level picker that
  * Playwright cannot drive in all environments.  We use Chromium's
@@ -19,9 +20,9 @@ import { waitForServices } from "../helpers/wait-for-services";
  * share button click will not produce a stream and the split layout will
  * not activate — the tests document this and skip gracefully.
  *
- * Mock peers are used to fill the right panel beyond its capacity so that
- * the overflow badge can be verified.  Mock peers require the Dioxus UI
- * to be built with `mockPeersEnabled: "true"` in config.js.
+ * Mock peers are used to verify many-participant rendering and scroll
+ * behavior.  Mock peers require the Dioxus UI to be built with
+ * `mockPeersEnabled: "true"` in config.js.
  */
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
@@ -366,90 +367,67 @@ test.describe("Screen share right panel layout", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 2. Overflow badge shows when peers exceed right panel capacity
+  // 2. All participants rendered with scrollable panel (no cap/badge)
   //
-  // When the number of peers exceeds the right panel's 2-column grid
-  // capacity, a `.grid-overflow-badge` element should appear showing
-  // "+N" and "more in meeting".
+  // When many peers are present during screen share, all participants
+  // are rendered as .split-peer-tile elements (no artificial cap, no
+  // overflow badge). The panel scrolls vertically when tiles overflow.
   //
-  // This test uses mock peers to fill the panel beyond capacity.
   // Requires `mockPeersEnabled: "true"` in config.js.
   // ──────────────────────────────────────────────────────────────────────
-  test("overflow badge shows when peers exceed right panel capacity", async ({ baseURL }) => {
+  test("all participants rendered with scrollable panel during screen share", async ({
+    baseURL,
+  }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
-    const meetingId = `e2e_ss_panel_overflow_${Date.now()}`;
+    const meetingId = `e2e_ss_panel_scroll_${Date.now()}`;
 
     const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
       uiURL,
       meetingId,
-      "SSOverHost",
-      "SSOverGuest",
+      "SSScrollHost",
+      "SSScrollGuest",
     );
 
     try {
-      // Give time for WebSocket/WebTransport peer discovery
       await hostPage.waitForTimeout(3000);
 
-      // Check if mock peers feature is available by looking for the button
       const mockButton = hostPage.locator("button.video-control-button", {
         has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
       });
-
       const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
-
       if (!mockPeersAvailable) {
-        test.skip(
-          true,
-          "Mock peers feature is not enabled. " +
-            'Set mockPeersEnabled: "true" in config.js to enable this test.',
-        );
+        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
         return;
       }
 
-      // Add enough mock peers to exceed the right panel capacity.
-      // The right panel uses a 2-column grid. At typical viewport sizes,
-      // only 4-8 tiles fit (2-4 rows * 2 cols). Adding 20 mock peers
-      // ensures overflow regardless of viewport height.
+      // Add 20 mock peers — enough to overflow the panel at any viewport.
       await addMockPeers(hostPage, 20);
-
-      // Wait for mock peer tiles to render in the normal grid
       await hostPage.waitForTimeout(2000);
 
-      // Guest starts screen sharing to trigger the split layout
       const shareActivated = await startScreenShare(guestPage, hostPage);
-
       if (!shareActivated) {
-        test.skip(
-          true,
-          "Screen share could not be auto-accepted. " +
-            "The --auto-select-desktop-capture-source flag may not be supported " +
-            "in this Chromium build or display environment.",
-        );
+        test.skip(true, "Screen share could not be auto-accepted.");
         return;
       }
-
-      // Wait for the split layout to stabilize with mock peers
       await hostPage.waitForTimeout(3000);
 
-      // ---- ASSERT: overflow badge is visible ----
-      const overflowBadge = hostPage.locator(".grid-overflow-badge");
-      await expect(overflowBadge).toBeVisible({ timeout: 10_000 });
-
-      // Verify the badge contains "+N" text (where N > 0)
-      const badgeText = await overflowBadge.textContent();
-      expect(badgeText).toBeTruthy();
-      expect(badgeText).toMatch(/\+\d+/);
-
-      // Verify the badge contains "more in meeting"
-      const moreSpan = overflowBadge.locator("span");
-      await expect(moreSpan).toContainText("more in meeting");
-
-      // Verify some split-peer-tile elements are also visible
-      // (the badge coexists with visible tiles)
+      // All participants should be rendered (no truncation/badge).
       const peerTiles = hostPage.locator(".split-peer-tile");
-      const visibleTileCount = await peerTiles.count();
-      expect(visibleTileCount).toBeGreaterThan(0);
+      const tileCount = await peerTiles.count();
+      // 20 mock + 2 real users (host + guest) = 22, but self-tile may
+      // or may not appear; assert at least 20 to confirm no cap.
+      expect(tileCount).toBeGreaterThanOrEqual(20);
+
+      // No overflow badge should be present.
+      const overflowBadge = hostPage.locator(".grid-overflow-badge");
+      await expect(overflowBadge).toHaveCount(0);
+
+      // Panel should be scrollable (scrollHeight > clientHeight).
+      const panel = hostPage.locator(".ss-peer-panel");
+      await expect(panel).toBeVisible({ timeout: 5_000 });
+      const scrollable = await panel.evaluate((el) => el.scrollHeight > el.clientHeight);
+      expect(scrollable).toBe(true);
     } finally {
       await browser1.close();
       await browser2.close();

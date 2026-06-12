@@ -3064,19 +3064,19 @@ pub fn AttendantsComponent(
     let has_screen_share = active_screen_sharer.is_some();
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
-    // The right panel uses a 2-column grid of compact tiles. We compute how
-    // many fit based on the available height, then run speaker promotion
-    // independently of the normal grid's visible_tile_count.
     //
-    // Screen-share right panel: compact tiles via CSS auto-fill grid.
-    // All sizing is handled purely by CSS — no Rust column/tile calculations.
-    // Internal element sizes (text, icons) are overridden in CSS for
-    // .split-peer-tile so they don't depend on --tile-h / --tile-w.
+    // Screen-share right panel: compact tiles via CSS flex-wrap layout.
+    // All visual sizing is handled purely by CSS (.ss-peer-panel).
+    //
+    // ALL participants are rendered in the DOM (vertical scroll handles
+    // overflow), but only the first `ss_decoded_limit` get live video
+    // decode. The rest render as avatar-tier tiles (`force_avatar: true`)
+    // — same pattern as the normal grid's decode-budget (issue #987).
+    // This prevents a 30-person meeting from spinning up 30 decoders
+    // during screen share on constrained hardware.
 
     // Build a separate tile list for the screen-share right panel.
-    // The grid's promotion used visible_tile_count which differs from the
-    // screen-share panel's capacity, so we rebuild from scratch and re-promote.
-    let (ss_tiles, _ss_overflow_count) = if has_screen_share {
+    let (ss_decoded_tiles, ss_avatar_tiles) = if has_screen_share {
         let mut ss_all: Vec<String> = Vec::with_capacity(total_tiles);
         for peer_id in display_peers.iter().take(capped_real) {
             ss_all.push(peer_id.clone());
@@ -3091,17 +3091,14 @@ pub fn AttendantsComponent(
             });
         }
 
-        // Show ALL participants — no artificial cap. Vertical scrolling in the
-        // right panel handles overflow when tiles hit their minimum height.
-        let ss_vis_count = ss_all.len();
-        let ss_ovf = 0;
-
+        // Promote active speakers into the decoded budget window.
+        let ss_budget = budget_cap.max(MIN_CAP).min(ss_all.len());
         {
             let speech_map = peer_speech_priority.read();
             let join_map = peer_join_time.read();
             promote_speakers(
                 &mut ss_all,
-                ss_vis_count,
+                ss_budget,
                 &speech_map,
                 &join_map,
                 now_ms,
@@ -3109,10 +3106,12 @@ pub fn AttendantsComponent(
             );
         }
 
-        let tiles: Vec<String> = ss_all.into_iter().take(ss_vis_count).collect();
-        (tiles, ss_ovf)
+        // Split: first ss_budget tiles get video decode, rest get avatars.
+        let decoded: Vec<String> = ss_all.iter().take(ss_budget).cloned().collect();
+        let avatars: Vec<String> = ss_all.iter().skip(ss_budget).cloned().collect();
+        (decoded, avatars)
     } else {
-        (Vec::new(), 0)
+        (Vec::new(), Vec::new())
     };
 
     // ORDERING INVARIANT: the active decode set is built in 3 phases:
@@ -3122,8 +3121,9 @@ pub fn AttendantsComponent(
     // The dedup check against previous_active_decode_set must run AFTER all
     // three phases. Moving any insertion after the dedup will silently desync.
     let mut active_decode_set: HashSet<u64> = if has_screen_share {
-        // In screen share mode, decode only the tiles visible in the right panel.
-        ss_tiles
+        // In screen share mode, decode only the budget-capped tiles.
+        // Avatar-tier tiles are rendered but not decoded.
+        ss_decoded_tiles
             .iter()
             .filter_map(|pid| pid.parse::<u64>().ok())
             .collect()
@@ -3791,11 +3791,12 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — CSS-driven auto-fill grid.
+                                // Right panel — CSS flex-wrap panel.
                                 div {
                                     class: "ss-peer-panel",
                                     style: "width: {right_pct:.2}%;",
-                                    for tile_id in ss_tiles.iter() {
+                                    // Decoded tiles — live video canvas
+                                    for tile_id in ss_decoded_tiles.iter() {
                                         {
                                             let is_mock = tile_id.starts_with("mock-");
                                             if is_mock {
@@ -3828,9 +3829,43 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
-
-                                    // No overflow badge in screen-share mode — all participants
-                                    // are rendered and the panel scrolls vertically if needed.
+                                    // Off-budget avatar tiles — rendered in DOM
+                                    // but no video decode (force_avatar: true).
+                                    for tile_id in ss_avatar_tiles.iter() {
+                                        {
+                                            let is_mock = tile_id.starts_with("mock-");
+                                            if is_mock {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        force_avatar: true,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_session_id: my_session_id.clone(),
+                                                        on_toggle_pin: move |_: String| {},
+                                                    }
+                                                }
+                                            } else {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        force_avatar: true,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_session_id: my_session_id.clone(),
+                                                        pinned_peer_id: current_pinned.clone(),
+                                                        on_toggle_pin: toggle_pin.clone(),
+                                                        room_id: Some(id.clone()),
+                                                        is_current_user_host: is_owner,
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }

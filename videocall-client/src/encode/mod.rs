@@ -32,15 +32,15 @@ use videocall_types::Callback;
 pub use camera_encoder::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
-    camera_encoder_frames_submitted_ok, CameraEncoder, LiveQualitySnapshot, QualityTierBounds,
-    SimulcastLayerInfo, SimulcastSendSnapshot,
+    camera_encoder_frames_submitted_ok, camera_encoder_layers_torn_down, CameraEncoder,
+    LiveQualitySnapshot, QualityTierBounds, SimulcastLayerInfo, SimulcastSendSnapshot,
 };
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{
     screen_encoder_errors_closed_codec, screen_encoder_errors_configure_fatal,
     screen_encoder_errors_generic, screen_encoder_errors_vpx_mem_alloc,
-    screen_encoder_frames_submitted_ok, ScreenEncoder, ScreenQualitySnapshot,
-    ScreenQualityTierBounds, ScreenShareEvent,
+    screen_encoder_frames_submitted_ok, screen_encoder_layers_torn_down, ScreenEncoder,
+    ScreenQualitySnapshot, ScreenQualityTierBounds, ScreenShareEvent,
 };
 
 /// Trait to abstract over different microphone encoder implementations

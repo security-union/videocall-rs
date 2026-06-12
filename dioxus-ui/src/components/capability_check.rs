@@ -256,11 +256,122 @@ pub fn apply_capability_override(
     }
 }
 
+/// Whether [`capability_max_simulcast_layers`] can skip the ~100 ms CPU
+/// microbenchmark **and** the navigator sniff entirely and just return `1`
+/// (issue #1065).
+///
+/// This is a pure perf gate: it does NOT change the layer decision. It returns
+/// `true` only in the cases where the wasm wrapper would have returned `1`
+/// anyway, so the early return is behaviour-identical:
+///
+/// * `flag <= 1` — every call site combines the capability ceiling with the
+///   runtime flag as `min(flag, capability)` (`host.rs` encoder setup + the
+///   `send_layer_max` hook), so `min(flag<=1, _) == flag` and the effective
+///   layer count floors at 1 no matter what the sniff would have produced. The
+///   diagnostics summary stores `video_capability` standalone, but both
+///   formatters (`performance_settings::format_simulcast_summary` /
+///   `_compact`) take their `effective_video <= 1` branch — which never
+///   references the capability number — whenever `flag <= 1`, so the unsniffed
+///   `1` is never surfaced. `flag <= 1` is the production-OFF default's old
+///   behaviour and the `pinSimulcastMaxLayers(ctx, 1)` e2e OFF path.
+///
+/// The guard additionally requires `override_layers.is_none()` so a TEST-ONLY
+/// `testCapabilityMaxLayersOverride` (issue #1093) always takes effect. In
+/// practice every e2e caller pairs the override with `experimentalSimulcastMaxLayers
+/// = 3` (see `e2e/helpers/simulcast-config.ts` + `simulcast-per-receiver.spec.ts`:
+/// the override is only ever passed through `enableSimulcastFlag(ctx, 3, …)`,
+/// never alongside `pinSimulcastMaxLayers(ctx, 1)`), so `flag <= 1` already
+/// implies no override today. Gating on the override too makes the skip robust
+/// to a hypothetical future test that pairs an override with `flag <= 1`: the
+/// override would still be honoured rather than silently swallowed by the skip.
+///
+/// The CPU score is log-only / health-field-only since issue #1140 — it has not
+/// gated the layer count since then — so skipping its computation cannot change
+/// any layer decision; at most it omits the observability breadcrumb in the
+/// already-single-layer case.
+///
+/// Like [`max_simulcast_layers`] / [`apply_capability_override`], the only
+/// non-test caller is the wasm32-gated [`capability_max_simulcast_layers`], so
+/// the native non-test build sees this as dead code (`cargo clippy --all` does
+/// not lint test targets); the `allow` keeps that build warning-free without
+/// hiding genuine dead code on wasm or in the host tests.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub fn should_skip_capability_sniff(flag: u32, override_layers: Option<u32>) -> bool {
+    flag <= 1 && override_layers.is_none()
+}
+
 // ---------------------------------------------------------------------------
 // Browser-side wrapper. The simulcast ceiling needs the live navigator + the
 // wasm-gated capability benchmark, so the real implementation is wasm32-only;
 // the host build (used by `cargo test --lib`) gets a conservative stub.
 // ---------------------------------------------------------------------------
+
+/// The JS global the console-log collector (`console_log_collector.rs`) and the
+/// health reporter (`videocall-client/src/health_reporter.rs`) both use for the
+/// per-page CPU capability score. Keeping the name in one place keeps the
+/// reader/writer here in lockstep with those two consumers.
+#[cfg(target_arch = "wasm32")]
+const CAPABILITY_SCORE_GLOBAL: &str = "__videocall_capability_score";
+
+/// Read the cached per-page capability score from `window.__videocall_capability_score`.
+///
+/// Returns `Some(score)` only for a finite, strictly-positive value (mirroring
+/// the validation in `health_reporter::read_client_metadata`, which treats
+/// `<= 0` / non-finite as "absent" and omits `client_capability_score`). Returns
+/// `None` on a cache miss — the global is unset, `undefined`, or not a usable
+/// number — so the caller knows to fall back to a one-shot benchmark.
+#[cfg(target_arch = "wasm32")]
+fn read_cached_capability_score(window: &web_sys::Window) -> Option<u32> {
+    use wasm_bindgen::JsValue;
+    let val = js_sys::Reflect::get(window, &JsValue::from_str(CAPABILITY_SCORE_GLOBAL)).ok()?;
+    let score = val.as_f64()?;
+    if score.is_finite() && score > 0.0 {
+        Some(score.min(u32::MAX as f64) as u32)
+    } else {
+        None
+    }
+}
+
+/// Memoize a freshly-computed capability score into
+/// `window.__videocall_capability_score` so subsequent readers (this function on
+/// a later mount, plus `health_reporter::read_client_metadata`) reuse it instead
+/// of re-benchmarking. A failed write is non-fatal — it only costs a future
+/// re-benchmark — so the `Result` is intentionally ignored.
+#[cfg(target_arch = "wasm32")]
+fn write_cached_capability_score(window: &web_sys::Window, score: u32) {
+    use wasm_bindgen::JsValue;
+    let _ = js_sys::Reflect::set(
+        window,
+        &JsValue::from_str(CAPABILITY_SCORE_GLOBAL),
+        &JsValue::from_f64(score as f64),
+    );
+}
+
+/// Capability score for the observability breadcrumb + health field, reusing the
+/// cached global when present (issue #1065).
+///
+/// On a cache HIT returns the cached value with NO benchmark — so a Host
+/// re-mount reuses the score rather than re-benchmarking. On a cache MISS runs
+/// the ~100 ms benchmark exactly ONCE (within this function) and writes it back,
+/// so the `client_capability_score` health field gets a real (non-zero) value
+/// even when console-log upload is disabled (the only other writer never runs).
+///
+/// Note: when console-log upload IS enabled, the collector's
+/// `set_console_log_context` (`console_log_collector.rs`) ALSO runs its own
+/// unconditional one-shot benchmark on connect — it does not consult this cache
+/// first — so on the mount-before-connect race the benchmark can run twice per
+/// page (once here on miss, once in the collector). That is unchanged by this
+/// fix; the win is eliminating the PER-MOUNT re-benchmark, which is the #1065
+/// hot path.
+#[cfg(target_arch = "wasm32")]
+fn cached_or_benchmark_capability_score(window: &web_sys::Window) -> u32 {
+    if let Some(score) = read_cached_capability_score(window) {
+        return score;
+    }
+    let score = videocall_client::capability::videocall_capability_score();
+    write_cached_capability_score(window, score);
+    score
+}
 
 /// Device-capability ceiling on simulcast layers (issue #989 / #1140), sniffed
 /// from the live browser environment.
@@ -269,23 +380,62 @@ pub fn apply_capability_override(
 /// applies the pure [`max_simulcast_layers`] (cores + platform only). Returns a
 /// conservative **1** if the browser globals are unreachable.
 ///
-/// The CPU benchmark `videocall_capability_score()` is still *read and logged*
-/// here as an observability breadcrumb (issue #1140 keeps it alive as a
-/// log-once signal + the `client_capability_score` health field), but it is
-/// **NOT** passed to [`max_simulcast_layers`] — it no longer gates the layer
-/// count. Do not reintroduce a score threshold here or in any dashboard.
+/// The CPU benchmark score is still *logged* here as an observability
+/// breadcrumb (issue #1140 keeps it alive as a log-once signal + the
+/// `client_capability_score` health field), but it is **NOT** passed to
+/// [`max_simulcast_layers`] — it no longer gates the layer count. Do not
+/// reintroduce a score threshold here or in any dashboard.
+///
+/// ## #1065: don't re-run the benchmark on every Host mount
+///
+/// Host mounts/remounts call this once each, and the benchmark is a synchronous
+/// ~100 ms main-thread busy loop. Two changes keep that cost off the hot path
+/// without altering the layer decision:
+///
+/// 1. When [`should_skip_capability_sniff`] is true (feature OFF — the
+///    production default `experimentalSimulcastMaxLayers <= 1` — with no test
+///    override), return `1` immediately, doing ZERO benchmark and ZERO navigator
+///    work. This is behaviour-identical because every caller floors at
+///    `min(flag<=1, _) == 1` (see the helper's doc for the per-call-site proof).
+/// 2. Otherwise, READ the cached `window.__videocall_capability_score` (set by
+///    the console-log collector's preamble path) instead of re-benchmarking, so
+///    a Host re-mount reuses the score. On a cache MISS (Host's `use_hook`
+///    commonly runs at mount *before* `set_console_log_context` fires from
+///    `on_connection_established`, and the collector never sets it at all when
+///    console-log upload is disabled), fall back to running the benchmark ONCE
+///    and writing the result back into the global — so `capability_check` itself
+///    benchmarks at most once per page, and the `client_capability_score` health
+///    field still gets a real (non-zero) value in the upload-disabled case.
+///    (The collector's own on-connect benchmark is unconditional, so the
+///    upload-enabled path may still benchmark once there too; the #1065 win is
+///    removing the per-mount re-benchmark, not deduping against the collector.)
 ///
 /// This is only the capability ceiling; the *operating point* starts at 1 layer
 /// and is ramped up at runtime by `videocall-aq` (issue #1141). The encoder is
 /// configured with `min(this, experimentalSimulcastMaxLayers runtime flag)`, and
 /// the flag now defaults to 3 (feature ON, #1082).
 ///
-/// wasm32-only: it sniffs `web_sys` navigator and calls
-/// `videocall_client::capability::videocall_capability_score()` (for the log
-/// only), which is itself `#[cfg(target_arch = "wasm32")]`. The pure-logic
-/// [`max_simulcast_layers`] above is available on host for unit testing.
+/// wasm32-only: it sniffs `web_sys` navigator and reads/refreshes the cached
+/// CPU score (for the log + health field only, via
+/// `videocall_client::capability::videocall_capability_score()` on a cache
+/// miss), both of which are `#[cfg(target_arch = "wasm32")]`. The pure-logic
+/// [`max_simulcast_layers`] / [`should_skip_capability_sniff`] above are
+/// available on host for unit testing.
 #[cfg(target_arch = "wasm32")]
 pub fn capability_max_simulcast_layers() -> u32 {
+    // #1065 short-circuit: when the feature is OFF (runtime flag <= 1) and no
+    // test override is configured, the effective layer count is pinned to 1 at
+    // every call site (`min(flag<=1, _) == 1`; the diagnostics summary's
+    // `video_capability` is hidden by the formatters' `effective_video <= 1`
+    // branch). Return 1 with ZERO benchmark + ZERO navigator work. The override
+    // is read first (it is `None` in every production/default-docker config) so
+    // an active e2e override always takes effect rather than being swallowed.
+    let override_layers = crate::constants::test_capability_max_layers_override();
+    let flag = crate::constants::experimental_simulcast_max_layers();
+    if should_skip_capability_sniff(flag, override_layers) {
+        return 1;
+    }
+
     let Some(window) = web_sys::window() else {
         return 1;
     };
@@ -301,10 +451,18 @@ pub fn capability_max_simulcast_layers() -> u32 {
     let user_agent = navigator.user_agent().unwrap_or_default();
     let platform = parse_platform_from_ua(&user_agent);
 
-    // Observability breadcrumb ONLY (issue #1140): read + log the score, but do
+    // Observability breadcrumb ONLY (issue #1140): obtain + log the score, but do
     // not feed it to the layer decision. Keeping the read here documents at the
     // call site that the score is intentionally NOT a gate.
-    let score = videocall_client::capability::videocall_capability_score();
+    //
+    // #1065: reuse the cached `window.__videocall_capability_score` instead of
+    // re-running the ~100 ms benchmark on every Host mount. On a cache miss
+    // (Host raced ahead of `set_console_log_context`, or console-log upload is
+    // disabled so the collector never set it) run the benchmark ONCE and memoize
+    // it back into the global, so `capability_check` benchmarks at most once per
+    // page (a re-mount reuses it) and the `client_capability_score` health field
+    // still sees a real value.
+    let score = cached_or_benchmark_capability_score(&window);
     let older_intel = is_older_intel_mac(&platform, cores);
 
     let sniffed = max_simulcast_layers(cores, &platform);
@@ -318,7 +476,8 @@ pub fn capability_max_simulcast_layers() -> u32 {
     //
     // `SIMULCAST_MAX_LAYERS` is the real video ladder depth (the override is
     // clamped to it so a bogus config can't request more layers than exist).
-    let override_layers = crate::constants::test_capability_max_layers_override();
+    // `override_layers` was read once at the top of the function (before the
+    // #1065 skip guard) so the guard could honour an active override; reuse it.
     let ladder_depth = videocall_client::adaptive_quality_constants::SIMULCAST_MAX_LAYERS as u32;
     let layers = apply_capability_override(sniffed, override_layers, ladder_depth);
 
@@ -694,6 +853,76 @@ mod tests {
             apply_capability_override(3, Some(1), LADDER_DEPTH),
             1,
             "override 1 forces single layer regardless of sniffed capability"
+        );
+    }
+
+    // --- should_skip_capability_sniff (issue #1065) ----------------------
+
+    #[test]
+    fn skip_sniff_when_flag_off_and_no_override() {
+        // Feature OFF (flag 0 or 1) with no test override → the effective layer
+        // count is pinned to 1 at every call site, so the wasm wrapper can skip
+        // the ~100 ms benchmark + navigator sniff and just return 1.
+        assert!(
+            should_skip_capability_sniff(0, None),
+            "flag 0, no override must skip"
+        );
+        assert!(
+            should_skip_capability_sniff(1, None),
+            "flag 1, no override must skip"
+        );
+    }
+
+    #[test]
+    fn do_not_skip_sniff_when_feature_on() {
+        // Feature ON (flag >= 2) → the sniffed ceiling can matter (it is combined
+        // via min(flag, capability)), so the sniff must run. This is the
+        // mutation-killer for flipping `<=` to `<`: with `flag < 1` the boundary
+        // flag value 1 would WRONGLY stop skipping and run the benchmark again.
+        assert!(
+            !should_skip_capability_sniff(2, None),
+            "flag 2 must NOT skip — capability ceiling is live"
+        );
+        assert!(
+            !should_skip_capability_sniff(3, None),
+            "flag 3 (production default) must NOT skip"
+        );
+    }
+
+    #[test]
+    fn flag_one_is_the_skip_boundary() {
+        // Pin the `<=` boundary explicitly. If the predicate is mutated to `<`,
+        // flag == 1 would return false here and this assertion fails — proving the
+        // test is wired to the real boundary, not a tautology.
+        assert!(
+            should_skip_capability_sniff(1, None),
+            "flag == 1 is the inclusive OFF boundary and MUST skip"
+        );
+        assert!(
+            !should_skip_capability_sniff(2, None),
+            "flag == 2 is the first ON value and MUST NOT skip"
+        );
+    }
+
+    #[test]
+    fn do_not_skip_sniff_when_override_present_even_if_flag_off() {
+        // An active #1093 test override must ALWAYS reach
+        // `apply_capability_override`, so the skip guard must NOT fire while an
+        // override is configured — even on the flag <= 1 boundary. This is the
+        // mutation-killer for dropping the `&& override_layers.is_none()` clause:
+        // without it these would WRONGLY skip and swallow the override.
+        assert!(
+            !should_skip_capability_sniff(0, Some(3)),
+            "flag 0 with override must NOT skip — override must take effect"
+        );
+        assert!(
+            !should_skip_capability_sniff(1, Some(3)),
+            "flag 1 with override must NOT skip — override must take effect"
+        );
+        // And of course an override with the feature on also runs the sniff path.
+        assert!(
+            !should_skip_capability_sniff(3, Some(3)),
+            "flag 3 with override must NOT skip"
         );
     }
 }

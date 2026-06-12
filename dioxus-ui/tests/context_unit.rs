@@ -11,10 +11,10 @@
 use wasm_bindgen_test::*;
 
 use dioxus_ui::context::{
-    clear_display_name_from_storage, clear_transport_sticky_and_pref, email_to_display_name,
-    load_display_name_from_storage, load_transport_preference, resolve_transport_config,
-    save_display_name_to_storage, save_transport_preference, save_transport_sticky,
-    validate_display_name, TransportPreference, DISPLAY_NAME_MAX_LEN,
+    apply_transport_decision, clear_display_name_from_storage, clear_transport_sticky_and_pref,
+    email_to_display_name, load_display_name_from_storage, load_transport_preference,
+    resolve_transport_config, save_display_name_to_storage, save_transport_preference,
+    save_transport_sticky, validate_display_name, TransportPreference, DISPLAY_NAME_MAX_LEN,
 };
 use videocall_types::validation::normalize_spaces;
 
@@ -580,6 +580,7 @@ fn transport_preference_storage_migrates_legacy_auto() {
 fn transport_preference_storage_invalid_value_returns_default() {
     // If localStorage contains an invalid string, load_transport_preference
     // should fall back to the default (WebTransport).
+    clear_transport_sticky_and_pref();
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item("vc_transport_preference", "invalid_value");
     }
@@ -594,4 +595,131 @@ fn transport_preference_storage_invalid_value_returns_default() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item("vc_transport_preference");
     }
+}
+
+// ---------------------------------------------------------------------------
+// apply_transport_decision — the #1291 persistence fix
+//
+// These exercise the SAME pure function the settings-modal "Apply" button and
+// `confirm_transport_change` both call, without needing `window.confirm` (which
+// `confirm_transport_change` blocks on). They assert the storage END-STATE and
+// what `load_transport_preference` returns on the NEXT load.
+//
+// NOTE: these wasm tests share one storage origin, so each clears storage at
+// start AND end via `clear_transport_sticky_and_pref()`.
+// ---------------------------------------------------------------------------
+
+/// #1291 headline fix: choosing WebTransport explicitly (remember OFF) after a
+/// prior pinned WebSocket choice must leave NO stale WS pin behind, so the next
+/// load resolves to WebTransport.
+///
+/// Fails if the `(true, false)` arm of `apply_transport_decision` stops clearing
+/// storage (e.g. reverted to a no-op): the planted WS sticky pin would survive
+/// and `load_transport_preference` would return WebSocket.
+#[wasm_bindgen_test]
+fn apply_decision_webtransport_not_remembered_clears_prior_ws_pin() {
+    clear_transport_sticky_and_pref();
+
+    let local_storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("test environment must have localStorage");
+    let session_storage = web_sys::window()
+        .and_then(|w| w.session_storage().ok().flatten())
+        .expect("test environment must have sessionStorage");
+
+    // Plant a prior pinned WebSocket choice.
+    local_storage
+        .set_item("vc_transport_sticky", "true")
+        .expect("plant sticky");
+    local_storage
+        .set_item("vc_transport_preference", "websocket")
+        .expect("plant WS pref");
+
+    // Explicit WebTransport, NOT remembered.
+    apply_transport_decision(TransportPreference::WebTransport, false);
+
+    // Every storage key must be gone.
+    assert_eq!(
+        local_storage.get_item("vc_transport_sticky").ok().flatten(),
+        None,
+        "sticky flag must be cleared"
+    );
+    assert_eq!(
+        local_storage
+            .get_item("vc_transport_preference")
+            .ok()
+            .flatten(),
+        None,
+        "localStorage preference must be cleared"
+    );
+    assert_eq!(
+        session_storage
+            .get_item("vc_transport_session")
+            .ok()
+            .flatten(),
+        None,
+        "sessionStorage value must be absent"
+    );
+
+    // Next load resolves to the implicit default.
+    assert_eq!(
+        load_transport_preference(),
+        TransportPreference::WebTransport,
+        "After clearing a WS pin, the next load must resolve to WebTransport"
+    );
+
+    clear_transport_sticky_and_pref();
+}
+
+/// #1291 hazard C.3: choosing WebSocket explicitly (remember OFF) after a prior
+/// pinned WebTransport choice must clear the stale sticky pin so the
+/// session-scoped WebSocket value wins on the next load.
+///
+/// Fails if the `(false, false)` arm of `apply_transport_decision` stops
+/// clearing the prior `localStorage` sticky+pref: `load_transport_preference`
+/// would see `sticky == true`, read the stale `webtransport` value, and ignore
+/// the `sessionStorage` WebSocket value — returning WebTransport and failing the
+/// final assertion.
+#[wasm_bindgen_test]
+fn apply_decision_websocket_not_remembered_clears_stale_wt_sticky() {
+    clear_transport_sticky_and_pref();
+
+    let local_storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("test environment must have localStorage");
+
+    // Plant a prior pinned WebTransport choice.
+    local_storage
+        .set_item("vc_transport_sticky", "true")
+        .expect("plant sticky");
+    local_storage
+        .set_item("vc_transport_preference", "webtransport")
+        .expect("plant WT pref");
+
+    // Explicit WebSocket, NOT remembered (session-scoped).
+    apply_transport_decision(TransportPreference::WebSocket, false);
+
+    // The stale sticky pin must be gone (otherwise it would shadow the session value).
+    assert_eq!(
+        local_storage.get_item("vc_transport_sticky").ok().flatten(),
+        None,
+        "stale WT sticky flag must be cleared"
+    );
+    assert_eq!(
+        local_storage
+            .get_item("vc_transport_preference")
+            .ok()
+            .flatten(),
+        None,
+        "stale localStorage WT preference must be cleared"
+    );
+
+    // Next load must resolve to WebSocket from the session-scoped value.
+    assert_eq!(
+        load_transport_preference(),
+        TransportPreference::WebSocket,
+        "Session-scoped WebSocket must win over a cleared WT sticky pin on next load"
+    );
+
+    clear_transport_sticky_and_pref();
 }

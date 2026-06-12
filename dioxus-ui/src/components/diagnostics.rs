@@ -26,9 +26,7 @@ use crate::components::performance_settings::{
     format_send_layer_short, format_send_total_kbps, format_simulcast_summary, layer_quality_label,
     peers_for_kind, DiagnosticsReader, HelpPopover, PerfControlsHandle, PerformanceSettingsPanel,
 };
-use crate::context::{
-    confirm_transport_change, load_transport_sticky, TransportPreference, TransportPreferenceCtx,
-};
+use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
 use dioxus::prelude::*;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
@@ -1074,11 +1072,18 @@ pub fn Diagnostics(
                             id: "diagnostics-transport-select",
                             class: "peer-selector",
                             onchange: move |evt: Event<FormData>| {
+                                // The diagnostics select has no "remember" checkbox, so it
+                                // expresses an explicit, NOT-remembered choice (#1291). Passing
+                                // `sticky = false` means: WebTransport clears all storage (load
+                                // resolves to the default); WebSocket writes a session-scoped
+                                // value AND clears any prior sticky pin, so WS wins this session
+                                // and is forgotten on tab close. Reading the stored sticky flag
+                                // here would re-pin against the user's intent.
                                 confirm_transport_change(
                                     &evt.value(),
                                     (transport_pref_ctx.0)(),
                                     "diagnostics-transport-select",
-                                    load_transport_sticky(),
+                                    false,
                                 );
                             },
                             option {

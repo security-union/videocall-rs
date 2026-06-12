@@ -605,7 +605,12 @@ h3 {
     height: 100% !important;
     background-color: var(--surface-elevated) !important;
     transition: transform 0.3s ease !important;
-    z-index: 9300 !important;
+    /* On mobile both drawers are full-width fixed overlays. Now that they can be
+       open at the same time (issue 1296), give diagnostics one layer above
+       peer-list (9300) so the right/diagnostics drawer deterministically sits on
+       top instead of relying on DOM order. Both keep their own close buttons, so
+       each stays independently dismissible. (issue 1296) */
+    z-index: 9301 !important;
     overflow-y: auto !important;
     transform: translateX(100%) !important;
     box-shadow: none !important;
@@ -1915,25 +1920,47 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 /* Drawer resize grip (issue 1296). One per drawer, positioned on the drawer's inner
    edge. Drag is driven by pointer listeners on each drawer's
    .drawer-resize-handle, using pointer capture (attendants.rs / diagnostics.rs).
-   The #grid-container handlers only drive the screen-share split, not resize. */
+   The #grid-container handlers only drive the screen-share split, not resize.
+
+   The handle div is the FULL-HEIGHT pointerdown/capture target (cursor ew-resize)
+   but is itself visually transparent; the visible affordance is a short, centered
+   vertical grip rendered via ::before so a bare edge-hover doesn't read as a solid
+   resizable bar. The grip uses var(--border) at rest and var(--accent) on
+   hover/focus/active. (issue 1296) */
 .drawer-resize-handle {
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 6px;
+  /* Slightly wider hit area than the old 6px so the grip is easy to grab. */
+  width: 10px;
   cursor: ew-resize;
   z-index: 9310;
-  background: var(--border);
-  opacity: 0.35;
-  transition: opacity 0.15s ease, background 0.15s ease;
+  background: transparent;
+  transition: background 0.15s ease;
   /* Suppress browser touch panning and text selection during a capture drag. */
   touch-action: none;
   user-select: none;
 }
 
-.drawer-resize-handle:hover,
-.drawer-resize-handle:focus {
-  opacity: 1;
+/* Centered grip: a short rounded vertical bar, vertically centered in the
+   full-height handle. var(--border) normally, var(--accent) on interaction. */
+.drawer-resize-handle::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 32px;
+  border-radius: 2px;
+  background: var(--border);
+  transition: background 0.15s ease;
+  pointer-events: none;
+}
+
+.drawer-resize-handle:hover::before,
+.drawer-resize-handle:focus::before,
+.drawer-resize-handle:active::before {
   background: var(--accent);
 }
 

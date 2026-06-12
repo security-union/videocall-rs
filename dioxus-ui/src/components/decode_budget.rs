@@ -1302,7 +1302,7 @@ mod tests {
         let c = ios_decode_tile_ceiling(true, 4).expect("iOS must have a ceiling");
         assert!(
             c < 14,
-            "iOS 4-core ceiling must be below the #1289 ratchet target of 14"
+            "iOS 4-core ceiling must be below the issue 1289 ratchet target of 14"
         );
         assert!(
             c < 9,

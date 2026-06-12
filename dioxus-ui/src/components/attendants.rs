@@ -1932,6 +1932,59 @@ pub fn AttendantsComponent(
         });
     }
 
+    // ── Auto-request media permission for pre-join preview (issue 1134) ──────
+    //
+    // So the camera/mic device selectors appear automatically when the user
+    // lands on the pre-join screen, fire a single permission request on mount.
+    // This fires ONLY on the manual pre-join path (`auto_join == false`); on the
+    // auto-join path (waiting-room admission / direct-URL) the auto-join effect
+    // already owns the single permission request that proceeds to connect, so
+    // this effect early-returns there to avoid a redundant getUserMedia.
+    // This is PREVIEW-ONLY and never auto-joins: it does NOT set
+    // `join_requested`, so `on_result` takes the `else if !join_requested()`
+    // branch (logs the preview message, does not connect), preserving the
+    // issue 933 no-auto-start invariant.
+    //
+    // `request()` is async (spawn_local in media_device_access.rs), so when it
+    // resolves `on_result` sets `media_access_granted = true`. That write
+    // invalidates this effect's subscription and re-runs it once; the
+    // `Rc<Cell<bool>>` one-shot guard — set BEFORE calling `request()` — makes
+    // that re-run a no-op, so the request fires exactly once. (This effect does
+    // NOT re-run on window `focus`: it reads none of the signals a focus event
+    // touches — the separate focus listener, which early-returns while
+    // `meeting_joined` is false, is what keeps focus from acting in pre-join.)
+    // The request is also gated on the live signals so it never fires while in
+    // a meeting, while connecting, or once access is already granted.
+    let auto_requested = use_hook(|| Rc::new(Cell::new(false)));
+    {
+        let mda = mda.clone();
+        let auto_requested = auto_requested.clone();
+        use_effect(move || {
+            // Manual pre-join path only: on the auto-join path the auto-join
+            // effect already owns the single permission request that proceeds
+            // to connect, so skipping here avoids a redundant getUserMedia.
+            if auto_join {
+                return;
+            }
+            // Subscribe to the reactive triggers by reading them in the closure.
+            let joined = meeting_joined();
+            let granted = media_access_granted();
+            let requested = join_requested();
+            // Fire exactly once on a clean pre-join mount: not in a meeting, not
+            // already granted, no join in flight, and the guard not yet tripped.
+            if joined || granted || requested || auto_requested.get() {
+                return;
+            }
+            // Set the guard BEFORE requesting: once `request()` resolves and
+            // `on_result` flips `media_access_granted`, this effect re-runs —
+            // the guard makes that re-run return early, so request() fires once.
+            auto_requested.set(true);
+            // Preview-only: deliberately do NOT set `join_requested` — keeps
+            // `on_result` on the preview branch (no connect).
+            mda.borrow().request();
+        });
+    }
+
     // Keep each pre-join <select>'s DOM `.value` in sync with the restored
     // selection signal once devices are enumerated. (issue #959 restore bug)
     //
@@ -3434,10 +3487,19 @@ pub fn AttendantsComponent(
                             mic_on: prejoin_mic_on,
                             on_request_permission: {
                                 let mda = mda.clone();
+                                let auto_requested = auto_requested.clone();
                                 move |_| {
-                                    // Preview-only permission request: does NOT join
-                                    // (join_requested stays false).
-                                    mda.borrow().request();
+                                    // Preview-only permission request: does NOT
+                                    // join (join_requested stays false). Share the
+                                    // on-mount auto-request's one-shot guard so a
+                                    // manual click while the auto-probe is still
+                                    // in flight doesn't fire a second concurrent
+                                    // getUserMedia; still works if the auto-effect
+                                    // never ran (guard not yet set).
+                                    if !auto_requested.get() {
+                                        auto_requested.set(true);
+                                        mda.borrow().request();
+                                    }
                                 }
                             },
                             on_camera_toggle: {

@@ -677,7 +677,7 @@ fn send_layer_preference_via(
 ///     boolean, NOT a per-peer property. When the local transport is not WT (or
 ///     no connection is active yet) the tick returns early and seeds nothing,
 ///     preserving the M2 healthy cold-start for WS clients;
-///   * otherwise drives [`PeerDecodeManager::seed_early_congestion_for_wt_peers`]
+///   * otherwise drives [`PeerDecodeManager::seed_early_congestion_for_connected_peers`]
 ///     (which now seeds purely on the per-peer congestion gate — the WT decision
 ///     has already been made on the local transport — and clamps each seeded layer
 ///     to the user's receive bounds) and then publishes the
@@ -775,7 +775,7 @@ fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Opti
         // `observe_early_congestion`.
         inner
             .peer_decode_manager
-            .seed_early_congestion_for_wt_peers(now_ms, &bounds);
+            .seed_early_congestion_for_connected_peers(now_ms, &bounds);
 
         // Publish the resulting desired map through the existing sender so
         // dedup/rate-limit invariants hold. The map is clamped to the user's

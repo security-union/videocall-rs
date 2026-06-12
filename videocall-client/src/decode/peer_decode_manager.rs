@@ -2249,25 +2249,27 @@ impl PeerDecodeManager {
         desired
     }
 
-    /// Early-seed congestion across every peer showing an early-congested sample
-    /// (issue #1179, Part B).
+    /// Early-seed congestion across every connected peer showing an
+    /// early-congested sample (issue #1179, Part B).
     ///
     /// Drives [`Peer::seed_early_congestion`] for each connected peer; the
     /// primitive is itself a no-op on a clean sample, so a peer healthy at join
     /// is seeded nothing. The early-seed primitive's `observe_early_congestion`
-    /// congestion gate is the only thing deciding whether a given peer flips to
-    /// constrained.
+    /// congestion gate is the ONLY thing deciding whether a given peer flips to
+    /// constrained — this method applies NO transport filtering of its own.
     ///
-    /// NOTE — the WebTransport gate is NOT here. #1179's root cause is THIS
-    /// client's own downlink being WebTransport (reliable-unistream flow-control
-    /// pinning), which is a single client-wide boolean — NOT a per-peer property.
-    /// A peer's announced `transport_type` describes that *remote sender's*
-    /// uplink and is the wrong signal for a downlink-pinning bug. The local-WT
-    /// decision is therefore made ONCE by the caller
-    /// ([`crate::client::video_call_client`]'s early-seed timer tick) on the
+    /// NOTE — there is NO transport gate in this method (neither client-wide nor
+    /// per-peer). The WebTransport decision was already made by the caller. #1179's
+    /// root cause is THIS client's own downlink being WebTransport
+    /// (reliable-unistream flow-control pinning), which is a single client-wide
+    /// boolean — NOT a per-peer property. A peer's announced `transport_type`
+    /// describes that *remote sender's* uplink and is the wrong signal for a
+    /// downlink-pinning bug. The local-WT decision is therefore made ONCE by the
+    /// caller ([`crate::client::video_call_client`]'s early-seed timer tick) on the
     /// client's active connection transport, and this loop is only ever reached
-    /// when that gate has passed. Keeping the gate at the call site makes the
-    /// WT-only semantics explicit and removes any per-peer transport read here.
+    /// when that gate has passed. Keeping the gate at the call site removes any
+    /// per-peer transport read here, so this method simply seeds every connected
+    /// peer whose congestion gate trips.
     ///
     /// Returns `true` if any peer was actually seeded (a congested early sample
     /// flipped it to constrained). The caller still emits the resulting
@@ -2278,7 +2280,7 @@ impl PeerDecodeManager {
     /// [`Peer::seed_early_congestion`] so the seeded decode layer is clamped to
     /// the user's per-kind `max`/`min` exactly as the 5s tick clamps its output
     /// (PR #1192 review). Open (default) bounds are an identity clamp.
-    pub fn seed_early_congestion_for_wt_peers(
+    pub fn seed_early_congestion_for_connected_peers(
         &mut self,
         now_ms: u64,
         bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
@@ -5435,8 +5437,10 @@ mod tests {
     // Issue #1179, Part B: early-seed wiring (manager level)
     //
     // These exercise the two glue methods the early-seed timer drives:
-    //   * seed_early_congestion_for_wt_peers — WT-ONLY, and a no-op on a
-    //     clean WT join (M2 preserved);
+    //   * seed_early_congestion_for_connected_peers — seeds purely on each
+    //     peer's congestion gate (no transport filtering of its own; the WT
+    //     decision lives at the call site) and is a no-op on a clean join
+    //     (M2 preserved);
     //   * current_desired_preferences — READ-ONLY (advances no hysteresis).
     // -----------------------------------------------------------------
 
@@ -5469,8 +5473,8 @@ mod tests {
     /// UNKNOWN-announcing peer must be seeded exactly like a WT-announcing one.
     ///
     /// MUTATION CHECK: fails if a per-peer `transport_type` gate is (re)introduced
-    /// into `seed_early_congestion_for_wt_peers` — then the WS/UNKNOWN peers would
-    /// NOT be seeded and their desired entries would be missing.
+    /// into `seed_early_congestion_for_connected_peers` — then the WS/UNKNOWN peers
+    /// would NOT be seeded and their desired entries would be missing.
     #[wasm_bindgen_test]
     fn early_seed_constrains_congested_peers_regardless_of_peer_transport() {
         use crate::decode::layer_chooser::PrefMediaKind;
@@ -5491,7 +5495,7 @@ mod tests {
         // Open (default) bounds — these tests cover the unbounded user; the bounds
         // clamp is exercised separately in `early_seed_respects_user_receive_max`.
         let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
-        let seeded = manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        let seeded = manager.seed_early_congestion_for_connected_peers(2000, &bounds);
         assert!(seeded, "the congested peers' samples must seed a constrain");
 
         let desired = manager.current_desired_preferences(2000, &bounds);
@@ -5530,7 +5534,7 @@ mod tests {
         manager.connected_peers.insert(101, peer);
 
         let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
-        let seeded = manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        let seeded = manager.seed_early_congestion_for_connected_peers(2000, &bounds);
         assert!(!seeded, "a clean WT join must seed nothing (M2)");
         let desired = manager.current_desired_preferences(2000, &bounds);
         assert!(
@@ -5571,7 +5575,7 @@ mod tests {
         // `early_seed_respects_user_receive_max`.
         let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
         // Seed: constrains video 2 -> 1 (and audio, video-proxied).
-        assert!(mgr.seed_early_congestion_for_wt_peers(2000, &bounds));
+        assert!(mgr.seed_early_congestion_for_connected_peers(2000, &bounds));
 
         // Load a CLEAN downlink so that IF the accessor (incorrectly) advanced the
         // chooser, the clean-window streak would build and eventually climb.
@@ -5681,7 +5685,7 @@ mod tests {
         let mut bounds = ReceiveLayerBounds::default();
         bounds.set_kind(PrefMediaKind::Video, None, Some(0));
 
-        let seeded = manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        let seeded = manager.seed_early_congestion_for_connected_peers(2000, &bounds);
         assert!(
             seeded,
             "the congested sample must still seed a constrain (clamp is a pure \
@@ -5737,7 +5741,7 @@ mod tests {
         manager.connected_peers.insert(950, peer);
 
         let bounds = ReceiveLayerBounds::default();
-        manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        manager.seed_early_congestion_for_connected_peers(2000, &bounds);
 
         let desired = manager.current_desired_preferences(2000, &bounds);
         assert_eq!(

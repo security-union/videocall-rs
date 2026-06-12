@@ -85,6 +85,28 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo clippy --target wasm32-unknown-unknown -p videocall-client --tests -- -D warnings
+      # videocall-aq, videocall-codecs, and neteq run NATIVE libtest (see the
+      # `cargo test videocall-aq` / `cargo test videocall-codecs` /
+      # `cargo test neteq` steps in the wasm-test job), so they are linted on
+      # the host target with NO `--target wasm32-unknown-unknown`. `cargo clippy
+      # --all` does not lint test targets, so deny-by-default lints in their
+      # `#[test]` code went uncaught — the same gap #1211 closed for
+      # videocall-client's wasm tests.
+      - name: clippy (videocall-aq test targets)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo clippy -p videocall-aq --tests -- -D warnings
+      - name: clippy (videocall-codecs test targets)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo clippy -p videocall-codecs --tests -- -D warnings
+      - name: clippy (neteq test targets)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo clippy -p neteq --tests -- -D warnings
 
   wasm-check:
     name: wasm32 check

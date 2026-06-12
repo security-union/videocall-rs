@@ -468,6 +468,38 @@ const _: () = {
     );
 };
 
+/// Minimum interval (in milliseconds) between two KEYFRAME_REQUESTs the
+/// **delivery-aware** relaxation path will admit from a receiver that is STILL
+/// WAITING for a keyframe (issue #1297).
+///
+/// The strict steady-state per-pair budget
+/// ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`], 1/sec) throttles a genuinely
+/// frozen receiver identically to a flooder, and its only relaxation path
+/// ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`]) can NEVER fire on a
+/// lossless WS/TCP path — there is no loss, so the `CongestionTracker` never
+/// marks the receiver congested. On the common deployment (small, all-WS,
+/// capable HW, good network) a frozen receiver's legitimate recovery requests
+/// were therefore dropped, leaving its video stuck frozen.
+///
+/// The fix tracks, per `(target, media_kind)` bucket, whether the relay has
+/// observed a qualifying keyframe-bearing frame DELIVERED since the receiver's
+/// last request. While the receiver is still waiting (no delivery seen), the
+/// limiter admits a retry even when the strict per-pair budget is exhausted —
+/// but no faster than this interval, so a receiver hammering faster than it is
+/// still throttled. Once a frame is delivered the waiting flag clears and the
+/// strict budget re-engages, so a receiver that keeps requesting AFTER recovery
+/// is throttled again (a spammer-after-delivery cannot reopen the storm).
+///
+/// `200`ms: admits ~5 retries/sec while waiting — comfortably under the
+/// unchanged global per-receiver ceiling ([`KEYFRAME_REQUEST_MAX_PER_SEC`],
+/// 32/sec, which still bounds the still-waiting allow), and matched to
+/// real-world links: on a 200ms+ RTT path (Change Impact Policy) a single
+/// retry's round trip is ~200ms, so retrying faster than this cannot have
+/// observed the previous request's result yet and would only add redundant
+/// PLI pressure. 5 retries/sec recovers a frozen tile within a few hundred ms
+/// even if some keyframe responses are themselves lost.
+pub const KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS: u64 = 200;
+
 /// Maximum number of `session_ids` the relay will accept from a single
 /// VIEWPORT control packet (HCL issue #988).
 ///

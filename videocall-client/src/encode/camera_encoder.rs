@@ -669,6 +669,45 @@ fn should_teardown_shed_layer(
     }
 }
 
+/// Minimum interval between PLI-driven *forced* keyframes a publisher will emit
+/// (issue #1287 emit coalescer). The periodic GOP keyframe is NOT gated by this.
+///
+/// A publisher has one encoder per layer feeding a single outbound stream that is
+/// broadcast to ALL receivers; a forced keyframe is ~5-10x a delta frame, x the
+/// active simulcast layers, and fans out to every receiver's downlink — not just
+/// the requester. With N receivers each allowed ~3 inbound KEYFRAME_REQUESTs/sec
+/// by the relay, an uncoalesced publisher can be driven toward frame-rate forced
+/// keyframes, amplifying egress by xN x layers. Because a single keyframe is
+/// broadcast, ONE emission already satisfies every pending requester, so
+/// collapsing a burst of PLIs into one forced keyframe per window cuts that
+/// worst-case amplification without harming recovery: a request that lands
+/// mid-window is honored the instant the window expires, so added recovery
+/// latency is bounded by this value.
+///
+/// 250ms (at most ~4 forced keyframes/sec at 30fps, vs up to frame-rate before)
+/// is a conservative starting point within the issue's 250-500ms range — longer
+/// coalesces more but adds recovery latency. Tune/validate via performance-reviewer.
+const FORCED_KEYFRAME_COOLDOWN_MS: f64 = 250.0;
+
+/// Pure PLI-coalescing decision (issue #1287, host-testable single source of truth).
+///
+/// Returns `true` iff a PLI-driven forced keyframe is allowed to be emitted now,
+/// given when the last keyframe was emitted (`last_keyframe_emit_ms`) and the
+/// cooldown window. The last keyframe may be periodic OR forced — either one is
+/// broadcast to the whole room and satisfies all pending PLIs, so both reset the
+/// window. `None` ⇒ no keyframe emitted yet ⇒ always allowed. The `>=` makes the
+/// boundary inclusive: a PLI exactly `cooldown_ms` after the last keyframe fires.
+///
+/// This is the ONLY place the comparison lives so a host unit test pins it
+/// (mutating `>=`→`>`, inverting the comparison, or dropping the `None` guard all
+/// make the test fail).
+fn pli_keyframe_allowed(now_ms: f64, last_keyframe_emit_ms: Option<f64>, cooldown_ms: f64) -> bool {
+    match last_keyframe_emit_ms {
+        Some(last) => now_ms - last >= cooldown_ms,
+        None => true,
+    }
+}
+
 /// Decide whether a just-encoded frame counts as "healthy" for the purpose of
 /// resetting the encoder restart counter.
 ///
@@ -2558,6 +2597,13 @@ impl CameraEncoder {
                 // Start encoding video and audio.
                 let mut video_frame_counter: u32 = 0;
 
+                // Wall-clock (`performance.now()`, ms) of the last keyframe this
+                // publisher emitted — periodic OR PLI-forced. Drives the forced-
+                // keyframe emit coalescer (issue #1287): PLIs landing within
+                // FORCED_KEYFRAME_COOLDOWN_MS of the last keyframe are held, not
+                // re-emitted. `None` until the first keyframe goes out.
+                let mut last_keyframe_emit_ms: Option<f64> = None;
+
                 // Per-encoder bitrate and dimensions now live in each
                 // `LayerEncoder` (local_bitrate / current_w / current_h) so each
                 // layer reconfigures independently. The tier-controlled caches
@@ -3059,12 +3105,30 @@ impl CameraEncoder {
                                 .unwrap()
                                 .unchecked_into::<VideoFrame>();
 
-                            // Read-and-clear the PLI keyframe request ONCE per
-                            // frame and apply the SAME keyframe flag to every
-                            // layer. Reading it per-layer would let only the
-                            // first layer see the request (the swap clears it),
-                            // desynchronizing keyframes across layers.
-                            let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
+                            // Resolve the PLI keyframe request ONCE per frame and
+                            // apply the SAME keyframe flag to every layer (reading
+                            // it per-layer would let only the first layer see the
+                            // request, desynchronizing keyframes across layers).
+                            //
+                            // Emit-side coalescer (issue #1287): a forced keyframe is
+                            // broadcast to ALL receivers, so ONE emission satisfies
+                            // every pending requester. We therefore PEEK the request
+                            // (`load`, not `swap`) and only honor it outside the
+                            // forced-keyframe cooldown window — collapsing a burst of
+                            // PLIs from many receivers into at most one forced
+                            // keyframe per FORCED_KEYFRAME_COOLDOWN_MS. A request that
+                            // arrives mid-window is left PENDING (flag not cleared)
+                            // and honored the instant the window expires, so it is
+                            // never lost; added recovery latency is bounded by the
+                            // cooldown. The periodic GOP keyframe is never gated.
+                            let now_ms = window().performance().unwrap().now();
+                            let pli_pending = force_keyframe.load(Ordering::Acquire);
+                            let pli_requested = pli_pending
+                                && pli_keyframe_allowed(
+                                    now_ms,
+                                    last_keyframe_emit_ms,
+                                    FORCED_KEYFRAME_COOLDOWN_MS,
+                                );
                             // Use tier-controlled keyframe interval instead of the
                             // static constant, allowing adaptive quality to adjust it.
                             // Using `%` instead of `.is_multiple_of()` for compatibility
@@ -3073,6 +3137,16 @@ impl CameraEncoder {
                             let is_periodic_keyframe = local_keyframe_interval > 0
                                 && video_frame_counter % local_keyframe_interval == 0;
                             let want_keyframe = is_periodic_keyframe || pli_requested;
+                            if want_keyframe {
+                                // ANY keyframe (periodic or forced) is broadcast to
+                                // the whole room and satisfies every pending PLI, so
+                                // clear the request flag and (re)start the cooldown
+                                // window from this emission. Clearing here — only when
+                                // we actually emit — is what lets a mid-cooldown
+                                // request survive to be honored at window expiry.
+                                force_keyframe.store(false, Ordering::Release);
+                                last_keyframe_emit_ms = Some(now_ms);
+                            }
                             if pli_requested {
                                 log::info!(
                                     "CameraEncoder: forcing keyframe at frame {} (PLI)",
@@ -3408,10 +3482,11 @@ mod tests {
     use super::{
         build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
         frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
-        layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin, shed_reason,
-        should_pin_single_layer_low, should_teardown_shed_layer, LayerView, SimulcastLayerInfo,
-        SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
-        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin, pli_keyframe_allowed,
+        shed_reason, should_pin_single_layer_low, should_teardown_shed_layer, LayerView,
+        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
+        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
+        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
 
@@ -3855,6 +3930,71 @@ mod tests {
         assert_eq!(
             freed, 1,
             "exactly the rungs whose dwell exceeded the threshold are freed"
+        );
+    }
+
+    #[test]
+    fn forced_keyframe_pli_coalesces_within_cooldown_window() {
+        // Issue #1287: pins the SINGLE SOURCE OF TRUTH for the publisher-side PLI
+        // emit coalescer (`pli_keyframe_allowed`). The encode loop emits a forced
+        // keyframe iff this returns true AND a PLI is pending, so pinning it here
+        // pins the behavior off-wasm (the live encode loop is not host-runnable).
+        //
+        // Mutations these assertions CATCH:
+        //  * dropping the `None` guard (the first forced keyframe would be blocked) — case 1
+        //  * inverting the comparison (`>=`→`<`) — every Some case flips and FAILS
+        //  * swapping `>=`→`>` — the exact-boundary case (249 suppress, 250 allow) flips
+        let cd = FORCED_KEYFRAME_COOLDOWN_MS; // 250.0
+
+        // No keyframe emitted yet (None) → the first PLI is always allowed.
+        assert!(
+            pli_keyframe_allowed(0.0, None, cd),
+            "the first forced keyframe (no prior keyframe) must always be allowed"
+        );
+        // 249ms after the last keyframe (< 250ms) → SUPPRESS (still in cooldown).
+        assert!(
+            !pli_keyframe_allowed(249.0, Some(0.0), cd),
+            "a PLI 249ms after the last keyframe must be coalesced (suppressed)"
+        );
+        // Exactly 250ms → ALLOW (pins the inclusive `>=`; a `>` mutation fails here).
+        assert!(
+            pli_keyframe_allowed(250.0, Some(0.0), cd),
+            "a PLI exactly one cooldown after the last keyframe must be allowed (>= is inclusive)"
+        );
+        // Well past the window → ALLOW.
+        assert!(
+            pli_keyframe_allowed(1_000.0, Some(250.0), cd),
+            "a PLI long after the window must be allowed"
+        );
+
+        // ACCEPTANCE (#1287): drive the REAL decision over a frame stream where EVERY
+        // frame has a PLI pending (worst case: N receivers hammering one publisher),
+        // replicating the encode loop's state update (any emitted keyframe resets the
+        // window — see the `if want_keyframe` block in the loop), and assert the burst
+        // coalesces to ~one forced keyframe per cooldown. This drives the real helper —
+        // NOT a literal vs itself: remove the gate and `forced` jumps to 30 (one per
+        // frame), failing the `== 4` assertion below. (The inclusive-`>=` boundary is
+        // pinned by the scalar `pli_keyframe_allowed(250.0, Some(0.0), cd)` case above,
+        // not here: at 30fps no frame lands exactly on a 250ms boundary.) 30fps => a
+        // frame every ~33.33ms; no periodic GOP in this 1s slice, so all are PLI-forced.
+        let frame_interval_ms = 1000.0 / 30.0;
+        let mut last_keyframe_emit_ms: Option<f64> = None;
+        let mut forced = 0u32;
+        let mut now = 0.0_f64;
+        for _ in 0..30 {
+            // pli_pending is ALWAYS true in this saturated worst case.
+            if pli_keyframe_allowed(now, last_keyframe_emit_ms, cd) {
+                forced += 1;
+                last_keyframe_emit_ms = Some(now);
+            }
+            now += frame_interval_ms;
+        }
+        // 1s of saturated PLI at a 250ms cooldown: the first frame at/after each window
+        // fires, so emissions land at t≈0, 266.7, 533.3, 800ms => exactly 4 (vs up to
+        // 30 = frame-rate with no coalescer).
+        assert_eq!(
+            forced, 4,
+            "saturated PLI for 1s must coalesce to exactly 4 forced keyframes, got {forced}"
         );
     }
 

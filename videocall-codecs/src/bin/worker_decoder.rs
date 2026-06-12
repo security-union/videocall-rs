@@ -271,22 +271,15 @@ impl Decodable for WebDecoder {
 
             // Second buffer stage observability (issue #1020). Frames handed to
             // `VideoDecoder.decode()` sit in WebCodecs' own internal queue, which is unpaced: even
-            // with the jitter-buffer freshness deadline in place, a burst of frames can still pile
-            // up here and be painted back-to-back, partially defeating the buffer-side fix. We read
-            // the decoder's queue depth so the backlog is at least visible.
+            // with the jitter-buffer freshness deadline in place, a burst of frames could pile up
+            // here and be painted back-to-back, partially defeating the buffer-side fix.
             //
-            // TODO(#1020): turn this read into real backpressure. The correct fix is to consult
-            // `decode_queue_size()` *before the jitter buffer releases a frame* (i.e. in
-            // `JitterBuffer::find_and_move_continuous_frames`) and stop pulling new frames while the
-            // WebCodecs queue is above a small high-water mark (e.g. > 2-3 frames), letting the
-            // decoder drain at display rate instead of as fast as it can. That requires threading
-            // the live queue depth from this worker back into the jitter buffer (e.g. a
-            // `decode_queue_depth: Rc<Cell<u32>>` shared handle, or a `can_accept()` callback
-            // injected at `JitterBuffer::new`). Dropping a frame *here* is not an option: the frame
-            // has already been removed from the jitter buffer, so skipping it would create a
-            // reference gap and force a `DataError: A key frame is required` reset. Deferred to keep
-            // this pass confined to the (already substantial) jitter-buffer deadline; admission
-            // gating must live on the release side, not the post-release side.
+            // Release-side backpressure (issue #1024) now caps this: the jitter buffer reads the
+            // live depth via `Decodable::decode_queue_depth()` (implemented below) *before*
+            // releasing a frame and holds new frames while the queue is at/above its high-water
+            // mark, so under healthy pacing this depth stays around that mark and the warn below
+            // should rarely fire. If it still fires, the decoder genuinely can't keep up and the
+            // freshness deadline will skip to live. This warn is kept purely for observability.
             let decode_queue_size = decoder.decode_queue_size();
             if decode_queue_size > WEBCODECS_QUEUE_WARN_DEPTH {
                 log::debug!(
@@ -342,6 +335,17 @@ impl Decodable for WebDecoder {
                 }
             }
         }
+    }
+
+    /// Live depth of the WebCodecs `VideoDecoder` internal queue, used by the jitter buffer for
+    /// release-side backpressure (issue #1024). Returns `0` when no decoder is configured yet, so
+    /// the buffer is free to release the first frame(s) and let the decoder come up.
+    fn decode_queue_depth(&self) -> u32 {
+        self.decoder
+            .borrow()
+            .as_ref()
+            .map(|d| d.decode_queue_size())
+            .unwrap_or(0)
     }
 }
 

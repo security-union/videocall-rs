@@ -155,3 +155,12 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo test -p videocall-aq --lib
+      # videocall-transport has host-testable WebTransport helpers with
+      # plain libtest `#[test]` coverage. wasm-pack only discovers
+      # `#[wasm_bindgen_test]`, and clippy compiles the library but not its
+      # test target, so run the native lib tests explicitly.
+      - name: cargo test videocall-transport (native)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo test -p videocall-transport --lib

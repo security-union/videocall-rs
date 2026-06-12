@@ -12799,4 +12799,248 @@ mod tests {
              held behind the departure coalesce window"
         );
     }
+
+    /// #1235: the #1203 departure coalescing is exercised through the REAL
+    /// departure handlers, not just the `schedule_coalesced_recompute` primitive.
+    ///
+    /// The two existing #1203 tests above drive `TestScheduleCoalescedRecompute`
+    /// (the primitive) directly. That pins the coalescing machinery but leaves a
+    /// gap: nothing proves that the actual `leave_rooms` (explicit `Leave`) and
+    /// `forget_session` (cross-server `EvictInstance`) call sites are still wired
+    /// to `schedule_coalesced_recompute` rather than the pre-#1203 immediate
+    /// `do_send(RecomputeLayerHints { source: None })`. This test closes that gap
+    /// by driving the FULL relay lifecycle through the real handlers:
+    ///
+    ///   * Connect -> JoinRoom -> Leave                              (-> leave_rooms)
+    ///   * Connect -> JoinRoom -> ActivateConnection -> EvictInstance (-> forget_session)
+    ///
+    /// Topology (every departed room keeps >=1 member so a recompute is actually
+    /// SCHEDULED — `leave_rooms`/`forget_session` only schedule when the room is
+    /// NOT drained to empty):
+    ///   * Room A: 3 members. A1 departs via `Leave`, A2 departs via
+    ///     `EvictInstance`; A3 remains. BOTH departures hit room A within the
+    ///     coalesce window, so they MUST coalesce into ONE recompute.
+    ///   * Room B: 2 members. B1 departs via `Leave`; B2 remains. ONE recompute.
+    ///   => 2 distinct affected rooms => exactly 2 recomputes total, NOT one per
+    ///      departure (which would be 3).
+    ///
+    /// The counter is reset AFTER all joins/activations complete. This is load-
+    /// bearing: the JoinRoom handler's synchronous body does
+    /// `do_send(RecomputeLayerHints { source: None })` (the #1108 Stage-3 join
+    /// restore), so each join bumps the counter; resetting after a drain probe
+    /// isolates the count to the departures under test. `ActivateConnection` on a
+    /// session with a fresh, unshared instance_id is an eviction no-op
+    /// (`instance_index.get(iid)` is None on first activation) so it schedules no
+    /// recompute of its own.
+    ///
+    /// MUTATION PROOF: reverting EITHER departure call site to the immediate
+    /// `do_send(RecomputeLayerHints { room, source: None })` breaks this test.
+    ///   * Reverting `leave_rooms` fires room A's + room B's `Leave`-driven
+    ///     recomputes synchronously, tripping the pre-window `== 0` assert.
+    ///   * Reverting `forget_session` fires room A's `EvictInstance`-driven
+    ///     recompute synchronously, tripping the pre-window `== 0` assert.
+    /// Both reverts have been run and observed to fail (see the issue/PR notes).
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1235_real_departure_handlers_coalesce() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        // Unique, #1235-specific room names and session/instance ids so this
+        // test cannot collide with any other test's state. `#[serial]` already
+        // serializes, but unique keys keep the actor state hermetic regardless.
+        let room_a = "i1235-coalesce-room-a".to_string();
+        let room_b = "i1235-coalesce-room-b".to_string();
+
+        // (session_id, instance_id) for every member.
+        let a1 = (1_235_001u64, "i1235-a1");
+        let a2 = (1_235_002u64, "i1235-a2");
+        let a3 = (1_235_003u64, "i1235-a3");
+        let b1 = (1_235_004u64, "i1235-b1");
+        let b2 = (1_235_005u64, "i1235-b2");
+
+        // A no-op session recipient: every real JoinRoom needs a
+        // `Recipient<Message>` registered via Connect first. DummySession never
+        // sends anything, so no LAYER_PREFERENCE interceptor recompute can fire
+        // from this test — the only recomputes are the join restore (which we
+        // reset away) and the departures under test.
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        // Helper: Connect + JoinRoom a non-observer member into a room.
+        async fn join_member(
+            chat: &Addr<ChatServer>,
+            session: SessionId,
+            instance_id: &str,
+            room: &str,
+        ) {
+            let dummy = DummySession.start();
+            chat.send(Connect {
+                id: session,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+            chat.send(JoinRoom {
+                session,
+                room: room.to_string(),
+                user_id: format!("{instance_id}@example.com"),
+                display_name: instance_id.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some(instance_id.to_string()),
+                is_host: false,
+                end_on_host_leave: false,
+                transport: "websocket".to_string(),
+            })
+            .await
+            .expect("JoinRoom delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        }
+
+        // --- Setup: populate both rooms via the REAL join path. ---
+        join_member(&chat, a1.0, a1.1, &room_a).await;
+        join_member(&chat, a2.0, a2.1, &room_a).await;
+        join_member(&chat, a3.0, a3.1, &room_a).await;
+        join_member(&chat, b1.0, b1.1, &room_b).await;
+        join_member(&chat, b2.0, b2.1, &room_b).await;
+
+        // A2 is the EvictInstance target. The cross-server eviction path
+        // (EvictInstance -> evict_stale_session -> forget_session) requires
+        // `instance_index[iid] -> prev_session`, which is populated by
+        // ActivateConnection (NOT JoinRoom). Activate ONLY A2: its instance_id is
+        // unique and unshared, so this first activation finds no prior
+        // instance_index entry and performs no eviction itself (it only claims
+        // the forward mapping + broadcasts PARTICIPANT_JOINED). No recompute.
+        chat.send(ActivateConnection { session: a2.0 })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Drain every queued JoinRoom-restore recompute (one per non-observer
+        // join) and the ActivateConnection work by round-tripping a state probe,
+        // THEN reset the counter so it reflects ONLY the departures under test.
+        let _ = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        // Sanity: no departure has happened yet, and nothing should be pending /
+        // armed from the join phase (joins use immediate do_send, not the
+        // coalesce timer).
+        let (pending_pre, armed_pre) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            pending_pre, 0,
+            "joins must not leave anything in the departure coalesce set"
+        );
+        assert!(
+            !armed_pre,
+            "joins must not arm the departure coalesce timer"
+        );
+
+        // --- Drive the departure burst through the REAL handlers. ---
+        // Room A, departure 1: explicit Leave -> leave_rooms. A2 + A3 remain, so
+        // the room is NOT empty and a coalesced recompute IS scheduled.
+        chat.send(Leave {
+            session: a1.0,
+            room: room_a.clone(),
+            user_id: format!("{}@example.com", a1.1),
+        })
+        .await
+        .expect("Leave delivery should succeed");
+
+        // Room A, departure 2: cross-server EvictInstance -> evict_stale_session
+        // -> forget_session. A3 remains, so the room is NOT empty and a coalesced
+        // recompute IS scheduled (dedups with departure 1: same room A).
+        // new_session_id differs from A2's session so the eviction is not a
+        // self-skip.
+        chat.send(EvictInstance(EvictInstancePayload {
+            instance_id: a2.1.to_string(),
+            room: room_a.clone(),
+            user_id: format!("{}@example.com", a2.1),
+            new_session_id: 1_235_999,
+        }))
+        .await
+        .expect("EvictInstance delivery should succeed");
+
+        // Room B, single departure: explicit Leave -> leave_rooms. B2 remains.
+        chat.send(Leave {
+            session: b1.0,
+            room: room_b.clone(),
+            user_id: format!("{}@example.com", b1.1),
+        })
+        .await
+        .expect("Leave delivery should succeed");
+
+        // Round-trip a state probe: this forces all the queued Leave/Evict
+        // messages above to DRAIN before we read the counter, making the
+        // pre-window assertion race-free.
+        let (pending_after_burst, armed_after_burst) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+
+        // BEFORE the window elapses: NO recompute has run (all departures are
+        // debounced behind the trailing timer). This is the assertion that a
+        // reverted (immediate-do_send) call site trips.
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "real-handler departures must be DEFERRED until the coalesce window \
+             elapses — a non-zero count here means a departure call site fired an \
+             immediate recompute instead of coalescing"
+        );
+        // Exactly the two affected rooms are pending behind ONE armed timer.
+        assert_eq!(
+            pending_after_burst, 2,
+            "two distinct rooms saw a departure (room A via Leave+Evict coalesced, \
+             room B via Leave) => exactly two pending rooms"
+        );
+        assert!(
+            armed_after_burst,
+            "the burst must arm exactly one trailing coalesce timer"
+        );
+
+        // Wait out the coalesce window + slack for the flush to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 250,
+        ))
+        .await;
+
+        // Exactly one recompute per distinct affected room (2), NOT one per
+        // departure (3). Room A's two departures coalesced into one.
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            2,
+            "three real departures across two rooms must yield exactly two \
+             recomputes (one per distinct room), not one per departure"
+        );
+
+        // The flush drained the pending set and cleared the timer handle.
+        let (pending_final, armed_final) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            pending_final, 0,
+            "the flush must drain the departure coalesce set"
+        );
+        assert!(
+            !armed_final,
+            "the flush must clear the timer handle so the next burst re-arms fresh"
+        );
+    }
 }

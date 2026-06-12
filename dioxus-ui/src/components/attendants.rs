@@ -4195,41 +4195,50 @@ pub fn AttendantsComponent(
                                         let expanded = if controls_expanded() { " controls-expanded" } else { "" };
                                         format!("video-controls-container {pos}{hidden}{expanded}")
                                     },
-                                    // #1296: carve the action bar out of the SAME pinned-drawer
-                                    // insets the grid already consumes, so a pinned drawer never
-                                    // overlays the controls. We read the LIVE `left_inset`/
-                                    // `right_inset` locals (computed once per render ~L2909, already
-                                    // 0 for any unpinned side and already proportionally scaled by
-                                    // the 60%-cap), so this stays in lockstep with the grid and
-                                    // auto-clears to the original position on unpin (no captured
-                                    // copy). Mobile ignores pinning, so emit no positional override.
-                                    //
-                                    // The bottom dock is centered via `left:50%; transform:
-                                    // translateX(-50%)` in global.css, and its hidden/hover variants
-                                    // change ONLY `transform`. Setting inline `left` overrides just
-                                    // the `left` from .dock-bottom and leaves every transform (and
-                                    // its slide-in/out animation) intact, so shifting the centering
-                                    // origin by half the NET inset re-centers the bar in the space
-                                    // between the two drawers without fighting the animation. Both
-                                    // insets 0 -> calc(50% + 0px) == original center; left-only ->
-                                    // shifts right; right-only -> shifts left; both equal -> stays
-                                    // centered (just narrower free space). The left/right docks are
-                                    // edge-anchored (16px), so we add only the same-side inset to
-                                    // that edge; the opposite inset doesn't affect a side dock.
+                                    // issue 1296: carve the action bar out of the SAME pinned-drawer insets the
+                                    // grid consumes so a pinned drawer never overlays the controls. EVERY branch
+                                    // below sets BOTH `left` and `right` longhands (and mobile sets both to
+                                    // `auto`) because dioxus-web restores any inline style property a new string
+                                    // omits — emitting only one side would let a stale opposite anchor survive a
+                                    // dock switch and stretch the fixed-width bar full-width. See the style block.
                                     style: {
                                         if mobile {
-                                            String::new()
+                                            // dioxus-web 0.7.3 does NOT atomically replace an inline `style`
+                                            // string: it snapshots, overwrites, then RESTORES any inline
+                                            // property the new string omits (guard: `!getPropertyValue(prop)`).
+                                            // So an empty string would leave a prior `left`/`right` in place.
+                                            // Emit BOTH longhands as `auto` to actively clear any override a
+                                            // previous (non-mobile) dock left behind. Mobile ignores pinning.
+                                            "left: auto; right: auto;".to_string()
                                         } else {
+                                            // Because of that same non-atomic restore behavior, EVERY dock
+                                            // branch must set BOTH `left` and `right` longhands — otherwise a
+                                            // dock switch (e.g. Bottom -> Right) keeps the old side's inline
+                                            // value next to the new one and the fixed-width bar gets two
+                                            // anchors and stretches full-width. Setting the opposite side to
+                                            // `auto` matches each dock's CSS default (bottom is centered, left
+                                            // dock is left-anchored, right dock is right-anchored), so it is
+                                            // harmless, AND it is exactly what makes "auto-clears on unpin /
+                                            // dock-switch" actually hold.
+                                            //
+                                            // We read the LIVE `left_inset`/`right_inset` locals (computed once
+                                            // per render, already 0 for any unpinned side and already scaled by
+                                            // the 60%-cap), so the bar stays in lockstep with the grid insets.
+                                            // Bottom: shift the `left:50%` centering origin by half the NET
+                                            // inset (left only -> shifts right, right only -> shifts left, both
+                                            // equal -> stays centered). The bottom dock's hidden/hover variants
+                                            // change ONLY `transform`, so overriding `left` leaves the slide
+                                            // animation intact.
                                             match dock_position() {
                                                 DockPosition::Bottom => format!(
-                                                    "left: calc(50% + {:.0}px);",
+                                                    "left: calc(50% + {:.0}px); right: auto;",
                                                     (left_inset - right_inset) / 2.0
                                                 ),
                                                 DockPosition::Left => {
-                                                    format!("left: calc(16px + {left_inset:.0}px);")
+                                                    format!("left: calc(16px + {left_inset:.0}px); right: auto;")
                                                 }
                                                 DockPosition::Right => {
-                                                    format!("right: calc(16px + {right_inset:.0}px);")
+                                                    format!("left: auto; right: calc(16px + {right_inset:.0}px);")
                                                 }
                                             }
                                         }
@@ -4843,6 +4852,7 @@ pub fn AttendantsComponent(
                             class: "drawer-resize-handle",
                             role: "separator",
                             aria_orientation: "vertical",
+                            aria_label: "Resize panel",
                             tabindex: "0",
                             // keyboard resize is a follow-up
                             // Pointer capture: on pointerdown the handle captures the

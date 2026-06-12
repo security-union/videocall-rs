@@ -1943,7 +1943,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* Centered grip: a short rounded vertical bar, vertically centered in the
-   full-height handle. var(--border) normally, var(--accent) on interaction. */
+   full-height handle. var(--border-emphasis) normally, var(--accent) on interaction. */
 .drawer-resize-handle::before {
   content: "";
   position: absolute;
@@ -1953,7 +1953,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   width: 3px;
   height: 32px;
   border-radius: 2px;
-  background: var(--border);
+  background: var(--border-emphasis);
   transition: background 0.15s ease;
   pointer-events: none;
 }

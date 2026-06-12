@@ -1184,6 +1184,111 @@ test.describe("Drawer pin + resize (#1296)", () => {
     }
   });
 
+  // The side-dock tests above deliberately switch the dock while UNPINNED so the
+  // stale bottom-dock `left` collapses to a harmless `calc(50% + 0px)`. This test
+  // does the OPPOSITE on purpose: it switches Bottom -> Right while STILL PINNED,
+  // which is the dock-switch RESURRECTION bug.
+  //
+  // REVERT-SENSITIVE: while pinned on the bottom dock, the bar carries an inline
+  // `left: calc(50% + Npx)` (N > 0 for a pinned LEFT drawer). Pre-fix, switching
+  // to the Right dock emits only `right: ...` and OMITS `left` — but the
+  // dioxus-web style interpreter RESTORES the omitted `left` longhand, so the
+  // fixed-width bar ends up with BOTH `left` AND `right` anchors and stretches to
+  // (nearly) the full viewport width. The fix makes the Right arm emit
+  // `left: auto` (every arm now writes both longhands), clearing the stale
+  // anchor. So pre-fix this test fails BOTH the `left == auto/absent` assertion
+  // (the stale `calc(50% + Npx)` survives) AND the `width < vw*0.9` assertion
+  // (the bar spans the viewport); post-fix both pass.
+  test("issue1: pinned Bottom -> Right dock switch clears the stale bottom-dock left anchor (no resurrection)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    // LEFT drawer: a pinned left drawer gives left_inset > 0 (right_inset == 0),
+    // so the bottom dock emits `left: calc(50% + Npx)` with N = (left_inset -
+    // right_inset)/2 > 0 — the POSITIVE stale anchor we want to outlive the
+    // switch on pre-fix code.
+    const spec = DRAWERS.left;
+    const meetingId = `e2e_drawer_bar_dockswitch_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "bar-dockswitch@videocall.rs",
+        "BarDockSwitch",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BarDockSwitch");
+      await joinMeetingFromPage(page);
+      await openDrawer(page, spec);
+
+      // Pin while on the DEFAULT bottom dock: left_inset > 0 makes the bottom
+      // dock re-center via `left: calc(50% + Npx)` with N > 0.
+      await setPinned(page, spec, true);
+
+      // Sanity (still on the bottom dock): the stale positive `left` anchor
+      // exists BEFORE the switch. This holds on BOTH pre-fix and post-fix — both
+      // emit `left: calc(50% + Npx)` for a pinned bottom dock — so the test
+      // always reaches the switch below.
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return bottomDockOffsetPx(raw);
+          },
+          { timeout: 10_000 },
+        )
+        .toBeGreaterThan(0);
+
+      // Live inner width — the same source of truth the layout uses (see
+      // `pageInnerWidth`). The stretched-bar assertion keys off this.
+      const vw = await pageInnerWidth(page);
+
+      // Switch to the RIGHT dock while STILL PINNED (on purpose — the side-dock
+      // tests above switch while unpinned to dodge this very bug).
+      await setDock(page, "Right");
+
+      // (a) The stale bottom-dock `left` must NOT survive the switch: the inline
+      // `left` is either absent ("") or explicitly `auto`. Pre-fix this value is
+      // the surviving `calc(50% + Npx)` (the interpreter restores the omitted
+      // longhand), so this assertion FAILS pre-fix. Post-fix the Right arm emits
+      // `left: auto`, so the trimmed raw value is "" or "auto".
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return raw.trim();
+          },
+          { timeout: 10_000 },
+        )
+        .toMatch(/^(auto)?$/);
+
+      // (b) The rendered bar must be right-anchored, NOT full-width. Pre-fix the
+      // surviving `left` + the new `right` make the fixed-width bar stretch to
+      // (nearly) the viewport width, so `width < vw*0.9` FAILS. Post-fix the bar
+      // hugs the right side and is far narrower than the viewport.
+      await expect(actionBar(page)).toBeVisible();
+      await expect
+        .poll(() => boxOf(page, "nav.video-controls-container").then((b) => b.width), {
+          timeout: 10_000,
+        })
+        .toBeLessThan(vw * 0.9);
+
+      // Placement backstop (consistent with the side-dock tests): a right-docked
+      // bar sits in the right half of the viewport. A stretched (resurrected)
+      // bar would center near vw/2 and fail this too.
+      await expect
+        .poll(() => centerXOf(page, "nav.video-controls-container"), { timeout: 10_000 })
+        .toBeGreaterThan(vw * 0.5);
+    } finally {
+      await browser.close();
+    }
+  });
+
   // =========================================================================
   // ISSUE 2 — unpinning restores BOTH the tile grid inset AND the action bar
   // to full width / base position. FAILS if unpin leaves a stale inset or a

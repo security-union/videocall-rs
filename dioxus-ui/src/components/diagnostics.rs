@@ -1378,6 +1378,7 @@ pub fn Diagnostics(
                 class: "drawer-resize-handle",
                 role: "separator",
                 aria_orientation: "vertical",
+                aria_label: "Resize panel",
                 tabindex: "0",
                 // keyboard resize is a follow-up
                 // Pointer capture: capturing the pointer on pointerdown routes every

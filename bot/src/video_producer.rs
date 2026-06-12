@@ -47,12 +47,20 @@ impl VideoProducer {
     ///
     /// No pre-generation needed -- each frame is rendered from RMS data
     /// directly in the video loop (~0.5ms per frame vs ~5ms for VP9 encode).
+    ///
+    /// `rms_fps` is the fps the `rms` buffer was sampled at (one entry per frame
+    /// at that rate — see `ekg_renderer::compute_rms_per_frame`). The simulcast
+    /// loop paces at the TOP layer's fps, which can be higher than `rms_fps`, so
+    /// it remaps the index by `rms_fps / render_fps` to keep the waveform
+    /// animating at real time (issue #1123 item 2). The single-stream path paces
+    /// at the same fps `rms` was built at, so it indexes `rms` directly.
     #[allow(clippy::too_many_arguments)]
     pub fn from_ekg(
         user_id: String,
         renderer: EkgRenderer,
         rms: Vec<f32>,
         max_rms: f32,
+        rms_fps: u32,
         packet_sender: Sender<OutboundFrame>,
         media_start: Instant,
         loop_duration: Duration,
@@ -73,6 +81,7 @@ impl VideoProducer {
                 renderer,
                 rms,
                 max_rms,
+                rms_fps,
                 packet_sender,
                 quit_clone,
                 media_start,
@@ -150,6 +159,7 @@ impl VideoProducer {
         renderer: EkgRenderer,
         rms: Vec<f32>,
         max_rms: f32,
+        rms_fps: u32,
         packet_sender: Sender<OutboundFrame>,
         quit: Arc<AtomicBool>,
         media_start: Instant,
@@ -186,6 +196,7 @@ impl VideoProducer {
                                 renderer,
                                 rms,
                                 max_rms,
+                                rms_fps,
                                 packet_sender,
                                 quit,
                                 media_start,
@@ -845,9 +856,8 @@ impl VideoProducer {
                 enc_w,
                 enc_h,
                 framerate,
-                frames_per_keyframe,
                 ideal_bitrate_kbps: tier.ideal_bitrate_kbps,
-                sequence: 0,
+                kf: LayerKeyframeState::new(frames_per_keyframe),
                 frame_interval_us: 1_000_000 / framerate as u64,
                 next_due_us: 0,
                 needs_scale,
@@ -881,6 +891,7 @@ impl VideoProducer {
         renderer: EkgRenderer,
         rms: Vec<f32>,
         max_rms: f32,
+        rms_fps: u32,
         packet_sender: Sender<OutboundFrame>,
         quit: Arc<AtomicBool>,
         media_start: Instant,
@@ -991,15 +1002,28 @@ impl VideoProducer {
 
             // Render the EKG frame ONCE at native resolution; all layers encode
             // a downscaled copy of the same source.
-            let rms_value = if frame_in_loop < rms.len() {
-                rms[frame_in_loop]
-            } else {
-                0.0
-            };
+            //
+            // The `rms` buffer was sampled at `rms_fps` (one entry per frame at
+            // that rate), but this loop paces at `render_fps` (the top layer's
+            // fps, often higher). Map the render-tick index to the rms index by
+            // real time so the waveform animates at real time across the FULL
+            // loop instead of fast-forwarding and flatlining the tail at 0.0
+            // (issue #1123 item 2). The bounds check below still guards the
+            // final partial frame.
+            let rms_index = ekg_rms_index_for_render_frame(frame_in_loop, rms_fps, render_fps);
+            let rms_value = rms.get(rms_index).copied().unwrap_or(0.0);
             renderer.render_frame_rgb_into(&mut frame_buf, rms_value, max_rms, frame_in_loop);
             rgb_to_i420_into(&frame_buf, &mut i420_buf);
 
             for layer in layers.iter_mut() {
+                // Loop-wrap keyframe latch (issue #1123 item 1): record the wrap
+                // for EVERY layer FIRST — before the shed / not-yet-due
+                // `continue`s below — so a layer that skips this exact tick still
+                // forces a keyframe on its next DUE encode (clears the latch),
+                // instead of serving deltas across the source-loop discontinuity
+                // until its next periodic keyframe (~5s for L0).
+                layer.kf.latch_wrap(at_loop_wrap);
+
                 // Top-down shed (issue #1083 V21): skip any layer at/above the
                 // AQ's active count entirely — no encode, no send. The base layer
                 // (id 0) is always < active (active is floored at 1), so it always
@@ -1026,11 +1050,11 @@ impl VideoProducer {
                     layer.next_due_us += layer.frame_interval_us;
                 }
 
-                // Per-layer keyframe cadence; force on loop wrap for every layer.
-                let periodic_keyframe = layer
-                    .sequence
-                    .is_multiple_of(layer.frames_per_keyframe as u64);
-                let force_keyframe = at_loop_wrap || periodic_keyframe;
+                // Per-layer keyframe cadence; force on loop wrap (latched so a
+                // layer that skipped the wrap tick still keyframes here) or on the
+                // layer's own periodic cadence. (Folds the periodic computation
+                // in, so the unit test exercises this exact decision.)
+                let force_keyframe = layer.kf.force_keyframe(at_loop_wrap);
 
                 let encode_input: &[u8] = if layer.needs_scale {
                     scale_i420(
@@ -1049,9 +1073,9 @@ impl VideoProducer {
                 let frames_result = if force_keyframe {
                     layer
                         .encoder
-                        .encode_keyframe(layer.sequence as i64, encode_input)
+                        .encode_keyframe(layer.kf.sequence as i64, encode_input)
                 } else {
-                    layer.encoder.encode(layer.sequence as i64, encode_input)
+                    layer.encoder.encode(layer.kf.sequence as i64, encode_input)
                 };
 
                 let frames = match frames_result {
@@ -1065,18 +1089,31 @@ impl VideoProducer {
                             "EKG simulcast encode error for {} (L{}): {}",
                             user_id, layer.layer_id, e
                         );
-                        layer.sequence += 1;
+                        // Failed encode: no frame emitted. Advance the sequence
+                        // but DO NOT clear the latch (the success path's
+                        // `on_encoded` is the only clear), so the next attempt
+                        // still keyframes across the source-loop cut.
+                        layer.kf.sequence += 1;
                         continue;
                     }
                 };
 
+                // Track whether a key-flagged packet was actually OBSERVED on the
+                // wire (issue #1123 item 1 hardening). At `g_lag_in_frames = 1` a
+                // forced keyframe emits its key packet on this same call, so this
+                // resolves the latch on exactly the frame that caused it; if lag
+                // ever rises this still only clears once the key packet is truly
+                // observed (no early clear of a deferred keyframe). Cheap: just OR
+                // the per-frame `key` flag — no allocation.
+                let mut saw_key = false;
                 for frame in frames {
+                    saw_key |= frame.key;
                     let sent = build_and_send_layer(
                         &packet_sender,
                         &user_id_bytes,
                         frame.data,
                         frame.key,
-                        layer.sequence,
+                        layer.kf.sequence,
                         layer.framerate,
                         layer.layer_id,
                     )?;
@@ -1094,7 +1131,7 @@ impl VideoProducer {
                         trace!(
                             "Sent VP9 L{} frame {} ({} bytes, {}) for {}",
                             layer.layer_id,
-                            layer.sequence,
+                            layer.kf.sequence,
                             frame.data.len(),
                             if frame.key { "key" } else { "delta" },
                             user_id
@@ -1102,7 +1139,10 @@ impl VideoProducer {
                     }
                 }
 
-                layer.sequence += 1;
+                // Post-encode: advance sequence and clear the wrap latch iff a
+                // keyframe was observed (Finding 2). Same method the unit test
+                // drives.
+                layer.kf.on_encoded(saw_key);
             }
 
             if render_count.is_multiple_of(render_fps as u64 * 5) {
@@ -1249,6 +1289,12 @@ impl VideoProducer {
             let source_frame = renderer.frame_i420(speaking, frame_in_loop);
 
             for layer in layers.iter_mut() {
+                // Loop-wrap keyframe latch (issue #1123 item 1) — see
+                // ekg_video_loop_simulcast. Record the wrap for EVERY layer
+                // BEFORE the shed / not-yet-due `continue`s so a layer that
+                // skips this tick still keyframes on its next due encode.
+                layer.kf.latch_wrap(at_loop_wrap);
+
                 // Top-down shed (issue #1083 V21) — see ekg_video_loop_simulcast.
                 // Skip any layer at/above the AQ active count; base layer always
                 // flows (active floored at 1).
@@ -1267,10 +1313,10 @@ impl VideoProducer {
                     layer.next_due_us += layer.frame_interval_us;
                 }
 
-                let periodic_keyframe = layer
-                    .sequence
-                    .is_multiple_of(layer.frames_per_keyframe as u64);
-                let force_keyframe = at_loop_wrap || periodic_keyframe;
+                // Force on loop wrap (latched), periodic cadence, or pending
+                // latch — see ekg_video_loop_simulcast. Same method drives both
+                // loops and the unit test.
+                let force_keyframe = layer.kf.force_keyframe(at_loop_wrap);
 
                 let encode_input: &[u8] = if layer.needs_scale {
                     scale_i420(
@@ -1289,9 +1335,9 @@ impl VideoProducer {
                 let frames_result = if force_keyframe {
                     layer
                         .encoder
-                        .encode_keyframe(layer.sequence as i64, encode_input)
+                        .encode_keyframe(layer.kf.sequence as i64, encode_input)
                 } else {
-                    layer.encoder.encode(layer.sequence as i64, encode_input)
+                    layer.encoder.encode(layer.kf.sequence as i64, encode_input)
                 };
 
                 let frames = match frames_result {
@@ -1305,18 +1351,25 @@ impl VideoProducer {
                             "Costume simulcast encode error for {} (L{}): {}",
                             user_id, layer.layer_id, e
                         );
-                        layer.sequence += 1;
+                        // Failed encode: advance the sequence but leave the latch
+                        // set (only `on_encoded` clears it) so the next attempt
+                        // still keyframes across the source-loop cut.
+                        layer.kf.sequence += 1;
                         continue;
                     }
                 };
 
+                // Clear the wrap latch only on an OBSERVED key packet (issue
+                // #1123 item 1 hardening) — see ekg_video_loop_simulcast.
+                let mut saw_key = false;
                 for frame in frames {
+                    saw_key |= frame.key;
                     let sent = build_and_send_layer(
                         &packet_sender,
                         &user_id_bytes,
                         frame.data,
                         frame.key,
-                        layer.sequence,
+                        layer.kf.sequence,
                         layer.framerate,
                         layer.layer_id,
                     )?;
@@ -1335,7 +1388,7 @@ impl VideoProducer {
                         trace!(
                             "Sent costume VP9 L{} frame {} ({} bytes, {}) for {}",
                             layer.layer_id,
-                            layer.sequence,
+                            layer.kf.sequence,
                             frame.data.len(),
                             if frame.key { "key" } else { "delta" },
                             user_id
@@ -1343,7 +1396,7 @@ impl VideoProducer {
                     }
                 }
 
-                layer.sequence += 1;
+                layer.kf.on_encoded(saw_key);
             }
 
             if render_count.is_multiple_of(render_fps as u64 * 5) {
@@ -1490,6 +1543,142 @@ fn build_and_send_layer(
     Ok(packet_sender.try_send(out_frame).is_ok())
 }
 
+/// Per-layer loop-wrap keyframe latch (issue #1123 item 1), pure so it is
+/// host-unit-testable without a real encoder. Called once per RENDER tick for
+/// EVERY layer (including shed/not-yet-due ones, BEFORE the not-due `continue`)
+/// to carry a pending wrap keyframe forward to the layer's next encode.
+///
+/// `pending` is the layer's current latch; `at_loop_wrap` is the render-tick
+/// wrap signal. Returns the latch's new value: it becomes (or stays) `true`
+/// whenever a wrap fires, and is otherwise left unchanged. The latch is cleared
+/// elsewhere — only when the layer actually encodes (see
+/// [`resolve_layer_keyframe`]).
+fn latch_loop_wrap(pending: bool, at_loop_wrap: bool) -> bool {
+    pending || at_loop_wrap
+}
+
+/// Decide whether a layer that is about to encode must force a keyframe (issue
+/// #1123 item 1). Pure, so the keyframe state machine is testable without
+/// libvpx.
+///
+/// A layer forces a keyframe if the current render tick is a loop wrap, OR its
+/// own periodic cadence is due, OR a previous wrap was latched while the layer
+/// was shed/not-yet-due ([`latch_loop_wrap`]). The caller clears the latch only
+/// AFTER a SUCCESSFUL encode (a failed encode emits no frame, so a pending wrap
+/// keyframe must survive to the next attempt — otherwise the layer would serve
+/// a delta across the source-loop cut once the failed keyframe is forgotten).
+fn resolve_layer_keyframe(at_loop_wrap: bool, periodic_keyframe: bool, pending: bool) -> bool {
+    at_loop_wrap || periodic_keyframe || pending
+}
+
+/// One simulcast layer's keyframe state machine (issue #1123 item 1): the
+/// per-layer monotonic `sequence`, its periodic keyframe cadence
+/// (`frames_per_keyframe`), and the loop-wrap keyframe latch
+/// (`pending_keyframe`). Split out of [`SimulcastLayer`] (which owns a real
+/// `VideoEncoder` and so is not host-constructible) so the EXACT transition
+/// logic both simulcast loops execute is exercised by unit tests — the loops
+/// call these methods at the real per-tick sites, so breaking a method breaks a
+/// test (no parallel re-implementation to drift out of sync).
+struct LayerKeyframeState {
+    /// Per-layer monotonic sequence counter (independent stream, like the
+    /// client's `Vec<u64>` per-layer sequences). Used as the encoder PTS and as
+    /// the on-wire `VideoMetadata.sequence` for this layer.
+    sequence: u64,
+    /// This layer's periodic keyframe interval, in frames (>= 1).
+    frames_per_keyframe: u32,
+    /// Loop-wrap keyframe latch. The source content loops; at the wrap there is
+    /// a content discontinuity, so EVERY layer must emit a keyframe on its first
+    /// frame after the wrap or a receiver decoding that layer sees a delta
+    /// across the cut (a brief artifact). A layer slower than the render loop is
+    /// often mid-interval on the exact wrap tick and `continue`s past the encode
+    /// via the "not yet due" guard; latching the wrap here (set on
+    /// [`Self::latch_wrap`], cleared on [`Self::on_encoded`] only when a keyframe
+    /// was actually observed) guarantees the layer's next DUE frame is forced to
+    /// a keyframe even if it skipped the wrap tick.
+    pending_keyframe: bool,
+}
+
+impl LayerKeyframeState {
+    /// Initial state for a freshly built layer: sequence 0, latch clear. The
+    /// first render tick's `at_loop_wrap` (true on `prev_frame_index == None`)
+    /// plus the periodic cadence (`sequence % frames_per_keyframe == 0` at
+    /// sequence 0) already keyframe the first frame.
+    fn new(frames_per_keyframe: u32) -> Self {
+        Self {
+            sequence: 0,
+            frames_per_keyframe: frames_per_keyframe.max(1),
+            pending_keyframe: false,
+        }
+    }
+
+    /// Per-tick latch step (real site (a)). Called once per RENDER tick for
+    /// EVERY layer — including shed / not-yet-due ones, BEFORE the not-due
+    /// `continue` — so a wrap that lands on a tick the layer skips is carried
+    /// forward to its next encode. Set-only (never clears here): the latch is
+    /// cleared in [`Self::on_encoded`].
+    fn latch_wrap(&mut self, at_loop_wrap: bool) {
+        self.pending_keyframe = latch_loop_wrap(self.pending_keyframe, at_loop_wrap);
+    }
+
+    /// Keyframe decision for a layer that is about to encode (real site (c)).
+    /// Folds the periodic cadence computation in so the test exercises the real
+    /// periodic logic too: forces a keyframe on a loop wrap, on the layer's own
+    /// periodic cadence, OR when a previous wrap is still latched. Pure (no
+    /// mutation) — the latch is cleared later, on an observed keyframe.
+    ///
+    /// Invariant: whenever `pending_keyframe` is set this returns `true`, so a
+    /// latched layer's next encode is ALWAYS a forced keyframe. That is what
+    /// makes the lag=1 clear-on-observed-keyframe in [`Self::on_encoded`] exact
+    /// (the forced keyframe emits its key packet synchronously, so the tick that
+    /// resolves the latch is the tick that observes the keyframe).
+    fn force_keyframe(&self, at_loop_wrap: bool) -> bool {
+        let periodic = self
+            .sequence
+            .is_multiple_of(self.frames_per_keyframe as u64);
+        resolve_layer_keyframe(at_loop_wrap, periodic, self.pending_keyframe)
+    }
+
+    /// Post-encode step (real site (e)). Advances the sequence for any encoded
+    /// frame and clears the loop-wrap latch ONLY when a keyframe was actually
+    /// OBSERVED on the wire (`was_keyframe`), not merely on a successful encode
+    /// call (issue #1123 item 1 hardening). At `g_lag_in_frames = 1` a forced
+    /// keyframe emits its key packet on the same encode call, so this clears
+    /// exactly on the frame that resolved the latch; if lag ever rises to >= 2
+    /// it still only clears once the key packet is genuinely observed downstream,
+    /// so a deferred keyframe cannot drop the latch early. A failed encode emits
+    /// no frame and MUST NOT call this from the success path (the loop's `Err`
+    /// arm advances `sequence` and `continue`s, leaving the latch set so the next
+    /// attempt still keyframes across the source-loop cut).
+    fn on_encoded(&mut self, was_keyframe: bool) {
+        if was_keyframe {
+            self.pending_keyframe = false;
+        }
+        self.sequence += 1;
+    }
+}
+
+/// Map a render-tick index to the EKG `rms` index so the waveform animates at
+/// real time across the full source loop in simulcast mode (issue #1123
+/// item 2). Pure, so the mapping is host-unit-testable.
+///
+/// The `rms` buffer is built in `main.rs` at the AQ default tier's `ekg_fps`
+/// (one entry per frame at `ekg_fps`), but the simulcast loop paces at
+/// `render_fps` (the TOP layer's fps, e.g. 30). When `render_fps > ekg_fps`,
+/// using `frame_in_loop` (a render-fps index) directly as the `rms` index runs
+/// the waveform too fast and reads `0.0` (the out-of-range fallback) for the
+/// loop tail. Scaling by `ekg_fps / render_fps` makes the index track REAL
+/// TIME: render frame `f` is at `f / render_fps` seconds into the loop, which
+/// is `rms` entry `f * ekg_fps / render_fps`.
+///
+/// Both fps values are `>= 1` (the caller floors them), so no divide-by-zero.
+/// The result is `usize`; the caller still bounds-checks against `rms.len()`
+/// for the final (partial) frame of the loop.
+fn ekg_rms_index_for_render_frame(frame_in_loop: usize, ekg_fps: u32, render_fps: u32) -> usize {
+    // u128 intermediate so a long loop * high fps cannot overflow u64/usize.
+    let scaled = (frame_in_loop as u128) * (ekg_fps as u128) / (render_fps.max(1) as u128);
+    scaled as usize
+}
+
 /// Pure decision half of [`apply_simulcast_aq`] (issue #1083 V21) — no encoder
 /// side effects, so it is host-unit-testable without a real libvpx encoder.
 ///
@@ -1582,14 +1771,15 @@ struct SimulcastLayer {
     enc_w: u32,
     enc_h: u32,
     framerate: u32,
-    frames_per_keyframe: u32,
     /// This layer's fixed VBR target (the tier's `ideal_bitrate_kbps`). Stored
     /// for the startup log so it stays consistent with the encoder's actual
     /// configured target without a fragile re-lookup into the ladder.
     ideal_bitrate_kbps: u32,
-    /// Per-layer monotonic sequence counter (independent stream, like the
-    /// client's `Vec<u64>` per-layer sequences).
-    sequence: u64,
+    /// Keyframe state machine: per-layer `sequence`, periodic cadence, and the
+    /// loop-wrap keyframe latch (issue #1123 item 1). Split into its own
+    /// host-constructible struct ([`LayerKeyframeState`]) so the exact
+    /// transitions both simulcast loops drive are unit-tested directly.
+    kf: LayerKeyframeState,
     /// This layer's own inter-frame interval in microseconds
     /// (`1_000_000 / framerate`). Drives per-layer pacing so a sub-render-fps
     /// layer (e.g. a 20fps base layer under a 30fps render loop) is fed at its
@@ -1803,5 +1993,259 @@ mod tests {
             "non-simulcast must issue no bitrate directives: {:?}",
             to_apply
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Loop-wrap keyframe latch (issue #1123 item 1) — pure state machine.
+    // ------------------------------------------------------------------
+
+    /// Drive ONE render tick of the REAL [`LayerKeyframeState`] in the EXACT
+    /// order, and through the EXACT methods, that both simulcast loops use:
+    ///   (a) `latch_wrap(at_loop_wrap)` — every tick, BEFORE the not-due skip;
+    ///   (b) the not-due skip (`continue` in the loop) — modeled by returning
+    ///       `None` without touching the encode/clear methods;
+    ///   (c) `force_keyframe(at_loop_wrap)` — the keyframe decision;
+    ///   (d) `on_encoded(was_keyframe)` — clear-on-observed-key + seq advance.
+    /// At `g_lag_in_frames = 1` a forced keyframe emits its key packet on the
+    /// same encode call, so `was_keyframe == force` — the loop ORs the emitted
+    /// `frame.key`, which for a forced keyframe is exactly `force`. This is NOT
+    /// a re-implementation: it calls the same `LayerKeyframeState` methods the
+    /// loops call, so making any of those method bodies a no-op (or dropping a
+    /// term) fails the assertions below.
+    ///
+    /// Returns `Some(was_keyframe)` for a tick the layer encoded, `None` for a
+    /// tick it skipped (not due).
+    fn drive_tick(layer: &mut LayerKeyframeState, at_loop_wrap: bool, due: bool) -> Option<bool> {
+        // (a) real site (a): latch the wrap for EVERY layer, before the skip.
+        layer.latch_wrap(at_loop_wrap);
+        // (b) real site (b): the "not yet due" guard `continue`s past encode.
+        if !due {
+            return None;
+        }
+        // (c) real site (c): the keyframe decision.
+        let force = layer.force_keyframe(at_loop_wrap);
+        // (d) real site (e): a forced keyframe at lag=1 emits its key packet on
+        // this same call, so the observed-key flag equals `force`. A non-forced
+        // encode observes no key packet (`false`). This mirrors the loop's
+        // `saw_key |= frame.key` + `on_encoded(saw_key)`.
+        layer.on_encoded(force);
+        Some(force)
+    }
+
+    /// THE test for issue #1123 item 1. A layer slower than the render loop is
+    /// NOT due on the exact wrap tick, so it skips the wrap; its NEXT due frame
+    /// must still be a forced keyframe (carried by the latch), NOT a delta. A
+    /// large `frames_per_keyframe` ensures the periodic cadence is NOT due on
+    /// that next frame, so ONLY the latch can force it. Drives the REAL
+    /// `LayerKeyframeState`: making `latch_wrap` a no-op, or dropping
+    /// `resolve_layer_keyframe`'s `pending` term inside `force_keyframe`, fails
+    /// this (no X==X pin).
+    #[test]
+    fn loop_wrap_keyframe_survives_a_skipped_tick() {
+        // Periodic interval huge so sequence%kf is only 0 on the very first
+        // encode; subsequent encodes are periodic-delta unless the latch fires.
+        let mut layer = LayerKeyframeState::new(1000);
+
+        // t0: first render tick is a wrap (prev_frame_index == None). Layer is
+        // due here (its initial deadline is 0) — first frame is a keyframe.
+        assert_eq!(
+            drive_tick(&mut layer, true, true),
+            Some(true),
+            "first frame after start must be a keyframe"
+        );
+
+        // Steady delta frames while NOT wrapping (sequence 1..) — periodic is far
+        // away, so these are deltas.
+        assert_eq!(drive_tick(&mut layer, false, true), Some(false));
+        assert_eq!(drive_tick(&mut layer, false, true), Some(false));
+
+        // THE WRAP, but the slow layer is mid-interval => NOT due this tick. It
+        // skips the encode entirely; the wrap must be LATCHED.
+        assert_eq!(
+            drive_tick(&mut layer, true, false),
+            None,
+            "slow layer skips the encode on the wrap tick"
+        );
+
+        // A couple more render ticks pass with the layer still not due, no wrap.
+        assert_eq!(drive_tick(&mut layer, false, false), None);
+
+        // The layer's NEXT due frame: NOT a wrap tick, periodic NOT due, yet it
+        // MUST be a keyframe because the wrap was latched across the skip.
+        assert_eq!(
+            drive_tick(&mut layer, false, true),
+            Some(true),
+            "the first frame the slow layer emits after a loop wrap MUST be a keyframe"
+        );
+
+        // And the latch is now cleared — the following due frame is a delta.
+        // This also pins the Finding-2 invariant: the latched encode above was
+        // forced (`force == true`), so `on_encoded(true)` cleared the latch.
+        assert_eq!(
+            drive_tick(&mut layer, false, true),
+            Some(false),
+            "the latch must clear after the keyframe is emitted (no perpetual keyframes)"
+        );
+    }
+
+    /// Negative control: with NO wrap ever, a layer that skips ticks must NOT
+    /// spontaneously keyframe — it only keyframes on its periodic cadence. This
+    /// proves the keyframe in the test above is caused by the WRAP latch, not by
+    /// skipping per se. Fails if `latch_wrap` set the latch unconditionally.
+    #[test]
+    fn skipped_ticks_without_wrap_do_not_force_keyframe() {
+        let mut layer = LayerKeyframeState::new(1000);
+        // First frame keyframes (start), then deltas with interleaved skips and
+        // NO wrap at all.
+        assert_eq!(
+            drive_tick(&mut layer, false, true),
+            Some(true),
+            "first frame keyframes"
+        );
+        assert_eq!(drive_tick(&mut layer, false, false), None);
+        assert_eq!(drive_tick(&mut layer, false, false), None);
+        assert_eq!(
+            drive_tick(&mut layer, false, true),
+            Some(false),
+            "no wrap => the post-skip frame must be a delta, not a keyframe"
+        );
+    }
+
+    /// A layer fast enough to be due ON the wrap tick keyframes immediately and
+    /// does not also keyframe the following frame (latch cleared in-place by
+    /// `on_encoded(true)`). Fails if `on_encoded` clears unconditionally (it
+    /// would clear a never-set latch — harmless here — but more importantly
+    /// fails if `on_encoded` does NOT clear on an observed keyframe: the next
+    /// frame would then stay forced).
+    #[test]
+    fn fast_layer_keyframes_on_the_wrap_tick_itself() {
+        let mut layer = LayerKeyframeState::new(1000);
+        assert_eq!(
+            drive_tick(&mut layer, true, true),
+            Some(true),
+            "start keyframe"
+        );
+        assert_eq!(drive_tick(&mut layer, false, true), Some(false));
+        // Wrap AND due on the same tick.
+        assert_eq!(
+            drive_tick(&mut layer, true, true),
+            Some(true),
+            "a layer due on the wrap tick keyframes that frame"
+        );
+        assert_eq!(
+            drive_tick(&mut layer, false, true),
+            Some(false),
+            "the frame after the wrap keyframe is a delta"
+        );
+    }
+
+    /// Finding 2 / issue #1123 item 1: a FAILED encode emits no frame, so the
+    /// latch MUST persist and the next attempt must still keyframe across the
+    /// source-loop cut. The loop's `Err` arm does NOT call `on_encoded` (it
+    /// advances `sequence` and `continue`s), so model the failure by NOT calling
+    /// `on_encoded` on the failed tick — only `sequence += 1` — and assert the
+    /// next due encode is still a keyframe. Fails if the success path's
+    /// `on_encoded` is moved to (or shared with) the failure path, because then
+    /// the latch would clear despite no observed keyframe.
+    #[test]
+    fn failed_encode_keeps_latch_until_a_keyframe_is_observed() {
+        let mut layer = LayerKeyframeState::new(1000);
+        // Start frame keyframes and clears.
+        assert_eq!(drive_tick(&mut layer, true, true), Some(true));
+        assert_eq!(drive_tick(&mut layer, false, true), Some(false));
+
+        // A wrap on a due tick latches AND would force a keyframe — but the
+        // encode FAILS. Model the loop's Err arm: latch first (site a), the
+        // layer IS due, the decision is a forced keyframe, then the encode
+        // errors so `on_encoded` is NOT called; only the sequence advances.
+        layer.latch_wrap(true);
+        assert!(
+            layer.force_keyframe(true),
+            "wrap tick must decide a keyframe"
+        );
+        layer.sequence += 1; // mirrors the loop's `Err` arm (no `on_encoded`).
+        assert!(
+            layer.pending_keyframe,
+            "a failed encode must leave the wrap latch set"
+        );
+
+        // No wrap now, periodic not due, but the latch survived the failure, so
+        // the next successful due encode MUST still be a keyframe.
+        assert_eq!(
+            drive_tick(&mut layer, false, true),
+            Some(true),
+            "the encode after a failed keyframe must still be a keyframe (latch survived)"
+        );
+        // ...and then clear.
+        assert_eq!(drive_tick(&mut layer, false, true), Some(false));
+    }
+
+    // ------------------------------------------------------------------
+    // EKG rms real-time index mapping (issue #1123 item 2).
+    // ------------------------------------------------------------------
+
+    /// The render-frame -> rms-index map must cover the FULL rms buffer at the
+    /// loop end (no premature flatline) and track real time, when the simulcast
+    /// render fps exceeds the fps the rms was sampled at. Models a 10s loop:
+    /// rms sampled at 20fps (200 entries) but rendered at 30fps (300 ticks).
+    #[test]
+    fn rms_index_tracks_real_time_across_full_loop() {
+        let rms_fps = 20u32;
+        let render_fps = 30u32;
+        let loop_secs = 10u32;
+        let rms_len = (rms_fps * loop_secs) as usize; // 200
+        let render_ticks = (render_fps * loop_secs) as usize; // 300
+
+        // Tick 0 maps to rms[0].
+        assert_eq!(
+            ekg_rms_index_for_render_frame(0, rms_fps, render_fps),
+            0,
+            "first render frame maps to rms[0]"
+        );
+
+        // Every render tick maps in-range (the LAST tick must NOT overshoot the
+        // buffer by more than the final partial frame): index < rms_len for all
+        // but possibly the final tick, which must be exactly rms_len-1 or rms_len.
+        let last_tick = render_ticks - 1; // 299
+        let last_index = ekg_rms_index_for_render_frame(last_tick, rms_fps, render_fps);
+        // 299 * 20 / 30 = 199 -> the FINAL rms entry. Crucially NOT < ~133 (which
+        // is what the buggy `frame_in_loop`-as-index would flatline past: tick
+        // 200 already == rms_len under the old code).
+        assert_eq!(
+            last_index,
+            rms_len - 1,
+            "the final render tick must map to the LAST rms entry, not past it"
+        );
+
+        // Real-time tracking: a render tick at the loop midpoint (~5s) must map
+        // to ~the rms midpoint. Tick 150 (=5s at 30fps) -> 150*20/30 = 100 = rms
+        // midpoint.
+        assert_eq!(
+            ekg_rms_index_for_render_frame(render_ticks / 2, rms_fps, render_fps),
+            rms_len / 2,
+            "the loop-midpoint render frame must map to the rms midpoint (real-time)"
+        );
+
+        // Regression guard: under the OLD code (index == frame_in_loop), tick 200
+        // would already be >= rms_len (200) and read the 0.0 fallback, flatlining
+        // the last third of the loop. The mapping must keep it in range.
+        assert!(
+            ekg_rms_index_for_render_frame(200, rms_fps, render_fps) < rms_len,
+            "render tick 200 must stay in range (old code flatlined here)"
+        );
+    }
+
+    /// When rms_fps == render_fps (the common case where the top layer's fps
+    /// equals the AQ default tier fps), the mapping must be the identity so the
+    /// behavior is unchanged from indexing rms directly.
+    #[test]
+    fn rms_index_is_identity_when_fps_match() {
+        for f in [0usize, 1, 7, 199, 200, 599] {
+            assert_eq!(
+                ekg_rms_index_for_render_frame(f, 30, 30),
+                f,
+                "equal fps must map the index 1:1"
+            );
+        }
     }
 }

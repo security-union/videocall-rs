@@ -372,8 +372,11 @@ pub struct CameraEncoder {
     shared_video_tier_index: Rc<AtomicU32>,
     /// Current audio quality tier index (0=high, 3=emergency).
     shared_audio_tier_index: Rc<AtomicU32>,
-    /// Worst peer FPS from the encoder control loop (f32 bits in AtomicU32).
-    shared_encoder_p75_peer_fps: Rc<AtomicU32>,
+    /// The encoder control loop's *reported* queue-depth value (f32 bits in
+    /// AtomicU32) plumbed out to the health reporter for Prometheus telemetry.
+    /// Distinct from the internal `shared_encoder_queue_depth` AQ bridge — this
+    /// atom carries the telemetry copy, not the raw encode-loop→control-loop signal.
+    shared_encoder_queue_depth_report: Rc<AtomicU32>,
     /// PID target bitrate kbps from the encoder control loop (f32 bits in AtomicU32).
     shared_encoder_target_bitrate_kbps: Rc<AtomicU32>,
     /// Tier transition events buffer, drained by health reporter each health packet.
@@ -809,7 +812,7 @@ impl CameraEncoder {
             screen_sharing_active: Rc::new(AtomicBool::new(false)),
             shared_video_tier_index: Rc::new(AtomicU32::new(0)),
             shared_audio_tier_index: Rc::new(AtomicU32::new(0)),
-            shared_encoder_p75_peer_fps: Rc::new(AtomicU32::new(0)),
+            shared_encoder_queue_depth_report: Rc::new(AtomicU32::new(0)),
             shared_encoder_target_bitrate_kbps: Rc::new(AtomicU32::new(0)),
             shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
             shared_climb_limiter_snapshot: Rc::new(RefCell::new(ClimbLimiterSnapshot::default())),
@@ -892,7 +895,7 @@ impl CameraEncoder {
         let screen_sharing_active = self.screen_sharing_active.clone();
         let shared_video_tier_idx = self.shared_video_tier_index.clone();
         let shared_audio_tier_idx = self.shared_audio_tier_index.clone();
-        let shared_encoder_p75_peer_fps = self.shared_encoder_p75_peer_fps.clone();
+        let shared_encoder_queue_depth_report = self.shared_encoder_queue_depth_report.clone();
         let shared_encoder_target_bitrate_kbps = self.shared_encoder_target_bitrate_kbps.clone();
         let shared_tier_transitions = self.shared_tier_transitions.clone();
         let shared_climb_limiter_snapshot = self.shared_climb_limiter_snapshot.clone();
@@ -1271,7 +1274,7 @@ impl CameraEncoder {
                 // shared atomics have been removed; `encoder_queue_depth()`
                 // carries the sender backpressure signal (encoder queue depth)
                 // through the existing host telemetry channel.
-                shared_encoder_p75_peer_fps.store(
+                shared_encoder_queue_depth_report.store(
                     (encoder_control.encoder_queue_depth() as f32).to_bits(),
                     Ordering::Relaxed,
                 );
@@ -1529,9 +1532,9 @@ impl CameraEncoder {
         }
     }
 
-    /// Returns the encoder worst peer FPS atomic (f32 bits).
-    pub fn shared_encoder_p75_peer_fps(&self) -> Rc<AtomicU32> {
-        self.shared_encoder_p75_peer_fps.clone()
+    /// Returns the reported encoder-queue-depth telemetry atomic (f32 bits).
+    pub fn shared_encoder_queue_depth_report(&self) -> Rc<AtomicU32> {
+        self.shared_encoder_queue_depth_report.clone()
     }
 
     /// Returns the encoder target bitrate kbps atomic (f32 bits).

@@ -3337,7 +3337,7 @@
             }
           ],
           "title": "Adaptive Quality Tiers",
-          "description": "Quality tier per sender (0=best HD, higher=more degraded). Correlate tier changes with target bitrate and p75 peer FPS to identify the trigger.",
+          "description": "Quality tier per sender (0=best HD, higher=more degraded). Correlate tier changes with target bitrate and encoder queue depth (videocall_encoder_queue_depth, sender-side backpressure) to identify the trigger.",
           "type": "timeseries"
         },
         {
@@ -3393,8 +3393,8 @@
           },
           "targets": [
             {
-              "expr": "videocall_encoder_p75_peer_fps{meeting_id=~\"$meeting\"}",
-              "legendFormat": "{{display_name}} p75_peer",
+              "expr": "videocall_encoder_queue_depth{meeting_id=~\"$meeting\"}",
+              "legendFormat": "{{display_name}} queue_depth",
               "refId": "A"
             },
             {
@@ -3403,8 +3403,8 @@
               "refId": "B"
             }
           ],
-          "title": "p75 Peer FPS (Encoder Input)",
-          "description": "The p75 receiver FPS vs what the encoder actually produces. A low p75 means degradation is widespread enough to justify stepping down quality for the sender.",
+          "title": "Encoder Queue Depth vs Output FPS",
+          "description": "Sender-side encoder queue depth (a backpressure signal: rising depth means the encoder is falling behind) vs what the encoder actually produces. A growing queue depth indicates the sender is congested enough to justify stepping down quality.",
           "type": "timeseries"
         },
         {
@@ -3480,7 +3480,7 @@
             }
           ],
           "title": "Reference Loss & Decode Errors (per receiver)",
-          "description": "Per-receiver-pair receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series) is the always-on signal and returns to 0 when healthy. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update on a real WebCodecs decode fault) \u2014 read these two as 'has a fault occurred', not 'is one occurring right now'. Correlate with tier changes and p75_peer_fps to find whether degradation is isolated or widespread. All three are registered + emitted server-side and conditionally populated.",
+          "description": "Per-receiver-pair receiver health. seq-loss/sec (videocall_video_seq_loss_per_sec, #1013 reference-loss proxy, 570 live series) is the always-on signal and returns to 0 when healthy. videocall_decoder_errors_total is a cumulative gauge and videocall_video_frames_dropped latches its last nonzero value (both only update on a real WebCodecs decode fault) \u2014 read these two as 'has a fault occurred', not 'is one occurring right now'. Correlate with tier changes and encoder queue depth (videocall_encoder_queue_depth, sender-side backpressure) to find whether degradation is isolated or widespread. All three are registered + emitted server-side and conditionally populated.",
           "type": "timeseries"
         }
       ]

@@ -654,13 +654,13 @@ lazy_static! {
     // NOTE(#1184): videocall_encoder_fps_ratio / videocall_encoder_bitrate_ratio
     // removed — dead telemetry whose source proto fields no longer exist.
 
-    /// p75 peer FPS signal driving encoder decisions.
-    pub static ref ENCODER_P75_PEER_FPS: GaugeVec = register_gauge_vec!(
-        "videocall_encoder_p75_peer_fps",
-        "p75 peer FPS driving adaptive quality decisions",
+    /// Encoder queue depth signal driving encoder (sender-side) decisions.
+    pub static ref ENCODER_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_queue_depth",
+        "Encoder queue depth (sender-side backpressure signal driving adaptive quality decisions)",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
-    .expect("Failed to create encoder_p75_peer_fps metric");
+    .expect("Failed to create encoder_queue_depth metric");
 
     /// Screen share quality tier (0=high, 1=medium, 2=low)
     pub static ref ADAPTIVE_SCREEN_TIER: GaugeVec = register_gauge_vec!(

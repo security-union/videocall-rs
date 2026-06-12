@@ -4,6 +4,8 @@ on:
   pull_request:
     branches: [hcl-main, PR-staging]
     paths:
+      - 'actix-api/**'
+      - 'meeting-api/**'
       - 'videocall-client/**'
       - 'videocall-codecs/**'
       - 'videocall-types/**'

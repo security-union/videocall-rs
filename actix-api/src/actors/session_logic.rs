@@ -24,7 +24,8 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::{
-    classify_packet, KeyframeRequestLimiter, KeyframeTarget, PacketKind,
+    classify_packet, outbound_keyframe_observation, KeyframeRequestLimiter, KeyframeTarget,
+    PacketKind,
 };
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
@@ -501,6 +502,7 @@ impl SessionLogic {
                 target_user_id,
                 target_session_id,
                 layer,
+                kind,
             } => {
                 if self.observer {
                     return InboundAction::Processed;
@@ -528,9 +530,18 @@ impl SessionLogic {
                 // one identity), else fall back to the target user_id (older
                 // clients). `KeyframeTarget::from_request` encodes that choice.
                 let target = KeyframeTarget::from_request(&target_user_id, target_session_id);
+                // #1297: `kind` (derived from the inner request bytes in
+                // `classify_packet`) splits VIDEO and SCREEN into separate
+                // rate-limit buckets so SCREEN recovery is not starved by VIDEO
+                // requests in the same second. The delivery-aware relaxation
+                // inside `allow_with_congestion` lets a still-frozen receiver on
+                // a lossless WS path re-request even when the strict budget is
+                // exhausted (the `congested` path cannot fire on a lossless
+                // link); `handle_outbound` clears that waiting flag when the
+                // matching media is actually delivered.
                 if !self
                     .keyframe_limiter
-                    .allow_with_congestion(target, layer, congested)
+                    .allow_with_congestion(target, kind, layer, congested)
                 {
                     warn!(
                         "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting user {} session {}",
@@ -561,12 +572,49 @@ impl SessionLogic {
     /// Handle an outbound message from ChatServer (to be sent to client).
     ///
     /// Returns the bytes to send and tracks metrics.
-    pub fn handle_outbound(&self, msg: &Message) -> Vec<u8> {
+    ///
+    /// #1297: this is also the DELIVERY-OBSERVATION point for the keyframe
+    /// limiter. Every forwarded frame this receiver is about to be sent is the
+    /// delivery side of the keyframe-request/keyframe-delivery loop. When the
+    /// frame is a MEDIA VIDEO/SCREEN packet, we clear THIS receiver's
+    /// still-waiting flag for that `(publisher, kind)` bucket so the strict
+    /// per-pair budget re-engages on its next request (a receiver that keeps
+    /// requesting after recovery is throttled again). This runs for BOTH
+    /// transports because both `WsChatSession` and `WtChatSession` route every
+    /// outbound frame through here. It is `&mut self` purely so the observation
+    /// can mutate `self.keyframe_limiter` — the SAME limiter instance the
+    /// inbound KEYFRAME_REQUEST arm reads, so request-set and delivery-clear act
+    /// on one map.
+    ///
+    /// DELIVERY semantics (honest contract): like the `RELAY_ROOM_BYTES_TOTAL`
+    /// "outbound" accounting above, this hook runs when a frame is HANDED to the
+    /// transport — BEFORE the per-transport priority-drop / channel-full check
+    /// (both callers invoke `handle_outbound` first). So a keyframe that is
+    /// subsequently priority-dropped under outbound-channel saturation still
+    /// clears the wait. That imprecision is benign: a drop here means the
+    /// receiver's outbound channel is SATURATED, which fires `on_outbound_drop`
+    /// → the receiver is then flagged congested, so the #979 congested
+    /// relaxation (not the delivery-aware path) covers its next recovery
+    /// request. On the healthy, unsaturated path #1297 targets — the common
+    /// all-WS deployment — the frame IS delivered and clearing the wait is
+    /// correct.
+    pub fn handle_outbound(&mut self, msg: &Message) -> Vec<u8> {
         RELAY_ROOM_BYTES_TOTAL
             .with_label_values(&[&self.room, "outbound"])
             .inc_by(msg.msg.len() as f64);
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_sent(self.id, msg.msg.len() as u64);
+
+        // #1297 delivery observation: cheap partial decode (no `data` copy —
+        // see `outbound_keyframe_observation`). Only MEDIA VIDEO/SCREEN frames
+        // return Some; everything else (the bulk of traffic) is a no-op here.
+        // Observers never request keyframes, so skip the work for them.
+        if !self.observer {
+            if let Some((target, kind)) = outbound_keyframe_observation(&msg.msg) {
+                self.keyframe_limiter.observe_delivery(target, kind);
+            }
+        }
+
         // `msg.msg` is a shared `bytes::Bytes` (#1063): the single NATS payload
         // allocation is refcounted across all fan-out receivers. The
         // per-transport outbound channel (`Sender<Vec<u8>>` for WS, or

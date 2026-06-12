@@ -4208,21 +4208,28 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* ── Decode-budget "tiles paused" banner (#1142 Phase 1) ─────────────
-   A slim, dismissible glass bar pinned top-centre of the grid area. It is
+   A slim, dismissible dark bar pinned top-centre of the grid area. It is
    NOT a modal: it overlays the grid (absolute within #grid-container) and
-   does not block interaction with the tiles below. The glass treatment
-   mirrors `.peer-toast` (backdrop blur, near-opaque dark surface) and the
-   accent is the shared amber `--warning` token.
+   does not block interaction with the tiles below. The accent is the shared
+   amber `--warning` token.
 
-   The banner surface is ALWAYS dark (it hardcodes rgba(30,30,30,0.9) in both
+   #1197: this banner has NO backdrop-filter blur (unlike `.peer-toast`). It
+   only appears under sustained decode-budget pressure — i.e. exactly when the
+   device is already CPU/GPU-bound and shedding video to keep audio alive — so
+   a GPU compositing blur here adds cost precisely when the GPU is the
+   bottleneck. The surface was already 90% opaque, so the blur affected only the
+   ~10% bleed-through and was barely perceptible; bumping the fill to near-opaque
+   removes the GPU cost with negligible visual change.
+
+   The banner surface is ALWAYS dark (it hardcodes rgba(30,30,30,0.97) in both
    themes), so its foreground colours MUST be literal light-on-dark — NOT the
    `--text-on-glass-strong` token, which flips to near-black under
    html[data-theme="light"] and would render the text + ✕ invisible on the dark
    surface. We therefore use literal rgba(255,255,255,0.95) for body text and the
    dismiss glyph, matching how the amber accent is already a literal. Contrast on
-   the composited dark surface: white text ≈ 11–16:1, amber #ff9f0a ≈ 6–8:1
-   (range = page background showing through the ~0.9-opacity surface) — both well
-   past 4.5:1, in BOTH themes. */
+   the near-opaque dark surface: white text ≈ 15–16:1, amber #ff9f0a ≈ 7–8:1
+   (the more-opaque fill only RAISES contrast vs the prior ~0.9 surface, since
+   less page background bleeds through) — both well past 4.5:1, in BOTH themes. */
 .decode-budget-banner {
   position: absolute;
   top: 12px;
@@ -4234,10 +4241,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 10px;
   max-width: min(560px, calc(100% - 24px));
   padding: 8px 10px 8px 14px;
-  background: rgba(30, 30, 30, 0.9)
-    /* @token-exempt: dark near-opaque banner surface, matches .peer-toast */;
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  background: rgba(30, 30, 30, 0.97)
+    /* @token-exempt: flat near-opaque dark banner surface. No backdrop-filter
+       blur (#1197): the banner only renders under decode-budget pressure, when
+       the GPU is already the bottleneck, so a compositing blur would add cost
+       exactly when it hurts most. The fill is near-opaque (was 0.9 + blur), so
+       dropping the blur is visually ~indistinguishable. */;
   border: 1px solid var(--btn-warning-border);
   border-radius: var(--radius-lg, 14px);
   box-shadow: 0 8px 32px var(--shadow-card-deep);

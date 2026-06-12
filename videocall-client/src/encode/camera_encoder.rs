@@ -514,6 +514,36 @@ pub struct CameraEncoder {
     /// mid-call (it is NOT latched at cold start). In simulcast mode
     /// (`effective_layers > 1`) this stays `false` and the gate is a no-op.
     single_layer_low_pin: Rc<AtomicBool>,
+    /// "Loop already running" canary (issue #1295). Mirrors the mic encoder's
+    /// `codecs[0].is_instantiated()` canary, which the camera lacks. Set
+    /// synchronously in `start()` right before `spawn_local`; cleared by the
+    /// spawned task on EVERY task-exit path. `start()`'s guard reads it to refuse
+    /// a duplicate loop spawn (and to tear down the old loop on a real switch),
+    /// so at most one acquire/`set_src_object` is ever in flight for the selected
+    /// device — closing the intermittent wrong-device race.
+    loop_running: Arc<AtomicBool>,
+    /// Device id the currently-running loop is bound to (issue #1295). Recorded
+    /// synchronously in `start()` alongside `loop_running`, cleared on every
+    /// task-exit path (epoch-guarded). The guard compares it to the freshly-selected
+    /// device: same id => the live loop is already correct (true duplicate, no
+    /// respawn); different id with no `switching` raised (the OFF→switch→ON
+    /// path) => a real device change the `select()`-while-disabled missed, so
+    /// stop() the stale loop and respawn on the new device. `Rc<RefCell<…>>`
+    /// (not an atomic) matches this file's shared-mutable-across-`spawn_local`
+    /// idiom and is safe on the single-threaded wasm executor.
+    loop_device_id: Rc<RefCell<Option<String>>>,
+    /// Loop-generation epoch (issue #1295). `start()` bumps it synchronously
+    /// before spawning and each task captures its own value. On EVERY task-exit
+    /// path a loop clears `loop_running`/`loop_device_id` ONLY if this epoch
+    /// still equals its captured value — i.e. "I am still the latest loop". This
+    /// closes the supersede race: when a different-device start() tears down a
+    /// stale loop and spawns a new one, the new loop has set the canary/bound-id
+    /// synchronously; the stale loop then exits LATER and must NOT clobber them.
+    /// The epoch mismatch makes the stale loop's clear a no-op, so exactly the
+    /// latest loop owns the canary. The per-frame exit check also reads it, so a
+    /// superseded loop self-terminates on its next frame regardless of
+    /// enabled/switching.
+    loop_epoch: Arc<AtomicU64>,
 }
 
 /// Upper bound on simulcast layers regardless of what the caller requests.
@@ -915,6 +945,9 @@ impl CameraEncoder {
             // control loop sets it once it observes single-stream mode + >3
             // peers. No effect in simulcast mode.
             single_layer_low_pin: Rc::new(AtomicBool::new(false)),
+            loop_running: Arc::new(AtomicBool::new(false)),
+            loop_device_id: Rc::new(RefCell::new(None)),
+            loop_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -1838,6 +1871,55 @@ impl CameraEncoder {
         } else {
             return;
         };
+
+        // No-op if not enabled (mirrors MicrophoneEncoder::start():396). This is
+        // the documented contract — start() does nothing unless set_enabled(true)
+        // has been called. Placing it BEFORE the running-guard guarantees that by
+        // the time we reach the guard, is_enabled() is true, so a raised
+        // `switching` unambiguously means a device switch.
+        if !self.state.is_enabled() {
+            log::debug!("CameraEncoder::start() called but encoder is not enabled");
+            return;
+        }
+
+        // Single-loop + correct-device guard (issue #1295). `loop_running` is the
+        // "already running" canary (mirrors the mic's `is_instantiated()`);
+        // `loop_device_id` records which device the live loop is bound to. We are
+        // enabled here (checked above), so a loop already being alive means we
+        // must tear it down before spawning the replacement in TWO cases, then
+        // re-enable so the new loop survives its per-frame check:
+        //
+        //   1. Explicit switch: the UI raised `switching` (select() while
+        //      enabled).
+        //   2. Different-device with NO `switching` raised — the OFF→switch→ON
+        //      hole: select() ran while disabled so it never set `switching`, and
+        //      the live loop captured its device_id at spawn and reuses it across
+        //      every `'restart`, so it can never retarget itself.
+        //
+        // In BOTH cases we stop() the stale loop (clearing enabled+switching) and
+        // then set_enabled(true) for the new loop. The stale loop is forced to
+        // exit by the per-frame/acquire epoch check (its captured epoch is now
+        // stale), NOT by the enabled flip — so re-enabling for the new loop does
+        // not keep the old one alive. A true SAME-device duplicate returns early
+        // instead: the early not-enabled guard above already guarantees we are
+        // enabled here, so the early-return only has to test (running, no
+        // switching, bound == selected). Spawning a second loop would race two
+        // getUserMedia/set_src_object acquisitions on the shared <video>.
+        let running = self.loop_running.load(Ordering::Acquire);
+        if running {
+            let switch_requested = switching.load(Ordering::Acquire);
+            let bound = self.loop_device_id.borrow().clone();
+            let same_device = bound.as_deref() == Some(device_id.as_str());
+            if !switch_requested && same_device {
+                // True duplicate on the SAME device: the live loop is already
+                // correct — do nothing.
+                return;
+            }
+            // Explicit switch OR different-device-no-switching: tear down the
+            // stale loop and re-enable for the replacement.
+            self.stop();
+            self.state.set_enabled(true);
+        }
         let on_error = self.on_error.clone();
 
         log::info!(
@@ -1845,6 +1927,27 @@ impl CameraEncoder {
             device_id
         );
 
+        // Commit to running BEFORE spawning (synchronous, no check-then-set race
+        // with the guard reads above). Bump the epoch so this loop has a unique
+        // generation; record the bound device id; set the canary. The spawned
+        // task captures `my_epoch` and clears canary/bound-id on exit ONLY if it
+        // is still the latest generation (epoch unchanged) — a superseded loop's
+        // clear is a no-op, so it can never clobber a newer loop's state. The
+        // per-frame exit check also reads the epoch, so a superseded loop
+        // self-terminates on its next frame.
+        //
+        // `fetch_add` returns the PREVIOUS value, so `my_epoch` = previous + 1 =
+        // the value now stored; a later `loop_epoch.load() == my_epoch` is true
+        // iff no newer start() has bumped it.
+        let my_epoch = self
+            .loop_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        *self.loop_device_id.borrow_mut() = Some(device_id.clone());
+        self.loop_running.store(true, Ordering::Release);
+        let loop_running = self.loop_running.clone();
+        let loop_device_id = self.loop_device_id.clone();
+        let loop_epoch = self.loop_epoch.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
 
@@ -1875,6 +1978,18 @@ impl CameraEncoder {
                     error!("{msg}");
                     if let Some(cb) = &on_error {
                         cb.emit(msg);
+                    }
+                    // Reset `switching` on this task-exit (issue #1295), like the
+                    // per-frame and acquire-bail exits: a latched switching=true
+                    // left here would stick the next loop off (see the acquire-bail
+                    // comment). Safe — the legitimate next loop stop()s first.
+                    switching.store(false, Ordering::Release);
+                    // Clear only if still the latest loop (issue #1295 epoch
+                    // guard): a superseded loop must not clobber a newer one's
+                    // canary/bound-id.
+                    if loop_epoch.load(Ordering::Acquire) == my_epoch {
+                        loop_running.store(false, Ordering::Release);
+                        *loop_device_id.borrow_mut() = None;
                     }
                     return;
                 }
@@ -1936,6 +2051,19 @@ impl CameraEncoder {
                         error!("CameraEncoder: max restarts ({MAX_RESTARTS}) reached, giving up");
                         if let Some(cb) = &on_error {
                             cb.emit("Camera encoder failed after repeated restarts".into());
+                        }
+                        // Reset `switching` on this task-exit (issue #1295), like
+                        // the per-frame and acquire-bail exits: a latched
+                        // switching=true left here would stick the next loop off
+                        // (see the acquire-bail comment). Safe — the legitimate
+                        // next loop stop()s first.
+                        switching.store(false, Ordering::Release);
+                        // Clear only if still the latest loop (issue #1295 epoch
+                        // guard): a superseded loop must not clobber a newer
+                        // one's canary/bound-id.
+                        if loop_epoch.load(Ordering::Acquire) == my_epoch {
+                            loop_running.store(false, Ordering::Release);
+                            *loop_device_id.borrow_mut() = None;
                         }
                         return;
                     }
@@ -2010,6 +2138,48 @@ impl CameraEncoder {
                     device.id(),
                     device.get_tracks().length()
                 );
+
+                // Acquire-phase supersede check (issue #1295). getUserMedia is an
+                // await point: while THIS loop was acquiring (cold start OR a
+                // `'restart` re-acquisition), a newer start() may have superseded
+                // us — directly (epoch bumped) or because we were disabled/asked
+                // to switch. `set_src_object` below binds the SHARED <video>
+                // element, so a stale loop binding here is the exact wrong-device
+                // race. Bail BEFORE binding: stop the just-acquired tracks so the
+                // camera is released, then return. The epoch-guarded clear is a
+                // no-op when superseded (a newer loop owns the canary), so we
+                // never clobber the latest loop's state.
+                if !enabled.load(Ordering::Acquire)
+                    || switching.load(Ordering::Acquire)
+                    || loop_epoch.load(Ordering::Acquire) != my_epoch
+                {
+                    log::info!(
+                        "CameraEncoder: superseded during acquire (epoch/enabled/switching), releasing stream without binding"
+                    );
+                    // Reset `switching` exactly like the per-frame exit does
+                    // (issue #1295). `switching` is latched true by select() and
+                    // is cleared in only two prior places (stop() and the
+                    // per-frame exit); this acquire-bail is a NEW task-exit path,
+                    // so without this reset a loop that bails here on switching
+                    // would leave the flag set. The next start() runs with
+                    // running==false (this loop just cleared the canary), so it
+                    // skips the guard's stop() — the only thing that would clear
+                    // switching — and the replacement loop would inherit a stale
+                    // switching==true and bail at its own acquire check, sticking
+                    // the camera off. Clearing it here is safe: a switch-triggered
+                    // respawn always stop()s first, so the legitimate next loop
+                    // never relies on switching being set.
+                    switching.store(false, Ordering::Release);
+                    for track in device.get_tracks().iter() {
+                        track.unchecked_into::<MediaStreamTrack>().stop();
+                    }
+                    if loop_epoch.load(Ordering::Acquire) == my_epoch {
+                        loop_running.store(false, Ordering::Release);
+                        *loop_device_id.borrow_mut() = None;
+                    }
+                    return;
+                }
+
                 // Configure the local preview element
                 // Muted must be set before calling play() to avoid autoplay restrictions
                 video_element.set_muted(true);
@@ -2386,7 +2556,16 @@ impl CameraEncoder {
                 let mut encoded_ok_this_cycle = false;
 
                 'encode: loop {
-                    if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
+                    // Exit when disabled, switching, OR superseded (issue #1295):
+                    // a newer start() bumped `loop_epoch` past our captured
+                    // `my_epoch`, so we are a stale loop and must self-terminate
+                    // even though `enabled` may have been set true again for the
+                    // newer loop. This is what forces the OFF→switch→ON stale loop
+                    // to die — the enabled flip alone would not.
+                    if !enabled.load(Ordering::Acquire)
+                        || switching.load(Ordering::Acquire)
+                        || loop_epoch.load(Ordering::Acquire) != my_epoch
+                    {
                         switching.store(false, Ordering::Release);
                         let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                         video_track.stop();
@@ -2399,6 +2578,13 @@ impl CameraEncoder {
                                     layer.layer_id
                                 );
                             }
+                        }
+                        // Clear only if still the latest loop (issue #1295 epoch
+                        // guard): a superseded loop must not clobber a newer
+                        // one's canary/bound-id.
+                        if loop_epoch.load(Ordering::Acquire) == my_epoch {
+                            loop_running.store(false, Ordering::Release);
+                            *loop_device_id.borrow_mut() = None;
                         }
                         return;
                     }

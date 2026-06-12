@@ -4213,7 +4213,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    does not block interaction with the tiles below. The accent is the shared
    amber `--warning` token.
 
-   #1197: this banner has NO backdrop-filter blur (unlike `.peer-toast`). It
+   Per issue 1197, this banner has NO backdrop-filter blur (unlike `.peer-toast`). It
    only appears under sustained decode-budget pressure — i.e. exactly when the
    device is already CPU/GPU-bound and shedding video to keep audio alive — so
    a GPU compositing blur here adds cost precisely when the GPU is the
@@ -4221,13 +4221,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    ~10% bleed-through and was barely perceptible; bumping the fill to near-opaque
    removes the GPU cost with negligible visual change.
 
-   The banner surface is ALWAYS dark (it hardcodes rgba(30,30,30,0.97) in both
+   The banner surface is ALWAYS dark (a flat near-opaque dark fill in both
    themes), so its foreground colours MUST be literal light-on-dark — NOT the
    `--text-on-glass-strong` token, which flips to near-black under
    html[data-theme="light"] and would render the text + ✕ invisible on the dark
    surface. We therefore use literal rgba(255,255,255,0.95) for body text and the
    dismiss glyph, matching how the amber accent is already a literal. Contrast on
-   the near-opaque dark surface: white text ≈ 15–16:1, amber #ff9f0a ≈ 7–8:1
+   the near-opaque dark surface: white text ≈ 15–16:1, amber accent ≈ 7–8:1
    (the more-opaque fill only RAISES contrast vs the prior ~0.9 surface, since
    less page background bleeds through) — both well past 4.5:1, in BOTH themes. */
 .decode-budget-banner {

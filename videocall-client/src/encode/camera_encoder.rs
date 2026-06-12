@@ -43,6 +43,11 @@ static CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
+// Cumulative count of upper-rung `VideoEncoder`s torn down after a sustained
+// shed dwell (issue #1230). Bumped once per rung freed in the encode loop; the
+// freed encoder + its ~100KB output buffer are reclaimed and the existing lazy
+// path (`encoders_to_build`) rebuilds the rung if it is ever earned back.
+static CAMERA_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL: AtomicU64 = AtomicU64::new(0);
 
 pub fn camera_encoder_errors_closed_codec() -> u64 {
     CAMERA_ENCODER_ERRORS_CLOSED_CODEC.load(Ordering::Relaxed)
@@ -58,6 +63,14 @@ pub fn camera_encoder_errors_generic() -> u64 {
 }
 pub fn camera_encoder_frames_submitted_ok() -> u64 {
     CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
+}
+/// Cumulative count of upper-rung simulcast `VideoEncoder`s torn down after a
+/// sustained shed dwell (issue #1230). A pure observability hook: it lets
+/// Prometheus/Grafana confirm memory is actually being reclaimed on devices
+/// stuck in distress, and that teardown is NOT thrashing (a rapidly climbing
+/// counter alongside frequent rebuilds would mean the dwell is mistuned).
+pub fn camera_encoder_layers_torn_down() -> u64 {
+    CAMERA_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL.load(Ordering::Relaxed)
 }
 use crate::connection::MediaStreamKey;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -578,6 +591,48 @@ const fn encoders_to_build(active: usize, ceiling: usize) -> usize {
         ceiling
     } else {
         active
+    }
+}
+
+/// Sustained-shed dwell before an upper-rung `VideoEncoder` is torn down to
+/// reclaim its native VPX/WebCodecs state + ~100KB output buffer (issue #1230).
+///
+/// Why 30s: the AQ controller can shed/restore a layer at most once per
+/// `MIN_TIER_TRANSITION_INTERVAL_MS` = 1500ms (the `can_transition` floor in
+/// `videocall-aq/src/manager.rs`), so 30s is 20× the minimum shed→restore
+/// interval — a transient bounce can never accumulate 30s of CONTINUOUS shed and
+/// so never trips teardown. Teardown is also thrash-free regardless of how soon
+/// an earn-up follows: it requires 30s of UNBROKEN shed, and the per-frame stamp
+/// loop clears a rung's dwell clock the instant it is re-activated, so a
+/// teardown→rebuild→teardown cycle is necessarily ≥30s apart, not a tight loop.
+/// And a re-earned rung is rebuilt by the SAME lazy `encoders_to_build` path a
+/// publisher already runs at every cold start (only the base is built up front
+/// since #1204/#1227) — teardown introduces no new rebuild-stall class, only
+/// defers an already-existing one. (`MIN_TIER_TRANSITION_INTERVAL_MS` lives in
+/// `videocall-aq/src/constants.rs`. NOTE: `CLIMB_COOLDOWN_BASE_MS` is unrelated
+/// here — it governs the crash-CEILING decay axis, not layer earn-up.)
+const SHED_TEARDOWN_DWELL_MS: f64 = 30_000.0;
+
+/// Pure teardown decision (issue #1230, host-testable single source of truth).
+///
+/// Given when a rung first became continuously shed (`shed_since_ms`, `None`
+/// once it is active or already torn down), the current clock (`now_ms`), and
+/// the dwell threshold, return `true` iff the rung has been shed for at least
+/// `dwell_threshold_ms`. `None` ⇒ `false` (not currently shed → never tear
+/// down). The `>=` makes the boundary inclusive: exactly `dwell_threshold_ms`
+/// of dwell tears down.
+///
+/// This is the ONLY place the comparison lives so a host unit test pins it
+/// (mutating `>=`→`>`, inverting the comparison, or dropping the `None` guard
+/// all make the test fail). Both encode loops call it.
+fn should_teardown_shed_layer(
+    shed_since_ms: Option<f64>,
+    now_ms: f64,
+    dwell_threshold_ms: f64,
+) -> bool {
+    match shed_since_ms {
+        Some(since) => now_ms - since >= dwell_threshold_ms,
+        None => false,
     }
 }
 
@@ -1854,6 +1909,18 @@ impl CameraEncoder {
             let mut prev_active_layers: usize =
                 shared_active_layer_count.load(Ordering::Relaxed) as usize;
 
+            // Per-rung "continuously shed since" wall-clock (ms, `performance.now()`),
+            // indexed by `layer_id` (issue #1230). `Some(t)` once a rung drops out of
+            // the active set; cleared to `None` when it is active again or after it is
+            // torn down. Declared OUTSIDE `'restart` (like `prev_active_layers`) so a
+            // mid-dwell encoder restart does not reset the clock and re-arm a full 30s
+            // wait. The encode loop STAMPS this every frame from the same
+            // `local_active_layers` it tears down against, so the dwell clock actually
+            // advances (it is not a dead timer). Sized `n_layers`; in single-stream
+            // mode (`n_layers == 1`) it has one slot that is never used (the base layer
+            // is never shed).
+            let mut shed_since_ms: Vec<Option<f64>> = vec![None; n_layers];
+
             'restart: loop {
                 // Backoff + max-restart guard (skip on first iteration).
                 if restart_count > 0 {
@@ -2032,10 +2099,23 @@ impl CameraEncoder {
                 // OUTPUT/EGRESS is unchanged: the encode loop already only encodes
                 // layers with `layer_id < active`, so for any given active-count
                 // sequence the same frames are emitted whether the un-earned
-                // encoders existed or not. Teardown-after-shed is intentionally
-                // NOT implemented (issue #1204 marks it optional and gated on a
-                // rebuild-latency measurement) — a shed encoder is retained so a
-                // later restore reuses it with no rebuild stall.
+                // encoders existed or not.
+                //
+                // TEARDOWN-AFTER-SHED (issue #1230): a shed upper rung is RETAINED
+                // (its encoder + ~100KB output buffer) so a brief shed→restore
+                // bounce reuses it with no rebuild stall. But on a device under
+                // SUSTAINED distress that never earns the rung back, holding that
+                // native VPX/WebCodecs state for the share's lifetime is a leak.
+                // So once a rung has been continuously shed for
+                // `SHED_TEARDOWN_DWELL_MS` (30s — 20× the 1500ms AQ min transition
+                // interval, so a transient bounce never accumulates the dwell) the
+                // encode loop closes+drops its `LayerEncoder` to reclaim the memory; the
+                // SAME lazy path above (`encoders_to_build`) rebuilds it if it is
+                // ever earned back, seeded from its persisted sequence. Teardown
+                // pops ONLY the top built rung(s) to keep `layers` a contiguous
+                // 0..len prefix (shed is strictly top-down) and never frees the
+                // base layer. See `should_teardown_shed_layer` + the per-frame
+                // dwell tracking in the encode loop.
                 //
                 // PR A: n_layers == 1, so only the base layer is ever built —
                 // byte-identical to the legacy single-encoder path.
@@ -2372,11 +2452,24 @@ impl CameraEncoder {
                             sequence_numbers[already_built..want].iter().enumerate()
                         {
                             let layer_idx = already_built + offset;
+                            // #1230 rebuild-latency: time the construct+configure
+                            // cost of the (re)build so it is field-measurable on
+                            // real devices/bots. This delta is the build CALL cost;
+                            // the configure→first-emitted-keyframe latency can be
+                            // derived in the field by correlating this log with the
+                            // first chunk emitted for `layer_idx` (the per-chunk
+                            // handler computes `now` already). This is the
+                            // "documented rebuild-latency measurement" that #1204
+                            // gated teardown on — now enabled.
+                            let build_started_ms = window().performance().unwrap().now();
                             match build_layer(layer_idx, initial_seq) {
                                 Ok(le) => {
+                                    let build_ms =
+                                        window().performance().unwrap().now() - build_started_ms;
                                     log::info!(
-                                        "CameraEncoder: lazily constructed simulcast layer {} on first activation (#1204)",
-                                        layer_idx
+                                        "CameraEncoder: lazily (re)built simulcast layer {} on activation in {:.1}ms (#1204/#1230 rebuild-latency)",
+                                        layer_idx,
+                                        build_ms
                                     );
                                     layers.push(le);
                                 }
@@ -2397,6 +2490,86 @@ impl CameraEncoder {
                         if build_failed {
                             restart_count += 1;
                             break 'encode;
+                        }
+                    }
+
+                    // ── Sustained-shed teardown (issue #1230) ──────────────────
+                    // SIMULCAST-ONLY. In single-stream mode (`n_layers == 1`,
+                    // `simulcast == false`) this entire block is skipped, so the
+                    // legacy path is byte-identical. Runs in the SAME loop that
+                    // reads `local_active_layers` and would rebuild a rung, so a
+                    // layer is freed only while observed inactive by the loop that
+                    // would earn it back — no separate thread, no AQ-loop teardown.
+                    if simulcast {
+                        let now_ms = window().performance().unwrap().now();
+                        // 1) STAMP per-rung shed-since each frame from the active
+                        // count we just read. A rung is "shed" iff its id >=
+                        // active. Stamp the start on the shed edge; clear when it
+                        // is active again. This is what makes the dwell clock
+                        // advance — it is updated every frame, not in a side task.
+                        for layer in layers.iter() {
+                            let id = layer.layer_id as usize;
+                            if id >= local_active_layers {
+                                // Currently shed: arm the clock if not already.
+                                if shed_since_ms[id].is_none() {
+                                    shed_since_ms[id] = Some(now_ms);
+                                }
+                            } else {
+                                // Active: clear any prior shed timer.
+                                shed_since_ms[id] = None;
+                            }
+                        }
+
+                        // 2) TEAR DOWN the top built rung(s) whose shed dwell has
+                        // exceeded the threshold. Pop ONLY from the end so `layers`
+                        // stays a contiguous 0..len prefix (the lazy-build path
+                        // above rebuilds `already_built..want` and assumes
+                        // `layers[i].layer_id == i`). Shed is strictly top-down
+                        // (the AQ controller's `drop_top_layer` decrements the
+                        // active count from the top), so the only shed rungs are at
+                        // the end — popping the tail is exactly the shed set. Floor
+                        // at keeping >= 1 layer: never free the base (id 0). Guard
+                        // `layers.len() > local_active_layers` so we never free an
+                        // ACTIVE rung even if its (stale) timer were armed.
+                        while layers.len() > local_active_layers
+                            && layers.len() > 1
+                            && should_teardown_shed_layer(
+                                shed_since_ms[layers.len() - 1],
+                                now_ms,
+                                SHED_TEARDOWN_DWELL_MS,
+                            )
+                        {
+                            // Pop the top rung. Its `layer_id` equals its index
+                            // (contiguous prefix invariant), so this is the highest
+                            // shed layer.
+                            if let Some(top) = layers.pop() {
+                                let id = top.layer_id as usize;
+                                let dwell_s = shed_since_ms[id]
+                                    .map(|t| (now_ms - t) / 1000.0)
+                                    .unwrap_or(0.0);
+                                // CRITICAL: persist this rung's sequence back into
+                                // `sequence_numbers[id]` BEFORE dropping it, exactly
+                                // like the end-of-loop writeback
+                                // (`sequence_numbers[layer.layer_id] = layer.seq_out.get()`),
+                                // so a future lazy rebuild seeds from the continued
+                                // (non-regressed) sequence and a receiver that
+                                // re-acquires the rung never sees a duplicate seq.
+                                sequence_numbers[id] = top.seq_out.get();
+                                // Close + drop frees the native encoder and the
+                                // ~100KB output buffer owned by the output closure.
+                                let _ = top.encoder.close();
+                                drop(top);
+                                // The rung is gone; clear its timer so a future
+                                // rebuild+shed re-arms a fresh dwell.
+                                shed_since_ms[id] = None;
+                                CAMERA_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                log::info!(
+                                    "CameraEncoder: tore down shed simulcast layer {} after {:.1}s sustained shed dwell, reclaiming encoder+buffer (#1230); lazy path rebuilds it if earned back",
+                                    id,
+                                    dwell_s
+                                );
+                            }
                         }
                     }
 
@@ -3012,8 +3185,9 @@ mod tests {
         build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
         frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
         layer_ceiling_to_count, next_single_layer_pin, shed_reason, should_pin_single_layer_low,
-        LayerView, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
-        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        should_teardown_shed_layer, LayerView, SimulcastLayerInfo, SHED_TEARDOWN_DWELL_MS,
+        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
+        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
 
@@ -3365,6 +3539,65 @@ mod tests {
 
         // Single-stream ceiling (PR-A default): only ever the one base encoder.
         assert_eq!(encoders_to_build(1, 1), 1);
+    }
+
+    #[test]
+    fn sustained_shed_teardown_decision_fires_only_past_dwell() {
+        // Issue #1230: pins the SINGLE SOURCE OF TRUTH for teardown
+        // (`should_teardown_shed_layer`). The encode loop frees a shed upper rung
+        // iff this returns true, so pinning it here pins the whole behavior off-wasm
+        // (the counter is bumped in the live loop and is not host-runnable).
+        //
+        // Mutations these assertions CATCH:
+        //  * dropping the `None` guard (an un-shed rung would tear down) — first case
+        //  * inverting the comparison (`>=`→`<`) — every Some case flips and FAILS
+        //  * swapping `>=`→`>` — the exact-boundary case (29_999 retain, 30_000 tear
+        //    down) flips and FAILS
+        let dwell = SHED_TEARDOWN_DWELL_MS; // 30_000.0
+
+        // Not currently shed (None) → never tear down, no matter how late the clock.
+        assert!(
+            !should_teardown_shed_layer(None, 100_000.0, dwell),
+            "a rung that is not shed (None) must never be torn down"
+        );
+        // Dwelled 29.999s (< 30s) → RETAIN (boundary just under threshold).
+        assert!(
+            !should_teardown_shed_layer(Some(0.0), 29_999.0, dwell),
+            "29.999s < 30s dwell must retain the rung"
+        );
+        // Exactly 30s → TEAR DOWN (pins the inclusive `>=`; a `>` mutation fails).
+        assert!(
+            should_teardown_shed_layer(Some(0.0), 30_000.0, dwell),
+            "exactly 30s dwell must tear down (>= is inclusive)"
+        );
+        // 35s dwell (armed at t=10s, now 45s) → TEAR DOWN.
+        assert!(
+            should_teardown_shed_layer(Some(10_000.0), 45_000.0, dwell),
+            "35s dwell must tear down"
+        );
+        // 10s dwell (armed at t=10s, now 20s) → RETAIN.
+        assert!(
+            !should_teardown_shed_layer(Some(10_000.0), 20_000.0, dwell),
+            "10s dwell must retain"
+        );
+
+        // FREED-COUNT SEMANTICS: drive the REAL decision helper over a per-rung
+        // shed-since array (as the encode loop does) and count the trues. This
+        // pins "freed count == number of rungs whose dwell exceeded N" via the
+        // actual decision path — NOT a literal-against-itself. now = 40_000ms:
+        //   id0 base: never shed (None)            → retain
+        //   id1: armed t=0   (40s dwell >= 30s)     → tear down
+        //   id2: armed t=20s (20s dwell <  30s)     → retain
+        let now_ms = 40_000.0;
+        let shed_since: [Option<f64>; 3] = [None, Some(0.0), Some(20_000.0)];
+        let freed = shed_since
+            .iter()
+            .filter(|s| should_teardown_shed_layer(**s, now_ms, dwell))
+            .count();
+        assert_eq!(
+            freed, 1,
+            "exactly the rungs whose dwell exceeded the threshold are freed"
+        );
     }
 
     #[test]

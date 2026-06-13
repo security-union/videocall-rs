@@ -185,8 +185,14 @@ test.describe("Pre-join auto-shows device selectors without auto-joining (issue 
     // auto-request usually grants first and removes the button — so we only
     // exercise the click when the button is actually still present, and assert
     // the granted state either way.
+    const grantedByAutoRequest = await page
+      .locator(CAMERA_TOGGLE)
+      .waitFor({ state: "visible", timeout: 3_000 })
+      .then(() => true)
+      .catch(() => false);
+
     const allow = page.locator(PERMISSION_ALLOW);
-    if (await allow.isVisible().catch(() => false)) {
+    if (!grantedByAutoRequest && (await allow.isVisible().catch(() => false))) {
       await allow.click().catch(() => {
         // Auto-grant may have detached the button between probe and click; the
         // granted-state wait below is the real gate.
@@ -195,8 +201,8 @@ test.describe("Pre-join auto-shows device selectors without auto-joining (issue 
 
     // Whether via the auto-request or the manual fallback click, the granted
     // state must be reached: prompt gone, toggles + selects present.
-    await expect(page.locator(PERMISSION_PROMPT)).toBeHidden({ timeout: 15_000 });
     await expect(page.locator(CAMERA_TOGGLE)).toBeVisible({ timeout: 15_000 });
+    await expect(page.locator(PERMISSION_PROMPT)).toBeHidden({ timeout: 15_000 });
     await expect(page.locator(MIC_TOGGLE)).toBeVisible();
     await expect(page.locator(CAMERA_SELECT)).toBeVisible();
 

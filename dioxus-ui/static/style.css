@@ -81,6 +81,17 @@ canvas {
 #peer-list-container.visible {
   transform: translateX(0);
   visibility: visible;
+  /* Open INSTANTLY (no slide) so the drag-resize handle — an absolutely
+     positioned child that rides the drawer's `transform` — is at its FINAL hit
+     position the moment `.visible` applies, instead of being a moving target
+     during a 0.3s slide-in. Close stays animated: the base rule's
+     `transition: transform 0.3s ease` governs the transition INTO the closed
+     state, and this 0s duration only applies while opening (in the `.visible`
+     state). Without this, a pointer drag that grabs the handle's transient
+     mid-slide position misses the moving handle entirely. The transform VALUE is
+     unchanged, so the closed full-hide at custom widths and the popover
+     containing-block behaviour are preserved. (issue 1296) */
+  transition-duration: 0s;
 }
 
 /* Shared sidebar styles */
@@ -1182,6 +1193,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 #diagnostics-sidebar.visible {
   transform: translateX(0);
   visibility: visible;
+  /* Open INSTANTLY (no slide) so the drag-resize handle is at its FINAL hit
+     position the moment `.visible` applies — same rationale as
+     `#peer-list-container.visible`. The right drawer happens to pass the resize
+     e2e today only because its heavier component mounts slowly enough that the
+     handle's box is read post-settle; that is timing-luck, so it gets the same
+     deterministic fix for symmetry. Close stays animated via the base
+     `transition: transform 0.3s ease`; the transform VALUE is unchanged so the
+     fixed help-popover's containing block is unaffected. (issue 1296) */
+  transition-duration: 0s;
 }
 
 #diagnostics-sidebar .diagnostics-data {
@@ -8361,13 +8381,18 @@ details.perf-peers[open] .perf-peers__chev {
    on EVERY edge: `#diagnostics-sidebar { overflow-y: auto }` makes the box clip
    both axes (CSS overflow propagation), and an `absolute` popover anchored to a
    wrapper INSIDE that scroll box was clipped at the right border (horizontal) and
-   the bottom fold (vertical). `fixed` anchors to the viewport (no transformed
-   ancestor on desktop), and `use_help_popover_anchor` writes the live `left/top`
-   each open + on scroll(capture)/resize, flipping the popover ABOVE the button
-   when there isn't room below. The inline `left/top` overrides the safe defaults
-   below (off-screen-left until the first reposition tick, so no flash at 0,0).
-   `max-height` + `overflow:auto` keep a tall popover usable on short viewports.
-   (#1131 scroll-clip fix) */
+   the bottom fold (vertical). IMPORTANT: the OPEN drawer carries a non-`none`
+   `transform` (`#diagnostics-sidebar.visible { transform: translateX(0) }`), which
+   makes the DRAWER — not the viewport — the containing block for this fixed
+   popover, AND scrolls it with the drawer. So the popover's inline `left/top` are
+   in the drawer's coordinate space, NOT viewport space. `use_help_popover_anchor`
+   computes the desired VIEWPORT position (clamp + flip ABOVE the button when there
+   isn't room below) and `reposition_help_popover` then maps it into this containing
+   block (subtract the offsetParent rect, add back its scrollTop) before writing
+   `left/top`, each open + on scroll(capture)/resize. The inline `left/top`
+   overrides the safe defaults below (off-screen-left until the first reposition
+   tick, so no flash at 0,0). `max-height` + `overflow:auto` keep a tall popover
+   usable on short viewports. (#1131 scroll-clip fix; containing-block mapping) */
 .perf-help-popover {
   position: fixed;
   z-index: 1001;

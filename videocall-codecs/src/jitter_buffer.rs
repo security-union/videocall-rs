@@ -612,13 +612,21 @@ impl<T> JitterBuffer<T> {
         self.source_frame_interval_ms
     }
 
+    /// Return the total playout-latency estimate and its stage-1 jitter-buffer span.
+    /// Computes the stage-1 span once so emitters can publish both values without
+    /// repeating the buffer walk.
+    pub fn playout_latency_parts_ms(&self, now_ms: u128) -> (f64, f64) {
+        let stage1_ms = self.buffered_span_ms(now_ms);
+        let stage2_ms = self.decoder.decode_queue_depth() as f64 * self.source_frame_interval_ms;
+        (stage1_ms + stage2_ms, stage1_ms)
+    }
+
     /// Total buffered video playout latency in ms (issue #1252). Spans BOTH receive pipeline
     /// stages: the stage-1 jitter-buffer backlog span ([`buffered_span_ms`](Self::buffered_span_ms))
     /// plus the stage-2 WebCodecs decoder queue (bounded by #1024's high-water mark), the latter
     /// valued at one source frame interval per queued frame. Read-only: never mutates state.
     pub fn playout_latency_ms(&self, now_ms: u128) -> f64 {
-        let stage2_ms = self.decoder.decode_queue_depth() as f64 * self.source_frame_interval_ms;
-        self.buffered_span_ms(now_ms) + stage2_ms
+        self.playout_latency_parts_ms(now_ms).0
     }
 }
 

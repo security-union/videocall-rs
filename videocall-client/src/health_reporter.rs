@@ -2239,6 +2239,93 @@ mod tests {
             .expect("HealthPacket payload must be valid protobuf")
     }
 
+    fn health_packet_with_camera_playout_stats(fps_received: f64) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.last_camera_stats = Some(json!({
+            "fps_received": fps_received,
+            "playout_latency_ms": 1500.0,
+            "playout_stage1_span_ms": 1200.0,
+        }));
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    #[test]
+    fn playout_latency_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_latency_ms, 1500.0);
+        assert_eq!(stats.playout_stage1_span_ms, 1200.0);
+    }
+
+    #[test]
+    fn playout_latency_omitted_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        assert_eq!(stats.playout_latency_ms, 0.0);
+        assert_eq!(stats.playout_stage1_span_ms, 0.0);
+    }
+
     /// #1032: a cached agent-memory reading rides the HealthPacket on the wire.
     #[test]
     fn agent_memory_rides_health_packet_when_present() {

@@ -1543,9 +1543,9 @@ mod tests {
     /// DIFFERENT source than the function so the test is not a tautology, and it is constructed so
     /// it FAILS if any operand is dropped or the interval term is removed (mutation-resistant):
     ///   - emitted=10, painted=4 => outstanding=6; interval=33.0 => 198.0.
-    /// If the code drops `painted`        => 10×33 = 330 ≠ 198 (fails).
-    /// If the code drops the interval term=> 6           ≠ 198 (fails).
-    /// If the code uses + instead of ×     => 6+33 = 39  ≠ 198 (fails).
+    ///     If the code drops `painted`        => 10×33 = 330 ≠ 198 (fails).
+    ///     If the code drops the interval term=> 6           ≠ 198 (fails).
+    ///     If the code uses + instead of ×     => 6+33 = 39  ≠ 198 (fails).
     #[test]
     fn paint_lag_ms_is_outstanding_times_interval() {
         let emitted: u64 = 10;

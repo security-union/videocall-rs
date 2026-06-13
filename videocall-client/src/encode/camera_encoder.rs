@@ -97,7 +97,7 @@ use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
 use super::classify_encode_error::{classify_encode_error, EncodeErrorBucket};
-use super::encoder_state::EncoderState;
+use super::encoder_state::{pli_keyframe_allowed, EncoderState};
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
@@ -688,25 +688,6 @@ fn should_teardown_shed_layer(
 /// is a conservative starting point within the issue's 250-500ms range — longer
 /// coalesces more but adds recovery latency. Tune/validate via performance-reviewer.
 const FORCED_KEYFRAME_COOLDOWN_MS: f64 = 250.0;
-
-/// Pure PLI-coalescing decision (issue #1287, host-testable single source of truth).
-///
-/// Returns `true` iff a PLI-driven forced keyframe is allowed to be emitted now,
-/// given when the last keyframe was emitted (`last_keyframe_emit_ms`) and the
-/// cooldown window. The last keyframe may be periodic OR forced — either one is
-/// broadcast to the whole room and satisfies all pending PLIs, so both reset the
-/// window. `None` ⇒ no keyframe emitted yet ⇒ always allowed. The `>=` makes the
-/// boundary inclusive: a PLI exactly `cooldown_ms` after the last keyframe fires.
-///
-/// This is the ONLY place the comparison lives so a host unit test pins it
-/// (mutating `>=`→`>`, inverting the comparison, or dropping the `None` guard all
-/// make the test fail).
-fn pli_keyframe_allowed(now_ms: f64, last_keyframe_emit_ms: Option<f64>, cooldown_ms: f64) -> bool {
-    match last_keyframe_emit_ms {
-        Some(last) => now_ms - last >= cooldown_ms,
-        None => true,
-    }
-}
 
 /// Decide whether a just-encoded frame counts as "healthy" for the purpose of
 /// resetting the encoder restart counter.

@@ -274,6 +274,14 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                         metric!("from_peer", stats_msg.from_peer.unwrap_or_default()),
                         metric!("to_peer", stats_msg.to_peer.unwrap_or_default()),
                         metric!("frames_buffered", stats_msg.frames_buffered.unwrap_or(0)),
+                        metric!(
+                            "playout_latency_ms",
+                            stats_msg.playout_latency_ms.unwrap_or(0.0)
+                        ),
+                        metric!(
+                            "playout_stage1_span_ms",
+                            stats_msg.playout_stage1_span_ms.unwrap_or(0.0)
+                        ),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);

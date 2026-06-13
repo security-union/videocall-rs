@@ -523,6 +523,13 @@ fn check_jitter_buffer_for_ready_frames() {
                                 if now - last_emit >= DIAGNOSTIC_EMIT_INTERVAL_MS {
                                     *last_emit_cell.borrow_mut() = now;
 
+                                    // Buffered video playout latency (issue #1252): how far behind
+                                    // live this peer's video is. Compute only on the 1 Hz emit path.
+                                    // Total spans both receive stages (jitter-buffer backlog +
+                                    // decoder queue); stage-1 is emitted separately for attribution.
+                                    let (playout_latency_ms, playout_stage1_span_ms) =
+                                        jb.playout_latency_parts_ms(current_time_ms);
+
                                     let evt = DiagEvent {
                                         subsystem: "video",
                                         stream_id: None,
@@ -531,6 +538,11 @@ fn check_jitter_buffer_for_ready_frames() {
                                             metric!("from_peer", from_peer.clone()),
                                             metric!("to_peer", to_peer.clone()),
                                             metric!("frames_buffered", buffered),
+                                            metric!("playout_latency_ms", playout_latency_ms),
+                                            metric!(
+                                                "playout_stage1_span_ms",
+                                                playout_stage1_span_ms
+                                            ),
                                         ],
                                     };
                                     let _ = global_sender().try_broadcast(evt);
@@ -539,8 +551,13 @@ fn check_jitter_buffer_for_ready_frames() {
                                     if let Ok(scope) =
                                         js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>()
                                     {
-                                        let msg =
-                                            VideoStatsMessage::new(from_peer, to_peer, buffered);
+                                        let msg = VideoStatsMessage::new(
+                                            from_peer,
+                                            to_peer,
+                                            buffered,
+                                            playout_latency_ms,
+                                            playout_stage1_span_ms,
+                                        );
                                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                             let _ = scope.post_message(&val);
                                         }

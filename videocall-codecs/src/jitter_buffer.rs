@@ -134,6 +134,20 @@ const MAX_CONSECUTIVE_OLD_FRAMES: u64 = 300;
 /// as harmless reordering.
 const STREAM_RESTART_BACKTRACK_THRESHOLD: u64 = 30;
 
+// --- Source-cadence estimator (issue #1252 playout-latency metric) ---
+/// Default source frame interval (~30fps) used until enough released-frame samples accumulate.
+const DEFAULT_SOURCE_FRAME_INTERVAL_MS: f64 = 33.3;
+/// EWMA smoothing factor for the source frame-interval estimate. Small so a single burst/stall
+/// sample can't whip the estimate around; it tracks the steady-state source cadence.
+const SOURCE_FRAME_INTERVAL_EWMA_ALPHA: f64 = 0.1;
+/// Plausible source-cadence bounds (≈1fps..125fps). Released-frame inter-arrival deltas outside
+/// this band are NOT folded into the estimate: a delta of 0 (frames that arrived in the same burst
+/// or out of order) would drag it toward the decoder drain rate and zero the metric, and a
+/// multi-second delta (post-stall) would spuriously inflate it. Clamping to this band keeps the
+/// estimate anchored to real source cadence.
+const MIN_SOURCE_FRAME_INTERVAL_MS: f64 = 8.0;
+const MAX_SOURCE_FRAME_INTERVAL_MS: f64 = 1000.0;
+
 pub struct JitterBuffer<T> {
     /// Frames that have been received but are not yet continuous with the last decoded frame.
     /// A BTreeMap is used to keep them sorted by sequence number automatically.
@@ -168,6 +182,15 @@ pub struct JitterBuffer<T> {
     /// `find_and_move_continuous_frames`.
     backpressure_hold_since_ms: Option<u128>,
 
+    /// Rolling estimate of the SOURCE frame interval in ms (issue #1252). Derived from the
+    /// inter-arrival spacing of *released* frames (which preserves source cadence), NOT the
+    /// decoder's drain rate. Feeds the stage-2 term of the playout-latency metric.
+    source_frame_interval_ms: f64,
+
+    /// `arrival_time_ms` of the most recently released frame, used to derive the source-cadence
+    /// inter-arrival delta. `None` until the first release (and after a flush).
+    last_released_arrival_time_ms: Option<u128>,
+
     // --- Decoder Interface ---
     /// The abstract decoder that will receive frames ready for decoding.
     decoder: Box<dyn Decodable<Frame = T>>,
@@ -183,6 +206,8 @@ impl<T> JitterBuffer<T> {
             dropped_frames_count: 0,
             num_consecutive_old_frames: 0,
             backpressure_hold_since_ms: None,
+            source_frame_interval_ms: DEFAULT_SOURCE_FRAME_INTERVAL_MS,
+            last_released_arrival_time_ms: None,
             decoder,
         }
     }
@@ -628,9 +653,29 @@ impl<T> JitterBuffer<T> {
     /// elapsed time from before this release.
     fn push_to_decoder(&mut self, frame: FrameBuffer) {
         let seq = frame.sequence_number();
+        // Record source cadence BEFORE the frame is moved into the decoder (issue #1252).
+        self.record_release_cadence(frame.arrival_time_ms);
         log::trace!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
         self.backpressure_hold_since_ms = None;
+    }
+
+    /// Folds a released frame's arrival time into the rolling source frame-interval estimate
+    /// (issue #1252). The estimate must track the SOURCE cadence (~30fps), so it is derived from
+    /// the inter-arrival spacing of consecutive *released* frames (preserved in their
+    /// `arrival_time_ms`), never the decoder's drain rate. Implausible deltas — 0/negative from
+    /// burst-or-reordered arrivals, or multi-second post-stall gaps — are discarded rather than
+    /// folded, so the estimate stays anchored to real source cadence.
+    fn record_release_cadence(&mut self, arrival_time_ms: u128) {
+        if let Some(prev) = self.last_released_arrival_time_ms {
+            let delta = arrival_time_ms.saturating_sub(prev) as f64;
+            if (MIN_SOURCE_FRAME_INTERVAL_MS..=MAX_SOURCE_FRAME_INTERVAL_MS).contains(&delta) {
+                self.source_frame_interval_ms = self.source_frame_interval_ms
+                    * (1.0 - SOURCE_FRAME_INTERVAL_EWMA_ALPHA)
+                    + delta * SOURCE_FRAME_INTERVAL_EWMA_ALPHA;
+            }
+        }
+        self.last_released_arrival_time_ms = Some(arrival_time_ms);
     }
 
     /// Checks if the jitter buffer is currently waiting for a keyframe to continue.
@@ -671,6 +716,10 @@ impl<T> JitterBuffer<T> {
         // starts its escape-hatch timer fresh and cannot inherit stale elapsed time from before the
         // flush.
         self.backpressure_hold_since_ms = None;
+        // Reset the release-cadence anchor so the first post-flush release does not measure a delta
+        // across the flush gap (issue #1252). The smoothed interval estimate itself persists — the
+        // source cadence does not change across a flush.
+        self.last_released_arrival_time_ms = None;
         // Consider resetting jitter estimator as well if needed
         self.jitter_estimator = JitterEstimator::new();
     }
@@ -685,6 +734,70 @@ impl<T> JitterBuffer<T> {
 
     pub fn get_dropped_frames_count(&self) -> u64 {
         self.dropped_frames_count
+    }
+
+    /// Stage-1 backlog span in ms (issue #1252): the arrival-time gap between the newest buffered
+    /// frame and the next frame the decoder is waiting to release. This is how far behind live the
+    /// jitter-buffer playout point sits — the dominant term of the playout-latency metric, and the
+    /// one that captures the 5–6s lag #1024 may merely relocate (it is timestamp-derived, not
+    /// depth-derived). Read-only: never mutates the buffer or any counter.
+    ///
+    /// Returns 0 when fewer than two frames are buffered or nothing is releasable. `now_ms` is the
+    /// current wall-clock time; it bounds the span to the head-of-line age so a newest frame with a
+    /// bad/rolled-back arrival timestamp (which cannot truly be in the future) can't inflate it.
+    pub fn buffered_span_ms(&self, now_ms: u128) -> f64 {
+        // Identify the next-to-release (head-of-line) frame — same selection as
+        // `enforce_freshness_deadline`: the next continuous frame if buffered, else the oldest
+        // buffered frame (gap / never-decoded).
+        let head_key = match self.last_decoded_sequence_number {
+            Some(last_seq) => {
+                let next_continuous_seq = last_seq + 1;
+                if self.buffered_frames.contains_key(&next_continuous_seq) {
+                    Some(next_continuous_seq)
+                } else {
+                    self.buffered_frames.keys().next().copied()
+                }
+            }
+            None => self.buffered_frames.keys().next().copied(),
+        };
+
+        let Some(head_key) = head_key else {
+            return 0.0;
+        };
+        let (Some(head), Some(newest)) = (
+            self.buffered_frames.get(&head_key),
+            self.buffered_frames.values().next_back(),
+        ) else {
+            return 0.0;
+        };
+
+        let span = newest.arrival_time_ms.saturating_sub(head.arrival_time_ms) as f64;
+        let head_age = now_ms.saturating_sub(head.arrival_time_ms) as f64;
+        span.min(head_age)
+    }
+
+    /// Rolling estimate of the source frame interval in ms (~33ms at 30fps), derived from released-
+    /// frame inter-arrival deltas (source cadence), NOT the decoder drain rate. See
+    /// [`record_release_cadence`](Self::record_release_cadence).
+    pub fn source_frame_interval_ms(&self) -> f64 {
+        self.source_frame_interval_ms
+    }
+
+    /// Return the total playout-latency estimate and its stage-1 jitter-buffer span.
+    /// Computes the stage-1 span once so emitters can publish both values without
+    /// repeating the buffer walk.
+    pub fn playout_latency_parts_ms(&self, now_ms: u128) -> (f64, f64) {
+        let stage1_ms = self.buffered_span_ms(now_ms);
+        let stage2_ms = self.decoder.decode_queue_depth() as f64 * self.source_frame_interval_ms;
+        (stage1_ms + stage2_ms, stage1_ms)
+    }
+
+    /// Total buffered video playout latency in ms (issue #1252). Spans BOTH receive pipeline
+    /// stages: the stage-1 jitter-buffer backlog span ([`buffered_span_ms`](Self::buffered_span_ms))
+    /// plus the stage-2 WebCodecs decoder queue (bounded by #1024's high-water mark), the latter
+    /// valued at one source frame interval per queued frame. Read-only: never mutates state.
+    pub fn playout_latency_ms(&self, now_ms: u128) -> f64 {
+        self.playout_latency_parts_ms(now_ms).0
     }
 }
 
@@ -1851,5 +1964,99 @@ mod tests {
         );
         // The fresh keyframe stays gated (queue still pinned), not force-released.
         assert!(jb.buffered_frames.contains_key(&10));
+    }
+
+    // --- Playout-latency metric (issue #1252) ---
+
+    /// The total playout-latency estimate must be the SUM of both stages:
+    ///   stage-1 = newest − next-to-release arrival span, and
+    ///   stage-2 = decode_queue_depth() × source_frame_interval_ms.
+    /// This pins both terms with known inputs and a fixed mock decode-queue depth: if either term
+    /// is dropped from the sum, the asserted total no longer matches.
+    #[test]
+    fn playout_latency_total_spans_both_stages() {
+        let (mut jb, _decoded, queue_depth) = create_test_jitter_buffer_with_queue_depth();
+
+        // Delta-only backlog with no keyframe: nothing is released (so the source-interval estimate
+        // stays at its default) and last_decoded stays None (never-decoded head selection = oldest).
+        // Arrival span stays under MAX_PLAYOUT_AGE_MS so the insert-time poll can't evict it.
+        jb.insert_frame(create_test_frame(10, FrameType::DeltaFrame), 1000);
+        jb.insert_frame(create_test_frame(11, FrameType::DeltaFrame), 2000);
+        jb.insert_frame(create_test_frame(12, FrameType::DeltaFrame), 2500);
+        assert_eq!(jb.buffered_frames_len(), 3, "backlog must be retained");
+
+        // Fixed stage-2 depth; default source interval (no releases happened).
+        queue_depth.store(2, Ordering::SeqCst);
+        assert_eq!(
+            jb.source_frame_interval_ms(),
+            DEFAULT_SOURCE_FRAME_INTERVAL_MS
+        );
+
+        let now = 3000;
+        // Stage-1: newest (seq 12 @2500) − head (seq 10 @1000) = 1500ms.
+        let span = jb.buffered_span_ms(now);
+        assert!(
+            (span - 1500.0).abs() < 1e-9,
+            "stage-1 span should be 1500ms, got {span}"
+        );
+
+        // Total = stage-1 (1500) + stage-2 (2 × 33.3).
+        let expected_stage2 = 2.0 * DEFAULT_SOURCE_FRAME_INTERVAL_MS;
+        let total = jb.playout_latency_ms(now);
+        assert!(
+            (total - (1500.0 + expected_stage2)).abs() < 1e-9,
+            "total should be stage1 + stage2 = {}, got {total}",
+            1500.0 + expected_stage2
+        );
+        // Explicit guard that BOTH terms are present (kills a mutant that drops either).
+        assert!((total - span - expected_stage2).abs() < 1e-9);
+    }
+
+    /// The source frame-interval estimate must track the SOURCE cadence (released-frame
+    /// inter-arrival spacing), moving off its default toward the observed interval. If
+    /// `record_release_cadence` never folds samples, the estimate stays at the default and this
+    /// fails.
+    #[test]
+    fn source_frame_interval_tracks_release_cadence() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+
+        // Keyframe + continuous deltas spaced 50ms apart in arrival time; all release in order.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 1050);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), 1100);
+        jb.insert_frame(create_test_frame(4, FrameType::DeltaFrame), 1150);
+        jb.find_and_move_continuous_frames(1300);
+
+        let est = jb.source_frame_interval_ms();
+        assert!(
+            est > DEFAULT_SOURCE_FRAME_INTERVAL_MS + 1.0,
+            "estimate should rise off the {DEFAULT_SOURCE_FRAME_INTERVAL_MS}ms default toward the 50ms cadence, got {est}"
+        );
+        assert!(
+            est < 50.0,
+            "EWMA must not overshoot the observed 50ms interval, got {est}"
+        );
+    }
+
+    /// `buffered_span_ms` must select the next-to-release head the same way the release path does:
+    /// across a gap (next continuous seq not buffered) it falls back to the OLDEST buffered frame,
+    /// and the span is measured from THAT frame to the newest. Backpressure pins the decoder so no
+    /// frame is released during setup, isolating the head-selection logic.
+    #[test]
+    fn buffered_span_head_selection_handles_gap() {
+        let (mut jb, _decoded, queue_depth) = create_test_jitter_buffer_with_queue_depth();
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst); // block all releases
+
+        // Mid-stream (last decoded = 5), then a GAP: seq 6 never arrives. Two later frames buffer.
+        jb.last_decoded_sequence_number = Some(5);
+        jb.insert_frame(create_test_frame(8, FrameType::DeltaFrame), 1000);
+        jb.insert_frame(create_test_frame(12, FrameType::DeltaFrame), 1300);
+
+        // Head falls back to the oldest buffered frame (seq 8 @1000); newest is seq 12 @1300.
+        let span = jb.buffered_span_ms(1300);
+        assert!(
+            (span - 300.0).abs() < 1e-9,
+            "gap head selection should span 1300−1000=300ms, got {span}"
+        );
     }
 }

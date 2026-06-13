@@ -513,7 +513,8 @@ const LAYER_HINT_MEDIA_KINDS: [i32; 2] = [1, 3];
 /// Map a normalized preference-map media-kind discriminant (1/2/3) onto the
 /// `LayerHintPacket.MediaKind` wire enum used when emitting a hint. Anything
 /// outside `{1,2,3}` maps to UNSPECIFIED(0) (never produced on the happy path —
-/// [`LAYER_HINT_MEDIA_KINDS`] only contains 1/2/3).
+/// [`LAYER_HINT_MEDIA_KINDS`] only contains 1 and 3 since #1118 N3, both mapped
+/// below; the AUDIO(2) arm is retained for completeness should a caller pass it).
 fn layer_hint_media_kind(
     kind: i32,
 ) -> videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind {

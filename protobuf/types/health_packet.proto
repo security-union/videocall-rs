@@ -49,6 +49,13 @@ message VideoStats {
   // dashboard can tell whether the #1024 release-side gate REMOVED the backlog
   // or merely RELOCATED it (total stays high while this drops => relocated).
   double playout_stage1_span_ms = 6;
+  // Stage-3 paint lag (#1252): decoded-but-unpainted frames living in the
+  // worker→main postMessage queue + main-thread paint task queue — a region
+  // decode_queue_size() (stage 2) cannot observe — valued at one source frame
+  // interval per outstanding frame. Computed in the worker as
+  // (frames_emitted − frames_painted) so the FIFO delay of the stats message
+  // itself does not hide the backlog. Reported only while fps_received > 0.
+  double playout_paint_lag_ms = 7;
 }
 
 message PeerStats {

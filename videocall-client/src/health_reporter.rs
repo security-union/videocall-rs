@@ -892,6 +892,14 @@ impl HealthReporter {
                                 video_stats["playout_stage1_span_ms"] = json!(v);
                             }
                         }
+                        // Stage-3 paint lag (#1252): decoded-but-unpainted backlog in the
+                        // worker->main postMessage + paint queues. Same bucket/guard as the two
+                        // latency fields above.
+                        "playout_paint_lag_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_paint_lag_ms"] = json!(v);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1770,6 +1778,13 @@ impl HealthReporter {
                     }
                     if let Some(v) = video.get("playout_stage1_span_ms").and_then(|v| v.as_f64()) {
                         vs.playout_stage1_span_ms = v;
+                    }
+                    // Stage-3 paint lag (#1252): same fps_received > 0 guard — a paused/hidden tile
+                    // decodes nothing and paints nothing, so any residual emitted-vs-painted skew
+                    // is not user-perceived latency. When fps == 0 the field stays at its 0.0
+                    // default => "at live".
+                    if let Some(v) = video.get("playout_paint_lag_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_paint_lag_ms = v;
                     }
                 }
                 ps.video_stats = ::protobuf::MessageField::some(vs);

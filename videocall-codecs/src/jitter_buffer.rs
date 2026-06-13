@@ -622,6 +622,26 @@ impl<T> JitterBuffer<T> {
     }
 }
 
+/// Stage-3 paint lag in ms (issue #1252): the time-valued backlog of decoded-but-unpainted frames
+/// sitting in the worker→main `postMessage` queue + the main-thread paint task queue — a region
+/// that `decode_queue_size()` (stage 2) cannot observe.
+///
+/// Computed as `(frames_emitted − frames_painted) × source_frame_interval_ms`, where
+/// `frames_emitted` is held un-delayed in the worker and `frames_painted` is the main thread's
+/// most recent ACK. `saturating_sub` floors the frame count at 0 so a transient ACK overshoot
+/// (e.g. just after a reset, while old in-flight frames are still being painted) reads as "at
+/// live" rather than underflowing.
+///
+/// Pure and side-effect free so the arithmetic can be unit-tested off the wasm-only worker path.
+pub fn paint_lag_ms(
+    frames_emitted: u64,
+    frames_painted: u64,
+    source_frame_interval_ms: f64,
+) -> f64 {
+    let outstanding = frames_emitted.saturating_sub(frames_painted);
+    outstanding as f64 * source_frame_interval_ms
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1515,6 +1535,45 @@ mod tests {
         assert!(
             (span - 300.0).abs() < 1e-9,
             "gap head selection should span 1300−1000=300ms, got {span}"
+        );
+    }
+
+    /// Stage-3 paint lag (#1252): `paint_lag_ms` must equal
+    /// `(emitted − painted) × source_frame_interval_ms`. The asserted value is computed from a
+    /// DIFFERENT source than the function so the test is not a tautology, and it is constructed so
+    /// it FAILS if any operand is dropped or the interval term is removed (mutation-resistant):
+    ///   - emitted=10, painted=4 => outstanding=6; interval=33.0 => 198.0.
+    /// If the code drops `painted`        => 10×33 = 330 ≠ 198 (fails).
+    /// If the code drops the interval term=> 6           ≠ 198 (fails).
+    /// If the code uses + instead of ×     => 6+33 = 39  ≠ 198 (fails).
+    #[test]
+    fn paint_lag_ms_is_outstanding_times_interval() {
+        let emitted: u64 = 10;
+        let painted: u64 = 4;
+        let interval = 33.0_f64;
+        let expected = (emitted - painted) as f64 * interval; // 6 × 33 = 198.0
+        let got = paint_lag_ms(emitted, painted, interval);
+        assert!(
+            (got - expected).abs() < 1e-9,
+            "paint_lag_ms({emitted},{painted},{interval}) should be {expected}, got {got}"
+        );
+        // Guard: a non-trivial interval term must actually scale the result.
+        assert!(
+            got > (emitted - painted) as f64,
+            "interval term must scale, got {got}"
+        );
+    }
+
+    /// `paint_lag_ms` must floor the outstanding frame count at 0 (saturating_sub) so a transient
+    /// ACK overshoot — painted briefly exceeding emitted, e.g. just after a reset while old
+    /// in-flight frames are still painted — reads as "at live" (0.0) rather than a huge value from
+    /// u64 wraparound. Fails if `saturating_sub` is replaced with a wrapping/plain subtraction.
+    #[test]
+    fn paint_lag_ms_saturates_when_painted_exceeds_emitted() {
+        let got = paint_lag_ms(3, 7, 33.0);
+        assert_eq!(
+            got, 0.0,
+            "painted > emitted must floor to 0.0 (at live), got {got}"
         );
     }
 }

@@ -38,7 +38,7 @@
 use std::cell::{Cell, RefCell};
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
-use videocall_codecs::jitter_buffer::JitterBuffer;
+use videocall_codecs::jitter_buffer::{paint_lag_ms, JitterBuffer};
 use videocall_codecs::messages::{VideoStatsMessage, WorkerMessage};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -124,6 +124,10 @@ impl WebDecoder {
                         &format!("[WORKER] Error posting decoded frame: {e:?}").into(),
                     );
                 }
+                // Stage-3 paint lag (issue #1252): count every decoded frame handed off to the
+                // worker->main postMessage queue. The main thread ACKs how many it has drained
+                // (WorkerMessage::PaintProgress); the 1Hz tick computes emitted - painted.
+                FRAMES_EMITTED.with(|c| c.set(c.get().wrapping_add(1)));
                 video_frame.close();
             }) as Box<dyn FnMut(_)>)
         };
@@ -356,6 +360,14 @@ thread_local! {
     static CONTEXT_FROM: RefCell<Option<String>> = const { RefCell::new(None) };
     static CONTEXT_TO: RefCell<Option<String>> = const { RefCell::new(None) };
     static LAST_DIAGNOSTIC_EMIT_MS: RefCell<f64> = const { RefCell::new(0.0) };
+    /// Cumulative count of decoded frames this worker has `post_message`'d to the main thread
+    /// (issue #1252, stage-3 paint lag). Incremented in the WebCodecs `on_output` closure.
+    static FRAMES_EMITTED: Cell<u64> = const { Cell::new(0) };
+    /// Latest cumulative count of frames the main thread reports it has drained from the
+    /// worker->main `postMessage` queue, ACK'd back via `WorkerMessage::PaintProgress`
+    /// (issue #1252, stage-3 paint lag). The difference `emitted - painted` is the
+    /// decoded-but-unpainted backlog `decode_queue_size()` cannot see.
+    static FRAMES_PAINTED: Cell<u64> = const { Cell::new(0) };
 }
 
 const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
@@ -410,6 +422,13 @@ fn handle_worker_message(message: WorkerMessage) {
             CONTEXT_FROM.with(|f| *f.borrow_mut() = Some(from_peer));
             CONTEXT_TO.with(|t| *t.borrow_mut() = Some(to_peer));
             console::log_1(&"[WORKER] Set diagnostics context (from_peer,to_peer)".into());
+        }
+        WorkerMessage::PaintProgress { painted } => {
+            // Stage-3 paint lag (issue #1252): cumulative frames the main thread has drained from
+            // the worker->main postMessage queue. Store the latest; the 1Hz tick computes
+            // emitted - painted. This ACK is itself delayed by the same FIFO backlog, which only
+            // makes the computed lag read slightly LARGER (conservative) — fine for a gross signal.
+            FRAMES_PAINTED.with(|c| c.set(painted));
         }
     }
 }
@@ -492,6 +511,16 @@ fn check_jitter_buffer_for_ready_frames() {
             // clock as the buffer poll above.
             let playout_latency_ms = jb.playout_latency_ms(current_time_ms);
             let playout_stage1_span_ms = jb.buffered_span_ms(current_time_ms);
+            // Stage-3 paint lag (issue #1252): decoded-but-unpainted frames still sitting in the
+            // worker->main postMessage queue + main-thread paint task queue — a region
+            // decode_queue_size() (stage 2) cannot observe. Computed in the worker so the FIFO
+            // delay that this very stats message rides through does NOT hide the backlog; valued
+            // at one source-frame-interval per outstanding frame.
+            let playout_paint_lag_ms = paint_lag_ms(
+                FRAMES_EMITTED.with(|c| c.get()),
+                FRAMES_PAINTED.with(|c| c.get()),
+                jb.source_frame_interval_ms(),
+            );
             #[cfg(feature = "wasm")]
             {
                 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
@@ -522,6 +551,7 @@ fn check_jitter_buffer_for_ready_frames() {
                                                 "playout_stage1_span_ms",
                                                 playout_stage1_span_ms
                                             ),
+                                            metric!("playout_paint_lag_ms", playout_paint_lag_ms),
                                         ],
                                     };
                                     let _ = global_sender().try_broadcast(evt);
@@ -536,6 +566,7 @@ fn check_jitter_buffer_for_ready_frames() {
                                             buffered,
                                             playout_latency_ms,
                                             playout_stage1_span_ms,
+                                            playout_paint_lag_ms,
                                         );
                                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                             let _ = scope.post_message(&val);
@@ -579,5 +610,16 @@ fn reset_jitter_buffer() {
     JITTER_BUFFER.with(|jb_cell| {
         *jb_cell.borrow_mut() = None;
     });
+    // Stage-3 paint lag (issue #1252): the FRAMES_EMITTED / FRAMES_PAINTED counters are
+    // deliberately NOT reset here. They are lifetime-cumulative per worker, and the main thread's
+    // painted counter (in the wasm.rs onmessage closure) is likewise monotonic and survives an
+    // in-place reset — that closure is not recreated when the worker tears down its decoder. They
+    // stay coherent across a reset on their own: frames dropped by `destroy_decoder()` were never
+    // emitted (`on_output` never fired, so they were never counted), while frames already
+    // `post_message`'d before the reset still drain on the main thread and are still counted. So
+    // `emitted - painted` remains the true in-flight backlog. Zeroing only the worker side here
+    // would desync it from the still-monotonic main-thread ACK (the next ACK would set
+    // FRAMES_PAINTED far above a freshly-zeroed FRAMES_EMITTED), flooring paint lag to a false 0
+    // for minutes — hiding exactly the lag this metric exists to surface.
     console::log_1(&"[WORKER] Jitter buffer reset to initial state".into());
 }

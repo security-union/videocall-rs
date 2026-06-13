@@ -1678,14 +1678,13 @@ mod tests {
         jb.flush();
         decoded.lock().unwrap().clear();
 
-        jb.insert_frame(create_test_frame(10, FrameType::KeyFrame), 2160);
-        jb.find_and_move_continuous_frames(2170);
-        jb.insert_frame(create_test_frame(11, FrameType::DeltaFrame), 2180);
-        jb.find_and_move_continuous_frames(4030);
+        jb.last_decoded_sequence_number = Some(10);
+        jb.insert_frame(create_test_frame(11, FrameType::DeltaFrame), 300);
+        jb.find_and_move_continuous_frames(2200);
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,
-            "post-flush eviction fires immediately despite the pre-flush throttle window"
+            "post-flush eviction fires immediately despite being inside the pre-flush throttle window"
         );
     }
 

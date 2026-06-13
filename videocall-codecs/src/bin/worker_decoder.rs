@@ -452,6 +452,16 @@ fn handle_worker_message(message: WorkerMessage) {
             // makes the computed lag read slightly LARGER (conservative) — fine for a gross signal.
             FRAMES_PAINTED.with(|c| c.set(painted));
         }
+        WorkerMessage::InjectStaleFrame(frame) => {
+            // Test-only (issue #1022). Unlike DecodeFrame (which stamps arrival with the worker's
+            // wall clock), insert using the back-dated arrival_time_ms carried in the FrameBuffer
+            // so the head-of-line frame is already "old". On the next ~10ms tick,
+            // find_and_move_continuous_frames(Date::now()) computes head_age = now - back-dated
+            // arrival, which trips the #1020 freshness deadline and surfaces a freshness_skip
+            // (#1045) the E2E spec can observe. Only the MOCK_PEERS_ENABLED-gated injection hook
+            // (videocall_client::freshness_inject) sends this; production never does.
+            inject_stale_frame_to_jitter_buffer(frame);
+        }
     }
 }
 
@@ -484,6 +494,43 @@ fn insert_frame_to_jitter_buffer(frame: FrameBuffer) {
             // Get current time in milliseconds
             let current_time_ms = js_sys::Date::now() as u128;
             jb.insert_frame(video_frame, current_time_ms);
+        }
+    });
+}
+
+/// Test-only (issue #1022): insert a crafted frame at the `arrival_time_ms` carried in the
+/// `FrameBuffer`, rather than `Date::now()`. A back-dated arrival lets an E2E spec form a stale
+/// head-of-line backlog so the worker's ~10ms tick trips the #1020 freshness deadline and emits
+/// an observable `freshness_skip` (#1045). Mirrors `insert_frame_to_jitter_buffer` byte-for-byte
+/// except for the arrival-time source. Only the `MOCK_PEERS_ENABLED`-gated injection hook sends
+/// the `InjectStaleFrame` message that reaches here.
+fn inject_stale_frame_to_jitter_buffer(frame: FrameBuffer) {
+    JITTER_BUFFER.with(|jb_cell| {
+        let mut jb_opt = jb_cell.borrow_mut();
+
+        if jb_opt.is_none() {
+            match initialize_jitter_buffer() {
+                Ok(jb) => *jb_opt = Some(jb),
+                Err(e) => {
+                    console::error_1(
+                        &format!("[WORKER] Failed to initialize jitter buffer: {e:?}").into(),
+                    );
+                    return;
+                }
+            }
+        }
+
+        if let Some(jb) = jb_opt.as_mut() {
+            let arrival_time_ms = frame.arrival_time_ms;
+            let video_frame = VideoFrame {
+                sequence_number: frame.sequence_number(),
+                frame_type: frame.frame.frame_type,
+                codec: frame.frame.codec,
+                data: frame.frame.data.clone(),
+                timestamp: frame.frame.timestamp,
+            };
+            // Use the caller-supplied (back-dated) arrival time, NOT Date::now().
+            jb.insert_frame(video_frame, arrival_time_ms);
         }
     });
 }

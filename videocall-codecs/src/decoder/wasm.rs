@@ -237,6 +237,26 @@ impl WasmDecoder {
         }
     }
 
+    /// **Test-only** (issue #1022): post a crafted frame the worker will insert at the
+    /// `arrival_time_ms` carried in the `FrameBuffer` (NOT the worker's wall clock the way
+    /// [`push_frame`](Self::push_frame) does). With a back-dated arrival, an E2E spec can form a
+    /// stale head-of-line backlog so the worker's ~10ms tick trips the #1020 freshness deadline
+    /// and emits an observable `freshness_skip` (#1045). Only the `MOCK_PEERS_ENABLED`-gated
+    /// injection hook (`videocall_client::freshness_inject`) calls this; production never does.
+    pub fn inject_stale_frame(&self, frame: FrameBuffer) {
+        let message = WorkerMessage::InjectStaleFrame(frame);
+        match serde_wasm_bindgen::to_value(&message) {
+            Ok(js_message) => {
+                if let Err(e) = self.worker.post_message(&js_message) {
+                    log::error!("Error posting inject-stale-frame message to worker: {e:?}");
+                }
+            }
+            Err(e) => {
+                log::error!("Error serializing inject-stale-frame message: {e:?}");
+            }
+        }
+    }
+
     /// Provide diagnostic context to the worker so that metrics include original peer IDs
     pub fn set_context(&self, from_peer: String, to_peer: String) {
         let message = WorkerMessage::SetContext { from_peer, to_peer };

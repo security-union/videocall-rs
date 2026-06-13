@@ -2799,6 +2799,13 @@ pub fn AttendantsComponent(
     // in production where that runtime-config flag is false.
     use_hook(crate::components::decode_budget_inject::register_decode_budget_inject_hooks);
 
+    // Register `window.__videocall_inject_stale_video_backlog` /
+    // `window.__videocall_freshness_skips` so an E2E spec can deterministically
+    // trip the #1020 jitter-buffer freshness deadline (which runs in the decoder
+    // worker) and observe the resulting `freshness_skip` event (#1022). Also gated
+    // on `MOCK_PEERS_ENABLED`, so a no-op in production.
+    use_hook(crate::components::freshness_inject::register_freshness_inject_hooks);
+
     // Host self-view speaking glow — update DOM directly to avoid re-rendering
     // the entire meeting view on every audio-level tick.
     // Note: host glow is intentionally not suppressed by pin state so the local

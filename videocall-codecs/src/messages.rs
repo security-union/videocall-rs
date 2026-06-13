@@ -38,6 +38,19 @@ pub enum WorkerMessage {
     /// decoded-but-unpainted backlog living in the postMessage + paint task queues —
     /// a region `decode_queue_size()` cannot observe.
     PaintProgress { painted: u64 },
+    /// **Test-only** (issue #1022): insert a crafted frame into the worker's
+    /// [`JitterBuffer`](crate::jitter_buffer::JitterBuffer) using the `arrival_time_ms`
+    /// carried in the `FrameBuffer` itself, instead of stamping it with the worker's
+    /// wall clock the way [`WorkerMessage::DecodeFrame`] does.
+    ///
+    /// This exists solely so an E2E spec can deterministically form a *stale* head-of-line
+    /// backlog (back-dated arrival time) and let the worker's ~10ms tick trip the #1020
+    /// freshness deadline (`MAX_PLAYOUT_AGE_MS`), making the resulting `freshness_skip`
+    /// diagnostic (#1045) observable from a browser test. It is emitted ONLY by the
+    /// `MOCK_PEERS_ENABLED`-gated injection hook (see
+    /// `videocall_client::freshness_inject`); no production code path sends it, so the
+    /// production decode pipeline is byte-for-byte unaffected when the flag is off.
+    InjectStaleFrame(FrameBuffer),
 }
 
 /// Video statistics message sent by the worker

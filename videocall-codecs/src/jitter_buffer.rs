@@ -194,10 +194,34 @@ pub struct JitterBuffer<T> {
     // --- Decoder Interface ---
     /// The abstract decoder that will receive frames ready for decoding.
     decoder: Box<dyn Decodable<Frame = T>>,
+
+    /// Proactive keyframe-request hook (issue #1025). Invoked when the freshness
+    /// deadline evicts a stale **keyframe-less** backlog: the buffer has dropped
+    /// the stale deltas (bounding memory) but has NO buffered keyframe to resume
+    /// from, so playout is frozen on the last-good frame until a fresh keyframe
+    /// arrives. Calling this the instant we evict — rather than waiting for the
+    /// client's reactive gap-driven request — shortens recovery. The actual PLI
+    /// mechanism lives in `videocall-client`; this is the codecs→client handle the
+    /// `TODO(#1020)` called for. Defaults to a no-op (`new`), so native tests and
+    /// non-wasm callers need not supply one; the worker injects the real one via
+    /// [`JitterBuffer::with_keyframe_request`]. The client's keyframe-request path
+    /// already coalesces (#1011), so firing once per eviction tick cannot storm.
+    request_keyframe: Box<dyn Fn()>,
 }
 
 impl<T> JitterBuffer<T> {
     pub fn new(decoder: Box<dyn Decodable<Frame = T>>) -> Self {
+        // Default: no proactive keyframe request (native/mock callers). The worker
+        // supplies a real hook via `with_keyframe_request`.
+        Self::with_keyframe_request(decoder, Box::new(|| {}))
+    }
+
+    /// Like [`JitterBuffer::new`] but injects the proactive keyframe-request hook
+    /// (issue #1025) — mirroring how `decoder` is injected. See `request_keyframe`.
+    pub fn with_keyframe_request(
+        decoder: Box<dyn Decodable<Frame = T>>,
+        request_keyframe: Box<dyn Fn()>,
+    ) -> Self {
         Self {
             buffered_frames: BTreeMap::new(),
             last_decoded_sequence_number: None,
@@ -209,6 +233,7 @@ impl<T> JitterBuffer<T> {
             source_frame_interval_ms: DEFAULT_SOURCE_FRAME_INTERVAL_MS,
             last_released_arrival_time_ms: None,
             decoder,
+            request_keyframe,
         }
     }
 
@@ -622,23 +647,22 @@ impl<T> JitterBuffer<T> {
                 let stale_cutoff = head_key + 1;
                 let dropped_before = self.dropped_frames_count;
                 self.drop_frames_before(stale_cutoff);
-                if self.dropped_frames_count > dropped_before {
+                let dropped_any = self.dropped_frames_count > dropped_before;
+                if dropped_any {
                     log::debug!(
-                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {} stale delta frame(s); holding last-good frame and awaiting keyframe recovery.",
+                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {} stale delta frame(s); holding last-good frame and proactively requesting a keyframe (#1025).",
                         self.dropped_frames_count - dropped_before
                     );
+                    // Issue #1025 (resolves the TODO(#1020) here): proactively ask the client to
+                    // request a keyframe the instant we evict a stale keyframe-less backlog, rather
+                    // than waiting for the client's reactive gap-driven request to notice. There is
+                    // no buffered keyframe to skip to, so playout is frozen on the last-good frame
+                    // until a fresh keyframe arrives — fetching one sooner directly shortens that
+                    // freeze. Fired ONLY when we actually evicted (`dropped_any`), not on every
+                    // tick; the client's keyframe-request path coalesces (#1011), so a burst of
+                    // evictions collapses to one in-flight request and cannot storm the publisher.
+                    (self.request_keyframe)();
                 }
-                // TODO(#1020): trigger a PLI / keyframe request from here. The PLI mechanism lives
-                // in the client crate (videocall-client: peer_decode_manager::send_keyframe_request,
-                // gap detection in track_sequence), not in videocall-codecs, and the jitter buffer
-                // has no handle back to it. The client already issues keyframe requests on observed
-                // sequence gaps, which covers the common no-keyframe stall. A clean fix would thread
-                // a `request_keyframe` callback into JitterBuffer::new (mirroring how `decoder` is
-                // injected) so the codecs layer can proactively ask for a keyframe the instant it
-                // evicts a stale keyframe-less backlog, rather than waiting for the client's
-                // gap-driven request. Deferred to keep this change transport-agnostic and confined
-                // to the buffer; the eviction above guarantees the buffer cannot grow unbounded in
-                // the meantime.
                 false
             }
         }
@@ -1459,6 +1483,78 @@ mod tests {
         assert!(
             !jb.buffered_frames.contains_key(&2),
             "stale head delta should be evicted"
+        );
+    }
+
+    /// Issue #1025: evicting a stale KEYFRAME-LESS backlog (no buffered keyframe to
+    /// skip to) must proactively fire the injected `request_keyframe` hook so the
+    /// client fetches a fresh keyframe immediately, instead of waiting for its
+    /// reactive gap-driven request. The contrast — a stale backlog that DOES contain
+    /// a keyframe — skips to that keyframe and must NOT fire the hook (recovery is
+    /// already in hand).
+    ///
+    /// Mutation coverage: removing the `(self.request_keyframe)()` call drops the
+    /// keyframe-less count to 0 (first assert fails); moving the call outside the
+    /// `dropped_any` guard or into the keyframe-present branch fails the `== 1` /
+    /// `== 0` asserts.
+    #[test]
+    fn keyframe_less_backlog_eviction_fires_proactive_keyframe_request() {
+        // --- keyframe-less stall: exactly one proactive request on eviction ---
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded_frames = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded_frames.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let start = 2000u128;
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), start);
+        jb.find_and_move_continuous_frames(start + 100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+
+        // Stall: only deltas arrive (no keyframe); seq 2 goes stale.
+        let stall = start + 200;
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), stall);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), stall);
+        let now = stall + (MAX_PLAYOUT_AGE_MS as u128) + 50;
+        jb.find_and_move_continuous_frames(now);
+
+        assert!(
+            !jb.buffered_frames.contains_key(&2),
+            "stale head delta must be evicted"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "evicting a keyframe-less backlog must fire exactly one proactive keyframe request"
+        );
+
+        // --- contrast: a stale backlog WITH a buffered keyframe must NOT request ---
+        let requests2 = Arc::new(AtomicU32::new(0));
+        let decoded2 = Arc::new(Mutex::new(Vec::new()));
+        let r2 = requests2.clone();
+        let mut jb2 = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded2.clone())),
+            Box::new(move || {
+                r2.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let s = 5000u128;
+        jb2.insert_frame(create_test_frame(1, FrameType::KeyFrame), s);
+        jb2.find_and_move_continuous_frames(s + 100);
+        // Stall behind a gap, but a fresh keyframe (seq 10) IS buffered to skip to.
+        let stall2 = s + 200;
+        jb2.insert_frame(create_test_frame(5, FrameType::DeltaFrame), stall2);
+        jb2.insert_frame(create_test_frame(10, FrameType::KeyFrame), stall2);
+        let now2 = stall2 + (MAX_PLAYOUT_AGE_MS as u128) + 50;
+        jb2.find_and_move_continuous_frames(now2);
+        assert_eq!(
+            requests2.load(Ordering::SeqCst),
+            0,
+            "skipping to a buffered keyframe must NOT fire a proactive request"
         );
     }
 

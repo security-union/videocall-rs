@@ -11467,6 +11467,142 @@ mod tests {
         );
     }
 
+    /// #1283: direct coverage for the actor-driven DEMAND-gauge sweep loop
+    /// (`sweep_layer_preference_gauge`): room iteration, the per-session
+    /// `has_any()` skip, the per-kind MAX-bucket tally, and — the easiest path to
+    /// silently regress — the explicit-zero `SET` for an active room whose demand
+    /// vanished. The unit tests already pin the pure classifier; this seeds actor
+    /// state and asserts the resulting gauge values end-to-end.
+    ///
+    /// Mutation-proofing: a Prometheus gauge reads 0 whether it was explicitly set
+    /// to 0 OR never touched, so a naive "assert == 0" would pass even if the
+    /// explicit-zero `SET` were dropped. We therefore PRE-POISON every asserted
+    /// cell to a sentinel (99) before the sweep — every assertion below then proves
+    /// the sweep actually `SET` that cell (to a count or to an explicit zero).
+    /// - Invert the `has_any()` skip → the active-room counts collapse to 0 (fail).
+    /// - Drop the explicit-zero `SET` → the poisoned 99 survives where 0 is
+    ///   expected (the active-room "0"/empty cells and the whole empty room) (fail).
+    #[actix_rt::test]
+    #[serial]
+    async fn test_sweep_layer_preference_gauge_sets_buckets_and_explicit_zero() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        // `sweep_layer_preference_gauge` is `&self` (no actor context), so we drive
+        // it directly on a constructed (un-started) server with seeded state.
+        let mut server = ChatServer::new(nats_client).await;
+
+        // Unique room names → isolated global-gauge series (and `#[serial]` keeps
+        // these tests off each other's toes).
+        let active_room = "test-1283-active";
+        let empty_room = "test-1283-empty-no-prefs";
+
+        let member = |session: SessionId| RoomMemberInfo {
+            session,
+            user_id: format!("u{session}"),
+            display_name: format!("d{session}"),
+            is_host: false,
+            end_on_host_leave: false,
+        };
+
+        // --- Active room: a KNOWN distribution across buckets × {video, screen} ---
+        // recv-A (1001): video MAX layer 2 → bucket "2"; screen layer 0 → "0".
+        // recv-B (1002): video MAX layer 1 → bucket "1"; NO screen pref → uncounted.
+        // recv-C (1003): forged video layer 7 → bucket "other"; screen layer 2 → "2".
+        // The max-per-kind reduction means recv-A's two video entries (layer 2 is
+        // the max) bucket once at "2".
+        server.session_layer_prefs.insert(
+            1001,
+            layer_prefs_with_kinds(&[(900, 1, 0), (900, 1, 2), (901, 3, 0)]),
+        );
+        server
+            .session_layer_prefs
+            .insert(1002, layer_prefs_with_kinds(&[(900, 1, 1)]));
+        server
+            .session_layer_prefs
+            .insert(1003, layer_prefs_with_kinds(&[(900, 1, 7), (901, 3, 2)]));
+        server.room_members.insert(
+            active_room.to_string(),
+            vec![member(1001), member(1002), member(1003)],
+        );
+
+        // --- Empty room: a member that EXISTS but has no recorded prefs
+        // (`has_any()` false). The room is still iterated and must be SET to 0
+        // across every cell — the explicit-zero path. ---
+        server.session_layer_prefs.insert(2001, empty_layer_prefs());
+        server
+            .room_members
+            .insert(empty_room.to_string(), vec![member(2001)]);
+
+        // Pre-poison every cell we will assert, so each assertion proves the sweep
+        // SET it (an unswept cell would read 99, not the expected value).
+        for room in [active_room, empty_room] {
+            for (_, kind_label) in LAYER_PREFERENCE_GAUGE_KINDS.iter() {
+                for bucket in RELAY_LAYER_ID_BUCKETS.iter() {
+                    RELAY_LAYER_PREFERENCE_SESSIONS
+                        .with_label_values(&[room, kind_label, bucket])
+                        .set(99.0);
+                }
+            }
+        }
+
+        server.sweep_layer_preference_gauge();
+
+        let g = |room: &str, kind: &str, bucket: &str| {
+            RELAY_LAYER_PREFERENCE_SESSIONS
+                .with_label_values(&[room, kind, bucket])
+                .get() as u64
+        };
+
+        // Active room — VIDEO: B→"1", A→"2", C→"other"; "0" has no demand → 0.
+        assert_eq!(
+            g(active_room, "video", "0"),
+            0,
+            "no receiver wants video layer 0"
+        );
+        assert_eq!(
+            g(active_room, "video", "1"),
+            1,
+            "recv-B video max = layer 1"
+        );
+        assert_eq!(
+            g(active_room, "video", "2"),
+            1,
+            "recv-A video max = layer 2"
+        );
+        assert_eq!(
+            g(active_room, "video", "other"),
+            1,
+            "recv-C forged video layer 7 buckets to \"other\""
+        );
+        // Active room — SCREEN: A→"0", C→"2"; B has no screen pref (uncounted).
+        assert_eq!(g(active_room, "screen", "0"), 1, "recv-A screen layer 0");
+        assert_eq!(
+            g(active_room, "screen", "1"),
+            0,
+            "no receiver wants screen layer 1"
+        );
+        assert_eq!(g(active_room, "screen", "2"), 1, "recv-C screen layer 2");
+        assert_eq!(
+            g(active_room, "screen", "other"),
+            0,
+            "no forged screen layer"
+        );
+
+        // Empty room — explicit zero across ALL cells (members present, no demand).
+        for (_, kind_label) in LAYER_PREFERENCE_GAUGE_KINDS.iter() {
+            for bucket in RELAY_LAYER_ID_BUCKETS.iter() {
+                assert_eq!(
+                    g(empty_room, kind_label, bucket),
+                    0,
+                    "a room with members but no recorded prefs must be SET to 0 \
+                     (explicit-zero path) at {kind_label}/{bucket}, not left stale"
+                );
+            }
+        }
+    }
+
     #[actix_rt::test]
     async fn test_handle_msg_drops_non_matching_screen_layer() {
         // Phase 3: SCREEN is layer-filtered like VIDEO. Receiver wants screen

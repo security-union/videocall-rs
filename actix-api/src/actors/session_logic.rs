@@ -126,6 +126,18 @@ impl Default for CongestionTracker {
 /// O(n) `retain()` cost so it does not run on every single drop.
 const CLEANUP_INTERVAL: u32 = 100;
 
+/// Hard upper bound on the number of distinct senders tracked per receiver
+/// (issue #1320). The amortized time-based cleanup runs only every
+/// [`CLEANUP_INTERVAL`] drops, so between passes the map could in principle
+/// accumulate one entry per distinct `sender_session_id` seen — a slow
+/// memory-amplification vector if a peer churns join/leave to cycle through
+/// server-assigned session ids (lower severity than #1303's client-forged
+/// KEYFRAME_REQUEST targets, since the id here is server-assigned, not in the
+/// packet payload). This cap is ~5–10× the largest realistic room, so it never
+/// constrains legitimate traffic; it only backstops the pathological case.
+/// At ~40 bytes per [`SenderDropState`], 256 entries is ~10 KB per receiver.
+const MAX_TRACKED_SENDERS: usize = 256;
+
 impl CongestionTracker {
     pub fn new() -> Self {
         Self {
@@ -148,15 +160,44 @@ impl CongestionTracker {
     /// `CONGESTION_WINDOW * 10` (10 seconds of inactivity) is removed. This
     /// prevents unbounded growth when transient participants leave while
     /// avoiding an O(n) `retain()` on every single drop.
+    /// Remove sender entries idle longer than `CONGESTION_WINDOW * 10` (10s of
+    /// no recorded drops). Shared by the amortized cleanup and the #1320
+    /// cap-pressure sweep.
+    fn evict_stale_senders(&mut self, now: Instant) {
+        let stale_threshold = CONGESTION_WINDOW * 10;
+        self.senders
+            .retain(|_, state| now.duration_since(state.window_start) <= stale_threshold);
+    }
+
     pub fn record_drop(&mut self, sender_session_id: u64) -> Option<u64> {
         let now = Instant::now();
 
         // Amortized cleanup of stale sender entries.
         self.total_drops = self.total_drops.wrapping_add(1);
         if self.total_drops.is_multiple_of(CLEANUP_INTERVAL) {
-            let stale_threshold = CONGESTION_WINDOW * 10;
-            self.senders
-                .retain(|_, state| now.duration_since(state.window_start) <= stale_threshold);
+            self.evict_stale_senders(now);
+        }
+
+        // #1320: hard entry-count bound as defense-in-depth on top of the
+        // amortized time-based cleanup above. If we are at the cap and this is a
+        // NEW sender, force an immediate stale sweep first; if STILL at the cap
+        // afterward, skip tracking this drop rather than grow the map unbounded.
+        // An ALREADY-tracked sender is never refused (its window/notify state and
+        // the #979 keyframe-relax path it feeds are untouched). Refusing a brand
+        // new sender only when the cap is genuinely full is harmless: at that
+        // point this receiver is already tracking MAX_TRACKED_SENDERS congested
+        // sources, `last_congestion` is already being driven, and
+        // `is_actively_congested()` already returns true — so the dropped
+        // tracking for one more sender costs nothing the relax path needs.
+        if self.senders.len() >= MAX_TRACKED_SENDERS
+            && !self.senders.contains_key(&sender_session_id)
+        {
+            self.evict_stale_senders(now);
+            if self.senders.len() >= MAX_TRACKED_SENDERS
+                && !self.senders.contains_key(&sender_session_id)
+            {
+                return None;
+            }
         }
 
         let state = self
@@ -771,6 +812,62 @@ mod tests {
         assert_eq!(tracker.senders.len(), 2);
         assert!(tracker.senders.contains_key(&100));
         assert!(tracker.senders.contains_key(&200));
+    }
+
+    /// #1320: the senders map must be hard-bounded at MAX_TRACKED_SENDERS. A NEW
+    /// sender beyond the cap (with no stale entries to evict) is refused so the
+    /// map cannot grow unbounded; an ALREADY-tracked sender is never refused.
+    ///
+    /// Mutation coverage: removing the cap gate inserts `over_cap_sender`, growing
+    /// the map to MAX+1 and failing the size/containment asserts. Dropping the
+    /// `!contains_key` term (refusing existing senders too) makes the established
+    /// sender's threshold-crossing return `None`, failing the final assert.
+    #[test]
+    fn test_congestion_tracker_bounds_senders_map_at_cap() {
+        let mut tracker = CongestionTracker::new();
+        let now = Instant::now();
+
+        // Fill to the cap with FRESH (non-stale) entries so the stale sweep
+        // cannot make room.
+        for id in 0..MAX_TRACKED_SENDERS as u64 {
+            tracker.senders.insert(
+                id,
+                SenderDropState {
+                    drop_count: 0,
+                    window_start: now,
+                    last_notify: None,
+                },
+            );
+        }
+        assert_eq!(tracker.senders.len(), MAX_TRACKED_SENDERS);
+
+        // A NEW sender beyond the cap must be REFUSED: no growth, returns None.
+        let over_cap_sender = MAX_TRACKED_SENDERS as u64 + 1;
+        assert_eq!(
+            tracker.record_drop(over_cap_sender),
+            None,
+            "a new sender at the cap must not be admitted"
+        );
+        assert!(
+            !tracker.senders.contains_key(&over_cap_sender),
+            "the over-cap sender must not be inserted"
+        );
+        assert_eq!(
+            tracker.senders.len(),
+            MAX_TRACKED_SENDERS,
+            "the map must not grow past MAX_TRACKED_SENDERS"
+        );
+
+        // An ALREADY-tracked sender is still recorded at the cap (never refused):
+        // prove the drop lands by crossing the congestion threshold.
+        let established = 0u64;
+        tracker.senders.get_mut(&established).unwrap().drop_count = CONGESTION_DROP_THRESHOLD - 1;
+        assert_eq!(
+            tracker.record_drop(established),
+            Some(established),
+            "an already-tracked sender must keep being recorded at the cap"
+        );
+        assert_eq!(tracker.senders.len(), MAX_TRACKED_SENDERS);
     }
 
     // =====================================================================

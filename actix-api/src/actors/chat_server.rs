@@ -2811,6 +2811,16 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                     members.retain(|m| m.session != session);
                     room_became_empty = members.is_empty();
                 }
+                // Unlike `leave_rooms` / `forget_session`, this branch does NOT
+                // call `forget_layer_hint_state_for_source`, and deliberately so:
+                // both LAYER_HINT maps (`layer_hint_state` and the #1118 N1
+                // `layer_hint_recheck_handles`) are keyed by SOURCE publisher, and
+                // a never-activated session (an RTT-election loser) never broadcast
+                // PARTICIPANT_JOINED, so no peer ever subscribed to it, sent a
+                // LAYER_PREFERENCE against it, or caused a union/hint to be computed
+                // for it as a source. It therefore holds no entry in either map —
+                // there is nothing to reap, and the per-`(source, kind)` recheck
+                // invariant is not stranded.
                 self.forget_room_if_empty(&room);
                 if let Some(iid) = self.session_instance.remove(&session) {
                     if self.instance_index.get(&iid).copied() == Some(session) {
@@ -13445,10 +13455,14 @@ mod tests {
     ///
     /// MUTATION PROOF: delete the `SkipClearPending` arm's
     /// `layer_hint_recheck_handles.remove(&key) -> cancel_future` (the N1 cancel)
-    /// and proof (1) trips on the first cycle (`after_restore` becomes 1, not 0);
-    /// replace that `cancel_future(handle)` with a bare `remove` (drop the handle
-    /// without cancelling) and proof (1) still passes but proof (2) trips — the
-    /// surviving timer fires after the window and bumps the counter above 0.
+    /// and proof (1) trips on cycle 0's `after_drop` (it reads 3, not 1): the
+    /// un-cancelled re-check timers accumulate — including the ones armed
+    /// transiently when each member joined solo (a publisher with no receivers has
+    /// union 0, a downgrade), which the restore's `SkipClearPending` is what
+    /// normally reaps. Separately, replace that `cancel_future(handle)` with a bare
+    /// `remove` (drop the handle without cancelling) and proof (1) still passes but
+    /// proof (2) trips — the surviving timer fires after the window and bumps the
+    /// counter above 0 (verified: 9).
     #[actix_rt::test]
     #[serial]
     async fn test_1118_n1_orphaned_recheck_timers_are_cancelled() {

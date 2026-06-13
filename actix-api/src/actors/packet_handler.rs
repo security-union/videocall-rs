@@ -723,7 +723,12 @@ pub fn outbound_keyframe_observation(data: &[u8]) -> Option<(KeyframeTarget, Key
     let mut packet_type: i32 = 0;
     let mut media_kind: i32 = 0;
     let mut session_id: u64 = 0;
-    let mut user_id: Vec<u8> = Vec::new();
+    // #1306: capture the user_id byte RANGE within `data` rather than copying it.
+    // This runs per outbound media frame; the user_id is only consumed (via
+    // `from_request`'s `to_vec`) in the rare `session_id == 0` fallback, so a
+    // per-frame `read_bytes` allocation is pure waste in the common session-keyed
+    // path. Materialized as a slice only at the end, and only when needed.
+    let mut user_id_range: Option<(usize, usize)> = None;
 
     loop {
         let raw_tag = match is.read_raw_tag_or_eof() {
@@ -743,10 +748,24 @@ pub fn outbound_keyframe_observation(data: &[u8]) -> Option<(KeyframeTarget, Key
                 };
             }
             (FIELD_USER_ID, WireType::LengthDelimited) => {
-                user_id = match is.read_bytes() {
-                    Ok(v) => v,
+                // Read the length prefix and record the slice bounds WITHOUT
+                // copying (vs `read_bytes`, which allocates a Vec). Bounds-check
+                // against `data` before trusting the attacker-controllable length,
+                // then skip the bytes to keep parsing — exactly what `read_bytes`
+                // does internally, minus the allocation.
+                let len = match is.read_raw_varint64() {
+                    Ok(v) => v as usize,
                     Err(_) => return None,
                 };
+                let start = is.pos() as usize;
+                let end = match start.checked_add(len) {
+                    Some(end) if end <= data.len() => end,
+                    _ => return None,
+                };
+                if is.skip_raw_bytes(len as u32).is_err() {
+                    return None;
+                }
+                user_id_range = Some((start, end));
             }
             (FIELD_SESSION_ID, WireType::Varint) => {
                 session_id = match is.read_uint64() {
@@ -786,8 +805,14 @@ pub fn outbound_keyframe_observation(data: &[u8]) -> Option<(KeyframeTarget, Key
     };
 
     // Mirror the request-side target construction so the delivery key JOINS the
-    // request key (session when set, else user_id — #1124).
-    let target = KeyframeTarget::from_request(&user_id, session_id);
+    // request key (session when set, else user_id — #1124). The user_id slice is
+    // materialized (and copied by `from_request`) ONLY in the `session_id == 0`
+    // fallback; the common session-keyed path never touches it.
+    let user_id: &[u8] = match user_id_range {
+        Some((start, end)) => &data[start..end],
+        None => &[],
+    };
+    let target = KeyframeTarget::from_request(user_id, session_id);
     Some((target, kind))
 }
 
@@ -2084,6 +2109,48 @@ mod tests {
             outbound_keyframe_observation(&[1, 2, 3, 0xff]),
             None,
             "unparseable bytes fail safe to no observation"
+        );
+    }
+
+    #[test]
+    fn test_outbound_observation_user_fallback_when_session_zero() {
+        // #1124: when the outer session_id is 0 (legacy user-id-wide case) the
+        // observation falls back to KeyframeTarget::User(user_id). This is the
+        // ONLY path that materializes the user_id bytes, so it pins the #1306
+        // zero-copy range capture: an off-by-one or wrong offset in the recorded
+        // (start, end) range would corrupt the extracted user_id and fail the
+        // equality below. The multi-KB `data` (field 3) is serialized AFTER
+        // user_id (field 2), proving the recorded range stays valid across the
+        // skip of the payload.
+        let user_id = b"publisher@example.com".to_vec();
+        let delivered = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id: 0,
+            user_id: user_id.clone(),
+            media_kind: MediaKind::VIDEO.into(),
+            data: vec![7u8; 4096],
+            ..Default::default()
+        };
+        let raw = delivered.write_to_bytes().unwrap();
+        assert_eq!(
+            outbound_keyframe_observation(&raw),
+            Some((KeyframeTarget::User(user_id), KeyframeMediaKind::Video)),
+            "session_id == 0 must fall back to the EXACT user_id bytes (zero-copy range capture)"
+        );
+
+        // An empty/absent user_id with session 0 must still parse and yield the
+        // empty-user target (the `None` range arm), never panic.
+        let no_user = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id: 0,
+            media_kind: MediaKind::VIDEO.into(),
+            data: vec![0u8; 16],
+            ..Default::default()
+        };
+        assert_eq!(
+            outbound_keyframe_observation(&no_user.write_to_bytes().unwrap()),
+            Some((KeyframeTarget::User(Vec::new()), KeyframeMediaKind::Video)),
+            "session 0 with no user_id yields the empty-user target without panicking"
         );
     }
 

@@ -203,7 +203,7 @@ message HealthPacket {
   optional double render_fps = 66;
 
   // Compatibility field added after TELEM-7/8/9 consumed 56-66.
-  optional double encoder_p75_peer_fps = 67;       // p75 peer FPS driving encoder decisions
+  optional double encoder_p75_peer_fps = 67;       // sender-side encoder queue depth (backpressure) driving encoder decisions; field NAME frozen — value is queue depth, NOT p75 peer FPS (#1231/#1263)
 
   // Adaptive decode-budget controller state (#987). Surfaces the receiver-side
   // tile-cap decision so population-scale dashboards can see the adaptive loop's

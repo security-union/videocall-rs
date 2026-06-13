@@ -189,8 +189,10 @@ pub struct HealthReporter {
     adaptive_video_tier: Rc<RefCell<Rc<AtomicU32>>>,
     /// Adaptive audio tier index from CameraEncoder (0=high, 3=emergency).
     adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
-    /// Encoder p75 peer FPS (f32 bits in AtomicU32).
-    encoder_p75_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Sender-side encoder queue-depth report (f32 bits in AtomicU32) — encoder backpressure, NOT
+    /// p75 peer FPS (the value was always queue depth; see #1231/#1263). Serialized to the
+    /// frozen-named proto field `encoder_p75_peer_fps = 67`, whose name predates the correction.
+    encoder_queue_depth_report: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder PID target bitrate kbps (f32 bits in AtomicU32).
     encoder_target_bitrate_kbps: Rc<RefCell<Rc<AtomicU32>>>,
     /// Screen share quality tier index.
@@ -402,7 +404,7 @@ impl HealthReporter {
             connection_controller: Rc::new(RefCell::new(None)),
             adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            encoder_p75_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_queue_depth_report: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
@@ -513,7 +515,7 @@ impl HealthReporter {
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &mut self,
-        p75_peer_fps: Rc<AtomicU32>,
+        queue_depth_report: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
@@ -525,7 +527,7 @@ impl HealthReporter {
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
     ) {
-        *self.encoder_p75_peer_fps.borrow_mut() = p75_peer_fps;
+        *self.encoder_queue_depth_report.borrow_mut() = queue_depth_report;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
         *self.adaptive_screen_tier.borrow_mut() = screen_tier;
         *self.screen_sharing_active.borrow_mut() = screen_active;
@@ -1062,7 +1064,7 @@ impl HealthReporter {
         let connection_controller = Rc::downgrade(&self.connection_controller);
         let adaptive_video_tier = self.adaptive_video_tier.clone();
         let adaptive_audio_tier = self.adaptive_audio_tier.clone();
-        let encoder_p75_peer_fps = self.encoder_p75_peer_fps.clone();
+        let encoder_queue_depth_report = self.encoder_queue_depth_report.clone();
         let encoder_target_bitrate_kbps = self.encoder_target_bitrate_kbps.clone();
         let adaptive_screen_tier = self.adaptive_screen_tier.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
@@ -1148,9 +1150,9 @@ impl HealthReporter {
                             };
 
                         // Read encoder decision inputs from shared atomics (f32 bits → f64).
-                        let p75_peer_fps_val =
-                            f32::from_bits(encoder_p75_peer_fps.borrow().load(Ordering::Relaxed))
-                                as f64;
+                        let queue_depth_report_val = f32::from_bits(
+                            encoder_queue_depth_report.borrow().load(Ordering::Relaxed),
+                        ) as f64;
                         let target_bitrate_kbps_val = f32::from_bits(
                             encoder_target_bitrate_kbps.borrow().load(Ordering::Relaxed),
                         ) as f64;
@@ -1236,7 +1238,7 @@ impl HealthReporter {
                             videocall_transport::webtransport::datagram_drop_count(),
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
-                            p75_peer_fps_val,
+                            queue_depth_report_val,
                             target_bitrate_kbps_val,
                             screen_tier_val,
                             screen_active_val,
@@ -1300,7 +1302,7 @@ impl HealthReporter {
         datagram_drops_total: u64,
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
-        encoder_p75_peer_fps: f64,
+        encoder_queue_depth_report: f64,
         encoder_target_bitrate_kbps: f64,
         adaptive_screen_tier: u32,
         screen_sharing_active: bool,
@@ -1376,8 +1378,8 @@ impl HealthReporter {
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
         // Encoder decision inputs (P0)
-        if encoder_p75_peer_fps.is_finite() {
-            pb.encoder_p75_peer_fps = Some(encoder_p75_peer_fps);
+        if encoder_queue_depth_report.is_finite() {
+            pb.encoder_p75_peer_fps = Some(encoder_queue_depth_report);
         }
         pb.adaptive_screen_tier = Some(adaptive_screen_tier);
         pb.screen_sharing_active = Some(screen_sharing_active);
@@ -2082,7 +2084,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -2160,7 +2162,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -2214,7 +2216,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -2368,7 +2370,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,

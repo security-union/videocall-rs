@@ -920,6 +920,23 @@ pub struct ChatServer {
     /// TRAILING (dedups the whole burst) rather than per-event. Cancelled in
     /// [`Actor::stopping`] so a stopped actor leaks no `SpawnHandle`.
     recompute_coalesce_handle: Option<SpawnHandle>,
+    /// In-flight suppress-lazy re-check timers, keyed by `(room, source session,
+    /// media_kind)` — parallel to [`ChatServer::layer_hint_state`] (#1118 N1).
+    ///
+    /// `recompute_layer_hints_for_source` arms ONE `notify_later`
+    /// [`RecomputeLayerHints`] timer per `(room, source, kind)` whose union just
+    /// dropped (a `ScheduleRecheck`) to re-evaluate after
+    /// [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`]. Storing the `SpawnHandle` lets us
+    /// CANCEL that pending re-check the moment it is no longer needed: when demand
+    /// returns to the emitted level (`SkipClearPending`), when we emit (the
+    /// re-check matured or was superseded by an eager restore), and when the
+    /// publisher leaves ([`ChatServer::forget_layer_hint_state_for_source`]).
+    /// Without this, rapid drop→restore→drop churn at the ~200 ms preference
+    /// cadence accumulated orphaned timers (bounded — ~10 per key, self-draining
+    /// after the window, and safe since a fired re-check hits the
+    /// `!is_member`/`SkipClearPending` no-op — but wasteful). Cancelled wholesale
+    /// in [`Actor::stopping`] so a stopped actor leaks no `SpawnHandle`.
+    layer_hint_recheck_handles: HashMap<(String, SessionId, i32), SpawnHandle>,
 }
 
 impl ChatServer {
@@ -943,6 +960,7 @@ impl ChatServer {
             layer_hint_state: HashMap::new(),
             pending_recompute_rooms: std::collections::HashSet::new(),
             recompute_coalesce_handle: None,
+            layer_hint_recheck_handles: HashMap::new(),
         }
     }
 
@@ -1051,7 +1069,7 @@ impl ChatServer {
             //      / meeting-end disconnect burst into ONE recompute over settled
             //      membership avoids the O(n) per-connection storm. (JOINs stay
             //      immediate — a real viewer waits on their tile.)
-            self.forget_layer_hint_state_for_source(room_id, *session_id);
+            self.forget_layer_hint_state_for_source(room_id, *session_id, actor_ctx);
             if !room_became_empty {
                 let room_owned = room_id.to_string();
                 self.schedule_coalesced_recompute(&room_owned, actor_ctx);
@@ -1409,7 +1427,7 @@ impl ChatServer {
         // #1203: COALESCED behind the trailing debounce, same as the
         // `leave_rooms` departure trigger above — eviction is a departure and a
         // reconnection wave evicts many stale sessions in a burst.
-        self.forget_layer_hint_state_for_source(room, session_id);
+        self.forget_layer_hint_state_for_source(room, session_id, ctx);
         if room_still_populated {
             self.schedule_coalesced_recompute(room, ctx);
         }
@@ -1476,9 +1494,11 @@ impl ChatServer {
     ///
     /// Collects every kind whose debounce decision is `Emit` into a single
     /// `LayerHintPacket` and publishes it once to the publisher's self-subject.
-    /// Kinds that need the suppress-lazy window cause one deferred
-    /// `notify_later` re-check to be scheduled (idempotent — the re-check simply
-    /// recomputes the then-current union).
+    /// Each kind that needs the suppress-lazy window arms its OWN deferred
+    /// `notify_later` re-check (tracked in [`ChatServer::layer_hint_recheck_handles`]
+    /// keyed `(room, source, kind)`) so the timer can be cancelled the instant the
+    /// downgrade is resolved (#1118 N1); the re-check is idempotent — it simply
+    /// recomputes the then-current union.
     fn recompute_layer_hints_for_source(
         &mut self,
         room: &str,
@@ -1501,7 +1521,6 @@ impl ChatServer {
 
         let mut entries: Vec<LayerHintEntry> = Vec::new();
         let mut emit_directions: Vec<LayerHintDirection> = Vec::new();
-        let mut schedule_recheck = false;
 
         for &kind in LAYER_HINT_MEDIA_KINDS.iter() {
             let union = self.max_requested_layer(room, source, kind);
@@ -1513,12 +1532,21 @@ impl ChatServer {
                     // Record the emission: clear any pending downgrade and store
                     // the value we are about to tell the publisher.
                     self.layer_hint_state.insert(
-                        key,
+                        key.clone(),
                         LayerHintEmitState {
                             last_emitted: value,
                             pending_lower_since: None,
                         },
                     );
+                    // The downgrade (if any) is resolved: this is either the
+                    // matured suppress firing from its own re-check timer, or an
+                    // eager restore superseding a still-pending downgrade. Either
+                    // way the re-check timer for this key is done/orphaned —
+                    // cancel + drop it (#1118 N1). Cancelling an already-fired
+                    // handle is a harmless no-op.
+                    if let Some(handle) = self.layer_hint_recheck_handles.remove(&key) {
+                        ctx.cancel_future(handle);
+                    }
                     let mut entry = LayerHintEntry::new();
                     entry.media_kind = layer_hint_media_kind(kind).into();
                     entry.max_requested_layer = value;
@@ -1526,19 +1554,40 @@ impl ChatServer {
                     emit_directions.push(direction);
                 }
                 LayerHintDecision::ScheduleRecheck { .. } => {
-                    // Mark the pending downgrade so the (eventual) re-check knows
-                    // the window is already counting, and arrange exactly one
-                    // deferred recompute for this source.
-                    let entry = self
-                        .layer_hint_state
-                        .entry(key)
-                        .or_insert(LayerHintEmitState {
-                            last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
-                            pending_lower_since: None,
-                        });
-                    if entry.pending_lower_since.is_none() {
-                        entry.pending_lower_since = Some(now);
-                        schedule_recheck = true;
+                    // First observation of this downgrade: record the pending
+                    // timestamp (scoped so the `layer_hint_state` borrow ends
+                    // before we touch `layer_hint_recheck_handles`).
+                    let newly_pending = {
+                        let entry = self.layer_hint_state.entry(key.clone()).or_insert(
+                            LayerHintEmitState {
+                                last_emitted: LAYER_HINT_FULL_LADDER_SENTINEL,
+                                pending_lower_since: None,
+                            },
+                        );
+                        if entry.pending_lower_since.is_none() {
+                            entry.pending_lower_since = Some(now);
+                            true
+                        } else {
+                            false
+                        }
+                    };
+                    if newly_pending {
+                        // Arm a per-`(source, kind)` suppress-lazy re-check at
+                        // `now + window` and remember its handle so it can be
+                        // cancelled if demand returns before the deadline
+                        // (#1118 N1). `pending_lower_since` was None, so no live
+                        // timer exists for this key; any prior handle is stale and
+                        // cancelled defensively on insert.
+                        let handle = ctx.notify_later(
+                            RecomputeLayerHints {
+                                room: room.to_string(),
+                                source: Some(source),
+                            },
+                            window,
+                        );
+                        if let Some(old) = self.layer_hint_recheck_handles.insert(key, handle) {
+                            ctx.cancel_future(old);
+                        }
                     }
                 }
                 LayerHintDecision::SkipClearPending => {
@@ -1549,32 +1598,23 @@ impl ChatServer {
                     if let Some(state) = self.layer_hint_state.get_mut(&key) {
                         state.pending_lower_since = None;
                     }
+                    // Its re-check timer (if armed) is now orphaned — the downgrade
+                    // it was waiting out has been cancelled by restored demand.
+                    // Cancel + drop it so drop→restore→drop churn cannot accumulate
+                    // timers (#1118 N1).
+                    if let Some(handle) = self.layer_hint_recheck_handles.remove(&key) {
+                        ctx.cancel_future(handle);
+                    }
                 }
                 LayerHintDecision::SkipKeepPending => {
                     // Still counting down toward the original deadline — leave the
-                    // pending timestamp untouched.
+                    // pending timestamp and its in-flight re-check timer untouched.
                 }
             }
         }
 
         if !entries.is_empty() {
             self.emit_layer_hint(room, source, entries, &emit_directions);
-        }
-
-        if schedule_recheck {
-            // Deferred suppress-lazy re-check: re-evaluate this source's unions
-            // after the debounce window. Re-running is safe/idempotent — the
-            // decision is a pure function of persisted state + the then-current
-            // union, so a flapping receiver that has since restored demand simply
-            // yields a skip (or an eager restore) at the deadline instead of the
-            // suppress.
-            ctx.notify_later(
-                RecomputeLayerHints {
-                    room: room.to_string(),
-                    source: Some(source),
-                },
-                window,
-            );
         }
     }
 
@@ -1671,9 +1711,29 @@ impl ChatServer {
     /// Drop all LAYER_HINT debounce state for a departed publisher `source` in
     /// `room` (#1108). Called from the teardown paths so the
     /// `layer_hint_state` map cannot leak entries for sessions that have left.
-    fn forget_layer_hint_state_for_source(&mut self, room: &str, source: SessionId) {
+    ///
+    /// Also cancels + drops any in-flight suppress-lazy re-check timers for this
+    /// source (#1118 N1) so a departed publisher leaks no `SpawnHandle` and no
+    /// orphaned re-check fires after teardown (it would no-op on `!is_member`, but
+    /// reaping the timer is cheaper and mirrors the `layer_hint_state` reap and the
+    /// `pending_departures` `cancel_future` cleanup elsewhere).
+    fn forget_layer_hint_state_for_source(
+        &mut self,
+        room: &str,
+        source: SessionId,
+        ctx: &mut Context<Self>,
+    ) {
         self.layer_hint_state
             .retain(|(r, s, _kind), _| !(r == room && *s == source));
+        self.layer_hint_recheck_handles
+            .retain(|(r, s, _kind), handle| {
+                if r == room && *s == source {
+                    ctx.cancel_future(*handle);
+                    false
+                } else {
+                    true
+                }
+            });
     }
 
     /// Coalesce a DEPARTURE-driven (leave/evict) room-wide LAYER_HINT recompute
@@ -1866,15 +1926,22 @@ impl Actor for ChatServer {
         });
     }
 
-    /// Cancel the in-flight #1203 coalescing timer on actor stop so a stopping
+    /// Cancel every in-flight LAYER_HINT timer on actor stop so a stopping
     /// `ChatServer` leaks no `SpawnHandle` (mirrors the `pending_departures`
-    /// `cancel_future` cleanup elsewhere). Dropping any not-yet-flushed pending
-    /// rooms is correct: a stopping relay has no publishers left to hint.
+    /// `cancel_future` cleanup elsewhere): the single #1203 departure-coalescing
+    /// timer AND every per-`(room, source, kind)` suppress-lazy re-check timer
+    /// (#1118 N1). Dropping any not-yet-flushed pending rooms / re-checks is
+    /// correct: a stopping relay has no publishers left to hint.
     fn stopping(&mut self, ctx: &mut Self::Context) -> actix::Running {
         if let Some(handle) = self.recompute_coalesce_handle.take() {
             ctx.cancel_future(handle);
         }
         self.pending_recompute_rooms.clear();
+        // Cancel every in-flight suppress-lazy re-check timer too (#1118 N1) so a
+        // stopping `ChatServer` leaks no `SpawnHandle`.
+        for (_key, handle) in self.layer_hint_recheck_handles.drain() {
+            ctx.cancel_future(handle);
+        }
         actix::Running::Stop
     }
 }
@@ -2514,6 +2581,62 @@ impl Handler<TestCoalesceState> for ChatServer {
     }
 }
 
+/// Test-only (#1118 N1): directly seed or clear ONE receiver's recorded layer
+/// preference for a `(source, kind)`, then run the REAL
+/// `recompute_layer_hints_for_source` for `source`. Returns the number of
+/// in-flight suppress-lazy re-check timers currently tracked for `source` (across
+/// kinds), so a churn test can assert orphaned timers are cancelled rather than
+/// accumulated. Drives the real arm/cancel paths — it does NOT bump
+/// [`RECOMPUTE_LAYER_HINTS_INVOCATIONS`] (that counts only timer-driven handler
+/// entries), so a separate fire-count assertion can prove the actix timer itself
+/// was cancelled (not merely dropped from the map).
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "usize")]
+struct TestSeedPrefAndRecompute {
+    room: String,
+    receiver: SessionId,
+    source: SessionId,
+    kind: i32,
+    /// `Some(layer)` records a downgrade preference; `None` clears it (a
+    /// fail-open restore).
+    desired: Option<u32>,
+}
+
+#[cfg(test)]
+impl Handler<TestSeedPrefAndRecompute> for ChatServer {
+    type Result = MessageResult<TestSeedPrefAndRecompute>;
+
+    fn handle(&mut self, msg: TestSeedPrefAndRecompute, ctx: &mut Self::Context) -> Self::Result {
+        let prefs = self.session_layer_prefs.entry(msg.receiver).or_default();
+        {
+            let mut guard = prefs
+                .state
+                .write()
+                .expect("prefs lock should not be poisoned");
+            match msg.desired {
+                Some(layer) => {
+                    guard.layers.insert((msg.source, msg.kind), layer);
+                }
+                None => {
+                    guard.layers.remove(&(msg.source, msg.kind));
+                }
+            }
+            let any = !guard.layers.is_empty();
+            prefs
+                .non_empty
+                .store(any, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.recompute_layer_hints_for_source(&msg.room, msg.source, ctx);
+        let count = self
+            .layer_hint_recheck_handles
+            .keys()
+            .filter(|(r, s, _kind)| *r == msg.room && *s == msg.source)
+            .count();
+        MessageResult(count)
+    }
+}
+
 /// Handle per-room policy updates fanned out by `meeting-api` over
 /// [`MEETING_SETTINGS_UPDATE_SUBJECT`].
 ///
@@ -2695,6 +2818,16 @@ impl Handler<ExecutePendingDeparture> for ChatServer {
                     members.retain(|m| m.session != session);
                     room_became_empty = members.is_empty();
                 }
+                // Unlike `leave_rooms` / `forget_session`, this branch does NOT
+                // call `forget_layer_hint_state_for_source`, and deliberately so:
+                // both LAYER_HINT maps (`layer_hint_state` and the #1118 N1
+                // `layer_hint_recheck_handles`) are keyed by SOURCE publisher, and
+                // a never-activated session (an RTT-election loser) never broadcast
+                // PARTICIPANT_JOINED, so no peer ever subscribed to it, sent a
+                // LAYER_PREFERENCE against it, or caused a union/hint to be computed
+                // for it as a source. It therefore holds no entry in either map —
+                // there is nothing to reap, and the per-`(source, kind)` recheck
+                // invariant is not stranded.
                 self.forget_room_if_empty(&room);
                 if let Some(iid) = self.session_instance.remove(&session) {
                     if self.instance_index.get(&iid).copied() == Some(session) {
@@ -13477,6 +13610,152 @@ mod tests {
         assert!(
             !armed_final,
             "the flush must clear the timer handle so the next burst re-arms fresh"
+        );
+    }
+
+    /// #1118 N1: a downgrade arms exactly ONE suppress-lazy re-check timer per
+    /// `(source, kind)`, and restoring demand CANCELS it — so rapid
+    /// drop→restore→drop churn cannot accumulate orphaned timers.
+    ///
+    /// Two independent proofs, because a structural map check alone is fakeable
+    /// (a `remove` without `cancel_future` would drop the map entry while leaving
+    /// the actix timer scheduled):
+    ///   1. STRUCTURAL — after each DROP the tracked re-check-timer count for the
+    ///      publisher is 1; after each RESTORE it is 0.
+    ///   2. BEHAVIORAL — after the churn (ended on a RESTORE) the recompute
+    ///      counter is reset and the FULL debounce window is waited out; no
+    ///      orphaned re-check may fire. This only passes if `cancel_future` was
+    ///      actually called: merely dropping the `SpawnHandle` does NOT cancel an
+    ///      actix `notify_later` timer.
+    ///
+    /// MUTATION PROOF: delete the `SkipClearPending` arm's
+    /// `layer_hint_recheck_handles.remove(&key) -> cancel_future` (the N1 cancel)
+    /// and proof (1) trips on cycle 0's `after_drop` (it reads 3, not 1): the
+    /// un-cancelled re-check timers accumulate — including the ones armed
+    /// transiently when each member joined solo (a publisher with no receivers has
+    /// union 0, a downgrade), which the restore's `SkipClearPending` is what
+    /// normally reaps. Separately, replace that `cancel_future(handle)` with a bare
+    /// `remove` (drop the handle without cancelling) and proof (1) still passes but
+    /// proof (2) trips — the surviving timer fires after the window and bumps the
+    /// counter above 0 (verified: 9).
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1118_n1_orphaned_recheck_timers_are_cancelled() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        // A no-op session recipient so JoinRoom (which needs a registered
+        // `Recipient<Message>`) succeeds; it never sends, so no LAYER_PREFERENCE
+        // interceptor recompute fires from this test.
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+        async fn join_member(chat: &Addr<ChatServer>, session: SessionId, iid: &str, room: &str) {
+            let dummy = DummySession.start();
+            chat.send(Connect {
+                id: session,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+            chat.send(JoinRoom {
+                session,
+                room: room.to_string(),
+                user_id: format!("{iid}@example.com"),
+                display_name: iid.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some(iid.to_string()),
+                is_host: false,
+                end_on_host_leave: false,
+                transport: "websocket".to_string(),
+            })
+            .await
+            .expect("JoinRoom delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        }
+
+        let room = "i1118n1-churn-room".to_string();
+        let publisher: SessionId = 1_118_001;
+        let receiver: SessionId = 1_118_002;
+        const VIDEO_KIND: i32 = 1;
+
+        // Publisher (the hinted source) + a constraining receiver, both real
+        // members so `is_member` passes and the receiver participates in the
+        // union. `receiver != publisher` (a publisher is not a receiver of itself).
+        join_member(&chat, publisher, "i1118n1-pub", &room).await;
+        join_member(&chat, receiver, "i1118n1-rcv", &room).await;
+
+        // Drain the JoinRoom-restore recomputes (fail-open, no timers armed).
+        let _ = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+
+        // --- Proof (1): structural arm/cancel across drop→restore churn. ---
+        for cycle in 0..6 {
+            // DROP: the receiver asks for layer 0 of the publisher's VIDEO → the
+            // union falls below the (sentinel) last-emitted → ScheduleRecheck arms
+            // exactly one re-check timer for (room, publisher, VIDEO).
+            let after_drop = chat
+                .send(TestSeedPrefAndRecompute {
+                    room: room.clone(),
+                    receiver,
+                    source: publisher,
+                    kind: VIDEO_KIND,
+                    desired: Some(0),
+                })
+                .await
+                .expect("seed-drop delivery should succeed");
+            assert_eq!(
+                after_drop, 1,
+                "cycle {cycle}: a downgrade must arm exactly ONE re-check timer"
+            );
+
+            // RESTORE: clear the preference → union returns to the emitted level →
+            // SkipClearPending must cancel + drop the pending re-check timer.
+            let after_restore = chat
+                .send(TestSeedPrefAndRecompute {
+                    room: room.clone(),
+                    receiver,
+                    source: publisher,
+                    kind: VIDEO_KIND,
+                    desired: None,
+                })
+                .await
+                .expect("seed-restore delivery should succeed");
+            assert_eq!(
+                after_restore, 0,
+                "cycle {cycle}: restoring demand must CANCEL the pending re-check \
+                 timer — no orphan may remain tracked"
+            );
+        }
+
+        // --- Proof (2): no orphaned actix timer survives to fire. ---
+        // Reset AFTER the churn (the seed messages call the inner fn directly and
+        // never bump this counter; only a timer-driven RecomputeLayerHints does).
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        // Wait out the FULL debounce window + slack. Every drop timer was armed at
+        // its drop time + window and cancelled by the following restore, so none
+        // may fire.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_SUPPRESS_DEBOUNCE_MS + 400,
+        ))
+        .await;
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "no orphaned suppress re-check may fire after the window once demand \
+             was restored (a non-zero count means a cancelled timer still ran)"
         );
     }
 }

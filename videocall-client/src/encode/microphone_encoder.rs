@@ -107,9 +107,10 @@ fn clamp_audio_layer_count(max_layers: u32) -> u32 {
 ///
 /// NOTE (#1201 — accepted design): this user SEND ceiling is the ONLY runtime
 /// gate on audio rungs. Unlike video/screen, audio has NO runtime shed from
-/// encoder backpressure, the relay layer-union, or a `LAYER_HINT`: the relay
-/// computes no AUDIO union (#1118 N3) and the client ignores AUDIO hints. So at
-/// the default (Auto) ceiling the full 24/32/50 kbps ladder (~106 kbps) is
+/// encoder backpressure, the relay layer-union, or a `LAYER_HINT`: the client
+/// ignores AUDIO hints, and the relay stops computing the AUDIO union under
+/// #1118 N3 (PR #1330). So at the default (Auto) ceiling the full
+/// 24/32/50 kbps ladder (~106 kbps) is
 /// published unconditionally — a deliberate, documented cost (audio is ~1-3% of
 /// call bandwidth). A publisher-side audio shed was rejected because today's only
 /// signal is the receiver's VIDEO-downlink proxy, and shedding audio on a

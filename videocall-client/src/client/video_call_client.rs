@@ -3198,11 +3198,12 @@ impl Inner {
                             // composes it with backpressure + the real ladder depth
                             // (fail-open if the value is the u32::MAX sentinel).
                             // AUDIO entries are ignored on purpose (#1201): audio
-                            // HAS a 3-rung ladder (#1086), but the publisher does
-                            // not act on a relay AUDIO hint and the relay computes
-                            // no AUDIO union (#1118 N3), so the full audio ladder is
-                            // always published. UNSPECIFIED is the back-compat
-                            // default the relay never emits. Ignore both (fail-open).
+                            // HAS a 3-rung ladder (#1086), but the publisher never
+                            // acts on a relay AUDIO hint, so the full audio ladder is
+                            // always published (the relay side stops emitting the
+                            // AUDIO union under #1118 N3 / PR #1330). UNSPECIFIED is
+                            // the back-compat default the relay never emits. Ignore
+                            // both (fail-open).
                             for entry in &hint.entries {
                                 match entry.media_kind.enum_value() {
                                     Ok(MediaKind::VIDEO) => {

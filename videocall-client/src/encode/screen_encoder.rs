@@ -52,7 +52,7 @@ use web_sys::VideoTrack;
 use super::super::client::VideoCallClient;
 use super::classify_encode_error::classify_encode_error;
 use super::classify_encode_error::EncodeErrorBucket;
-use super::encoder_state::EncoderState;
+use super::encoder_state::{pli_keyframe_allowed, EncoderState};
 use super::transform::transform_screen_chunk;
 use crate::crypto::aes::Aes128State;
 
@@ -2485,7 +2485,12 @@ impl ScreenEncoder {
             };
 
             let mut screen_frame_counter: u32 = 0;
-            let mut last_pli_keyframe_time: f64 = 0.0;
+            // Wall-clock (`performance.now()`, ms) of the last keyframe this screen
+            // publisher emitted — periodic OR PLI-forced. Drives the forced-keyframe
+            // emit coalescer (issues #1287/#1312/#1322): PLIs landing within
+            // ENCODER_PLI_COOLDOWN_MS of the last keyframe are held pending, not
+            // re-emitted. `None` until the first keyframe goes out.
+            let mut last_keyframe_emit_ms: Option<f64> = None;
             let mut current_encoder_width = width;
             let mut current_encoder_height = height;
 
@@ -2933,35 +2938,56 @@ impl ScreenEncoder {
                         }
 
                         let opts = VideoEncoderEncodeOptions::new();
-                        // Check if a keyframe was requested via PLI.
-                        let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
+                        // Emit-side PLI coalescer (issues #1287/#1312/#1322). A forced
+                        // keyframe is broadcast to ALL receivers, so ONE emission
+                        // satisfies every pending requester. PEEK the request flag
+                        // (`load`, not `swap`) and only honor it outside the
+                        // forced-keyframe cooldown window. A request that arrives
+                        // mid-window is left PENDING (flag not cleared) and honored the
+                        // instant the window expires — never dropped. (The prior `swap`
+                        // cleared the flag unconditionally, so a PLI landing mid-cooldown
+                        // was LOST instead of held — issue #1322.) The shared
+                        // `pli_keyframe_allowed` predicate is the single source of truth
+                        // for the window comparison; screen uses a longer cooldown than
+                        // camera (screen content tolerates more aggressive coalescing).
                         let now = window()
                             .performance()
                             .expect("Performance API not available")
                             .now();
-                        let pli_cooldown_ok =
-                            (now - last_pli_keyframe_time) >= ENCODER_PLI_COOLDOWN_MS;
-                        let force_pli = pli_requested && pli_cooldown_ok;
-                        if force_pli {
-                            last_pli_keyframe_time = now;
-                        }
+                        let pli_pending = force_keyframe.load(Ordering::Acquire);
+                        let force_pli = pli_pending
+                            && pli_keyframe_allowed(
+                                now,
+                                last_keyframe_emit_ms,
+                                ENCODER_PLI_COOLDOWN_MS,
+                            );
                         // Use tier-controlled keyframe interval.
                         // Using `%` instead of `.is_multiple_of()` for compatibility
                         // with Rust toolchains older than 1.87.
                         #[allow(clippy::manual_is_multiple_of)]
                         let is_periodic_keyframe = local_keyframe_interval > 0
                             && screen_frame_counter % local_keyframe_interval == 0;
-                        opts.set_key_frame(is_periodic_keyframe || force_pli);
+                        let want_keyframe = is_periodic_keyframe || force_pli;
+                        if want_keyframe {
+                            // ANY keyframe (periodic or forced) is broadcast to the whole
+                            // room and satisfies every pending PLI, so clear the request
+                            // flag and (re)start the cooldown window from this emission.
+                            // Clearing here — only when we actually emit — is what lets a
+                            // mid-cooldown request survive to be honored at window expiry.
+                            force_keyframe.store(false, Ordering::Release);
+                            last_keyframe_emit_ms = Some(now);
+                        }
+                        opts.set_key_frame(want_keyframe);
                         if force_pli {
                             log::info!(
                                 "ScreenEncoder: forcing keyframe at frame {} (PLI)",
                                 screen_frame_counter
                             );
-                        } else if pli_requested {
+                        } else if pli_pending {
                             log::info!(
-                                "ScreenEncoder: PLI keyframe suppressed at frame {} (cooldown: {:.0}ms since last)",
+                                "ScreenEncoder: PLI keyframe held at frame {} (within {:.0}ms cooldown, will fire at window expiry)",
                                 screen_frame_counter,
-                                now - last_pli_keyframe_time,
+                                ENCODER_PLI_COOLDOWN_MS,
                             );
                         }
 
@@ -3623,6 +3649,110 @@ mod tests {
             7,
             "single-stream apply_initial_tier must NOT force the active layer count \
              (byte-identical legacy behavior; the #1229 seed is gated on simulcast)"
+        );
+    }
+
+    /// Issue #1322: a PLI that lands mid-cooldown must be HELD pending and honored
+    /// at window expiry, NOT dropped. This pins the screen encode-loop coalescer
+    /// state machine (PEEK the flag with `load`, gate with the shared
+    /// `pli_keyframe_allowed`, and `store(false)` ONLY when a keyframe is actually
+    /// emitted), mirroring the real loop. The prior code used `swap(false)` which
+    /// cleared the flag unconditionally, so a mid-cooldown PLI was LOST — this test
+    /// fails under that mutation (the `still pending` assertions flip, and the held
+    /// PLI never fires at window expiry).
+    #[test]
+    fn screen_mid_cooldown_pli_is_held_then_fired_not_dropped() {
+        use super::pli_keyframe_allowed;
+        use super::ENCODER_PLI_COOLDOWN_MS;
+
+        let force_keyframe = AtomicBool::new(false);
+        let cd = ENCODER_PLI_COOLDOWN_MS; // 2000.0
+        let mut last_keyframe_emit_ms: Option<f64> = None;
+
+        // One encode-loop tick, byte-for-byte the loop's decision: peek (load), gate
+        // with the shared predicate, and clear (store false) ONLY on an actual emit.
+        // Returns whether a keyframe is emitted this tick.
+        let mut tick = |now: f64, is_periodic: bool| -> bool {
+            let pli_pending = force_keyframe.load(Ordering::Acquire);
+            let force_pli = pli_pending && pli_keyframe_allowed(now, last_keyframe_emit_ms, cd);
+            let want_keyframe = is_periodic || force_pli;
+            if want_keyframe {
+                force_keyframe.store(false, Ordering::Release);
+                last_keyframe_emit_ms = Some(now);
+            }
+            want_keyframe
+        };
+
+        // t=0: a periodic keyframe emits and starts the cooldown window.
+        assert!(tick(0.0, true), "periodic keyframe at t=0 must emit");
+
+        // t=500: a PLI arrives well within the 2000ms cooldown.
+        force_keyframe.store(true, Ordering::Release);
+        assert!(
+            !tick(500.0, false),
+            "a PLI 500ms into a 2000ms cooldown must NOT force a keyframe yet"
+        );
+        // #1322 core guard: the request must remain PENDING, not be cleared/dropped.
+        assert!(
+            force_keyframe.load(Ordering::Acquire),
+            "a mid-cooldown PLI must stay pending (held), not be dropped"
+        );
+
+        // t=1500: still inside the window — still held, still pending.
+        assert!(!tick(1500.0, false), "still within the cooldown window");
+        assert!(
+            force_keyframe.load(Ordering::Acquire),
+            "the PLI must still be pending deeper into the window"
+        );
+
+        // t=2000: the window expires (>= cooldown) → the held PLI fires immediately.
+        assert!(
+            tick(2000.0, false),
+            "a held PLI must fire the instant the cooldown window expires"
+        );
+        // The emit clears the flag so it does not re-fire next tick.
+        assert!(
+            !force_keyframe.load(Ordering::Acquire),
+            "emitting the keyframe must clear the request flag"
+        );
+    }
+
+    /// Issue #1312 parity: under a saturated PLI burst (every frame requests a
+    /// keyframe, the N-receivers-hammering-one-publisher worst case) the screen
+    /// coalescer must collapse the burst to at most one forced keyframe per
+    /// ENCODER_PLI_COOLDOWN_MS window — not one per frame. Drives the real shared
+    /// predicate with the real clear-on-emit state update (no periodic keyframes in
+    /// this slice). Removing the cooldown gate makes every frame force a keyframe,
+    /// failing the `== 3` assertion.
+    ///
+    /// A 300ms inter-frame spacing is used deliberately: 2000ms is NOT an integer
+    /// multiple of it (2000/300 ≈ 6.67), so every window boundary falls strictly
+    /// between two frames, keeping the count robust to float rounding (the boundary
+    /// is pinned separately and exactly by `pli_keyframe_allowed_pins_cooldown_boundary`).
+    #[test]
+    fn screen_saturated_pli_burst_coalesces_to_one_per_window() {
+        use super::pli_keyframe_allowed;
+        use super::ENCODER_PLI_COOLDOWN_MS;
+
+        let cd = ENCODER_PLI_COOLDOWN_MS; // 2000.0
+        let frame_interval_ms = 300.0;
+        let mut last_keyframe_emit_ms: Option<f64> = None;
+        let mut forced = 0u32;
+        let mut now = 0.0_f64;
+        // ~6s of saturated PLI: a PLI is pending every frame; no periodic GOP in this
+        // slice, so every emit is PLI-forced. Emissions land at the first frame at/after
+        // each window: t=0 (None guard), t=2100 (frame 7), t=4200 (frame 14) ⇒ 3.
+        for _ in 0..20 {
+            if pli_keyframe_allowed(now, last_keyframe_emit_ms, cd) {
+                forced += 1;
+                last_keyframe_emit_ms = Some(now);
+            }
+            now += frame_interval_ms;
+        }
+        assert_eq!(
+            forced, 3,
+            "a saturated PLI burst at a 2000ms cooldown must coalesce to 3 forced keyframes, \
+             not one per frame"
         );
     }
 }

@@ -7696,12 +7696,12 @@ mod tests {
             4242,
             MediaType::SCREEN,
         );
-        // `>=` not `==`: KEYFRAME_REQUESTS_SENT is a process-global counter shared
+        // `>` not `==`: KEYFRAME_REQUESTS_SENT is a process-global counter shared
         // across native tests that cargo runs in parallel threads, so an interleaved
         // bump from another test could break an exact `before + 1`. The emitted
         // packet's contents (asserted below) are the real coverage.
         assert!(
-            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed) >= before + 1,
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed) > before,
             "emit_keyframe_request must bump the sent counter"
         );
 

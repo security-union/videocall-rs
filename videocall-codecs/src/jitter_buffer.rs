@@ -1536,9 +1536,8 @@ mod tests {
     /// already in hand).
     ///
     /// Mutation coverage: removing the `(self.request_keyframe)()` call drops the
-    /// keyframe-less count to 0 (first assert fails); moving the call outside the
-    /// `dropped_any` guard or into the keyframe-present branch fails the `== 1` /
-    /// `== 0` asserts.
+    /// keyframe-less count to 0 (first assert fails); firing from the keyframe-present
+    /// branch fails the `== 0` contrast assert.
     #[test]
     fn keyframe_less_backlog_eviction_fires_proactive_keyframe_request() {
         // --- keyframe-less stall: exactly one proactive request on eviction ---
@@ -1648,6 +1647,45 @@ mod tests {
             requests.load(Ordering::SeqCst),
             2,
             "an eviction past the throttle window fires a fresh request"
+        );
+    }
+
+    /// `flush()` resets the proactive keyframe-request throttle so a fresh post-flush
+    /// stream can request recovery immediately instead of inheriting the previous
+    /// stall's cooldown.
+    #[test]
+    fn flush_resets_proactive_keyframe_request_throttle() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 300);
+        jb.find_and_move_continuous_frames(2150);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "first stale keyframe-less eviction fires a proactive request"
+        );
+
+        jb.flush();
+        decoded.lock().unwrap().clear();
+
+        jb.insert_frame(create_test_frame(10, FrameType::KeyFrame), 2160);
+        jb.find_and_move_continuous_frames(2170);
+        jb.insert_frame(create_test_frame(11, FrameType::DeltaFrame), 2180);
+        jb.find_and_move_continuous_frames(4030);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "post-flush eviction fires immediately despite the pre-flush throttle window"
         );
     }
 

@@ -104,6 +104,19 @@ fn clamp_audio_layer_count(max_layers: u32) -> u32 {
 /// ceiling — mirroring the video/screen base-present invariant. A layer is
 /// published iff `layer_id < ceiling_count`. Pure free function so the gate is
 /// host-testable without a `MicrophoneEncoder` / AudioWorklet.
+///
+/// NOTE (#1201 — accepted design): this user SEND ceiling is the ONLY runtime
+/// gate on audio rungs. Unlike video/screen, audio has NO runtime shed from
+/// encoder backpressure, the relay layer-union, or a `LAYER_HINT`: the client
+/// ignores AUDIO hints, and the relay stops computing the AUDIO union under
+/// #1118 N3 (PR #1330). So at the default (Auto) ceiling the full
+/// 24/32/50 kbps ladder (~106 kbps) is
+/// published unconditionally — a deliberate, documented cost (audio is ~1-3% of
+/// call bandwidth). A publisher-side audio shed was rejected because today's only
+/// signal is the receiver's VIDEO-downlink proxy, and shedding audio on a
+/// video-congestion proxy risks degrading the highest-priority / lowest-cost
+/// stream while audio itself is fine. Revisit only if a REAL audio-downlink-
+/// health signal lands (#1290).
 fn audio_layer_is_published(layer_id: u32, ceiling_atomic: u32) -> bool {
     let ceiling_count =
         crate::encode::camera_encoder::layer_ceiling_to_count(ceiling_atomic).max(1);

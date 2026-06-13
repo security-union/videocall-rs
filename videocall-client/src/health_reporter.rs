@@ -2254,10 +2254,12 @@ mod tests {
             .expect("HealthPacket payload must be valid protobuf")
     }
 
-    fn health_packet_with_camera_paint_lag(fps_received: f64) -> PbHealthPacket {
+    fn health_packet_with_camera_playout_stats(fps_received: f64) -> PbHealthPacket {
         let mut peer = PeerHealthData::new("peer-1".to_string());
         peer.last_camera_stats = Some(json!({
             "fps_received": fps_received,
+            "playout_latency_ms": 1500.0,
+            "playout_stage1_span_ms": 1200.0,
             "playout_paint_lag_ms": 1800.0,
         }));
 
@@ -2309,8 +2311,40 @@ mod tests {
     }
 
     #[test]
+    fn playout_latency_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_latency_ms, 1500.0);
+        assert_eq!(stats.playout_stage1_span_ms, 1200.0);
+    }
+
+    #[test]
+    fn playout_latency_omitted_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        assert_eq!(stats.playout_latency_ms, 0.0);
+        assert_eq!(stats.playout_stage1_span_ms, 0.0);
+    }
+
+    #[test]
     fn playout_paint_lag_folds_when_fps_received_positive() {
-        let pb = health_packet_with_camera_paint_lag(30.0);
+        let pb = health_packet_with_camera_playout_stats(30.0);
         let stats = pb
             .peer_stats
             .get("peer-1")
@@ -2325,7 +2359,7 @@ mod tests {
 
     #[test]
     fn playout_paint_lag_omitted_when_fps_received_zero() {
-        let pb = health_packet_with_camera_paint_lag(0.0);
+        let pb = health_packet_with_camera_playout_stats(0.0);
         let stats = pb
             .peer_stats
             .get("peer-1")

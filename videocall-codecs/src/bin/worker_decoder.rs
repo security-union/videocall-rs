@@ -505,22 +505,6 @@ fn check_jitter_buffer_for_ready_frames() {
             // Rate limited to 1 Hz to avoid flooding diagnostics.
             // The client layer will attach original ids later in the pipeline.
             let buffered = jb.buffered_frames_len() as u64;
-            // Buffered video playout latency (issue #1252): how far behind live this peer's video
-            // is. Total spans BOTH receive stages (jitter-buffer backlog + decoder queue); the
-            // stage-1 span is emitted separately for attribution. Read-only; uses the same tick
-            // clock as the buffer poll above.
-            let playout_latency_ms = jb.playout_latency_ms(current_time_ms);
-            let playout_stage1_span_ms = jb.buffered_span_ms(current_time_ms);
-            // Stage-3 paint lag (issue #1252): decoded-but-unpainted frames still sitting in the
-            // worker->main postMessage queue + main-thread paint task queue — a region
-            // decode_queue_size() (stage 2) cannot observe. Computed in the worker so the FIFO
-            // delay that this very stats message rides through does NOT hide the backlog; valued
-            // at one source-frame-interval per outstanding frame.
-            let playout_paint_lag_ms = paint_lag_ms(
-                FRAMES_EMITTED.with(|c| c.get()),
-                FRAMES_PAINTED.with(|c| c.get()),
-                jb.source_frame_interval_ms(),
-            );
             #[cfg(feature = "wasm")]
             {
                 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
@@ -537,6 +521,24 @@ fn check_jitter_buffer_for_ready_frames() {
                                 // Only emit if at least DIAGNOSTIC_EMIT_INTERVAL_MS has passed
                                 if now - last_emit >= DIAGNOSTIC_EMIT_INTERVAL_MS {
                                     *last_emit_cell.borrow_mut() = now;
+
+                                    // Buffered video playout latency (issue #1252): how far behind
+                                    // live this peer's video is. Compute only on the 1 Hz emit path.
+                                    // Total spans both receive stages (jitter-buffer backlog +
+                                    // decoder queue); stage-1 is emitted separately for attribution.
+                                    let (playout_latency_ms, playout_stage1_span_ms) =
+                                        jb.playout_latency_parts_ms(current_time_ms);
+                                    // Stage-3 paint lag (issue #1252): decoded-but-unpainted frames
+                                    // still sitting in the worker->main postMessage queue +
+                                    // main-thread paint task queue — a region decode_queue_size()
+                                    // (stage 2) cannot observe. Compute on the same 1 Hz emit path
+                                    // so the metric reflects the same sampling cadence as the rest
+                                    // of the video diagnostic packet.
+                                    let playout_paint_lag_ms = paint_lag_ms(
+                                        FRAMES_EMITTED.with(|c| c.get()),
+                                        FRAMES_PAINTED.with(|c| c.get()),
+                                        jb.source_frame_interval_ms(),
+                                    );
 
                                     let evt = DiagEvent {
                                         subsystem: "video",

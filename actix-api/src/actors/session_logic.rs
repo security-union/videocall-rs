@@ -128,13 +128,17 @@ const CLEANUP_INTERVAL: u32 = 100;
 
 /// Hard upper bound on the number of distinct senders tracked per receiver
 /// (issue #1320). The amortized time-based cleanup runs only every
-/// [`CLEANUP_INTERVAL`] drops, so between passes the map could in principle
-/// accumulate one entry per distinct `sender_session_id` seen — a slow
-/// memory-amplification vector if a peer churns join/leave to cycle through
-/// server-assigned session ids (lower severity than #1303's client-forged
-/// KEYFRAME_REQUEST targets, since the id here is server-assigned, not in the
-/// packet payload). This cap is ~5–10× the largest realistic room, so it never
-/// constrains legitimate traffic; it only backstops the pathological case.
+/// [`CLEANUP_INTERVAL`] drops, so between passes the map could accumulate one
+/// entry per distinct `sender_session_id` seen — a memory-amplification vector
+/// in the SAME client-forgeable trust class as #1303. The key is the outer
+/// `PacketWrapper.session_id` of the forwarded media packet (see
+/// `on_outbound_drop`); ingress only stamps it when the client sends 0
+/// (`chat_server::handle_msg`), so a non-zero value is publisher-controlled and
+/// fanned out unchanged — a malicious publisher can stamp a distinct id on each
+/// of its own packets and mint a fresh entry per dropped packet on any
+/// saturated receiver (no join/leave churn needed). This cap makes key fidelity
+/// irrelevant: it is ~5–10× the largest realistic room (≈13× a 20-user room),
+/// so it never constrains legitimate traffic and only backstops the abuse case.
 /// At ~40 bytes per [`SenderDropState`], 256 entries is ~10 KB per receiver.
 const MAX_TRACKED_SENDERS: usize = 256;
 
@@ -145,6 +149,15 @@ impl CongestionTracker {
             total_drops: 0,
             last_congestion: None,
         }
+    }
+
+    /// Remove sender entries idle longer than `CONGESTION_WINDOW * 10` (10s of
+    /// no recorded drops). Shared by the amortized cleanup and the #1320
+    /// cap-pressure sweep.
+    fn evict_stale_senders(&mut self, now: Instant) {
+        let stale_threshold = CONGESTION_WINDOW * 10;
+        self.senders
+            .retain(|_, state| now.duration_since(state.window_start) <= stale_threshold);
     }
 
     /// Record a dropped outbound packet from the given sender.
@@ -159,16 +172,10 @@ impl CongestionTracker {
     /// drops: any sender whose `window_start` is older than
     /// `CONGESTION_WINDOW * 10` (10 seconds of inactivity) is removed. This
     /// prevents unbounded growth when transient participants leave while
-    /// avoiding an O(n) `retain()` on every single drop.
-    /// Remove sender entries idle longer than `CONGESTION_WINDOW * 10` (10s of
-    /// no recorded drops). Shared by the amortized cleanup and the #1320
-    /// cap-pressure sweep.
-    fn evict_stale_senders(&mut self, now: Instant) {
-        let stale_threshold = CONGESTION_WINDOW * 10;
-        self.senders
-            .retain(|_, state| now.duration_since(state.window_start) <= stale_threshold);
-    }
-
+    /// avoiding an O(n) `retain()` on every single drop. As a defense-in-depth
+    /// backstop the map is ALSO hard-capped at [`MAX_TRACKED_SENDERS`] (#1320):
+    /// at the cap a NEW sender is refused (after one forced stale sweep) so the
+    /// map cannot grow unbounded between amortized passes.
     pub fn record_drop(&mut self, sender_session_id: u64) -> Option<u64> {
         let now = Instant::now();
 

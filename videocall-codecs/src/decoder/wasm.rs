@@ -67,10 +67,16 @@ impl Decodable for WasmDecoder {
         // Create a closure to handle messages from the worker.
         let on_message_closure = {
             // We need to use Rc<RefCell<>> to share the callback since trait objects can't be cloned
-            use std::cell::RefCell;
+            use std::cell::{Cell, RefCell};
             use std::rc::Rc;
             let callback_rc = Rc::new(RefCell::new(callback));
             let callback_for_closure = callback_rc.clone();
+            // Stage-3 paint lag (issue #1252): mirror of the active render path's frame-drain count
+            // + ACK. This Decodable path is not used for real rendering, but counting here keeps
+            // the worker's emitted/painted accounting coherent if it ever is.
+            let painted = Rc::new(Cell::new(0u64));
+            let last_ack_ms = Rc::new(Cell::new(0f64));
+            let ack_worker = worker.clone();
 
             Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
                 let js_val = event.data();
@@ -78,6 +84,7 @@ impl Decodable for WasmDecoder {
                 // Clone js_val before trying to convert it to avoid move issues
                 match js_val.clone().dyn_into::<VideoFrame>() {
                     Ok(video_frame) => {
+                        painted.set(painted.get().wrapping_add(1));
                         // Convert VideoFrame to DecodedFrame for consistency
                         let decoded_frame = DecodedFrame {
                             sequence_number: 0, // Note: sequence number tracking happens in jitter buffer
@@ -91,6 +98,7 @@ impl Decodable for WasmDecoder {
                             cb(decoded_frame);
                         }
                         video_frame.close();
+                        post_paint_progress(&ack_worker, &painted, &last_ack_ms);
                     }
                     Err(_) => {
                         if !handle_worker_diag_message(&js_val) {
@@ -142,14 +150,27 @@ impl WasmDecoder {
 
         // Create a closure to handle messages from the worker.
         let on_message_closure = {
+            use std::cell::Cell;
+            use std::rc::Rc;
             let callback = on_video_frame;
+            // Stage-3 paint lag (issue #1252): count every decoded VideoFrame this (main-thread)
+            // closure drains from the worker->main postMessage queue — count the queue-drain, not
+            // paint success, so a hidden tile (frame consumed but not actually painted) still
+            // counts. The cumulative count is ACK'd back to the worker (which holds the un-delayed
+            // emitted count) so it can compute emitted - painted at its 1Hz tick.
+            let painted = Rc::new(Cell::new(0u64));
+            let last_ack_ms = Rc::new(Cell::new(0f64));
+            // Clone the worker into the closure so the ACK can be posted back upstream.
+            let ack_worker = worker.clone();
             Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
                 let js_val = event.data();
 
                 // Clone js_val before trying to convert it to avoid move issues
                 match js_val.clone().dyn_into::<VideoFrame>() {
                     Ok(video_frame) => {
+                        painted.set(painted.get().wrapping_add(1));
                         callback(video_frame);
+                        post_paint_progress(&ack_worker, &painted, &last_ack_ms);
                     }
                     Err(_) => {
                         if !handle_worker_diag_message(&js_val) {
@@ -254,6 +275,37 @@ impl Drop for WasmDecoder {
     }
 }
 
+/// Throttled ACK of the cumulative number of decoded frames the main thread has drained from the
+/// worker->main `postMessage` queue (issue #1252, stage-3 paint lag). Posts a
+/// `WorkerMessage::PaintProgress` back to the worker at most every `PAINT_PROGRESS_ACK_INTERVAL_MS`
+/// (≤2 msgs/s) so the worker — which holds the un-delayed `frames_emitted` count — can compute
+/// `emitted - painted` at its 1Hz tick. Kept cheap; serialized with serde_wasm_bindgen, mirroring
+/// [`WasmDecoder::push_frame`].
+#[inline]
+fn post_paint_progress(
+    worker: &Worker,
+    painted: &std::rc::Rc<std::cell::Cell<u64>>,
+    last_ack_ms: &std::rc::Rc<std::cell::Cell<f64>>,
+) {
+    const PAINT_PROGRESS_ACK_INTERVAL_MS: f64 = 500.0;
+    let now = js_sys::Date::now();
+    if now - last_ack_ms.get() < PAINT_PROGRESS_ACK_INTERVAL_MS {
+        return;
+    }
+    last_ack_ms.set(now);
+    let message = WorkerMessage::PaintProgress {
+        painted: painted.get(),
+    };
+    match serde_wasm_bindgen::to_value(&message) {
+        Ok(js_message) => {
+            if let Err(e) = worker.post_message(&js_message) {
+                log::error!("Error posting PaintProgress to worker: {e:?}");
+            }
+        }
+        Err(e) => log::error!("Error serializing PaintProgress: {e:?}"),
+    }
+}
+
 /// Handle diagnostics objects posted by the worker. Returns true if handled.
 fn handle_worker_diag_message(js_val: &JsValue) -> bool {
     // Try to deserialize the JavaScript object using serde
@@ -281,6 +333,10 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                         metric!(
                             "playout_stage1_span_ms",
                             stats_msg.playout_stage1_span_ms.unwrap_or(0.0)
+                        ),
+                        metric!(
+                            "playout_paint_lag_ms",
+                            stats_msg.playout_paint_lag_ms.unwrap_or(0.0)
                         ),
                     ],
                 };

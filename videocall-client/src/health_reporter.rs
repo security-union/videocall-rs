@@ -894,6 +894,14 @@ impl HealthReporter {
                                 video_stats["playout_stage1_span_ms"] = json!(v);
                             }
                         }
+                        // Stage-3 paint lag (#1252): decoded-but-unpainted backlog in the
+                        // worker->main postMessage + paint queues. Same bucket/guard as the two
+                        // latency fields above.
+                        "playout_paint_lag_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_paint_lag_ms"] = json!(v);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1773,6 +1781,13 @@ impl HealthReporter {
                     if let Some(v) = video.get("playout_stage1_span_ms").and_then(|v| v.as_f64()) {
                         vs.playout_stage1_span_ms = v;
                     }
+                    // Stage-3 paint lag (#1252): same fps_received > 0 guard — a paused/hidden tile
+                    // decodes nothing and paints nothing, so any residual emitted-vs-painted skew
+                    // is not user-perceived latency. When fps == 0 the field stays at its 0.0
+                    // default => "at live".
+                    if let Some(v) = video.get("playout_paint_lag_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_paint_lag_ms = v;
+                    }
                 }
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 
@@ -2247,6 +2262,7 @@ mod tests {
             "fps_received": fps_received,
             "playout_latency_ms": 1500.0,
             "playout_stage1_span_ms": 1200.0,
+            "playout_paint_lag_ms": 1800.0,
         }));
 
         let mut health_map = HashMap::new();
@@ -2326,6 +2342,36 @@ mod tests {
         assert_eq!(stats.fps_received, 0.0);
         assert_eq!(stats.playout_latency_ms, 0.0);
         assert_eq!(stats.playout_stage1_span_ms, 0.0);
+    }
+
+    #[test]
+    fn playout_paint_lag_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_paint_lag_ms, 1800.0);
+    }
+
+    #[test]
+    fn playout_paint_lag_omitted_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        assert_eq!(stats.playout_paint_lag_ms, 0.0);
     }
 
     /// #1032: a cached agent-memory reading rides the HealthPacket on the wire.

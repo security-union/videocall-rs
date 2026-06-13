@@ -571,6 +571,20 @@ lazy_static! {
     )
     .expect("Failed to create video_playout_stage1_span_ms metric");
 
+    /// Per-peer stage-3 paint lag in ms (#1252): decoded-but-unpainted frames living in the
+    /// worker->main `postMessage` queue + main-thread paint task queue — a region the stage-2
+    /// decoder-queue depth cannot observe. Computed in the worker as
+    /// (frames_emitted − frames_painted) × source frame interval. Reported only while the tile is
+    /// actively receiving (fps_received > 0); 0 = at live. Complements
+    /// `videocall_video_playout_latency_ms`: if total lag stays high while latency_ms is low, the
+    /// backlog has relocated downstream into the paint path.
+    pub static ref VIDEO_PLAYOUT_PAINT_LAG_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_playout_paint_lag_ms",
+        "Per-peer stage-3 paint lag in ms — decoded-but-unpainted backlog in the worker->main postMessage + paint queues (#1252)",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_playout_paint_lag_ms metric");
+
     /// Call quality score (0-100, min of audio and video)
     pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_call_quality_score",

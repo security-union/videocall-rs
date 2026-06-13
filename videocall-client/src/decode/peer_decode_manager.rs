@@ -54,6 +54,104 @@ pub fn keyframe_requests_sent_count() -> u64 {
     KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed)
 }
 
+/// Build and emit a single `KEYFRAME_REQUEST` `PacketWrapper` for `peer_user_id`'s
+/// `requested_media_type` stream, keyed to `target_session_id` for the relay's per-session
+/// rate limiter (#1124).
+///
+/// Extracted as a free helper (issue #1025) so BOTH the manager's gap-/visibility-driven
+/// `send_keyframe_request(&self, ...)` AND the worker's proactive eviction route can produce
+/// the **identical** packet without either holding `&PeerDecodeManager`. The proactive route
+/// (`VideoPeerDecoder::set_keyframe_request_route`) captures a cheap clone of the `send_packet`
+/// `Callback` plus the owned `local_user_id` / peer id / session id and calls this directly.
+///
+/// Coalescing (#979 / #1011): this helper does NOT rate-limit. The CLIENT-side per-stream
+/// backoff lives in `SequenceTracker::should_request_keyframe` and gates only the gap-driven
+/// path; the visibility-driven proactive path (and now the eviction-driven one) intentionally
+/// bypass it, exactly as the existing visibility PLIs do. The authoritative coalescer is the
+/// RELAY's per-`(receiver, target_session)` `KEYFRAME_REQUEST` limiter — every request, from
+/// every client subsystem, lands on it as the same `target_session_id`-keyed packet, so a burst
+/// of evictions cannot storm the publisher regardless of how many subsystems ask.
+///
+/// Uses `send_packet` (reliable stream), NOT datagrams: a `KEYFRAME_REQUEST` is a control
+/// message that must be delivered reliably. Sent unencrypted (raw `MediaPacket`) because the
+/// relay must read the target `user_id` / `target_session_id` to route and rate-limit it.
+fn emit_keyframe_request(
+    send_packet: &Callback<PacketWrapper>,
+    local_user_id: &str,
+    peer_user_id: &str,
+    target_session_id: u64,
+    requested_media_type: MediaType,
+) {
+    let media_type_byte = match requested_media_type {
+        MediaType::VIDEO => b"VIDEO".to_vec(),
+        MediaType::SCREEN => b"SCREEN".to_vec(),
+        _ => return,
+    };
+
+    let media_packet = MediaPacket {
+        media_type: MediaType::KEYFRAME_REQUEST.into(),
+        user_id: peer_user_id.as_bytes().to_vec(),
+        target_session_id,
+        data: media_type_byte,
+        ..Default::default()
+    };
+
+    let media_data = match media_packet.write_to_bytes() {
+        Ok(data) => data,
+        Err(e) => {
+            log::warn!("Failed to serialize keyframe request: {}", e);
+            return;
+        }
+    };
+
+    let wrapper = PacketWrapper {
+        packet_type: PacketType::MEDIA.into(),
+        user_id: local_user_id.as_bytes().to_vec(),
+        data: media_data,
+        ..Default::default()
+    };
+
+    KEYFRAME_REQUESTS_SENT.fetch_add(1, Ordering::Relaxed);
+    log::info!(
+        "Sending KEYFRAME_REQUEST to {} (session {}) for {:?}",
+        peer_user_id,
+        target_session_id,
+        requested_media_type
+    );
+    send_packet.emit(wrapper);
+}
+
+/// Install the proactive keyframe-request route (issue #1025) on a peer's VIDEO and SCREEN
+/// decoders. Each route captures a cheap clone of the transport `send_packet` callback plus the
+/// owned local user id, the peer's user id, and the peer's relay `session_id` (the per-session
+/// limiter key, #1124), so it can call [`emit_keyframe_request`] for the right peer + stream
+/// without holding `&PeerDecodeManager`. The worker fires the route when its jitter buffer
+/// evicts a stale keyframe-less backlog for that stream.
+fn install_keyframe_request_routes(
+    peer: &Peer,
+    send_packet: &Callback<PacketWrapper>,
+    local_user_id: &str,
+) {
+    for (decoder, media_type) in [
+        (&peer.video, MediaType::VIDEO),
+        (&peer.screen, MediaType::SCREEN),
+    ] {
+        let send_packet = send_packet.clone();
+        let local_user_id = local_user_id.to_owned();
+        let peer_user_id = peer.user_id.clone();
+        let session_id = peer.session_id;
+        decoder.set_keyframe_request_route(Box::new(move || {
+            emit_keyframe_request(
+                &send_packet,
+                &local_user_id,
+                &peer_user_id,
+                session_id,
+                media_type,
+            );
+        }));
+    }
+}
+
 #[derive(Debug)]
 pub enum PeerDecodeError {
     AesDecryptError,
@@ -2531,6 +2629,14 @@ impl PeerDecodeManager {
         // `userid` is the local (reporting) user — captured before the mutable
         // borrow of `connected_peers` so `Peer::decode` can stamp it as the
         // `from_peer` on its windowed loss/keyframe bus events (#1013).
+        //
+        // Issue #1025: also clone the transport send-packet callback + local user id BEFORE the
+        // mutable borrow of `connected_peers`, so the per-decoder proactive keyframe-request
+        // routes installed in the `!context_initialized` block can capture them without
+        // double-borrowing `self`. `Callback` is a cheap `Rc`-clone. `None` means the transport
+        // isn't wired (e.g. pre-connect / post-disconnect) — the proactive route stays unset.
+        let send_packet_for_route = self.send_packet.clone();
+        let local_user_id_for_route = self.local_user_id.clone();
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             let was_screen_enabled = peer.screen_enabled;
             if !peer.context_initialized {
@@ -2538,6 +2644,18 @@ impl PeerDecodeManager {
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
                 peer.screen
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
+                // Issue #1025: install the proactive keyframe-request route on each video
+                // decoder. The worker fires this (via the jitter buffer) the instant it evicts a
+                // stale keyframe-less backlog for this stream, so we request a fresh keyframe for
+                // THIS peer + media type immediately. Each route is bound to one (peer,
+                // media_type) and emits the identical `KEYFRAME_REQUEST` that the gap-/
+                // visibility-driven paths do, so it flows through the same relay limiter (#979 /
+                // #1011) and cannot storm. Installed only when the transport is wired
+                // (`send_packet` set); `session_id` (not `sid_str`) is the per-session limiter
+                // key (#1124).
+                if let Some(send_packet) = &send_packet_for_route {
+                    install_keyframe_request_routes(peer, send_packet, &local_user_id_for_route);
+                }
                 peer.context_initialized = true;
             }
             match peer.decode(&packet, userid) {
@@ -2653,44 +2771,13 @@ impl PeerDecodeManager {
             debug!("Cannot send KEYFRAME_REQUEST: no send_packet callback");
             return;
         };
-
-        let media_type_byte = match requested_media_type {
-            MediaType::VIDEO => b"VIDEO".to_vec(),
-            MediaType::SCREEN => b"SCREEN".to_vec(),
-            _ => return,
-        };
-
-        let media_packet = MediaPacket {
-            media_type: MediaType::KEYFRAME_REQUEST.into(),
-            user_id: peer_user_id.as_bytes().to_vec(),
-            target_session_id,
-            data: media_type_byte,
-            ..Default::default()
-        };
-
-        let media_data = match media_packet.write_to_bytes() {
-            Ok(data) => data,
-            Err(e) => {
-                log::warn!("Failed to serialize keyframe request: {}", e);
-                return;
-            }
-        };
-
-        let wrapper = PacketWrapper {
-            packet_type: PacketType::MEDIA.into(),
-            user_id: self.local_user_id.as_bytes().to_vec(),
-            data: media_data,
-            ..Default::default()
-        };
-
-        KEYFRAME_REQUESTS_SENT.fetch_add(1, Ordering::Relaxed);
-        log::info!(
-            "Sending KEYFRAME_REQUEST to {} (session {}) for {:?}",
+        emit_keyframe_request(
+            send_packet,
+            &self.local_user_id,
             peer_user_id,
             target_session_id,
-            requested_media_type
+            requested_media_type,
         );
-        send_packet.emit(wrapper);
     }
 
     /// Send a `PEER_EVENT(screen_decode_started)` to the publisher whose
@@ -7530,6 +7617,103 @@ mod tests {
         assert!(
             alice.audio_enabled && alice.video_enabled,
             "force-off with no flags set must not change any peer"
+        );
+    }
+
+    /// Issue #1025: the free `emit_keyframe_request` helper — shared by the manager's
+    /// `send_keyframe_request` and the worker-driven proactive route — must build the same
+    /// `KEYFRAME_REQUEST` packet shape the legacy method built and bump the global counter.
+    ///
+    /// This is a NATIVE `#[test]` (not `#[wasm_bindgen_test]`) so it actually runs in CI on a
+    /// box whose browser harness silently no-ops wasm tests. It exercises the exact code the
+    /// proactive eviction route invokes, since that route calls this helper directly.
+    ///
+    /// Mutation coverage: flipping the VIDEO/SCREEN byte, the `KEYFRAME_REQUEST` media_type, the
+    /// `target_session_id`, the inner/outer `user_id`, or removing the counter increment all
+    /// break a concrete assert below.
+    #[test]
+    fn emit_keyframe_request_builds_expected_packet_and_counts() {
+        use std::rc::Rc;
+
+        let captured: Rc<RefCell<Option<PacketWrapper>>> = Rc::new(RefCell::new(None));
+        let sink = captured.clone();
+        let send_packet: Callback<PacketWrapper> = Callback::from(move |p: PacketWrapper| {
+            *sink.borrow_mut() = Some(p);
+        });
+
+        let before = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
+        emit_keyframe_request(
+            &send_packet,
+            "me@example.com",
+            "peer@example.com",
+            4242,
+            MediaType::SCREEN,
+        );
+        assert_eq!(
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed),
+            before + 1,
+            "emit_keyframe_request must bump the sent counter exactly once"
+        );
+
+        let wrapper = captured.borrow().clone().expect("packet must be emitted");
+        assert_eq!(wrapper.packet_type, PacketType::MEDIA.into());
+        assert_eq!(
+            wrapper.user_id,
+            b"me@example.com".to_vec(),
+            "outer wrapper user_id is the LOCAL (sending) user"
+        );
+
+        let inner = MediaPacket::parse_from_bytes(&wrapper.data).expect("inner MediaPacket");
+        assert_eq!(inner.media_type, MediaType::KEYFRAME_REQUEST.into());
+        assert_eq!(
+            inner.user_id,
+            b"peer@example.com".to_vec(),
+            "inner user_id is the TARGET peer the relay routes to"
+        );
+        assert_eq!(
+            inner.target_session_id, 4242,
+            "session id is the per-session relay limiter key (#1124)"
+        );
+        assert_eq!(
+            inner.data,
+            b"SCREEN".to_vec(),
+            "SCREEN request must carry the SCREEN stream selector"
+        );
+
+        // VIDEO selector is distinct.
+        captured.borrow_mut().take();
+        emit_keyframe_request(
+            &send_packet,
+            "me@example.com",
+            "peer@example.com",
+            1,
+            MediaType::VIDEO,
+        );
+        let wrapper = captured
+            .borrow()
+            .clone()
+            .expect("video packet must be emitted");
+        let inner = MediaPacket::parse_from_bytes(&wrapper.data).expect("inner MediaPacket");
+        assert_eq!(inner.data, b"VIDEO".to_vec());
+
+        // A non-VIDEO/SCREEN media type is rejected (no emit, no count bump).
+        let before = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
+        captured.borrow_mut().take();
+        emit_keyframe_request(
+            &send_packet,
+            "me@example.com",
+            "peer@example.com",
+            1,
+            MediaType::AUDIO,
+        );
+        assert!(
+            captured.borrow().is_none(),
+            "AUDIO is not a keyframe-bearing stream; emit must be a no-op"
+        );
+        assert_eq!(
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed),
+            before,
+            "rejected media type must not bump the counter"
         );
     }
 }

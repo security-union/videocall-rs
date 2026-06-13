@@ -39,7 +39,7 @@ use std::cell::{Cell, RefCell};
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
 use videocall_codecs::jitter_buffer::{paint_lag_ms, JitterBuffer};
-use videocall_codecs::messages::{VideoStatsMessage, WorkerMessage};
+use videocall_codecs::messages::{RequestKeyframeMessage, VideoStatsMessage, WorkerMessage};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
@@ -613,7 +613,41 @@ fn initialize_jitter_buffer() -> Result<JitterBuffer<DecodedFrame>, String> {
     let boxed_decoder = Box::new(web_decoder);
 
     console::log_1(&"[WORKER] Initializing jitter buffer with WebCodecs decoder".into());
-    Ok(JitterBuffer::new(boxed_decoder))
+    // Issue #1025: inject the proactive keyframe-request hook. The jitter buffer fires this
+    // (via `with_keyframe_request`) the instant the freshness deadline evicts a stale
+    // keyframe-less backlog — at which point playout is frozen on the last-good frame with
+    // no buffered keyframe to resume from. We post a `RequestKeyframeMessage` to the main
+    // thread, which owns the transport (WebTransport OR WebSocket) and the PeerDecodeManager,
+    // so it can send a real KEYFRAME_REQUEST for this decoder's peer/stream. The diagnostics
+    // context (CONTEXT_FROM/CONTEXT_TO) is read at FIRE time (not captured at init) because
+    // `SetContext` can arrive after the buffer is constructed; it is carried for log symmetry
+    // only — the main-side callback is per-decoder and needs no identity from the wire.
+    Ok(JitterBuffer::with_keyframe_request(
+        boxed_decoder,
+        Box::new(post_request_keyframe_to_main),
+    ))
+}
+
+/// Worker-side keyframe-request hook (issue #1025): post a [`RequestKeyframeMessage`] to the
+/// main thread. Invoked by the jitter buffer on a keyframe-less stale-backlog eviction. Reading
+/// the diagnostics context here (rather than capturing it at init) keeps the message tagged
+/// correctly even when `SetContext` lands after `initialize_jitter_buffer`.
+fn post_request_keyframe_to_main() {
+    let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
+        console::warn_1(&"[WORKER] request_keyframe: no worker scope; dropping".into());
+        return;
+    };
+    let from_peer = CONTEXT_FROM.with(|f| f.borrow().clone());
+    let to_peer = CONTEXT_TO.with(|t| t.borrow().clone());
+    let msg = RequestKeyframeMessage::new(from_peer, to_peer);
+    match serde_wasm_bindgen::to_value(&msg) {
+        Ok(val) => {
+            let _ = scope.post_message(&val);
+        }
+        Err(e) => {
+            console::warn_1(&format!("[WORKER] request_keyframe: serialize failed: {e:?}").into());
+        }
+    }
 }
 
 fn flush_jitter_buffer() {

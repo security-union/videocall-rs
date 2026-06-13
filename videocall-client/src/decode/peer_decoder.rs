@@ -72,6 +72,11 @@ struct CanvasRenderer {
     to_peer: Option<String>,
 }
 
+/// Shared slot for the proactive keyframe-request route (issue #1025). `Rc` so the decoder's
+/// worker-message closure and `VideoPeerDecoder` share it; `RefCell<Option<..>>` because the
+/// route is installed after construction (and may be `None` before the transport is wired).
+type KeyframeRequestRoute = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
 ///
 /// VideoPeerDecoder
 ///
@@ -135,6 +140,19 @@ pub struct VideoPeerDecoder {
     /// Shared (`Rc`) with the paint closure captured in [`Self::new`]; the
     /// `Cell` is sufficient because every access is on the single render thread.
     paint_enabled: Rc<Cell<bool>>,
+    /// Issue #1025: proactive keyframe-request route. The underlying `WasmDecoder`'s
+    /// worker-message closure (captured in [`Self::new`]) holds a clone of this `Rc` and,
+    /// when the worker posts a `RequestKeyframeMessage`, invokes the inner closure if set.
+    /// The owner (`PeerDecodeManager`) installs the closure via
+    /// [`Self::set_keyframe_request_route`] once it has the transport send-packet callback,
+    /// the local user id, and this peer's identity. `None` (the initial state, and after a
+    /// disconnect that clears the route) makes the proactive path a safe no-op.
+    ///
+    /// Shared on the single render thread; `RefCell` because the closure is installed after
+    /// construction. The boxed closure issues a `KEYFRAME_REQUEST` for this decoder's
+    /// peer/stream — it is bound to one (peer, media_type), so the worker message carries no
+    /// identity.
+    keyframe_request_route: KeyframeRequestRoute,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -272,9 +290,22 @@ impl VideoPeerDecoder {
             Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
         };
 
+        // Issue #1025: shared slot for the proactive keyframe-request route. The closure
+        // handed to the decoder reads this slot when the worker signals a keyframe-less
+        // eviction; the manager installs the real route later via
+        // `set_keyframe_request_route`. While `None` the proactive path is a no-op.
+        let keyframe_request_route: KeyframeRequestRoute = Rc::new(RefCell::new(None));
+        let route_for_decoder = keyframe_request_route.clone();
+        let on_request_keyframe = move || {
+            if let Some(route) = route_for_decoder.borrow().as_ref() {
+                route();
+            }
+        };
+
         let wasm_decoder = videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(
             videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
             Box::new(on_video_frame),
+            Box::new(on_request_keyframe),
         );
 
         let decoder = Box::new(WasmVideoFrameDecoder {
@@ -289,6 +320,7 @@ impl VideoPeerDecoder {
             stream_context: RefCell::new(None),
             first_render_pending_ack,
             paint_enabled,
+            keyframe_request_route,
         })
     }
 
@@ -505,6 +537,20 @@ impl VideoPeerDecoder {
         self.decoder.flush()
     }
 
+    /// Install the proactive keyframe-request route (issue #1025).
+    ///
+    /// `route` is invoked on the main thread when the worker signals that it evicted a stale
+    /// keyframe-less backlog for this decoder's stream (no buffered keyframe to resume from).
+    /// The `PeerDecodeManager` supplies a closure that emits a `KEYFRAME_REQUEST` for this
+    /// decoder's peer + media type — it is already bound to one (peer, stream), so the worker
+    /// message carries no identity. Installing it here (rather than at construction) lets the
+    /// manager build it once the transport send-packet callback, the local user id, and the
+    /// peer's identity are all known. Replaces any previously-installed route; pass-through to
+    /// the shared slot the decoder closure reads.
+    pub fn set_keyframe_request_route(&self, route: Box<dyn Fn()>) {
+        *self.keyframe_request_route.borrow_mut() = Some(route);
+    }
+
     /// No-op decoder for unit tests — avoids requiring WebCodecs / worker link tags.
     #[cfg(test)]
     pub(crate) fn noop() -> Self {
@@ -525,6 +571,7 @@ impl VideoPeerDecoder {
             stream_context: RefCell::new(None),
             first_render_pending_ack: Rc::new(RefCell::new(false)),
             paint_enabled: Rc::new(Cell::new(true)),
+            keyframe_request_route: Rc::new(RefCell::new(None)),
         }
     }
 

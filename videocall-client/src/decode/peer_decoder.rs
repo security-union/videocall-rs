@@ -551,6 +551,25 @@ impl VideoPeerDecoder {
         *self.keyframe_request_route.borrow_mut() = Some(route);
     }
 
+    /// Drop any installed keyframe-request route. The route closure captures a
+    /// clone of the transport `send_packet` `Callback` (a strong `Rc` that
+    /// reaches `Inner`), so it must be cleared on teardown alongside
+    /// `send_packet` itself — otherwise it keeps `Inner` alive after the UI scope
+    /// unmounts (the cc7tp/#502 `Rc`-cycle class). See
+    /// [`PeerDecodeManager::clear_send_packet_callback`].
+    pub fn clear_keyframe_request_route(&self) {
+        *self.keyframe_request_route.borrow_mut() = None;
+    }
+
+    /// Test/observability helper: whether a keyframe-request route is currently
+    /// installed. Used by the #1025 teardown regression test to assert that
+    /// `clear_send_packet_callback` actually drops the route (breaking the
+    /// `Rc`-cycle leg).
+    #[doc(hidden)]
+    pub fn has_keyframe_request_route(&self) -> bool {
+        self.keyframe_request_route.borrow().is_some()
+    }
+
     /// No-op decoder for unit tests — avoids requiring WebCodecs / worker link tags.
     #[cfg(test)]
     pub(crate) fn noop() -> Self {

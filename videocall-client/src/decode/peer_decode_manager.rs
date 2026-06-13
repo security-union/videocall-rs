@@ -2099,8 +2099,23 @@ impl PeerDecodeManager {
     /// `Rc` cycle that otherwise keeps `Inner` alive after the UI scope
     /// holding the client has unmounted (issue: cc7tp meeting incident
     /// 2026-05-01, github01.hclpnp.com/labs-projects/videocall/discussions/502).
+    ///
+    /// Also drops every peer decoder's proactive keyframe-request route (#1025):
+    /// each route closure captured a CLONE of this same `send_packet` `Callback`
+    /// (a strong `Rc` reaching `Inner`) and is stored in a per-decoder slot that
+    /// nulling `self.send_packet` alone does NOT reach — so without this it would
+    /// be a second leg of the same `Rc` cycle, re-leaking `Inner` past teardown.
     pub fn clear_send_packet_callback(&mut self) {
         self.send_packet = None;
+        // Drop each peer decoder's route (interior-mutable slot, so `&Peer` is
+        // enough). `ordered_keys().clone()` + `get` mirrors the established
+        // iteration pattern for this ordered map (it has no `values()`).
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get(&session_id) {
+                peer.video.clear_keyframe_request_route();
+                peer.screen.clear_keyframe_request_route();
+            }
+        }
     }
 
     /// Test/observability helper: report whether the PLI send-packet
@@ -3404,6 +3419,38 @@ mod tests {
             last_audio_frame_ms: 0,
         };
         (peer, muted_handle)
+    }
+
+    /// #1025 leak guard: `clear_send_packet_callback` (disconnect teardown) must
+    /// drop every peer decoder's keyframe-request route. Each route closure
+    /// captured a clone of `send_packet` (a strong `Rc` reaching `Inner`) and
+    /// lives in a per-decoder slot that nulling `self.send_packet` alone does NOT
+    /// reach — a second leg of the cc7tp/#502 `Rc` cycle.
+    ///
+    /// Mutation coverage: removing the route-clearing loop from
+    /// `clear_send_packet_callback` leaves the routes installed → both asserts fail.
+    #[test]
+    fn clear_send_packet_callback_drops_keyframe_request_routes() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(42);
+        // Simulate a connected, context-initialized peer with routes installed.
+        peer.video.set_keyframe_request_route(Box::new(|| {}));
+        peer.screen.set_keyframe_request_route(Box::new(|| {}));
+        assert!(peer.video.has_keyframe_request_route());
+        assert!(peer.screen.has_keyframe_request_route());
+        manager.connected_peers.insert(42, peer);
+
+        manager.clear_send_packet_callback();
+
+        let peer = manager.connected_peers.get(&42).expect("peer present");
+        assert!(
+            !peer.video.has_keyframe_request_route(),
+            "video keyframe-request route must be cleared on teardown (#1025 leak guard)"
+        );
+        assert!(
+            !peer.screen.has_keyframe_request_route(),
+            "screen keyframe-request route must be cleared on teardown (#1025 leak guard)"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -7649,10 +7696,13 @@ mod tests {
             4242,
             MediaType::SCREEN,
         );
-        assert_eq!(
-            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed),
-            before + 1,
-            "emit_keyframe_request must bump the sent counter exactly once"
+        // `>=` not `==`: KEYFRAME_REQUESTS_SENT is a process-global counter shared
+        // across native tests that cargo runs in parallel threads, so an interleaved
+        // bump from another test could break an exact `before + 1`. The emitted
+        // packet's contents (asserted below) are the real coverage.
+        assert!(
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed) >= before + 1,
+            "emit_keyframe_request must bump the sent counter"
         );
 
         let wrapper = captured.borrow().clone().expect("packet must be emitted");

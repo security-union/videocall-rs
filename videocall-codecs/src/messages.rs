@@ -41,15 +41,28 @@ pub struct VideoStatsMessage {
     pub from_peer: Option<String>,
     pub to_peer: Option<String>,
     pub frames_buffered: Option<u64>,
+    /// Total buffered video playout latency in ms (issue #1252): stage-1 jitter-buffer backlog
+    /// span + stage-2 decoder-queue depth × source frame interval.
+    pub playout_latency_ms: Option<f64>,
+    /// Stage-1 attribution of `playout_latency_ms`: the jitter-buffer backlog span alone.
+    pub playout_stage1_span_ms: Option<f64>,
 }
 
 impl VideoStatsMessage {
-    pub fn new(from_peer: String, to_peer: String, frames_buffered: u64) -> Self {
+    pub fn new(
+        from_peer: String,
+        to_peer: String,
+        frames_buffered: u64,
+        playout_latency_ms: f64,
+        playout_stage1_span_ms: f64,
+    ) -> Self {
         Self {
             kind: "video_stats".to_string(),
             from_peer: Some(from_peer),
             to_peer: Some(to_peer),
             frames_buffered: Some(frames_buffered),
+            playout_latency_ms: Some(playout_latency_ms),
+            playout_stage1_span_ms: Some(playout_stage1_span_ms),
         }
     }
 }

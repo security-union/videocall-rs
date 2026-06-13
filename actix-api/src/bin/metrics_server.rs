@@ -64,7 +64,8 @@ use sec_api::metrics::{
     PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
     SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
     TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE,
+    VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -422,6 +423,8 @@ fn remove_per_peer_metrics(
     let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_SEQ_LOSS_PER_SEC.remove_label_values(&labels);
+    let _ = VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
+    let _ = VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
     let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
@@ -1171,6 +1174,19 @@ fn process_health_packet_to_metrics_pb(
                             .with_label_values(&peer_labels)
                             .set(video_stats.bitrate_kbps as f64);
                     }
+
+                    // Buffered video playout latency (#1252): how far behind live this peer's
+                    // video is (jitter-buffer backlog + decoder queue), plus its stage-1
+                    // attribution. Set UNCONDITIONALLY so the gauges recover to 0 when the receiver
+                    // catches back up to live — the client only reports a nonzero value while the
+                    // tile is actively receiving (fps_received > 0), so a paused/hidden tile reads
+                    // 0 here rather than a stale latch.
+                    VIDEO_PLAYOUT_LATENCY_MS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_latency_ms);
+                    VIDEO_PLAYOUT_STAGE1_SPAN_MS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_stage1_span_ms);
                 }
 
                 // Screen video metrics (separate from camera)

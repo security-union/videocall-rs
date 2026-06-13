@@ -179,6 +179,21 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
         return PacketKind::Dropped;
     }
 
+    // Drop client-originated LAYER_HINT packets (#1119).
+    // LAYER_HINT is symmetric to CONGESTION: a RELAY-authored, self-addressed
+    // control packet emitted only by the relay's per-source layer aggregator
+    // (`emit_layer_hint`) onto a publisher's own subject so the client can cap its
+    // simulcast ladder. The relay NEVER parses an inbound LAYER_HINT (see the proto
+    // doc on `PacketType::LAYER_HINT`), so a client-sent one is always forged.
+    // It is harmless today — it never touches the relay's union state, and every
+    // recipient rejects it via the client self-targeting check — but reflecting a
+    // relay-authored-only control type client→room is an avoidable broadcast vector.
+    // Drop it here, fail-closed, so the "relay never reflects relay-authored control
+    // packets" invariant is explicit.
+    if packet_wrapper.packet_type == PacketType::LAYER_HINT.into() {
+        return PacketKind::Dropped;
+    }
+
     // Drop client-originated MEETING packets.
     // MEETING events (HOST_MUTE_PARTICIPANT, MEETING_ENDED, etc.) are
     // server-authoritative: they are published exclusively by meeting-api
@@ -952,6 +967,20 @@ mod tests {
     fn test_classify_congestion_packet_as_dropped() {
         let wrapper = PacketWrapper {
             packet_type: PacketType::CONGESTION.into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+    }
+
+    #[test]
+    fn test_classify_layer_hint_packet_as_dropped() {
+        // #1119: a client-sent LAYER_HINT is always forged (LAYER_HINT is
+        // relay-authored-only) and must be dropped at ingest, never reflected to
+        // the room — symmetric with the CONGESTION drop above.
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::LAYER_HINT.into(),
             data: vec![1, 2, 3],
             ..Default::default()
         };

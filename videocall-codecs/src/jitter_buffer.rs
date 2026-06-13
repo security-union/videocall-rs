@@ -48,6 +48,13 @@ const MAX_PLAYOUT_DELAY_MS: f64 = 500.0;
 /// - This is a live videoconference: liveness beats completeness. ~1.8s is the boundary past which
 ///   continuing to drain buffered video does more harm (A/V desync, growing lag) than dropping it.
 const MAX_PLAYOUT_AGE_MS: f64 = 1800.0;
+/// Minimum interval between proactive keyframe requests fired by the keyframe-less
+/// eviction path (issue #1025). Matched to the relay's KEYFRAME_REQUEST window
+/// (`KEYFRAME_REQUEST_WINDOW_MS`, ~1s) so a sustained keyframe-less stall emits at
+/// most ~1 request/sec from this receiver's uplink — the rate the relay will
+/// actually honor — instead of one per ~10ms eviction tick. See
+/// `last_keyframe_request_ms`.
+const PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS: f64 = 1000.0;
 /// A multiplier applied to the jitter estimate to provide a safety margin.
 /// A value of 3.0 means we buffer enough to handle jitter up to 3x the running average.
 const JITTER_MULTIPLIER: f64 = 3.0;
@@ -194,10 +201,49 @@ pub struct JitterBuffer<T> {
     // --- Decoder Interface ---
     /// The abstract decoder that will receive frames ready for decoding.
     decoder: Box<dyn Decodable<Frame = T>>,
+
+    /// Proactive keyframe-request hook (issue #1025). Invoked when the freshness
+    /// deadline evicts a stale **keyframe-less** backlog: the buffer has dropped
+    /// the stale deltas (bounding memory) but has NO buffered keyframe to resume
+    /// from, so playout is frozen on the last-good frame until a fresh keyframe
+    /// arrives. Calling this the instant we evict — rather than waiting for the
+    /// client's reactive gap-driven request — shortens recovery. The actual PLI
+    /// mechanism lives in `videocall-client`; this is the codecs→client handle the
+    /// `TODO(#1020)` called for. Defaults to a no-op (`new`), so native tests and
+    /// non-wasm callers need not supply one; the worker injects the real one via
+    /// [`JitterBuffer::with_keyframe_request`]. The relay's per-(receiver,session)
+    /// KEYFRAME_REQUEST limiter (#979/#1011) coalesces for the *publisher*, but it
+    /// does not throttle *this* receiver's uplink or worker→main bus, so the fire
+    /// is additionally rate-limited at the source — see `last_keyframe_request_ms`.
+    request_keyframe: Box<dyn Fn()>,
+
+    /// Wall-clock (ms) of the last proactive keyframe request fired by the
+    /// keyframe-less eviction path (issue #1025). Source-side throttle: under a
+    /// *sustained* keyframe-less stall (the publisher keeps sending deltas, each
+    /// aging past the freshness deadline and evicting on the next ~10ms tick) the
+    /// eviction cadence tracks the delta rate (~10–30/s), and without this gate the
+    /// hook would spray the already-struggling receiver's uplink + worker→main bus
+    /// with that many KEYFRAME_REQUESTs — packets the relay limiter then drops
+    /// anyway. We fire at most once per `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS`
+    /// so the emitted rate matches the rate the relay will honor (~1/s). `None`
+    /// until the first fire; reset on `flush()` so a fresh stream can request
+    /// immediately.
+    last_keyframe_request_ms: Option<u128>,
 }
 
 impl<T> JitterBuffer<T> {
     pub fn new(decoder: Box<dyn Decodable<Frame = T>>) -> Self {
+        // Default: no proactive keyframe request (native/mock callers). The worker
+        // supplies a real hook via `with_keyframe_request`.
+        Self::with_keyframe_request(decoder, Box::new(|| {}))
+    }
+
+    /// Like [`JitterBuffer::new`] but injects the proactive keyframe-request hook
+    /// (issue #1025) — mirroring how `decoder` is injected. See `request_keyframe`.
+    pub fn with_keyframe_request(
+        decoder: Box<dyn Decodable<Frame = T>>,
+        request_keyframe: Box<dyn Fn()>,
+    ) -> Self {
         Self {
             buffered_frames: BTreeMap::new(),
             last_decoded_sequence_number: None,
@@ -209,6 +255,8 @@ impl<T> JitterBuffer<T> {
             source_frame_interval_ms: DEFAULT_SOURCE_FRAME_INTERVAL_MS,
             last_released_arrival_time_ms: None,
             decoder,
+            request_keyframe,
+            last_keyframe_request_ms: None,
         }
     }
 
@@ -622,23 +670,37 @@ impl<T> JitterBuffer<T> {
                 let stale_cutoff = head_key + 1;
                 let dropped_before = self.dropped_frames_count;
                 self.drop_frames_before(stale_cutoff);
-                if self.dropped_frames_count > dropped_before {
+                let dropped_any = self.dropped_frames_count > dropped_before;
+                if dropped_any {
                     log::debug!(
-                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {} stale delta frame(s); holding last-good frame and awaiting keyframe recovery.",
+                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {} stale delta frame(s); holding last-good frame and proactively requesting a keyframe (#1025).",
                         self.dropped_frames_count - dropped_before
                     );
+                    // Issue #1025 (resolves the TODO(#1020) here): proactively ask the client to
+                    // request a keyframe when we evict a stale keyframe-less backlog, rather than
+                    // waiting for the client's reactive gap-driven request to notice. There is no
+                    // buffered keyframe to skip to, so playout is frozen on the last-good frame
+                    // until a fresh keyframe arrives — fetching one sooner directly shortens that
+                    // freeze.
+                    //
+                    // Source-side throttle: a *sustained* keyframe-less stall evicts on ~every
+                    // ~10ms tick (the head delta ages past the deadline as fast as deltas arrive),
+                    // so firing per-eviction would spray this already-struggling receiver's uplink
+                    // + worker→main bus at ~10–30/s. The relay limiter (#979/#1011) coalesces for
+                    // the publisher but not for our uplink, so we gate at the source: fire at most
+                    // once per PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS (≈ the relay window).
+                    let should_request = match self.last_keyframe_request_ms {
+                        Some(last) => {
+                            (current_time_ms.saturating_sub(last)) as f64
+                                >= PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS
+                        }
+                        None => true,
+                    };
+                    if should_request {
+                        self.last_keyframe_request_ms = Some(current_time_ms);
+                        (self.request_keyframe)();
+                    }
                 }
-                // TODO(#1020): trigger a PLI / keyframe request from here. The PLI mechanism lives
-                // in the client crate (videocall-client: peer_decode_manager::send_keyframe_request,
-                // gap detection in track_sequence), not in videocall-codecs, and the jitter buffer
-                // has no handle back to it. The client already issues keyframe requests on observed
-                // sequence gaps, which covers the common no-keyframe stall. A clean fix would thread
-                // a `request_keyframe` callback into JitterBuffer::new (mirroring how `decoder` is
-                // injected) so the codecs layer can proactively ask for a keyframe the instant it
-                // evicts a stale keyframe-less backlog, rather than waiting for the client's
-                // gap-driven request. Deferred to keep this change transport-agnostic and confined
-                // to the buffer; the eviction above guarantees the buffer cannot grow unbounded in
-                // the meantime.
                 false
             }
         }
@@ -720,6 +782,10 @@ impl<T> JitterBuffer<T> {
         // across the flush gap (issue #1252). The smoothed interval estimate itself persists — the
         // source cadence does not change across a flush.
         self.last_released_arrival_time_ms = None;
+        // Reset the proactive keyframe-request throttle (issue #1025) so a fresh stream after a
+        // flush (e.g. stream restart) can request a recovery keyframe immediately rather than
+        // inheriting the pre-flush cooldown.
+        self.last_keyframe_request_ms = None;
         // Consider resetting jitter estimator as well if needed
         self.jitter_estimator = JitterEstimator::new();
     }
@@ -1459,6 +1525,166 @@ mod tests {
         assert!(
             !jb.buffered_frames.contains_key(&2),
             "stale head delta should be evicted"
+        );
+    }
+
+    /// Issue #1025: evicting a stale KEYFRAME-LESS backlog (no buffered keyframe to
+    /// skip to) must proactively fire the injected `request_keyframe` hook so the
+    /// client fetches a fresh keyframe immediately, instead of waiting for its
+    /// reactive gap-driven request. The contrast — a stale backlog that DOES contain
+    /// a keyframe — skips to that keyframe and must NOT fire the hook (recovery is
+    /// already in hand).
+    ///
+    /// Mutation coverage: removing the `(self.request_keyframe)()` call drops the
+    /// keyframe-less count to 0 (first assert fails); firing from the keyframe-present
+    /// branch fails the `== 0` contrast assert.
+    #[test]
+    fn keyframe_less_backlog_eviction_fires_proactive_keyframe_request() {
+        // --- keyframe-less stall: exactly one proactive request on eviction ---
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded_frames = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded_frames.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let start = 2000u128;
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), start);
+        jb.find_and_move_continuous_frames(start + 100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+
+        // Stall: only deltas arrive (no keyframe); seq 2 goes stale.
+        let stall = start + 200;
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), stall);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), stall);
+        let now = stall + (MAX_PLAYOUT_AGE_MS as u128) + 50;
+        jb.find_and_move_continuous_frames(now);
+
+        assert!(
+            !jb.buffered_frames.contains_key(&2),
+            "stale head delta must be evicted"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "evicting a keyframe-less backlog must fire exactly one proactive keyframe request"
+        );
+
+        // --- contrast: a stale backlog WITH a buffered keyframe must NOT request ---
+        let requests2 = Arc::new(AtomicU32::new(0));
+        let decoded2 = Arc::new(Mutex::new(Vec::new()));
+        let r2 = requests2.clone();
+        let mut jb2 = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded2.clone())),
+            Box::new(move || {
+                r2.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+        let s = 5000u128;
+        jb2.insert_frame(create_test_frame(1, FrameType::KeyFrame), s);
+        jb2.find_and_move_continuous_frames(s + 100);
+        // Stall behind a gap, but a fresh keyframe (seq 10) IS buffered to skip to.
+        let stall2 = s + 200;
+        jb2.insert_frame(create_test_frame(5, FrameType::DeltaFrame), stall2);
+        jb2.insert_frame(create_test_frame(10, FrameType::KeyFrame), stall2);
+        let now2 = stall2 + (MAX_PLAYOUT_AGE_MS as u128) + 50;
+        jb2.find_and_move_continuous_frames(now2);
+        assert_eq!(
+            requests2.load(Ordering::SeqCst),
+            0,
+            "skipping to a buffered keyframe must NOT fire a proactive request"
+        );
+    }
+
+    /// Issue #1025 (source-side throttle): a SUSTAINED keyframe-less stall evicts
+    /// one stale head per poll (~every 10ms tick in production). The proactive
+    /// keyframe request must fire at most once per
+    /// PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS so the struggling receiver does
+    /// not spray its uplink/worker bus with requests the relay would only drop.
+    ///
+    /// Mutation coverage: removing the throttle (firing on every eviction) makes
+    /// the within-window evictions fire too, failing the `== 1` assert; not
+    /// updating `last_keyframe_request_ms` makes the second window never fire,
+    /// failing the `== 2` assert.
+    #[test]
+    fn proactive_keyframe_request_is_throttled_under_sustained_stall() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // Decode a keyframe (last good = seq 1), then a keyframe-less backlog
+        // (seq 2,3,4) all "arrived during the stall" so each is independently stale.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 300);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), 300);
+        jb.insert_frame(create_test_frame(4, FrameType::DeltaFrame), 300);
+
+        // Three evictions in quick succession (10ms apart, well within the 1000ms
+        // throttle). Only the FIRST may fire a proactive request.
+        jb.find_and_move_continuous_frames(2150); // evict seq 2 → fires (#1)
+        jb.find_and_move_continuous_frames(2160); // evict seq 3 → throttled
+        jb.find_and_move_continuous_frames(2170); // evict seq 4 → throttled
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "sustained eviction within one throttle window must fire exactly once"
+        );
+
+        // A later eviction PAST the throttle window fires again.
+        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1400);
+        jb.find_and_move_continuous_frames(3200); // 3200 - 2150 = 1050ms ≥ 1000 → fires (#2)
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "an eviction past the throttle window fires a fresh request"
+        );
+    }
+
+    /// `flush()` resets the proactive keyframe-request throttle so a fresh post-flush
+    /// stream can request recovery immediately instead of inheriting the previous
+    /// stall's cooldown.
+    #[test]
+    fn flush_resets_proactive_keyframe_request_throttle() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 300);
+        jb.find_and_move_continuous_frames(2150);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "first stale keyframe-less eviction fires a proactive request"
+        );
+
+        jb.flush();
+        decoded.lock().unwrap().clear();
+
+        jb.last_decoded_sequence_number = Some(10);
+        jb.insert_frame(create_test_frame(11, FrameType::DeltaFrame), 300);
+        jb.find_and_move_continuous_frames(2200);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "post-flush eviction fires immediately despite being inside the pre-flush throttle window"
         );
     }
 

@@ -80,3 +80,42 @@ impl VideoStatsMessage {
         }
     }
 }
+
+/// Discriminator value carried in [`RequestKeyframeMessage::kind`]. Used by the
+/// main thread's `onmessage` dispatch to tell this proactive keyframe-request
+/// signal apart from the `"video_stats"` diagnostics message — both ride the same
+/// serde worker->main channel (the third kind of payload is a raw
+/// `web_sys::VideoFrame`, which is distinguished structurally by a failed
+/// `dyn_into::<VideoFrame>()`).
+pub const REQUEST_KEYFRAME_KIND: &str = "request_keyframe";
+
+/// Worker->main proactive keyframe-request signal (issue #1025).
+///
+/// Posted by the worker's `JitterBuffer` keyframe-request hook the instant the
+/// freshness deadline evicts a stale **keyframe-less** backlog (see
+/// `JitterBuffer::with_keyframe_request`). The buffer has dropped the stale
+/// deltas but has no buffered keyframe to resume from, so playout is frozen on
+/// the last-good frame until a fresh keyframe arrives — this message asks the
+/// main thread (which owns the transport and the `PeerDecodeManager`) to issue a
+/// `KEYFRAME_REQUEST` for this decoder's peer/stream immediately, rather than
+/// waiting for the client's reactive gap-driven request.
+///
+/// `from_peer` / `to_peer` mirror the worker's diagnostics context and are
+/// carried for log symmetry only; the main-side callback is per-decoder (already
+/// bound to one peer + media type), so it needs no identity from the wire.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RequestKeyframeMessage {
+    pub kind: String,
+    pub from_peer: Option<String>,
+    pub to_peer: Option<String>,
+}
+
+impl RequestKeyframeMessage {
+    pub fn new(from_peer: Option<String>, to_peer: Option<String>) -> Self {
+        Self {
+            kind: REQUEST_KEYFRAME_KIND.to_string(),
+            from_peer,
+            to_peer,
+        }
+    }
+}

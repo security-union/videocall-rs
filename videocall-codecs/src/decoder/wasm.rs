@@ -20,7 +20,9 @@
 
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
-use crate::messages::{VideoStatsMessage, WorkerMessage};
+use crate::messages::{
+    RequestKeyframeMessage, VideoStatsMessage, WorkerMessage, REQUEST_KEYFRAME_KIND,
+};
 #[cfg(feature = "wasm")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
 use wasm_bindgen::prelude::*;
@@ -101,7 +103,13 @@ impl Decodable for WasmDecoder {
                         post_paint_progress(&ack_worker, &painted, &last_ack_ms);
                     }
                     Err(_) => {
-                        if !handle_worker_diag_message(&js_val) {
+                        // Issue #1025: this `Decodable::new` path is not used for real peer
+                        // rendering (peer decoders use `new_with_video_frame_callback`), so there
+                        // is no proactive keyframe hook to fire here — but we still recognize the
+                        // worker's RequestKeyframeMessage so it isn't logged as "unexpected".
+                        if !handle_worker_request_keyframe(&js_val)
+                            && !handle_worker_diag_message(&js_val)
+                        {
                             log::warn!("Received unexpected message from worker: {js_val:?}");
                         }
                     }
@@ -129,10 +137,18 @@ impl Decodable for WasmDecoder {
 }
 
 impl WasmDecoder {
-    /// Create a WasmDecoder with VideoFrame callback for direct canvas rendering
+    /// Create a WasmDecoder with VideoFrame callback for direct canvas rendering.
+    ///
+    /// `on_request_keyframe` (issue #1025) is invoked on the main thread whenever the
+    /// worker posts a [`RequestKeyframeMessage`] — i.e. the worker's jitter buffer just
+    /// evicted a stale keyframe-less backlog and wants a fresh keyframe fetched now. The
+    /// owner (e.g. `VideoPeerDecoder`) supplies a closure that issues a `KEYFRAME_REQUEST`
+    /// for this decoder's peer/stream. Pass a no-op (`Box::new(|| {})`) when no proactive
+    /// keyframe path is wired.
     pub fn new_with_video_frame_callback(
         _codec: crate::decoder::VideoCodec,
         on_video_frame: Box<dyn Fn(VideoFrame)>,
+        on_request_keyframe: Box<dyn Fn()>,
     ) -> Self {
         log::info!("Creating WASM decoder with VideoFrame callback");
         // Find the worker script URL from the link tag added by Trunk.
@@ -162,6 +178,10 @@ impl WasmDecoder {
             let last_ack_ms = Rc::new(Cell::new(0f64));
             // Clone the worker into the closure so the ACK can be posted back upstream.
             let ack_worker = worker.clone();
+            // Issue #1025: proactive keyframe-request callback. Moved into the closure (which is
+            // stored on the struct and kept alive for the worker's lifetime) so it survives as
+            // long as the decoder. Invoked when the worker posts a RequestKeyframeMessage.
+            let request_keyframe = on_request_keyframe;
             Closure::wrap(Box::new(move |event: web_sys::MessageEvent| {
                 let js_val = event.data();
 
@@ -173,7 +193,13 @@ impl WasmDecoder {
                         post_paint_progress(&ack_worker, &painted, &last_ack_ms);
                     }
                     Err(_) => {
-                        if !handle_worker_diag_message(&js_val) {
+                        // Worker->main serde messages: try the proactive keyframe-request signal
+                        // (#1025) first, then the diagnostics stats message. Order is irrelevant
+                        // (each gates on its own `kind`), but checking the keyframe request first
+                        // keeps the recovery path off the (more frequent) stats path.
+                        if handle_worker_request_keyframe(&js_val) {
+                            request_keyframe();
+                        } else if !handle_worker_diag_message(&js_val) {
                             log::warn!("Received unexpected message from worker: {js_val:?}");
                         }
                     }
@@ -303,6 +329,28 @@ fn post_paint_progress(
             }
         }
         Err(e) => log::error!("Error serializing PaintProgress: {e:?}"),
+    }
+}
+
+/// Recognize the worker's proactive keyframe-request signal (issue #1025). Returns `true` if
+/// the posted value is a [`RequestKeyframeMessage`] (so the caller should fire its keyframe
+/// callback), `false` otherwise (the caller falls through to the diagnostics parse).
+///
+/// Both this and [`handle_worker_diag_message`] deserialize the same JS object shape via serde
+/// and disambiguate on the `kind` field, mirroring the existing stats dispatch. We check the
+/// discriminant explicitly so a `VideoStatsMessage` (whose extra fields are all `Option` and
+/// would deserialize fine into this struct's subset) is NOT mistaken for a keyframe request.
+fn handle_worker_request_keyframe(js_val: &JsValue) -> bool {
+    match serde_wasm_bindgen::from_value::<RequestKeyframeMessage>(js_val.clone()) {
+        Ok(msg) if msg.kind == REQUEST_KEYFRAME_KIND => {
+            log::debug!(
+                "Proactive keyframe request from worker (#1025): from_peer={:?} to_peer={:?}",
+                msg.from_peer,
+                msg.to_peer
+            );
+            true
+        }
+        _ => false,
     }
 }
 

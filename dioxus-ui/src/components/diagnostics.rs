@@ -616,13 +616,9 @@ pub fn Diagnostics(
     /// nothing. (#1131 unify)
     #[props(default)]
     perf_controls: Option<PerfControlsHandle>,
-    /// Current drawer width in px, owned by the parent so it can persist + reflow
-    /// the tile grid. (#1296)
+    /// Current drawer width in px, owned by the parent so it can persist the
+    /// drag-resized width. (#1296)
     width: f64,
-    /// Whether this drawer is pinned (reflows the tile grid). (#1296)
-    pinned: bool,
-    /// Fired when the user toggles pin/overlay mode. (#1296)
-    on_toggle_pin: EventHandler<()>,
     /// Fired on resize-handle pointerdown so the parent can begin a drag. (#1296)
     on_resize_start: EventHandler<()>,
     /// Fired on each resize-handle pointermove, carrying the pointer's `client_x`.
@@ -1046,12 +1042,10 @@ pub fn Diagnostics(
     // Performance handle hasn't been published yet, because the always-present
     // Connection & system group owns it.
 
-    let pin_label = if pinned { "Unpin panel" } else { "Pin panel" };
-
     rsx! {
         div {
             id: "diagnostics-sidebar",
-            class: if is_open { if pinned { "visible pinned" } else { "visible" } } else { "" },
+            class: if is_open { "visible" } else { "" },
             style: format!("width: {}px", width),
             // Non-modal drawer: a labelled region (the modal-trap behaviour stays
             // off — the call UI behind it remains interactive). (#1131 §5 a11y)
@@ -1062,27 +1056,6 @@ pub fn Diagnostics(
                 // Spacer keeps the × rightmost (the cross-nav button was removed
                 // when the Performance panel merged into this drawer; #1131).
                 div { style: "flex: 1 1 auto;" }
-                button {
-                    class: "pin-button",
-                    aria_pressed: pinned,
-                    aria_label: pin_label,
-                    title: pin_label,
-                    onclick: move |_| on_toggle_pin.call(()),
-                    svg {
-                        xmlns: "http://www.w3.org/2000/svg",
-                        width: "20",
-                        height: "20",
-                        view_box: "0 0 24 24",
-                        fill: "none",
-                        stroke: "currentColor",
-                        stroke_width: "2",
-                        stroke_linecap: "round",
-                        stroke_linejoin: "round",
-                        // Pushpin / map-pin icon
-                        path { d: "M12 17v5" }
-                        path { d: "M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" }
-                    }
-                }
                 button {
                     class: "close-button",
                     "aria-label": "Close panel",

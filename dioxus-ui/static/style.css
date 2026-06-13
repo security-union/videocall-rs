@@ -83,16 +83,6 @@ canvas {
   visibility: visible;
 }
 
-/* Pinned drawer: anchored inside #main-container (position:relative) rather than
-   fixed-over-viewport. The LOAD-BEARING reflow is the Rust grid inset in
-   attendants.rs (avail_w + #grid-container left/right), NOT this CSS — this rule
-   only changes the drawer's own positioning + chrome. */
-#peer-list-container.pinned {
-  position: absolute;
-  box-shadow: none;
-  border-right: 1px solid var(--border);
-}
-
 /* Shared sidebar styles */
 .sidebar-header {
   display: flex;
@@ -1063,16 +1053,6 @@ select {
   box-shadow: var(--shadow-sm);
 }
 
-/* Pinned drawer: anchored inside #main-container (position:relative) rather than
-   fixed-over-viewport. The LOAD-BEARING reflow is the Rust grid inset in
-   attendants.rs (avail_w + #grid-container left/right), NOT this CSS — this rule
-   only changes the drawer's own positioning + chrome. */
-#diagnostics-sidebar.pinned {
-  position: absolute;
-  box-shadow: none;
-  border-left: 1px solid var(--border);
-}
-
 /* Theme compliance (#1131 §5): the `.perf-*` text uses --text-primary/-secondary/
    -tertiary. Inside the settings modal those are remapped to the white
    settings-modal tokens for dark theme; mirror that remap for the drawer so the
@@ -1884,39 +1864,6 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   transform: scale(0.95);
 }
 
-/* Drawer pin/overlay toggle button (issue 1296). Visually matches .menu-button. */
-.pin-button {
-  background: var(--glass-bg-hover);
-  border: none;
-  border-radius: 8px;
-  width: 32px;
-  height: 32px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.2s ease;
-  color: var(--text-primary);
-}
-
-.pin-button:hover {
-  background: var(--scrollbar-thumb-active);
-  transform: scale(1.05);
-}
-
-.pin-button:active {
-  transform: scale(0.95);
-}
-
-.pin-button[aria-pressed="true"] {
-  color: var(--accent);
-}
-
-.pin-button:focus-visible {
-  outline: 2px solid var(--accent);
-  outline-offset: 2px;
-}
-
 /* Drawer resize grip (issue 1296). One per drawer, positioned on the drawer's inner
    edge. Drag is driven by pointer listeners on each drawer's
    .drawer-resize-handle, using pointer capture (attendants.rs / diagnostics.rs).
@@ -1925,7 +1872,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    The handle div is the FULL-HEIGHT pointerdown/capture target (cursor ew-resize)
    but is itself visually transparent; the visible affordance is a short, centered
    vertical grip rendered via ::before so a bare edge-hover doesn't read as a solid
-   resizable bar. The grip uses var(--border) at rest and var(--accent) on
+   resizable bar. The grip uses var(--border-emphasis) at rest and var(--accent) on
    hover/focus/active. (issue 1296) */
 .drawer-resize-handle {
   position: absolute;

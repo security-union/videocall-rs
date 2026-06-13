@@ -233,16 +233,18 @@ pub struct EncoderBitrateController {
     /// survives past the oscillation window (a good bet clears the flap memory).
     layer_probe_penalty_ms: f64,
 
-    /// Monotonic count of UNION-CAP sheds — ticks where the relay layer-union cap
-    /// reduced the active layer count below what backpressure alone left this tick
+    /// Monotonic count of RELAY-UNION-cap sheds — ticks where the relay layer-union
+    /// cap (NOT backpressure, and NOT the user "layers published" ceiling) was the
+    /// binding cap that reduced the active layer count below what backpressure left
     /// (issue #1294). A union-cap shed is demand-driven (every receiver asked for
     /// fewer layers), NOT a flap, so it is deliberately NOT penalized (see the
     /// shed-classification block in [`tick`](Self::tick)); but it was also SILENT,
-    /// leaving field logs unable to tell a union-driven shed from a
-    /// backpressure/congestion one. This counter — plus the paired
+    /// leaving field logs unable to tell a union-driven shed from a backpressure,
+    /// congestion, or user-ceiling one. This counter — plus the paired
     /// `AQ_LAYER_SHED: cause=union_cap` log line — makes the path observable so the
-    /// next incident reveals which shed path actually fired. Observability ONLY: it
-    /// changes no control decision.
+    /// next incident reveals which shed path actually fired. A user-ceiling shed is
+    /// attributed `cause=user_cap` instead and does NOT increment this counter.
+    /// Observability ONLY: it changes no control decision.
     union_cap_shed_total: u64,
 
     /// The highest active-layer count this controller has EARNED at runtime and
@@ -801,28 +803,48 @@ impl EncoderBitrateController {
                 // flap paths classify identically and stay in lockstep.
                 self.arm_probe_penalty_if_oscillation(now, "backpressure");
             }
-            // #1294 observability: detect the UNION-CAP portion of this tick's
-            // shed — active fell BELOW what the backpressure block left, i.e. the
-            // relay layer-union cap (not backpressure) removed the rung. This is
-            // demand-driven (every receiver asked for fewer layers), NOT a flap, so
-            // it is intentionally NOT penalized above; but it was SILENT, so field
-            // logs could not tell it apart from a backpressure/congestion shed.
-            // Count + log it (observability ONLY — no control effect) so the next
-            // incident reveals which shed path actually fired. See #1294.
+            // #1294 observability: a TOP-SIDE CAP removed a rung this tick — active
+            // fell BELOW what the backpressure block left. The active count is
+            // capped to `cap = union_requested_layer_cap.min(user_layer_ceiling_cap)`
+            // (see the cap block above), so EITHER the relay layer-union OR the user
+            // "layers published" ceiling can drive this. Both are demand/user-driven,
+            // NOT flaps, so neither is penalized above; but the shed was SILENT, so
+            // field logs could not tell a cap shed from a backpressure/congestion
+            // one — nor which CAP bound. Attribute to whichever cap is the lower
+            // count (the one that actually determined `cap` via the `.min()`), so a
+            // RELAY-union shed (#1294's concern) is not conflated with a USER-thumb
+            // shed. Observability ONLY — no control effect. See #1294.
             let active_now = self.quality_manager.active_layer_count();
             if active_now < active_after_backpressure {
-                self.union_cap_shed_total = self.union_cap_shed_total.saturating_add(1);
-                log::info!(
-                    "AQ_LAYER_SHED: cause=union_cap active {} -> {} (relay layer-union cap={}; demand-driven, not penalized) total={}",
-                    active_after_backpressure,
-                    active_now,
-                    if self.union_requested_layer_cap == usize::MAX {
+                let cap_label = |c: usize| {
+                    if c == usize::MAX {
                         "uncapped".to_string()
                     } else {
-                        self.union_requested_layer_cap.to_string()
-                    },
-                    self.union_cap_shed_total,
-                );
+                        c.to_string()
+                    }
+                };
+                // `union <= user` mirrors `cap = union.min(user)`: when equal (or
+                // union lower) the union is the binding cap; otherwise the user
+                // ceiling is. fail-open (`usize::MAX`) on a side means it cannot be
+                // the lower one unless both are open (then active would not have
+                // dropped via the cap at all).
+                if self.union_requested_layer_cap <= self.user_layer_ceiling_cap {
+                    self.union_cap_shed_total = self.union_cap_shed_total.saturating_add(1);
+                    log::info!(
+                        "AQ_LAYER_SHED: cause=union_cap active {} -> {} (relay layer-union cap={}; demand-driven, not penalized) union_total={}",
+                        active_after_backpressure,
+                        active_now,
+                        cap_label(self.union_requested_layer_cap),
+                        self.union_cap_shed_total,
+                    );
+                } else {
+                    log::info!(
+                        "AQ_LAYER_SHED: cause=user_cap active {} -> {} (user layers-published ceiling={}; user-driven, not penalized)",
+                        active_after_backpressure,
+                        active_now,
+                        cap_label(self.user_layer_ceiling_cap),
+                    );
+                }
             }
             // Any shed clears the in-flight probe marker: a union-only shed is not
             // an oscillation (so we did not arm above), but the probed layer is
@@ -3429,6 +3451,53 @@ mod tests {
             controller.union_cap_shed_total(),
             union_count_before_backpressure,
             "a BACKPRESSURE shed must NOT increment the union-cap counter (#1294)"
+        );
+    }
+
+    /// #1294 cause-split: a shed driven by the USER "layers published" ceiling
+    /// (union fail-open) must be attributed `cause=user_cap` and must NOT increment
+    /// `union_cap_shed_total`. Guards against the original defect of hardcoding
+    /// `cause=union_cap` for any top-side cap shed — which would mislabel a
+    /// user-thumb shed as a relay-union shed and corrupt the #1294 signal.
+    /// Mutation proof: attributing every cap shed to the union counter trips the
+    /// final `== 0` assertion.
+    #[test]
+    fn test_user_ceiling_shed_is_not_counted_as_union_cap_1294() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+        // Relay union stays fail-open (Auto) for the whole test, so the only
+        // top-side cap that can bind is the USER ceiling.
+
+        // Earn 2 layers under clear.
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(controller.active_layer_count(), 2);
+        assert_eq!(controller.union_cap_shed_total(), 0);
+
+        // USER lowers the "layers published" thumb to base (count 1) while the
+        // union is Auto and backpressure is clear. The cap suppress is eager, so
+        // active drops to 1 this tick — driven purely by the USER ceiling.
+        controller.observe_user_layer_ceiling(1);
+        t += probe_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "user ceiling suppressed to base"
+        );
+        assert_eq!(
+            controller.union_cap_shed_total(),
+            0,
+            "a USER-ceiling shed must be attributed cause=user_cap, NOT counted as a \
+             union-cap shed (#1294 cause split)"
         );
     }
 

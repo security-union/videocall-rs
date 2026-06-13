@@ -499,15 +499,22 @@ impl LayerPrefs {
 const LAYER_HINT_FULL_LADDER_SENTINEL: u32 = u32::MAX;
 
 /// The media kinds the relay computes a layer union for, as the normalized
-/// preference-map discriminants (VIDEO=1, AUDIO=2, SCREEN=3 — see
+/// preference-map discriminants (VIDEO=1, SCREEN=3 — see
 /// [`normalize_pref_media_kind`]). A publisher produces at most one ladder per
 /// kind, so a hint carries at most one [`LayerHintEntry`] per element here.
-const LAYER_HINT_MEDIA_KINDS: [i32; 3] = [1, 2, 3];
+///
+/// AUDIO(2) is deliberately EXCLUDED (issue #1118 N3): audio has no simulcast
+/// ladder, the publisher's `LAYER_HINT` dispatch arm ignores AUDIO/UNSPECIFIED
+/// entries (`video_call_client.rs`, the `_ => {}` fail-open arm), so scanning the
+/// AUDIO union and emitting any AUDIO entry is pure wasted work on the relay. The
+/// relay therefore computes/emits hints only for VIDEO + SCREEN.
+const LAYER_HINT_MEDIA_KINDS: [i32; 2] = [1, 3];
 
 /// Map a normalized preference-map media-kind discriminant (1/2/3) onto the
 /// `LayerHintPacket.MediaKind` wire enum used when emitting a hint. Anything
 /// outside `{1,2,3}` maps to UNSPECIFIED(0) (never produced on the happy path —
-/// [`LAYER_HINT_MEDIA_KINDS`] only contains 1/2/3).
+/// [`LAYER_HINT_MEDIA_KINDS`] only contains 1 and 3 since #1118 N3, both mapped
+/// below; the AUDIO(2) arm is retained for completeness should a caller pass it).
 fn layer_hint_media_kind(
     kind: i32,
 ) -> videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind {
@@ -13024,6 +13031,38 @@ mod tests {
         assert_eq!(layer_hint_media_kind(3), HintKind::SCREEN);
         assert_eq!(layer_hint_media_kind(0), HintKind::MEDIA_KIND_UNSPECIFIED);
         assert_eq!(layer_hint_media_kind(99), HintKind::MEDIA_KIND_UNSPECIFIED);
+    }
+
+    /// #1118 N3: the relay must compute/emit layer hints ONLY for VIDEO + SCREEN.
+    /// AUDIO(2) has no simulcast ladder, and the publisher's `LAYER_HINT` dispatch
+    /// arm ignores AUDIO/UNSPECIFIED entries (`video_call_client.rs`, the `_ => {}`
+    /// fail-open arm), so scanning the AUDIO union and emitting any AUDIO entry is
+    /// pure wasted work. `LAYER_HINT_MEDIA_KINDS` directly drives the recompute
+    /// scan (`for &kind in LAYER_HINT_MEDIA_KINDS.iter()`), so pinning it pins the
+    /// emitted-kinds behavior. Re-adding AUDIO(2) fails this test.
+    #[test]
+    fn test_layer_hint_media_kinds_exclude_audio() {
+        use videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind as HintKind;
+        assert!(
+            !LAYER_HINT_MEDIA_KINDS.contains(&2),
+            "AUDIO(2) must not be scanned/emitted — no simulcast ladder, client ignores it (#1118 N3)"
+        );
+        assert_eq!(
+            LAYER_HINT_MEDIA_KINDS,
+            [1, 3],
+            "the relay computes layer unions for exactly VIDEO(1) + SCREEN(3)"
+        );
+        // Every scanned kind maps to a real laddered wire kind — never AUDIO or
+        // UNSPECIFIED — so the scan list and the emitted kinds stay in lockstep.
+        for &kind in LAYER_HINT_MEDIA_KINDS.iter() {
+            assert!(
+                matches!(
+                    layer_hint_media_kind(kind),
+                    HintKind::VIDEO | HintKind::SCREEN
+                ),
+                "scanned kind {kind} must emit as VIDEO or SCREEN"
+            );
+        }
     }
 
     // =====================================================================

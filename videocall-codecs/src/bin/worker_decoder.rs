@@ -38,8 +38,10 @@
 use std::cell::{Cell, RefCell};
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
-use videocall_codecs::jitter_buffer::{paint_lag_ms, JitterBuffer};
-use videocall_codecs::messages::{RequestKeyframeMessage, VideoStatsMessage, WorkerMessage};
+use videocall_codecs::jitter_buffer::{paint_lag_ms, FreshnessSkip, JitterBuffer};
+use videocall_codecs::messages::{
+    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerMessage,
+};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
@@ -521,6 +523,16 @@ fn check_jitter_buffer_for_ready_frames() {
             let current_time_ms = js_sys::Date::now() as u128;
             jb.find_and_move_continuous_frames(current_time_ms);
 
+            // Forward any freshness-deadline skip to the main thread for field-log
+            // visibility (issue #1045). The deadline runs here in the worker, whose
+            // logs the main-thread capture pipeline never sees; this is the only way
+            // to confirm #1020 (and future decode-side fixes) actually fire in the
+            // field. Event-driven (only on an actual skip), so unlike the 1Hz stats
+            // below it is not rate-limited.
+            if let Some(skip) = jb.take_freshness_skip() {
+                post_freshness_skip_to_main(&skip);
+            }
+
             // Publish buffered frames metric periodically under subsystem "video" with stream_id unset.
             // Rate limited to 1 Hz to avoid flooding diagnostics.
             // The client layer will attach original ids later in the pipeline.
@@ -646,6 +658,33 @@ fn post_request_keyframe_to_main() {
         }
         Err(e) => {
             console::warn_1(&format!("[WORKER] request_keyframe: serialize failed: {e:?}").into());
+        }
+    }
+}
+
+/// Post a freshness-deadline skip (issue #1045) to the main thread so it lands in
+/// uploaded field logs. Mirrors `post_request_keyframe_to_main`; context
+/// (CONTEXT_FROM/CONTEXT_TO) is read at emit time.
+fn post_freshness_skip_to_main(skip: &FreshnessSkip) {
+    let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
+        console::warn_1(&"[WORKER] freshness_skip: no worker scope; dropping".into());
+        return;
+    };
+    let from_peer = CONTEXT_FROM.with(|f| f.borrow().clone());
+    let to_peer = CONTEXT_TO.with(|t| t.borrow().clone());
+    let msg = FreshnessSkipMessage::new(
+        from_peer,
+        to_peer,
+        skip.head_age_ms,
+        skip.keyframe_seq,
+        skip.dropped,
+    );
+    match serde_wasm_bindgen::to_value(&msg) {
+        Ok(val) => {
+            let _ = scope.post_message(&val);
+        }
+        Err(e) => {
+            console::warn_1(&format!("[WORKER] freshness_skip: serialize failed: {e:?}").into());
         }
     }
 }

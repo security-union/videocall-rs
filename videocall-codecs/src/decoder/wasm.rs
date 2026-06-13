@@ -21,7 +21,8 @@
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
 use crate::messages::{
-    RequestKeyframeMessage, VideoStatsMessage, WorkerMessage, REQUEST_KEYFRAME_KIND,
+    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerMessage,
+    FRESHNESS_SKIP_KIND, REQUEST_KEYFRAME_KIND,
 };
 #[cfg(feature = "wasm")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
@@ -356,14 +357,11 @@ fn handle_worker_request_keyframe(js_val: &JsValue) -> bool {
 
 /// Handle diagnostics objects posted by the worker. Returns true if handled.
 fn handle_worker_diag_message(js_val: &JsValue) -> bool {
-    // Try to deserialize the JavaScript object using serde
-    match serde_wasm_bindgen::from_value::<VideoStatsMessage>(js_val.clone()) {
-        Ok(stats_msg) => {
-            // Only handle video_stats messages
-            if stats_msg.kind != "video_stats" {
-                return false;
-            }
-
+    // video_stats (issue #1252). A freshness_skip message ALSO deserializes into
+    // VideoStatsMessage (its fields are all `Option`), so we must check `kind` and
+    // fall through rather than treating a successful deserialize as a match.
+    if let Ok(stats_msg) = serde_wasm_bindgen::from_value::<VideoStatsMessage>(js_val.clone()) {
+        if stats_msg.kind == "video_stats" {
             #[cfg(feature = "wasm")]
             {
                 let evt = DiagEvent {
@@ -390,12 +388,42 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                 };
                 let _ = global_sender().try_broadcast(evt);
             }
-            true
-        }
-        Err(_) => {
-            // Not a recognized diagnostic message
-            log::debug!("Received unexpected message from worker: {js_val:?}");
-            false
+            return true;
         }
     }
+
+    // freshness_skip (issue #1045): the #1020 freshness-deadline outcome, forwarded
+    // from the worker so it lands in uploaded field logs. Re-broadcast as a
+    // DiagEvent with the worker's peer context, mirroring the video_stats path.
+    if let Ok(skip_msg) = serde_wasm_bindgen::from_value::<FreshnessSkipMessage>(js_val.clone()) {
+        if skip_msg.kind == FRESHNESS_SKIP_KIND {
+            #[cfg(feature = "wasm")]
+            {
+                let evt = DiagEvent {
+                    subsystem: "video",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics: vec![
+                        metric!("event", "freshness_skip"),
+                        metric!("from_peer", skip_msg.from_peer.unwrap_or_default()),
+                        metric!("to_peer", skip_msg.to_peer.unwrap_or_default()),
+                        metric!("head_age_ms", skip_msg.head_age_ms),
+                        // -1 marks the keyframe-less (held last-good) case, since the
+                        // metric value is numeric and `keyframe_seq` is optional.
+                        metric!(
+                            "keyframe_seq",
+                            skip_msg.keyframe_seq.map(|s| s as i64).unwrap_or(-1)
+                        ),
+                        metric!("dropped", skip_msg.dropped),
+                    ],
+                };
+                let _ = global_sender().try_broadcast(evt);
+            }
+            return true;
+        }
+    }
+
+    // Not a recognized diagnostic message
+    log::debug!("Received unexpected message from worker: {js_val:?}");
+    false
 }

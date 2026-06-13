@@ -668,12 +668,20 @@ fn DevicePreview(
 
             if !media_access_granted {
                 // ── Pre-permission state ──────────────────────────────
+                // Access is requested automatically on the pre-join screen
+                // (issue 1134), so this prompt reflects the in-flight
+                // auto-request. The "Allow camera & mic" button below is a
+                // manual fallback only for that brief in-flight window (e.g. if
+                // the auto-request is slow): once permission resolves either
+                // way, `on_result` sets `media_access_granted` unconditionally,
+                // which replaces this whole block with the device UI — so the
+                // button is never the thing shown after a block/denial.
                 div {
                     class: "prejoin-permission-prompt",
                     "data-testid": PREVIEW_PERMISSION_PROMPT_TESTID,
                     role: "note",
                     p { class: "prejoin-permission-text",
-                        "Allow camera & microphone access to preview your devices and choose which to use."
+                        "Requesting camera & microphone access…"
                     }
                     button {
                         r#type: "button",

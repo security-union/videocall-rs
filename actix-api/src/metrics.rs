@@ -125,6 +125,22 @@ pub const RELAY_LAYER_PREFERENCE_UPDATE_OUTCOMES: &[&str] = &[
 /// suppression).
 pub const RELAY_LAYER_HINT_DIRECTIONS: &[&str] = &["suppress", "restore"];
 
+/// Every `kind` label value of `relay_layer_preference_sessions{room, kind,
+/// layer_id}` (#1170 demand-side gauge). Only the two media kinds that carry a
+/// simulcast ladder are tracked — AUDIO has no layers so it is intentionally
+/// absent (a receiver never expresses a per-layer preference for audio).
+pub const RELAY_LAYER_PREFERENCE_KINDS: &[&str] = &["video", "screen"];
+
+/// Every `layer_id` bucket label value shared by the per-layer relay metrics
+/// (`relay_layer_forwarded_by_layer_total` #1105 and
+/// `relay_layer_preference_sessions` #1170). The wire `simulcast_layer_id` is a
+/// forgeable `u32` outside the AEAD seal, so it is BUCKETED in code (0/1/2 to
+/// their own bucket, everything else to `"other"`) before becoming a label —
+/// capping this label to EXACTLY 4 values regardless of what arrives on the
+/// wire. This array is the room-drain GC's source of truth for those four
+/// buckets.
+pub const RELAY_LAYER_ID_BUCKETS: &[&str] = &["0", "1", "2", "other"];
+
 /// Remove EVERY room-labeled relay CounterVec/GaugeVec series for `room`.
 ///
 /// Called by `chat_server` the moment a room drains to empty (see
@@ -171,6 +187,17 @@ pub fn forget_room_metrics(room: &str) {
     // relay_layer_hint_emitted_total{room, direction} (#1108).
     for direction in RELAY_LAYER_HINT_DIRECTIONS {
         let _ = RELAY_LAYER_HINT_EMITTED_TOTAL.remove_label_values(&[room, direction]);
+    }
+
+    // relay_layer_preference_sessions{room, kind, layer_id} (#1170): full
+    // cartesian product of the two bounded taxonomies. The periodic sweep
+    // re-sets these (including zeros) for LIVE rooms; once a room drains the
+    // sweep stops writing it, so its last values would otherwise linger — this
+    // removal erases them at drain time.
+    for kind in RELAY_LAYER_PREFERENCE_KINDS {
+        for bucket in RELAY_LAYER_ID_BUCKETS {
+            let _ = RELAY_LAYER_PREFERENCE_SESSIONS.remove_label_values(&[room, kind, bucket]);
+        }
     }
 
     // relay_packet_drops_total{room, transport, drop_reason}: full cartesian
@@ -654,13 +681,13 @@ lazy_static! {
     // NOTE(#1184): videocall_encoder_fps_ratio / videocall_encoder_bitrate_ratio
     // removed — dead telemetry whose source proto fields no longer exist.
 
-    /// p75 peer FPS signal driving encoder decisions.
-    pub static ref ENCODER_P75_PEER_FPS: GaugeVec = register_gauge_vec!(
-        "videocall_encoder_p75_peer_fps",
-        "p75 peer FPS driving adaptive quality decisions",
+    /// Encoder queue depth signal driving encoder (sender-side) decisions.
+    pub static ref ENCODER_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_queue_depth",
+        "Encoder queue depth (sender-side backpressure signal driving adaptive quality decisions)",
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
-    .expect("Failed to create encoder_p75_peer_fps metric");
+    .expect("Failed to create encoder_queue_depth metric");
 
     /// Screen share quality tier (0=high, 1=medium, 2=low)
     pub static ref ADAPTIVE_SCREEN_TIER: GaugeVec = register_gauge_vec!(
@@ -1160,6 +1187,51 @@ lazy_static! {
         &["room", "direction"]
     )
     .expect("Failed to create relay_layer_hint_emitted_total metric");
+
+    /// DEMAND-side per-layer distribution: how many receiver sessions currently
+    /// request each simulcast layer, per room and media kind (#1170).
+    ///
+    /// This is the COMPLEMENT of [`RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL`]
+    /// (#1105), which counts the FORWARDED side ("what layer mix is flowing").
+    /// This gauge answers the other half: "what layer mix are receivers ASKING
+    /// for?" — the input to the relay's suppress/restore decisions. Comparing
+    /// the two surfaces, e.g., a room where most sessions request L0 but the
+    /// relay is still forwarding L2 (a publisher not yet honoring a LAYER_HINT).
+    ///
+    /// AGGREGATION (the #1170-flagged semantics, decided here): each receiver
+    /// session is classified by its MAX requested layer for the kind — the
+    /// highest `desired_layer` across every source it has expressed a preference
+    /// for — because the relay must produce/forward up to that highest layer for
+    /// that receiver, so the max is the single layer that characterizes the
+    /// session's demand. This is computed SEPARATELY per `kind` (a receiver may
+    /// want low SCREEN but full VIDEO). The gauge value for
+    /// `{room, kind, layer_id}` is the COUNT of sessions in `room` whose max
+    /// requested layer for `kind` buckets to `layer_id`.
+    ///
+    /// FAIL-OPEN EXCLUSION: a receiver with NO recorded preference entry for a
+    /// kind wants the full ladder (it has expressed no demand) and is NOT
+    /// counted. This is deliberate: counting it would conflate "no signal yet"
+    /// (every freshly-joined session) with "explicitly requests the top layer",
+    /// inflating the top bucket. The gauge therefore reflects only EXPRESSED
+    /// downgrade demand. A room with simulcast off / no LAYER_PREFERENCE packets
+    /// yet leaves every series at zero.
+    ///
+    /// CARDINALITY: bounded — `room` × exactly 2 `kind`
+    /// ([`RELAY_LAYER_PREFERENCE_KINDS`]) × exactly 4 `layer_id` buckets
+    /// ([`RELAY_LAYER_ID_BUCKETS`]). NO per-source/session/peer label is EVER
+    /// added (session ids churn on reconnect — per-client granularity is #1170
+    /// item 3, deliberately deferred). The `layer_id` is bucketed in code (see
+    /// `chat_server::layer_id_bucket`) before becoming a label, so a forged wire
+    /// id cannot create unbounded series. Series for a drained room are removed
+    /// by [`forget_room_metrics`]; series for active rooms are explicitly
+    /// re-SET (including zeros) every sweep so a bucket that no longer has demand
+    /// reads `0`, never a stale value.
+    pub static ref RELAY_LAYER_PREFERENCE_SESSIONS: GaugeVec = register_gauge_vec!(
+        "relay_layer_preference_sessions",
+        "Count of receiver sessions requesting each simulcast layer per room and kind; demand-side complement of relay_layer_forwarded_by_layer_total; layer_id bucketed to 0|1|2|other (#1170)",
+        &["room", "kind", "layer_id"]
+    )
+    .expect("Failed to create relay_layer_preference_sessions metric");
 
     /// Current outbound channel occupancy per transport
     pub static ref RELAY_OUTBOUND_QUEUE_DEPTH: GaugeVec = register_gauge_vec!(
@@ -1759,6 +1831,14 @@ mod tests {
             .with_label_values(&[room, "webtransport"])
             .set(3.0);
         RELAY_VIEWPORT_SET_SIZE.with_label_values(&[room]).set(4.0);
+        // relay_layer_preference_sessions{room, kind, layer_id} (#1170): seed one
+        // representative cell from each bounded taxonomy.
+        RELAY_LAYER_PREFERENCE_SESSIONS
+            .with_label_values(&[room, "video", "0"])
+            .set(5.0);
+        RELAY_LAYER_PREFERENCE_SESSIONS
+            .with_label_values(&[room, "screen", "other"])
+            .set(2.0);
 
         // Confirm the seeds are non-zero (otherwise the post-removal assert
         // below would pass vacuously — Adversarial check #2).
@@ -1774,6 +1854,13 @@ mod tests {
                 .with_label_values(&[room, "websocket"])
                 .get(),
             7.0
+        );
+        assert_eq!(
+            RELAY_LAYER_PREFERENCE_SESSIONS
+                .with_label_values(&[room, "video", "0"])
+                .get(),
+            5.0,
+            "demand-gauge seed must be observable before removal (non-vacuous)"
         );
 
         // Drain the room.
@@ -1857,6 +1944,19 @@ mod tests {
         );
         assert_eq!(
             RELAY_VIEWPORT_SET_SIZE.with_label_values(&[room]).get(),
+            0.0
+        );
+        // Both seeded demand-gauge cells must be removed by forget_room_metrics.
+        assert_eq!(
+            RELAY_LAYER_PREFERENCE_SESSIONS
+                .with_label_values(&[room, "video", "0"])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_LAYER_PREFERENCE_SESSIONS
+                .with_label_values(&[room, "screen", "other"])
+                .get(),
             0.0
         );
 

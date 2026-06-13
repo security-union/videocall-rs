@@ -355,6 +355,15 @@ impl NetSimShim {
                 // independently of path delay. A non-zero `bw_delay` means the
                 // bucket was in deficit for this packet — the link could not
                 // absorb the offered byte rate. See `bandwidth_wait_us`.
+                //
+                // CONSUMER-AGNOSTIC (issue #1226): this bump fires on EVERY
+                // shaped-packet deficit, in BOTH shim directions and on BOTH
+                // call sites — the native bot uplink shim (whose AQ samples it
+                // via `observe_uplink_saturation`) AND the browser-side netsim
+                // hook (#1080/#1218), which has no reader and simply lets the
+                // counter accumulate, ignored. The counter is therefore NOT
+                // bot-only state; a future reader must not assume every
+                // increment corresponds to a bot AQ sample.
                 if !bw_delay.is_zero() {
                     self.bandwidth_wait_us.fetch_add(
                         bw_delay.as_micros().min(u128::from(u64::MAX)) as u64,

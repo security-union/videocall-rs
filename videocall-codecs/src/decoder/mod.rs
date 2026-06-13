@@ -71,6 +71,18 @@ pub trait Decodable: Send + Sync {
 
     /// Sends a raw frame buffer to the decoder for processing.
     fn decode(&self, frame: FrameBuffer);
+
+    /// Returns the number of chunks currently queued inside the underlying decoder but not yet
+    /// processed (the second buffer stage — e.g. WebCodecs `VideoDecoder.decodeQueueSize`).
+    ///
+    /// The jitter buffer reads this to apply release-side backpressure (issue #1024): it stops
+    /// releasing fresh frames while this depth is at/above a high-water mark, so frames drain at
+    /// display rate instead of being shoveled into an unpaced second-stage queue and painted
+    /// back-to-back. Decoders without an observable internal queue (native/mock) return the default
+    /// `0`, which disables backpressure for them (their pacing is handled elsewhere).
+    fn decode_queue_depth(&self) -> u32 {
+        0
+    }
 }
 
 // Conditionally compile and expose the native implementation

@@ -14,8 +14,13 @@
 //!
 //! 1. `render_fps` — sampled at ~1 Hz, the rate at which the local render loop
 //!    is actually painting frames.
-//! 2. `longtask_ms_per_sec` — main-thread long-task time per wall-clock second
-//!    (a proxy for main-thread saturation / jank).
+//! 2. `longtask` — main-thread long-task time per wall-clock second (a proxy
+//!    for main-thread saturation / jank), as `Option<f64>`. It is `None` on
+//!    browsers where the Long Tasks API is unavailable (WebKit/Safari + all iOS
+//!    browsers — issue #1286), which is treated conservatively everywhere: a
+//!    `None` can never confirm "idle / not busy" (so it never permits growth or
+//!    recovery) but also never manufactures distress (so it never suppresses an
+//!    FPS-driven protective step-down).
 //!
 //! `avg_decode_latency_ms` is intentionally NOT referenced: it is not populated
 //! anywhere on the client, so keying on it would be keying on a constant.
@@ -131,6 +136,69 @@ pub const STEP_UP_COOLDOWN_MS: f64 = 4000.0;
 /// final.
 pub const MIN_CAP: usize = 1;
 
+/// Absolute upper bound on simultaneously-decoded tiles for **mobile WebKit
+/// (iOS)** devices, regardless of core count (issue #1286 / #1289).
+///
+/// First-guess value — pending a performance-reviewer pass. DO NOT treat as
+/// final.
+///
+/// ## Why a hard mobile ceiling exists
+///
+/// On iOS the only main-thread-saturation signal we have (`longtask`) does not
+/// exist (the Long Tasks API is WebKit-blind), and `render_fps` (rAF) measures
+/// compositor paint, not video decode, so it stays healthy while the decode
+/// pipeline backs up. With no valid backpressure signal, the adaptive loop
+/// reads "healthy" and would otherwise grow the cap without bound. In #1289 a
+/// 4-core iPhone ratcheted its cap 9 → 14 tiles until video froze and audio
+/// backed up 1725 ms. This ceiling is the floor of last resort that binds even
+/// when every signal reads healthy.
+pub const IOS_DECODE_TILE_CEILING_ABS: usize = 6;
+
+/// Pure, unit-testable device-class tile ceiling (issue #1286 / #1289).
+///
+/// Returns `Some(max_tiles)` when a device-class upper bound applies, or `None`
+/// when the platform imposes no extra ceiling (the cap is then governed solely
+/// by the existing `[MIN_CAP, min(natural, CANVAS_LIMIT)]` clamp + the adaptive
+/// loop). The bound is intentionally a function of `cores` so a higher-end
+/// phone is allowed a few more tiles than a 4-core handset, with a hard
+/// absolute cap ([`IOS_DECODE_TILE_CEILING_ABS`]) on top.
+///
+/// ## Scope: iOS only, NOT all WebKit
+///
+/// The ceiling is gated on `is_ios` (mobile WebKit), NOT on desktop Safari. The
+/// #1289 repro and the real decode-collapse risk are on phones; a Mac Pro
+/// running desktop Safari should not be clamped to a phone-class tile budget.
+/// Part A's longtask-blind conservatism already covers ALL WebKit (it only
+/// *prevents* unjustified growth; it does not force a low ceiling), so desktop
+/// Safari is protected from the ratchet without an aggressive absolute cap.
+///
+/// ## Tiers (first-guess — DO NOT treat as final)
+///
+/// - `is_ios == false` → `None` (no device ceiling).
+/// - iOS, `cores <= 4` → 4 tiles. This is the #1289 class (a 4-core iPhone that
+///   ratcheted to 14 and collapsed); 4 is WELL below that 14-tile failure
+///   point and below the 9-tile point where the ratchet began.
+/// - iOS, `cores in 5..=7` → 5 tiles.
+/// - iOS, `cores >= 8` → [`IOS_DECODE_TILE_CEILING_ABS`] (6) tiles — the hard
+///   absolute mobile cap; even a top-tier phone never decodes more.
+///
+/// `cores == 0` (navigator could not report a count) is treated as the most
+/// conservative `<= 4` tier.
+pub fn ios_decode_tile_ceiling(is_ios: bool, cores: u32) -> Option<usize> {
+    if !is_ios {
+        return None;
+    }
+    let tiles = match cores {
+        0..=4 => 4,
+        5..=7 => 5,
+        _ => IOS_DECODE_TILE_CEILING_ABS,
+    };
+    // Never exceed the hard absolute mobile cap, and never drop below MIN_CAP.
+    // `MIN_CAP` (1) < `IOS_DECODE_TILE_CEILING_ABS` (6) are both consts, so the
+    // clamp bounds are well-ordered and `clamp` cannot panic.
+    Some(tiles.clamp(MIN_CAP, IOS_DECODE_TILE_CEILING_ABS))
+}
+
 /// A single ~1 Hz quality sample.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BudgetSample {
@@ -138,8 +206,24 @@ pub struct BudgetSample {
     /// the renderer produced no measurable FPS for this window (treated as
     /// missing, not as zero).
     pub render_fps: Option<f64>,
-    /// Main-thread long-task time per wall-clock second for this window.
-    pub longtask_ms_per_sec: f64,
+    /// Main-thread long-task time per wall-clock second for this window, if the
+    /// Long Tasks API is available on this browser. `None` means **the signal
+    /// is unavailable** (e.g. WebKit/Safari + all iOS browsers, where the
+    /// `"longtask"` PerformanceObserver entry type is not implemented and the
+    /// observer is never installed — issue #1286). It is distinct from
+    /// `Some(0.0)`, which means the signal IS available and the main thread was
+    /// genuinely idle this window. A `None` longtask is treated conservatively
+    /// everywhere: it can NEVER confirm "idle / not busy" (so it never permits
+    /// cap growth or recovery), but it also never *manufactures* distress (so
+    /// it never suppresses an FPS-driven protective step-down). This mirrors the
+    /// conservative handling of a `None` `render_fps`.
+    ///
+    /// TODO(#1024/#1025/#1020): WebKit/iOS has no main-thread-saturation signal
+    /// at all today, so the controller flies blind on jank there and relies on
+    /// the device-class tile ceiling (Part B / `ios_decode_tile_ceiling`) plus
+    /// FPS alone. A real iOS-valid backpressure signal (decode-queue depth) is
+    /// tracked by #1024/#1025/#1020; wire it in here when it lands.
+    pub longtask: Option<f64>,
 }
 
 /// Current adaptive-budget state, owned by the caller across ticks.
@@ -198,39 +282,54 @@ pub fn median_render_fps(samples: &[BudgetSample], n: usize) -> Option<f64> {
     Some(median)
 }
 
-/// True if every one of the last `n` samples has `longtask_ms_per_sec`
-/// at or above `threshold`. Used for sustained-severity detection (the
+/// True if every one of the last `n` samples has a *present* `longtask`
+/// reading at or above `threshold`. Used for sustained-severity detection (the
 /// catastrophic tier is defined with a `>=` boundary per the design notes).
+///
+/// A `None` longtask (signal unavailable — WebKit/iOS, issue #1286) maps to
+/// `false` for that sample, so it can never *manufacture* a severe down-trigger:
+/// absence of evidence is not evidence of jank. The protective step-down still
+/// fires off FPS alone (see [`decide_step`]); this only governs the *long-task*
+/// severity tier.
 fn longtask_sustained_at_or_above(samples: &[BudgetSample], n: usize, threshold: f64) -> bool {
     if n == 0 || samples.len() < n {
         return false;
     }
     samples[samples.len() - n..]
         .iter()
-        .all(|s| s.longtask_ms_per_sec >= threshold)
+        .all(|s| s.longtask.map(|lt| lt >= threshold).unwrap_or(false))
 }
 
-/// True if every one of the last `n` samples has `longtask_ms_per_sec`
-/// strictly above `threshold`. Used for sustained-busy detection.
+/// True if every one of the last `n` samples has a *present* `longtask`
+/// reading strictly above `threshold`. Used for sustained-busy detection.
+///
+/// A `None` longtask (signal unavailable — WebKit/iOS, issue #1286) maps to
+/// `false` for that sample, so it never adds a busy-driven down-trigger. The
+/// FPS-driven step-down is unaffected.
 fn longtask_sustained_above(samples: &[BudgetSample], n: usize, threshold: f64) -> bool {
     if n == 0 || samples.len() < n {
         return false;
     }
     samples[samples.len() - n..]
         .iter()
-        .all(|s| s.longtask_ms_per_sec > threshold)
+        .all(|s| s.longtask.map(|lt| lt > threshold).unwrap_or(false))
 }
 
 /// True when the last [`SUSTAIN_SAMPLES`] samples qualify as *recovery*: a
-/// healthy median FPS (>= [`FPS_STEP_UP`]) over the window AND an idle main
-/// thread (every sample's `longtask_ms_per_sec` < [`LONGTASK_IDLE_MS_PER_SEC`])
-/// across that same window.
+/// healthy median FPS (>= [`FPS_STEP_UP`]) over the window AND a *confirmed*
+/// idle main thread (every sample has a PRESENT `longtask` reading <
+/// [`LONGTASK_IDLE_MS_PER_SEC`]) across that same window.
 ///
 /// This is the SINGLE source of truth for the recovery condition. [`decide_step`]
 /// uses it to gate the up-step, and the control loop in `attendants.rs` uses
 /// the *same* function to decide whether to increment `direction_hold`. Keeping
 /// them in one place prevents the two from silently drifting apart (which would
 /// desync `direction_hold` accounting from the up-step gate).
+///
+/// A `None` longtask (signal unavailable — WebKit/iOS, issue #1286) means we
+/// CANNOT confirm the main thread was idle, so it does NOT qualify for recovery
+/// (no up-step / no `direction_hold` increment). This is the core of the #1286
+/// fix on the recovery path: a blind `0.0` must not read as "idle".
 ///
 /// `n` is the sustain window length; callers pass [`SUSTAIN_SAMPLES`].
 pub fn recovery_qualifying(samples: &[BudgetSample], n: usize) -> bool {
@@ -240,11 +339,14 @@ pub fn recovery_qualifying(samples: &[BudgetSample], n: usize) -> bool {
     if !fps_healthy {
         return false;
     }
-    // Idle for the entire window. `samples.len() >= n` is guaranteed by the
-    // `median_render_fps` success above (it returns `None` otherwise).
-    samples[samples.len() - n..]
-        .iter()
-        .all(|s| s.longtask_ms_per_sec < LONGTASK_IDLE_MS_PER_SEC)
+    // Confirmed idle for the entire window. A missing longtask reading cannot
+    // confirm idle, so it disqualifies. `samples.len() >= n` is guaranteed by
+    // the `median_render_fps` success above (it returns `None` otherwise).
+    samples[samples.len() - n..].iter().all(|s| {
+        s.longtask
+            .map(|lt| lt < LONGTASK_IDLE_MS_PER_SEC)
+            .unwrap_or(false)
+    })
 }
 
 /// True when the last `n` samples are NOT exhibiting *measured step-down
@@ -256,7 +358,8 @@ pub fn recovery_qualifying(samples: &[BudgetSample], n: usize) -> bool {
 ///
 /// - median render FPS over the window `>= FPS_STEP_DOWN` (>= 24 — the distress
 ///   floor, which deliberately INCLUDES the 24-30 hysteresis band), AND
-/// - every sample's `longtask_ms_per_sec` `< LONGTASK_BUSY_MS_PER_SEC`.
+/// - every sample has a PRESENT `longtask` reading `< LONGTASK_BUSY_MS_PER_SEC`
+///   (a `None`/unavailable reading does NOT qualify — see #1286 note below).
 ///
 /// ## Why a separate, broader gate than [`recovery_qualifying`]?
 ///
@@ -281,6 +384,19 @@ pub fn recovery_qualifying(samples: &[BudgetSample], n: usize) -> bool {
 ///
 /// Returns `false` for a short window (fewer than `n` samples) or any missing
 /// `render_fps` in the window, mirroring [`decide_step`]'s conservative handling.
+///
+/// ## #1286: a missing (`None`) longtask reading BLOCKS growth
+///
+/// This gate's whole job is to confirm the machine is "not under measured
+/// pressure" before it adds decode load. A `None` longtask (signal unavailable
+/// — WebKit/iOS, where the Long Tasks API does not exist) means we CANNOT
+/// confirm the main thread is not busy, so it must NOT qualify for growth.
+/// Treating a blind `0.0` as "not busy" is exactly the inversion that let a
+/// 4-core iPhone's cap ratchet 9→14 tiles and collapse (#1289). `render_fps`
+/// alone cannot save us here: rAF measures compositor paint, not decode, and
+/// stays healthy on WebKit even while the decode pipeline backs up. So when the
+/// long-task signal is absent, this gate returns `false` and the cap can only
+/// be held or stepped DOWN (off FPS) — never grown.
 pub fn non_distress_growth_qualifying(samples: &[BudgetSample], n: usize) -> bool {
     if n == 0 || samples.len() < n {
         return false;
@@ -291,9 +407,11 @@ pub fn non_distress_growth_qualifying(samples: &[BudgetSample], n: usize) -> boo
     if !fps_ok {
         return false;
     }
-    samples[samples.len() - n..]
-        .iter()
-        .all(|s| s.longtask_ms_per_sec < LONGTASK_BUSY_MS_PER_SEC)
+    samples[samples.len() - n..].iter().all(|s| {
+        s.longtask
+            .map(|lt| lt < LONGTASK_BUSY_MS_PER_SEC)
+            .unwrap_or(false)
+    })
 }
 
 /// Decide the next budget step from recent samples and current state.
@@ -374,6 +492,32 @@ pub fn decide_step(
     BudgetStep::Hold
 }
 
+/// Severe-tier label for a multi-tile (`magnitude > 1`) down-step, reproducing
+/// [`decide_step`]'s catastrophic-pressure test EXACTLY so a support-triage log
+/// is not misled by a single closing sample (issue #1000).
+///
+/// FPS uses the window median (`<= FPS_SEVERE`) and long-task uses the SUSTAINED
+/// window check via the SAME [`longtask_sustained_at_or_above`] predicate (with
+/// [`LONGTASK_SEVERE_MS_PER_SEC`]) that `decide_step` evaluates at its severity
+/// branch — so the label can never silently drift from the step magnitude. Both
+/// conditions may hold at once, hence the combined `fps+longtask_severe` label.
+///
+/// `(false, false)` is unreachable when called as intended (`decide_step` only
+/// returns `magnitude > 1` when at least one severe condition holds); it is
+/// labeled `unknown_severe` rather than asserted so logging can never panic. The
+/// `severe_label_matches_decide_step_severity` test pins this agreement.
+pub(crate) fn severe_label(samples: &[BudgetSample], median: Option<f64>) -> &'static str {
+    let fps_severe = median.map(|m| m <= FPS_SEVERE).unwrap_or(false);
+    let longtask_severe =
+        longtask_sustained_at_or_above(samples, SUSTAIN_SAMPLES, LONGTASK_SEVERE_MS_PER_SEC);
+    match (fps_severe, longtask_severe) {
+        (true, true) => "fps+longtask_severe",
+        (true, false) => "fps_severe",
+        (false, true) => "longtask_severe",
+        (false, false) => "unknown_severe",
+    }
+}
+
 /// Resolve the **effective decode cap**: the number of on-screen tiles that may
 /// actually decode video, given the current override mode and adaptive state.
 ///
@@ -396,21 +540,44 @@ pub fn decide_step(
 ///
 /// `natural` is the uncapped layout tile count and `cap` is the loop-owned
 /// adaptive cap (only consulted on the pressured-Auto path).
+///
+/// ## `device_ceiling` (issue #1286 / #1289)
+///
+/// `device_ceiling` is an optional HARD upper bound that binds on EVERY mode
+/// (including `Auto`-unpressured, which otherwise returns the raw `natural`).
+/// It is the single place the device-class tile ceiling is enforced for the
+/// actuator, so the ceiling cannot be bypassed by any path. `None` means no
+/// device ceiling on this platform. The bound is applied AFTER each mode's own
+/// clamp and is floored at [`MIN_CAP`] so the local participant always decodes
+/// at least one tile.
+///
+/// This function stays pure / DOM-free: the caller computes the ceiling (e.g.
+/// via [`ios_decode_tile_ceiling`] with a cached `is_ios()` + core count) and
+/// passes it in, so `effective_cap` remains fully unit-testable without a
+/// browser.
 pub fn effective_cap(
     override_mode: crate::context::DecodeBudgetOverride,
     pressured: bool,
     natural: usize,
     cap: usize,
+    device_ceiling: Option<usize>,
 ) -> usize {
     use crate::context::DecodeBudgetOverride;
 
-    match override_mode {
+    let base = match override_mode {
         DecodeBudgetOverride::Fixed(n) => n.clamp(
             MIN_CAP,
             natural.clamp(MIN_CAP, crate::constants::CANVAS_LIMIT),
         ),
         DecodeBudgetOverride::Auto if !pressured => natural.min(crate::constants::CANVAS_LIMIT),
         DecodeBudgetOverride::Auto => cap,
+    };
+
+    // Device-class ceiling binds last, on every mode. Floor at MIN_CAP so a
+    // tiny/zero ceiling can never starve the local view below one tile.
+    match device_ceiling {
+        Some(ceiling) => base.min(ceiling.max(MIN_CAP)),
+        None => base,
     }
 }
 
@@ -418,19 +585,34 @@ pub fn effective_cap(
 mod tests {
     use super::*;
 
-    /// A sample with explicit FPS and a comfortably-idle main thread.
+    /// A sample with explicit FPS and a comfortably-idle main thread (a
+    /// *present* `Some(0.0)` long-task reading — i.e. a Chromium browser where
+    /// the Long Tasks API IS available and reported genuine idleness this
+    /// window). Distinct from `None` ("signal unavailable"), exercised by the
+    /// #1286 tests below.
     fn fps_sample(fps: f64) -> BudgetSample {
         BudgetSample {
             render_fps: Some(fps),
-            longtask_ms_per_sec: 0.0,
+            longtask: Some(0.0),
         }
     }
 
-    /// A sample with healthy FPS but a given long-task load.
+    /// A sample with healthy FPS but a given (present) long-task load.
     fn longtask_sample(longtask: f64) -> BudgetSample {
         BudgetSample {
             render_fps: Some(60.0),
-            longtask_ms_per_sec: longtask,
+            longtask: Some(longtask),
+        }
+    }
+
+    /// A sample with explicit FPS but **no** long-task signal (`None`),
+    /// modelling a WebKit/iOS browser where the Long Tasks API is unavailable
+    /// (issue #1286). The control loop must treat this as "cannot confirm idle /
+    /// not busy" — never as a healthy `0.0`.
+    fn fps_blind_longtask_sample(fps: f64) -> BudgetSample {
+        BudgetSample {
+            render_fps: Some(fps),
+            longtask: None,
         }
     }
 
@@ -492,6 +674,82 @@ mod tests {
         );
     }
 
+    /// #1000: `severe_label` must agree with `decide_step`'s ACTUAL severity
+    /// outcome for the same window. `severe_label` is only consulted on a
+    /// multi-tile down-step, so the contract is: it returns a concrete severe
+    /// tier IFF `decide_step` (under a down-eligible state) returns `Down(m)`
+    /// with `m > 1`, and the specific tier matches WHICH condition fired. Both
+    /// derive fps-severe / longtask-severe from the SAME `FPS_SEVERE` and
+    /// `longtask_sustained_at_or_above(LONGTASK_SEVERE_MS_PER_SEC)` inputs, so
+    /// this pins them together: changing `decide_step`'s severity
+    /// predicate/threshold OR `severe_label`'s branch logic in isolation breaks
+    /// the agreement and fails this test (the drift #1000 was filed to close).
+    #[test]
+    fn severe_label_matches_decide_step_severity() {
+        // Down-eligible: cap well above MIN_CAP, cooldown long elapsed, so the
+        // severity branch is reachable and `magnitude` reflects the true tier
+        // (mild = 1; severe = ceil(cap*0.25) > 1 at cap = 20).
+        let state = state_with_cap(20);
+        let natural = 9;
+
+        let catastrophic_fps = [
+            fps_sample(FPS_SEVERE - 1.0),
+            fps_sample(FPS_SEVERE),
+            fps_sample(FPS_SEVERE - 2.0),
+        ];
+        let extreme_longtask = [
+            longtask_sample(LONGTASK_SEVERE_MS_PER_SEC + 10.0),
+            longtask_sample(LONGTASK_SEVERE_MS_PER_SEC),
+            longtask_sample(LONGTASK_SEVERE_MS_PER_SEC + 5.0),
+        ];
+        let combined = [
+            BudgetSample {
+                render_fps: Some(FPS_SEVERE - 1.0),
+                longtask: Some(LONGTASK_SEVERE_MS_PER_SEC + 10.0),
+            },
+            BudgetSample {
+                render_fps: Some(FPS_SEVERE),
+                longtask: Some(LONGTASK_SEVERE_MS_PER_SEC),
+            },
+            BudgetSample {
+                render_fps: Some(FPS_SEVERE - 2.0),
+                longtask: Some(LONGTASK_SEVERE_MS_PER_SEC + 1.0),
+            },
+        ];
+        // Mild: FPS below step-down but ABOVE severe, main thread idle → Down(1).
+        let mild = (FPS_SEVERE + FPS_STEP_DOWN) / 2.0;
+        let mild_pressure = [fps_sample(mild), fps_sample(mild), fps_sample(mild)];
+        // Healthy: no pressure → Hold.
+        let healthy = [fps_sample(60.0), fps_sample(58.0), fps_sample(60.0)];
+
+        let cases: [(&str, &[BudgetSample], &str); 5] = [
+            ("catastrophic_fps", &catastrophic_fps, "fps_severe"),
+            ("extreme_longtask", &extreme_longtask, "longtask_severe"),
+            ("combined", &combined, "fps+longtask_severe"),
+            ("mild_pressure", &mild_pressure, "unknown_severe"),
+            ("healthy", &healthy, "unknown_severe"),
+        ];
+
+        for (name, samples, expected_label) in cases {
+            let median = median_render_fps(samples, SUSTAIN_SAMPLES);
+            let label = severe_label(samples, median);
+            assert_eq!(
+                label, expected_label,
+                "severe_label classification for {name}"
+            );
+
+            // Lock the boolean against decide_step's REAL magnitude: a severe
+            // (non-"unknown") label IFF decide_step returns a multi-tile down-step.
+            let step = decide_step(samples, &state, natural, PAST_COOLDOWN);
+            let decide_severe = matches!(step, BudgetStep::Down(m) if m > 1);
+            let label_severe = label != "unknown_severe";
+            assert_eq!(
+                decide_severe, label_severe,
+                "{name}: severe_label ({label}) disagrees with decide_step ({step:?})"
+            );
+        }
+    }
+
     #[test]
     fn mild_pressure_is_single_tile_down() {
         // Just below FPS_STEP_DOWN but well above FPS_SEVERE, and long-tasks are
@@ -500,15 +758,15 @@ mod tests {
         let samples = [
             BudgetSample {
                 render_fps: Some(mild),
-                longtask_ms_per_sec: LONGTASK_BUSY_MS_PER_SEC + 10.0,
+                longtask: Some(LONGTASK_BUSY_MS_PER_SEC + 10.0),
             },
             BudgetSample {
                 render_fps: Some(mild),
-                longtask_ms_per_sec: LONGTASK_BUSY_MS_PER_SEC + 10.0,
+                longtask: Some(LONGTASK_BUSY_MS_PER_SEC + 10.0),
             },
             BudgetSample {
                 render_fps: Some(mild),
-                longtask_ms_per_sec: LONGTASK_BUSY_MS_PER_SEC + 10.0,
+                longtask: Some(LONGTASK_BUSY_MS_PER_SEC + 10.0),
             },
         ];
         let state = state_with_cap(20);
@@ -690,7 +948,7 @@ mod tests {
             fps_sample(10.0),
             BudgetSample {
                 render_fps: None,
-                longtask_ms_per_sec: 0.0,
+                longtask: Some(0.0),
             },
             fps_sample(10.0),
         ];
@@ -720,7 +978,7 @@ mod tests {
         let busy = [
             BudgetSample {
                 render_fps: Some(FPS_STEP_UP + 5.0),
-                longtask_ms_per_sec: LONGTASK_IDLE_MS_PER_SEC + 1.0,
+                longtask: Some(LONGTASK_IDLE_MS_PER_SEC + 1.0),
             },
             fps_sample(FPS_STEP_UP + 5.0),
             fps_sample(FPS_STEP_UP + 5.0),
@@ -761,15 +1019,15 @@ mod tests {
         let busy = [
             BudgetSample {
                 render_fps: Some(60.0),
-                longtask_ms_per_sec: LONGTASK_BUSY_MS_PER_SEC,
+                longtask: Some(LONGTASK_BUSY_MS_PER_SEC),
             },
             BudgetSample {
                 render_fps: Some(60.0),
-                longtask_ms_per_sec: LONGTASK_BUSY_MS_PER_SEC,
+                longtask: Some(LONGTASK_BUSY_MS_PER_SEC),
             },
             BudgetSample {
                 render_fps: Some(60.0),
-                longtask_ms_per_sec: LONGTASK_BUSY_MS_PER_SEC,
+                longtask: Some(LONGTASK_BUSY_MS_PER_SEC),
             },
         ];
         assert!(!non_distress_growth_qualifying(&busy, SUSTAIN_SAMPLES));
@@ -780,7 +1038,7 @@ mod tests {
             fps_sample(29.0),
             BudgetSample {
                 render_fps: None,
-                longtask_ms_per_sec: 0.0,
+                longtask: Some(0.0),
             },
             fps_sample(29.0),
         ];
@@ -971,32 +1229,50 @@ mod tests {
     #[test]
     fn effective_cap_auto_unpressured_is_natural_capped_at_canvas() {
         // Un-pressured Auto shows every natural tile, bounded by CANVAS_LIMIT.
-        assert_eq!(effective_cap(DecodeBudgetOverride::Auto, false, 5, 99), 5);
         assert_eq!(
-            effective_cap(DecodeBudgetOverride::Auto, false, CANVAS_LIMIT + 7, 99),
+            effective_cap(DecodeBudgetOverride::Auto, false, 5, 99, None),
+            5
+        );
+        assert_eq!(
+            effective_cap(
+                DecodeBudgetOverride::Auto,
+                false,
+                CANVAS_LIMIT + 7,
+                99,
+                None
+            ),
             CANVAS_LIMIT,
             "natural above the canvas limit is capped at CANVAS_LIMIT"
         );
         // `cap` is irrelevant on the un-pressured path.
-        assert_eq!(effective_cap(DecodeBudgetOverride::Auto, false, 4, 1), 4);
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Auto, false, 4, 1, None),
+            4
+        );
     }
 
     #[test]
     fn effective_cap_auto_pressured_uses_loop_cap() {
         // Pressured Auto: the control loop owns the cap; return it verbatim.
-        assert_eq!(effective_cap(DecodeBudgetOverride::Auto, true, 12, 3), 3);
-        assert_eq!(effective_cap(DecodeBudgetOverride::Auto, true, 12, 1), 1);
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Auto, true, 12, 3, None),
+            3
+        );
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Auto, true, 12, 1, None),
+            1
+        );
     }
 
     #[test]
     fn effective_cap_fixed_clamps_into_natural_and_canvas() {
         // Fixed(n) is bounded above by min(natural, CANVAS_LIMIT)...
         assert_eq!(
-            effective_cap(DecodeBudgetOverride::Fixed(6), false, 10, 99),
+            effective_cap(DecodeBudgetOverride::Fixed(6), false, 10, 99, None),
             6
         );
         assert_eq!(
-            effective_cap(DecodeBudgetOverride::Fixed(9), false, 4, 99),
+            effective_cap(DecodeBudgetOverride::Fixed(9), false, 4, 99, None),
             4,
             "Fixed cannot exceed the natural tile count"
         );
@@ -1005,14 +1281,15 @@ mod tests {
                 DecodeBudgetOverride::Fixed(CANVAS_LIMIT + 5),
                 false,
                 CANVAS_LIMIT + 5,
-                99
+                99,
+                None
             ),
             CANVAS_LIMIT,
             "Fixed is clamped to CANVAS_LIMIT even when natural is larger"
         );
         // Pressured flag is ignored under a Fixed override.
         assert_eq!(
-            effective_cap(DecodeBudgetOverride::Fixed(6), true, 10, 2),
+            effective_cap(DecodeBudgetOverride::Fixed(6), true, 10, 2, None),
             6
         );
     }
@@ -1022,14 +1299,182 @@ mod tests {
         // 0-peer layout: the clamp upper bound is floored at MIN_CAP so the
         // result is never below MIN_CAP and `clamp` never sees max < min.
         assert_eq!(
-            effective_cap(DecodeBudgetOverride::Auto, false, 0, 0),
+            effective_cap(DecodeBudgetOverride::Auto, false, 0, 0, None),
             0,
             "un-pressured Auto reports the raw natural (0) — caller floors at render"
         );
         assert_eq!(
-            effective_cap(DecodeBudgetOverride::Fixed(4), false, 0, 0),
+            effective_cap(DecodeBudgetOverride::Fixed(4), false, 0, 0, None),
             MIN_CAP,
             "Fixed never returns below MIN_CAP even with 0 natural tiles"
+        );
+    }
+
+    // ── #1286 Part A: longtask-blind (None) handling ─────────────────────────
+    //
+    // These pin the core inversion fix: on a browser where the Long Tasks API is
+    // unavailable (WebKit/iOS), `longtask` is `None` and the controller must
+    // treat it as "cannot confirm not-busy / idle" — never as a healthy `0.0`.
+    // Each test would PASS again (i.e. fail to protect) if `BudgetSample.longtask`
+    // were reverted to a bare `f64` defaulting the blind case to `0.0`, because
+    // `0.0 < LONGTASK_BUSY/IDLE` would re-permit growth.
+
+    #[test]
+    fn blind_longtask_with_healthy_fps_does_not_grow() {
+        // SOURCE-OF-TRUTH PINNED: `non_distress_growth_qualifying` must return
+        // false when longtask is None, even at a healthy 60 fps. MUTATION THAT
+        // BREAKS IT: mapping `None` -> "not busy" (e.g. `.unwrap_or(true)` or a
+        // bare-f64 `0.0`) in `non_distress_growth_qualifying` makes this pass the
+        // gate and the assert fails. This is the #1289 iPhone ratchet.
+        let blind = [fps_blind_longtask_sample(60.0); 5];
+        assert!(
+            !non_distress_growth_qualifying(&blind, SUSTAIN_SAMPLES),
+            "blind (None) longtask must NOT qualify for growth even at 60 fps"
+        );
+
+        // And `decide_step` must NOT return Up on the blind+healthy window: a
+        // None longtask cannot satisfy `recovery_qualifying`, so even with the
+        // recovery hold maxed out there is no up-step. MUTATION: making
+        // `recovery_qualifying` treat None as idle returns Up here.
+        let mut state = state_with_cap(5);
+        state.direction_hold = RECOVERY_HOLD;
+        assert_ne!(
+            decide_step(&blind, &state, 12, PAST_COOLDOWN),
+            BudgetStep::Up,
+            "blind longtask must never produce an Up step"
+        );
+        // Specifically, with no FPS pressure it Holds (neither grows nor shrinks).
+        assert_eq!(
+            decide_step(&blind, &state, 12, PAST_COOLDOWN),
+            BudgetStep::Hold
+        );
+    }
+
+    #[test]
+    fn blind_longtask_with_low_fps_still_steps_down() {
+        // PROTECTIVE STEP-DOWN MUST SURVIVE: a None longtask must never SUPPRESS
+        // an FPS-driven down-step. With sustained low FPS and a blind longtask,
+        // `decide_step` must still return Down. MUTATION THAT BREAKS IT: making
+        // the down path require a present/non-None longtask (e.g. gating
+        // `fps_low` on longtask) would yield Hold here and the assert fails.
+        let mild = (FPS_SEVERE + FPS_STEP_DOWN) / 2.0;
+        let blind_low = [fps_blind_longtask_sample(mild); 5];
+        let state = state_with_cap(8);
+        assert_eq!(
+            decide_step(&blind_low, &state, 12, PAST_COOLDOWN),
+            BudgetStep::Down(1),
+            "FPS-driven protective step-down must fire even when longtask is blind"
+        );
+    }
+
+    #[test]
+    fn blind_longtask_does_not_manufacture_severe_or_busy() {
+        // A None longtask must never ADD a long-task-driven down-trigger: the
+        // sustained-busy / sustained-severe helpers map None -> false per sample.
+        // MUTATION: mapping None -> true (e.g. treating absence as "above
+        // threshold") would make these fire spuriously.
+        let blind = [fps_blind_longtask_sample(60.0); SUSTAIN_SAMPLES];
+        assert!(!longtask_sustained_above(
+            &blind,
+            SUSTAIN_SAMPLES,
+            LONGTASK_BUSY_MS_PER_SEC
+        ));
+        assert!(!longtask_sustained_at_or_above(
+            &blind,
+            SUSTAIN_SAMPLES,
+            LONGTASK_SEVERE_MS_PER_SEC
+        ));
+        // Healthy FPS + blind longtask => no down-trigger at all => Hold.
+        let state = state_with_cap(8);
+        assert_eq!(
+            decide_step(&blind, &state, 12, PAST_COOLDOWN),
+            BudgetStep::Hold
+        );
+    }
+
+    // ── #1286 Part B: device-class tile ceiling ──────────────────────────────
+
+    #[test]
+    fn ios_ceiling_4_core_is_below_1289_ratchet_target() {
+        // SOURCE-OF-TRUTH PINNED: #1289 was a 4-core iPhone whose cap ratcheted
+        // to 14 tiles and collapsed. The ceiling for that device class must be
+        // STRICTLY below 14 (and below the 9-tile point where the ratchet began).
+        // MUTATION THAT BREAKS IT: raising the `0..=4` tier or
+        // IOS_DECODE_TILE_CEILING_ABS at/above 14, or returning None for iOS.
+        let c = ios_decode_tile_ceiling(true, 4).expect("iOS must have a ceiling");
+        assert!(
+            c < 14,
+            "iOS 4-core ceiling must be below the issue 1289 ratchet target of 14"
+        );
+        assert!(
+            c < 9,
+            "iOS 4-core ceiling must be below the 9-tile ratchet start"
+        );
+        assert_eq!(c, 4, "first-guess 4-core tier");
+        // cores == 0 (unknown) falls in the most-conservative tier.
+        assert_eq!(ios_decode_tile_ceiling(true, 0), Some(4));
+    }
+
+    #[test]
+    fn ios_ceiling_tiers_and_absolute_cap() {
+        // Higher-core phones get a few more tiles, but never above the hard
+        // absolute mobile cap. MUTATION: changing the tiers/abs cap fails these.
+        assert_eq!(ios_decode_tile_ceiling(true, 6), Some(5));
+        assert_eq!(
+            ios_decode_tile_ceiling(true, 16),
+            Some(IOS_DECODE_TILE_CEILING_ABS)
+        );
+        assert!(
+            IOS_DECODE_TILE_CEILING_ABS < 9,
+            "abs mobile cap below ratchet start"
+        );
+    }
+
+    #[test]
+    fn non_ios_gets_no_device_ceiling() {
+        // SOURCE-OF-TRUTH PINNED: desktop/Android (is_ios == false) must get
+        // None — no phone-class clamp. MUTATION: returning Some(_) for non-iOS
+        // (e.g. dropping the `if !is_ios` guard) fails this.
+        assert_eq!(ios_decode_tile_ceiling(false, 4), None);
+        assert_eq!(ios_decode_tile_ceiling(false, 32), None);
+    }
+
+    #[test]
+    fn effective_cap_device_ceiling_binds_below_growth() {
+        // The ceiling must clamp the actuator on EVERY mode, including the
+        // un-pressured Auto path that otherwise returns the raw natural. With a
+        // 12-tile natural and a 4-tile iOS ceiling, the effective cap is 4 — even
+        // though all signals are "healthy" and growth would otherwise reach 12.
+        // MUTATION THAT BREAKS IT: not applying `device_ceiling` in
+        // `effective_cap` (returning `base`) yields 12 and the assert fails.
+        let ceiling = ios_decode_tile_ceiling(true, 4); // Some(4)
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Auto, false, 12, 99, ceiling),
+            4,
+            "un-pressured Auto must be clamped by the device ceiling"
+        );
+        // Pressured Auto: loop-owned cap of 9 (the #1289 ratchet value) is
+        // clamped to 4 by the ceiling.
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Auto, true, 12, 9, ceiling),
+            4,
+            "pressured loop cap above the ceiling is clamped down"
+        );
+        // Fixed override above the ceiling is also clamped.
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Fixed(10), false, 12, 99, ceiling),
+            4
+        );
+        // A ceiling >= the base is a no-op.
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Auto, false, 3, 99, Some(4)),
+            3,
+            "ceiling above the natural count does not lower the cap"
+        );
+        // No ceiling (None) leaves the cap at natural — non-iOS path.
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::Auto, false, 12, 99, None),
+            12
         );
     }
 }

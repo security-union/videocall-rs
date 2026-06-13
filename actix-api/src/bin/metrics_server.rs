@@ -56,15 +56,15 @@ use sec_api::metrics::{
     CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE,
     DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N,
     DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS,
-    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_P75_PEER_FPS,
-    ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC,
-    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
-    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
-    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
-    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
-    VIDEO_FRAMES_DROPPED, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_TARGET_BITRATE_KBPS,
+    HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL,
+    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
+    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
+    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
+    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
+    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
+    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
+    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -254,7 +254,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = DATAGRAM_DROPS.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
-    let _ = ENCODER_P75_PEER_FPS.remove_label_values(&reporter_labels);
+    let _ = ENCODER_QUEUE_DEPTH.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_SCREEN_TIER.remove_label_values(&reporter_labels);
     let _ = SCREEN_SHARING_ACTIVE.remove_label_values(&reporter_labels);
     let _ = ENCODER_OUTPUT_FPS.remove_label_values(&reporter_labels);
@@ -783,10 +783,13 @@ fn process_health_packet_to_metrics_pb(
 
         // Encoder decision inputs (P0). NOTE(#1184): encoder_fps_ratio removed
         // (dead telemetry — receiver FPS no longer feeds the sender AQ).
-        if let Some(fps) = health_packet.encoder_p75_peer_fps {
-            ENCODER_P75_PEER_FPS
+        // NOTE(#1231): the `encoder_p75_peer_fps` wire field now carries the
+        // encoder queue depth (sender-side backpressure); the gauge was renamed
+        // to videocall_encoder_queue_depth. The proto field name is unchanged.
+        if let Some(queue_depth) = health_packet.encoder_p75_peer_fps {
+            ENCODER_QUEUE_DEPTH
                 .with_label_values(&reporter_labels)
-                .set(fps);
+                .set(queue_depth);
         }
         if let Some(tier) = health_packet.adaptive_screen_tier {
             ADAPTIVE_SCREEN_TIER

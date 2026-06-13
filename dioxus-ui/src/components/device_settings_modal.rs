@@ -2,10 +2,7 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
-use crate::context::{
-    clear_transport_sticky_and_pref, load_transport_sticky, save_transport_preference,
-    save_transport_preference_session, save_transport_sticky, TransportPreference,
-};
+use crate::context::{apply_transport_decision, load_transport_sticky, TransportPreference};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
@@ -590,6 +587,24 @@ pub fn DeviceSettingsModal(
                                                             "data-testid": test_id,
                                                             class: if is_selected { "transport-segmented-option selected" } else { "transport-segmented-option" },
                                                             onclick: move |_| {
+                                                                // Picking a DIFFERENT protocol is a fresh, uncommitted
+                                                                // choice, so un-check "Remember" in the UI — otherwise a
+                                                                // stale pin from the previously selected protocol (e.g.
+                                                                // an old WebSocket pin) would keep the toggle stuck ON
+                                                                // and the user could never clear it (issue #1291).
+                                                                // `use_signal` only runs its init once per mount; after that
+                                                                // `sticky_transport` is reconciled here (radio reset) and by
+                                                                // the "Remember" checkbox — never by storage. This is an IN-MEMORY reset
+                                                                // only: storage is intentionally NOT touched here, because
+                                                                // the modal is a staging surface and persistence happens
+                                                                // solely on "Apply" via `apply_transport_decision` (which
+                                                                // clears any stale pin in its `(true,false)` and
+                                                                // `(false,false)` arms). Mutating storage on an
+                                                                // uncommitted radio click would wipe a confirmed pin even
+                                                                // if the user abandons the modal without applying.
+                                                                if pending_protocol() != value {
+                                                                    sticky_transport.set(false);
+                                                                }
                                                                 pending_protocol.set(value);
                                                             },
                                                             "{label}"
@@ -600,45 +615,48 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // Hidden for the default (WebTransport) since pinning the
-                                    // implicit default is a no-op.
-                                    if pending_protocol() != TransportPreference::default() {
-                                        div { class: "device-setting-group sticky-protocol-row",
-                                            div { class: "sticky-protocol-row-inner",
-                                                div { class: "sticky-protocol-text",
-                                                    label {
-                                                        r#for: "sticky-transport-checkbox",
-                                                        class: "sticky-protocol-label",
-                                                        "Remember protocol choice"
-                                                    }
-                                                    p { class: "sticky-protocol-hint", "Pin this protocol across browser sessions." }
-                                                }
+                                    // Shown for BOTH protocols (#1291): hiding the toggle for the
+                                    // default left a stale WebSocket pin un-clearable when the user
+                                    // switched the radio back to WebTransport. Pinning the default
+                                    // is itself harmless — `apply_transport_decision` writes
+                                    // `vc_transport_preference=webtransport` + `vc_transport_sticky=true`,
+                                    // which `load_transport_preference` resolves to WebTransport anyway.
+                                    div { class: "device-setting-group sticky-protocol-row",
+                                        div { class: "sticky-protocol-row-inner",
+                                            div { class: "sticky-protocol-text",
                                                 label {
-                                                    class: "glow-switch",
-                                                    "aria-label": "Remember protocol choice across browser sessions",
-                                                    input {
-                                                        id: "sticky-transport-checkbox",
-                                                        r#type: "checkbox",
-                                                        checked: sticky_transport(),
-                                                        onchange: move |evt: Event<FormData>| {
-                                                            // Persist immediately so the choice survives an unexpected tab close.
-                                                            let checked = evt.checked();
-                                                            sticky_transport.set(checked);
-                                                            if checked {
-                                                                save_transport_preference(pending_protocol());
-                                                                save_transport_sticky(true);
-                                                            } else {
-                                                                clear_transport_sticky_and_pref();
-                                                            }
-                                                        },
-                                                    }
-                                                    span { class: "glow-switch-track" }
+                                                    r#for: "sticky-transport-checkbox",
+                                                    class: "sticky-protocol-label",
+                                                    "Remember protocol choice"
                                                 }
+                                                p { class: "sticky-protocol-hint", "Pin this protocol across browser sessions." }
+                                            }
+                                            label {
+                                                class: "glow-switch",
+                                                "aria-label": "Remember protocol choice across browser sessions",
+                                                input {
+                                                    id: "sticky-transport-checkbox",
+                                                    r#type: "checkbox",
+                                                    checked: sticky_transport(),
+                                                    onchange: move |evt: Event<FormData>| {
+                                                        // Stage the choice in memory only; persistence happens
+                                                        // solely on "Apply" via `apply_transport_decision`,
+                                                        // mirroring the radio's in-memory-only reset. Writing
+                                                        // storage on an uncommitted toggle would pin (or wipe) a
+                                                        // protocol even if the user abandons the modal.
+                                                        sticky_transport.set(evt.checked());
+                                                    },
+                                                }
+                                                span { class: "glow-switch-track" }
                                             }
                                         }
                                     }
 
-                                    // Default+sticky is a silent no-op, so suppress the advisory there.
+                                    // Advisory shown only for a NON-default (WebSocket) pin. The
+                                    // "switch back to WebTransport to clear" wording is only true
+                                    // when the pinned protocol is WebSocket, so it stays suppressed
+                                    // for a WebTransport+remember selection (which is itself
+                                    // harmless — load resolves it to the default regardless).
                                     if sticky_transport() && pending_protocol() != TransportPreference::default() {
                                         div {
                                             class: "settings-info-panel",
@@ -674,14 +692,14 @@ pub fn DeviceSettingsModal(
                                             div { class: "settings-info-panel-body",
                                                 p { class: "settings-info-panel-title", "Protocol pinned" }
                                                 p { class: "settings-info-panel-text",
-                                                    "This protocol will be used on every future page load. To clear it, switch back to WebTransport. Picking a different protocol replaces the saved choice."
+                                                    "This protocol will be used on every future page load. Turn off \"Remember protocol choice\" (or switch back to WebTransport) to clear it."
                                                 }
                                             }
                                         }
                                     }
 
-                                    // Only shown when the pending selection diverges from the active one.
-                                    if pending_protocol() != transport_preference {
+                                    // Shown when the staged selection (protocol or sticky flag) diverges from the stored state.
+                                    if pending_protocol() != transport_preference || sticky_transport() != load_transport_sticky() {
                                         div { class: "transport-apply-row",
                                             p { class: "transport-preference-note", "Changing protocol will reload the page." }
                                             button {
@@ -689,23 +707,12 @@ pub fn DeviceSettingsModal(
                                                 class: "transport-apply-button",
                                                 "data-testid": "transport-apply-button",
                                                 onclick: move |_| {
-                                                    let pref = pending_protocol();
-                                                    let is_default = pref == TransportPreference::default();
-                                                    match (is_default, sticky_transport()) {
-                                                        // Default + not sticky: clear all storage so the
-                                                        // implicit default takes over on reload.
-                                                        (true, false) => {
-                                                            clear_transport_sticky_and_pref();
-                                                        }
-                                                        (_, true) => {
-                                                            save_transport_preference(pref);
-                                                            save_transport_sticky(true);
-                                                        }
-                                                        (false, false) => {
-                                                            // Session-scoped: survives the reload only.
-                                                            save_transport_preference_session(pref);
-                                                        }
-                                                    }
+                                                    // Single source of truth for the persistence decision,
+                                                    // shared with `confirm_transport_change` so the two
+                                                    // callers cannot drift. For a non-default + not-sticky
+                                                    // choice this also clears any prior sticky pin so a
+                                                    // session-scoped choice wins on the next load (#1291).
+                                                    apply_transport_decision(pending_protocol(), sticky_transport());
                                                     if let Some(w) = web_sys::window() {
                                                         let _ = w.location().reload();
                                                     }

@@ -63,20 +63,23 @@ canvas {
 
 #peer-list-container {
   position: fixed;
-  left: -400px;
+  left: 0;
   top: 0;
   height: 100%;
   width: 400px;
+  /* Slide via transform so any custom (dragged) width still slides fully out of
+     view in the closed state — a fixed negative `left` could not. (issue 1296) */
+  transform: translateX(-100%);
   background-color: var(--color-surface-elevated);
   color: var(--text-primary);
-  transition: left 0.3s ease;
+  transition: transform 0.3s ease;
   z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
 }
 
 #peer-list-container.visible {
-  left: 0;
+  transform: translateX(0);
   visibility: visible;
 }
 
@@ -592,7 +595,12 @@ h3 {
     height: 100% !important;
     background-color: var(--surface-elevated) !important;
     transition: transform 0.3s ease !important;
-    z-index: 9300 !important;
+    /* On mobile both drawers are full-width fixed overlays. Now that they can be
+       open at the same time (issue 1296), give diagnostics one layer above
+       peer-list (9300) so the right/diagnostics drawer deterministically sits on
+       top instead of relying on DOM order. Both keep their own close buttons, so
+       each stays independently dismissible. (issue 1296) */
+    z-index: 9301 !important;
     overflow-y: auto !important;
     transform: translateX(100%) !important;
     box-shadow: none !important;
@@ -601,6 +609,12 @@ h3 {
   #diagnostics-sidebar.visible {
     transform: translateX(0) !important;
     visibility: visible !important;
+  }
+
+  /* Hide the resize grip on mobile: drawers are forced full-width (width:100%
+     !important) here, so the handle is a no-op affordance. (issue 1296) */
+  .drawer-resize-handle {
+    display: none !important;
   }
 
   #peer-list-container .sidebar-header,
@@ -1019,18 +1033,21 @@ select {
 #diagnostics-sidebar {
   position: fixed;
   /* Widened 650 → 720 so the two-column per-kind perf cards stay 2-col at this
-     width (card container ~662px → ~315px/col). Closed offset matches the
-     width. (#1131 unify) */
-  right: -720px;
+     width (card container ~662px → ~315px/col). The closed state slides off-screen
+     via transform: translateX(100%) below, not a negative offset. (issue 1131 unify) */
+  right: 0;
   top: 0;
   height: 100%;
   width: 720px;
+  /* Slide via transform so any custom (dragged) width still slides fully out of
+     view in the closed state — a fixed negative `right` could not. (issue 1296) */
+  transform: translateX(100%);
   background-color: var(--surface-elevated);
   /* Use the theme text token (not hard-coded white) so the migrated perf text +
      the drawer body read correctly in BOTH themes. Dark theme additionally
      remaps --text-* to the settings-modal tokens below. (#1131 §5) */
   color: var(--text-primary);
-  transition: right 0.3s ease;
+  transition: transform 0.3s ease;
   z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
@@ -1163,7 +1180,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 #diagnostics-sidebar.visible {
-  right: 0;
+  transform: translateX(0);
   visibility: visible;
 }
 
@@ -1845,6 +1862,66 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .menu-button:active {
   transform: scale(0.95);
+}
+
+/* Drawer resize grip (issue 1296). One per drawer, positioned on the drawer's inner
+   edge. Drag is driven by pointer listeners on each drawer's
+   .drawer-resize-handle, using pointer capture (attendants.rs / diagnostics.rs).
+   The #grid-container handlers only drive the screen-share split, not resize.
+
+   The handle div is the FULL-HEIGHT pointerdown/capture target (cursor ew-resize)
+   but is itself visually transparent; the visible affordance is a short, centered
+   vertical grip rendered via ::before so a bare edge-hover doesn't read as a solid
+   resizable bar. The grip uses var(--border-emphasis) at rest and var(--accent) on
+   hover/focus/active. (issue 1296) */
+.drawer-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* Slightly wider hit area than the old 6px so the grip is easy to grab. */
+  width: 10px;
+  cursor: ew-resize;
+  z-index: 9310;
+  background: transparent;
+  transition: background 0.15s ease;
+  /* Suppress browser touch panning and text selection during a capture drag. */
+  touch-action: none;
+  user-select: none;
+}
+
+/* Centered grip: a short rounded vertical bar, vertically centered in the
+   full-height handle. var(--border-emphasis) normally, var(--accent) on interaction. */
+.drawer-resize-handle::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 32px;
+  border-radius: 2px;
+  background: var(--border-emphasis);
+  transition: background 0.15s ease;
+  pointer-events: none;
+}
+
+.drawer-resize-handle:hover::before,
+.drawer-resize-handle:focus::before,
+.drawer-resize-handle:active::before {
+  background: var(--accent);
+}
+
+.drawer-resize-handle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+#peer-list-container .drawer-resize-handle {
+  right: 0;
+}
+
+#diagnostics-sidebar .drawer-resize-handle {
+  left: 0;
 }
 
 .context-menu {
@@ -4208,21 +4285,28 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* ── Decode-budget "tiles paused" banner (#1142 Phase 1) ─────────────
-   A slim, dismissible glass bar pinned top-centre of the grid area. It is
+   A slim, dismissible dark bar pinned top-centre of the grid area. It is
    NOT a modal: it overlays the grid (absolute within #grid-container) and
-   does not block interaction with the tiles below. The glass treatment
-   mirrors `.peer-toast` (backdrop blur, near-opaque dark surface) and the
-   accent is the shared amber `--warning` token.
+   does not block interaction with the tiles below. The accent is the shared
+   amber `--warning` token.
 
-   The banner surface is ALWAYS dark (it hardcodes rgba(30,30,30,0.9) in both
+   Per issue 1197, this banner has NO backdrop-filter blur (unlike `.peer-toast`). It
+   only appears under sustained decode-budget pressure — i.e. exactly when the
+   device is already CPU/GPU-bound and shedding video to keep audio alive — so
+   a GPU compositing blur here adds cost precisely when the GPU is the
+   bottleneck. The surface was already 90% opaque, so the blur affected only the
+   ~10% bleed-through and was barely perceptible; bumping the fill to near-opaque
+   removes the GPU cost with negligible visual change.
+
+   The banner surface is ALWAYS dark (a flat near-opaque dark fill in both
    themes), so its foreground colours MUST be literal light-on-dark — NOT the
    `--text-on-glass-strong` token, which flips to near-black under
    html[data-theme="light"] and would render the text + ✕ invisible on the dark
    surface. We therefore use literal rgba(255,255,255,0.95) for body text and the
    dismiss glyph, matching how the amber accent is already a literal. Contrast on
-   the composited dark surface: white text ≈ 11–16:1, amber #ff9f0a ≈ 6–8:1
-   (range = page background showing through the ~0.9-opacity surface) — both well
-   past 4.5:1, in BOTH themes. */
+   the near-opaque dark surface: white text ≈ 15–16:1, amber accent ≈ 7–8:1
+   (the more-opaque fill only RAISES contrast vs the prior ~0.9 surface, since
+   less page background bleeds through) — both well past 4.5:1, in BOTH themes. */
 .decode-budget-banner {
   position: absolute;
   top: 12px;
@@ -4234,10 +4318,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 10px;
   max-width: min(560px, calc(100% - 24px));
   padding: 8px 10px 8px 14px;
-  background: rgba(30, 30, 30, 0.9)
-    /* @token-exempt: dark near-opaque banner surface, matches .peer-toast */;
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  background: rgba(30, 30, 30, 0.97)
+    /* @token-exempt: flat near-opaque dark banner surface. No backdrop-filter
+       blur (#1197): the banner only renders under decode-budget pressure, when
+       the GPU is already the bottleneck, so a compositing blur would add cost
+       exactly when it hurts most. The fill is near-opaque (was 0.9 + blur), so
+       dropping the blur is visually ~indistinguishable. */;
   border: 1px solid var(--btn-warning-border);
   border-radius: var(--radius-lg, 14px);
   box-shadow: 0 8px 32px var(--shadow-card-deep);
@@ -4395,7 +4481,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--glass-bg-hover);
   border-radius: var(--radius-lg);
   padding: 10px 16px;
-  color: var(--text-primary);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes (rgba(30,30,30,0.88) above), so the theme-flipping --text-primary
+     token must NOT be used here — it goes near-black under
+     html[data-theme="light"] and would render the toast text invisible on the
+     dark surface. This literal equals --text-primary's dark value (opaque white)
+     so dark mode is byte-identical; white on rgb(30,30,30) ≈ 16:1, well past
+     4.5:1. */
+  color: #ffffff;
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
@@ -4433,7 +4526,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-left .toast-icon svg {
-  color: var(--toast-action-neutral);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes, so --toast-action-neutral must NOT be used — it flips near-black
+     (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this icon glyph
+     invisible on the dark chip. Literal equals the token's dark value so dark mode
+     is unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
+     ≈ 6-7:1, past 4.5:1. */
+  color: rgba(255, 255, 255, 0.5);
 }
 
 .peer-toast .toast-text {
@@ -4443,7 +4542,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .peer-toast .toast-name {
   font-weight: 600;
-  color: var(--text-on-glass-strong);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes, so --text-on-glass-strong must NOT be used — it flips near-black
+     (rgba(0,0,0,0.92)) under html[data-theme="light"], rendering the participant
+     name invisible on the dark surface (the reported issue 1189 bug). Literal
+     equals the token's dark value so dark mode is unchanged; white 0.95 on
+     rgb(30,30,30) ≈ 14.5:1, well past 4.5:1. */
+  color: rgba(255, 255, 255, 0.95);
 }
 
 .peer-toast.toast-joined .toast-action {
@@ -4452,7 +4557,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-left .toast-action {
-  color: var(--text-on-glass-faint);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes, so --text-on-glass-faint must NOT be used — it flips near-black
+     (rgba(0,0,0,0.44)) under html[data-theme="light"], rendering this faint
+     secondary text invisible on the dark surface. Literal equals the token's dark
+     value so dark mode is unchanged; preserves the dimmer secondary weight. White
+     0.5 on rgb(30,30,30) ≈ 6-7:1, still past 4.5:1. */
+  color: rgba(255, 255, 255, 0.5);
   font-weight: 400;
 }
 
@@ -4474,7 +4585,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-loading .toast-icon svg {
-    color: var(--toast-action-neutral);
+    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+       both themes, so --toast-action-neutral must NOT be used — it flips near-black
+       (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this loading
+       glyph invisible on the dark chip. Literal equals the token's dark value so
+       dark mode is unchanged; preserves the dim neutral weight. White 0.5 on
+       rgb(30,30,30) ≈ 6-7:1, past 4.5:1. */
+    color: rgba(255, 255, 255, 0.5);
     animation: screen-share-spin 1s linear infinite;
 }
 
@@ -4491,7 +4608,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-error .toast-icon svg {
-    color: var(--danger, var(--toast-action-neutral));
+    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+       both themes. --danger is UNDEFINED in this codebase, so this fell through to
+       --toast-action-neutral, which flips near-black (rgba(0,0,0,0.45)) under
+       html[data-theme="light"], rendering the error glyph invisible on the dark
+       chip. Literal equals the (fallen-through) token's dark value so dark mode is
+       unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
+       ≈ 6-7:1, past 4.5:1. */
+    color: rgba(255, 255, 255, 0.5);
 }
 
 @keyframes screen-share-spin {

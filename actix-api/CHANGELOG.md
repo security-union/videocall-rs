@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **BREAKING**: Added `_UNKNOWN = 0` variants to all protobuf enums (`PacketType`, `MediaType`, `MeetingEventType`). This shifts all existing enum values by 1. Clients and servers must be updated together.
 - CI: Updated workflows to trigger rebuilds when `videocall-types/` or `protobuf/` change. This ensures API, UI, and CLI are rebuilt when protobuf definitions change.
+- Renamed Prometheus gauge `videocall_encoder_p75_peer_fps` to `videocall_encoder_queue_depth` ([#1231](https://github.com/security-union/videocall-rs/issues/1231)); the value is encoder queue depth (sender backpressure), not p75 FPS — operators must update any external/out-of-repo dashboards or alerts referencing the old name.
 
 ## [0.1.0](https://github.com/security-union/videocall-rs/releases/tag/sec-api-v0.1.0) - 2025-03-24
 

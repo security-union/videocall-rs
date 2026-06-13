@@ -26,10 +26,9 @@ use crate::components::performance_settings::{
     format_send_layer_short, format_send_total_kbps, format_simulcast_summary, layer_quality_label,
     peers_for_kind, DiagnosticsReader, HelpPopover, PerfControlsHandle, PerformanceSettingsPanel,
 };
-use crate::context::{
-    confirm_transport_change, load_transport_sticky, TransportPreference, TransportPreferenceCtx,
-};
+use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
 use dioxus_core::Task;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
@@ -617,6 +616,17 @@ pub fn Diagnostics(
     /// nothing. (#1131 unify)
     #[props(default)]
     perf_controls: Option<PerfControlsHandle>,
+    /// Current drawer width in px, owned by the parent so it can persist the
+    /// drag-resized width. (#1296)
+    width: f64,
+    /// Fired on resize-handle pointerdown so the parent can begin a drag. (#1296)
+    on_resize_start: EventHandler<()>,
+    /// Fired on each resize-handle pointermove, carrying the pointer's `client_x`.
+    /// The parent owns the width signals + clamp, so the math lives there. (#1296)
+    on_resize_move: EventHandler<f64>,
+    /// Fired on resize-handle pointerup so the parent can persist + end the drag.
+    /// (#1296)
+    on_resize_end: EventHandler<()>,
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
     let mut selected_peer = use_signal(|| "All Peers".to_string());
@@ -1036,6 +1046,7 @@ pub fn Diagnostics(
         div {
             id: "diagnostics-sidebar",
             class: if is_open { "visible" } else { "" },
+            style: format!("width: {}px", width),
             // Non-modal drawer: a labelled region (the modal-trap behaviour stays
             // off — the call UI behind it remains interactive). (#1131 §5 a11y)
             role: "region",
@@ -1074,11 +1085,18 @@ pub fn Diagnostics(
                             id: "diagnostics-transport-select",
                             class: "peer-selector",
                             onchange: move |evt: Event<FormData>| {
+                                // The diagnostics select has no "remember" checkbox, so it
+                                // expresses an explicit, NOT-remembered choice (#1291). Passing
+                                // `sticky = false` means: WebTransport clears all storage (load
+                                // resolves to the default); WebSocket writes a session-scoped
+                                // value AND clears any prior sticky pin, so WS wins this session
+                                // and is forgotten on tab close. Reading the stored sticky flag
+                                // here would re-pin against the user's intent.
                                 confirm_transport_change(
                                     &evt.value(),
                                     (transport_pref_ctx.0)(),
                                     "diagnostics-transport-select",
-                                    load_transport_sticky(),
+                                    false,
                                 );
                             },
                             option {
@@ -1333,6 +1351,56 @@ pub fn Diagnostics(
                     capped: neteq_capped,
                     single_peer,
                 }
+            }
+            div {
+                class: "drawer-resize-handle",
+                role: "separator",
+                aria_orientation: "vertical",
+                aria_label: "Resize panel",
+                tabindex: "0",
+                // keyboard resize is a follow-up
+                // Pointer capture: capturing the pointer on pointerdown routes every
+                // subsequent pointermove/up to THIS handle even when the pointer moves
+                // over the drawer body or a tile — required for shrink to work. The
+                // width math + persistence live in the parent (attendants.rs), which
+                // owns the width signals; this handle only forwards pointer coords.
+                onpointerdown: move |evt| {
+                    evt.prevent_default();
+                    on_resize_start.call(());
+                    let native = evt.as_web_event();
+                    if let Some(t) = native.target() {
+                        use wasm_bindgen::JsCast;
+                        if let Ok(el) = t.dyn_into::<web_sys::Element>() {
+                            let _ = el.set_pointer_capture(native.pointer_id());
+                        }
+                    }
+                },
+                onpointermove: move |evt| {
+                    on_resize_move.call(evt.as_web_event().client_x() as f64);
+                },
+                onpointerup: move |evt| {
+                    evt.prevent_default();
+                    on_resize_end.call(());
+                },
+                // Reuse on_resize_end on cancel AND lost-capture: its parent closure
+                // resets resizing_drawer to None (always) and persists the (already-
+                // clamped) width ONLY if a real move happened this drag. A no-move
+                // cancel (OS gesture, touch interruption, lost capture) leaves
+                // width and storage untouched — nothing can latch.
+                onpointercancel: move |_| {
+                    on_resize_end.call(());
+                },
+                // #1296: onpointerup only fires when the pointer is released over the
+                // captured element. If capture is lost another way (release off-element,
+                // OS interruption, element re-render) the browser fires
+                // `lostpointercapture` on the SAME element that captured (this handle
+                // div, via set_pointer_capture on evt.target() in onpointerdown).
+                // Forward to on_resize_end — the parent resets resizing_drawer to None
+                // (and valid-gated flush/persist), so a later hover over the handle
+                // can't keep resizing.
+                onlostpointercapture: move |_| {
+                    on_resize_end.call(());
+                },
             }
         }
     }

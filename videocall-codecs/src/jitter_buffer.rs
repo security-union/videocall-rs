@@ -54,6 +54,23 @@ const JITTER_MULTIPLIER: f64 = 3.0;
 /// A smoothing factor for delay updates to prevent rapid, jarring changes.
 const DELAY_SMOOTHING_FACTOR: f64 = 0.99;
 
+/// Release-side WebCodecs backpressure high-water mark (issue #1024).
+///
+/// Frames released by the jitter buffer are handed to the WebCodecs `VideoDecoder`, whose own
+/// internal queue is *unpaced* — given a burst it decodes and paints as fast as it can rather than
+/// at display rate. That is the "second buffer stage" #1020 describes: the jitter-buffer freshness
+/// deadline bounds the first stage, but without this gate a recovery burst still piles into the
+/// decoder and is painted back-to-back. So before releasing a frame we consult the live decoder
+/// queue depth (`Decodable::decode_queue_depth()`) and stop releasing while it is at/above this
+/// mark, letting the decoder drain to display rate. Frames simply stay buffered for the next tick.
+///
+/// Chosen as 3: large enough to keep the decoder continuously fed (no underrun/stutter at ~30fps,
+/// where a healthy queue sits at 0-1) yet small enough that the second-stage backlog can never
+/// exceed a few frames (~100ms). If a backup persists long enough that the head-of-line frame ages
+/// past `MAX_PLAYOUT_AGE_MS`, the freshness deadline — which runs *before* this gate every tick —
+/// skips to live, so backpressure can never turn into unbounded lag.
+const DECODE_QUEUE_HIGH_WATER_MARK: u32 = 3;
+
 /// The maximum number of frames the buffer will hold before rejecting new ones.
 const MAX_BUFFER_SIZE: usize = 200;
 // From libwebrtc's jitter_buffer_common.h
@@ -109,7 +126,7 @@ impl<T> JitterBuffer<T> {
     /// The main entry point for a new frame arriving from the network.
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
-        println!("[JITTER_BUFFER] Inserting frame: {seq}");
+        log::trace!("[JITTER_BUFFER] Inserting frame: {seq}");
 
         // --- Pre-insertion checks ---
         // 1. Ignore frames that are too old.
@@ -121,15 +138,15 @@ impl<T> JitterBuffer<T> {
                 if frame.frame_type == FrameType::KeyFrame
                     && last_decoded.saturating_sub(seq) > STREAM_RESTART_BACKTRACK_THRESHOLD
                 {
-                    println!(
+                    log::debug!(
                         "[JITTER_BUFFER] Detected keyframe with older sequence ({seq} <= {last_decoded}). Assuming stream restart – flushing buffer."
                     );
                     self.flush();
                 } else {
-                    println!("[JITTER_BUFFER] Ignoring old frame: {seq}");
+                    log::trace!("[JITTER_BUFFER] Ignoring old frame: {seq}");
                     self.num_consecutive_old_frames += 1;
                     if self.num_consecutive_old_frames > MAX_CONSECUTIVE_OLD_FRAMES {
-                        println!(
+                        log::debug!(
                             "[JITTER_BUFFER] Received {} consecutive old frames. Flushing buffer.",
                             self.num_consecutive_old_frames
                         );
@@ -147,15 +164,15 @@ impl<T> JitterBuffer<T> {
         if self.buffered_frames.len() >= MAX_BUFFER_SIZE {
             // Allow a keyframe to clear the buffer if it's full.
             if frame.frame_type == FrameType::KeyFrame {
-                println!("[JITTER_BUFFER] Buffer full, but received keyframe. Clearing buffer.");
+                log::debug!("[JITTER_BUFFER] Buffer full, but received keyframe. Clearing buffer.");
                 self.drop_all_frames();
             } else {
-                println!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
+                log::debug!("[JITTER_BUFFER] Buffer full. Rejecting frame: {seq}");
                 return; // Reject the frame.
             }
         }
 
-        println!("[JITTER_BUFFER] Received frame: {seq}");
+        log::trace!("[JITTER_BUFFER] Received frame: {seq}");
 
         self.jitter_estimator.update_estimate(seq, arrival_time_ms);
         self.update_target_playout_delay();
@@ -185,7 +202,7 @@ impl<T> JitterBuffer<T> {
     pub fn find_and_move_continuous_frames(&mut self, current_time_ms: u128) {
         let mut frames_were_moved = false;
 
-        println!(
+        log::trace!(
             "[JB_POLL] Checking buffer. Last decoded: {:?}, Buffer size: {}, Target delay: {:.2}ms",
             self.last_decoded_sequence_number,
             self.buffered_frames.len(),
@@ -209,13 +226,29 @@ impl<T> JitterBuffer<T> {
                 continue;
             }
 
+            // Release-side backpressure (issue #1024). The freshness deadline above has already had
+            // its chance to evict a stale backlog this tick; only AFTER that do we throttle the
+            // release of fresh frames. If the WebCodecs decoder's own (unpaced) queue is at/above
+            // the high-water mark, stop releasing this tick so it drains at display rate instead of
+            // being shoveled full and painting back-to-back. The held frames stay buffered and are
+            // re-evaluated on the next ~10ms tick; if the backup persists until the head ages past
+            // MAX_PLAYOUT_AGE_MS the freshness deadline (which runs first) skips to live, so this
+            // can never accumulate unbounded lag. Decoders with no observable queue (native/mock)
+            // report depth 0 and are never throttled.
+            if self.decoder.decode_queue_depth() >= DECODE_QUEUE_HIGH_WATER_MARK {
+                println!(
+                    "[JB_POLL] Decode-queue backpressure: holding release (queue depth >= {DECODE_QUEUE_HIGH_WATER_MARK})."
+                );
+                break;
+            }
+
             let next_decodable_key: Option<u64> = if let Some(last_seq) =
                 self.last_decoded_sequence_number
             {
                 // CASE 1: We are in a continuous stream. Look for the next frame.
                 let next_continuous_seq = last_seq + 1;
                 if self.buffered_frames.contains_key(&next_continuous_seq) {
-                    println!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
+                    log::trace!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
                     Some(next_continuous_seq)
                 } else {
                     // CASE 2: Gap detected. Look for the next keyframe after the gap.
@@ -225,11 +258,13 @@ impl<T> JitterBuffer<T> {
                         .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
                         .map(|(&s, _)| s);
                     if let Some(k) = keyframe {
-                        println!(
+                        log::trace!(
                             "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
                         );
                     } else {
-                        println!("[JB_POLL] Gap after {last_seq}. No subsequent keyframe found.");
+                        log::trace!(
+                            "[JB_POLL] Gap after {last_seq}. No subsequent keyframe found."
+                        );
                     }
                     keyframe
                 }
@@ -241,9 +276,9 @@ impl<T> JitterBuffer<T> {
                     .find(|(_, f)| f.is_keyframe())
                     .map(|(&s, _)| s);
                 if let Some(k) = keyframe {
-                    println!("[JB_POLL] Seeking first keyframe. Found: {k}");
+                    log::trace!("[JB_POLL] Seeking first keyframe. Found: {k}");
                 } else {
-                    println!("[JB_POLL] Seeking first keyframe. None found in buffer.");
+                    log::trace!("[JB_POLL] Seeking first keyframe. None found in buffer.");
                 }
                 keyframe
             };
@@ -253,7 +288,7 @@ impl<T> JitterBuffer<T> {
                     let time_in_buffer_ms = (current_time_ms - frame.arrival_time_ms) as f64;
 
                     let is_ready = time_in_buffer_ms >= self.target_playout_delay_ms;
-                    println!(
+                    log::trace!(
                         "[JB_POLL] Candidate {key}: Time in buffer: {time_in_buffer_ms:.2}ms, Target: {:.2}ms -> Ready: {is_ready}",
                         self.target_playout_delay_ms
                     );
@@ -269,7 +304,7 @@ impl<T> JitterBuffer<T> {
                                 .is_some_and(|last_seq| key > last_seq + 1);
 
                             if is_first_frame || is_gap_recovery {
-                                println!(
+                                log::debug!(
                                     "[JITTER_BUFFER] Keyframe {key} recovery. Dropping frames before it."
                                 );
                                 self.drop_frames_before(key);
@@ -283,7 +318,7 @@ impl<T> JitterBuffer<T> {
                     }
                 }
             } else {
-                println!("[JB_POLL] No decodable frame found in buffer.");
+                log::trace!("[JB_POLL] No decodable frame found in buffer.");
             }
 
             if !found_frame_to_move {
@@ -384,7 +419,7 @@ impl<T> JitterBuffer<T> {
                 self.drop_frames_before(keyframe_seq);
                 let dropped_any = self.dropped_frames_count > dropped_before;
                 if dropped_any {
-                    println!(
+                    log::debug!(
                         "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms >= {MAX_PLAYOUT_AGE_MS:.0}ms). Skipped to live keyframe {keyframe_seq}, dropped {} stale frame(s).",
                         self.dropped_frames_count - dropped_before
                     );
@@ -403,7 +438,7 @@ impl<T> JitterBuffer<T> {
                 let dropped_before = self.dropped_frames_count;
                 self.drop_frames_before(stale_cutoff);
                 if self.dropped_frames_count > dropped_before {
-                    println!(
+                    log::debug!(
                         "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {} stale delta frame(s); holding last-good frame and awaiting keyframe recovery.",
                         self.dropped_frames_count - dropped_before
                     );
@@ -427,7 +462,7 @@ impl<T> JitterBuffer<T> {
     /// Pushes a single frame to the shared decodable queue.
     fn push_to_decoder(&mut self, frame: FrameBuffer) {
         let seq = frame.sequence_number();
-        println!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
+        log::trace!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
     }
 
@@ -447,7 +482,7 @@ impl<T> JitterBuffer<T> {
 
         self.dropped_frames_count += keys_to_drop.len() as u64;
         for key in keys_to_drop {
-            println!("[JITTER_BUFFER] Dropping stale frame: {key}");
+            log::trace!("[JITTER_BUFFER] Dropping stale frame: {key}");
             self.buffered_frames.remove(&key);
         }
     }
@@ -457,7 +492,7 @@ impl<T> JitterBuffer<T> {
         let num_dropped = self.buffered_frames.len() as u64;
         self.buffered_frames.clear();
         self.dropped_frames_count += num_dropped;
-        println!("[JITTER_BUFFER] Dropped all {num_dropped} frames.");
+        log::debug!("[JITTER_BUFFER] Dropped all {num_dropped} frames.");
     }
 
     /// Flushes the jitter buffer, resetting its state completely.
@@ -487,12 +522,17 @@ mod tests {
     use super::*;
     use crate::decoder::DecodedFrame;
     use crate::frame::{FrameType, VideoFrame};
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    /// A mock decoder for testing purposes. It stores decoded frames in a shared Vec.
+    /// A mock decoder for testing purposes. It stores decoded frames in a shared Vec, and exposes a
+    /// shared, test-controllable `queue_depth` so tests can simulate a backed-up WebCodecs decoder
+    /// and exercise the release-side backpressure gate (issue #1024). Depth defaults to 0, so every
+    /// pre-existing test sees no backpressure.
     struct MockDecoder {
         decoded_frames: Arc<Mutex<Vec<DecodedFrame>>>,
+        queue_depth: Arc<AtomicU32>,
     }
 
     // This impl is for native targets
@@ -514,6 +554,9 @@ mod tests {
                 height: 0,
                 data: frame.frame.data.to_vec(),
             });
+        }
+        fn decode_queue_depth(&self) -> u32 {
+            self.queue_depth.load(Ordering::SeqCst)
         }
     }
 
@@ -537,11 +580,26 @@ mod tests {
                 data: frame.frame.data.to_vec(),
             });
         }
+        fn decode_queue_depth(&self) -> u32 {
+            self.queue_depth.load(Ordering::SeqCst)
+        }
     }
 
     impl MockDecoder {
         fn new_with_vec(decoded_frames: Arc<Mutex<Vec<DecodedFrame>>>) -> Self {
-            Self { decoded_frames }
+            Self {
+                decoded_frames,
+                queue_depth: Arc::new(AtomicU32::new(0)),
+            }
+        }
+        fn new_with_vec_and_depth(
+            decoded_frames: Arc<Mutex<Vec<DecodedFrame>>>,
+            queue_depth: Arc<AtomicU32>,
+        ) -> Self {
+            Self {
+                decoded_frames,
+                queue_depth,
+            }
         }
     }
 
@@ -554,6 +612,23 @@ mod tests {
         let mock_decoder = Box::new(MockDecoder::new_with_vec(decoded_frames.clone()));
         let jitter_buffer = JitterBuffer::new(mock_decoder);
         (jitter_buffer, decoded_frames)
+    }
+
+    /// Like `create_test_jitter_buffer`, but also returns a handle to the mock decoder's simulated
+    /// WebCodecs queue depth so a test can drive release-side backpressure (issue #1024).
+    fn create_test_jitter_buffer_with_queue_depth() -> (
+        JitterBuffer<crate::decoder::DecodedFrame>,
+        Arc<Mutex<Vec<DecodedFrame>>>,
+        Arc<AtomicU32>,
+    ) {
+        let decoded_frames = Arc::new(Mutex::new(Vec::new()));
+        let queue_depth = Arc::new(AtomicU32::new(0));
+        let mock_decoder = Box::new(MockDecoder::new_with_vec_and_depth(
+            decoded_frames.clone(),
+            queue_depth.clone(),
+        ));
+        let jitter_buffer = JitterBuffer::new(mock_decoder);
+        (jitter_buffer, decoded_frames, queue_depth)
     }
 
     fn create_test_frame(seq: u64, frame_type: FrameType) -> VideoFrame {
@@ -1135,5 +1210,112 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].sequence_number, 1);
         assert_eq!(jb.get_dropped_frames_count(), 0);
+    }
+
+    // --- Release-side decode-queue backpressure (issue #1024) ---
+
+    /// While the WebCodecs decoder's internal queue is at/above the high-water mark, the jitter
+    /// buffer must hold (not release, not drop) ready frames; once the decoder drains below the
+    /// mark, release resumes. Frames stay well under MAX_PLAYOUT_AGE_MS throughout, so the freshness
+    /// deadline never participates — this isolates the backpressure gate.
+    #[test]
+    fn backpressure_holds_frames_at_hwm_then_releases() {
+        let (mut jb, decoded_frames, queue_depth) = create_test_jitter_buffer_with_queue_depth();
+        let mut time = 1000;
+
+        // Decoder is already backed up at the high-water mark.
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
+
+        // A keyframe + delta arrive and age past the playout delay (but far below the freshness
+        // deadline).
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), time);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), time);
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+
+        // Nothing may be released while the decoder sits at the mark, and nothing may be dropped.
+        assert!(
+            decoded_frames.lock().unwrap().is_empty(),
+            "backpressure must hold all frames while the decode queue is at the high-water mark"
+        );
+        assert_eq!(
+            jb.buffered_frames_len(),
+            2,
+            "held frames stay buffered, not dropped"
+        );
+        assert_eq!(jb.get_dropped_frames_count(), 0);
+
+        // Decoder drains below the mark -> release resumes on the next tick.
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK - 1, Ordering::SeqCst);
+        time += 100; // still far under MAX_PLAYOUT_AGE_MS
+        jb.find_and_move_continuous_frames(time);
+
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(
+            queue.len(),
+            2,
+            "frames must release once the decoder drains below the high-water mark"
+        );
+        assert_eq!(queue[0].sequence_number, 1);
+        assert_eq!(queue[1].sequence_number, 2);
+    }
+
+    /// The freshness deadline is the backpressure safety valve and MUST run first: even with the
+    /// decoder pinned at the high-water mark, a stale backlog is still evicted (so it cannot grow
+    /// unbounded behind a slow decoder). Backpressure only gates the release of the *fresh*
+    /// skip-to-live keyframe, which decodes once the decoder drains.
+    ///
+    /// This guards the ordering (freshness before backpressure) AND the gate's existence:
+    /// - move the gate before `enforce_freshness_deadline` → stale deltas are not evicted (fails);
+    /// - remove the gate → the keyframe releases immediately despite the full queue (fails).
+    #[test]
+    fn freshness_eviction_runs_before_backpressure() {
+        let (mut jb, decoded_frames, queue_depth) = create_test_jitter_buffer_with_queue_depth();
+        let start = 1000;
+
+        // Decode an initial keyframe so we are mid-stream (last good = seq 1).
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), start);
+        jb.find_and_move_continuous_frames(start + 100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        decoded_frames.lock().unwrap().clear();
+
+        // Pin the decoder at the high-water mark so backpressure is active for the rest of the test.
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
+
+        // A stall: stale deltas accumulate, then a fresh keyframe arrives much later.
+        let stall_arrival = start + 200;
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), stall_arrival);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), stall_arrival);
+        let keyframe_arrival = stall_arrival + (MAX_PLAYOUT_AGE_MS as u128) + 100;
+        jb.insert_frame(create_test_frame(5, FrameType::KeyFrame), keyframe_arrival);
+
+        // Poll where the head delta (seq 2) is stale but the keyframe (seq 5) is fresh.
+        let now = keyframe_arrival + 50;
+        jb.find_and_move_continuous_frames(now);
+
+        // Freshness ran first: the stale deltas are evicted even though the decoder is backed up.
+        assert!(
+            !jb.buffered_frames.contains_key(&2),
+            "stale delta must be evicted by the freshness deadline even under backpressure"
+        );
+        assert!(!jb.buffered_frames.contains_key(&3));
+        // Backpressure holds the fresh keyframe: not decoded yet, still buffered, playout unchanged.
+        assert!(
+            decoded_frames.lock().unwrap().is_empty(),
+            "the skip-to-live keyframe is gated by backpressure until the decoder drains"
+        );
+        assert!(
+            jb.buffered_frames.contains_key(&5),
+            "the fresh keyframe is retained, awaiting decoder drain"
+        );
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+
+        // Decoder drains -> the keyframe releases and skip-to-live completes.
+        queue_depth.store(0, Ordering::SeqCst);
+        jb.find_and_move_continuous_frames(now + 10);
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].sequence_number, 5);
+        assert_eq!(jb.last_decoded_sequence_number, Some(5));
     }
 }

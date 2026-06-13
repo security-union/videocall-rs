@@ -901,6 +901,9 @@ async fn run_client(
                     renderer,
                     rms,
                     max_rms,
+                    // rms was sampled at ekg_fps; the simulcast loop remaps the
+                    // index to its (possibly higher) render fps (#1123 item 2).
+                    ekg_fps,
                     packet_tx.clone(),
                     media_start,
                     loop_duration,
@@ -923,6 +926,9 @@ async fn run_client(
                 renderer,
                 rms,
                 max_rms,
+                // rms was sampled at ekg_fps; the simulcast loop remaps the
+                // index to its (possibly higher) render fps (#1123 item 2).
+                ekg_fps,
                 packet_tx.clone(),
                 media_start,
                 loop_duration,

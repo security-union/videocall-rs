@@ -21,7 +21,8 @@ use crate::{
         LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_RECOMPUTE_COALESCE_MS,
         LAYER_HINT_SUPPRESS_DEBOUNCE_MS, LAYER_PREFERENCE_MAX_ENTRIES,
         LAYER_PREFERENCE_MAX_LAYER_ID, LAYER_PREFERENCE_MIN_UPDATE_INTERVAL,
-        RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL,
+        LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS,
+        VIEWPORT_MIN_UPDATE_INTERVAL,
     },
     messages::{
         server::{
@@ -54,9 +55,10 @@ use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
     RELAY_CONGESTION_FILTERED_TOTAL, RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
     RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
-    RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_PREFERENCE_UPDATES_TOTAL,
-    RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL, RELAY_VIEWPORT_FILTERED_TOTAL,
-    RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE, RELAY_VIEWPORT_UPDATES_TOTAL,
+    RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
+    RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
+    RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE,
+    RELAY_VIEWPORT_UPDATES_TOTAL,
 };
 use videocall_types::protos::layer_hint_packet::layer_hint_packet::Entry as LayerHintEntry;
 use videocall_types::protos::layer_hint_packet::LayerHintPacket;
@@ -382,6 +384,55 @@ fn layer_id_bucket(layer_id: u32) -> &'static str {
     }
 }
 
+/// The media kinds that carry a simulcast ladder, as `(normalized preference-map
+/// discriminant, gauge `kind` label)` pairs, for the DEMAND-side gauge
+/// `relay_layer_preference_sessions` (#1170).
+///
+/// VIDEO(1) and SCREEN(3) only — AUDIO(2) has no simulcast layers, so a receiver
+/// never expresses a per-layer preference for it and it is excluded. The string
+/// here is the EXACT `kind` label and MUST stay in lockstep with
+/// [`crate::metrics::RELAY_LAYER_PREFERENCE_KINDS`] (the room-drain GC iterates
+/// that array; this one drives the sweep — a mismatch would leak series for any
+/// kind present in one but not the other). The unit test
+/// `layer_preference_gauge_kinds_match_metrics_taxonomy` pins them together.
+const LAYER_PREFERENCE_GAUGE_KINDS: [(i32, &str); 2] = [(1, "video"), (3, "screen")];
+
+/// Classify ONE receiver's recorded layer preferences into a per-kind MAX-layer
+/// bucket, for the demand-side gauge (#1170).
+///
+/// For each kind in [`LAYER_PREFERENCE_GAUGE_KINDS`] (VIDEO, SCREEN) this finds
+/// the MAX `desired_layer` the receiver has requested across ALL sources for
+/// that kind, then buckets it via [`layer_id_bucket`] (so a forged id collapses
+/// to `"other"`). The max is the right reduction because the relay must
+/// forward/produce up to the highest layer the receiver asked for, so that
+/// single layer characterizes the session's demand for the kind.
+///
+/// The return is parallel to [`LAYER_PREFERENCE_GAUGE_KINDS`] by index:
+/// `result[i]` is `Some(bucket)` when the receiver has at least one preference
+/// entry for that kind, or `None` when it has expressed NO preference for the
+/// kind. `None` means FAIL-OPEN (wants the full ladder) and the caller MUST NOT
+/// count it — absence of demand is not a request for the top layer.
+///
+/// Free function (takes the layers map by reference, no `&self`) so it is
+/// unit-testable without constructing a NATS-backed actor.
+fn classify_session_max_layer_buckets(
+    layers: &HashMap<(u64, i32), u32>,
+) -> [Option<&'static str>; LAYER_PREFERENCE_GAUGE_KINDS.len()] {
+    let mut out: [Option<&'static str>; LAYER_PREFERENCE_GAUGE_KINDS.len()] =
+        [None; LAYER_PREFERENCE_GAUGE_KINDS.len()];
+    for (idx, (kind, _label)) in LAYER_PREFERENCE_GAUGE_KINDS.iter().enumerate() {
+        // Max desired_layer over every (source, this-kind) entry the receiver
+        // recorded. `None` (no entry for the kind) stays fail-open / uncounted.
+        let max_for_kind = layers
+            .iter()
+            .filter(|((_, k), _)| k == kind)
+            .map(|(_, &layer)| layer)
+            .max();
+        out[idx] = max_for_kind.map(layer_id_bucket);
+    }
+    out
+}
+
 /// Per-session layer-preference state, shared between the session's NATS
 /// subscription task and [`ChatServer`].
 ///
@@ -448,15 +499,22 @@ impl LayerPrefs {
 const LAYER_HINT_FULL_LADDER_SENTINEL: u32 = u32::MAX;
 
 /// The media kinds the relay computes a layer union for, as the normalized
-/// preference-map discriminants (VIDEO=1, AUDIO=2, SCREEN=3 — see
+/// preference-map discriminants (VIDEO=1, SCREEN=3 — see
 /// [`normalize_pref_media_kind`]). A publisher produces at most one ladder per
 /// kind, so a hint carries at most one [`LayerHintEntry`] per element here.
-const LAYER_HINT_MEDIA_KINDS: [i32; 3] = [1, 2, 3];
+///
+/// AUDIO(2) is deliberately EXCLUDED (issue #1118 N3): audio has no simulcast
+/// ladder, the publisher's `LAYER_HINT` dispatch arm ignores AUDIO/UNSPECIFIED
+/// entries (`video_call_client.rs`, the `_ => {}` fail-open arm), so scanning the
+/// AUDIO union and emitting any AUDIO entry is pure wasted work on the relay. The
+/// relay therefore computes/emits hints only for VIDEO + SCREEN.
+const LAYER_HINT_MEDIA_KINDS: [i32; 2] = [1, 3];
 
 /// Map a normalized preference-map media-kind discriminant (1/2/3) onto the
 /// `LayerHintPacket.MediaKind` wire enum used when emitting a hint. Anything
 /// outside `{1,2,3}` maps to UNSPECIFIED(0) (never produced on the happy path —
-/// [`LAYER_HINT_MEDIA_KINDS`] only contains 1/2/3).
+/// [`LAYER_HINT_MEDIA_KINDS`] only contains 1 and 3 since #1118 N3, both mapped
+/// below; the AUDIO(2) arm is retained for completeness should a caller pass it).
 fn layer_hint_media_kind(
     kind: i32,
 ) -> videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind {
@@ -508,6 +566,19 @@ struct RecomputeLayerHints {
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct FlushPendingRecomputes;
+
+/// Periodic self-tick that refreshes the DEMAND-side simulcast gauge
+/// `relay_layer_preference_sessions{room, kind, layer_id}` (#1170 item 2).
+///
+/// Sent by the [`LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL`] `run_interval`
+/// armed in [`Actor::started`]. The handler is a READ-ONLY pass over the live
+/// rooms (`RwLock::read()` on each session's prefs, bounded by
+/// [`LAYER_HINT_MAX_RECEIVERS_SCANNED`] per room) that re-SETs every active
+/// room's gauge cells. It never takes a write lock and never mutates actor
+/// state, so it cannot block the forwarding hot path or starve the mailbox.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct SweepLayerPreferenceGauge;
 
 /// Per-`(room, source, media_kind)` emit/debounce state for LAYER_HINT (#1108).
 ///
@@ -1631,6 +1702,70 @@ impl ChatServer {
             self.recompute_coalesce_handle = Some(handle);
         }
     }
+
+    /// Refresh the DEMAND-side gauge `relay_layer_preference_sessions{room, kind,
+    /// layer_id}` for every live room (#1170 item 2).
+    ///
+    /// READ-ONLY: takes each session's `LayerPrefs` read lock and never a write
+    /// lock; mutates no actor state. Cost is O(rooms × min(sessions, 256)) —
+    /// per-room session scans are bounded by [`LAYER_HINT_MAX_RECEIVERS_SCANNED`]
+    /// exactly as the union scan is, so a pathological room cannot stall the
+    /// actor. For each active room it SETs all
+    /// `LAYER_PREFERENCE_GAUGE_KINDS.len() × RELAY_LAYER_ID_BUCKETS.len()` cells
+    /// (explicit zeros included) so a bucket whose demand vanished reads `0`
+    /// rather than a stale count. Drained rooms are not iterated here (they are
+    /// gone from `room_members`); their series are removed by
+    /// [`crate::metrics::forget_room_metrics`] at drain time.
+    fn sweep_layer_preference_gauge(&self) {
+        for (room, members) in &self.room_members {
+            // Tally counts: [kind_idx][bucket_idx]. Indexed parallel to
+            // LAYER_PREFERENCE_GAUGE_KINDS and RELAY_LAYER_ID_BUCKETS.
+            let mut counts =
+                [[0u64; RELAY_LAYER_ID_BUCKETS.len()]; LAYER_PREFERENCE_GAUGE_KINDS.len()];
+
+            for member in members.iter().take(LAYER_HINT_MAX_RECEIVERS_SCANNED) {
+                let Some(prefs) = self.session_layer_prefs.get(&member.session) else {
+                    // No prefs handle for this session at all = fail-open
+                    // (expressed no demand) → contributes nothing, like an empty
+                    // map. Matches the union scan's `None` arm.
+                    continue;
+                };
+                // Lock-free short-circuit: an empty prefs map (no LAYER_PREFERENCE
+                // recorded yet) expresses no demand for any kind, so skip the read
+                // lock entirely — keeps the simulcast-off / no-prefs case free.
+                if !prefs.has_any() {
+                    continue;
+                }
+                // Poisoned lock = fail-open (uncounted), mirroring the forward
+                // filter's `unwrap_or`.
+                let Ok(guard) = prefs.state.read() else {
+                    continue;
+                };
+                let buckets = classify_session_max_layer_buckets(&guard.layers);
+                drop(guard);
+                for (kind_idx, bucket) in buckets.iter().enumerate() {
+                    // `None` = no preference for this kind = fail-open, not counted.
+                    if let Some(bucket) = bucket {
+                        let bucket_idx = RELAY_LAYER_ID_BUCKETS
+                            .iter()
+                            .position(|b| b == bucket)
+                            .expect("layer_id_bucket only returns RELAY_LAYER_ID_BUCKETS values");
+                        counts[kind_idx][bucket_idx] += 1;
+                    }
+                }
+            }
+
+            // SET every cell for this active room, including zeros, so a bucket
+            // that lost all demand since the last sweep reads 0 not a stale value.
+            for (kind_idx, (_, kind_label)) in LAYER_PREFERENCE_GAUGE_KINDS.iter().enumerate() {
+                for (bucket_idx, bucket_label) in RELAY_LAYER_ID_BUCKETS.iter().enumerate() {
+                    RELAY_LAYER_PREFERENCE_SESSIONS
+                        .with_label_values(&[room, kind_label, bucket_label])
+                        .set(counts[kind_idx][bucket_idx] as f64);
+                }
+            }
+        }
+    }
 }
 
 impl Actor for ChatServer {
@@ -1716,6 +1851,18 @@ impl Actor for ChatServer {
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             }
+        });
+
+        // Arm the periodic DEMAND-side gauge sweep (#1170 item 2). `run_interval`
+        // invokes the closure inside the actor with `&mut self` access, so the
+        // sweep runs on the actor thread and reads `room_members` /
+        // `session_layer_prefs` directly — no cross-thread snapshot needed. We
+        // delegate to a `do_send` of `SweepLayerPreferenceGauge` (rather than
+        // inlining) so the sweep body lives in one Handler that is reachable from
+        // tests and keeps each tick a discrete, short mailbox message rather than
+        // work spliced into the timer driver.
+        ctx.run_interval(LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, |_act, ctx| {
+            ctx.address().do_send(SweepLayerPreferenceGauge);
         });
     }
 
@@ -2303,6 +2450,18 @@ impl Handler<FlushPendingRecomputes> for ChatServer {
             // missing `room_members` entry).
             self.handle(RecomputeLayerHints { room, source: None }, ctx);
         }
+    }
+}
+
+impl Handler<SweepLayerPreferenceGauge> for ChatServer {
+    type Result = ();
+
+    fn handle(
+        &mut self,
+        _msg: SweepLayerPreferenceGauge,
+        _ctx: &mut Self::Context,
+    ) -> Self::Result {
+        self.sweep_layer_preference_gauge();
     }
 }
 
@@ -11315,6 +11474,142 @@ mod tests {
         );
     }
 
+    /// #1283: direct coverage for the actor-driven DEMAND-gauge sweep loop
+    /// (`sweep_layer_preference_gauge`): room iteration, the per-session
+    /// `has_any()` skip, the per-kind MAX-bucket tally, and — the easiest path to
+    /// silently regress — the explicit-zero `SET` for an active room whose demand
+    /// vanished. The unit tests already pin the pure classifier; this seeds actor
+    /// state and asserts the resulting gauge values end-to-end.
+    ///
+    /// Mutation-proofing: a Prometheus gauge reads 0 whether it was explicitly set
+    /// to 0 OR never touched, so a naive "assert == 0" would pass even if the
+    /// explicit-zero `SET` were dropped. We therefore PRE-POISON every asserted
+    /// cell to a sentinel (99) before the sweep — every assertion below then proves
+    /// the sweep actually `SET` that cell (to a count or to an explicit zero).
+    /// - Invert the `has_any()` skip → the active-room counts collapse to 0 (fail).
+    /// - Drop the explicit-zero `SET` → the poisoned 99 survives where 0 is
+    ///   expected (the active-room "0"/empty cells and the whole empty room) (fail).
+    #[actix_rt::test]
+    #[serial]
+    async fn test_sweep_layer_preference_gauge_sets_buckets_and_explicit_zero() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+        // `sweep_layer_preference_gauge` is `&self` (no actor context), so we drive
+        // it directly on a constructed (un-started) server with seeded state.
+        let mut server = ChatServer::new(nats_client).await;
+
+        // Unique room names → isolated global-gauge series (and `#[serial]` keeps
+        // these tests off each other's toes).
+        let active_room = "test-1283-active";
+        let empty_room = "test-1283-empty-no-prefs";
+
+        let member = |session: SessionId| RoomMemberInfo {
+            session,
+            user_id: format!("u{session}"),
+            display_name: format!("d{session}"),
+            is_host: false,
+            end_on_host_leave: false,
+        };
+
+        // --- Active room: a KNOWN distribution across buckets × {video, screen} ---
+        // recv-A (1001): video MAX layer 2 → bucket "2"; screen layer 0 → "0".
+        // recv-B (1002): video MAX layer 1 → bucket "1"; NO screen pref → uncounted.
+        // recv-C (1003): forged video layer 7 → bucket "other"; screen layer 2 → "2".
+        // The max-per-kind reduction means recv-A's two video entries (layer 2 is
+        // the max) bucket once at "2".
+        server.session_layer_prefs.insert(
+            1001,
+            layer_prefs_with_kinds(&[(900, 1, 0), (900, 1, 2), (901, 3, 0)]),
+        );
+        server
+            .session_layer_prefs
+            .insert(1002, layer_prefs_with_kinds(&[(900, 1, 1)]));
+        server
+            .session_layer_prefs
+            .insert(1003, layer_prefs_with_kinds(&[(900, 1, 7), (901, 3, 2)]));
+        server.room_members.insert(
+            active_room.to_string(),
+            vec![member(1001), member(1002), member(1003)],
+        );
+
+        // --- Empty room: a member that EXISTS but has no recorded prefs
+        // (`has_any()` false). The room is still iterated and must be SET to 0
+        // across every cell — the explicit-zero path. ---
+        server.session_layer_prefs.insert(2001, empty_layer_prefs());
+        server
+            .room_members
+            .insert(empty_room.to_string(), vec![member(2001)]);
+
+        // Pre-poison every cell we will assert, so each assertion proves the sweep
+        // SET it (an unswept cell would read 99, not the expected value).
+        for room in [active_room, empty_room] {
+            for (_, kind_label) in LAYER_PREFERENCE_GAUGE_KINDS.iter() {
+                for bucket in RELAY_LAYER_ID_BUCKETS.iter() {
+                    RELAY_LAYER_PREFERENCE_SESSIONS
+                        .with_label_values(&[room, kind_label, bucket])
+                        .set(99.0);
+                }
+            }
+        }
+
+        server.sweep_layer_preference_gauge();
+
+        let g = |room: &str, kind: &str, bucket: &str| {
+            RELAY_LAYER_PREFERENCE_SESSIONS
+                .with_label_values(&[room, kind, bucket])
+                .get() as u64
+        };
+
+        // Active room — VIDEO: B→"1", A→"2", C→"other"; "0" has no demand → 0.
+        assert_eq!(
+            g(active_room, "video", "0"),
+            0,
+            "no receiver wants video layer 0"
+        );
+        assert_eq!(
+            g(active_room, "video", "1"),
+            1,
+            "recv-B video max = layer 1"
+        );
+        assert_eq!(
+            g(active_room, "video", "2"),
+            1,
+            "recv-A video max = layer 2"
+        );
+        assert_eq!(
+            g(active_room, "video", "other"),
+            1,
+            "recv-C forged video layer 7 buckets to \"other\""
+        );
+        // Active room — SCREEN: A→"0", C→"2"; B has no screen pref (uncounted).
+        assert_eq!(g(active_room, "screen", "0"), 1, "recv-A screen layer 0");
+        assert_eq!(
+            g(active_room, "screen", "1"),
+            0,
+            "no receiver wants screen layer 1"
+        );
+        assert_eq!(g(active_room, "screen", "2"), 1, "recv-C screen layer 2");
+        assert_eq!(
+            g(active_room, "screen", "other"),
+            0,
+            "no forged screen layer"
+        );
+
+        // Empty room — explicit zero across ALL cells (members present, no demand).
+        for (_, kind_label) in LAYER_PREFERENCE_GAUGE_KINDS.iter() {
+            for bucket in RELAY_LAYER_ID_BUCKETS.iter() {
+                assert_eq!(
+                    g(empty_room, kind_label, bucket),
+                    0,
+                    "a room with members but no recorded prefs must be SET to 0 \
+                     (explicit-zero path) at {kind_label}/{bucket}, not left stale"
+                );
+            }
+        }
+    }
+
     #[actix_rt::test]
     async fn test_handle_msg_drops_non_matching_screen_layer() {
         // Phase 3: SCREEN is layer-filtered like VIDEO. Receiver wants screen
@@ -12097,6 +12392,115 @@ mod tests {
 
     const VIDEO_KIND: i32 = 1;
 
+    /// Build a `(source, kind) -> desired_layer` map for the demand-gauge
+    /// classifier (#1170), mirroring `LayerPrefsState.layers`.
+    fn layers_map(entries: &[(u64, i32, u32)]) -> HashMap<(u64, i32), u32> {
+        entries.iter().map(|&(s, k, l)| ((s, k), l)).collect()
+    }
+
+    /// Resolve a kind's classified bucket from the parallel-indexed result of
+    /// `classify_session_max_layer_buckets`, by the kind's gauge label.
+    fn bucket_for_kind<'a>(
+        classified: &[Option<&'a str>; LAYER_PREFERENCE_GAUGE_KINDS.len()],
+        kind_label: &str,
+    ) -> Option<&'a str> {
+        let idx = LAYER_PREFERENCE_GAUGE_KINDS
+            .iter()
+            .position(|(_, label)| *label == kind_label)
+            .expect("kind_label must be a known gauge kind");
+        classified[idx]
+    }
+
+    /// Pins the #1170 demand-gauge aggregation: each receiver is classified by
+    /// its MAX requested layer PER KIND, an empty map contributes nothing, and a
+    /// forged layer id buckets to "other". This is the source-of-truth reduction
+    /// the gauge depends on — it must fail if the max is swapped for min, if the
+    /// per-kind split is broken, or if fail-open exclusion regresses.
+    #[test]
+    fn test_classify_session_max_layer_buckets() {
+        const SCREEN_KIND: i32 = 3;
+
+        // Receiver wants {(srcA,VIDEO):0, (srcB,VIDEO):2, (srcC,SCREEN):1}.
+        // MAX over VIDEO is 2 → bucket "2"; SCREEN has a single entry 1 → "1".
+        let m = layers_map(&[
+            (10, VIDEO_KIND, 0),
+            (11, VIDEO_KIND, 2),
+            (12, SCREEN_KIND, 1),
+        ]);
+        let classified = classify_session_max_layer_buckets(&m);
+        assert_eq!(
+            bucket_for_kind(&classified, "video"),
+            Some("2"),
+            "VIDEO must classify by the MAX requested layer (2), not the min (0) or first-seen"
+        );
+        assert_eq!(
+            bucket_for_kind(&classified, "screen"),
+            Some("1"),
+            "SCREEN is classified independently of VIDEO"
+        );
+
+        // Empty map = no demand expressed for any kind → every kind is None
+        // (uncounted / fail-open), contributing nothing to the gauge.
+        let empty = layers_map(&[]);
+        let classified_empty = classify_session_max_layer_buckets(&empty);
+        assert_eq!(bucket_for_kind(&classified_empty, "video"), None);
+        assert_eq!(bucket_for_kind(&classified_empty, "screen"), None);
+
+        // A receiver with only VIDEO prefs is fail-open (None) for SCREEN, not
+        // counted as some default bucket.
+        let video_only = layers_map(&[(10, VIDEO_KIND, 1)]);
+        let classified_vo = classify_session_max_layer_buckets(&video_only);
+        assert_eq!(bucket_for_kind(&classified_vo, "video"), Some("1"));
+        assert_eq!(
+            bucket_for_kind(&classified_vo, "screen"),
+            None,
+            "no SCREEN entry = fail-open = uncounted, NOT a default bucket"
+        );
+
+        // A forged / out-of-ladder layer id (9) must collapse to "other" so it
+        // cannot create an unbounded label series. Use it as the MAX so the
+        // bucketing of the chosen max is what is under test.
+        let forged = layers_map(&[(10, VIDEO_KIND, 0), (11, VIDEO_KIND, 9)]);
+        let classified_forged = classify_session_max_layer_buckets(&forged);
+        assert_eq!(
+            bucket_for_kind(&classified_forged, "video"),
+            Some("other"),
+            "a forged/out-of-ladder layer id (9) must bucket to \"other\""
+        );
+
+        // AUDIO has no simulcast ladder: even a (bogus) AUDIO entry must not
+        // appear as a tracked kind (only VIDEO+SCREEN are gauge kinds).
+        const AUDIO_KIND: i32 = 2;
+        assert!(
+            !LAYER_PREFERENCE_GAUGE_KINDS
+                .iter()
+                .any(|(k, _)| *k == AUDIO_KIND),
+            "AUDIO must NOT be a demand-gauge kind (no simulcast layers)"
+        );
+    }
+
+    /// The sweep's kind taxonomy ([`LAYER_PREFERENCE_GAUGE_KINDS`]) and the
+    /// room-drain GC's taxonomy ([`crate::metrics::RELAY_LAYER_PREFERENCE_KINDS`])
+    /// MUST list the exact same `kind` label set — otherwise the sweep would
+    /// write a series the GC never removes (a leak) or vice versa. This fails if
+    /// either array drifts.
+    #[test]
+    fn layer_preference_gauge_kinds_match_metrics_taxonomy() {
+        let sweep_labels: std::collections::BTreeSet<&str> = LAYER_PREFERENCE_GAUGE_KINDS
+            .iter()
+            .map(|(_, label)| *label)
+            .collect();
+        let gc_labels: std::collections::BTreeSet<&str> =
+            crate::metrics::RELAY_LAYER_PREFERENCE_KINDS
+                .iter()
+                .copied()
+                .collect();
+        assert_eq!(
+            sweep_labels, gc_labels,
+            "the sweep's kind labels and the room-drain GC's kind labels must match exactly"
+        );
+    }
+
     #[test]
     fn test_union_max_over_receivers() {
         // Three receivers want layers {2, 1, 2} of source 900's VIDEO. The union
@@ -12629,6 +13033,38 @@ mod tests {
         assert_eq!(layer_hint_media_kind(99), HintKind::MEDIA_KIND_UNSPECIFIED);
     }
 
+    /// #1118 N3: the relay must compute/emit layer hints ONLY for VIDEO + SCREEN.
+    /// AUDIO(2) has no simulcast ladder, and the publisher's `LAYER_HINT` dispatch
+    /// arm ignores AUDIO/UNSPECIFIED entries (`video_call_client.rs`, the `_ => {}`
+    /// fail-open arm), so scanning the AUDIO union and emitting any AUDIO entry is
+    /// pure wasted work. `LAYER_HINT_MEDIA_KINDS` directly drives the recompute
+    /// scan (`for &kind in LAYER_HINT_MEDIA_KINDS.iter()`), so pinning it pins the
+    /// emitted-kinds behavior. Re-adding AUDIO(2) fails this test.
+    #[test]
+    fn test_layer_hint_media_kinds_exclude_audio() {
+        use videocall_types::protos::layer_hint_packet::layer_hint_packet::MediaKind as HintKind;
+        assert!(
+            !LAYER_HINT_MEDIA_KINDS.contains(&2),
+            "AUDIO(2) must not be scanned/emitted — no simulcast ladder, client ignores it (#1118 N3)"
+        );
+        assert_eq!(
+            LAYER_HINT_MEDIA_KINDS,
+            [1, 3],
+            "the relay computes layer unions for exactly VIDEO(1) + SCREEN(3)"
+        );
+        // Every scanned kind maps to a real laddered wire kind — never AUDIO or
+        // UNSPECIFIED — so the scan list and the emitted kinds stay in lockstep.
+        for &kind in LAYER_HINT_MEDIA_KINDS.iter() {
+            assert!(
+                matches!(
+                    layer_hint_media_kind(kind),
+                    HintKind::VIDEO | HintKind::SCREEN
+                ),
+                "scanned kind {kind} must emit as VIDEO or SCREEN"
+            );
+        }
+    }
+
     // =====================================================================
     // #1203 — DEPARTURE-recompute coalescing (trailing debounce)
     // =====================================================================
@@ -12797,6 +13233,250 @@ mod tests {
             1,
             "a JOIN-style recompute must run IMMEDIATELY (one invocation), not be \
              held behind the departure coalesce window"
+        );
+    }
+
+    /// #1235: the #1203 departure coalescing is exercised through the REAL
+    /// departure handlers, not just the `schedule_coalesced_recompute` primitive.
+    ///
+    /// The two existing #1203 tests above drive `TestScheduleCoalescedRecompute`
+    /// (the primitive) directly. That pins the coalescing machinery but leaves a
+    /// gap: nothing proves that the actual `leave_rooms` (explicit `Leave`) and
+    /// `forget_session` (cross-server `EvictInstance`) call sites are still wired
+    /// to `schedule_coalesced_recompute` rather than the pre-#1203 immediate
+    /// `do_send(RecomputeLayerHints { source: None })`. This test closes that gap
+    /// by driving the FULL relay lifecycle through the real handlers:
+    ///
+    ///   * Connect -> JoinRoom -> Leave                              (-> leave_rooms)
+    ///   * Connect -> JoinRoom -> ActivateConnection -> EvictInstance (-> forget_session)
+    ///
+    /// Topology (every departed room keeps >=1 member so a recompute is actually
+    /// SCHEDULED — `leave_rooms`/`forget_session` only schedule when the room is
+    /// NOT drained to empty):
+    ///   * Room A: 3 members. A1 departs via `Leave`, A2 departs via
+    ///     `EvictInstance`; A3 remains. BOTH departures hit room A within the
+    ///     coalesce window, so they MUST coalesce into ONE recompute.
+    ///   * Room B: 2 members. B1 departs via `Leave`; B2 remains. ONE recompute.
+    ///   => 2 distinct affected rooms => exactly 2 recomputes total, NOT one per
+    ///      departure (which would be 3).
+    ///
+    /// The counter is reset AFTER all joins/activations complete. This is load-
+    /// bearing: the JoinRoom handler's synchronous body does
+    /// `do_send(RecomputeLayerHints { source: None })` (the #1108 Stage-3 join
+    /// restore), so each join bumps the counter; resetting after a drain probe
+    /// isolates the count to the departures under test. `ActivateConnection` on a
+    /// session with a fresh, unshared instance_id is an eviction no-op
+    /// (`instance_index.get(iid)` is None on first activation) so it schedules no
+    /// recompute of its own.
+    ///
+    /// MUTATION PROOF: reverting EITHER departure call site to the immediate
+    /// `do_send(RecomputeLayerHints { room, source: None })` breaks this test.
+    ///   * Reverting `leave_rooms` fires room A's + room B's `Leave`-driven
+    ///     recomputes synchronously, tripping the pre-window `== 0` assert.
+    ///   * Reverting `forget_session` fires room A's `EvictInstance`-driven
+    ///     recompute synchronously, tripping the pre-window `== 0` assert.
+    /// Both reverts have been run and observed to fail (see the issue/PR notes).
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1235_real_departure_handlers_coalesce() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        // Unique, #1235-specific room names and session/instance ids so this
+        // test cannot collide with any other test's state. `#[serial]` already
+        // serializes, but unique keys keep the actor state hermetic regardless.
+        let room_a = "i1235-coalesce-room-a".to_string();
+        let room_b = "i1235-coalesce-room-b".to_string();
+
+        // (session_id, instance_id) for every member.
+        let a1 = (1_235_001u64, "i1235-a1");
+        let a2 = (1_235_002u64, "i1235-a2");
+        let a3 = (1_235_003u64, "i1235-a3");
+        let b1 = (1_235_004u64, "i1235-b1");
+        let b2 = (1_235_005u64, "i1235-b2");
+
+        // A no-op session recipient: every real JoinRoom needs a
+        // `Recipient<Message>` registered via Connect first. DummySession never
+        // sends anything, so no LAYER_PREFERENCE interceptor recompute can fire
+        // from this test — the only recomputes are the join restore (which we
+        // reset away) and the departures under test.
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        // Helper: Connect + JoinRoom a non-observer member into a room.
+        async fn join_member(
+            chat: &Addr<ChatServer>,
+            session: SessionId,
+            instance_id: &str,
+            room: &str,
+        ) {
+            let dummy = DummySession.start();
+            chat.send(Connect {
+                id: session,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+            chat.send(JoinRoom {
+                session,
+                room: room.to_string(),
+                user_id: format!("{instance_id}@example.com"),
+                display_name: instance_id.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some(instance_id.to_string()),
+                is_host: false,
+                end_on_host_leave: false,
+                transport: "websocket".to_string(),
+            })
+            .await
+            .expect("JoinRoom delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        }
+
+        // --- Setup: populate both rooms via the REAL join path. ---
+        join_member(&chat, a1.0, a1.1, &room_a).await;
+        join_member(&chat, a2.0, a2.1, &room_a).await;
+        join_member(&chat, a3.0, a3.1, &room_a).await;
+        join_member(&chat, b1.0, b1.1, &room_b).await;
+        join_member(&chat, b2.0, b2.1, &room_b).await;
+
+        // A2 is the EvictInstance target. The cross-server eviction path
+        // (EvictInstance -> evict_stale_session -> forget_session) requires
+        // `instance_index[iid] -> prev_session`, which is populated by
+        // ActivateConnection (NOT JoinRoom). Activate ONLY A2: its instance_id is
+        // unique and unshared, so this first activation finds no prior
+        // instance_index entry and performs no eviction itself (it only claims
+        // the forward mapping + broadcasts PARTICIPANT_JOINED). No recompute.
+        chat.send(ActivateConnection { session: a2.0 })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // Drain every queued JoinRoom-restore recompute (one per non-observer
+        // join) and the ActivateConnection work by round-tripping a state probe,
+        // THEN reset the counter so it reflects ONLY the departures under test.
+        let _ = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        // Sanity: no departure has happened yet, and nothing should be pending /
+        // armed from the join phase (joins use immediate do_send, not the
+        // coalesce timer).
+        let (pending_pre, armed_pre) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            pending_pre, 0,
+            "joins must not leave anything in the departure coalesce set"
+        );
+        assert!(
+            !armed_pre,
+            "joins must not arm the departure coalesce timer"
+        );
+
+        // --- Drive the departure burst through the REAL handlers. ---
+        // Room A, departure 1: explicit Leave -> leave_rooms. A2 + A3 remain, so
+        // the room is NOT empty and a coalesced recompute IS scheduled.
+        chat.send(Leave {
+            session: a1.0,
+            room: room_a.clone(),
+            user_id: format!("{}@example.com", a1.1),
+        })
+        .await
+        .expect("Leave delivery should succeed");
+
+        // Room A, departure 2: cross-server EvictInstance -> evict_stale_session
+        // -> forget_session. A3 remains, so the room is NOT empty and a coalesced
+        // recompute IS scheduled (dedups with departure 1: same room A).
+        // new_session_id differs from A2's session so the eviction is not a
+        // self-skip.
+        chat.send(EvictInstance(EvictInstancePayload {
+            instance_id: a2.1.to_string(),
+            room: room_a.clone(),
+            user_id: format!("{}@example.com", a2.1),
+            new_session_id: 1_235_999,
+        }))
+        .await
+        .expect("EvictInstance delivery should succeed");
+
+        // Room B, single departure: explicit Leave -> leave_rooms. B2 remains.
+        chat.send(Leave {
+            session: b1.0,
+            room: room_b.clone(),
+            user_id: format!("{}@example.com", b1.1),
+        })
+        .await
+        .expect("Leave delivery should succeed");
+
+        // Round-trip a state probe: this forces all the queued Leave/Evict
+        // messages above to DRAIN before we read the counter, making the
+        // pre-window assertion race-free.
+        let (pending_after_burst, armed_after_burst) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+
+        // BEFORE the window elapses: NO recompute has run (all departures are
+        // debounced behind the trailing timer). This is the assertion that a
+        // reverted (immediate-do_send) call site trips.
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "real-handler departures must be DEFERRED until the coalesce window \
+             elapses — a non-zero count here means a departure call site fired an \
+             immediate recompute instead of coalescing"
+        );
+        // Exactly the two affected rooms are pending behind ONE armed timer.
+        assert_eq!(
+            pending_after_burst, 2,
+            "two distinct rooms saw a departure (room A via Leave+Evict coalesced, \
+             room B via Leave) => exactly two pending rooms"
+        );
+        assert!(
+            armed_after_burst,
+            "the burst must arm exactly one trailing coalesce timer"
+        );
+
+        // Wait out the coalesce window + slack for the flush to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 250,
+        ))
+        .await;
+
+        // Exactly one recompute per distinct affected room (2), NOT one per
+        // departure (3). Room A's two departures coalesced into one.
+        assert_eq!(
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            2,
+            "three real departures across two rooms must yield exactly two \
+             recomputes (one per distinct room), not one per departure"
+        );
+
+        // The flush drained the pending set and cleared the timer handle.
+        let (pending_final, armed_final) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            pending_final, 0,
+            "the flush must drain the departure coalesce set"
+        );
+        assert!(
+            !armed_final,
+            "the flush must clear the timer handle so the next burst re-arms fresh"
         );
     }
 }

@@ -277,7 +277,7 @@ pub fn Host(
 
         // Wire encoder decision inputs + screen tier to health reporter for metrics
         client.set_encoder_metric_sources(
-            camera.shared_encoder_p75_peer_fps(),
+            camera.shared_encoder_queue_depth_report(),
             camera.shared_encoder_target_bitrate_kbps(),
             screen.shared_screen_tier_index(),
             camera.screen_sharing_flag(),
@@ -435,13 +435,17 @@ pub fn Host(
                     // Auto-select camera device
                     let cam_needs_start = if !video_id.is_empty() {
                         s.media_devices.video_inputs.select(&video_id);
-                        // stop() clears both enabled and switching flags so that
-                        // select() below does not set the switching flag (which
-                        // would cause the new encoding loop to exit immediately).
+                        // Restore the lobby camera (issue #1295). This is a clean
+                        // restore: select() records the device while the encoder
+                        // is (re)enabled below, and because no prior loop is alive
+                        // in the lobby the deferred start() simply spawns exactly
+                        // one loop bound to this device. (select() here runs while
+                        // the encoder is still DISABLED, so it does NOT raise
+                        // `switching` — the start() single-loop/epoch guard, not a
+                        // switching flag, is what would prevent duplicates if a
+                        // loop ever were alive.) `was_enabled` keeps a camera that
+                        // was OFF in the lobby from being force-started.
                         let was_enabled = s.prev_video_enabled;
-                        if was_enabled {
-                            s.camera.stop();
-                        }
                         s.camera.select(video_id);
                         if was_enabled {
                             s.camera.set_enabled(true);

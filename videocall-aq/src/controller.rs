@@ -2515,6 +2515,58 @@ mod tests {
         );
     }
 
+    /// Issue #1229: the screen AQ loop is spawned ONCE and outlives individual
+    /// share sessions; while idle it keeps ticking a CLEAR queue, so the headroom
+    /// probe drifts `active_layer_count` UP toward the ceiling. On the next
+    /// (re)share the loop re-arms cold start by calling
+    /// `set_simulcast_ceiling_start_at_base` again — which MUST reset the active
+    /// count back to the base rung so the re-share starts at base (the #1200
+    /// first-frame contract), not at the drifted-up count.
+    ///
+    /// This test drives the REAL drift (clean ticks ramp the active count up via
+    /// the probe), asserts it actually climbed (so the test is meaningful, not
+    /// X==X), then re-arms and asserts it dropped back to exactly 1. Mutation
+    /// check: if the re-arm reset is removed (i.e. the second
+    /// `set_simulcast_ceiling_start_at_base` call is deleted), the final assert
+    /// fails because the active count is still the drifted-up value.
+    #[test]
+    fn test_screen_reshare_rearm_resets_drifted_active_count_to_base() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = screen_controller_with_clock(&clock);
+
+        // First share: arm cold start, then let the probe ramp drift the active
+        // count UP under a sustained-clear encoder queue (idle/clean ticks).
+        controller.set_simulcast_ceiling_start_at_base(3);
+        assert_eq!(controller.active_layer_count(), 1, "cold start at base");
+
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..12 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() > 1 {
+                break;
+            }
+        }
+        // The drift MUST actually happen, or the reset below proves nothing.
+        assert!(
+            controller.active_layer_count() > 1,
+            "precondition: clean ticks must drift the active count above base \
+             (got {}) so the re-arm reset is genuinely exercised",
+            controller.active_layer_count()
+        );
+
+        // Next (re)share: the AQ loop re-arms cold start. This MUST reset the
+        // active count back to the base rung. (Remove this call → final assert
+        // fails: mutation guard.)
+        controller.set_simulcast_ceiling_start_at_base(3);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "a re-share re-arm must reset the drifted active count back to the base rung (#1229)"
+        );
+    }
+
     /// #1199 signal 1 (server CONGESTION): a CONGESTION cut on the SCREEN
     /// controller must shed the top active rung, exactly like the camera.
     #[test]

@@ -327,13 +327,24 @@ pub fn log_level_explicit() -> Option<log::LevelFilter> {
     parsed
 }
 
+/// Single source of truth for the startup-init log-level fallback used when
+/// `logLevel` is absent/empty/unparseable. The `precedence_fallback_literals_pinned`
+/// test pins this against the documented literal (Info) so a drift here fails loudly.
+pub(crate) const STARTUP_LOG_LEVEL_FALLBACK: log::LevelFilter = log::LevelFilter::Info;
+/// Single source of truth for the console-log *collection* ceiling fallback used
+/// when `logLevel` is absent (bump to Debug — historical capture behaviour). The
+/// `precedence_fallback_literals_pinned` test pins this against the documented
+/// literal (Debug) so a drift here fails loudly.
+pub(crate) const COLLECTION_LOG_LEVEL_FALLBACK: log::LevelFilter = log::LevelFilter::Debug;
+
 /// Configured WASM logger max level for startup init. Falls back to
-/// [`log::LevelFilter::Info`] when the key is absent, empty, unparseable, or the
-/// config can't be read — preserving the historical hardcoded init level so a
-/// missing/stale config behaves as before. Delegates to [`log_level_explicit`]
-/// so a typo's `warn!` surfaces at startup (the collection path may re-emit it).
+/// [`STARTUP_LOG_LEVEL_FALLBACK`] (Info) when the key is absent, empty,
+/// unparseable, or the config can't be read — preserving the historical hardcoded
+/// init level so a missing/stale config behaves as before. Delegates to
+/// [`log_level_explicit`] so a typo's `warn!` surfaces at startup (the collection
+/// path may re-emit it).
 pub fn log_level() -> log::LevelFilter {
-    log_level_explicit().unwrap_or(log::LevelFilter::Info)
+    log_level_explicit().unwrap_or(STARTUP_LOG_LEVEL_FALLBACK)
 }
 
 pub fn split_users(s: Option<&str>) -> Vec<String> {
@@ -604,26 +615,26 @@ mod log_level_tests {
         assert_eq!(parse_log_level("verbose"), None);
     }
 
-    /// Lockstep pin on the two precedence fallback literals — the entire point of
-    /// the dial. If someone edits a caller's fallback, this forces them to update
-    /// this test, so the documented precedence can't silently regress:
-    ///   - `attendants.rs`: collection ceiling when `logLevel` is ABSENT → Debug.
-    ///   - `log_level()`:    startup init when `logLevel` is ABSENT/unparseable → Info.
+    /// Lockstep pin on the two precedence fallback consts — the entire point of
+    /// the dial. The shared consts (`super::STARTUP_LOG_LEVEL_FALLBACK` /
+    /// `super::COLLECTION_LOG_LEVEL_FALLBACK`) are the single source of truth used
+    /// at the real call sites (`log_level()` and `attendants.rs`). Pinning them
+    /// against the documented literal here means editing a call-site fallback now
+    /// forces editing the shared const, which this test catches on drift:
+    ///   - collection ceiling when `logLevel` is ABSENT → Debug.
+    ///   - startup init when `logLevel` is ABSENT/unparseable → Info.
     #[test]
     fn precedence_fallback_literals_pinned() {
-        // Mirror of `attendants.rs`: `log_level_explicit().unwrap_or(Debug)`.
-        const COLLECTION_ABSENT_FALLBACK: LevelFilter = LevelFilter::Debug;
-        // Mirror of `log_level()`: `log_level_explicit().unwrap_or(Info)`.
-        const STARTUP_ABSENT_FALLBACK: LevelFilter = LevelFilter::Info;
+        use super::{COLLECTION_LOG_LEVEL_FALLBACK, STARTUP_LOG_LEVEL_FALLBACK};
         assert_eq!(
-            COLLECTION_ABSENT_FALLBACK,
-            LevelFilter::Debug,
-            "absent logLevel must bump collection to Debug (historical capture)"
-        );
-        assert_eq!(
-            STARTUP_ABSENT_FALLBACK,
+            STARTUP_LOG_LEVEL_FALLBACK,
             LevelFilter::Info,
             "absent/typo logLevel must init at Info (historical hardcoded level)"
+        );
+        assert_eq!(
+            COLLECTION_LOG_LEVEL_FALLBACK,
+            LevelFilter::Debug,
+            "absent logLevel must bump collection to Debug (historical capture)"
         );
     }
 }

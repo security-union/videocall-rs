@@ -124,6 +124,10 @@ static SCREEN_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
 static SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
 static SCREEN_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
 static SCREEN_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
+// Cumulative count of upper-rung `VideoEncoder`s torn down after a sustained
+// shed dwell (issue #1230). Bumped once per `extra_layers` rung freed; the base
+// screen layer is never torn down. Mirrors the camera counter.
+static SCREEN_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL: AtomicU64 = AtomicU64::new(0);
 
 pub fn screen_encoder_errors_closed_codec() -> u64 {
     SCREEN_ENCODER_ERRORS_CLOSED_CODEC.load(Ordering::Relaxed)
@@ -140,6 +144,13 @@ pub fn screen_encoder_errors_generic() -> u64 {
 pub fn screen_encoder_frames_submitted_ok() -> u64 {
     SCREEN_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
 }
+/// Cumulative count of upper-rung simulcast `VideoEncoder`s torn down after a
+/// sustained shed dwell (issue #1230). Pure observability hook, mirrors the
+/// camera getter: confirms memory is reclaimed on sustained-distress devices and
+/// that teardown is not thrashing.
+pub fn screen_encoder_layers_torn_down() -> u64 {
+    SCREEN_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL.load(Ordering::Relaxed)
+}
 
 fn is_fatal_encoder_error_message(msg: &str) -> bool {
     msg.contains("closed codec")
@@ -155,6 +166,43 @@ fn is_fatal_encoder_error(err: &JsValue) -> bool {
 
 fn should_reacquire_screen_capture(media_acquired: bool, restart_count: u32) -> bool {
     !media_acquired || restart_count > 0
+}
+
+/// Sustained-shed dwell before an upper-rung screen `VideoEncoder` is torn down
+/// to reclaim its native VPX/WebCodecs state + ~150KB output buffer (issue
+/// #1230). Sibling of the camera const (no shared encode-util module exists, so
+/// each loop owns its const, matching the per-file pure-helper style).
+///
+/// Why 30s: the AQ controller can shed/restore a layer at most once per
+/// `MIN_TIER_TRANSITION_INTERVAL_MS` = 1500ms (the `can_transition` floor in
+/// `videocall-aq/src/manager.rs`), so 30s is 20× the minimum shed→restore
+/// interval — a transient bounce can never accumulate 30s of CONTINUOUS shed and
+/// so never trips teardown. Teardown is thrash-free regardless of how soon an
+/// earn-up follows: it requires 30s of UNBROKEN shed and the per-frame stamp loop
+/// clears a rung's dwell clock the instant it is re-activated, so a
+/// teardown→rebuild→teardown cycle is necessarily ≥30s apart. A re-earned rung is
+/// rebuilt by the SAME lazy `build_extra_layer` path a publisher already runs at
+/// every cold start (only the base is built up front since #1204/#1227), so
+/// teardown introduces no new rebuild-stall class. (`MIN_TIER_TRANSITION_INTERVAL_MS`
+/// lives in `videocall-aq/src/constants.rs`. NOTE: `CLIMB_COOLDOWN_BASE_MS` is
+/// unrelated — it governs the crash-CEILING decay axis, not layer earn-up.)
+const SHED_TEARDOWN_DWELL_MS: f64 = 30_000.0;
+
+/// Pure teardown decision (issue #1230, host-testable single source of truth) —
+/// sibling of the camera helper. Returns `true` iff `shed_since_ms` is `Some(t)`
+/// AND `now_ms - t >= dwell_threshold_ms`; `None` ⇒ `false` (not currently shed,
+/// or already torn down). The `>=` makes the boundary inclusive. This is the only
+/// place the comparison lives so a host unit test pins it (mutating `>=`→`>`,
+/// inverting the comparison, or dropping the `None` guard all fail the test).
+fn should_teardown_shed_layer(
+    shed_since_ms: Option<f64>,
+    now_ms: f64,
+    dwell_threshold_ms: f64,
+) -> bool {
+    match shed_since_ms {
+        Some(since) => now_ms - since >= dwell_threshold_ms,
+        None => false,
+    }
 }
 
 fn stop_media_stream_tracks(stream: &MediaStream) {
@@ -705,6 +753,13 @@ impl ScreenEncoder {
         let quality_bounds = self.quality_bounds.clone();
         let n_layers = self.effective_layer_count() as usize;
         let shared_active_layer_count = self.shared_active_layer_count.clone();
+        // Issue #1229: the AQ loop must observe share start/stop edges so it can
+        // (a) NOT drift the layer ramp up while idle and (b) re-arm cold start
+        // on every (re)share. The control loop is spawned once and outlives
+        // individual share sessions, so without this it would keep ramping the
+        // active layer count up against a clear idle queue and a re-share would
+        // start above the base rung (violating the #1200 first-frame contract).
+        let screen_sharing_active = self.screen_sharing_active.clone();
         let shared_layer_bitrates_bps = self.shared_layer_bitrates_bps.clone();
         // Sender encoder backpressure (issue #1108, Phase B): the control loop
         // READS the depth the encode loop published and forwards it to the
@@ -792,6 +847,17 @@ impl ScreenEncoder {
             let mut last_wt_stall_snapshot: u64 =
                 videocall_transport::webtransport::unistream_ready_stall_count();
             let mut wt_stall_window_start_ms: f64 = js_sys::Date::now();
+            // Issue #1229: previous sharing state, used to detect the rising edge
+            // of a (re)share inside the loop. Seeded from the CURRENT value at
+            // spawn time. `set_encoder_control` is called during encoder setup —
+            // BEFORE any share starts — and the first `start()`/`start_with_stream()`
+            // flips `screen_sharing_active` to `true` inside `run_screen_encoding`
+            // (a SEPARATE future spawned after this one), so this seed is `false`
+            // and the FIRST share is a genuine `false -> true` rising edge that
+            // re-arms cold start. That re-arm is idempotent on a cold first share
+            // (the controller is already at the base rung), so seeding from the
+            // live value is correct without special-casing the first share.
+            let mut was_sharing = screen_sharing_active.load(Ordering::Acquire);
             // Self-timer AQ loop (issue #1108): tick at AQ_TICK_INTERVAL_MS
             // instead of waiting on receiver diagnostics. Runs for the lifetime
             // of the owning ScreenEncoder. This `spawn_local` future is NOT bound
@@ -809,6 +875,73 @@ impl ScreenEncoder {
                     break;
                 }
                 let now = js_sys::Date::now();
+                // ── Issue #1229: share start/stop edge handling ───────────────
+                // Track the previous sharing state so we can (a) re-arm cold
+                // start on the RISING edge of a (re)share and (b) avoid drifting
+                // the layer ramp UP while idle (no share running). The control
+                // loop is spawned once and ticks for the encoder's whole life, so
+                // it MUST observe these edges itself — `stop()` does not break it.
+                let now_sharing = screen_sharing_active.load(Ordering::Acquire);
+                // Compute BOTH edges from the OLD `was_sharing` before reassigning
+                // it. A single tick can be at most one of these (a rising and a
+                // falling edge are mutually exclusive), so the two are never both
+                // true on the same iteration.
+                //
+                // Sub-tick stop->start: a `stop()` followed by a `start()` fully
+                // contained within one AQ tick interval leaves `now_sharing` true
+                // at both samples, so `was_sharing` stayed true and NO rising edge
+                // is detected — the controller is not re-armed that tick. This is
+                // benign: (a) idle drift only accrues over idle TICKS and a sub-tick
+                // blip accrues none, and (b) `apply_initial_tier` (called by every
+                // `start`/`start_with_stream`) synchronously seeds the encode loop's
+                // `shared_active_layer_count` to the base rung regardless, so the
+                // re-share still starts at base even with no detected edge here.
+                let share_started = !was_sharing && now_sharing;
+                let share_stopped = was_sharing && !now_sharing;
+                was_sharing = now_sharing;
+                // RISING EDGE: a fresh share just began. Re-arm the controller's
+                // cold start so `active_layer_count` resets to the base rung (1),
+                // undoing any idle drift from a prior session. Done BEFORE this
+                // tick's `tick()`/write block so the freshly-armed base count is
+                // what gets written this iteration. Guarded by `n_layers > 1` to
+                // match the construction-time `set_simulcast_ceiling_start_at_base`
+                // guard — single-stream mode stays byte-identical.
+                if share_started {
+                    if n_layers > 1 {
+                        encoder_control.set_simulcast_ceiling_start_at_base(n_layers);
+                        log::info!(
+                            "ScreenEncoder: (re)share started — re-armed AQ cold start at base rung (ceiling {n_layers})"
+                        );
+                    }
+                    // Issue #1229 (telemetry purity): drain and DISCARD any pending
+                    // controller tier-transitions so the NEW share's
+                    // `shared_tier_transitions` starts from an EMPTY buffer. This is
+                    // the real guarantee that the new share's telemetry is clean,
+                    // because the user-quality-bounds apply block below runs on EVERY
+                    // idle tick (it is before the `now_sharing` gate) and a bounds
+                    // change can enqueue a `trigger: "coordination"` record at any
+                    // point during the idle gap — INCLUDING after the falling-edge
+                    // drain. Any such pre-share record belongs to the idle period,
+                    // not this share, so it is discarded here rather than later
+                    // drained inside the `now_sharing` block and mis-tagged to this
+                    // share's `shared_tier_transitions`. Runs for ALL share starts
+                    // (not gated on `n_layers > 1`): the "coordination" record is
+                    // pushed even in single-stream mode.
+                    let _ = encoder_control.drain_tier_transitions();
+                }
+                // Issue #1229 (perf polish): on the FALLING edge of sharing, drain
+                // and DISCARD any pending controller tier-transitions so the ended
+                // share does not extend its trailing records into the next share's
+                // telemetry. NOTE: this alone does NOT keep the buffer empty across
+                // the whole idle gap — the user-quality-bounds apply block below
+                // runs on every idle tick and a bounds change can re-populate the
+                // buffer AFTER this drain. The authoritative guarantee that the next
+                // share starts with a clean buffer is the RISING-edge drain above;
+                // this falling-edge drain just clears the ended share's tail
+                // promptly rather than waiting for the next share to start.
+                if share_stopped {
+                    let _ = encoder_control.drain_tier_transitions();
+                }
                 // Apply user screen-quality bounds if the UI changed them since
                 // we last applied. Cheap generation check; the controller snaps
                 // the current tier into range and surfaces it via
@@ -840,7 +973,13 @@ impl ScreenEncoder {
                 // The relay is actively dropping our packets; cut hard (multi-tier
                 // + shed the top active layer). `swap(false)` consumes our OWN
                 // per-encoder flag, so this never races the camera's flag.
-                if congestion_flag.swap(false, Ordering::AcqRel) {
+                //
+                // Issue #1229: ALWAYS consume the flag (the `swap(false)`) so a
+                // stale CONGESTION signal set during an idle gap does not leak
+                // into the next share, but only ACT on it (`force_congestion_cut`)
+                // while actually sharing — acting on an idle controller is
+                // pointless (the next re-share re-arms it to base anyway).
+                if congestion_flag.swap(false, Ordering::AcqRel) && now_sharing {
                     log::warn!(
                         "ScreenEncoder: server CONGESTION signal received, forcing aggressive congestion cut"
                     );
@@ -862,8 +1001,12 @@ impl ScreenEncoder {
                     if elapsed_ms >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_WINDOW_MS
                     {
                         let delta = current_ws_drops.saturating_sub(last_ws_drop_snapshot);
+                        // Issue #1229: roll the window/snapshot ALWAYS (so the
+                        // baseline isn't stale across an idle gap), but only act
+                        // (`force_video_step_down`) while sharing.
                         if delta
                             >= crate::adaptive_quality_constants::WS_SELF_CONGESTION_DROP_THRESHOLD
+                            && now_sharing
                         {
                             log::warn!(
                                 "ScreenEncoder: client WS backpressure detected ({} drops in {:.0}ms), \
@@ -908,7 +1051,9 @@ impl ScreenEncoder {
                         WT_SELF_CONGESTION_WINDOW_MS,
                         WT_SELF_CONGESTION_DROP_THRESHOLD,
                     );
-                    if decision.step_down {
+                    // Issue #1229: roll the window/snapshot ALWAYS (baseline not
+                    // stale across an idle gap), but only act while sharing.
+                    if decision.step_down && now_sharing {
                         log::warn!(
                             "ScreenEncoder: client WT uplink backpressure detected ({} unistream \
                              media-frame drops in {:.0}ms), forcing video step-down",
@@ -955,7 +1100,9 @@ impl ScreenEncoder {
                         WT_SATURATION_WINDOW_MS,
                         WT_SATURATION_STALL_THRESHOLD,
                     );
-                    if decision.step_down {
+                    // Issue #1229: roll the window/snapshot ALWAYS (baseline not
+                    // stale across an idle gap), but only act while sharing.
+                    if decision.step_down && now_sharing {
                         log::warn!(
                             "ScreenEncoder: client WT uplink saturation detected ({} slow ready() \
                              events in {:.0}ms), forcing video step-down",
@@ -970,147 +1117,183 @@ impl ScreenEncoder {
                     }
                 }
 
-                // Sender encoder backpressure (issue #1108). Feed the depth the
-                // encode loop published into the screen controller, then advance
-                // the AQ one tick. This is the SOLE gradual quality axis now:
-                // receiver FPS no longer reaches the sender AQ.
-                encoder_control.observe_encoder_queue_depth(
-                    shared_encoder_queue_depth.load(Ordering::Relaxed),
-                );
-                // Relay layer-union hint (issue #1108, Stage 3): feed the latest
-                // max-requested-layer the client wrote for SCREEN (u32::MAX =
-                // fail-open / no cap) so the controller caps the screen ladder to
-                // what some receiver actually wants. Applied right before `tick`
-                // so it composes with the just-observed backpressure decision.
-                encoder_control.observe_union_requested_layer(
-                    shared_union_requested_layer.load(Ordering::Relaxed),
-                );
-                // User SEND layer-ceiling (perf-panel): feed the latest user-
-                // selected layer COUNT for SCREEN (u32::MAX = Auto / no cap →
-                // usize::MAX fail-open). Applied right before `tick` so the cap
-                // composes with the union hint and backpressure as a further
-                // `min`. The base layer is always published (AQ floors at 1).
-                encoder_control.observe_user_layer_ceiling(
-                    crate::encode::camera_encoder::layer_ceiling_to_count(
-                        shared_user_layer_ceiling.load(Ordering::Relaxed),
-                    ),
-                );
-                encoder_control.tick(now);
-                let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
-
-                // Screen simulcast (issue #989, Phase 3b): publish the active
-                // layer count + per-layer target bitrates to the encode loop
-                // every tick. Skipped entirely in single-stream mode, so the
-                // legacy behavior is byte-identical.
-                if encoder_control.is_simulcast() {
-                    let active = encoder_control.active_layer_count() as u32;
-                    shared_active_layer_count.store(active, Ordering::Relaxed);
-                    let per_layer = encoder_control.layer_target_bitrates_kbps();
-                    let atomics = shared_layer_bitrates_bps.borrow();
-                    for (i, atomic) in atomics.iter().enumerate() {
-                        if let Some(&kbps) = per_layer.get(i) {
-                            atomic.store((kbps * 1000.0) as u32, Ordering::Relaxed);
-                        }
-                    }
-                }
-                if let Some(bitrate) = output_wasted {
-                    if enabled.load(Ordering::Acquire) {
-                        // Only update if change is greater than threshold
-                        let current = current_bitrate.load(Ordering::Relaxed) as f64;
-                        let new = bitrate;
-                        let percent_change = (new - current).abs() / current;
-
-                        if percent_change > BITRATE_CHANGE_THRESHOLD {
-                            if let Some(callback) = &on_encoder_settings_update {
-                                callback.emit(format!("Bitrate: {bitrate:.2} kbps"));
-                            }
-                            current_bitrate.store(bitrate as u32, Ordering::Relaxed);
-                        }
-                    } else if let Some(callback) = &on_encoder_settings_update {
-                        callback.emit("Disabled".to_string());
-                    }
-                }
-
-                // Issue #903: refresh the encoder's *target* bitrate every
-                // tick so the consumer's Cause line reflects what the encoder
-                // is currently trying to produce (not just the last
-                // negotiated step). This runs whether or not a tier change
-                // fired — PID-driven adjustments within a tier still change
-                // the target.
+                // ── Issue #1229: gradual AQ runs ONLY while sharing ───────────
+                // The observe → tick → simulcast-write → #903 refresh →
+                // tier-change → transitions sequence is the headroom-probe RAMP
+                // driver and the active-count writer. While idle (no share) we
+                // skip ALL of it so (a) `encoder_control.tick()` cannot advance
+                // the ramp against a clear queue and (b) `shared_active_layer_count`
+                // is NOT written — the two hard "no drift while idle" requirements
+                // of #1229. On the next (re)share the rising-edge block above has
+                // already re-armed the controller to the base rung before this
+                // tick, so the ramp resumes from base. The drop/stall WINDOW
+                // snapshots above are deliberately kept ROLLING every iteration
+                // (their counter reads + `*_window_start_ms` updates) so a
+                // baseline isn't stale across an idle gap; only the controller
+                // ACTIONS (`force_*`) are gated on `now_sharing`.
                 //
-                // Contract: at tier 0 the encoder is "unconstrained" and the
-                // entire Cause line must be omitted by the receiver. The
-                // tier-change branch below clears tier + hint at index 0;
-                // for symmetry the target bitrate must read `0` too,
-                // otherwise the receiver renders a partial `Cause: <N>kbps`
-                // line (the renderer keys off ANY non-default Cause field).
-                if encoder_control.video_tier_index() == 0 {
-                    shared_target_bitrate.store(0, Ordering::Relaxed);
-                } else {
-                    let last_target =
-                        encoder_control.last_target_bitrate_kbps().round().max(0.0) as u32;
-                    if last_target > 0 {
-                        shared_target_bitrate.store(last_target, Ordering::Relaxed);
-                    }
-                }
-
-                // Check for tier changes and update shared atomics.
-                if encoder_control.take_tier_changed() {
-                    let tier = encoder_control.current_video_tier();
-                    tier_max_width.store(tier.max_width, Ordering::Relaxed);
-                    tier_max_height.store(tier.max_height, Ordering::Relaxed);
-                    tier_keyframe_interval.store(tier.keyframe_interval_frames, Ordering::Relaxed);
-                    let tier_index = encoder_control.video_tier_index();
-                    shared_screen_tier_idx.store(tier_index as u32, Ordering::Relaxed);
-                    log::info!(
-                        "ScreenEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
-                        tier.label,
-                        tier.max_width,
-                        tier.max_height,
-                        tier.target_fps,
-                        tier.keyframe_interval_frames,
+                // SIDE EFFECT (intentional): the pre-change loop emitted
+                // `on_encoder_settings_update("Disabled")` on the first post-stop
+                // tick (the `else` branch of the `enabled` check, now inside this
+                // block). Moving that block under `now_sharing` means the label no
+                // longer flips to "Disabled" on stop. This is inconsequential: the
+                // screen encoder's `on_encoder_settings_update` is wired (host.rs)
+                // to a handler that flows to a no-op closure (attendants.rs), and
+                // the Diagnostics "Encoder Settings" panel renders an
+                // `encoder_settings` signal that is never updated — so neither
+                // "Bitrate: N kbps" nor "Disabled" is ever shown to the user. The
+                // emit is therefore deliberately dropped while idle rather than
+                // preserved on the falling edge.
+                if now_sharing {
+                    // Sender encoder backpressure (issue #1108). Feed the depth the
+                    // encode loop published into the screen controller, then advance
+                    // the AQ one tick. This is the SOLE gradual quality axis now:
+                    // receiver FPS no longer reaches the sender AQ.
+                    encoder_control.observe_encoder_queue_depth(
+                        shared_encoder_queue_depth.load(Ordering::Relaxed),
                     );
-                    // Issue #903: refresh the tier label exposed on the wire.
-                    // Tier 0 (highest) is treated as "unconstrained" and
-                    // clears the label so the receiver omits the Cause line.
-                    // Target bitrate must also be cleared here for the
-                    // same omit-on-unconstrained contract — the per-tick
-                    // refresh above already guards on `tier_index == 0`,
-                    // but a tier-change tick that arrives without a
-                    // subsequent diagnostics packet would otherwise leave
-                    // the previous tier's target bitrate stale.
-                    if tier_index == 0 {
-                        shared_target_bitrate.store(0, Ordering::Relaxed);
-                        shared_adaptive_tier.borrow_mut().clear();
-                        shared_cause_hint.borrow_mut().clear();
-                    } else {
-                        *shared_adaptive_tier.borrow_mut() = tier.label.to_string();
-                    }
-                }
+                    // Relay layer-union hint (issue #1108, Stage 3): feed the latest
+                    // max-requested-layer the client wrote for SCREEN (u32::MAX =
+                    // fail-open / no cap) so the controller caps the screen ladder to
+                    // what some receiver actually wants. Applied right before `tick`
+                    // so it composes with the just-observed backpressure decision.
+                    encoder_control.observe_union_requested_layer(
+                        shared_union_requested_layer.load(Ordering::Relaxed),
+                    );
+                    // User SEND layer-ceiling (perf-panel): feed the latest user-
+                    // selected layer COUNT for SCREEN (u32::MAX = Auto / no cap →
+                    // usize::MAX fail-open). Applied right before `tick` so the cap
+                    // composes with the union hint and backpressure as a further
+                    // `min`. The base layer is always published (AQ floors at 1).
+                    encoder_control.observe_user_layer_ceiling(
+                        crate::encode::camera_encoder::layer_ceiling_to_count(
+                            shared_user_layer_ceiling.load(Ordering::Relaxed),
+                        ),
+                    );
+                    encoder_control.tick(now);
+                    let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
-                // Drain tier transitions, overriding stream to "screen".
-                let mut transitions = encoder_control.drain_tier_transitions();
-                for t in &mut transitions {
-                    t.stream = "screen";
-                }
-                // Issue #903: capture the *most recent* transition's trigger
-                // as the publisher's cause classification. We only refresh
-                // the hint when AQ is actually constraining the encoder
-                // (tier index > 0); at the top tier the encoder is
-                // unconstrained and the receiver should not show a Cause
-                // line.
-                if !transitions.is_empty() && encoder_control.video_tier_index() > 0 {
-                    if let Some(last) = transitions.last() {
-                        let hint = cause_hint_from_trigger(last.trigger);
-                        if !hint.is_empty() {
-                            *shared_cause_hint.borrow_mut() = hint.to_string();
+                    // Screen simulcast (issue #989, Phase 3b): publish the active
+                    // layer count + per-layer target bitrates to the encode loop
+                    // every tick. Skipped entirely in single-stream mode, so the
+                    // legacy behavior is byte-identical.
+                    if encoder_control.is_simulcast() {
+                        let active = encoder_control.active_layer_count() as u32;
+                        shared_active_layer_count.store(active, Ordering::Relaxed);
+                        let per_layer = encoder_control.layer_target_bitrates_kbps();
+                        let atomics = shared_layer_bitrates_bps.borrow();
+                        for (i, atomic) in atomics.iter().enumerate() {
+                            if let Some(&kbps) = per_layer.get(i) {
+                                atomic.store((kbps * 1000.0) as u32, Ordering::Relaxed);
+                            }
                         }
                     }
-                }
-                if !transitions.is_empty() {
-                    shared_tier_transitions.borrow_mut().extend(transitions);
+                    if let Some(bitrate) = output_wasted {
+                        if enabled.load(Ordering::Acquire) {
+                            // Only update if change is greater than threshold
+                            let current = current_bitrate.load(Ordering::Relaxed) as f64;
+                            let new = bitrate;
+                            let percent_change = (new - current).abs() / current;
+
+                            if percent_change > BITRATE_CHANGE_THRESHOLD {
+                                if let Some(callback) = &on_encoder_settings_update {
+                                    callback.emit(format!("Bitrate: {bitrate:.2} kbps"));
+                                }
+                                current_bitrate.store(bitrate as u32, Ordering::Relaxed);
+                            }
+                        } else if let Some(callback) = &on_encoder_settings_update {
+                            callback.emit("Disabled".to_string());
+                        }
+                    }
+
+                    // Issue #903: refresh the encoder's *target* bitrate every
+                    // tick so the consumer's Cause line reflects what the encoder
+                    // is currently trying to produce (not just the last
+                    // negotiated step). This runs whether or not a tier change
+                    // fired — PID-driven adjustments within a tier still change
+                    // the target.
+                    //
+                    // Contract: at tier 0 the encoder is "unconstrained" and the
+                    // entire Cause line must be omitted by the receiver. The
+                    // tier-change branch below clears tier + hint at index 0;
+                    // for symmetry the target bitrate must read `0` too,
+                    // otherwise the receiver renders a partial `Cause: <N>kbps`
+                    // line (the renderer keys off ANY non-default Cause field).
+                    if encoder_control.video_tier_index() == 0 {
+                        shared_target_bitrate.store(0, Ordering::Relaxed);
+                    } else {
+                        let last_target =
+                            encoder_control.last_target_bitrate_kbps().round().max(0.0) as u32;
+                        if last_target > 0 {
+                            shared_target_bitrate.store(last_target, Ordering::Relaxed);
+                        }
+                    }
+
+                    // Check for tier changes and update shared atomics.
+                    if encoder_control.take_tier_changed() {
+                        let tier = encoder_control.current_video_tier();
+                        tier_max_width.store(tier.max_width, Ordering::Relaxed);
+                        tier_max_height.store(tier.max_height, Ordering::Relaxed);
+                        tier_keyframe_interval
+                            .store(tier.keyframe_interval_frames, Ordering::Relaxed);
+                        let tier_index = encoder_control.video_tier_index();
+                        shared_screen_tier_idx.store(tier_index as u32, Ordering::Relaxed);
+                        log::info!(
+                            "ScreenEncoder: tier changed to '{}' ({}x{}, {}fps, kf={})",
+                            tier.label,
+                            tier.max_width,
+                            tier.max_height,
+                            tier.target_fps,
+                            tier.keyframe_interval_frames,
+                        );
+                        // Issue #903: refresh the tier label exposed on the wire.
+                        // Tier 0 (highest) is treated as "unconstrained" and
+                        // clears the label so the receiver omits the Cause line.
+                        // Target bitrate must also be cleared here for the
+                        // same omit-on-unconstrained contract — the per-tick
+                        // refresh above already guards on `tier_index == 0`,
+                        // but a tier-change tick that arrives without a
+                        // subsequent diagnostics packet would otherwise leave
+                        // the previous tier's target bitrate stale.
+                        if tier_index == 0 {
+                            shared_target_bitrate.store(0, Ordering::Relaxed);
+                            shared_adaptive_tier.borrow_mut().clear();
+                            shared_cause_hint.borrow_mut().clear();
+                        } else {
+                            *shared_adaptive_tier.borrow_mut() = tier.label.to_string();
+                        }
+                    }
+
+                    // Drain tier transitions, overriding stream to "screen".
+                    let mut transitions = encoder_control.drain_tier_transitions();
+                    for t in &mut transitions {
+                        t.stream = "screen";
+                    }
+                    // Issue #903: capture the *most recent* transition's trigger
+                    // as the publisher's cause classification. We only refresh
+                    // the hint when AQ is actually constraining the encoder
+                    // (tier index > 0); at the top tier the encoder is
+                    // unconstrained and the receiver should not show a Cause
+                    // line.
+                    if !transitions.is_empty() && encoder_control.video_tier_index() > 0 {
+                        if let Some(last) = transitions.last() {
+                            let hint = cause_hint_from_trigger(last.trigger);
+                            if !hint.is_empty() {
+                                *shared_cause_hint.borrow_mut() = hint.to_string();
+                            }
+                        }
+                    }
+                    if !transitions.is_empty() {
+                        shared_tier_transitions.borrow_mut().extend(transitions);
+                    }
                 }
 
+                // Issue #1229: the re-election consume runs ALWAYS (even while
+                // idle) so a re-election that completes during an idle gap is
+                // CONSUMED here and does not leak its signal into the next share.
+                // `notify_reelection_completed` on an idle, soon-to-be-re-armed
+                // controller is harmless: the rising-edge re-arm on the next share
+                // start supersedes any state it touches.
                 if reelection_completed_signal.swap(false, Ordering::AcqRel) {
                     log::info!("ScreenEncoder: re-election completed, notifying quality manager");
                     encoder_control.notify_reelection_completed();
@@ -1261,6 +1444,22 @@ impl ScreenEncoder {
             .store(tier.keyframe_interval_frames, Ordering::Relaxed);
         self.current_bitrate
             .store(tier.ideal_bitrate_kbps, Ordering::Relaxed);
+
+        // Issue #1229: on every (re)share, synchronously reset the active screen
+        // layer count to the BASE rung when simulcast is active, so the encode
+        // loop (a SEPARATE spawn_local future that reads `shared_active_layer_count`
+        // at setup ~run_screen_encoding and per-frame) starts at base from frame
+        // one — not the construction-time FULL count (`clamp_screen_layer_count(max_layers)`)
+        // nor a value drifted up by a prior session's AQ loop. The AQ control loop
+        // independently re-arms the controller on the sharing rising edge (see
+        // `set_encoder_control`); this write closes the cross-future race where the
+        // encode loop could read the stale-high count before the AQ loop's first
+        // post-edge tick writes the fresh base value. No-op semantics in
+        // single-stream mode: the encode loop ignores `shared_active_layer_count`
+        // unless `simulcast` (n_layers > 1), so writing 1 here is byte-identical.
+        if self.effective_layer_count() > 1 {
+            self.shared_active_layer_count.store(1, Ordering::Relaxed);
+        }
 
         // Issue #903: seed the publisher-side encoder-state metadata so the
         // very first frames carry meaningful Cause data. The screen-share
@@ -1662,6 +1861,18 @@ impl ScreenEncoder {
         // short cascade without spinning forever if the browser is wedged.
         // Revisit this cap if the fatal-error classifier is broadened.
         const MAX_RESTARTS: u32 = 5;
+
+        // Per-rung "continuously shed since" wall-clock (ms, `performance.now()`),
+        // indexed by `layer_id` (issue #1230). `Some(t)` once a higher rung drops
+        // out of the active set; cleared to `None` when active again or after
+        // teardown. Declared OUTSIDE `'restart` (like the camera's
+        // `prev_active_layers`; screen has no such persistent var, so add one) so a
+        // mid-dwell encoder restart does not reset the clock. The encode loop STAMPS
+        // this every frame from the same `local_active_layers` it tears down
+        // against, so the dwell clock advances (not a dead timer). Sized `n_layers`;
+        // slot 0 (the base `screen_encoder`) is never used — the base is never shed.
+        let mut shed_since_ms: Vec<Option<f64>> = vec![None; n_layers];
+
         let mut media_acquired = true; // true because we already have a stream
 
         // These variables hold the current media state. They are initialized from
@@ -2070,9 +2281,19 @@ impl ScreenEncoder {
             // build only the rungs already active (`1..initial_active`), and the
             // encode loop builds the rest when the AQ ramp/restore raises the
             // active count. OUTPUT is unchanged — the encode loop already encodes
-            // only `layer_id < active`. Teardown-after-shed is intentionally NOT
-            // implemented (issue #1204 marks it optional, gated on a
-            // rebuild-latency measurement) — a shed rung is retained for reuse.
+            // only `layer_id < active`.
+            //
+            // TEARDOWN-AFTER-SHED (issue #1230): a shed upper rung is retained (its
+            // encoder + ~150KB output buffer) so a brief shed→restore bounce reuses
+            // it with no rebuild stall. But on a device under SUSTAINED distress the
+            // rung's native VPX/WebCodecs state would leak for the share's lifetime,
+            // so once a rung has been continuously shed for `SHED_TEARDOWN_DWELL_MS`
+            // (30s) the encode loop pops+closes its `LayerEncoder` from the END of
+            // `extra_layers` (top-down shed keeps it a contiguous prefix) to reclaim
+            // the memory; this same lazy path rebuilds it (seeded from its persisted
+            // sequence) if it is ever earned back. The base screen layer (id 0,
+            // the standalone `screen_encoder`) is NEVER torn down. See
+            // `should_teardown_shed_layer` + the per-frame dwell tracking below.
             let build_extra_layer = |layer_idx: usize,
                                      initial_seq: u64|
              -> Result<LayerEncoder, ()> {
@@ -2459,11 +2680,22 @@ impl ScreenEncoder {
                             .enumerate()
                         {
                             let layer_idx = next_rung + offset;
+                            // #1230 rebuild-latency: time the construct+configure
+                            // cost so it is field-measurable on real devices/bots.
+                            // This delta is the build CALL cost; configure→first-
+                            // emitted-keyframe latency can be derived in the field by
+                            // correlating this log with the first chunk emitted for
+                            // `layer_idx`. This is the "documented rebuild-latency
+                            // measurement" that #1204 gated teardown on — now enabled.
+                            let build_started_ms = window().performance().unwrap().now();
                             match build_extra_layer(layer_idx, initial_seq) {
                                 Ok(le) => {
+                                    let build_ms =
+                                        window().performance().unwrap().now() - build_started_ms;
                                     info!(
-                                        "ScreenEncoder: lazily constructed simulcast rung {} on first activation (#1204)",
-                                        layer_idx
+                                        "ScreenEncoder: lazily (re)built simulcast rung {} on activation in {:.1}ms (#1204/#1230 rebuild-latency)",
+                                        layer_idx,
+                                        build_ms
                                     );
                                     extra_layers.push(le);
                                 }
@@ -2480,6 +2712,82 @@ impl ScreenEncoder {
                         if build_failed {
                             restart_count += 1;
                             break 'encode;
+                        }
+                    }
+                }
+
+                // ── Sustained-shed teardown (issue #1230) ──────────────────────
+                // SIMULCAST-ONLY. In single-stream mode (`n_layers == 1`,
+                // `simulcast == false`) this whole block is skipped, so the legacy
+                // single-encoder path is byte-identical. Operates on `extra_layers`
+                // (rungs 1..n); the base screen layer (id 0, the standalone
+                // `screen_encoder`) is NEVER torn down. Runs in the SAME loop that
+                // reads `local_active_layers` and would rebuild a rung.
+                if simulcast {
+                    let now_ms = window().performance().unwrap().now();
+                    // 1) STAMP per-rung shed-since each frame from the active count
+                    // we just read. An extra rung is "shed" iff its id >= active.
+                    // Arm on the shed edge; clear when active again. This is what
+                    // makes the dwell clock advance (updated every frame here, not
+                    // in a side task).
+                    for layer in extra_layers.iter() {
+                        let id = layer.layer_id as usize;
+                        if id >= local_active_layers {
+                            if shed_since_ms[id].is_none() {
+                                shed_since_ms[id] = Some(now_ms);
+                            }
+                        } else {
+                            shed_since_ms[id] = None;
+                        }
+                    }
+
+                    // 2) TEAR DOWN the top extra rung(s) whose shed dwell exceeded
+                    // the threshold. Pop ONLY from the END so `extra_layers` stays a
+                    // contiguous prefix of rungs 1.. (the lazy-build path above
+                    // rebuilds `next_rung..` and assumes
+                    // `extra_layers[i].layer_id == i + 1`). Screen shed is strictly
+                    // top-down, so the shed set is exactly the tail. The base layer
+                    // is never in `extra_layers`, so it can never be freed here.
+                    // Guard `extra_layers.len() + 1 > local_active_layers` so an
+                    // ACTIVE rung is never freed: the top extra rung's id is
+                    // `extra_layers.len()` (ids run 1..=len), and it is shed iff
+                    // `len >= local_active_layers` — which for integers is exactly
+                    // `len + 1 > local_active_layers`. So the guard holds iff that
+                    // top rung is shed.
+                    while !extra_layers.is_empty()
+                        && extra_layers.len() + 1 > local_active_layers
+                        && should_teardown_shed_layer(
+                            shed_since_ms[extra_layers.len()],
+                            now_ms,
+                            SHED_TEARDOWN_DWELL_MS,
+                        )
+                    {
+                        // `shed_since_ms[extra_layers.len()]` indexes the top extra
+                        // rung's id (id == index + 1; the last extra rung is at
+                        // vec index len-1 → id len).
+                        if let Some(top) = extra_layers.pop() {
+                            let id = top.layer_id as usize;
+                            let dwell_s = shed_since_ms[id]
+                                .map(|t| (now_ms - t) / 1000.0)
+                                .unwrap_or(0.0);
+                            // CRITICAL: persist this rung's sequence back into
+                            // `sequence_numbers[id]` BEFORE dropping, exactly like
+                            // the post-loop writeback
+                            // (`sequence_numbers[layer.layer_id] = layer.seq_out.get()`),
+                            // so a future lazy rebuild seeds from the continued
+                            // sequence and a receiver re-acquiring the rung never
+                            // sees a duplicate seq.
+                            sequence_numbers[id] = top.seq_out.get();
+                            let _ = top.encoder.close();
+                            drop(top);
+                            shed_since_ms[id] = None;
+                            SCREEN_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL
+                                .fetch_add(1, Ordering::Relaxed);
+                            info!(
+                                "ScreenEncoder: tore down shed simulcast rung {} after {:.1}s sustained shed dwell, reclaiming encoder+buffer (#1230); lazy path rebuilds it if earned back",
+                                id,
+                                dwell_s
+                            );
                         }
                     }
                 }
@@ -2917,8 +3225,10 @@ mod tests {
     use super::clamp_screen_layer_count;
     use super::is_fatal_encoder_error_message;
     use super::should_reacquire_screen_capture;
+    use super::should_teardown_shed_layer;
     use super::ScreenEncoder;
     use super::SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS;
+    use super::SHED_TEARDOWN_DWELL_MS;
     use crate::{Callback, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
 
     fn build_test_client() -> VideoCallClient {
@@ -3172,6 +3482,147 @@ mod tests {
         assert!(
             !encoder.shared_screen_cause_hint.borrow().is_empty(),
             "constrained tier must seed cause hint"
+        );
+    }
+
+    #[test]
+    fn sustained_shed_teardown_decision_fires_only_past_dwell() {
+        // Issue #1230: pins the screen SINGLE SOURCE OF TRUTH for teardown
+        // (`should_teardown_shed_layer`). The encode loop frees a shed extra rung
+        // iff this returns true, so pinning it here pins the behavior off-wasm (the
+        // counter is bumped in the live loop and is not host-runnable).
+        //
+        // Mutations these assertions CATCH:
+        //  * dropping the `None` guard (a non-shed rung would tear down) — first case
+        //  * inverting the comparison (`>=`→`<`) — every Some case flips and FAILS
+        //  * swapping `>=`→`>` — the exact-boundary case flips and FAILS
+        let dwell = SHED_TEARDOWN_DWELL_MS; // 30_000.0
+
+        assert!(
+            !should_teardown_shed_layer(None, 100_000.0, dwell),
+            "a rung that is not shed (None) must never be torn down"
+        );
+        assert!(
+            !should_teardown_shed_layer(Some(0.0), 29_999.0, dwell),
+            "29.999s < 30s dwell must retain the rung"
+        );
+        assert!(
+            should_teardown_shed_layer(Some(0.0), 30_000.0, dwell),
+            "exactly 30s dwell must tear down (>= is inclusive)"
+        );
+        assert!(
+            should_teardown_shed_layer(Some(10_000.0), 45_000.0, dwell),
+            "35s dwell must tear down"
+        );
+        assert!(
+            !should_teardown_shed_layer(Some(10_000.0), 20_000.0, dwell),
+            "10s dwell must retain"
+        );
+
+        // FREED-COUNT SEMANTICS via the REAL decision path (NOT X==X). Screen's
+        // `extra_layers` are rungs 1.. (base id 0 is the standalone encoder, never
+        // in this array). Index the per-rung shed-since array by id; id 0 (base) is
+        // never shed. now = 40_000ms:
+        //   id1: armed t=0    (40s dwell >= 30s) → tear down
+        //   id2: armed t=20s  (20s dwell <  30s) → retain
+        let now_ms = 40_000.0;
+        let shed_since: [Option<f64>; 3] = [None, Some(0.0), Some(20_000.0)];
+        let freed = shed_since
+            .iter()
+            .filter(|s| should_teardown_shed_layer(**s, now_ms, dwell))
+            .count();
+        assert_eq!(
+            freed, 1,
+            "exactly the extra rungs whose dwell exceeded the threshold are freed"
+        );
+    }
+
+    /// Issue #1229: on every (re)share, `apply_initial_tier` must synchronously
+    /// reset `shared_active_layer_count` to the BASE rung (1) when simulcast is
+    /// active (`max_layers > 1`). This closes the cross-future race where the
+    /// encode loop (a separate `spawn_local`) could read a stale-high active count
+    /// — either the construction-time FULL seed (`clamp_screen_layer_count(max_layers)`)
+    /// or a value drifted up by a prior session's AQ ramp — before the AQ control
+    /// loop's first post-rising-edge tick writes the fresh base value.
+    ///
+    /// This pins the screen-side seed directly (the `videocall-aq` test only
+    /// exercises the controller's `set_simulcast_ceiling_start_at_base`). Mutation
+    /// guard: deleting the `shared_active_layer_count.store(1, ...)` in
+    /// `apply_initial_tier` leaves the stored-high value (3) in place and fails the
+    /// assert. We store a HIGH value (3) first to stand in for the drifted/full
+    /// count, then prove the seed forces it back to base.
+    #[test]
+    fn apply_initial_tier_seeds_active_layer_count_to_base_when_simulcast() {
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+            3, // max_layers (simulcast — exercises the new cold-start seed branch)
+        );
+
+        // Construction already seeds the FULL count for simulcast; assert that so
+        // the test is meaningful (the seed must move it DOWN, not be a no-op).
+        assert_eq!(
+            encoder.shared_active_layer_count.load(Ordering::Relaxed),
+            3,
+            "precondition: simulcast construction seeds the full active layer count"
+        );
+        // Stand in for a count drifted up by a prior session's AQ ramp.
+        encoder
+            .shared_active_layer_count
+            .store(3, Ordering::Relaxed);
+
+        encoder.apply_initial_tier(0);
+
+        assert_eq!(
+            encoder.shared_active_layer_count.load(Ordering::Relaxed),
+            1,
+            "simulcast (re)share must cold-start the active layer count at the base rung (#1229)"
+        );
+    }
+
+    /// Pairs with the simulcast test above: in SINGLE-STREAM mode (`max_layers == 1`)
+    /// `apply_initial_tier` must NOT force `shared_active_layer_count` — the screen
+    /// path stays byte-identical to its pre-#1229 behavior. The construction seed
+    /// for `max_layers == 1` is `clamp_screen_layer_count(1) == 1`; the new branch
+    /// is gated on `effective_layer_count() > 1`, so it is skipped here and the
+    /// value the encode loop reads is whatever was there. We store a SENTINEL (7)
+    /// before the call and assert it survives unchanged, which proves the branch did
+    /// not execute (a regression that dropped the `effective_layer_count() > 1` guard
+    /// would clobber it to 1 and fail).
+    #[test]
+    fn apply_initial_tier_leaves_active_layer_count_untouched_in_single_stream() {
+        let client = build_test_client();
+        let mut encoder = ScreenEncoder::new(
+            client,
+            500,
+            Callback::from(|_: String| {}),
+            Callback::from(|_: ScreenShareEvent| {}),
+            Rc::new(AtomicBool::new(false)),
+            1, // max_layers (single-stream — the new branch must be skipped)
+        );
+
+        // Construction seed for single-stream is the base rung.
+        assert_eq!(
+            encoder.shared_active_layer_count.load(Ordering::Relaxed),
+            1,
+            "precondition: single-stream construction seeds the base rung"
+        );
+        // Sentinel that the byte-identical single-stream path must not touch.
+        encoder
+            .shared_active_layer_count
+            .store(7, Ordering::Relaxed);
+
+        encoder.apply_initial_tier(0);
+
+        assert_eq!(
+            encoder.shared_active_layer_count.load(Ordering::Relaxed),
+            7,
+            "single-stream apply_initial_tier must NOT force the active layer count \
+             (byte-identical legacy behavior; the #1229 seed is gated on simulcast)"
         );
     }
 }

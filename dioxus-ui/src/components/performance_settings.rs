@@ -2089,9 +2089,14 @@ const HELP_POPOVER_GAP_PX: f64 = 8.0;
 ///
 /// The popover is rendered `position: fixed` so it escapes the Diagnostics
 /// drawer's scroll-clip (`#diagnostics-sidebar { overflow-y: auto }` clips BOTH
-/// axes per the CSS overflow-propagation rule). `fixed` anchors to the viewport
-/// (no transformed ancestor on desktop), so to keep the popover visually tied to
-/// its button we compute its top-left here from the button's rect.
+/// axes per the CSS overflow-propagation rule). This function returns the popover
+/// top-left in VIEWPORT coords computed from the button's rect. NOTE: an OPEN
+/// drawer carries a non-`none` `transform` (`#diagnostics-sidebar.visible {
+/// transform: translateX(0) }`), which makes the drawer the containing block for
+/// the `position: fixed` popover — so these viewport coords cannot be written to
+/// `left/top` directly. `reposition_help_popover` (the only caller) maps them into
+/// that containing block before writing them; this function is purely the viewport
+/// math and is unit-tested in isolation.
 ///
 /// Rules:
 ///   - Horizontal: align the popover's LEFT to the button's left, then clamp into
@@ -2263,9 +2268,13 @@ fn use_help_popover_anchor(
     });
 }
 
-/// Measure the button + popover and write the computed `left/top` (viewport
-/// coords) onto the `position: fixed` popover. No-op if either element is absent
-/// or the window is unavailable.
+/// Measure the button + popover, compute the popover's target top-left in VIEWPORT
+/// coords, then map those into the popover's actual containing block before writing
+/// `left/top`. The open Diagnostics drawer carries a `transform`, which makes IT
+/// (not the viewport) the containing block for the `position: fixed` popover and
+/// also scrolls it; the mapping below (subtract the offsetParent rect, add back its
+/// scroll) is what makes the popover land at the intended viewport position. No-op
+/// if either element is absent or the window is unavailable.
 fn reposition_help_popover(btn_id: &str, popup_id: &str) {
     let Some(win) = web_sys::window() else {
         return;
@@ -2303,8 +2312,41 @@ fn reposition_help_popover(btn_id: &str, popup_id: &str) {
     );
 
     if let Some(html) = popup.dyn_ref::<web_sys::HtmlElement>() {
-        let _ = html.style().set_property("left", &format!("{left:.1}px"));
-        let _ = html.style().set_property("top", &format!("{top:.1}px"));
+        // (left, top) are VIEWPORT coords. But the popover is `position: fixed`
+        // INSIDE the Diagnostics drawer, and the drawer carries a non-`none`
+        // `transform` while open (`#diagnostics-sidebar.visible { transform:
+        // translateX(0) }`). A transformed ancestor becomes the containing block
+        // for its `position: fixed` descendants, so the popover's inline `left/top`
+        // are interpreted RELATIVE TO THAT ANCESTOR'S box, not the viewport — and
+        // because the drawer is also the scroll container (`overflow-y: auto`), the
+        // fixed popover additionally scrolls with the drawer by `-scrollTop`.
+        // Measured live: rendered_x = inline_left + parent_rect.left, and
+        // rendered_y = inline_top + parent_rect.top - parent.scrollTop. Invert that
+        // mapping so the popover lands at the viewport coords we computed:
+        //   inline_left = left - parent_rect.left
+        //   inline_top  = top  - parent_rect.top + parent.scrollTop
+        // When there is NO transformed ancestor the offsetParent is typically the
+        // body (rect.left/top ≈ 0, scroll ≈ 0) or null, so the mapping degrades to
+        // a no-op and the viewport coords are written unchanged.
+        let (off_left, off_top) = match html.offset_parent() {
+            Some(parent) => {
+                let pr = parent.get_bounding_client_rect();
+                // scroll_* are i32; the drawer (offsetParent) is the scroll box.
+                (
+                    pr.left() - parent.scroll_left() as f64,
+                    pr.top() - parent.scroll_top() as f64,
+                )
+            }
+            None => (0.0, 0.0),
+        };
+        let inline_left = left - off_left;
+        let inline_top = top - off_top;
+        let _ = html
+            .style()
+            .set_property("left", &format!("{inline_left:.1}px"));
+        let _ = html
+            .style()
+            .set_property("top", &format!("{inline_top:.1}px"));
     }
 }
 

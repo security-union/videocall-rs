@@ -186,22 +186,38 @@ interface JoinOpts {
    * run first. Defaults to false (camera left at its persisted state).
    */
   ensureCameraOn?: boolean;
+
+  /**
+   * When true, seed the persisted camera preference OFF (`vc_prejoin_camera_on=
+   * false`) so the camera is GENUINELY off in the meeting. This is required by
+   * the camera-OFF caption tests: the default seed turns the pre-join camera ON,
+   * and combined with the #1304 pre-join auto-getUserMedia, the Chromium
+   * `--use-fake-ui-for-media-stream` auto-grant, and #959 (camera state carries
+   * into the meeting), that leaves the in-meeting camera LIVE — which makes the
+   * "Camera — off" / "Will send … when the camera is on" captions false. Seeding
+   * OFF makes those OFF-state captions the truth. Mutually exclusive with
+   * `ensureCameraOn`. Defaults to false.
+   */
+  cameraOff?: boolean;
 }
 
 async function joinMeeting(page: Page, testLabel: string, opts: JoinOpts = {}): Promise<void> {
   const meetingId = `e2e_perf_${testLabel}_${Date.now()}`;
 
-  // Seed the persisted camera-ON preference before the app boots. This makes the
-  // pre-join camera toggle default ON; combined with `ensureCameraOn` (which
-  // drives the UI so the device list is populated) it guarantees the SEND
-  // encoder runs. addInitScript runs on every navigation (incl. post-reload).
-  await page.addInitScript(() => {
+  // Seed the persisted camera preference before the app boots. By default this
+  // makes the pre-join camera toggle default ON; combined with `ensureCameraOn`
+  // (which drives the UI so the device list is populated) it guarantees the SEND
+  // encoder runs. When `cameraOff` is set the seed is FALSE so the camera is
+  // genuinely off in the meeting (the OFF-state caption tests depend on this).
+  // addInitScript runs on every navigation (incl. post-reload).
+  const seedCameraOn = opts.cameraOff ? "false" : "true";
+  await page.addInitScript((value) => {
     try {
-      window.localStorage.setItem("vc_prejoin_camera_on", "true");
+      window.localStorage.setItem("vc_prejoin_camera_on", value);
     } catch {
       /* storage may be unavailable pre-navigation; the app origin sets it */
     }
-  });
+  }, seedCameraOn);
 
   await page.goto("/");
   await page.waitForTimeout(1500);
@@ -229,15 +245,25 @@ async function joinMeeting(page: Page, testLabel: string, opts: JoinOpts = {}): 
     // SEND encoder actually starts (so the VU readout shows {w}x{h}…kbps).
     await joinButton.waitFor({ timeout: 30_000 });
 
-    // Grant media if the permission prompt is showing (auto-granted by the
-    // --use-fake-ui-for-media-stream flag once clicked).
+    // Grant media if the permission prompt is still showing. NOTE (#1134): the
+    // pre-join screen AUTO-requests media on mount, so permission usually
+    // resolves on its own — the "Allow" button is only a manual fallback for the
+    // brief in-flight window. Once permission resolves, `media_access_granted`
+    // flips true and the whole prompt block (button included) is REPLACED by the
+    // device UI, so the button detaches. We therefore (a) make the click
+    // best-effort (it may race the auto-grant and detach mid-click) and (b) do
+    // NOT depend on the click landing: we wait for the GRANTED state directly —
+    // the prompt being hidden — which the auto-request reaches regardless.
     const allow = page.locator('[data-testid="prejoin-permission-allow"]');
     if (await allow.isVisible().catch(() => false)) {
-      await allow.click();
-      await expect(page.locator('[data-testid="prejoin-permission-prompt"]')).toBeHidden({
-        timeout: 15_000,
+      await allow.click({ timeout: 5_000 }).catch(() => {
+        /* auto-grant already replaced the prompt with the device UI */
       });
     }
+    // Either the click or the #1134 auto-request lands us in the granted state.
+    await expect(page.locator('[data-testid="prejoin-permission-prompt"]')).toBeHidden({
+      timeout: 15_000,
+    });
 
     // Ensure the camera toggle is ON (it defaults ON via the seeded preference,
     // but click it on if it somehow reads off).
@@ -292,9 +318,22 @@ async function joinMeeting(page: Page, testLabel: string, opts: JoinOpts = {}): 
 
 /** Open the in-meeting device-settings modal via the toolbar gear. */
 async function openSettingsModal(page: Page): Promise<void> {
-  // Reveal the action bar in case autohide is active, then click the gear.
+  // The controls bar auto-hides after ~1s of mouse inactivity and slides
+  // in/out on a transform transition, so a raw click can hit it mid-animation
+  // ("element is not stable"). Wake it the same way openDrawer does: hover the
+  // container, nudge the pointer to an interior viewport point, and let the
+  // slide-in settle before clicking the gear.
   await page.locator(".video-controls-container").hover();
-  await page.locator('[data-testid="open-settings"]').click();
+  const vp = page.viewportSize() ?? { width: 800, height: 600 };
+  await page.mouse.move(Math.floor(vp.width / 2), Math.floor(vp.height / 2));
+  await page.waitForTimeout(300);
+
+  const gear = page.locator('[data-testid="open-settings"]');
+  await expect(gear).toBeVisible({ timeout: 10_000 });
+  // Force-click as a belt-and-suspenders guard: even after the settle the bar
+  // can still report a sub-pixel transform drift on slower runners, which the
+  // actionability "stable" check rejects. The gear's hit target is unaffected.
+  await gear.click({ force: true });
   await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
 }
 
@@ -972,12 +1011,17 @@ test.describe("Performance settings panel (#961)", () => {
   test("SEND caption is source-aware: OFF sources read 'Will send …' (not 'Sending')", async ({
     page,
   }) => {
-    // This is a single-page meeting with no media driven (no ensureCameraOn, mic
-    // off), so all three SEND sources are OFF. The caption must NOT falsely claim
-    // to be "Sending" — it reads the future "Will send {N} … when {…}" form using
-    // the configured count, and names each kind's trigger.
+    // This is a single-page meeting with no media driven (camera seeded OFF via
+    // `cameraOff`, mic off), so all three SEND sources are OFF. Without
+    // `cameraOff` the default seed (`vc_prejoin_camera_on=true`) + the #1304
+    // pre-join auto-getUserMedia + the Chromium fake-UI auto-grant + #959
+    // (camera carries into the meeting) would leave the in-meeting camera LIVE,
+    // making the VIDEO caption read "Sending N of M layers" and breaking the
+    // OFF-state premise. The caption must NOT falsely claim to be "Sending" — it
+    // reads the future "Will send {N} … when {…}" form using the configured
+    // count, and names each kind's trigger.
     await enableSimulcastFlag(page.context(), 3);
-    await joinMeeting(page, "caption_source_aware");
+    await joinMeeting(page, "caption_source_aware", { cameraOff: true });
     await openPerformanceDrawer(page);
     await selectSendDirection(page);
 
@@ -1396,10 +1440,17 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(perfDrawer(page)).toHaveCount(0);
 
     // ── The drawer remains reachable via the ONLY remaining opener (Open
-    //    Diagnostics). Close Settings (the modal is open from openSettingsModal
-    //    above; toggle the gear once to close it), then open the drawer the
-    //    canonical way and confirm the migrated perf panel is its destination. ──
-    await page.locator('[data-testid="open-settings"]').click();
+    //    Diagnostics). Close Settings first (the modal is open from
+    //    openSettingsModal above), then open the drawer the canonical way and
+    //    confirm the migrated perf panel is its destination. ──
+    // Close via the modal's dedicated close button, NOT by re-clicking the gear:
+    // while the modal is open its `.device-settings-modal-overlay` covers the
+    // toolbar and intercepts pointer events to the gear, so a gear click is
+    // swallowed by the overlay and the modal never closes. (Escape is unreliable
+    // here too — its handler lives on the dialog div, which is not guaranteed to
+    // hold focus after the getByRole tab interactions above.) The close button's
+    // onclick calls `on_close` directly. See device_settings_modal.rs.
+    await modal.locator(".settings-modal-close").click();
     await expect(modal).toHaveCount(0);
 
     await openPerformanceDrawer(page);
@@ -1422,8 +1473,12 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
   test("Simulcast layers: Video (sending) reads 'Camera — off' when the camera is off", async ({
     page,
   }) => {
-    // Join WITHOUT turning the camera on, so send_video is gated to None.
-    await joinMeeting(page, "diag_cam_off");
+    // Join with the camera GENUINELY off (`cameraOff` seeds
+    // `vc_prejoin_camera_on=false`), so send_video is gated to None. The default
+    // seed would instead leave the camera LIVE (#1304 auto-getUserMedia + fake-UI
+    // auto-grant + #959 carry-into-meeting), making this line read "N of M layers
+    // active" and defeating the off-state regression guard.
+    await joinMeeting(page, "diag_cam_off", { cameraOff: true });
     await openPerformanceDrawer(page);
 
     await expect
@@ -1748,7 +1803,12 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(rawSummary.locator(".diag-disclosure-chev")).toHaveCount(1);
 
     // The enclosing <details> is the disclosure; its merged-blocks container.
-    const rawDetails = sidebar.locator("details.diag-disclosure", { has: rawSummary });
+    // Use the CSS :has() child form (NOT { has: rawSummary }): Playwright
+    // re-scopes an inner locator that is ITSELF `sidebar`-scoped against the
+    // outer match, double-scoping it to `#diagnostics-sidebar … #diagnostics-
+    // sidebar …` and resolving to 0 matches. The CSS form keys off the summary id
+    // directly and avoids that quirk.
+    const rawDetails = sidebar.locator("details.diag-disclosure:has(> summary#diag-h-raw-stats)");
     const rawBody = rawDetails.locator(".diagnostics-data");
     const rawBlocks = rawBody.locator(".diag-raw-block");
 
@@ -1776,7 +1836,11 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await buildSummary.scrollIntoViewIfNeeded();
     await expect(buildSummary).toBeVisible();
     await expect(buildSummary).toHaveText(/Build info/);
-    const buildDetails = sidebar.locator("details.diag-disclosure", { has: buildSummary });
+    // Same CSS :has() child form as the Raw-stats disclosure above, to avoid the
+    // Playwright same-scope `{ has: <sidebar-scoped> }` double-scoping quirk.
+    const buildDetails = sidebar.locator(
+      "details.diag-disclosure:has(> summary#diag-h-build-info)",
+    );
     const buildTable = buildDetails.locator(".build-info-table");
     // COLLAPSED BY DEFAULT (was an always-open section in iteration 2).
     await expect(buildTable).toBeHidden();

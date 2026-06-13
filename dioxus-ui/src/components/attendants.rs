@@ -527,7 +527,7 @@ pub fn AttendantsComponent(
     // Gating the placeholder on "ever opened" preserves the never-opened contract
     // (the element must NOT exist until the drawer is first opened). The heavy
     // `Diagnostics` component is still only mounted while actually open, so no
-    // diagnostics work runs for the closed placeholder. (#1296 both-open close)
+    // diagnostics work runs for the closed placeholder. (issue 1296 both-open close)
     let mut diagnostics_was_opened = use_signal(|| false);
     // Drawer width state. Both drawers are overlay-only: they float over the
     // tiles and never reflow the grid. Their widths are drag-resizable and
@@ -863,7 +863,7 @@ pub fn AttendantsComponent(
     // (toolbar button, deep-link redirect above, etc.). Reading `diagnostics_open`
     // here subscribes this effect to it; the write is guarded so it only fires once
     // (and never resets), so it cannot loop. After this latches, closing the drawer
-    // renders the persistent placeholder instead of unmounting. (#1296)
+    // renders the persistent placeholder instead of unmounting. (issue 1296)
     use_effect(move || {
         if diagnostics_open() && !diagnostics_was_opened() {
             diagnostics_was_opened.set(true);
@@ -5161,7 +5161,7 @@ pub fn AttendantsComponent(
                 // it UNMOUNTED `#diagnostics-sidebar` entirely — which broke the
                 // both-open close flow (a `:not(.visible)` assertion can't match an
                 // element that no longer exists) and was asymmetric with the left
-                // drawer. (#1296 both-open close)
+                // drawer. (issue 1296 both-open close)
                 if diagnostics_open() {
                     Diagnostics {
                         is_open: true,
@@ -5278,7 +5278,7 @@ pub fn AttendantsComponent(
                     // contract (`#diagnostics-sidebar` absent until first open) holds.
                     // The width inline style mirrors the open drawer so a future
                     // reopen has no layout pop; no children → no diagnostics work runs
-                    // while closed. (#1296 both-open close)
+                    // while closed. (issue 1296 both-open close)
                     div {
                         id: "diagnostics-sidebar",
                         class: "",
@@ -5288,7 +5288,7 @@ pub fn AttendantsComponent(
                         // region to a screen reader. The open `Diagnostics` root
                         // carries the `role="region"` + label; the placeholder is a
                         // pure DOM-presence shim so the both-open close flow can see
-                        // the element lose `visible` rather than vanish. (#1296)
+                        // the element lose `visible` rather than vanish. (issue 1296)
                     }
                 }
 

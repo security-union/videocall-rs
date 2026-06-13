@@ -8392,7 +8392,7 @@ details.perf-peers[open] .perf-peers__chev {
    `left/top`, each open + on scroll(capture)/resize. The inline `left/top`
    overrides the safe defaults below (off-screen-left until the first reposition
    tick, so no flash at 0,0). `max-height` + `overflow:auto` keep a tall popover
-   usable on short viewports. (#1131 scroll-clip fix; containing-block mapping) */
+   usable on short viewports. (issue 1131 scroll-clip fix; containing-block mapping) */
 .perf-help-popover {
   position: fixed;
   z-index: 1001;

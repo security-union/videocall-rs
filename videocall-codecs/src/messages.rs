@@ -119,3 +119,48 @@ impl RequestKeyframeMessage {
         }
     }
 }
+
+/// Discriminator carried in [`FreshnessSkipMessage::kind`] (issue #1045), to tell
+/// it apart from `"video_stats"` / `"request_keyframe"` on the shared serde
+/// worker->main channel.
+pub const FRESHNESS_SKIP_KIND: &str = "freshness_skip";
+
+/// Worker->main freshness-deadline skip diagnostic (issue #1045).
+///
+/// The jitter buffer's freshness deadline (#1020) runs INSIDE the decoder worker,
+/// whose `log`/`console` output the main-thread console-log capture+upload pipeline
+/// never sees — so in the field we could not confirm the freeze fix actually fired.
+/// The worker posts this the instant a skip occurs; the main thread re-broadcasts it
+/// as a `DiagEvent` (`handle_worker_diag_message`) so it lands in uploaded logs with
+/// the worker's `from_peer`/`to_peer` context. Mirrors `VideoStatsMessage`'s path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FreshnessSkipMessage {
+    pub kind: String,
+    pub from_peer: Option<String>,
+    pub to_peer: Option<String>,
+    /// Head-of-line age (ms) that tripped the deadline.
+    pub head_age_ms: f64,
+    /// Keyframe sequence skipped to, or `None` for the keyframe-less held case.
+    pub keyframe_seq: Option<u64>,
+    /// Stale frames evicted in this skip.
+    pub dropped: u64,
+}
+
+impl FreshnessSkipMessage {
+    pub fn new(
+        from_peer: Option<String>,
+        to_peer: Option<String>,
+        head_age_ms: f64,
+        keyframe_seq: Option<u64>,
+        dropped: u64,
+    ) -> Self {
+        Self {
+            kind: FRESHNESS_SKIP_KIND.to_string(),
+            from_peer,
+            to_peer,
+            head_age_ms,
+            keyframe_seq,
+            dropped,
+        }
+    }
+}

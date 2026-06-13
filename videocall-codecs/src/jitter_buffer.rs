@@ -155,6 +155,24 @@ const SOURCE_FRAME_INTERVAL_EWMA_ALPHA: f64 = 0.1;
 const MIN_SOURCE_FRAME_INTERVAL_MS: f64 = 8.0;
 const MAX_SOURCE_FRAME_INTERVAL_MS: f64 = 1000.0;
 
+/// Details of a freshness-deadline skip/eviction, surfaced to the worker so it can
+/// forward the event to the main thread's console-log upload pipeline (issue #1045).
+/// The freshness deadline runs INSIDE the decoder worker, so its outcome was
+/// previously invisible in field logs — we could not confirm #1020 (and future
+/// decode-side fixes) actually fired. `enforce_freshness_deadline` stashes this on
+/// each skip; the worker `take`s it after polling and emits a diagnostic.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FreshnessSkip {
+    /// Head-of-line age (ms) that tripped the deadline.
+    pub head_age_ms: f64,
+    /// Sequence number of the keyframe we skipped to, or `None` when there was no
+    /// buffered keyframe (the keyframe-less eviction path — playout held on the
+    /// last-good frame; see #1025).
+    pub keyframe_seq: Option<u64>,
+    /// Number of stale frames evicted in this skip.
+    pub dropped: u64,
+}
+
 pub struct JitterBuffer<T> {
     /// Frames that have been received but are not yet continuous with the last decoded frame.
     /// A BTreeMap is used to keep them sorted by sequence number automatically.
@@ -229,6 +247,12 @@ pub struct JitterBuffer<T> {
     /// until the first fire; reset on `flush()` so a fresh stream can request
     /// immediately.
     last_keyframe_request_ms: Option<u128>,
+
+    /// Most recent freshness-deadline skip this poll produced (issue #1045), set by
+    /// `enforce_freshness_deadline` and consumed by the worker via
+    /// [`JitterBuffer::take_freshness_skip`] after each poll to forward it to the
+    /// main thread for field-log visibility. `None` when no skip occurred.
+    last_freshness_skip: Option<FreshnessSkip>,
 }
 
 impl<T> JitterBuffer<T> {
@@ -257,12 +281,23 @@ impl<T> JitterBuffer<T> {
             decoder,
             request_keyframe,
             last_keyframe_request_ms: None,
+            last_freshness_skip: None,
         }
     }
 
     /// Returns the current number of frames buffered and waiting in the jitter buffer.
     pub fn buffered_frames_len(&self) -> usize {
         self.buffered_frames.len()
+    }
+
+    /// Take the most recent freshness-deadline skip (issue #1045), clearing it. The
+    /// worker calls this after each `find_and_move_continuous_frames` poll and, on
+    /// `Some`, forwards the event to the main thread so it lands in uploaded field
+    /// logs — the only way to confirm the #1020 freshness deadline actually fired on
+    /// real clients (the deadline runs inside the decoder worker, whose logs the
+    /// main-thread capture pipeline never sees).
+    pub fn take_freshness_skip(&mut self) -> Option<FreshnessSkip> {
+        self.last_freshness_skip.take()
     }
 
     /// The main entry point for a new frame arriving from the network.
@@ -652,10 +687,16 @@ impl<T> JitterBuffer<T> {
                 self.drop_frames_before(keyframe_seq);
                 let dropped_any = self.dropped_frames_count > dropped_before;
                 if dropped_any {
+                    let dropped = self.dropped_frames_count - dropped_before;
                     log::debug!(
-                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms >= {MAX_PLAYOUT_AGE_MS:.0}ms). Skipped to live keyframe {keyframe_seq}, dropped {} stale frame(s).",
-                        self.dropped_frames_count - dropped_before
+                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms >= {MAX_PLAYOUT_AGE_MS:.0}ms). Skipped to live keyframe {keyframe_seq}, dropped {dropped} stale frame(s)."
                     );
+                    // Surface the skip for field-log visibility (#1045); the worker forwards it.
+                    self.last_freshness_skip = Some(FreshnessSkip {
+                        head_age_ms,
+                        keyframe_seq: Some(keyframe_seq),
+                        dropped,
+                    });
                 }
                 dropped_any
             }
@@ -672,10 +713,17 @@ impl<T> JitterBuffer<T> {
                 self.drop_frames_before(stale_cutoff);
                 let dropped_any = self.dropped_frames_count > dropped_before;
                 if dropped_any {
+                    let dropped = self.dropped_frames_count - dropped_before;
                     log::debug!(
-                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {} stale delta frame(s); holding last-good frame and proactively requesting a keyframe (#1025).",
-                        self.dropped_frames_count - dropped_before
+                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {dropped} stale delta frame(s); holding last-good frame and proactively requesting a keyframe (#1025)."
                     );
+                    // Surface the skip for field-log visibility (#1045); the worker forwards it.
+                    // `keyframe_seq: None` marks the keyframe-less (held last-good) case.
+                    self.last_freshness_skip = Some(FreshnessSkip {
+                        head_age_ms,
+                        keyframe_seq: None,
+                        dropped,
+                    });
                     // Issue #1025 (resolves the TODO(#1020) here): proactively ask the client to
                     // request a keyframe when we evict a stale keyframe-less backlog, rather than
                     // waiting for the client's reactive gap-driven request to notice. There is no
@@ -1649,6 +1697,53 @@ mod tests {
             2,
             "an eviction past the throttle window fires a fresh request"
         );
+    }
+
+    /// Issue #1045: both freshness-skip paths must surface a `FreshnessSkip` for the
+    /// worker to forward to field logs — the keyframe-less eviction (`keyframe_seq:
+    /// None`, playout held) and the skip-to-buffered-keyframe path (`keyframe_seq:
+    /// Some`). `take_freshness_skip` returns and clears it.
+    ///
+    /// Mutation coverage: not stashing in either branch makes the corresponding
+    /// `expect` fail; a wrong `keyframe_seq` fails the `assert_eq!`.
+    #[test]
+    fn freshness_skip_is_surfaced_for_both_paths() {
+        // Keyframe-LESS eviction → keyframe_seq None.
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 300);
+        jb.find_and_move_continuous_frames(300 + MAX_PLAYOUT_AGE_MS as u128 + 50);
+        let skip = jb
+            .take_freshness_skip()
+            .expect("keyframe-less eviction must surface a skip");
+        assert_eq!(skip.keyframe_seq, None, "no buffered keyframe → None");
+        assert!(skip.dropped >= 1, "at least one stale frame evicted");
+        assert!(
+            skip.head_age_ms >= MAX_PLAYOUT_AGE_MS,
+            "head age must have tripped the deadline"
+        );
+        assert!(
+            jb.take_freshness_skip().is_none(),
+            "take must clear the skip"
+        );
+
+        // Skip-to-buffered-keyframe → keyframe_seq Some.
+        let (mut jb2, _d2) = create_test_jitter_buffer();
+        jb2.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb2.find_and_move_continuous_frames(1100);
+        jb2.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1200); // stale head (gap)
+        jb2.insert_frame(create_test_frame(10, FrameType::KeyFrame), 1200); // keyframe to skip to
+        jb2.find_and_move_continuous_frames(1200 + MAX_PLAYOUT_AGE_MS as u128 + 50);
+        let skip2 = jb2
+            .take_freshness_skip()
+            .expect("skip-to-keyframe must surface a skip");
+        assert_eq!(
+            skip2.keyframe_seq,
+            Some(10),
+            "must report the keyframe skipped to"
+        );
+        assert!(skip2.dropped >= 1);
     }
 
     /// Regression guard for the infinite-loop blocker: a stale post-gap keyframe that is ALREADY

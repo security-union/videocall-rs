@@ -4346,6 +4346,54 @@ pub fn AttendantsComponent(
                                         let expanded = if controls_expanded() { " controls-expanded" } else { "" };
                                         format!("video-controls-container {pos}{hidden}{expanded}")
                                     },
+                                    // issue 1296: carve the action bar out of the SAME pinned-drawer insets the
+                                    // grid consumes so a pinned drawer never overlays the controls. EVERY branch
+                                    // below sets BOTH `left` and `right` longhands (and mobile sets both to
+                                    // `auto`) because dioxus-web restores any inline style property a new string
+                                    // omits — emitting only one side would let a stale opposite anchor survive a
+                                    // dock switch and stretch the fixed-width bar full-width. See the style block.
+                                    style: {
+                                        if mobile {
+                                            // dioxus-web 0.7.3 does NOT atomically replace an inline `style`
+                                            // string: it snapshots, overwrites, then RESTORES any inline
+                                            // property the new string omits (guard: `!getPropertyValue(prop)`).
+                                            // So an empty string would leave a prior `left`/`right` in place.
+                                            // Emit BOTH longhands as `auto` to actively clear any override a
+                                            // previous (non-mobile) dock left behind. Mobile ignores pinning.
+                                            "left: auto; right: auto;".to_string()
+                                        } else {
+                                            // Because of that same non-atomic restore behavior, EVERY dock
+                                            // branch must set BOTH `left` and `right` longhands — otherwise a
+                                            // dock switch (e.g. Bottom -> Right) keeps the old side's inline
+                                            // value next to the new one and the fixed-width bar gets two
+                                            // anchors and stretches full-width. Setting the opposite side to
+                                            // `auto` matches each dock's CSS default (bottom is centered, left
+                                            // dock is left-anchored, right dock is right-anchored), so it is
+                                            // harmless, AND it is exactly what makes "auto-clears on unpin /
+                                            // dock-switch" actually hold.
+                                            //
+                                            // We read the LIVE `left_inset`/`right_inset` locals (computed once
+                                            // per render, already 0 for any unpinned side and already scaled by
+                                            // the 60%-cap), so the bar stays in lockstep with the grid insets.
+                                            // Bottom: shift the `left:50%` centering origin by half the NET
+                                            // inset (left only -> shifts right, right only -> shifts left, both
+                                            // equal -> stays centered). The bottom dock's hidden/hover variants
+                                            // change ONLY `transform`, so overriding `left` leaves the slide
+                                            // animation intact.
+                                            match dock_position() {
+                                                DockPosition::Bottom => format!(
+                                                    "left: calc(50% + {:.0}px); right: auto;",
+                                                    (left_inset - right_inset) / 2.0
+                                                ),
+                                                DockPosition::Left => {
+                                                    format!("left: calc(16px + {left_inset:.0}px); right: auto;")
+                                                }
+                                                DockPosition::Right => {
+                                                    format!("left: auto; right: calc(16px + {right_inset:.0}px);")
+                                                }
+                                            }
+                                        }
+                                    },
                                     // Primary: Mic button - always visible
                                     {
                                         let mda_mic = mda.clone();
@@ -4530,11 +4578,15 @@ pub fn AttendantsComponent(
                                                 let opening = !peer_list_open();
                                                 peer_list_open.set(opening);
                                                 if opening {
-                                                    diagnostics_open.set(false);
+                                                    // #1296: the two drawers are now INDEPENDENT —
+                                                    // opening the peer list no longer closes
+                                                    // diagnostics (they can be open together; the
+                                                    // inset math sums both and the 60%-cap keeps
+                                                    // tiles >= 40% vw). Only popovers / dev overlays
+                                                    // are dismissed so they don't float stale.
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);
-
                                                 }
                                             },
                                         }
@@ -4694,25 +4746,22 @@ pub fn AttendantsComponent(
                                                 let opening = !diagnostics_open();
                                                 diagnostics_open.set(opening);
                                                 if opening {
-                                                    peer_list_open.set(false);
-                                                    // Close Device Settings as a UX
-                                                    // choice — don't stack a modal
-                                                    // over the drawer (symmetry with
-                                                    // the reverse at
-                                                    // DeviceSettingsButton). The old
-                                                    // "two 4Hz loops can't coexist"
-                                                    // rationale is moot since the
-                                                    // Performance panel moved into
-                                                    // this drawer (#1131): there is
-                                                    // now ONE surface, with two
-                                                    // tick-scoped child components
-                                                    // (the panel + SimulcastLayers)
-                                                    // by design.
+                                                    // #1296: the two drawers are now INDEPENDENT —
+                                                    // opening diagnostics no longer closes the peer
+                                                    // list (both can be open together). Device
+                                                    // Settings (a modal) is still closed below as a
+                                                    // UX choice — don't stack a modal over the
+                                                    // drawer (symmetry with the reverse at
+                                                    // DeviceSettingsButton). The old "two 4Hz loops
+                                                    // can't coexist" rationale is moot since the
+                                                    // Performance panel moved into this drawer
+                                                    // (#1131): there is now ONE surface, with two
+                                                    // tick-scoped child components (the panel +
+                                                    // SimulcastLayers) by design.
                                                     device_settings_open.set(false);
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);
-
                                                 }
                                             },
                                         }
@@ -4954,6 +5003,7 @@ pub fn AttendantsComponent(
                             class: "drawer-resize-handle",
                             role: "separator",
                             aria_orientation: "vertical",
+                            aria_label: "Resize panel",
                             tabindex: "0",
                             // keyboard resize is a follow-up
                             // Pointer capture: on pointerdown the handle captures the
@@ -4962,12 +5012,15 @@ pub fn AttendantsComponent(
                             // is what makes shrink (drag left, over the drawer) work at all.
                             onpointerdown: {
                                 let lv = left_raf_valid.clone();
+                                let lp = left_raf_pending.clone();
                                 move |evt: PointerEvent| {
                                     evt.prevent_default();
                                     resizing_drawer.set(ResizingDrawer::Left);
                                     // Start a fresh drag with no valid stash yet: the flush in
                                     // pointerup is skipped until a real pointermove sets this.
                                     lv.set(false);
+                                    // Defensive: clear any stale pending flag so a fresh drag can always schedule its first rAF (can't start wedged).
+                                    lp.set(false);
                                     // No start-vw cache: the left edge sits at viewport x=0, so
                                     // the move handler reads client_x directly. drag_start_vw is
                                     // only needed by the right drawer.
@@ -5078,6 +5131,36 @@ pub fn AttendantsComponent(
                                     }
                                 }
                             },
+                            // #1296: lost-capture end-of-drag. onpointerup only fires when the
+                            // pointer is released over the captured element; if capture is lost
+                            // some other way (release off-element after capture was dropped, OS
+                            // interruption, element re-render) the browser fires
+                            // `lostpointercapture` on the SAME element that called
+                            // set_pointer_capture — here the handle div (capture is taken on
+                            // evt.target() in onpointerdown, which IS this div). Without this
+                            // handler resizing_drawer would stay Left and a later plain hover over
+                            // the handle (its move guard only checks `== Left`) would keep
+                            // resizing — the latch the user hit. We MIRROR onpointercancel exactly
+                            // so flush/persist/reset semantics are identical: clear pending, flush
+                            // + persist only if a real move happened, then reset to None.
+                            onlostpointercapture: {
+                                let lx = left_raf_x.clone();
+                                let lp = left_raf_pending.clone();
+                                let lv = left_raf_valid.clone();
+                                move |_: PointerEvent| {
+                                    if resizing_drawer() == ResizingDrawer::Left {
+                                        lp.set(false);
+                                        if lv.get() {
+                                            left_width.set(
+                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                            );
+                                            // Persist on lost-capture; value is already clamped.
+                                            save_f64("vc_drawer_left_width", left_width());
+                                        }
+                                        resizing_drawer.set(ResizingDrawer::None);
+                                    }
+                                }
+                            },
                         }
                     }
                 }
@@ -5157,6 +5240,7 @@ pub fn AttendantsComponent(
                         // signals), so it forwards pointer events here where the math runs.
                         on_resize_start: {
                             let rv = right_raf_valid.clone();
+                            let rp = right_raf_pending.clone();
                             move |_| {
                                 resizing_drawer.set(ResizingDrawer::Right);
                                 // Cache start-of-drag viewport width (not re-read per move).
@@ -5164,6 +5248,8 @@ pub fn AttendantsComponent(
                                 // Start a fresh drag with no valid stash yet: the flush in
                                 // on_resize_end is skipped until a real on_resize_move sets it.
                                 rv.set(false);
+                                // Defensive: clear any stale pending flag so a fresh drag can always schedule its first rAF (can't start wedged).
+                                rp.set(false);
                             }
                         },
                         // rAF-coalesced move: stash the raw client_x and schedule at most
@@ -5225,7 +5311,8 @@ pub fn AttendantsComponent(
                                     // the persisted value untouched — the stash still holds its
                                     // default and must not overwrite the current width.
                                     // Note: on_resize_end is also called from diagnostics.rs
-                                    // onpointercancel, so cancel + end share this flush path.
+                                    // onpointercancel AND onlostpointercapture, so end + cancel
+                                    // + lost-capture all share this flush path. (#1296)
                                     if rv.get() {
                                         right_width.set(
                                             (drag_start_vw() - rx.get())

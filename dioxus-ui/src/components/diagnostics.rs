@@ -1383,6 +1383,7 @@ pub fn Diagnostics(
                 class: "drawer-resize-handle",
                 role: "separator",
                 aria_orientation: "vertical",
+                aria_label: "Resize panel",
                 tabindex: "0",
                 // keyboard resize is a follow-up
                 // Pointer capture: capturing the pointer on pointerdown routes every
@@ -1408,11 +1409,23 @@ pub fn Diagnostics(
                     evt.prevent_default();
                     on_resize_end.call(());
                 },
-                // Reuse on_resize_end on cancel: its parent closure resets
-                // resizing_drawer to None (the only cleanup needed here) and
-                // persists the already-clamped width. Pointer stream cancellation
-                // (OS gesture, touch interruption, lost capture) thus can't latch.
+                // Reuse on_resize_end on cancel AND lost-capture: its parent closure
+                // resets resizing_drawer to None (always) and persists the (already-
+                // clamped) width ONLY if a real move happened this drag. A no-move
+                // cancel (OS gesture, touch interruption, lost capture) leaves
+                // width and storage untouched — nothing can latch.
                 onpointercancel: move |_| {
+                    on_resize_end.call(());
+                },
+                // #1296: onpointerup only fires when the pointer is released over the
+                // captured element. If capture is lost another way (release off-element,
+                // OS interruption, element re-render) the browser fires
+                // `lostpointercapture` on the SAME element that captured (this handle
+                // div, via set_pointer_capture on evt.target() in onpointerdown).
+                // Forward to on_resize_end — the parent resets resizing_drawer to None
+                // (and valid-gated flush/persist), so a later hover over the handle
+                // can't keep resizing.
+                onlostpointercapture: move |_| {
                     on_resize_end.call(());
                 },
             }

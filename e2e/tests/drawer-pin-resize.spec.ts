@@ -253,6 +253,183 @@ function pageInnerWidth(page: Page): Promise<number> {
 }
 
 // ---------------------------------------------------------------------------
+// Helpers added for the four #1296 fix scenarios (action-bar carve-out,
+// unpin-restores-bar, lost-capture resize end, both-drawers-open).
+// ---------------------------------------------------------------------------
+
+/** The action bar (`nav.video-controls-container`) — the bottom/side dock. */
+function actionBar(page: Page) {
+  return page.locator("nav.video-controls-container");
+}
+
+/**
+ * The pointer `client_x` that yields RIGHT-drawer width `w` for a given inner
+ * width `vw`: the right handler computes `width = drag_start_vw - client_x`, so
+ * to land width `w` the pointer must end at `vw - w`. Named for intent (the
+ * existing spec inlines `vw - target`).
+ */
+function vwMinus(vw: number, w: number): number {
+  return vw - w;
+}
+
+/**
+ * Read a RAW inline style property as authored (e.g. the literal
+ * `calc(50% + 160px)`), NOT the resolved/computed value. `inlineStylePx`
+ * `parseFloat`s and so can't see a `calc(...)`; the action-bar carve-out writes
+ * its position as a `calc()` expression (see attendants.rs ~L4224), so we assert
+ * on the authored string here. Returns "" when the prop is unset.
+ */
+function rawInlineStyle(page: Page, selector: string, prop: string): Promise<string> {
+  return page
+    .locator(selector)
+    .evaluate((el, p) => (el as HTMLElement).style.getPropertyValue(p), prop);
+}
+
+/**
+ * Parse the signed px offset N out of an action-bar bottom-dock `left` value of
+ * the form `calc(50% + Npx)` (N may be negative, e.g. `calc(50% + -280px)` —
+ * Rust's `{:.0}` formats a negative inset as `+ -280`). Returns `null` if the
+ * string is not in that shape, so a malformed/legacy value fails the test
+ * rather than silently parsing as 0.
+ */
+function bottomDockOffsetPx(value: string): number | null {
+  const m = value.match(/calc\(\s*50%\s*\+\s*(-?\d+(?:\.\d+)?)px\s*\)/);
+  return m ? parseFloat(m[1]) : null;
+}
+
+/**
+ * Parse the px inset N out of a SIDE-dock value of the form
+ * `calc(16px + Npx)` (left dock `left:` / right dock `right:`, attendants.rs
+ * ~L4229/L4232). Returns `null` if the string is not in that shape, so the
+ * base 16px-only edge anchor (no carve-out) fails the test rather than
+ * parsing as 0.
+ */
+function sideDockInsetPx(value: string): number | null {
+  const m = value.match(/calc\(\s*16px\s*\+\s*(-?\d+(?:\.\d+)?)px\s*\)/);
+  return m ? parseFloat(m[1]) : null;
+}
+
+/** Bounding box for a selector, asserting it is present. */
+async function boxOf(page: Page, selector: string): Promise<{ x: number; width: number }> {
+  const b = await page.locator(selector).boundingBox();
+  if (!b) throw new Error(`missing bounding box for ${selector}`);
+  return { x: b.x, width: b.width };
+}
+
+/** Bounding-box center x (px) for a selector. */
+async function centerXOf(page: Page, selector: string): Promise<number> {
+  const b = await boxOf(page, selector);
+  return b.x + b.width / 2;
+}
+
+/**
+ * Click a drawer's pin button and wait until the EFFECTIVE pinned state settles
+ * (the `pinned` class is added/removed). Returns once the class matches `want`.
+ */
+async function setPinned(page: Page, spec: DrawerSpec, want: boolean): Promise<void> {
+  const container = page.locator(`#${spec.containerId}`);
+  await container.locator("button.pin-button").click();
+  if (want) {
+    await expect(container).toHaveClass(/\bpinned\b/, { timeout: 10_000 });
+  } else {
+    await expect(container).not.toHaveClass(/\bpinned\b/, { timeout: 10_000 });
+  }
+}
+
+/**
+ * Switch the action-bar dock position via the in-UI "Dock position" menu (lives
+ * in the `.controls-secondary` group, which is revealed by the
+ * `.controls-expanded` class AND by a CSS `:hover` on the bar — see global.css).
+ * The dock button sits inside that group with `max-width:0`/`opacity:0` while
+ * collapsed, so we HOVER the action bar (CSS `:hover` keeps the group expanded
+ * as long as the pointer stays over the bar) and keep all interactions on the
+ * bar / its popout: clicking the dock button (Playwright moves the pointer ONTO
+ * the button, which is within the hovered bar) opens the menu; the menu options
+ * pop ABOVE the bar (`overflow: visible` on the expanded group). We do NOT move
+ * the pointer to viewport center (that would drop `:hover` and re-collapse the
+ * group). Returns once `nav.video-controls-container` carries
+ * `dock-<label-lowercased>`.
+ */
+async function setDock(page: Page, label: "Bottom" | "Left" | "Right"): Promise<void> {
+  // Hover the bar to wake it (sets controls_expanded) AND hold CSS `:hover`.
+  await actionBar(page).hover();
+  await page.waitForTimeout(300);
+
+  const dockButton = page.locator('button[title="Dock position"]');
+  await expect(dockButton).toBeVisible({ timeout: 10_000 });
+  // Re-hover immediately before clicking to guarantee the group is expanded
+  // (defends against an autohide tick between the wake and the click).
+  await dockButton.hover();
+  await dockButton.click();
+
+  const option = page.locator('div[role="option"]', { hasText: new RegExp(`^${label}$`) });
+  await expect(option.first()).toBeVisible({ timeout: 10_000 });
+  await option.first().click();
+
+  const dockClass = new RegExp(`\\bdock-${label.toLowerCase()}\\b`);
+  await expect(actionBar(page)).toHaveClass(dockClass, { timeout: 10_000 });
+}
+
+/** Computed style value for a selector (resolved, e.g. z-index "9301"). */
+function computedStyle(page: Page, selector: string, prop: string): Promise<string> {
+  return page
+    .locator(selector)
+    .evaluate((el, p) => window.getComputedStyle(el).getPropertyValue(p), prop);
+}
+
+/** Computed pseudo-element (`::before`) style value for a selector. */
+function computedPseudoStyle(
+  page: Page,
+  selector: string,
+  pseudo: string,
+  prop: string,
+): Promise<string> {
+  return page
+    .locator(selector)
+    .evaluate((el, args) => window.getComputedStyle(el, args.pseudo).getPropertyValue(args.prop), {
+      pseudo,
+      prop,
+    });
+}
+
+/**
+ * Begin a REAL captured drag on a drawer's resize handle and MOVE the pointer
+ * (trusted pointerdown so `set_pointer_capture` actually takes; pointermove
+ * registers a width change + sets the per-drag "valid" flag) but do NOT release
+ * with a clean `mouse.up`. Leaves the real pointer button DOWN at `endX`. The
+ * caller then ends the drag via a LOST-CAPTURE path (release the real capture +
+ * dispatch `lostpointercapture`) — exercising the shared `on_resize_end` path
+ * that a clean pointerup would otherwise mask. Returns the width observed
+ * mid-drag (after the move, before the lost-capture end).
+ */
+async function startCapturedDragNoRelease(
+  page: Page,
+  spec: DrawerSpec,
+  endX: number,
+): Promise<{ widthDuringDrag: number }> {
+  const handle = page.locator(`#${spec.containerId} .drawer-resize-handle`);
+  await expect(handle).toBeVisible({ timeout: 10_000 });
+  const box = await handle.boundingBox();
+  if (!box) throw new Error(`${spec.side} resize handle has no bounding box`);
+
+  const grabX = box.x + box.width / 2;
+  const grabY = box.y + box.height / 2;
+
+  await page.mouse.move(grabX, grabY);
+  await page.mouse.down();
+  // Intermediate + final move so the onpointermove handler fires (sets the
+  // valid flag + stashes client_x) and the width repaints.
+  await page.mouse.move((grabX + endX) / 2, grabY);
+  await page.mouse.move(endX, grabY);
+  // Let the rAF-coalesced width.set() flush so the mid-drag width is observable.
+  await page.waitForTimeout(150);
+  const widthDuringDrag = await containerWidthPx(page, spec);
+  // NOTE: pointer button intentionally left DOWN — the caller ends the drag via
+  // a lost-capture event, not mouse.up.
+  return { widthDuringDrag };
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -483,6 +660,90 @@ test.describe("Drawer pin + resize (#1296)", () => {
       }
     });
 
+    test(`${side} drawer: no-move pointer interaction on resize handle leaves width + storage untouched`, async ({
+      baseURL,
+    }) => {
+      test.setTimeout(90_000);
+      const uiURL = baseURL || DEFAULT_UI_URL;
+      const meetingId = `e2e_drawer_nomove_${side}_${Date.now()}`;
+      const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+      try {
+        const ctx = await createAuthenticatedContext(
+          browser,
+          `nomove-${side}@videocall.rs`,
+          `Nomove${side}`,
+          uiURL,
+        );
+        const page = await ctx.newPage();
+        await page.setViewportSize(DESKTOP);
+
+        await navigateToMeeting(page, meetingId, `Nomove${side}`);
+        await joinMeetingFromPage(page);
+        await openDrawer(page, spec);
+
+        // Protects the per-drag "valid" flush gate in attendants.rs
+        // (left_raf_valid / right_raf_valid, Rc<Cell<bool>> reset to false on
+        // pointerdown / on_resize_start, set true only on a real pointermove):
+        // the `if lv.get()` guards (LEFT pointerup ~L4894, LEFT pointercancel
+        // ~L4922) and the `if rv.get()` guard (RIGHT on_resize_end ~L5084),
+        // #1296. The rAF stash defaults are 0.0 (left_raf_x L542 / right_raf_x
+        // L544). Deleting these gates makes a NO-MOVE pointerup flush the
+        // default 0.0 stash -> LEFT clamps to DRAWER_MIN_WIDTH (240, vs the 320
+        // default), RIGHT clamps `drag_start_vw - 0.0` to max_for_side (~640 at
+        // vw=1280, vs the 560 default) and persists it via save_f64 — CHANGING
+        // the inline width AND writing the width key. With the gates intact a
+        // no-move interaction leaves both the width signal and localStorage
+        // untouched, which is what this test pins.
+
+        // Capture the pre-interaction inline width and the persisted width
+        // value (may be null if nothing was ever dragged this session — the
+        // gate must hold in that case too).
+        const widthBefore = await containerWidthPx(page, spec);
+        const storedBefore = await page.evaluate((k) => localStorage.getItem(k), spec.widthKey);
+
+        // Perform a NO-MOVE pointer interaction on the resize handle: locate it
+        // exactly like dragResizeHandleTo (bounding-box center), then
+        // down -> up at the SAME coords with NO `page.mouse.move` strictly
+        // between down() and up(). The pre-down positioning move presses no
+        // buttons, so it is not a captured drag pointermove and does not set the
+        // valid flag; only a move WHILE the button is down would. This mirrors a
+        // user clicking / focus-tapping the handle without dragging.
+        const handle = page.locator(`#${spec.containerId} .drawer-resize-handle`);
+        await expect(handle).toBeVisible({ timeout: 10_000 });
+        const box = await handle.boundingBox();
+        expect(box).not.toBeNull();
+        if (!box) throw new Error(`${spec.side} resize handle has no bounding box`);
+
+        const centerX = box.x + box.width / 2;
+        const centerY = box.y + box.height / 2;
+
+        await page.mouse.move(centerX, centerY); // positioning only (no buttons)
+        await page.mouse.down();
+        await page.mouse.up(); // no move between down/up => no-move interaction
+        // Let any (non-)flush + persistence settle, mirroring dragResizeHandleTo.
+        await page.waitForTimeout(300);
+
+        // Width must be UNCHANGED. Tolerance is tight (0 digits => within
+        // ~0.5px): the gate-removed no-move flush would shift LEFT by 80px
+        // (320 -> 240) and RIGHT by ~80px (560 -> ~640), so this assertion
+        // FAILS hard if either gate is deleted. expect.poll allows the
+        // (non-)flush to settle while still pinning "did not change".
+        await expect
+          .poll(() => containerWidthPx(page, spec), { timeout: 10_000 })
+          .toBeCloseTo(widthBefore, 0);
+
+        // Storage must be UNCHANGED. With the gate intact, save_f64 is never
+        // called for a no-move interaction, so the width key keeps its prior
+        // value (null or a real number). With the gate removed it would be
+        // written ("240" left / "~640" right), so `toBe(storedBefore)` FAILS.
+        const storedAfter = await page.evaluate((k) => localStorage.getItem(k), spec.widthKey);
+        expect(storedAfter).toBe(storedBefore);
+      } finally {
+        await browser.close();
+      }
+    });
+
     test(`${side} drawer: pin + resize persist across reload (localStorage)`, async ({
       baseURL,
     }) => {
@@ -606,4 +867,897 @@ test.describe("Drawer pin + resize (#1296)", () => {
       }
     });
   }
+
+  // =========================================================================
+  // ISSUE 1 — a pinned drawer must NOT overlay the action bar.
+  //
+  // The action bar (`nav.video-controls-container`) is carved out of the SAME
+  // pinned-drawer insets the grid consumes (attendants.rs ~L4224): the bottom
+  // dock re-centers via inline `left: calc(50% + Npx)` where N = (left_inset -
+  // right_inset)/2, and the side docks add the same-side inset to their 16px
+  // edge anchor. These tests FAIL if that carve-out is reverted (the bar would
+  // keep its base `calc(50% + 0px)` / `16px` and sit under the pinned drawer).
+  // =========================================================================
+  test("issue1: pinned LEFT drawer carves the bottom action bar to the right (no overlap)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const spec = DRAWERS.left;
+    const meetingId = `e2e_drawer_bar_left_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "bar-left@videocall.rs",
+        "BarLeft",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BarLeft");
+      await joinMeetingFromPage(page);
+      await openDrawer(page, spec);
+
+      // Base (unpinned) bottom dock is centered: `calc(50% + 0px)`. FAILS if a
+      // stale offset leaks while no drawer is pinned. (`bottomDockOffsetPx`
+      // also tolerates a `-0px` formatting.)
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return bottomDockOffsetPx(raw);
+          },
+          { timeout: 10_000 },
+        )
+        .toBeCloseTo(0, 0);
+      // Capture the centered bar's center x BEFORE pinning for the shift proof.
+      const centerBefore = await centerXOf(page, "nav.video-controls-container");
+
+      await setPinned(page, spec, true);
+
+      // Pinned LEFT => the bar's centering origin shifts RIGHT by left_inset/2,
+      // i.e. `calc(50% + Npx)` with N > 0. This is the inline-style source of
+      // truth for the carve-out, and FAILS (offset stays 0) on a revert.
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return bottomDockOffsetPx(raw);
+          },
+          { timeout: 10_000 },
+        )
+        .toBeGreaterThan(0);
+
+      // Independent geometric proof, robust to the bar's WIDTH: the rendered bar
+      // center MOVED to the right (away from the pinned left drawer). A revert
+      // leaves the bar centered (no shift), so this also FAILS on a revert. The
+      // shift is ~left_inset/2 (~160px @ 320 default); require a clear > 20px.
+      await expect(actionBar(page)).toBeVisible();
+      await expect
+        .poll(() => centerXOf(page, "nav.video-controls-container"), { timeout: 10_000 })
+        .toBeGreaterThan(centerBefore + 20);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("issue1: pinned RIGHT drawer carves the bottom action bar to the left (no overlap)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const spec = DRAWERS.right;
+    const meetingId = `e2e_drawer_bar_right_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "bar-right@videocall.rs",
+        "BarRight",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BarRight");
+      await joinMeetingFromPage(page);
+      await openDrawer(page, spec);
+
+      // Base centered: capture the bar center BEFORE pinning for the shift proof.
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return bottomDockOffsetPx(raw);
+          },
+          { timeout: 10_000 },
+        )
+        .toBeCloseTo(0, 0);
+      const centerBefore = await centerXOf(page, "nav.video-controls-container");
+
+      await setPinned(page, spec, true);
+
+      // Pinned RIGHT => the centering origin shifts LEFT by right_inset/2, i.e.
+      // `calc(50% + Npx)` with N < 0. FAILS (offset stays 0) on a revert.
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return bottomDockOffsetPx(raw);
+          },
+          { timeout: 10_000 },
+        )
+        .toBeLessThan(0);
+
+      // Geometric proof robust to the bar's WIDTH: the rendered bar center MOVED
+      // to the LEFT (away from the pinned right drawer). A revert leaves the bar
+      // centered (no shift), so this also FAILS on a revert. The shift is
+      // ~right_inset/2 (~280px @ 560 default); require a clear > 20px.
+      await expect(actionBar(page)).toBeVisible();
+      await expect
+        .poll(() => centerXOf(page, "nav.video-controls-container"), { timeout: 10_000 })
+        .toBeLessThan(centerBefore - 20);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("issue1: BOTH drawers pinned carve the bottom action bar on both sides (visible, between them)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_drawer_bar_both_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "bar-both@videocall.rs",
+        "BarBoth",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BarBoth");
+      await joinMeetingFromPage(page);
+
+      // Both drawers open together (issue 5 makes this possible — see those
+      // tests) and both pinned. Use DELIBERATELY UNEQUAL widths so the net bottom
+      // offset is a NON-ZERO value that can ONLY arise from summing BOTH insets:
+      // `(left_inset - right_inset)/2`. (An equal-width pair would net to 0 — the
+      // same value broken/base code emits — so it could NOT distinguish the fix
+      // from a revert. Unequal widths make this test fail on a revert.)
+      await openDrawer(page, DRAWERS.left);
+      await openDrawer(page, DRAWERS.right);
+      const vw = await pageInnerWidth(page);
+      const leftWidth = 300;
+      const rightWidth = 400; // both in-range; sum 700 < 60%-of-vw cap (768@1280)
+      await dragResizeHandleTo(page, DRAWERS.left, leftWidth);
+      await dragResizeHandleTo(page, DRAWERS.right, vw - rightWidth);
+      await setPinned(page, DRAWERS.left, true);
+      await setPinned(page, DRAWERS.right, true);
+
+      // Grid is carved on BOTH sides (the direct "both sides reserved" proof):
+      // left inset > 0 AND right inset > 0. FAILS if either side's reflow is
+      // missing.
+      await expect
+        .poll(() => gridInsetPx(page, DRAWERS.left), { timeout: 10_000 })
+        .toBeGreaterThan(0);
+      await expect
+        .poll(() => gridInsetPx(page, DRAWERS.right), { timeout: 10_000 })
+        .toBeGreaterThan(0);
+
+      // The bar position reflects BOTH insets: offset == (leftInset - rightInset)/2.
+      // With ~300 left and ~400 right that is ~ -50px (within the drags' ~5px
+      // landing tolerance, so allow a small band). A revert to base centering
+      // would give 0 — clearly outside this band — so this FAILS on a revert.
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return bottomDockOffsetPx(raw);
+          },
+          { timeout: 10_000 },
+        )
+        .toBeCloseTo((leftWidth - rightWidth) / 2, -1); // ~ -50, within ~5px
+      await expect(actionBar(page)).toBeVisible();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  // Non-bottom docks ARE reachable via the in-UI "Dock position" menu, so we
+  // cover the left-dock and right-dock carve-out too (attendants.rs ~L4228-4233:
+  // `left: calc(16px + leftWidthpx)` / `right: calc(16px + rightWidthpx)`).
+  test("issue1: pinned LEFT drawer with LEFT dock offsets the bar's left edge by the inset", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const spec = DRAWERS.left;
+    const meetingId = `e2e_drawer_bar_leftdock_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "bar-leftdock@videocall.rs",
+        "BarLeftDock",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BarLeftDock");
+      await joinMeetingFromPage(page);
+      await openDrawer(page, spec);
+
+      // Switch to the LEFT dock FIRST (while unpinned), then size + pin. The bar's
+      // positional inline prop is `left` for BOTH bottom and left docks, so the
+      // value is simply overwritten on each render — no stale cross-axis prop can
+      // linger (Dioxus's whole-`style`-attribute set preserves only props absent
+      // from the new value; same-named props are replaced).
+      await setDock(page, "Left");
+
+      // Set a known in-range width so the expected `calc(16px + Npx)` is exact.
+      const targetWidth = 300;
+      await dragResizeHandleTo(page, spec, targetWidth);
+      await setPinned(page, spec, true);
+
+      // Left dock + left pinned => `left: calc(16px + <leftWidth>px)`. The
+      // inset equals the (uncapped, single-side) left width (~targetWidth,
+      // within the drag's ~5px landing tolerance). Asserting the shape AND the
+      // value FAILS if the side-dock carve-out is reverted (it would stay at
+      // the base `16px` anchor with no `+ Npx`).
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return sideDockInsetPx(raw);
+          },
+          { timeout: 10_000 },
+        )
+        .toBeCloseTo(targetWidth, -1);
+      await expect(actionBar(page)).toBeVisible();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("issue1: pinned RIGHT drawer with RIGHT dock offsets the bar's right edge by the inset", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const spec = DRAWERS.right;
+    const meetingId = `e2e_drawer_bar_rightdock_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "bar-rightdock@videocall.rs",
+        "BarRightDock",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BarRightDock");
+      await joinMeetingFromPage(page);
+      await openDrawer(page, spec);
+
+      // Switch to the RIGHT dock FIRST (while UNPINNED), then size + pin. Right
+      // dock positions via the `right` prop while bottom dock used `left`, so a
+      // stale `left` from the prior bottom-dock render can linger (Dioxus's
+      // whole-`style` set preserves props absent from the new value). Switching
+      // while unpinned makes that stale `left` exactly `calc(50% + 0px)` —
+      // centered, zero-offset, harmless — and the `right` value below is the
+      // carve-out's source of truth regardless.
+      await setDock(page, "Right");
+
+      const targetWidth = 300;
+      await dragResizeHandleTo(page, spec, vwMinus(await pageInnerWidth(page), targetWidth));
+      await setPinned(page, spec, true);
+
+      // Right dock + right pinned => `right: calc(16px + <rightWidth>px)`
+      // (~targetWidth, within the drag's ~5px landing tolerance). FAILS if the
+      // side-dock carve-out is reverted (base `16px` anchor, no `+ Npx`).
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "right");
+            return sideDockInsetPx(raw);
+          },
+          { timeout: 10_000 },
+        )
+        .toBeCloseTo(targetWidth, -1);
+      await expect(actionBar(page)).toBeVisible();
+    } finally {
+      await browser.close();
+    }
+  });
+
+  // The side-dock tests above deliberately switch the dock while UNPINNED so the
+  // stale bottom-dock `left` collapses to a harmless `calc(50% + 0px)`. This test
+  // does the OPPOSITE on purpose: it switches Bottom -> Right while STILL PINNED,
+  // which is the dock-switch RESURRECTION bug.
+  //
+  // REVERT-SENSITIVE: while pinned on the bottom dock, the bar carries an inline
+  // `left: calc(50% + Npx)` (N > 0 for a pinned LEFT drawer). Pre-fix, switching
+  // to the Right dock emits only `right: ...` and OMITS `left` — but the
+  // dioxus-web style interpreter RESTORES the omitted `left` longhand, so the
+  // fixed-width bar ends up with BOTH `left` AND `right` anchors and stretches to
+  // (nearly) the full viewport width. The fix makes the Right arm emit
+  // `left: auto` (every arm now writes both longhands), clearing the stale
+  // anchor. So pre-fix this test fails BOTH the `left == auto/absent` assertion
+  // (the stale `calc(50% + Npx)` survives) AND the `width < vw*0.9` assertion
+  // (the bar spans the viewport); post-fix both pass.
+  test("issue1: pinned Bottom -> Right dock switch clears the stale bottom-dock left anchor (no resurrection)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    // LEFT drawer: a pinned left drawer gives left_inset > 0 (right_inset == 0),
+    // so the bottom dock emits `left: calc(50% + Npx)` with N = (left_inset -
+    // right_inset)/2 > 0 — the POSITIVE stale anchor we want to outlive the
+    // switch on pre-fix code.
+    const spec = DRAWERS.left;
+    const meetingId = `e2e_drawer_bar_dockswitch_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "bar-dockswitch@videocall.rs",
+        "BarDockSwitch",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BarDockSwitch");
+      await joinMeetingFromPage(page);
+      await openDrawer(page, spec);
+
+      // Pin while on the DEFAULT bottom dock: left_inset > 0 makes the bottom
+      // dock re-center via `left: calc(50% + Npx)` with N > 0.
+      await setPinned(page, spec, true);
+
+      // Sanity (still on the bottom dock): the stale positive `left` anchor
+      // exists BEFORE the switch. This holds on BOTH pre-fix and post-fix — both
+      // emit `left: calc(50% + Npx)` for a pinned bottom dock — so the test
+      // always reaches the switch below.
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return bottomDockOffsetPx(raw);
+          },
+          { timeout: 10_000 },
+        )
+        .toBeGreaterThan(0);
+
+      // Live inner width — the same source of truth the layout uses (see
+      // `pageInnerWidth`). The stretched-bar assertion keys off this.
+      const vw = await pageInnerWidth(page);
+
+      // Switch to the RIGHT dock while STILL PINNED (on purpose — the side-dock
+      // tests above switch while unpinned to dodge this very bug).
+      await setDock(page, "Right");
+
+      // (a) The stale bottom-dock `left` must NOT survive the switch: the inline
+      // `left` is either absent ("") or explicitly `auto`. Pre-fix this value is
+      // the surviving `calc(50% + Npx)` (the interpreter restores the omitted
+      // longhand), so this assertion FAILS pre-fix. Post-fix the Right arm emits
+      // `left: auto`, so the trimmed raw value is "" or "auto".
+      await expect
+        .poll(
+          async () => {
+            const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+            return raw.trim();
+          },
+          { timeout: 10_000 },
+        )
+        .toMatch(/^(auto)?$/);
+
+      // (b) The rendered bar must be right-anchored, NOT full-width. Pre-fix the
+      // surviving `left` + the new `right` make the fixed-width bar stretch to
+      // (nearly) the viewport width, so `width < vw*0.9` FAILS. Post-fix the bar
+      // hugs the right side and is far narrower than the viewport.
+      await expect(actionBar(page)).toBeVisible();
+      await expect
+        .poll(() => boxOf(page, "nav.video-controls-container").then((b) => b.width), {
+          timeout: 10_000,
+        })
+        .toBeLessThan(vw * 0.9);
+
+      // Placement backstop (consistent with the side-dock tests): a right-docked
+      // bar sits in the right half of the viewport. A stretched (resurrected)
+      // bar would center near vw/2 and fail this too.
+      await expect
+        .poll(() => centerXOf(page, "nav.video-controls-container"), { timeout: 10_000 })
+        .toBeGreaterThan(vw * 0.5);
+    } finally {
+      await browser.close();
+    }
+  });
+
+  // =========================================================================
+  // ISSUE 2 — unpinning restores BOTH the tile grid inset AND the action bar
+  // to full width / base position. FAILS if unpin leaves a stale inset or a
+  // stale bar offset behind.
+  // =========================================================================
+  for (const side of ["left", "right"] as const) {
+    const spec = DRAWERS[side];
+    test(`issue2: ${side} unpin restores grid inset to 0 AND the bottom action bar to centered`, async ({
+      baseURL,
+    }) => {
+      test.setTimeout(90_000);
+      const uiURL = baseURL || DEFAULT_UI_URL;
+      const meetingId = `e2e_drawer_unpinbar_${side}_${Date.now()}`;
+      const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+      try {
+        const ctx = await createAuthenticatedContext(
+          browser,
+          `unpinbar-${side}@videocall.rs`,
+          `UnpinBar${side}`,
+          uiURL,
+        );
+        const page = await ctx.newPage();
+        await page.setViewportSize(DESKTOP);
+
+        await navigateToMeeting(page, meetingId, `UnpinBar${side}`);
+        await joinMeetingFromPage(page);
+        await openDrawer(page, spec);
+
+        // Pin first: grid is inset on this side and the bar is carved off-center.
+        await setPinned(page, spec, true);
+        await expect.poll(() => gridInsetPx(page, spec), { timeout: 10_000 }).toBeGreaterThan(0);
+        // The bar offset is meaningfully non-zero while pinned (default widths
+        // give |offset| > 100). Poll the ABSOLUTE offset > 1 — not `.not.toBe(0)`
+        // on the nullable parse, which would false-pass on a `null` (malformed)
+        // value. `?? 0` collapses a parse miss to 0 so it fails this `> 1`.
+        await expect
+          .poll(
+            async () => {
+              const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+              return Math.abs(bottomDockOffsetPx(raw) ?? 0);
+            },
+            { timeout: 10_000 },
+          )
+          .toBeGreaterThan(1);
+
+        // Unpin: grid inset on this side returns to 0 AND the bar returns to its
+        // base centered `calc(50% + 0px)`. Both must restore — this is the
+        // regression the fix addresses.
+        await setPinned(page, spec, false);
+        await expect.poll(() => gridInsetPx(page, spec), { timeout: 10_000 }).toBe(0);
+        await expect
+          .poll(
+            async () => {
+              const raw = await rawInlineStyle(page, "nav.video-controls-container", "left");
+              return bottomDockOffsetPx(raw);
+            },
+            { timeout: 10_000 },
+          )
+          .toBeCloseTo(0, 0);
+        // Geometric backstop: the centered bar overlaps neither drawer edge is
+        // not asserted here (overlay drawers may float over it again); instead
+        // confirm the bar is back to centered by the inline value above and is
+        // still visible/interactive.
+        await expect(actionBar(page)).toBeVisible();
+      } finally {
+        await browser.close();
+      }
+    });
+  }
+
+  // =========================================================================
+  // ISSUE 4 — resize requires a REAL grab; there is no hover-latch; the grip
+  // is visible. The first sub-test (no hover-latch after a CLEAN drag) and the
+  // second (end the drag via a LOST-CAPTURE path, then hover) are distinct:
+  //
+  //   A clean down/move/up always fires `onpointerup`, whose flush + reset to
+  //   ResizingDrawer::None is DUPLICATED in `onlostpointercapture`/
+  //   `onpointercancel` (attendants.rs LEFT ~L4985 / diagnostics.rs RIGHT
+  //   ~L1422). So a clean-pointerup-only test would still PASS if
+  //   `onlostpointercapture` were deleted — it does NOT cover lost-capture.
+  //   The lost-capture sub-test ENDS the drag WITHOUT any pointerup reaching
+  //   the handle (it releases the real pointer capture + dispatches
+  //   `lostpointercapture`, and deliberately does NOT send `pointercancel` so
+  //   nothing masks a deletion of `onlostpointercapture`), so it is the only
+  //   thing that fails if that handler is removed and the drawer latches to a
+  //   later hover.
+  // =========================================================================
+  for (const side of ["left", "right"] as const) {
+    const spec = DRAWERS[side];
+    test(`issue4: ${side} resize needs a real grab — hovering the handle after a clean drag does NOT change width (no hover-latch)`, async ({
+      baseURL,
+    }) => {
+      test.setTimeout(90_000);
+      const uiURL = baseURL || DEFAULT_UI_URL;
+      const meetingId = `e2e_drawer_nolatch_clean_${side}_${Date.now()}`;
+      const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+      try {
+        const ctx = await createAuthenticatedContext(
+          browser,
+          `nolatch-${side}@videocall.rs`,
+          `NoLatch${side}`,
+          uiURL,
+        );
+        const page = await ctx.newPage();
+        await page.setViewportSize(DESKTOP);
+
+        await navigateToMeeting(page, meetingId, `NoLatch${side}`);
+        await joinMeetingFromPage(page);
+        await openDrawer(page, spec);
+
+        const vw = await pageInnerWidth(page);
+
+        // A real, complete drag (down -> move -> UP) changes the width.
+        const targetWidth = 360;
+        const dragX = side === "left" ? targetWidth : vwMinus(vw, targetWidth);
+        await dragResizeHandleTo(page, spec, dragX);
+        await expect
+          .poll(() => containerWidthPx(page, spec), { timeout: 10_000 })
+          .toBeCloseTo(targetWidth, -1);
+        const widthAfterDrag = await containerWidthPx(page, spec);
+
+        // Now move the mouse back OVER the handle WITHOUT pressing any button,
+        // then sweep across the drawer. With the drag ended (ResizingDrawer set
+        // back to None on pointerup), the onpointermove guard (`== <side>`) is
+        // false, so NO width change may occur. A hover-latch regression (drag
+        // state never reset) would resize on this buttonless move.
+        const handle = page.locator(`#${spec.containerId} .drawer-resize-handle`);
+        const box = await handle.boundingBox();
+        if (!box) throw new Error(`${spec.side} resize handle has no bounding box`);
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        // Sweep well away from the handle (toward viewport center) — a latched
+        // handler would map this X to a brand-new width.
+        await page.mouse.move(Math.floor(vw / 2), box.y + box.height / 2);
+        await page.waitForTimeout(300);
+
+        await expect
+          .poll(() => containerWidthPx(page, spec), { timeout: 10_000 })
+          .toBeCloseTo(widthAfterDrag, 0);
+      } finally {
+        await browser.close();
+      }
+    });
+
+    test(`issue4: ${side} resize ends cleanly via LOST-CAPTURE (not pointerup) — later hover does NOT change width`, async ({
+      baseURL,
+    }) => {
+      test.setTimeout(90_000);
+      const uiURL = baseURL || DEFAULT_UI_URL;
+      const meetingId = `e2e_drawer_lostcap_${side}_${Date.now()}`;
+      const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+      try {
+        const ctx = await createAuthenticatedContext(
+          browser,
+          `lostcap-${side}@videocall.rs`,
+          `LostCap${side}`,
+          uiURL,
+        );
+        const page = await ctx.newPage();
+        await page.setViewportSize(DESKTOP);
+
+        await navigateToMeeting(page, meetingId, `LostCap${side}`);
+        await joinMeetingFromPage(page);
+        await openDrawer(page, spec);
+
+        const vw = await pageInnerWidth(page);
+        const endTarget = 360;
+        const endX = side === "left" ? endTarget : vwMinus(vw, endTarget);
+
+        // Begin a REAL captured drag (trusted pointerdown -> set_pointer_capture
+        // actually takes; pointermove changes width + sets the valid flag) but
+        // leave the button DOWN — do NOT clean-release with mouse.up.
+        const { widthDuringDrag } = await startCapturedDragNoRelease(page, spec, endX);
+        expect(widthDuringDrag).toBeCloseTo(endTarget, -1);
+
+        // End the drag via a LOST-CAPTURE path instead of a clean pointerup.
+        //
+        // WHY this is distinct coverage (CLAUDE.md Check 2): a clean down/move/UP
+        // always fires `onpointerup`, whose flush + reset-to-None is DUPLICATED in
+        // the `onlostpointercapture` handler (attendants.rs LEFT ~L4985 /
+        // diagnostics.rs RIGHT ~L1422). So a clean-pointerup test would still pass
+        // with `onlostpointercapture` deleted. This test must end WITHOUT any
+        // pointerup ever reaching the handle, so the ONLY thing that can reset the
+        // drag is the lost-capture handler.
+        //
+        // Mechanism: Dioxus-web registers `lostpointercapture` as a BUBBLING,
+        // root-delegated listener (dioxus-core-types `event_bubbles` => true; the
+        // interpreter does `root.addEventListener("lostpointercapture", handler)`
+        // with NO isTrusted gate — verified in dioxus-web 0.7.3 dom.rs/core.js).
+        // So both of the following route to the Rust `onlostpointercapture`
+        // closure -> shared `on_resize_end` -> `resizing_drawer = None`:
+        //   1) `releasePointerCapture(1)` on the handle while the real mouse
+        //      button is down — fires a REAL, TRUSTED `lostpointercapture` AND
+        //      detaches the browser capture (Chromium's mouse pointerId is 1, the
+        //      same id the Rust onpointerdown captured). Detaching capture is what
+        //      keeps the trailing real `mouse.up` from being delivered to the
+        //      handle (no masking `onpointerup`).
+        //   2) a synthetic `lostpointercapture` dispatch — a deterministic backstop
+        //      that the handler ran even if the release in (1) is a no-op.
+        // We deliberately do NOT dispatch `pointercancel` here: that would also
+        // reset the drag and would MASK a deletion of `onlostpointercapture`,
+        // defeating the point of this test. (`onpointercancel` shares the same
+        // `on_resize_end` path and is covered implicitly by the no-latch test's
+        // reset semantics.)
+        await page.locator(`#${spec.containerId} .drawer-resize-handle`).evaluate((el) => {
+          try {
+            // Chromium mouse pointerId is 1; guard in case capture isn't held.
+            (el as Element & { releasePointerCapture(id: number): void }).releasePointerCapture(1);
+          } catch {
+            /* capture already released / different id — synthetic dispatch below
+               still drives the handler. */
+          }
+          el.dispatchEvent(new PointerEvent("lostpointercapture", { bubbles: true, pointerId: 1 }));
+        });
+        await page.waitForTimeout(150);
+
+        // Release the still-down real button OFF the handle. Capture was detached
+        // above, so this real `pointerup` targets the center element, NOT the
+        // handle — the handle's `onpointerup` does not fire, so it cannot mask the
+        // lost-capture reset.
+        const vh = page.viewportSize()?.height ?? DESKTOP.height;
+        await page.mouse.move(Math.floor(vw / 2), Math.floor(vh / 2));
+        await page.mouse.up();
+        await page.waitForTimeout(150);
+
+        const widthAfterEnd = await containerWidthPx(page, spec);
+
+        // Now hover the handle (NO button down) and sweep toward center. With the
+        // drag reset by the lost-capture path, the buttonless `pointermove` hits
+        // the `== <side>` guard (now false) and changes nothing. If
+        // `onlostpointercapture` were deleted, `resizing_drawer` would still be
+        // `<side>` and this hover would resize the drawer to the sweep's client_x
+        // — so this assertion is what fails when the lost-capture fix is reverted.
+        const handle = page.locator(`#${spec.containerId} .drawer-resize-handle`);
+        const box = await handle.boundingBox();
+        if (!box) throw new Error(`${spec.side} resize handle has no bounding box`);
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.mouse.move(Math.floor(vw / 2), box.y + box.height / 2);
+        await page.waitForTimeout(300);
+
+        await expect
+          .poll(() => containerWidthPx(page, spec), { timeout: 10_000 })
+          .toBeCloseTo(widthAfterEnd, 0);
+      } finally {
+        await browser.close();
+      }
+    });
+
+    test(`issue4: ${side} resize handle shows a visible centered grip on desktop`, async ({
+      baseURL,
+    }) => {
+      test.setTimeout(90_000);
+      const uiURL = baseURL || DEFAULT_UI_URL;
+      const meetingId = `e2e_drawer_grip_${side}_${Date.now()}`;
+      const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+      try {
+        const ctx = await createAuthenticatedContext(
+          browser,
+          `grip-${side}@videocall.rs`,
+          `Grip${side}`,
+          uiURL,
+        );
+        const page = await ctx.newPage();
+        await page.setViewportSize(DESKTOP);
+
+        await navigateToMeeting(page, meetingId, `Grip${side}`);
+        await joinMeetingFromPage(page);
+        await openDrawer(page, spec);
+
+        const handleSel = `#${spec.containerId} .drawer-resize-handle`;
+        await expect(page.locator(handleSel)).toBeVisible({ timeout: 10_000 });
+
+        // The grip is a `::before` pseudo-element with a real background
+        // (var(--border)) and non-zero size (3x32px). Assert the computed
+        // ::before background is neither `none` nor fully transparent and the
+        // grip has width/height. FAILS if the grip styling is removed (a bare
+        // transparent edge with no affordance).
+        const bg = await computedPseudoStyle(page, handleSel, "::before", "background-color");
+        expect(bg).not.toBe("");
+        expect(bg).not.toBe("none");
+        expect(bg).not.toBe("transparent");
+        expect(bg).not.toBe("rgba(0, 0, 0, 0)");
+
+        const gripW = await computedPseudoStyle(page, handleSel, "::before", "width");
+        const gripH = await computedPseudoStyle(page, handleSel, "::before", "height");
+        expect(parseFloat(gripW)).toBeGreaterThan(0);
+        expect(parseFloat(gripH)).toBeGreaterThan(0);
+      } finally {
+        await browser.close();
+      }
+    });
+  }
+
+  test("issue4: resize handle (and its grip) is hidden on a mobile viewport (<568px)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const spec = DRAWERS.left;
+    const meetingId = `e2e_drawer_grip_mobile_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "grip-mobile@videocall.rs",
+        "GripMobile",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(MOBILE);
+
+      await navigateToMeeting(page, meetingId, "GripMobile");
+      await joinMeetingFromPage(page);
+      await openDrawer(page, spec);
+
+      // On mobile the drawers are forced full-width, so the handle is a no-op
+      // affordance and is `display: none !important`. The element is hidden
+      // (not interactable), so its ::before grip is gone too. FAILS if the
+      // mobile hide is removed.
+      const handleSel = `#${spec.containerId} .drawer-resize-handle`;
+      await expect(page.locator(handleSel)).toBeHidden({ timeout: 10_000 });
+      const display = await computedStyle(page, handleSel, "display");
+      expect(display).toBe("none");
+    } finally {
+      await browser.close();
+    }
+  });
+
+  // =========================================================================
+  // ISSUE 5 — both drawers can be open at the SAME time. On the OLD code,
+  // opening one drawer closed the other (DiagnosticsButton/PeerListButton each
+  // set the other's open signal to false), so the "both visible" assertion
+  // must FAIL on the pre-fix code.
+  // =========================================================================
+  test("issue5: opening the peer list then diagnostics leaves BOTH drawers visible at once", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_drawer_both_open_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "both-open@videocall.rs",
+        "BothOpen",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BothOpen");
+      await joinMeetingFromPage(page);
+
+      const left = page.locator(`#${DRAWERS.left.containerId}`);
+      const right = page.locator(`#${DRAWERS.right.containerId}`);
+
+      // Open the peer list FIRST, then diagnostics. On the old code, opening
+      // diagnostics closed the peer list — so this asserts BOTH stay visible.
+      await openDrawer(page, DRAWERS.left);
+      await expect(left).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await openDrawer(page, DRAWERS.right);
+
+      // Both visible simultaneously — the core independence guarantee.
+      await expect(left).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await expect(right).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await expect(left).toBeVisible();
+      await expect(right).toBeVisible();
+
+      // Closing ONE (via its own close button) leaves the OTHER open. Close
+      // DIAGNOSTICS first; the peer list must remain. (Each close button is
+      // inside its own drawer, so no action-bar click is needed here.)
+      await right.locator("button.close-button").click();
+      await expect(right).not.toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await expect(left).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+
+      // Reverse: re-open DIAGNOSTICS, then close the PEER LIST — diagnostics must
+      // remain. We re-open the RIGHT drawer (not the left) on purpose: at this
+      // point only the LEFT peer-list panel is open, and on desktop it sits at
+      // the left edge and does NOT occlude the centered bottom action bar, so the
+      // "Open Diagnostics" control is reachable. (Re-opening while the wide right
+      // panel was open could occlude the bar — z 9000 < the drawer's.)
+      await openDrawer(page, DRAWERS.right);
+      await expect(left).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await expect(right).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await left.locator("button.close-button").click();
+      await expect(left).not.toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await expect(right).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+    } finally {
+      await browser.close();
+    }
+  });
+
+  test("issue5: mobile both-open — diagnostics stacks above peer-list (z 9301 > 9300); each close button dismisses only its own drawer", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(90_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_drawer_both_mobile_${Date.now()}`;
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "both-mobile@videocall.rs",
+        "BothMobile",
+        uiURL,
+      );
+      const page = await ctx.newPage();
+      // Start on DESKTOP to open both drawers via the action bar, then resize to
+      // mobile. WHY: on mobile each open drawer is a full-screen fixed overlay at
+      // z-index 9300/9301, which sits ABOVE the action bar (z 9000). Once the
+      // first drawer is open it would occlude the bar, so the second drawer's
+      // "Open" button could not be clicked. The open state is component state
+      // (independent of viewport), so opening both at desktop width and then
+      // shrinking the viewport faithfully reproduces the mobile both-open layout
+      // — and the mobile `@media (max-width:568px)` z-index rules apply purely
+      // from CSS on resize.
+      await page.setViewportSize(DESKTOP);
+
+      await navigateToMeeting(page, meetingId, "BothMobile");
+      await joinMeetingFromPage(page);
+
+      const left = page.locator(`#${DRAWERS.left.containerId}`);
+      const right = page.locator(`#${DRAWERS.right.containerId}`);
+
+      // Open both (side panels at desktop width — neither covers the bar).
+      await openDrawer(page, DRAWERS.left);
+      await openDrawer(page, DRAWERS.right);
+      await expect(left).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await expect(right).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+
+      // Now shrink to a mobile viewport: both drawers stay open (component state)
+      // and the mobile CSS turns them into stacked full-screen overlays.
+      await page.setViewportSize(MOBILE);
+      await expect(left).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await expect(right).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+
+      // Deterministic stacking: diagnostics (9301) sits above peer-list (9300)
+      // so the right drawer is on top regardless of DOM order. FAILS if the
+      // mobile z-index split is removed (both would be 9300).
+      const leftZ = parseInt(
+        await computedStyle(page, `#${DRAWERS.left.containerId}`, "z-index"),
+        10,
+      );
+      const rightZ = parseInt(
+        await computedStyle(page, `#${DRAWERS.right.containerId}`, "z-index"),
+        10,
+      );
+      expect(rightZ).toBe(9301);
+      expect(leftZ).toBe(9300);
+      expect(rightZ).toBeGreaterThan(leftZ);
+
+      // Each close button dismisses ONLY its own drawer. Close diagnostics
+      // (top) first; peer-list remains.
+      await right.locator("button.close-button").click();
+      await expect(right).not.toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+      await expect(left).toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+
+      // Then close peer-list; nothing else to dismiss.
+      await left.locator("button.close-button").click();
+      await expect(left).not.toHaveClass(/\bvisible\b/, { timeout: 10_000 });
+    } finally {
+      await browser.close();
+    }
+  });
 });

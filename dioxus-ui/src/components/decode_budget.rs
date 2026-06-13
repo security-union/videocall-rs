@@ -721,9 +721,25 @@ mod tests {
         let mild_pressure = [fps_sample(mild), fps_sample(mild), fps_sample(mild)];
         // Healthy: no pressure → Hold.
         let healthy = [fps_sample(60.0), fps_sample(58.0), fps_sample(60.0)];
+        // Boundary (#1316): window median EXACTLY == FPS_SEVERE. The FPS-severe predicate is
+        // inclusive (`m <= FPS_SEVERE`) in BOTH decide_step and severe_label, so median ==
+        // FPS_SEVERE IS severe. None of the other cases sits a median exactly on the threshold, so
+        // without this one a one-sided edit of EITHER function's comparison from `<=` to `<` would
+        // still pass (the #1000 drift class). With it: under `<` that function flips median==12 to
+        // not-severe, breaking either the label assertion or the label/decide_step agreement.
+        let fps_at_severe_boundary = [
+            fps_sample(FPS_SEVERE),
+            fps_sample(FPS_SEVERE),
+            fps_sample(FPS_SEVERE),
+        ];
 
-        let cases: [(&str, &[BudgetSample], &str); 5] = [
+        let cases: [(&str, &[BudgetSample], &str); 6] = [
             ("catastrophic_fps", &catastrophic_fps, "fps_severe"),
+            (
+                "fps_at_severe_boundary",
+                &fps_at_severe_boundary,
+                "fps_severe",
+            ),
             ("extreme_longtask", &extreme_longtask, "longtask_severe"),
             ("combined", &combined, "fps+longtask_severe"),
             ("mild_pressure", &mild_pressure, "unknown_severe"),

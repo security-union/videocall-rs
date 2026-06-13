@@ -233,6 +233,18 @@ pub struct EncoderBitrateController {
     /// survives past the oscillation window (a good bet clears the flap memory).
     layer_probe_penalty_ms: f64,
 
+    /// Monotonic count of UNION-CAP sheds — ticks where the relay layer-union cap
+    /// reduced the active layer count below what backpressure alone left this tick
+    /// (issue #1294). A union-cap shed is demand-driven (every receiver asked for
+    /// fewer layers), NOT a flap, so it is deliberately NOT penalized (see the
+    /// shed-classification block in [`tick`](Self::tick)); but it was also SILENT,
+    /// leaving field logs unable to tell a union-driven shed from a
+    /// backpressure/congestion one. This counter — plus the paired
+    /// `AQ_LAYER_SHED: cause=union_cap` log line — makes the path observable so the
+    /// next incident reveals which shed path actually fired. Observability ONLY: it
+    /// changes no control decision.
+    union_cap_shed_total: u64,
+
     /// The highest active-layer count this controller has EARNED at runtime and
     /// is entitled to recover back to (issue #1140 / #1141). Distinct from the
     /// device ceiling (`simulcast_layer_count`): the ramp starts active at 1 and
@@ -351,6 +363,7 @@ impl EncoderBitrateController {
             last_probe_add_at_ms: None,
             layer_probe_penalty_until_ms: 0.0,
             layer_probe_penalty_ms: LAYER_PROBE_PENALTY_BASE_MS,
+            union_cap_shed_total: 0,
             earned_active_ceiling: 1,
         }
     }
@@ -788,6 +801,29 @@ impl EncoderBitrateController {
                 // flap paths classify identically and stay in lockstep.
                 self.arm_probe_penalty_if_oscillation(now, "backpressure");
             }
+            // #1294 observability: detect the UNION-CAP portion of this tick's
+            // shed — active fell BELOW what the backpressure block left, i.e. the
+            // relay layer-union cap (not backpressure) removed the rung. This is
+            // demand-driven (every receiver asked for fewer layers), NOT a flap, so
+            // it is intentionally NOT penalized above; but it was SILENT, so field
+            // logs could not tell it apart from a backpressure/congestion shed.
+            // Count + log it (observability ONLY — no control effect) so the next
+            // incident reveals which shed path actually fired. See #1294.
+            let active_now = self.quality_manager.active_layer_count();
+            if active_now < active_after_backpressure {
+                self.union_cap_shed_total = self.union_cap_shed_total.saturating_add(1);
+                log::info!(
+                    "AQ_LAYER_SHED: cause=union_cap active {} -> {} (relay layer-union cap={}; demand-driven, not penalized) total={}",
+                    active_after_backpressure,
+                    active_now,
+                    if self.union_requested_layer_cap == usize::MAX {
+                        "uncapped".to_string()
+                    } else {
+                        self.union_requested_layer_cap.to_string()
+                    },
+                    self.union_cap_shed_total,
+                );
+            }
             // Any shed clears the in-flight probe marker: a union-only shed is not
             // an oscillation (so we did not arm above), but the probed layer is
             // gone either way, so there is nothing left to penalize on a later
@@ -1136,6 +1172,13 @@ impl EncoderBitrateController {
     /// Test/observability accessor.
     pub fn union_requested_layer_cap(&self) -> usize {
         self.union_requested_layer_cap
+    }
+
+    /// Monotonic count of union-cap sheds observed (issue #1294). Each increment
+    /// is paired with an `AQ_LAYER_SHED: cause=union_cap` log line. Observability
+    /// accessor; the value never influences a control decision.
+    pub fn union_cap_shed_total(&self) -> u64 {
+        self.union_cap_shed_total
     }
 
     /// Set the user's SEND layer-ceiling cap from the performance panel (the
@@ -3297,6 +3340,95 @@ mod tests {
             "a union-only shed must not penalize the probe — it must re-climb on the FIRST \
              eligible window (got {}), not wait out a (wrongly-armed) penalty backoff",
             controller.active_layer_count(),
+        );
+    }
+
+    /// #1294 observability: a UNION-CAP shed must increment `union_cap_shed_total`
+    /// (so field logs / the counter can tell it apart from a backpressure or
+    /// congestion shed), while a pure BACKPRESSURE shed must NOT touch that
+    /// counter. The two halves are independent mutation guards:
+    ///   * count on the wrong branch / never → the union assertion (0→1) trips;
+    ///   * count on ANY shed → the backpressure assertion (stays unchanged) trips.
+    #[test]
+    fn test_union_cap_shed_is_counted_distinct_from_backpressure_1294() {
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = controller_with_clock(500, &clock);
+        controller.set_simulcast_ceiling_start_at_base(3);
+
+        // Earn 2 layers under clear.
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
+        for _ in 0..6 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(controller.active_layer_count(), 2);
+        assert_eq!(
+            controller.union_cap_shed_total(),
+            0,
+            "no union-cap shed has happened yet"
+        );
+
+        // UNION-ONLY shed: union shrinks to the base while backpressure stays
+        // clear (depth 0), so the rung is removed PURELY by the union cap.
+        controller.observe_union_requested_layer(0);
+        t += probe_step_ms();
+        tick_at(&mut controller, &clock, t, 0);
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "union suppressed to base"
+        );
+        assert_eq!(
+            controller.union_cap_shed_total(),
+            1,
+            "a union-cap shed must be COUNTED (#1294 observability)"
+        );
+
+        // Reopen the union to the full ladder and re-earn at least 2 layers under
+        // clear (the probe may climb to 3; either is fine for the shed below).
+        controller.observe_union_requested_layer(2);
+        for _ in 0..8 {
+            t += probe_step_ms();
+            tick_at(&mut controller, &clock, t, 0);
+            if controller.active_layer_count() >= 2 {
+                break;
+            }
+        }
+        let active_pre_backpressure = controller.active_layer_count();
+        assert!(
+            active_pre_backpressure >= 2,
+            "re-earned >= 2 layers (got {active_pre_backpressure})"
+        );
+        let union_count_before_backpressure = controller.union_cap_shed_total();
+
+        // BACKPRESSURE shed: the union is fail-open (full ladder, non-binding at
+        // this active count), so sustained HIGH encoder-queue depth sheds the top
+        // layer via BACKPRESSURE, not the union cap. This must NOT increment the
+        // union-cap counter.
+        let step =
+            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 500.0;
+        let mut backpressure_shed = false;
+        for _ in 0..8 {
+            t += step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+            if controller.active_layer_count() < active_pre_backpressure {
+                backpressure_shed = true;
+                break;
+            }
+        }
+        assert!(
+            backpressure_shed,
+            "sustained backpressure must shed a layer (active now {})",
+            controller.active_layer_count()
+        );
+        assert_eq!(
+            controller.union_cap_shed_total(),
+            union_count_before_backpressure,
+            "a BACKPRESSURE shed must NOT increment the union-cap counter (#1294)"
         );
     }
 

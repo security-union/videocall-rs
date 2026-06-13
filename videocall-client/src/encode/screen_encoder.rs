@@ -2978,16 +2978,18 @@ impl ScreenEncoder {
                             last_keyframe_emit_ms = Some(now);
                         }
                         opts.set_key_frame(want_keyframe);
+                        // Log ONLY on emit, matching camera (issue #1347). Under the
+                        // peek (`load`) pattern the request flag stays set across the
+                        // whole hold window, so an `else if pli_pending` branch here
+                        // would fire on EVERY frame of the hold (string-allocating,
+                        // unbounded under sustained bursts) rather than once. A held
+                        // PLI is observable via the eventual "forcing keyframe" log at
+                        // window expiry; a per-window counter (not a per-frame log) is
+                        // the right tool if hold visibility is later needed.
                         if force_pli {
                             log::info!(
                                 "ScreenEncoder: forcing keyframe at frame {} (PLI)",
                                 screen_frame_counter
-                            );
-                        } else if pli_pending {
-                            log::info!(
-                                "ScreenEncoder: PLI keyframe held at frame {} (within {:.0}ms cooldown, will fire at window expiry)",
-                                screen_frame_counter,
-                                ENCODER_PLI_COOLDOWN_MS,
                             );
                         }
 

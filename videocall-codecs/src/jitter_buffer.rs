@@ -69,7 +69,12 @@ const DELAY_SMOOTHING_FACTOR: f64 = 0.99;
 /// exceed a few frames (~100ms). If a backup persists long enough that the head-of-line frame ages
 /// past `MAX_PLAYOUT_AGE_MS`, the freshness deadline — which runs *before* this gate every tick —
 /// skips to live, so backpressure can never turn into unbounded lag.
-const DECODE_QUEUE_HIGH_WATER_MARK: u32 = 3;
+///
+/// This is the single source of truth for the queue-depth threshold: `worker_decoder.rs` derives
+/// its `WEBCODECS_QUEUE_WARN_DEPTH` observability threshold from this constant so the two can't
+/// silently desync (the warn uses `>` while this gate uses `>=` — see that constant for why the
+/// operator difference is intentional).
+pub const DECODE_QUEUE_HIGH_WATER_MARK: u32 = 3;
 
 /// The maximum number of frames the buffer will hold before rejecting new ones.
 const MAX_BUFFER_SIZE: usize = 200;
@@ -236,7 +241,7 @@ impl<T> JitterBuffer<T> {
             // can never accumulate unbounded lag. Decoders with no observable queue (native/mock)
             // report depth 0 and are never throttled.
             if self.decoder.decode_queue_depth() >= DECODE_QUEUE_HIGH_WATER_MARK {
-                println!(
+                log::trace!(
                     "[JB_POLL] Decode-queue backpressure: holding release (queue depth >= {DECODE_QUEUE_HIGH_WATER_MARK})."
                 );
                 break;
@@ -1282,6 +1287,12 @@ mod tests {
         // Pin the decoder at the high-water mark so backpressure is active for the rest of the test.
         queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
 
+        // Baseline drop count captured while the decoder is ALREADY pinned but BEFORE the stall, so
+        // the delta below counts every freshness eviction that happens under backpressure —
+        // including the one that fires inside `insert_frame(5)`'s own end-of-insert poll, not only
+        // the explicit poll below. (Capturing after the inserts would read 0 and miss it.)
+        let dropped_before_stall = jb.get_dropped_frames_count();
+
         // A stall: stale deltas accumulate, then a fresh keyframe arrives much later.
         let stall_arrival = start + 200;
         jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), stall_arrival);
@@ -1293,22 +1304,50 @@ mod tests {
         let now = keyframe_arrival + 50;
         jb.find_and_move_continuous_frames(now);
 
-        // Freshness ran first: the stale deltas are evicted even though the decoder is backed up.
+        // Snapshot the state produced by that single under-backpressure tick into locals BEFORE the
+        // drain below, so the assertions are about the backpressured tick specifically and do not
+        // depend on being sequenced ahead of the drain (issue #1326 hardening). Asserting against
+        // the live buffer after the drain would pass spuriously: releasing keyframe 5 via
+        // gap-recovery runs `drop_frames_before(5)`, which removes deltas 2/3 anyway — so a
+        // post-drain `!contains_key(&2)` cannot tell whether the *freshness deadline* evicted them
+        // (gate runs second, correct) or the *keyframe-recovery drop* did (gate ran first, the
+        // regression). Capturing here freezes the distinction.
+        let evicted_2 = !jb.buffered_frames.contains_key(&2);
+        let evicted_3 = !jb.buffered_frames.contains_key(&3);
+        let dropped_by_freshness = jb.get_dropped_frames_count() - dropped_before_stall;
+        let keyframe_held = jb.buffered_frames.contains_key(&5);
+        let decoded_under_backpressure = decoded_frames.lock().unwrap().len();
+        let playout_after_poll = jb.last_decoded_sequence_number;
+
+        // Freshness ran FIRST, under backpressure: it evicted exactly the two stale deltas while the
+        // decoder was pinned at the HWM and nothing had been released yet. Because the keyframe is
+        // still held (not released), the only thing that could have dropped 2/3 at this point is the
+        // freshness deadline — not the keyframe-recovery drop, which only fires once 5 is released.
+        // Mutation coverage: moving the gate before `enforce_freshness_deadline` makes the gate
+        // `break` before freshness runs → 0 dropped, 2/3 retained (fails); removing the gate lets
+        // keyframe 5 release immediately despite the full queue → decoded == 1, playout advances
+        // (fails). Both hold regardless of where these asserts sit relative to the drain.
         assert!(
-            !jb.buffered_frames.contains_key(&2),
-            "stale delta must be evicted by the freshness deadline even under backpressure"
+            evicted_2 && evicted_3,
+            "stale deltas must be evicted by the freshness deadline even under backpressure"
         );
-        assert!(!jb.buffered_frames.contains_key(&3));
-        // Backpressure holds the fresh keyframe: not decoded yet, still buffered, playout unchanged.
-        assert!(
-            decoded_frames.lock().unwrap().is_empty(),
+        assert_eq!(
+            dropped_by_freshness, 2,
+            "freshness must evict exactly the two stale deltas while the decoder is pinned at the HWM"
+        );
+        assert_eq!(
+            decoded_under_backpressure, 0,
             "the skip-to-live keyframe is gated by backpressure until the decoder drains"
         );
         assert!(
-            jb.buffered_frames.contains_key(&5),
+            keyframe_held,
             "the fresh keyframe is retained, awaiting decoder drain"
         );
-        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        assert_eq!(
+            playout_after_poll,
+            Some(1),
+            "playout must not advance while backpressure holds the keyframe"
+        );
 
         // Decoder drains -> the keyframe releases and skip-to-live completes.
         queue_depth.store(0, Ordering::SeqCst);

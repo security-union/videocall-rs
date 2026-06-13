@@ -66,10 +66,64 @@ const DELAY_SMOOTHING_FACTOR: f64 = 0.99;
 ///
 /// Chosen as 3: large enough to keep the decoder continuously fed (no underrun/stutter at ~30fps,
 /// where a healthy queue sits at 0-1) yet small enough that the second-stage backlog can never
-/// exceed a few frames (~100ms). If a backup persists long enough that the head-of-line frame ages
-/// past `MAX_PLAYOUT_AGE_MS`, the freshness deadline — which runs *before* this gate every tick —
-/// skips to live, so backpressure can never turn into unbounded lag.
-const DECODE_QUEUE_HIGH_WATER_MARK: u32 = 3;
+/// exceed a few frames (~100ms).
+///
+/// Scope of the "no unbounded lag" guarantee (issue #1324). This gate bounds **buffer/memory** lag,
+/// not playout recovery in every case:
+/// - **Buffer/memory lag is always bounded.** If a backup persists long enough that the
+///   head-of-line frame ages past `MAX_PLAYOUT_AGE_MS`, the freshness deadline — which runs
+///   *before* this gate every tick — skips to live (or evicts a stale keyframe-less backlog), and
+///   `MAX_BUFFER_SIZE` caps the buffer regardless. So the jitter buffer can never grow unbounded
+///   behind a slow decoder.
+/// - **Playout recovery has a wedged-decoder caveat.** The freshness deadline only fires when the
+///   *head-of-line frame* is itself stale. If the decoder is truly wedged — `decode_queue_depth()`
+///   pinned at/above this mark, never draining, while still reporting `state() == Configured` —
+///   this gate holds release every tick, *including* a fresh skip-to-live keyframe whose own
+///   head-of-line age is below `MAX_PLAYOUT_AGE_MS`. The deadline never sees a stale head, and
+///   because `decode()` is never called the `decode()`-error → `reset_pipeline()` path in
+///   `worker_decoder.rs` never runs either, so playout could freeze on the last-good frame.
+///   `MAX_BACKPRESSURE_HOLD_MS` + the held-too-long escape hatch in
+///   `find_and_move_continuous_frames` closes that gap: once release has been held by this gate
+///   longer than that threshold while a releasable frame waits, the buffer force-releases the head
+///   frame and, if that does not unwedge the decoder, escalates to `Decodable::reset()`, so a
+///   wedged decoder recovers internally within a bounded time instead of freezing indefinitely.
+///
+/// This is the single source of truth for the queue-depth threshold: `worker_decoder.rs` derives
+/// its `WEBCODECS_QUEUE_WARN_DEPTH` observability threshold from this constant so the two can't
+/// silently desync (the warn uses `>` while this gate uses `>=` — see that constant for why the
+/// operator difference is intentional).
+pub const DECODE_QUEUE_HIGH_WATER_MARK: u32 = 3;
+
+/// Held-too-long backpressure escape-hatch threshold (issue #1324), in wall-clock milliseconds.
+///
+/// While the release-side gate (`DECODE_QUEUE_HIGH_WATER_MARK`) holds a *releasable* frame because
+/// the decoder queue is at/above the high-water mark, we track how long the gate has been holding
+/// it *continuously* (the `backpressure_hold_since_ms` clock, started at the first such tick and
+/// cleared on any release / non-hold / flush). If that elapsed time exceeds this threshold the gate
+/// is bypassed once (escape hatch) to break a genuinely wedged decoder — see
+/// `find_and_move_continuous_frames`.
+///
+/// Measured from the first gate-hold, NOT the last release: during a legitimate stall (waiting for
+/// a keyframe, or the freshness deadline working through a backlog) there may be no release for
+/// seconds, but that is not the gate wedging playout, so the clock only runs while the gate is
+/// actually holding a frame it could otherwise release.
+///
+/// Wall-clock, not a tick counter: the worker polls every ~10ms today, but a backgrounded tab
+/// clamps/pauses `setInterval`, so a fixed held-tick count would mean wildly different real time
+/// depending on focus. Measuring elapsed wall-clock makes the threshold tick-rate-independent.
+///
+/// Relationship to `MAX_PLAYOUT_AGE_MS` (1800ms): deliberately set ABOVE it (2000ms) so the normal
+/// stale-backlog path always gets its chance first. The freshness deadline fires whenever the
+/// *head-of-line* frame ages past 1800ms and handles every case it can see (skip-to-live / evict).
+/// This escape only needs to fire for the case the deadline structurally *cannot* see — a wedged
+/// decoder holding back a frame whose own head-of-line age is still fresh (< 1800ms). Sitting at
+/// 2000ms guarantees we never pre-empt the deadline's cheaper skip-to-live for a merely-slow
+/// decoder, and only the truly-wedged case (where the deadline never fires) reaches the escape.
+///
+/// Field-tunable: raising it makes the escape more conservative (longer freeze tolerated before
+/// forcing recovery); lowering it toward `MAX_PLAYOUT_AGE_MS` risks the escape racing the freshness
+/// deadline on a merely-slow decoder. Keep it strictly above `MAX_PLAYOUT_AGE_MS`.
+const MAX_BACKPRESSURE_HOLD_MS: f64 = 2000.0;
 
 /// The maximum number of frames the buffer will hold before rejecting new ones.
 const MAX_BUFFER_SIZE: usize = 200;
@@ -114,6 +168,20 @@ pub struct JitterBuffer<T> {
     /// A counter for consecutive old frames to detect stream corruption.
     num_consecutive_old_frames: u64,
 
+    /// Wall-clock time (ms) at which the release-side backpressure gate *began* continuously
+    /// holding a releasable frame (issue #1324). `None` whenever the gate is not the thing blocking
+    /// release — it is cleared on every successful release, on `flush()`, and on any tick the gate
+    /// does not hold a releasable frame. While the gate holds a releasable frame across consecutive
+    /// ticks this stays pinned at the first such tick, so `current_time - hold_since` measures how
+    /// long the gate has *continuously* held — the wedged-decoder signal.
+    ///
+    /// Deliberately measured from the first gate-hold, NOT from the last successful release: during
+    /// a legitimate network stall there may be no release for seconds while the buffer waits for a
+    /// keyframe or the freshness deadline does its work — that is not a wedged decoder and must not
+    /// trip the escape. See `MAX_BACKPRESSURE_HOLD_MS` and the escape hatch in
+    /// `find_and_move_continuous_frames`.
+    backpressure_hold_since_ms: Option<u128>,
+
     /// Rolling estimate of the SOURCE frame interval in ms (issue #1252). Derived from the
     /// inter-arrival spacing of *released* frames (which preserves source cadence), NOT the
     /// decoder's drain rate. Feeds the stage-2 term of the playout-latency metric.
@@ -137,6 +205,7 @@ impl<T> JitterBuffer<T> {
             target_playout_delay_ms: MIN_PLAYOUT_DELAY_MS,
             dropped_frames_count: 0,
             num_consecutive_old_frames: 0,
+            backpressure_hold_since_ms: None,
             source_frame_interval_ms: DEFAULT_SOURCE_FRAME_INTERVAL_MS,
             last_released_arrival_time_ms: None,
             decoder,
@@ -251,6 +320,11 @@ impl<T> JitterBuffer<T> {
                 continue;
             }
 
+            // Identify the frame the decoder could release next *before* consulting the gate, so the
+            // wedged-decoder escape hatch below can tell whether a releasable frame is actually
+            // waiting (vs. an empty buffer / waiting-for-keyframe, where holding is correct).
+            let next_decodable_key = self.next_decodable_key();
+
             // Release-side backpressure (issue #1024). The freshness deadline above has already had
             // its chance to evict a stale backlog this tick; only AFTER that do we throttle the
             // release of fresh frames. If the WebCodecs decoder's own (unpaced) queue is at/above
@@ -261,52 +335,63 @@ impl<T> JitterBuffer<T> {
             // can never accumulate unbounded lag. Decoders with no observable queue (native/mock)
             // report depth 0 and are never throttled.
             if self.decoder.decode_queue_depth() >= DECODE_QUEUE_HIGH_WATER_MARK {
-                println!(
-                    "[JB_POLL] Decode-queue backpressure: holding release (queue depth >= {DECODE_QUEUE_HIGH_WATER_MARK})."
+                // The gate would normally `break` and hold this tick.
+                if next_decodable_key.is_none() {
+                    // Nothing is releasable (empty buffer / waiting for a keyframe). The gate is not
+                    // what's blocking playout, so the wedged-decoder clock must NOT run — clear it so
+                    // a later genuine hold starts fresh. Then hold.
+                    self.backpressure_hold_since_ms = None;
+                    log::trace!(
+                        "[JB_POLL] Decode-queue backpressure: holding (queue depth >= {DECODE_QUEUE_HIGH_WATER_MARK}, nothing releasable)."
+                    );
+                    break;
+                }
+
+                // A releasable frame exists but the gate is holding it. Start (or continue) the
+                // continuous-hold clock; `current_time - hold_since` is how long the gate has held a
+                // releasable frame back-to-back.
+                let held_since = *self
+                    .backpressure_hold_since_ms
+                    .get_or_insert(current_time_ms);
+                let held_for_ms = current_time_ms.saturating_sub(held_since) as f64;
+
+                // Held-too-long escape hatch (issue #1324). A *truly wedged* decoder keeps its queue
+                // pinned at/above the mark forever while still reporting `Configured`. When the
+                // freshness deadline keeps the head fresh (e.g. it repeatedly skips to a newly
+                // arrived keyframe), it never sees a stale head to evict, and because `decode()` is
+                // never called the `decode()`-error -> `reset_pipeline()` path never fires either —
+                // playout would freeze on the last-good frame indefinitely. Once the gate has held a
+                // releasable frame continuously past MAX_BACKPRESSURE_HOLD_MS, force recovery.
+                if held_for_ms > MAX_BACKPRESSURE_HOLD_MS {
+                    // Escape path. First force-release the head decodable frame, bypassing the gate
+                    // once: this unblocks a merely-slow decoder cheaply, and if the forced
+                    // `decode()` errors (a decoder that rejects frames) the existing
+                    // `worker_decoder.rs` error path runs `reset_pipeline()`. If the decoder is hard
+                    // wedged (accepts the chunk but never drains, never errors), force-release alone
+                    // cannot help, so we ALSO escalate to `Decodable::reset()` to tear the pipeline
+                    // down. `escape_release_then_reset` clears the hold clock via the release, so the
+                    // escape does not re-fire every tick while recovery completes.
+                    log::warn!(
+                        "[JB_POLL] Backpressure held a releasable frame for {held_for_ms:.0}ms (> {MAX_BACKPRESSURE_HOLD_MS:.0}ms) with the decode queue pinned >= {DECODE_QUEUE_HIGH_WATER_MARK}; decoder appears wedged. Force-releasing the head frame and resetting the decoder pipeline (issue #1324)."
+                    );
+                    // The escape force-releases the head frame and escalates to a decoder reset, all
+                    // independent of the normal gated release path. Break afterwards: a reset has
+                    // been requested (deferred via setTimeout(0) in the WebCodecs impl), so there is
+                    // nothing more to do this tick — the next tick re-evaluates from the reset state.
+                    self.escape_release_then_reset(&mut frames_were_moved);
+                    break;
+                }
+                log::trace!(
+                    "[JB_POLL] Decode-queue backpressure: holding release (queue depth >= {DECODE_QUEUE_HIGH_WATER_MARK}, held {held_for_ms:.0}ms)."
                 );
                 break;
             }
 
-            let next_decodable_key: Option<u64> = if let Some(last_seq) =
-                self.last_decoded_sequence_number
-            {
-                // CASE 1: We are in a continuous stream. Look for the next frame.
-                let next_continuous_seq = last_seq + 1;
-                if self.buffered_frames.contains_key(&next_continuous_seq) {
-                    log::trace!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
-                    Some(next_continuous_seq)
-                } else {
-                    // CASE 2: Gap detected. Look for the next keyframe after the gap.
-                    let keyframe = self
-                        .buffered_frames
-                        .iter()
-                        .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
-                        .map(|(&s, _)| s);
-                    if let Some(k) = keyframe {
-                        log::trace!(
-                            "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
-                        );
-                    } else {
-                        log::trace!(
-                            "[JB_POLL] Gap after {last_seq}. No subsequent keyframe found."
-                        );
-                    }
-                    keyframe
-                }
-            } else {
-                // CASE 3: We have never decoded. We MUST start with a keyframe.
-                let keyframe = self
-                    .buffered_frames
-                    .iter()
-                    .find(|(_, f)| f.is_keyframe())
-                    .map(|(&s, _)| s);
-                if let Some(k) = keyframe {
-                    log::trace!("[JB_POLL] Seeking first keyframe. Found: {k}");
-                } else {
-                    log::trace!("[JB_POLL] Seeking first keyframe. None found in buffer.");
-                }
-                keyframe
-            };
+            // The gate is NOT holding this tick (decode queue below the high-water mark), so the
+            // continuous-hold clock must not run. Clear it; if release stalls again later it will
+            // restart from that new hold. (Release also clears it, but a frame held only by the
+            // playout-delay lower bound — not the gate — must reset it too.)
+            self.backpressure_hold_since_ms = None;
 
             if let Some(key) = next_decodable_key {
                 if let Some(frame) = self.buffered_frames.get(&key) {
@@ -319,25 +404,7 @@ impl<T> JitterBuffer<T> {
                     );
 
                     if is_ready {
-                        let frame_to_move = self.buffered_frames.remove(&key).unwrap();
-
-                        // If we're jumping to a keyframe to recover, drop everything before it.
-                        if frame_to_move.is_keyframe() {
-                            let is_first_frame = self.last_decoded_sequence_number.is_none();
-                            let is_gap_recovery = self
-                                .last_decoded_sequence_number
-                                .is_some_and(|last_seq| key > last_seq + 1);
-
-                            if is_first_frame || is_gap_recovery {
-                                log::debug!(
-                                    "[JITTER_BUFFER] Keyframe {key} recovery. Dropping frames before it."
-                                );
-                                self.drop_frames_before(key);
-                            }
-                        }
-
-                        self.push_to_decoder(frame_to_move);
-                        self.last_decoded_sequence_number = Some(key);
+                        self.release_frame(key);
                         frames_were_moved = true;
                         found_frame_to_move = true;
                     }
@@ -354,6 +421,99 @@ impl<T> JitterBuffer<T> {
         if frames_were_moved {
             // NOTE: No need to notify a condvar anymore. The decoder manages its own thread.
         }
+    }
+
+    /// Identifies the frame the decoder could release next, without removing it: the next
+    /// continuous sequence number (CASE 1), or, across a gap (CASE 2) or before the first decode
+    /// (CASE 3), the next/first buffered keyframe. Returns `None` when nothing is releasable yet
+    /// (empty buffer, or waiting for a keyframe).
+    fn next_decodable_key(&self) -> Option<u64> {
+        if let Some(last_seq) = self.last_decoded_sequence_number {
+            // CASE 1: We are in a continuous stream. Look for the next frame.
+            let next_continuous_seq = last_seq + 1;
+            if self.buffered_frames.contains_key(&next_continuous_seq) {
+                log::trace!("[JB_POLL] Seeking next continuous frame: {next_continuous_seq}");
+                Some(next_continuous_seq)
+            } else {
+                // CASE 2: Gap detected. Look for the next keyframe after the gap.
+                let keyframe = self
+                    .buffered_frames
+                    .iter()
+                    .find(|(&s, f)| s > next_continuous_seq && f.is_keyframe())
+                    .map(|(&s, _)| s);
+                if let Some(k) = keyframe {
+                    log::trace!(
+                        "[JB_POLL] Gap after {last_seq}. Seeking next keyframe. Found: {k}"
+                    );
+                } else {
+                    log::trace!("[JB_POLL] Gap after {last_seq}. No subsequent keyframe found.");
+                }
+                keyframe
+            }
+        } else {
+            // CASE 3: We have never decoded. We MUST start with a keyframe.
+            let keyframe = self
+                .buffered_frames
+                .iter()
+                .find(|(_, f)| f.is_keyframe())
+                .map(|(&s, _)| s);
+            if let Some(k) = keyframe {
+                log::trace!("[JB_POLL] Seeking first keyframe. Found: {k}");
+            } else {
+                log::trace!("[JB_POLL] Seeking first keyframe. None found in buffer.");
+            }
+            keyframe
+        }
+    }
+
+    /// Releases the buffered frame `key` to the decoder: handles keyframe gap/restart recovery
+    /// (dropping pre-keyframe frames), pushes to the decoder, and advances
+    /// `last_decoded_sequence_number`. Shared by the normal release path and the held-too-long
+    /// escape hatch so both have identical release semantics.
+    fn release_frame(&mut self, key: u64) {
+        let frame_to_move = self
+            .buffered_frames
+            .remove(&key)
+            .expect("release_frame called with a key not present in the buffer");
+
+        // If we're jumping to a keyframe to recover, drop everything before it.
+        if frame_to_move.is_keyframe() {
+            let is_first_frame = self.last_decoded_sequence_number.is_none();
+            let is_gap_recovery = self
+                .last_decoded_sequence_number
+                .is_some_and(|last_seq| key > last_seq + 1);
+
+            if is_first_frame || is_gap_recovery {
+                log::debug!("[JITTER_BUFFER] Keyframe {key} recovery. Dropping frames before it.");
+                self.drop_frames_before(key);
+            }
+        }
+
+        self.push_to_decoder(frame_to_move);
+        self.last_decoded_sequence_number = Some(key);
+    }
+
+    /// Held-too-long backpressure escape hatch (issue #1324). Called once when the gate has held
+    /// release past `MAX_BACKPRESSURE_HOLD_MS` with a frame waiting and the decode queue pinned at
+    /// the high-water mark. Force-releases the head decodable frame (bypassing the gate and the
+    /// playout-delay check — we are recovering, not pacing) and escalates to `Decodable::reset()`
+    /// to tear down a hard-wedged decoder that would accept the chunk but never drain.
+    ///
+    /// Ordering note: `reset()` on the WebCodecs decoder defers its jitter-buffer reset via
+    /// `setTimeout(0)`, so it runs *after* this call stack unwinds. The force-released frame is the
+    /// last frame fed to the doomed decoder instance; whether it drains or not, the pipeline reset
+    /// then starts a clean session that resumes from the next keyframe.
+    fn escape_release_then_reset(&mut self, frames_were_moved: &mut bool) {
+        if let Some(key) = self.next_decodable_key() {
+            // Force-release the head decodable frame, bypassing both the gate and the playout-delay
+            // readiness check. `release_frame` -> `push_to_decoder` clears the continuous-hold clock
+            // so the escape does not re-fire next tick.
+            self.release_frame(key);
+            *frames_were_moved = true;
+        }
+        // Escalate: reset the decoder pipeline for the hard-wedge case where the forced decode
+        // neither drains the queue nor errors. Default no-op for native/mock decoders.
+        self.decoder.reset();
     }
 
     /// Freshness-deadline enforcement (issue #1020).
@@ -485,12 +645,19 @@ impl<T> JitterBuffer<T> {
     }
 
     /// Pushes a single frame to the shared decodable queue.
+    ///
+    /// This is the single release point, so it also clears the backpressure continuous-hold clock
+    /// (`backpressure_hold_since_ms`): a successful release means the gate is NOT currently the
+    /// thing holding playout back, so the held-too-long escape-hatch elapsed measurement (issue
+    /// #1324) restarts from the next hold. A later transient hold therefore cannot inherit stale
+    /// elapsed time from before this release.
     fn push_to_decoder(&mut self, frame: FrameBuffer) {
         let seq = frame.sequence_number();
         // Record source cadence BEFORE the frame is moved into the decoder (issue #1252).
         self.record_release_cadence(frame.arrival_time_ms);
         log::trace!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
+        self.backpressure_hold_since_ms = None;
     }
 
     /// Folds a released frame's arrival time into the rolling source frame-interval estimate
@@ -545,6 +712,10 @@ impl<T> JitterBuffer<T> {
         self.drop_all_frames();
         self.last_decoded_sequence_number = None;
         self.num_consecutive_old_frames = 0;
+        // Reset the backpressure continuous-hold clock (issue #1324) so a later transient hold
+        // starts its escape-hatch timer fresh and cannot inherit stale elapsed time from before the
+        // flush.
+        self.backpressure_hold_since_ms = None;
         // Reset the release-cadence anchor so the first post-flush release does not measure a delta
         // across the flush gap (issue #1252). The smoothed interval estimate itself persists — the
         // source cadence does not change across a flush.
@@ -662,10 +833,12 @@ mod tests {
     /// A mock decoder for testing purposes. It stores decoded frames in a shared Vec, and exposes a
     /// shared, test-controllable `queue_depth` so tests can simulate a backed-up WebCodecs decoder
     /// and exercise the release-side backpressure gate (issue #1024). Depth defaults to 0, so every
-    /// pre-existing test sees no backpressure.
+    /// pre-existing test sees no backpressure. A shared `reset_count` makes the wedged-decoder
+    /// escape-hatch reset (issue #1324) observable.
     struct MockDecoder {
         decoded_frames: Arc<Mutex<Vec<DecodedFrame>>>,
         queue_depth: Arc<AtomicU32>,
+        reset_count: Arc<AtomicU32>,
     }
 
     // This impl is for native targets
@@ -690,6 +863,9 @@ mod tests {
         }
         fn decode_queue_depth(&self) -> u32 {
             self.queue_depth.load(Ordering::SeqCst)
+        }
+        fn reset(&self) {
+            self.reset_count.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -716,6 +892,9 @@ mod tests {
         fn decode_queue_depth(&self) -> u32 {
             self.queue_depth.load(Ordering::SeqCst)
         }
+        fn reset(&self) {
+            self.reset_count.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     impl MockDecoder {
@@ -723,15 +902,18 @@ mod tests {
             Self {
                 decoded_frames,
                 queue_depth: Arc::new(AtomicU32::new(0)),
+                reset_count: Arc::new(AtomicU32::new(0)),
             }
         }
         fn new_with_vec_and_depth(
             decoded_frames: Arc<Mutex<Vec<DecodedFrame>>>,
             queue_depth: Arc<AtomicU32>,
+            reset_count: Arc<AtomicU32>,
         ) -> Self {
             Self {
                 decoded_frames,
                 queue_depth,
+                reset_count,
             }
         }
     }
@@ -754,14 +936,33 @@ mod tests {
         Arc<Mutex<Vec<DecodedFrame>>>,
         Arc<AtomicU32>,
     ) {
+        let (jb, frames, depth, _reset) = create_test_jitter_buffer_with_queue_and_reset();
+        (jb, frames, depth)
+    }
+
+    /// Return type of `create_test_jitter_buffer_with_queue_and_reset`: the jitter buffer plus
+    /// shared handles to (decoded frames, simulated queue depth, reset count).
+    type JbWithQueueAndReset = (
+        JitterBuffer<crate::decoder::DecodedFrame>,
+        Arc<Mutex<Vec<DecodedFrame>>>,
+        Arc<AtomicU32>,
+        Arc<AtomicU32>,
+    );
+
+    /// Like `create_test_jitter_buffer_with_queue_depth`, but also returns a handle to the mock
+    /// decoder's reset counter so a test can observe the wedged-decoder escape-hatch reset
+    /// (issue #1324).
+    fn create_test_jitter_buffer_with_queue_and_reset() -> JbWithQueueAndReset {
         let decoded_frames = Arc::new(Mutex::new(Vec::new()));
         let queue_depth = Arc::new(AtomicU32::new(0));
+        let reset_count = Arc::new(AtomicU32::new(0));
         let mock_decoder = Box::new(MockDecoder::new_with_vec_and_depth(
             decoded_frames.clone(),
             queue_depth.clone(),
+            reset_count.clone(),
         ));
         let jitter_buffer = JitterBuffer::new(mock_decoder);
-        (jitter_buffer, decoded_frames, queue_depth)
+        (jitter_buffer, decoded_frames, queue_depth, reset_count)
     }
 
     fn create_test_frame(seq: u64, frame_type: FrameType) -> VideoFrame {
@@ -1415,6 +1616,12 @@ mod tests {
         // Pin the decoder at the high-water mark so backpressure is active for the rest of the test.
         queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
 
+        // Baseline drop count captured while the decoder is ALREADY pinned but BEFORE the stall, so
+        // the delta below counts every freshness eviction that happens under backpressure —
+        // including the one that fires inside `insert_frame(5)`'s own end-of-insert poll, not only
+        // the explicit poll below. (Capturing after the inserts would read 0 and miss it.)
+        let dropped_before_stall = jb.get_dropped_frames_count();
+
         // A stall: stale deltas accumulate, then a fresh keyframe arrives much later.
         let stall_arrival = start + 200;
         jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), stall_arrival);
@@ -1426,22 +1633,50 @@ mod tests {
         let now = keyframe_arrival + 50;
         jb.find_and_move_continuous_frames(now);
 
-        // Freshness ran first: the stale deltas are evicted even though the decoder is backed up.
+        // Snapshot the state produced by that single under-backpressure tick into locals BEFORE the
+        // drain below, so the assertions are about the backpressured tick specifically and do not
+        // depend on being sequenced ahead of the drain (issue #1326 hardening). Asserting against
+        // the live buffer after the drain would pass spuriously: releasing keyframe 5 via
+        // gap-recovery runs `drop_frames_before(5)`, which removes deltas 2/3 anyway — so a
+        // post-drain `!contains_key(&2)` cannot tell whether the *freshness deadline* evicted them
+        // (gate runs second, correct) or the *keyframe-recovery drop* did (gate ran first, the
+        // regression). Capturing here freezes the distinction.
+        let evicted_2 = !jb.buffered_frames.contains_key(&2);
+        let evicted_3 = !jb.buffered_frames.contains_key(&3);
+        let dropped_by_freshness = jb.get_dropped_frames_count() - dropped_before_stall;
+        let keyframe_held = jb.buffered_frames.contains_key(&5);
+        let decoded_under_backpressure = decoded_frames.lock().unwrap().len();
+        let playout_after_poll = jb.last_decoded_sequence_number;
+
+        // Freshness ran FIRST, under backpressure: it evicted exactly the two stale deltas while the
+        // decoder was pinned at the HWM and nothing had been released yet. Because the keyframe is
+        // still held (not released), the only thing that could have dropped 2/3 at this point is the
+        // freshness deadline — not the keyframe-recovery drop, which only fires once 5 is released.
+        // Mutation coverage: moving the gate before `enforce_freshness_deadline` makes the gate
+        // `break` before freshness runs → 0 dropped, 2/3 retained (fails); removing the gate lets
+        // keyframe 5 release immediately despite the full queue → decoded == 1, playout advances
+        // (fails). Both hold regardless of where these asserts sit relative to the drain.
         assert!(
-            !jb.buffered_frames.contains_key(&2),
-            "stale delta must be evicted by the freshness deadline even under backpressure"
+            evicted_2 && evicted_3,
+            "stale deltas must be evicted by the freshness deadline even under backpressure"
         );
-        assert!(!jb.buffered_frames.contains_key(&3));
-        // Backpressure holds the fresh keyframe: not decoded yet, still buffered, playout unchanged.
-        assert!(
-            decoded_frames.lock().unwrap().is_empty(),
+        assert_eq!(
+            dropped_by_freshness, 2,
+            "freshness must evict exactly the two stale deltas while the decoder is pinned at the HWM"
+        );
+        assert_eq!(
+            decoded_under_backpressure, 0,
             "the skip-to-live keyframe is gated by backpressure until the decoder drains"
         );
         assert!(
-            jb.buffered_frames.contains_key(&5),
+            keyframe_held,
             "the fresh keyframe is retained, awaiting decoder drain"
         );
-        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        assert_eq!(
+            playout_after_poll,
+            Some(1),
+            "playout must not advance while backpressure holds the keyframe"
+        );
 
         // Decoder drains -> the keyframe releases and skip-to-live completes.
         queue_depth.store(0, Ordering::SeqCst);
@@ -1450,6 +1685,305 @@ mod tests {
         assert_eq!(queue.len(), 1);
         assert_eq!(queue[0].sequence_number, 5);
         assert_eq!(jb.last_decoded_sequence_number, Some(5));
+    }
+
+    // --- Wedged-decoder held-too-long escape hatch (issue #1324) ---
+
+    /// A truly wedged decoder — queue pinned at/above the HWM, never draining — must NOT freeze
+    /// playout forever, even in the case the freshness deadline structurally cannot see: the
+    /// head-of-line frame stays FRESH (< MAX_PLAYOUT_AGE_MS) because the deadline keeps skipping to
+    /// a newly-arrived keyframe each tick, yet the gate holds that fresh keyframe every tick. Once
+    /// release has been held past MAX_BACKPRESSURE_HOLD_MS with a frame waiting, the escape hatch
+    /// force-releases the head frame AND resets the decoder pipeline.
+    ///
+    /// This faithfully reproduces the #1324 mechanism: fresh keyframes keep arriving (so the head is
+    /// continuously refreshed and never trips the 1800ms freshness deadline), but the wedged decoder
+    /// never drains, so backpressure holds release indefinitely. Only the held-too-long escape can
+    /// break it.
+    ///
+    /// Mutation coverage: deleting the escape-hatch branch leaves the gate `break`ing every tick, so
+    /// nothing is ever released and `reset()` is never called -> both final assertions fail.
+    #[test]
+    fn wedged_decoder_escape_hatch_force_releases_and_resets() {
+        let (mut jb, decoded_frames, queue_depth, reset_count) =
+            create_test_jitter_buffer_with_queue_and_reset();
+
+        // Establish a normal release (mirrors a real stream that was healthy before the decoder
+        // wedged). The continuous-hold clock starts only once the gate actually holds, below.
+        let start = 100_000u128;
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), start);
+        jb.find_and_move_continuous_frames(start + 100);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+        assert_eq!(decoded_frames.lock().unwrap().len(), 1);
+        let pre_wedge_release = start + 100;
+        decoded_frames.lock().unwrap().clear();
+
+        // The decoder now wedges: queue pinned at the HWM forever.
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
+
+        // Tick every 200ms. On each tick a FRESH keyframe arrives at a big sequence gap from the
+        // last decoded seq, so the freshness deadline keeps skipping to it (dropping the previous
+        // stale keyframe) and the head-of-line keyframe is therefore always recently arrived — its
+        // head-of-line age stays well under MAX_PLAYOUT_AGE_MS (1800ms) and the freshness deadline
+        // never *releases* anything (it only refreshes the head, since the gate holds release every
+        // tick). The continuous-hold clock (started at the first gate-hold tick) climbs past
+        // MAX_BACKPRESSURE_HOLD_MS. Only the held-too-long escape can break the wedge.
+        //
+        // `pre_wedge_release` is a CONSERVATIVE lower bound for the false-positive guard: the real
+        // hold clock starts at the first gate-hold (one tick later), so `now - pre_wedge_release`
+        // overestimates the held time. Using it to gate the "must not have fired yet" assertion can
+        // therefore only ever skip the assertion early — it never asserts no-fire when the escape
+        // could legitimately have fired.
+        let mut now = pre_wedge_release + 200;
+        let mut keyframe_seq = 100u64; // big gap from seq 1 -> always treated as gap recovery
+        let mut fired = false;
+        // Run long enough that the hold clock crosses MAX_BACKPRESSURE_HOLD_MS with margin, then
+        // some headroom to observe the escape.
+        for _ in 0..20 {
+            keyframe_seq += 1;
+            // Fresh keyframe arrives "now" (age 0 at this tick).
+            jb.insert_frame(create_test_frame(keyframe_seq, FrameType::KeyFrame), now);
+            jb.find_and_move_continuous_frames(now);
+
+            let held_upper_bound = (now - pre_wedge_release) as f64;
+            let released = !decoded_frames.lock().unwrap().is_empty();
+            let reset_fired = reset_count.load(Ordering::SeqCst) >= 1;
+
+            if !fired && held_upper_bound <= MAX_BACKPRESSURE_HOLD_MS {
+                // Even by the overestimate we are under the threshold: the escape must not have
+                // fired yet (no false positive).
+                assert!(
+                    !released,
+                    "escape hatch must not fire before MAX_BACKPRESSURE_HOLD_MS (held <= {held_upper_bound}ms)"
+                );
+                assert!(
+                    !reset_fired,
+                    "no reset before the threshold (held <= {held_upper_bound}ms)"
+                );
+            }
+            if released && reset_fired {
+                fired = true;
+            }
+            now += 200;
+        }
+
+        // By now held >> MAX_BACKPRESSURE_HOLD_MS. The escape hatch must have fired: a frame was
+        // force-released past the still-pinned queue AND the decoder pipeline was reset.
+        assert!(
+            !decoded_frames.lock().unwrap().is_empty(),
+            "wedged decoder must recover: a frame must be force-released past the threshold"
+        );
+        assert!(
+            reset_count.load(Ordering::SeqCst) >= 1,
+            "wedged decoder must recover: the pipeline must be reset past the threshold"
+        );
+    }
+
+    /// No false positive: a decoder that is merely SLOW — pinned at the HWM transiently but draining
+    /// below it within MAX_BACKPRESSURE_HOLD_MS — must NEVER trigger the escape hatch (no forced
+    /// release while gated, no reset). Normal backpressure must remain exactly as in #1024.
+    ///
+    /// Mutation coverage: lowering MAX_BACKPRESSURE_HOLD_MS below the drain window, or removing the
+    /// "held longer than threshold" guard, would fire the escape here and reset the decoder -> the
+    /// `reset_count == 0` assertion fails.
+    #[test]
+    fn slow_decoder_draining_within_threshold_never_escapes() {
+        let (mut jb, decoded_frames, queue_depth, reset_count) =
+            create_test_jitter_buffer_with_queue_and_reset();
+        let mut time = 1000u128;
+
+        // Healthy first release; the gate is not holding, so no hold clock runs yet.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), time);
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+        assert_eq!(decoded_frames.lock().unwrap().len(), 1);
+
+        // Decoder backs up at the HWM. Frame 2 waits behind the gate (this starts the hold clock).
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), time);
+
+        // Hold for a while but stay UNDER MAX_BACKPRESSURE_HOLD_MS (and under MAX_PLAYOUT_AGE_MS so
+        // freshness also stays out). 1000ms of hold across several ticks.
+        for _ in 0..5 {
+            time += 200;
+            jb.find_and_move_continuous_frames(time);
+        }
+        // Still gated: nothing released past the first frame, and crucially NO reset fired.
+        assert_eq!(
+            decoded_frames.lock().unwrap().len(),
+            1,
+            "a merely-slow decoder must stay gated, not force-released"
+        );
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "the escape hatch must not reset a decoder that is only transiently slow"
+        );
+
+        // The decoder drains within the threshold -> normal release resumes, still no reset.
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK - 1, Ordering::SeqCst);
+        time += 100;
+        jb.find_and_move_continuous_frames(time);
+        let queue = decoded_frames.lock().unwrap();
+        assert_eq!(queue.len(), 2, "frame 2 releases once the decoder drains");
+        assert_eq!(queue[1].sequence_number, 2);
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "no reset should ever occur for a slow-but-draining decoder"
+        );
+    }
+
+    /// The continuous-hold clock must RESET on a successful (gate-open, drain-then-release) release
+    /// so a later transient hold does not inherit stale elapsed time. Sequence: a long gated hold
+    /// (kept just under the threshold), then a drain that releases a frame, then a brief later hold
+    /// — the brief hold must not escape because the clock restarted at the intervening release.
+    ///
+    /// Mutation coverage: this pins the post-release reset behavior. The drain path clears the clock
+    /// via the gate-open path (`backpressure_hold_since_ms = None` after the gate check) AND via
+    /// `push_to_decoder` on the release; removing BOTH clears makes the second hold measure elapsed
+    /// from the first hold (1100ms) -> by the 3150ms poll that is 2050ms > the threshold, so the
+    /// escape fires and resets the decoder, failing the `reset_count == 0` assertion. (The dedicated
+    /// `escape_force_release_does_not_refire_next_tick` test below isolates the `push_to_decoder`
+    /// clear specifically, under a pinned queue where the gate-open clear cannot fire.)
+    #[test]
+    fn successful_release_resets_held_clock() {
+        let (mut jb, decoded_frames, queue_depth, reset_count) =
+            create_test_jitter_buffer_with_queue_and_reset();
+
+        // Healthy first release at t=1000.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100);
+        assert_eq!(decoded_frames.lock().unwrap().len(), 1);
+
+        // A long gated hold, but stay strictly UNDER the threshold so the escape never fires.
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 1100);
+        // Hold ~1700ms (just under 2000ms), keeping the head fresh: frame 2's arrival was 1100; we
+        // must keep head-age < 1800ms, so poll at <= 1100+1800. 1100 + 1700 = 2800 keeps head-age
+        // 1700ms (< 1800) and held 1700ms (< 2000). No escape.
+        jb.find_and_move_continuous_frames(2800);
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "no escape while under both thresholds"
+        );
+
+        // Decoder drains -> frame 2 releases at t=2850. This CLEARS the continuous-hold clock.
+        queue_depth.store(0, Ordering::SeqCst);
+        jb.find_and_move_continuous_frames(2850);
+        assert_eq!(decoded_frames.lock().unwrap().len(), 2);
+
+        // A NEW brief hold begins right after. Because the hold clock was cleared at the 2850
+        // release, it restarts at the next gate-hold (the insert poll at 2860), so a short hold of
+        // only ~300ms must NOT escape (it would if the clock had inherited the earlier long hold).
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), 2860);
+        jb.find_and_move_continuous_frames(3150); // held only 300ms since the 2850 release
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "a brief hold after a successful release must not inherit stale elapsed time"
+        );
+        // Frame 3 stays buffered (gated), not force-released.
+        assert_eq!(decoded_frames.lock().unwrap().len(), 2);
+        assert!(jb.buffered_frames.contains_key(&3));
+    }
+
+    /// The escape's force-release must reset the continuous-hold clock so the escape does NOT
+    /// re-fire on the very next tick. This isolates the `push_to_decoder` clear: throughout this
+    /// test the queue stays PINNED at the HWM, so the gate-open clear can never run — only
+    /// `push_to_decoder` (reached via the escape's force-release) can reset the clock.
+    ///
+    /// Mutation coverage: if `push_to_decoder` did not clear `backpressure_hold_since_ms`, after the
+    /// first escape the clock would still read from the original hold; the next tick (queue still
+    /// pinned, a fresh frame waiting) would see elapsed still > the threshold and escape AGAIN
+    /// immediately, so two ticks 10ms apart would each fire a reset. The assertion that the second
+    /// (immediately-following) tick adds NO new reset fails under that mutation.
+    #[test]
+    fn escape_force_release_does_not_refire_next_tick() {
+        let (mut jb, decoded_frames, queue_depth, reset_count) =
+            create_test_jitter_buffer_with_queue_and_reset();
+
+        // Healthy first release, then wedge the decoder (queue pinned for the rest of the test).
+        let start = 50_000u128;
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), start);
+        jb.find_and_move_continuous_frames(start + 100);
+        assert_eq!(decoded_frames.lock().unwrap().len(), 1);
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
+
+        // Drive the wedge until the escape fires exactly once. Fresh keyframes keep the head fresh
+        // (so freshness never releases anything); the hold clock starts at the first gate-hold and
+        // climbs past the threshold.
+        let mut now = start + 300;
+        let mut seq = 100u64;
+        while reset_count.load(Ordering::SeqCst) == 0 {
+            seq += 1;
+            jb.insert_frame(create_test_frame(seq, FrameType::KeyFrame), now);
+            jb.find_and_move_continuous_frames(now);
+            now += 200;
+            assert!(now < start + 10_000, "escape should have fired by now");
+        }
+        let resets_after_first_escape = reset_count.load(Ordering::SeqCst);
+        assert_eq!(
+            resets_after_first_escape, 1,
+            "escape fires exactly once first"
+        );
+
+        // The escape just force-released a frame (clearing the hold clock) WITHOUT the queue ever
+        // dropping below the HWM. Immediately poll again 10ms later with the queue STILL pinned and
+        // a fresh releasable frame present. If the clock was reset by the force-release, this brief
+        // hold (10ms) is far under the threshold and the escape must NOT re-fire.
+        seq += 1;
+        jb.insert_frame(create_test_frame(seq, FrameType::KeyFrame), now);
+        jb.find_and_move_continuous_frames(now);
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            resets_after_first_escape,
+            "escape must not re-fire on the very next tick — the force-release reset the hold clock"
+        );
+    }
+
+    /// `flush()` must reset the continuous-hold clock so a hold that begins after a flush starts
+    /// fresh and cannot inherit elapsed time accrued before it.
+    ///
+    /// Mutation coverage: if `flush()` did not clear `backpressure_hold_since_ms`, the post-flush
+    /// hold would still measure elapsed from the pre-flush hold (started t=1100) -> by the t=3200
+    /// poll that is 2100ms > the threshold and the escape would fire, failing the `reset_count == 0`
+    /// assertion. With the clear, the post-flush hold starts at t=3000 (only 200ms by t=3200).
+    #[test]
+    fn flush_resets_held_clock() {
+        let (mut jb, decoded_frames, queue_depth, reset_count) =
+            create_test_jitter_buffer_with_queue_and_reset();
+
+        // Healthy first release.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 1000);
+        jb.find_and_move_continuous_frames(1100);
+        assert_eq!(decoded_frames.lock().unwrap().len(), 1);
+
+        // Begin a gated hold so the continuous-hold clock starts (at the insert poll, t=1100).
+        queue_depth.store(DECODE_QUEUE_HIGH_WATER_MARK, Ordering::SeqCst);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 1100);
+
+        // Flush mid-hold: this must clear the hold clock.
+        jb.flush();
+        assert!(jb.buffered_frames.is_empty());
+
+        // After the flush a fresh stream starts: a new keyframe arrives while the decoder is still
+        // wedged. The new hold begins at the insert poll (t=3000). Poll at t=3200: with the
+        // flush-clear the hold is only 200ms old (no escape); WITHOUT the clear the clock still
+        // reads from the pre-flush hold at t=1100 -> 2100ms > threshold -> escape fires. So this
+        // isolates the flush-clear: any escape here can only come from inherited pre-flush time.
+        jb.insert_frame(create_test_frame(10, FrameType::KeyFrame), 3000);
+        jb.find_and_move_continuous_frames(3200);
+
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "a hold beginning after flush must not inherit pre-flush elapsed time"
+        );
+        // The fresh keyframe stays gated (queue still pinned), not force-released.
+        assert!(jb.buffered_frames.contains_key(&10));
     }
 
     // --- Playout-latency metric (issue #1252) ---

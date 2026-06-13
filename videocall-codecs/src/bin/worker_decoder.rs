@@ -281,9 +281,9 @@ impl Decodable for WebDecoder {
             // Release-side backpressure (issue #1024) now caps this: the jitter buffer reads the
             // live depth via `Decodable::decode_queue_depth()` (implemented below) *before*
             // releasing a frame and holds new frames while the queue is at/above its high-water
-            // mark, so under healthy pacing this depth stays around that mark and the warn below
-            // should rarely fire. If it still fires, the decoder genuinely can't keep up and the
-            // freshness deadline will skip to live. This warn is kept purely for observability.
+            // mark, so under healthy pacing this depth stays around that mark and the debug log
+            // below should rarely fire. If it still fires, the decoder genuinely can't keep up and
+            // the freshness deadline will skip to live. This log is kept purely for observability.
             let decode_queue_size = decoder.decode_queue_size();
             if decode_queue_size > WEBCODECS_QUEUE_WARN_DEPTH {
                 log::debug!(
@@ -351,6 +351,19 @@ impl Decodable for WebDecoder {
             .map(|d| d.decode_queue_size())
             .unwrap_or(0)
     }
+
+    /// Wedged-decoder recovery escalation (issue #1324). Tears down the current `VideoDecoder` and
+    /// schedules the jitter-buffer reset on the next event-loop tick. Called by the jitter buffer's
+    /// escape hatch when backpressure has held release past `MAX_BACKPRESSURE_HOLD_MS` and a
+    /// force-release did not break the wedge. `reset_pipeline()` defers the buffer reset via
+    /// `setTimeout(0)`, so calling it from inside the release loop is safe — the deferred
+    /// `reset_jitter_buffer()` runs after the current call stack unwinds.
+    fn reset(&self) {
+        console::warn_1(
+            &"[WORKER] Backpressure escape hatch: resetting decoder pipeline (wedged decoder, issue #1324)".into(),
+        );
+        self.reset_pipeline();
+    }
 }
 
 // Thread-local storage for the jitter buffer and related state
@@ -371,10 +384,17 @@ thread_local! {
 }
 
 const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
-/// Depth of the WebCodecs `VideoDecoder` internal queue above which we log a backlog warning.
-/// At ~30fps a healthy queue stays at 0-1; sustained depth here means frames are being shoveled
-/// faster than the decoder paints them (issue #1020, second buffer stage).
-const WEBCODECS_QUEUE_WARN_DEPTH: u32 = 3;
+/// Depth of the WebCodecs `VideoDecoder` internal queue above which we log a backlog (debug) line.
+/// Derived from the release-side gate's high-water mark (the single source of truth) so the two
+/// can't silently desync. The gate (`jitter_buffer.rs`) HOLDS release at
+/// `>= DECODE_QUEUE_HIGH_WATER_MARK`, so under healthy pacing the depth sits right at the mark;
+/// this observability log intentionally uses a strict `>` (below) so it fires only when the depth
+/// climbs ABOVE the mark — i.e. the decoder accepted more than the gate would normally let
+/// accumulate, the genuine "can't keep up" signal (issue #1020, second buffer stage). At ~30fps a
+/// healthy queue stays at 0-1. The `>` vs gate `>=` operator difference is intentional, not an
+/// off-by-one.
+const WEBCODECS_QUEUE_WARN_DEPTH: u32 =
+    videocall_codecs::jitter_buffer::DECODE_QUEUE_HIGH_WATER_MARK;
 const DIAGNOSTIC_EMIT_INTERVAL_MS: f64 = 1000.0; // Emit diagnostics at 1 Hz (once per second)
 
 #[wasm_bindgen(start)]

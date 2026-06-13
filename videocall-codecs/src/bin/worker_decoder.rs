@@ -347,6 +347,19 @@ impl Decodable for WebDecoder {
             .map(|d| d.decode_queue_size())
             .unwrap_or(0)
     }
+
+    /// Wedged-decoder recovery escalation (issue #1324). Tears down the current `VideoDecoder` and
+    /// schedules the jitter-buffer reset on the next event-loop tick. Called by the jitter buffer's
+    /// escape hatch when backpressure has held release past `MAX_BACKPRESSURE_HOLD_MS` and a
+    /// force-release did not break the wedge. `reset_pipeline()` defers the buffer reset via
+    /// `setTimeout(0)`, so calling it from inside the release loop is safe — the deferred
+    /// `reset_jitter_buffer()` runs after the current call stack unwinds.
+    fn reset(&self) {
+        console::warn_1(
+            &"[WORKER] Backpressure escape hatch: resetting decoder pipeline (wedged decoder, issue #1324)".into(),
+        );
+        self.reset_pipeline();
+    }
 }
 
 // Thread-local storage for the jitter buffer and related state

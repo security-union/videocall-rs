@@ -35,6 +35,20 @@ message VideoStats {
   double frames_buffered = 2;
   uint64 frames_decoded = 3;
   uint64 bitrate_kbps = 4;
+
+  // Buffered video playout latency (#1252): how far behind live this peer's
+  // decoded video is, in milliseconds. Spans BOTH receive pipeline stages —
+  // the jitter-buffer backlog (stage 1, the dominant arrival-time span) plus
+  // the WebCodecs decoder queue (stage 2, bounded by #1024's high-water mark).
+  // The receiver only reports a nonzero value while fps_received > 0, so a
+  // DecodeBudget-paused or hidden tile (stale buffered frame, no decode) can't
+  // masquerade as latency. 0 = at live; sustained >1800ms = the #1252 lag.
+  double playout_latency_ms = 5;
+  // Stage-1 attribution of playout_latency_ms: just the jitter-buffer backlog
+  // span (newest − next-to-release arrival time). Emitted separately so a
+  // dashboard can tell whether the #1024 release-side gate REMOVED the backlog
+  // or merely RELOCATED it (total stays high while this drops => relocated).
+  double playout_stage1_span_ms = 6;
 }
 
 message PeerStats {

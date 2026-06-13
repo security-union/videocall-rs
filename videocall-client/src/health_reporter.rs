@@ -879,6 +879,19 @@ impl HealthReporter {
                                 video_stats["keyframe_requests_per_sec"] = json!(kf);
                             }
                         }
+                        // Buffered video playout latency (#1252): total across both receive stages
+                        // and its stage-1 attribution. Stored in the camera/screen video_stats
+                        // bucket; folded into the health packet only when fps_received > 0.
+                        "playout_latency_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_latency_ms"] = json!(v);
+                            }
+                        }
+                        "playout_stage1_span_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_stage1_span_ms"] = json!(v);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1743,6 +1756,21 @@ impl HealthReporter {
                 }
                 if let Some(v) = video.get("bitrate_kbps").and_then(|v| v.as_u64()) {
                     vs.bitrate_kbps = v;
+                }
+
+                // Buffered video playout latency (#1252). Guard #1 (load-bearing): only fold the
+                // span when fps_received > 0. A DecodeBudget-paused or hidden tile keeps a stale
+                // frame buffered but decodes nothing, so its arrival-time span would read as
+                // latency even though the user isn't waiting on it. fps_received > 0 means frames
+                // are actually being received/decoded, so the lag is real. When fps == 0 the proto
+                // field stays at its 0.0 default, which the server publishes as "at live".
+                if vs.fps_received > 0.0 {
+                    if let Some(v) = video.get("playout_latency_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_latency_ms = v;
+                    }
+                    if let Some(v) = video.get("playout_stage1_span_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_stage1_span_ms = v;
+                    }
                 }
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 

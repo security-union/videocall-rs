@@ -549,6 +549,28 @@ lazy_static! {
     )
     .expect("Failed to create keyframe_requests_per_sec metric");
 
+    /// Per-peer buffered video playout latency in ms (#1252): how far behind live a receiver's
+    /// decoded video is, spanning the jitter-buffer backlog (stage 1) + WebCodecs decoder queue
+    /// (stage 2). Reported only while the tile is actively receiving (fps_received > 0); 0 = at
+    /// live. Sustained > 1800ms is the #1252 audio-ahead-of-video lag.
+    pub static ref VIDEO_PLAYOUT_LATENCY_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_playout_latency_ms",
+        "Per-peer buffered video playout latency in ms (how far behind live); spans jitter-buffer backlog + decoder queue. Sustained >1800ms => #1252 lag",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_playout_latency_ms metric");
+
+    /// Per-peer stage-1 attribution of `videocall_video_playout_latency_ms` (#1252): the
+    /// jitter-buffer backlog span alone. Lets a dashboard tell whether the #1024 release-side gate
+    /// REMOVED the backlog (total drops with this) or merely RELOCATED it into the decoder queue
+    /// (total stays high while this drops).
+    pub static ref VIDEO_PLAYOUT_STAGE1_SPAN_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_playout_stage1_span_ms",
+        "Per-peer jitter-buffer backlog span in ms — stage-1 attribution of videocall_video_playout_latency_ms",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_playout_stage1_span_ms metric");
+
     /// Call quality score (0-100, min of audio and video)
     pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_call_quality_score",

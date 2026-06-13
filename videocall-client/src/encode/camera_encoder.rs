@@ -540,9 +540,12 @@ pub struct CameraEncoder {
     /// stale loop and spawns a new one, the new loop has set the canary/bound-id
     /// synchronously; the stale loop then exits LATER and must NOT clobber them.
     /// The epoch mismatch makes the stale loop's clear a no-op, so exactly the
-    /// latest loop owns the canary. The per-frame exit check also reads it, so a
-    /// superseded loop self-terminates on its next frame regardless of
-    /// enabled/switching.
+    /// latest loop owns the canary. The acquire-phase and per-frame exit checks
+    /// also read it, so a superseded loop self-terminates before binding / on its
+    /// next frame even if `enabled` was flipped back true for the newer loop.
+    /// Epoch is the authoritative supersede signal — the supersede guards do NOT
+    /// consult `switching`, which only flags that a switch was *requested* (the
+    /// newest loop is that request's response and must not abort on it).
     loop_epoch: Arc<AtomicU64>,
 }
 
@@ -723,6 +726,31 @@ fn pli_keyframe_allowed(now_ms: f64, last_keyframe_emit_ms: Option<f64>, cooldow
 #[inline]
 fn frame_is_healthy(base_ok: bool) -> bool {
     base_ok
+}
+
+/// Whether a spawned encode loop has been superseded and must abandon its work
+/// WITHOUT binding the shared `<video>` element (issue #1295).
+///
+/// A loop is superseded iff it has been disabled (`!enabled`) OR a newer
+/// `start()` bumped the loop epoch past the value this loop captured at spawn
+/// (`loop_epoch != my_epoch`). The epoch is the SOLE supersede authority.
+///
+/// `switching` (the "a switch was requested" flag set by `EncoderState::select()`
+/// while enabled) is deliberately NOT a parameter and NOT consulted: the newest
+/// loop IS that request's response and must OWN the switch, not self-abort on it.
+/// On a real switch, `start()`'s running-guard tears the old loop down and bumps
+/// the epoch, so the stale loop is already caught by `loop_epoch != my_epoch`
+/// here; the newest loop sees its own epoch and proceeds to bind. Reading
+/// `switching` in this predicate was the initial-join dark-square bug — the loop
+/// that should bind killed itself because a post-permission devicechange had
+/// raised `switching`. Taking no `switching` arg makes that regression
+/// impossible to reintroduce without changing this signature.
+///
+/// Pure function so it can be unit-tested without a live camera / encoder; the
+/// acquire-phase and per-frame supersede guards both call it.
+#[inline]
+fn loop_is_superseded(enabled: bool, loop_epoch: u64, my_epoch: u64) -> bool {
+    !enabled || loop_epoch != my_epoch
 }
 
 /// A minimal, decoder-free view of one simulcast layer for formatting the
@@ -1972,8 +2000,8 @@ impl CameraEncoder {
         // task captures `my_epoch` and clears canary/bound-id on exit ONLY if it
         // is still the latest generation (epoch unchanged) — a superseded loop's
         // clear is a no-op, so it can never clobber a newer loop's state. The
-        // per-frame exit check also reads the epoch, so a superseded loop
-        // self-terminates on its next frame.
+        // per-frame and acquire exit checks also read the epoch, so a superseded
+        // loop self-terminates on its next frame / before binding.
         //
         // `fetch_add` returns the PREVIOUS value, so `my_epoch` = previous + 1 =
         // the value now stored; a later `loop_epoch.load() == my_epoch` is true
@@ -1984,6 +2012,17 @@ impl CameraEncoder {
             .wrapping_add(1);
         *self.loop_device_id.borrow_mut() = Some(device_id.clone());
         self.loop_running.store(true, Ordering::Release);
+        // Clear `switching` HERE, at the epoch commit (issue #1295). `switching`
+        // is set by select() to REQUEST a switch; the guard above already
+        // consumed it (read into `switch_requested`) to decide whether to tear
+        // the old loop down. This new loop, with its freshly-bumped epoch, IS the
+        // response to that request, so the request is now satisfied and the flag
+        // must be lowered. The supersede guards (acquire + per-frame) no longer
+        // read `switching` — they rely on the epoch — so this is the single,
+        // authoritative place (besides stop()) that lowers it: select() raises,
+        // commit (here) and stop() clear. Leaving it raised cannot strand a loop
+        // any more, but clearing it keeps the next start()'s guard read honest.
+        self.state.switching.store(false, Ordering::Release);
         let loop_running = self.loop_running.clone();
         let loop_device_id = self.loop_device_id.clone();
         let loop_epoch = self.loop_epoch.clone();
@@ -2018,14 +2057,12 @@ impl CameraEncoder {
                     if let Some(cb) = &on_error {
                         cb.emit(msg);
                     }
-                    // Reset `switching` on this task-exit (issue #1295), like the
-                    // per-frame and acquire-bail exits: a latched switching=true
-                    // left here would stick the next loop off (see the acquire-bail
-                    // comment). Safe — the legitimate next loop stop()s first.
-                    switching.store(false, Ordering::Release);
                     // Clear only if still the latest loop (issue #1295 epoch
                     // guard): a superseded loop must not clobber a newer one's
-                    // canary/bound-id.
+                    // canary/bound-id. `switching` is NOT touched here: it is
+                    // owned by select() (raise) and start()'s commit / stop()
+                    // (clear), and no supersede guard reads it any more, so a
+                    // task-exit reset would be dead code.
                     if loop_epoch.load(Ordering::Acquire) == my_epoch {
                         loop_running.store(false, Ordering::Release);
                         *loop_device_id.borrow_mut() = None;
@@ -2091,15 +2128,12 @@ impl CameraEncoder {
                         if let Some(cb) = &on_error {
                             cb.emit("Camera encoder failed after repeated restarts".into());
                         }
-                        // Reset `switching` on this task-exit (issue #1295), like
-                        // the per-frame and acquire-bail exits: a latched
-                        // switching=true left here would stick the next loop off
-                        // (see the acquire-bail comment). Safe — the legitimate
-                        // next loop stop()s first.
-                        switching.store(false, Ordering::Release);
                         // Clear only if still the latest loop (issue #1295 epoch
                         // guard): a superseded loop must not clobber a newer
-                        // one's canary/bound-id.
+                        // one's canary/bound-id. `switching` is NOT touched here:
+                        // it is owned by select() (raise) and start()'s commit /
+                        // stop() (clear), and no supersede guard reads it any
+                        // more, so a task-exit reset would be dead code.
                         if loop_epoch.load(Ordering::Acquire) == my_epoch {
                             loop_running.store(false, Ordering::Release);
                             *loop_device_id.borrow_mut() = None;
@@ -2181,34 +2215,33 @@ impl CameraEncoder {
                 // Acquire-phase supersede check (issue #1295). getUserMedia is an
                 // await point: while THIS loop was acquiring (cold start OR a
                 // `'restart` re-acquisition), a newer start() may have superseded
-                // us — directly (epoch bumped) or because we were disabled/asked
-                // to switch. `set_src_object` below binds the SHARED <video>
-                // element, so a stale loop binding here is the exact wrong-device
-                // race. Bail BEFORE binding: stop the just-acquired tracks so the
-                // camera is released, then return. The epoch-guarded clear is a
-                // no-op when superseded (a newer loop owns the canary), so we
-                // never clobber the latest loop's state.
-                if !enabled.load(Ordering::Acquire)
-                    || switching.load(Ordering::Acquire)
-                    || loop_epoch.load(Ordering::Acquire) != my_epoch
-                {
+                // us. `set_src_object` below binds the SHARED <video> element, so
+                // a stale loop binding here is the exact wrong-device race. Bail
+                // BEFORE binding: stop the just-acquired tracks so the camera is
+                // released, then return. The epoch-guarded clear is a no-op when
+                // superseded (a newer loop owns the canary), so we never clobber
+                // the latest loop's state.
+                //
+                // Supersede is decided by `epoch` and `enabled` ONLY — NOT by
+                // `switching` — via the shared `loop_is_superseded` predicate (the
+                // same one the per-frame guard uses). `switching` means "a switch
+                // was requested"; the LATEST loop IS the response to that request
+                // and must OWN it, not self-abort on it. A real switch tears the
+                // old loop down and bumps the epoch in start()'s guard/commit, so
+                // the stale loop is already caught by `loop_epoch != my_epoch`
+                // here (and again at the per-frame check); the newest loop — the
+                // one that should bind — sees its own epoch and a `switching`
+                // already cleared by the commit, so it proceeds. Reading
+                // `switching` here would instead kill the very loop that is meant
+                // to bind (the initial-join dark square, issue #1295).
+                if loop_is_superseded(
+                    enabled.load(Ordering::Acquire),
+                    loop_epoch.load(Ordering::Acquire),
+                    my_epoch,
+                ) {
                     log::info!(
-                        "CameraEncoder: superseded during acquire (epoch/enabled/switching), releasing stream without binding"
+                        "CameraEncoder: superseded during acquire (epoch/enabled), releasing stream without binding"
                     );
-                    // Reset `switching` exactly like the per-frame exit does
-                    // (issue #1295). `switching` is latched true by select() and
-                    // is cleared in only two prior places (stop() and the
-                    // per-frame exit); this acquire-bail is a NEW task-exit path,
-                    // so without this reset a loop that bails here on switching
-                    // would leave the flag set. The next start() runs with
-                    // running==false (this loop just cleared the canary), so it
-                    // skips the guard's stop() — the only thing that would clear
-                    // switching — and the replacement loop would inherit a stale
-                    // switching==true and bail at its own acquire check, sticking
-                    // the camera off. Clearing it here is safe: a switch-triggered
-                    // respawn always stop()s first, so the legitimate next loop
-                    // never relies on switching being set.
-                    switching.store(false, Ordering::Release);
                     for track in device.get_tracks().iter() {
                         track.unchecked_into::<MediaStreamTrack>().stop();
                     }
@@ -2602,17 +2635,22 @@ impl CameraEncoder {
                 let mut encoded_ok_this_cycle = false;
 
                 'encode: loop {
-                    // Exit when disabled, switching, OR superseded (issue #1295):
-                    // a newer start() bumped `loop_epoch` past our captured
-                    // `my_epoch`, so we are a stale loop and must self-terminate
-                    // even though `enabled` may have been set true again for the
-                    // newer loop. This is what forces the OFF→switch→ON stale loop
-                    // to die — the enabled flip alone would not.
-                    if !enabled.load(Ordering::Acquire)
-                        || switching.load(Ordering::Acquire)
-                        || loop_epoch.load(Ordering::Acquire) != my_epoch
-                    {
-                        switching.store(false, Ordering::Release);
+                    // Exit when disabled OR superseded (issue #1295), via the
+                    // shared `loop_is_superseded` predicate (the same one the
+                    // acquire-phase guard uses): a newer start() bumped
+                    // `loop_epoch` past our captured `my_epoch`, so we are a stale
+                    // loop and must self-terminate even though `enabled` may have
+                    // been set true again for the newer loop. This is what forces
+                    // the OFF→switch→ON stale loop to die — the enabled flip alone
+                    // would not. `switching` is NOT read here: the epoch already
+                    // covers supersede (a real switch bumps it), and the loop that
+                    // owns the current epoch is the switch's intended response,
+                    // which must keep running rather than exit on the request flag.
+                    if loop_is_superseded(
+                        enabled.load(Ordering::Acquire),
+                        loop_epoch.load(Ordering::Acquire),
+                        my_epoch,
+                    ) {
                         let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                         video_track.stop();
                         log::info!("CameraEncoder: stopped");
@@ -3444,10 +3482,11 @@ mod tests {
     use super::{
         build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
         frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
-        layer_ceiling_to_count, next_single_layer_pin, pli_keyframe_allowed, shed_reason,
-        should_pin_single_layer_low, should_teardown_shed_layer, LayerView, SimulcastLayerInfo,
-        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
-        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin, pli_keyframe_allowed,
+        shed_reason, should_pin_single_layer_low, should_teardown_shed_layer, LayerView,
+        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
+        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
+        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
 
@@ -3549,6 +3588,40 @@ mod tests {
         assert!(!is_fatal_encoder_error_message(
             "EncodingError: dropped one frame"
         ));
+    }
+
+    #[test]
+    fn loop_is_not_superseded_when_only_switching_is_raised() {
+        // Issue #1295 dark-square regression pin. On initial-join-with-camera-ON
+        // a post-permission `devicechange` raises `switching` on the very loop
+        // that should bind the capture stream to `<video id="webcam">`. The fixed
+        // supersede predicate is epoch + enabled ONLY, so a raised `switching`
+        // (with `enabled == true` and a matching epoch) must NOT mark the loop
+        // superseded — otherwise it bails before `set_src_object` and the camera
+        // stays dark until a manual OFF→ON. The pre-fix predicate OR-ed
+        // `switching` in and returned `true` here, producing the dark square.
+        //
+        // `loop_is_superseded` takes NO `switching` argument precisely so the bug
+        // cannot be reintroduced without changing this signature: re-adding a
+        // `switching` term forces a call-site/signature change that breaks this
+        // test. With `enabled == true` and equal epochs the loop is the live,
+        // current generation and must keep going.
+        assert!(
+            !loop_is_superseded(true, 7, 7),
+            "enabled with a matching epoch must NOT be superseded, even though a \
+             switch was requested (the dark-square bug returned true here)"
+        );
+
+        // The real supersede conditions DO trip it, so the assertion above is not
+        // vacuously "always false":
+        assert!(
+            loop_is_superseded(false, 7, 7),
+            "disabled → superseded (the loop must tear down)"
+        );
+        assert!(
+            loop_is_superseded(true, 8, 7),
+            "a newer start() bumped the epoch past ours → superseded"
+        );
     }
 
     #[test]

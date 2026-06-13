@@ -253,6 +253,15 @@ pub struct JitterBuffer<T> {
     /// [`JitterBuffer::take_freshness_skip`] after each poll to forward it to the
     /// main thread for field-log visibility. `None` when no skip occurred.
     last_freshness_skip: Option<FreshnessSkip>,
+
+    /// Wall-clock (ms) of the last freshness-skip diagnostic surfaced to the worker.
+    /// Uses the same ~1s source-side cadence as proactive keyframe requests so a
+    /// sustained stall does not post worker→main diagnostics on every decoder poll.
+    last_freshness_skip_emit_ms: Option<u128>,
+
+    /// Coalesced freshness-skip details accumulated while the diagnostic gate is
+    /// closed. The next emitted diagnostic includes this pending dropped count.
+    pending_freshness_skip: Option<FreshnessSkip>,
 }
 
 impl<T> JitterBuffer<T> {
@@ -282,6 +291,8 @@ impl<T> JitterBuffer<T> {
             request_keyframe,
             last_keyframe_request_ms: None,
             last_freshness_skip: None,
+            last_freshness_skip_emit_ms: None,
+            pending_freshness_skip: None,
         }
     }
 
@@ -298,6 +309,37 @@ impl<T> JitterBuffer<T> {
     /// main-thread capture pipeline never sees).
     pub fn take_freshness_skip(&mut self) -> Option<FreshnessSkip> {
         self.last_freshness_skip.take()
+    }
+
+    fn merge_freshness_skip(mut existing: FreshnessSkip, next: FreshnessSkip) -> FreshnessSkip {
+        existing.head_age_ms = existing.head_age_ms.max(next.head_age_ms);
+        existing.keyframe_seq = next.keyframe_seq;
+        existing.dropped += next.dropped;
+        existing
+    }
+
+    fn record_freshness_skip(&mut self, current_time_ms: u128, skip: FreshnessSkip) {
+        let should_emit = match self.last_freshness_skip_emit_ms {
+            Some(last) => {
+                (current_time_ms.saturating_sub(last)) as f64
+                    >= PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS
+            }
+            None => true,
+        };
+
+        if should_emit {
+            let skip = match self.pending_freshness_skip.take() {
+                Some(pending) => Self::merge_freshness_skip(pending, skip),
+                None => skip,
+            };
+            self.last_freshness_skip_emit_ms = Some(current_time_ms);
+            self.last_freshness_skip = Some(skip);
+        } else {
+            self.pending_freshness_skip = Some(match self.pending_freshness_skip.take() {
+                Some(pending) => Self::merge_freshness_skip(pending, skip),
+                None => skip,
+            });
+        }
     }
 
     /// The main entry point for a new frame arriving from the network.
@@ -692,11 +734,14 @@ impl<T> JitterBuffer<T> {
                         "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms >= {MAX_PLAYOUT_AGE_MS:.0}ms). Skipped to live keyframe {keyframe_seq}, dropped {dropped} stale frame(s)."
                     );
                     // Surface the skip for field-log visibility (#1045); the worker forwards it.
-                    self.last_freshness_skip = Some(FreshnessSkip {
-                        head_age_ms,
-                        keyframe_seq: Some(keyframe_seq),
-                        dropped,
-                    });
+                    self.record_freshness_skip(
+                        current_time_ms,
+                        FreshnessSkip {
+                            head_age_ms,
+                            keyframe_seq: Some(keyframe_seq),
+                            dropped,
+                        },
+                    );
                 }
                 dropped_any
             }
@@ -719,11 +764,14 @@ impl<T> JitterBuffer<T> {
                     );
                     // Surface the skip for field-log visibility (#1045); the worker forwards it.
                     // `keyframe_seq: None` marks the keyframe-less (held last-good) case.
-                    self.last_freshness_skip = Some(FreshnessSkip {
-                        head_age_ms,
-                        keyframe_seq: None,
-                        dropped,
-                    });
+                    self.record_freshness_skip(
+                        current_time_ms,
+                        FreshnessSkip {
+                            head_age_ms,
+                            keyframe_seq: None,
+                            dropped,
+                        },
+                    );
                     // Issue #1025 (resolves the TODO(#1020) here): proactively ask the client to
                     // request a keyframe when we evict a stale keyframe-less backlog, rather than
                     // waiting for the client's reactive gap-driven request to notice. There is no
@@ -834,6 +882,11 @@ impl<T> JitterBuffer<T> {
         // flush (e.g. stream restart) can request a recovery keyframe immediately rather than
         // inheriting the pre-flush cooldown.
         self.last_keyframe_request_ms = None;
+        // Reset freshness-skip diagnostic throttling too: a post-flush stream should not inherit
+        // stale diagnostic cooldown or coalesced skip details from before the stream reset.
+        self.last_freshness_skip = None;
+        self.last_freshness_skip_emit_ms = None;
+        self.pending_freshness_skip = None;
         // Consider resetting jitter estimator as well if needed
         self.jitter_estimator = JitterEstimator::new();
     }
@@ -1584,9 +1637,8 @@ mod tests {
     /// already in hand).
     ///
     /// Mutation coverage: removing the `(self.request_keyframe)()` call drops the
-    /// keyframe-less count to 0 (first assert fails); moving the call outside the
-    /// `dropped_any` guard or into the keyframe-present branch fails the `== 1` /
-    /// `== 0` asserts.
+    /// keyframe-less count to 0 (first assert fails); firing from the keyframe-present
+    /// branch fails the `== 0` contrast assert.
     #[test]
     fn keyframe_less_backlog_eviction_fires_proactive_keyframe_request() {
         // --- keyframe-less stall: exactly one proactive request on eviction ---
@@ -1699,6 +1751,44 @@ mod tests {
         );
     }
 
+    /// `flush()` resets the proactive keyframe-request throttle so a fresh post-flush
+    /// stream can request recovery immediately instead of inheriting the previous
+    /// stall's cooldown.
+    #[test]
+    fn flush_resets_proactive_keyframe_request_throttle() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 300);
+        jb.find_and_move_continuous_frames(2150);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "first stale keyframe-less eviction fires a proactive request"
+        );
+
+        jb.flush();
+        decoded.lock().unwrap().clear();
+
+        jb.last_decoded_sequence_number = Some(10);
+        jb.insert_frame(create_test_frame(11, FrameType::DeltaFrame), 300);
+        jb.find_and_move_continuous_frames(2200);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "post-flush eviction fires immediately despite being inside the pre-flush throttle window"
+        );
+    }
+
     /// Issue #1045: both freshness-skip paths must surface a `FreshnessSkip` for the
     /// worker to forward to field logs — the keyframe-less eviction (`keyframe_seq:
     /// None`, playout held) and the skip-to-buffered-keyframe path (`keyframe_seq:
@@ -1744,6 +1834,49 @@ mod tests {
             "must report the keyframe skipped to"
         );
         assert!(skip2.dropped >= 1);
+    }
+
+    /// Freshness-skip diagnostics use the same source-side cadence as proactive keyframe
+    /// requests: a sustained stall must not post worker→main diagnostics on every poll, but the
+    /// next emitted diagnostic should include the skipped frames coalesced while the gate was
+    /// closed.
+    #[test]
+    fn freshness_skip_diagnostics_are_throttled_and_coalesced() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        jb.insert_frame(create_test_frame(2, FrameType::DeltaFrame), 300);
+        jb.insert_frame(create_test_frame(3, FrameType::DeltaFrame), 300);
+        jb.insert_frame(create_test_frame(4, FrameType::DeltaFrame), 300);
+
+        jb.find_and_move_continuous_frames(2150);
+        let first = jb
+            .take_freshness_skip()
+            .expect("first freshness skip should emit immediately");
+        assert_eq!(first.keyframe_seq, None);
+        assert_eq!(first.dropped, 1);
+
+        jb.find_and_move_continuous_frames(2160);
+        assert!(
+            jb.take_freshness_skip().is_none(),
+            "within-window freshness skip should be throttled"
+        );
+        jb.find_and_move_continuous_frames(2170);
+        assert!(
+            jb.take_freshness_skip().is_none(),
+            "second within-window freshness skip should also be coalesced"
+        );
+
+        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1400);
+        jb.find_and_move_continuous_frames(3200);
+        let coalesced = jb
+            .take_freshness_skip()
+            .expect("next outside-window freshness skip should emit");
+        assert_eq!(coalesced.keyframe_seq, None);
+        assert_eq!(
+            coalesced.dropped, 3,
+            "diagnostic should include skipped frames coalesced while throttled plus the current skip"
+        );
     }
 
     /// Regression guard for the infinite-loop blocker: a stale post-gap keyframe that is ALREADY

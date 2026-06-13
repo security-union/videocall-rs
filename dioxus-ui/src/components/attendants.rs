@@ -62,7 +62,7 @@ use crate::context::{
     PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
     TransportPreferenceCtx,
 };
-use crate::local_storage::{load_bool, load_f64, save_bool, save_f64};
+use crate::local_storage::{load_f64, save_f64};
 use crate::types::DeviceInfo;
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -88,10 +88,10 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 /// Minimum width (px) a drawer can be dragged to. Below this the panel chrome
-/// (headers, controls) stops being usable. (#1296)
+/// (headers, controls) stops being usable.
 const DRAWER_MIN_WIDTH: f64 = 240.0;
 /// Absolute maximum drawer width (px). The per-side cap is the smaller of this
-/// and 50% of the viewport (see `max_for_side` in the render body). (#1296)
+/// and 50% of the viewport (see `max_for_side` in the render body).
 const DRAWER_MAX_ABS: f64 = 720.0;
 
 /// Which drawer (if any) is currently being resized by a pointer drag. Tracked
@@ -100,7 +100,7 @@ const DRAWER_MAX_ABS: f64 = 720.0;
 /// `.drawer-resize-handle` and use pointer capture (`set_pointer_capture`) so
 /// pointermove/up route to the handle even when the cursor is over the drawer
 /// body or the video tiles. The `#grid-container` onmousemove/up/leave handlers
-/// only drive the screen-share split (`ss_resizing`), NOT drawer resize. (#1296)
+/// only drive the screen-share split (`ss_resizing`), NOT drawer resize.
 #[derive(Clone, Copy, PartialEq)]
 enum ResizingDrawer {
     None,
@@ -517,15 +517,14 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
-    // Drawer pin + width state (#1296). Pinned drawers reflow the tile grid
-    // (carve out horizontal space); unpinned drawers overlay the tiles. Widths
-    // are clamped on load in case a value persisted by an older/incompatible
-    // release no longer satisfies the current min/max.
-    let mut left_pinned = use_signal(|| load_bool("vc_drawer_left_pinned", false));
+    // Drawer width state. Both drawers are overlay-only: they float over the
+    // tiles and never reflow the grid. Their widths are drag-resizable and
+    // persisted to localStorage. Widths are clamped on load in case a value
+    // persisted by an older/incompatible release no longer satisfies the current
+    // min/max.
     let mut left_width = use_signal(|| {
         load_f64("vc_drawer_left_width", 320.0).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS)
     });
-    let mut right_pinned = use_signal(|| load_bool("vc_drawer_right_pinned", false));
     let mut right_width = use_signal(|| {
         load_f64("vc_drawer_right_width", 560.0).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS)
     });
@@ -3041,49 +3040,16 @@ pub fn AttendantsComponent(
             }
         }
     };
-    let mobile = vw < 568.0;
-    // Pinned drawers carve out horizontal space from the tile area; overlay (unpinned)
-    // drawers float over tiles so contribute 0 inset. Mobile ignores pinning entirely.
-    let mut left_inset = if left_pinned() && !mobile {
-        left_width()
-    } else {
-        0.0
-    };
-    let mut right_inset = if right_pinned() && !mobile {
-        right_width()
-    } else {
-        0.0
-    };
-    // Cap combined pinned insets so tiles always keep >= ~40% of viewport width;
-    // scale both down proportionally if their sum would exceed 60% of vw.
-    let max_insets = vw * 0.6;
-    let inset_sum = left_inset + right_inset;
-    if inset_sum > max_insets && inset_sum > 0.0 {
-        let scale = max_insets / inset_sum;
-        left_inset *= scale;
-        right_inset *= scale;
-    }
-    // A pinned drawer RENDERS at its (possibly down-scaled) carved-out inset, so its
-    // visible width never exceeds the space reserved for it and it can't overlap
-    // tiles above the 60%-of-vw cap. Overlay/mobile drawers render at the raw width
-    // signal. The width signal stays the source of truth (clamped + persisted); only
-    // the render width is capped — keeping render width and avail_w in lockstep.
-    let left_render_w = if left_pinned() && !mobile {
-        left_inset
-    } else {
-        left_width()
-    };
-    let right_render_w = if right_pinned() && !mobile {
-        right_inset
-    } else {
-        right_width()
-    };
     // Per-side resize cap reused by the drag handler below. The smaller of the
     // absolute max and half the viewport. The DRAWER_MIN_WIDTH lower bound here is
-    // inert above the mobile gate (vw >= 568 always yields >= 284), but kept for
-    // safety if the breakpoint ever changes. (#1296)
+    // inert above the 568px breakpoint (where the CSS hides the resize handle on
+    // mobile, vw >= 568 always yields >= 284), but kept for safety if the
+    // breakpoint ever changes.
     let max_for_side = (vw * 0.5).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS);
-    let avail_w = (vw - pad_left - pad_right - left_inset - right_inset).max(0.0);
+    // Both drawers are overlay-only — they float over the tiles and never carve
+    // horizontal space out of the grid, so the available tile width is just the
+    // viewport minus padding.
+    let avail_w = (vw - pad_left - pad_right).max(0.0);
     let avail_h = (vh - pad_top - pad_bottom).max(0.0);
 
     // --- Count active speakers for auto-density escalation ---
@@ -3469,15 +3435,14 @@ pub fn AttendantsComponent(
     let tile_count = displayed_tile_count + if overflow_count > 0 { 1 } else { 0 };
 
     let container_style = if has_screen_share {
-        // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
-        // Inset the screen-share container box so pinned drawers reflow even while sharing — flex children use % of the container, so shrinking the container makes the share/peer split occupy the freed area.
-        format!(
-            "position: absolute; left: {left_inset:.0}px; right: {right_inset:.0}px; top: 0; bottom: 0; height: 100%; \
+        // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85).
+        // The container is full-bleed; the overlay drawers float over it without reflowing it.
+        "position: absolute; left: 0; right: 0; top: 0; bottom: 0; height: 100%; \
          display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
          padding: 16px 16px 80px 16px; \
          align-items: center; box-sizing: border-box; \
          grid-template-columns: none; grid-template-rows: none;"
-        )
+            .to_string()
     } else {
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
         // Explicitly reset all flex properties so the transition from
@@ -3515,7 +3480,7 @@ pub fn AttendantsComponent(
         };
         format!(
             "display: grid; \
-             position: absolute; top: 0; bottom: 0; left: {left_inset:.0}px; right: {right_inset:.0}px; \
+             position: absolute; top: 0; bottom: 0; left: 0; right: 0; \
              gap: {gap:.0}px; \
              padding: {pad_top:.0}px {pad_right:.0}px {pad_bottom:.0}px {pad_left:.0}px; \
              box-sizing: border-box; overflow: hidden; \
@@ -4346,54 +4311,10 @@ pub fn AttendantsComponent(
                                         let expanded = if controls_expanded() { " controls-expanded" } else { "" };
                                         format!("video-controls-container {pos}{hidden}{expanded}")
                                     },
-                                    // issue 1296: carve the action bar out of the SAME pinned-drawer insets the
-                                    // grid consumes so a pinned drawer never overlays the controls. EVERY branch
-                                    // below sets BOTH `left` and `right` longhands (and mobile sets both to
-                                    // `auto`) because dioxus-web restores any inline style property a new string
-                                    // omits — emitting only one side would let a stale opposite anchor survive a
-                                    // dock switch and stretch the fixed-width bar full-width. See the style block.
-                                    style: {
-                                        if mobile {
-                                            // dioxus-web 0.7.3 does NOT atomically replace an inline `style`
-                                            // string: it snapshots, overwrites, then RESTORES any inline
-                                            // property the new string omits (guard: `!getPropertyValue(prop)`).
-                                            // So an empty string would leave a prior `left`/`right` in place.
-                                            // Emit BOTH longhands as `auto` to actively clear any override a
-                                            // previous (non-mobile) dock left behind. Mobile ignores pinning.
-                                            "left: auto; right: auto;".to_string()
-                                        } else {
-                                            // Because of that same non-atomic restore behavior, EVERY dock
-                                            // branch must set BOTH `left` and `right` longhands — otherwise a
-                                            // dock switch (e.g. Bottom -> Right) keeps the old side's inline
-                                            // value next to the new one and the fixed-width bar gets two
-                                            // anchors and stretches full-width. Setting the opposite side to
-                                            // `auto` matches each dock's CSS default (bottom is centered, left
-                                            // dock is left-anchored, right dock is right-anchored), so it is
-                                            // harmless, AND it is exactly what makes "auto-clears on unpin /
-                                            // dock-switch" actually hold.
-                                            //
-                                            // We read the LIVE `left_inset`/`right_inset` locals (computed once
-                                            // per render, already 0 for any unpinned side and already scaled by
-                                            // the 60%-cap), so the bar stays in lockstep with the grid insets.
-                                            // Bottom: shift the `left:50%` centering origin by half the NET
-                                            // inset (left only -> shifts right, right only -> shifts left, both
-                                            // equal -> stays centered). The bottom dock's hidden/hover variants
-                                            // change ONLY `transform`, so overriding `left` leaves the slide
-                                            // animation intact.
-                                            match dock_position() {
-                                                DockPosition::Bottom => format!(
-                                                    "left: calc(50% + {:.0}px); right: auto;",
-                                                    (left_inset - right_inset) / 2.0
-                                                ),
-                                                DockPosition::Left => {
-                                                    format!("left: calc(16px + {left_inset:.0}px); right: auto;")
-                                                }
-                                                DockPosition::Right => {
-                                                    format!("left: auto; right: calc(16px + {right_inset:.0}px);")
-                                                }
-                                            }
-                                        }
-                                    },
+                                    // The action bar uses its plain CSS-defined position for each dock
+                                    // (bottom centered, left/right edge-anchored). Overlay drawers float
+                                    // over the tiles and do not reflow the grid, so the bar needs no
+                                    // inline position override.
                                     // Primary: Mic button - always visible
                                     {
                                         let mda_mic = mda.clone();
@@ -4580,10 +4501,10 @@ pub fn AttendantsComponent(
                                                 if opening {
                                                     // #1296: the two drawers are now INDEPENDENT —
                                                     // opening the peer list no longer closes
-                                                    // diagnostics (they can be open together; the
-                                                    // inset math sums both and the 60%-cap keeps
-                                                    // tiles >= 40% vw). Only popovers / dev overlays
-                                                    // are dismissed so they don't float stale.
+                                                    // diagnostics (both overlay drawers can be open
+                                                    // together, floating over the tiles). Only
+                                                    // popovers / dev overlays are dismissed so they
+                                                    // don't float stale.
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);
@@ -4962,10 +4883,9 @@ pub fn AttendantsComponent(
                 // Peer list sidebar
                 div {
                     id: "peer-list-container",
-                    class: if peer_list_open() { if left_pinned() && !mobile { "visible pinned" } else { "visible" } } else { "" },
-                    // Pinned drawers render at the (scaled) carved-out inset so they never
-                    // overlap tiles above the 60%-of-vw cap; overlay drawers use the raw width.
-                    style: format!("width: {}px", left_render_w),
+                    class: if peer_list_open() { "visible" } else { "" },
+                    // Overlay drawer: floats over the tiles at its (resizable) width.
+                    style: format!("width: {}px", left_width()),
                     if peer_list_open() {
                         PeerList {
                             peers: peers_for_display.clone(),
@@ -4991,12 +4911,6 @@ pub fn AttendantsComponent(
                                 move |_| {
                                     display_name_modal_open.set(true);
                                 }
-                            },
-                            pinned: left_pinned() && vw >= 568.0,
-                            on_toggle_pin: move |_| {
-                                let v = !left_pinned();
-                                left_pinned.set(v);
-                                save_bool("vc_drawer_left_pinned", v);
                             },
                         }
                         div {
@@ -5227,15 +5141,8 @@ pub fn AttendantsComponent(
                         // for the migrated Performance panel in the drawer's
                         // "Quality controls" group. (#1131 unify)
                         perf_controls: perf_controls_sink(),
-                        // Pinned drawers render at the (scaled) carved-out inset so they
-                        // never overlap tiles above the cap; overlay drawers use raw width.
-                        width: right_render_w,
-                        pinned: right_pinned() && vw >= 568.0,
-                        on_toggle_pin: move |_| {
-                            let v = !right_pinned();
-                            right_pinned.set(v);
-                            save_bool("vc_drawer_right_pinned", v);
-                        },
+                        // Overlay drawer: floats over the tiles at its (resizable) width.
+                        width: right_width(),
                         // The right handle lives in diagnostics.rs (no access to the width
                         // signals), so it forwards pointer events here where the math runs.
                         on_resize_start: {

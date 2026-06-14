@@ -285,6 +285,23 @@ message HealthPacket {
   // (encoded + sent). The AQ controller sheds the top layer(s) under congestion,
   // so this can be < effective_video_layers. The gap is the shed depth.
   optional uint32 active_video_layers = 76;
+
+  // Encoder auto-RESTART counters (#527), cumulative since page load,
+  // partitioned by reason. Distinct from the *_errors_* counters above: those
+  // count fault OCCURRENCES; these count restart CYCLES (the encode loop
+  // re-entering its 'restart loop). The relay's metrics_server expands these
+  // into a single labeled counter
+  // videocall_encoder_restart_total{kind=camera|screen, reason=closed_codec|memory|configure|other}.
+  // Only attached when non-zero (healthy sessions never restart), mirroring the
+  // encoder-error fields. Cold start and user-initiated stop do NOT bump these.
+  optional uint64 camera_encoder_restarts_closed_codec = 77;
+  optional uint64 camera_encoder_restarts_memory = 78;
+  optional uint64 camera_encoder_restarts_configure = 79;
+  optional uint64 camera_encoder_restarts_other = 80;
+  optional uint64 screen_encoder_restarts_closed_codec = 81;
+  optional uint64 screen_encoder_restarts_memory = 82;
+  optional uint64 screen_encoder_restarts_configure = 83;
+  optional uint64 screen_encoder_restarts_other = 84;
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

@@ -56,16 +56,16 @@ use sec_api::metrics::{
     CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE,
     DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N,
     DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS,
-    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_TARGET_BITRATE_KBPS,
-    HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL,
-    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
-    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
-    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
-    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL,
+    ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC,
+    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
+    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
+    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
+    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
+    VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
+    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -319,6 +319,19 @@ fn remove_session_metrics(session_info: &SessionInfo) {
             &session_info.session_id,
             result,
         ]);
+    }
+    // #527: encoder restart series (meeting_id, session_id, kind, reason). Remove
+    // the full bounded cartesian (2 kinds × 4 reasons) for this session so the
+    // session_id label leaves no residual series on disconnect.
+    for kind in ["camera", "screen"] {
+        for reason in ["closed_codec", "memory", "configure", "other"] {
+            let _ = ENCODER_RESTART_TOTAL.remove_label_values(&[
+                &session_info.meeting_id,
+                &session_info.session_id,
+                kind,
+                reason,
+            ]);
+        }
     }
     // TELEM-7: remove CLIENT_INFO using stored label values
     if let Some(ref info_labels) = session_info.client_info_labels {
@@ -743,6 +756,60 @@ fn process_health_packet_to_metrics_pb(
             if let Some(total) = value {
                 CLIENT_REELECTION_TOTAL
                     .with_label_values(&[meeting_id, session_id, result])
+                    .set(total as f64);
+            }
+        }
+
+        // #527: encoder auto-restart cycles, expanded into a single labeled
+        // gauge videocall_encoder_restart_total{kind, reason}. Same set()-to-
+        // cumulative convention as the re-election counter above. Each field is
+        // absent until the encoder has actually restarted for that reason, so a
+        // series only appears once a restart of that (kind, reason) has occurred.
+        for (kind, reason, value) in [
+            (
+                "camera",
+                "closed_codec",
+                health_packet.camera_encoder_restarts_closed_codec,
+            ),
+            (
+                "camera",
+                "memory",
+                health_packet.camera_encoder_restarts_memory,
+            ),
+            (
+                "camera",
+                "configure",
+                health_packet.camera_encoder_restarts_configure,
+            ),
+            (
+                "camera",
+                "other",
+                health_packet.camera_encoder_restarts_other,
+            ),
+            (
+                "screen",
+                "closed_codec",
+                health_packet.screen_encoder_restarts_closed_codec,
+            ),
+            (
+                "screen",
+                "memory",
+                health_packet.screen_encoder_restarts_memory,
+            ),
+            (
+                "screen",
+                "configure",
+                health_packet.screen_encoder_restarts_configure,
+            ),
+            (
+                "screen",
+                "other",
+                health_packet.screen_encoder_restarts_other,
+            ),
+        ] {
+            if let Some(total) = value {
+                ENCODER_RESTART_TOTAL
+                    .with_label_values(&[meeting_id, session_id, kind, reason])
                     .set(total as f64);
             }
         }
@@ -1554,6 +1621,26 @@ mod tests {
         false
     }
 
+    fn gauge_value(metric_name: &str, expected_labels: &[(&str, &str)]) -> Option<f64> {
+        let families = prometheus::gather();
+        for family in families {
+            if family.get_name() == metric_name {
+                for metric in family.get_metric() {
+                    let labels_match = expected_labels.iter().all(|(lname, lval)| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.get_name() == *lname && label.get_value() == *lval)
+                    });
+                    if labels_match {
+                        return Some(metric.get_gauge().get_value());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Helper function to create test peer stats with NetEQ data (protobuf)
     fn create_test_peer_stats(
         peer_id: &str,
@@ -1927,6 +2014,62 @@ mod tests {
                 ("to_peer", "bob"),
             ],
         ));
+    }
+
+    #[test]
+    fn encoder_restart_metric_expands_cumulative_fields_and_gc_removes_series() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let meeting_id = "meeting_restart_metric";
+        let session_id = "session_restart_metric";
+        let reporting_user_id = "alice";
+        let mut hp =
+            create_test_health_packet(session_id, meeting_id, reporting_user_id, HashMap::new());
+        hp.camera_encoder_restarts_closed_codec = Some(3);
+        hp.screen_encoder_restarts_configure = Some(5);
+
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        let camera_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("kind", "camera"),
+            ("reason", "closed_codec"),
+        ];
+        let screen_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("kind", "screen"),
+            ("reason", "configure"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_encoder_restart_total", &camera_labels),
+            Some(3.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_restart_total", &screen_labels),
+            Some(5.0)
+        );
+
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
+        let info = {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(
+            !series_exists("videocall_encoder_restart_total", &camera_labels),
+            "camera restart series must be removed by session GC"
+        );
+        assert!(
+            !series_exists("videocall_encoder_restart_total", &screen_labels),
+            "screen restart series must be removed by session GC"
+        );
     }
 
     #[test]

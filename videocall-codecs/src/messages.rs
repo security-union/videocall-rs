@@ -164,3 +164,140 @@ impl FreshnessSkipMessage {
         }
     }
 }
+
+/// Discriminator carried in [`WorkerLogMessage::kind`] (issue #1356), to tell it
+/// apart from `"video_stats"` / `"request_keyframe"` / `"freshness_skip"` on the
+/// shared serde worker->main channel.
+pub const WORKER_LOG_KIND: &str = "worker_log";
+
+/// Worker->main `log::` facade forwarding message (issue #1356, follow-up to #1045).
+///
+/// `log::{warn,error,..}!` lines emitted INSIDE the decoder Web Worker
+/// (`bin/worker_decoder.rs` and the modules it drives) never reach the main-thread
+/// console-log capture+upload pipeline — the worker has its own global scope and its
+/// own (until now, absent) `log` facade, so in the field those records were dropped
+/// on the floor. The worker installs a `log::Log` implementation that posts this
+/// message per enabled record; the main thread re-broadcasts it as a `DiagEvent`
+/// (`handle_worker_diag_message`) so it lands in uploaded logs with the worker's
+/// `from_peer`/`to_peer` context. Mirrors the `FreshnessSkipMessage` path (#1045).
+///
+/// `from_peer` / `to_peer` mirror the worker's diagnostics context (set via
+/// `WorkerMessage::SetContext`) so a forwarded line can be attributed to the peer
+/// whose decoder produced it. They are `Option` because a record can be emitted
+/// before `SetContext` arrives.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerLogMessage {
+    pub kind: String,
+    /// Log level as an uppercase string, e.g. "WARN" / "ERROR" / "INFO".
+    pub level: String,
+    /// The record's `target` (module path or explicit target), e.g.
+    /// "videocall_codecs::decoder::wasm".
+    pub target: String,
+    /// The rendered log message body.
+    pub message: String,
+    pub from_peer: Option<String>,
+    pub to_peer: Option<String>,
+    /// Records suppressed by the worker's rate-limit since the last forwarded line
+    /// (issue #1356). `0` on a normally-forwarded line; `> 0` folds a coalesced burst
+    /// into this line so a chatty loop reports volume without per-record amplification.
+    pub suppressed: u64,
+}
+
+impl WorkerLogMessage {
+    pub fn new(
+        level: String,
+        target: String,
+        message: String,
+        from_peer: Option<String>,
+        to_peer: Option<String>,
+        suppressed: u64,
+    ) -> Self {
+        Self {
+            kind: WORKER_LOG_KIND.to_string(),
+            level,
+            target,
+            message,
+            from_peer,
+            to_peer,
+            suppressed,
+        }
+    }
+}
+
+#[cfg(test)]
+mod worker_log_disambiguation_tests {
+    //! Serde disambiguation contract for the worker->main message channel (issue #1356).
+    //!
+    //! All five worker->main payloads share one JS-object channel and are told apart by their
+    //! `kind` field, but several have overlapping/optional field sets. The dispatcher
+    //! (`decoder/wasm.rs::handle_worker_diag_message` + `handle_worker_request_keyframe`)
+    //! deserializes-then-checks-`kind`, so two hazards exist: (1) a `WorkerLogMessage` must still
+    //! reach its own branch even though it *structurally* deserializes into the optional-field
+    //! `VideoStatsMessage`/`RequestKeyframeMessage`; (2) the new `WorkerLogMessage` branch must not
+    //! *swallow* an earlier message type. These tests pin both directions against the real structs
+    //! via `serde_json`, whose missing-required-field / unknown-field / `Option`-as-null semantics
+    //! match the runtime `serde-wasm-bindgen` codec. They run on the native test target (the wasm
+    //! test harness is unrelated to this contract).
+    use super::*;
+
+    fn worker_log_wire() -> String {
+        let m = WorkerLogMessage::new(
+            "WARN".into(),
+            "videocall_codecs::decoder::wasm".into(),
+            "decoder fell behind".into(),
+            Some("alice".into()),
+            Some("bob".into()),
+            3,
+        );
+        serde_json::to_string(&m).unwrap()
+    }
+
+    #[test]
+    fn worker_log_round_trips_with_its_kind() {
+        let wire = worker_log_wire();
+        let back: WorkerLogMessage = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.kind, WORKER_LOG_KIND);
+        assert_eq!(back.level, "WARN");
+        assert_eq!(back.target, "videocall_codecs::decoder::wasm");
+        assert_eq!(back.message, "decoder fell behind");
+        assert_eq!(back.from_peer.as_deref(), Some("alice"));
+        assert_eq!(back.suppressed, 3);
+    }
+
+    #[test]
+    fn worker_log_falls_through_overlapping_kinds() {
+        // A WorkerLogMessage *does* deserialize into the optional-field shapes (extra fields are
+        // ignored / required ones are present), but its kind is "worker_log", so the earlier
+        // kind-guards reject it and it falls through to its own branch.
+        let wire = worker_log_wire();
+        let as_vs: VideoStatsMessage = serde_json::from_str(&wire).unwrap();
+        assert_ne!(as_vs.kind, "video_stats");
+        let as_rk: RequestKeyframeMessage = serde_json::from_str(&wire).unwrap();
+        assert_ne!(as_rk.kind, REQUEST_KEYFRAME_KIND);
+        // freshness_skip requires head_age_ms/dropped, which WorkerLogMessage lacks, so it can't
+        // even deserialize into that shape.
+        assert!(serde_json::from_str::<FreshnessSkipMessage>(&wire).is_err());
+    }
+
+    #[test]
+    fn worker_log_branch_cannot_swallow_other_messages() {
+        // The new WorkerLogMessage branch deserializes-then-checks-kind. Its three required String
+        // fields (level/target/message) are absent from every other message, so none of them can
+        // deserialize into WorkerLogMessage at all -> the branch is structurally unable to swallow
+        // them, independent of the kind guard.
+        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0);
+        assert!(
+            serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
+        );
+
+        let fs = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7);
+        assert!(
+            serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&fs).unwrap()).is_err()
+        );
+
+        let rk = RequestKeyframeMessage::new(None, None);
+        assert!(
+            serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&rk).unwrap()).is_err()
+        );
+    }
+}

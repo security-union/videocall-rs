@@ -21,8 +21,8 @@
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
 use crate::messages::{
-    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerMessage,
-    FRESHNESS_SKIP_KIND, REQUEST_KEYFRAME_KIND,
+    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerLogMessage,
+    WorkerMessage, FRESHNESS_SKIP_KIND, REQUEST_KEYFRAME_KIND, WORKER_LOG_KIND,
 };
 #[cfg(feature = "wasm")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
@@ -415,6 +415,42 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                             skip_msg.keyframe_seq.map(|s| s as i64).unwrap_or(-1)
                         ),
                         metric!("dropped", skip_msg.dropped),
+                    ],
+                };
+                let _ = global_sender().try_broadcast(evt);
+            }
+            return true;
+        }
+    }
+
+    // worker_log (issue #1356): a `log::` record emitted INSIDE the decoder worker, forwarded so
+    // it lands in uploaded field logs (the worker's own `log`/`console` output is invisible to the
+    // main-thread capture pipeline). Re-broadcast as a DiagEvent with the worker's peer context,
+    // mirroring the freshness_skip path. NOTE on serde ordering: like the branches above we must
+    // deserialize *then* check `kind`, because these worker messages share one JS-object channel
+    // and their field sets overlap (a `RequestKeyframeMessage` is a structural subset, and a
+    // `VideoStatsMessage`'s fields are all optional). `WorkerLogMessage`'s `level`/`target`/
+    // `message` are required strings, so a stats/skip object will NOT deserialize into it — but we
+    // still gate on `WORKER_LOG_KIND` so nothing can be misrouted in either direction.
+    if let Ok(log_msg) = serde_wasm_bindgen::from_value::<WorkerLogMessage>(js_val.clone()) {
+        if log_msg.kind == WORKER_LOG_KIND {
+            #[cfg(feature = "wasm")]
+            {
+                let evt = DiagEvent {
+                    subsystem: "worker_log",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics: vec![
+                        metric!("event", "worker_log"),
+                        metric!("level", log_msg.level),
+                        metric!("target", log_msg.target),
+                        metric!("message", log_msg.message),
+                        metric!("from_peer", log_msg.from_peer.unwrap_or_default()),
+                        metric!("to_peer", log_msg.to_peer.unwrap_or_default()),
+                        // Records coalesced by the worker's rate limit since the last forwarded
+                        // line (issue #1356); 0 on a normal line. Surfaces dropped volume without
+                        // per-record network amplification.
+                        metric!("suppressed", log_msg.suppressed),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);

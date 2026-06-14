@@ -40,7 +40,8 @@ use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
 use videocall_codecs::jitter_buffer::{paint_lag_ms, FreshnessSkip, JitterBuffer};
 use videocall_codecs::messages::{
-    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerMessage,
+    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerLogMessage,
+    WorkerMessage,
 };
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -383,6 +384,19 @@ thread_local! {
     /// (issue #1252, stage-3 paint lag). The difference `emitted - painted` is the
     /// decoded-but-unpainted backlog `decode_queue_size()` cannot see.
     static FRAMES_PAINTED: Cell<u64> = const { Cell::new(0) };
+    /// Timestamp (ms, `Date::now()`) of the last worker `log::` record forwarded to the main
+    /// thread (issue #1356). Drives the forwarder's min-interval rate limit so a chatty
+    /// `log::warn!` loop cannot turn into per-record `postMessage` network amplification.
+    static WORKER_LOG_LAST_EMIT_MS: Cell<f64> = const { Cell::new(0.0) };
+    /// Count of worker `log::` records suppressed by the rate limit since the last forwarded
+    /// line (issue #1356). Folded into the next forwarded `WorkerLogMessage` as `suppressed`
+    /// so a coalesced burst reports its volume without sending one message per record.
+    static WORKER_LOG_SUPPRESSED: Cell<u64> = const { Cell::new(0) };
+    /// Re-entrancy guard for the `log::Log` impl (issue #1356). The forwarder must never
+    /// emit a `log::` record from inside its own `log()` (that would recurse), so it uses
+    /// `console::*` for internal errors — this flag is belt-and-suspenders against any
+    /// future change that introduces a nested record.
+    static WORKER_LOG_IN_LOG: Cell<bool> = const { Cell::new(false) };
 }
 
 const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
@@ -403,8 +417,15 @@ const DIAGNOSTIC_EMIT_INTERVAL_MS: f64 = 1000.0; // Emit diagnostics at 1 Hz (on
 pub fn main() {
     // Set up panic hook to get Rust panics in the console
     console_error_panic_hook::set_once();
-    // Initialize Rust log to console logging
-    log::set_max_level(log::LevelFilter::Debug);
+    // Install the worker->main `log::` forwarder FIRST, before any code path that could
+    // emit a record we want captured (issue #1356). It is the worker's ONLY `log::Log`
+    // facade: until now no logger was installed here, so every `log::` line emitted inside
+    // the worker was silently dropped (the `log` crate discards all records when no logger
+    // is set). Installing it before the rest of `main()` runs — and before the message and
+    // interval handlers are wired up — guarantees later records are not lost to a
+    // too-late install. `install_worker_logger` also sets the global `max_level`; without
+    // that the facade filters everything out regardless of the logger.
+    install_worker_logger();
     log::info!("Starting worker decoder with jitter buffer and message handling");
 
     let self_scope = js_sys::global()
@@ -685,6 +706,118 @@ fn post_freshness_skip_to_main(skip: &FreshnessSkip) {
         }
         Err(e) => {
             console::warn_1(&format!("[WORKER] freshness_skip: serialize failed: {e:?}").into());
+        }
+    }
+}
+
+/// Minimum interval (ms) between worker `log::` records forwarded to the main thread (issue
+/// #1356). Records arriving inside this window are coalesced: they are counted (not sent) and
+/// the count rides the next forwarded line as `suppressed`. At 250ms the worker forwards at most
+/// ~4 log lines/sec per worker no matter how chatty the source loop is, which is the throttle the
+/// issue requires ("no per-record network amplification"). WARN/ERROR are inherently low-volume,
+/// so in normal operation almost nothing is suppressed; the gate exists to cap a pathological
+/// hot-loop, not to throttle steady-state logging.
+const WORKER_LOG_MIN_INTERVAL_MS: f64 = 250.0;
+
+/// Maximum `log` level forwarded from the worker to the main-thread upload pipeline (issue #1356).
+///
+/// Default is `Warn`: `warn!`/`error!` are forwarded; `info!`/`debug!`/`trace!` are filtered at
+/// the facade and never even reach the rate limiter or the wire. This is the issue's "safe
+/// default" — the worker's `log::debug!` lines (e.g. the per-frame WebCodecs queue-depth trace)
+/// fire often enough that forwarding them by default would amplify field-log volume. To capture
+/// `debug!` from the worker during a field investigation, raise this single constant to
+/// `LevelFilter::Debug` and rebuild; the rate limiter still caps the volume.
+const WORKER_LOG_FORWARD_LEVEL: log::LevelFilter = log::LevelFilter::Warn;
+
+/// `log::Log` facade that forwards worker-side records to the main thread (issue #1356).
+///
+/// The decoder Web Worker has no console-log capture of its own — the main-thread pipeline that
+/// uploads field logs only sees the main thread. Before this, no logger was installed in the
+/// worker at all, so every `log::` line here was discarded by the `log` crate. This forwarder is
+/// installed first in `main()` (see `install_worker_logger`) and posts a `WorkerLogMessage` for
+/// each enabled, non-rate-limited record; `wasm.rs::handle_worker_diag_message` re-broadcasts it
+/// as a `DiagEvent` so it flows into the upload buffer exactly like the freshness-skip diagnostic.
+struct WorkerLogForwarder;
+
+impl log::Log for WorkerLogForwarder {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        // `max_level()` is also enforced by the `log!` macros before `log()` is called, but the
+        // crate contract requires `enabled()` to honor the level too (e.g. `log_enabled!`).
+        metadata.level() <= WORKER_LOG_FORWARD_LEVEL
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        // Re-entrancy guard: never let a record emitted from within `log()` recurse. We only use
+        // `console::*` (not `log::`) for internal errors below, so this can't trip today, but it
+        // keeps the invariant explicit and cheap.
+        if WORKER_LOG_IN_LOG.with(|g| g.replace(true)) {
+            return;
+        }
+        // Rate-limit / coalesce (issue #1356): forward at most one line per
+        // WORKER_LOG_MIN_INTERVAL_MS; otherwise count it and fold the count into the next line.
+        let now = js_sys::Date::now();
+        let last = WORKER_LOG_LAST_EMIT_MS.with(|c| c.get());
+        if last != 0.0 && now - last < WORKER_LOG_MIN_INTERVAL_MS {
+            WORKER_LOG_SUPPRESSED.with(|c| c.set(c.get().saturating_add(1)));
+            WORKER_LOG_IN_LOG.with(|g| g.set(false));
+            return;
+        }
+        WORKER_LOG_LAST_EMIT_MS.with(|c| c.set(now));
+        let suppressed = WORKER_LOG_SUPPRESSED.with(|c| c.replace(0));
+
+        let level = record.level().as_str().to_string();
+        let target = record.target().to_string();
+        let message = format!("{}", record.args());
+        post_worker_log_to_main(level, target, message, suppressed);
+
+        WORKER_LOG_IN_LOG.with(|g| g.set(false));
+    }
+
+    fn flush(&self) {}
+}
+
+static WORKER_LOG_FORWARDER: WorkerLogForwarder = WorkerLogForwarder;
+
+/// Install the worker->main `log::` forwarder and set the global max level (issue #1356).
+///
+/// Must run before any code path that emits a record we want to capture. `set_logger` returns
+/// `Err` if a logger is already installed (it can only be set once per process); the worker has
+/// none, so this succeeds — and if some future change installs one earlier, we surface it via
+/// `console` rather than panicking. Setting `max_level` is REQUIRED: the `log!` macros short-circuit
+/// on the global max level before consulting the logger, so without this every record would be
+/// filtered out regardless of the forwarder.
+fn install_worker_logger() {
+    match log::set_logger(&WORKER_LOG_FORWARDER) {
+        Ok(()) => log::set_max_level(WORKER_LOG_FORWARD_LEVEL),
+        Err(e) => {
+            console::warn_1(
+                &format!("[WORKER] worker_log: logger already set, not forwarding: {e:?}").into(),
+            );
+        }
+    }
+}
+
+/// Post a worker-side `log::` record to the main thread as a [`WorkerLogMessage`] (issue #1356).
+/// Mirrors `post_freshness_skip_to_main`: gets the worker scope, reads the diagnostics context
+/// (`CONTEXT_FROM`/`CONTEXT_TO`) at emit time so the line is attributed to the right peer, and
+/// posts. Uses only `console::*` for failures so it can never recurse into the `log` facade.
+fn post_worker_log_to_main(level: String, target: String, message: String, suppressed: u64) {
+    let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
+        // No worker scope (e.g. unit test / non-worker context): drop rather than panic.
+        return;
+    };
+    let from_peer = CONTEXT_FROM.with(|f| f.borrow().clone());
+    let to_peer = CONTEXT_TO.with(|t| t.borrow().clone());
+    let msg = WorkerLogMessage::new(level, target, message, from_peer, to_peer, suppressed);
+    match serde_wasm_bindgen::to_value(&msg) {
+        Ok(val) => {
+            let _ = scope.post_message(&val);
+        }
+        Err(e) => {
+            console::warn_1(&format!("[WORKER] worker_log: serialize failed: {e:?}").into());
         }
     }
 }

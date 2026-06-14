@@ -97,7 +97,7 @@ use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
 use super::classify_encode_error::{classify_encode_error, EncodeErrorBucket};
-use super::encoder_state::{pli_keyframe_allowed, EncoderState};
+use super::encoder_state::{keyframe_tick_decision, EncoderState, KeyframeTickInput};
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
@@ -3187,27 +3187,6 @@ impl CameraEncoder {
                             // never lost; added recovery latency is bounded by the
                             // cooldown. The periodic GOP keyframe is never gated.
                             let now_ms = window().performance().unwrap().now();
-                            // Issue #1311: a reconnect or re-election just happened.
-                            // Clear the forced-keyframe cooldown clock so the FIRST
-                            // post-transition PLI below emits immediately instead of
-                            // being coalesced away by a stale pre-transition keyframe
-                            // timestamp (the cooldown window is up to
-                            // FORCED_KEYFRAME_COOLDOWN_MS = 250ms of suppressed
-                            // recovery). One-shot edge: `.swap(false)` consumes it so
-                            // a single transition resets exactly once; a spurious set
-                            // only matters when a PLI is pending and merely allows an
-                            // emission a receiver already asked for (never forces an
-                            // unrequested keyframe — the periodic GOP is unaffected).
-                            if keyframe_cooldown_reset.swap(false, Ordering::AcqRel) {
-                                last_keyframe_emit_ms = None;
-                            }
-                            let pli_pending = force_keyframe.load(Ordering::Acquire);
-                            let pli_requested = pli_pending
-                                && pli_keyframe_allowed(
-                                    now_ms,
-                                    last_keyframe_emit_ms,
-                                    FORCED_KEYFRAME_COOLDOWN_MS,
-                                );
                             // Use tier-controlled keyframe interval instead of the
                             // static constant, allowing adaptive quality to adjust it.
                             // Using `%` instead of `.is_multiple_of()` for compatibility
@@ -3215,18 +3194,43 @@ impl CameraEncoder {
                             #[allow(clippy::manual_is_multiple_of)]
                             let is_periodic_keyframe = local_keyframe_interval > 0
                                 && video_frame_counter % local_keyframe_interval == 0;
-                            let want_keyframe = is_periodic_keyframe || pli_requested;
-                            if want_keyframe {
+                            // Resolve the keyframe decision via the shared single
+                            // source of truth (issue #1347 item 2: the camera AND
+                            // screen loops call the same pure `keyframe_tick_decision`,
+                            // which the host tests pin). It folds:
+                            //  * #1311 cooldown reset — a reconnect or re-election just
+                            //    happened (the `keyframe_cooldown_reset` one-shot edge,
+                            //    `.swap(false)`-consumed here so a single transition
+                            //    resets exactly once); the decision clears the stale
+                            //    cooldown clock so the FIRST post-transition PLI emits
+                            //    immediately instead of being coalesced away (up to
+                            //    FORCED_KEYFRAME_COOLDOWN_MS = 250ms of suppressed
+                            //    recovery). It only un-gates an ALREADY-pending PLI —
+                            //    never forces an unrequested keyframe.
+                            //  * #1287 PLI coalescer — PEEK the request flag (`load`,
+                            //    not `swap`) so a mid-cooldown PLI stays pending and is
+                            //    honored at window expiry rather than dropped.
+                            //  * periodic GOP — never gated by the cooldown.
+                            let decision = keyframe_tick_decision(KeyframeTickInput {
+                                now_ms,
+                                pli_pending: force_keyframe.load(Ordering::Acquire),
+                                is_periodic: is_periodic_keyframe,
+                                cooldown_reset: keyframe_cooldown_reset
+                                    .swap(false, Ordering::AcqRel),
+                                last_keyframe_emit_ms,
+                                cooldown_ms: FORCED_KEYFRAME_COOLDOWN_MS,
+                            });
+                            let want_keyframe = decision.want_keyframe;
+                            last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
+                            if decision.clear_force_keyframe {
                                 // ANY keyframe (periodic or forced) is broadcast to
                                 // the whole room and satisfies every pending PLI, so
-                                // clear the request flag and (re)start the cooldown
-                                // window from this emission. Clearing here — only when
-                                // we actually emit — is what lets a mid-cooldown
-                                // request survive to be honored at window expiry.
+                                // clear the request flag. Clearing only on an actual
+                                // emit is what lets a mid-cooldown request survive to
+                                // be honored at window expiry.
                                 force_keyframe.store(false, Ordering::Release);
-                                last_keyframe_emit_ms = Some(now_ms);
                             }
-                            if pli_requested {
+                            if decision.pli_forced {
                                 log::info!(
                                     "CameraEncoder: forcing keyframe at frame {} (PLI)",
                                     video_frame_counter
@@ -3561,9 +3565,9 @@ mod tests {
     use super::{
         build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
         frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
-        layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin, pli_keyframe_allowed,
-        shed_reason, should_pin_single_layer_low, should_teardown_shed_layer, LayerView,
-        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
+        keyframe_tick_decision, layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin,
+        shed_reason, should_pin_single_layer_low, should_teardown_shed_layer, KeyframeTickInput,
+        LayerView, SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
         SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
         SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
@@ -4014,58 +4018,45 @@ mod tests {
 
     #[test]
     fn forced_keyframe_pli_coalesces_within_cooldown_window() {
-        // Issue #1287: pins the SINGLE SOURCE OF TRUTH for the publisher-side PLI
-        // emit coalescer (`pli_keyframe_allowed`). The encode loop emits a forced
-        // keyframe iff this returns true AND a PLI is pending, so pinning it here
-        // pins the behavior off-wasm (the live encode loop is not host-runnable).
+        // Issue #1287 / #1347 item 2: drives the REAL per-frame keyframe decision the
+        // camera encode loop calls (`keyframe_tick_decision` — the production loop
+        // calls this exact fn, so a mutation to the real decision logic breaks this
+        // test off-wasm; the live encode loop is not host-runnable).
         //
-        // Mutations these assertions CATCH:
-        //  * dropping the `None` guard (the first forced keyframe would be blocked) — case 1
-        //  * inverting the comparison (`>=`→`<`) — every Some case flips and FAILS
-        //  * swapping `>=`→`>` — the exact-boundary case (249 suppress, 250 allow) flips
+        // ACCEPTANCE (#1287): a frame stream where EVERY frame has a PLI pending
+        // (worst case: N receivers hammering one publisher), replicating the encode
+        // loop's state update by feeding the decision's returned
+        // `last_keyframe_emit_ms` back in each tick. Assert the burst coalesces to
+        // ~one forced keyframe per cooldown. Removing the cooldown gate from the
+        // decision makes `forced` jump to 30 (one per frame), failing `== 4`; the
+        // inclusive-`>=` boundary itself is pinned exactly by
+        // `keyframe_tick_decision_coalesces_and_holds_pli` in `encoder_state`.
+        // 30fps => a frame every ~33.33ms; no periodic GOP in this 1s slice, so all
+        // emits are PLI-forced.
         let cd = FORCED_KEYFRAME_COOLDOWN_MS; // 250.0
-
-        // No keyframe emitted yet (None) → the first PLI is always allowed.
-        assert!(
-            pli_keyframe_allowed(0.0, None, cd),
-            "the first forced keyframe (no prior keyframe) must always be allowed"
-        );
-        // 249ms after the last keyframe (< 250ms) → SUPPRESS (still in cooldown).
-        assert!(
-            !pli_keyframe_allowed(249.0, Some(0.0), cd),
-            "a PLI 249ms after the last keyframe must be coalesced (suppressed)"
-        );
-        // Exactly 250ms → ALLOW (pins the inclusive `>=`; a `>` mutation fails here).
-        assert!(
-            pli_keyframe_allowed(250.0, Some(0.0), cd),
-            "a PLI exactly one cooldown after the last keyframe must be allowed (>= is inclusive)"
-        );
-        // Well past the window → ALLOW.
-        assert!(
-            pli_keyframe_allowed(1_000.0, Some(250.0), cd),
-            "a PLI long after the window must be allowed"
-        );
-
-        // ACCEPTANCE (#1287): drive the REAL decision over a frame stream where EVERY
-        // frame has a PLI pending (worst case: N receivers hammering one publisher),
-        // replicating the encode loop's state update (any emitted keyframe resets the
-        // window — see the `if want_keyframe` block in the loop), and assert the burst
-        // coalesces to ~one forced keyframe per cooldown. This drives the real helper —
-        // NOT a literal vs itself: remove the gate and `forced` jumps to 30 (one per
-        // frame), failing the `== 4` assertion below. (The inclusive-`>=` boundary is
-        // pinned by the scalar `pli_keyframe_allowed(250.0, Some(0.0), cd)` case above,
-        // not here: at 30fps no frame lands exactly on a 250ms boundary.) 30fps => a
-        // frame every ~33.33ms; no periodic GOP in this 1s slice, so all are PLI-forced.
         let frame_interval_ms = 1000.0 / 30.0;
         let mut last_keyframe_emit_ms: Option<f64> = None;
         let mut forced = 0u32;
         let mut now = 0.0_f64;
         for _ in 0..30 {
-            // pli_pending is ALWAYS true in this saturated worst case.
-            if pli_keyframe_allowed(now, last_keyframe_emit_ms, cd) {
+            // pli_pending is ALWAYS true in this saturated worst case; no reconnect.
+            let decision = keyframe_tick_decision(KeyframeTickInput {
+                now_ms: now,
+                pli_pending: true,
+                is_periodic: false,
+                cooldown_reset: false,
+                last_keyframe_emit_ms,
+                cooldown_ms: cd,
+            });
+            if decision.want_keyframe {
+                assert!(
+                    decision.pli_forced,
+                    "with no periodic GOP, every emit in this slice is PLI-forced"
+                );
                 forced += 1;
-                last_keyframe_emit_ms = Some(now);
             }
+            // Feed the decision's post-tick clock back, exactly like the loop.
+            last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
             now += frame_interval_ms;
         }
         // 1s of saturated PLI at a 250ms cooldown: the first frame at/after each window
@@ -4083,19 +4074,16 @@ mod tests {
         // running (it is NOT torn down — only the connection is rebuilt / the
         // re-election atomic flips), so `last_keyframe_emit_ms` carries a STALE
         // pre-transition timestamp. Without a reset, a recovery PLI on the first
-        // post-transition frame would be coalesced away by `pli_keyframe_allowed`
-        // for up to FORCED_KEYFRAME_COOLDOWN_MS. The fix arms a one-shot reset
+        // post-transition frame would be coalesced away for up to
+        // FORCED_KEYFRAME_COOLDOWN_MS. The fix arms a one-shot reset
         // (`keyframe_cooldown_reset`) that the encode loop `.swap(false)`-consumes
-        // each frame and, when set, clears `last_keyframe_emit_ms` to `None` so the
-        // PLI emits immediately.
+        // each frame and passes into the decision as `cooldown_reset`, which clears
+        // the stale clock so the PLI emits immediately.
         //
-        // This test models that exact encode-loop state machine off-wasm (the live
-        // loop is not host-runnable) and drives the REAL `pli_keyframe_allowed`
-        // helper. It is mutation-proof: the CONTROL arm pins that the cooldown
-        // genuinely WOULD suppress (so the assert is not vacuous), and the RESET
-        // arm fails if the `last_keyframe_emit_ms = None` reset is removed or the
-        // `.swap` consume is broken.
-        use std::sync::atomic::{AtomicBool, Ordering};
+        // This drives the REAL `keyframe_tick_decision` (the exact fn the camera
+        // production loop calls). It is mutation-proof: the CONTROL arm pins that the
+        // cooldown genuinely WOULD suppress (so the assert is not vacuous), and the
+        // RESET arm fails if the `cooldown_reset` clear is removed from the decision.
         let cd = FORCED_KEYFRAME_COOLDOWN_MS; // 250.0
 
         // A keyframe was emitted just before the transition.
@@ -4104,70 +4092,61 @@ mod tests {
         // 250ms cooldown window, with a PLI pending (a receiver requesting recovery).
         let first_frame_after_ms = pre_reconnect_emit_ms + 33.0;
 
-        // CONTROL: no reset armed. The stale timestamp must SUPPRESS the PLI — this
+        // CONTROL: reset NOT armed. The stale timestamp must SUPPRESS the PLI — this
         // pins that the window is real, so the reset arm below is a true behavioral
-        // difference, not an always-true assertion. (If this fired, the reset arm
-        // would prove nothing.)
-        {
-            let mut last_keyframe_emit_ms = Some(pre_reconnect_emit_ms);
-            let reset = AtomicBool::new(false); // NOT armed
-            if reset.swap(false, Ordering::AcqRel) {
-                last_keyframe_emit_ms = None;
-            }
-            let pli_pending = true;
-            let pli_emits = pli_pending
-                && pli_keyframe_allowed(first_frame_after_ms, last_keyframe_emit_ms, cd);
-            assert!(
-                !pli_emits,
-                "control: a PLI {}ms after the last keyframe must be coalesced \
-                 (suppressed) when no reconnect reset is armed",
-                first_frame_after_ms - pre_reconnect_emit_ms
-            );
-        }
+        // difference, not an always-true assertion.
+        let control = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: first_frame_after_ms,
+            pli_pending: true,
+            is_periodic: false,
+            cooldown_reset: false,
+            last_keyframe_emit_ms: Some(pre_reconnect_emit_ms),
+            cooldown_ms: cd,
+        });
+        assert!(
+            !control.want_keyframe,
+            "control: a PLI {}ms after the last keyframe must be coalesced when no \
+             reconnect reset is armed",
+            first_frame_after_ms - pre_reconnect_emit_ms
+        );
 
-        // RESET ARM: a reconnect/re-election armed the reset. The encode loop
-        // consumes it and clears `last_keyframe_emit_ms`, so the SAME PLI on the
-        // SAME early frame now EMITS. Removing the `last_keyframe_emit_ms = None`
-        // line (the mutation this test guards) makes `pli_emits` false and FAILS.
-        {
-            let mut last_keyframe_emit_ms = Some(pre_reconnect_emit_ms);
-            let reset = AtomicBool::new(true); // armed by the transition
-            let consumed = reset.swap(false, Ordering::AcqRel);
-            assert!(
-                consumed,
-                "the armed reset edge must be observed exactly once"
-            );
-            if consumed {
-                last_keyframe_emit_ms = None;
-            }
-            let pli_pending = true;
-            let pli_emits = pli_pending
-                && pli_keyframe_allowed(first_frame_after_ms, last_keyframe_emit_ms, cd);
-            assert!(
-                pli_emits,
-                "after a reconnect/re-election reset, the first PLI must emit a forced \
-                 keyframe immediately even {}ms < cooldown ({}ms) since the last keyframe",
-                first_frame_after_ms - pre_reconnect_emit_ms,
-                cd
-            );
+        // RESET ARM: a reconnect/re-election armed the reset (the loop
+        // `.swap(false)`-consumed it → `cooldown_reset: true`). The SAME PLI on the
+        // SAME early frame now EMITS. Removing the `cooldown_reset` clear from the
+        // decision makes `want_keyframe` false and FAILS.
+        let reset = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: first_frame_after_ms,
+            pli_pending: true,
+            is_periodic: false,
+            cooldown_reset: true,
+            last_keyframe_emit_ms: Some(pre_reconnect_emit_ms),
+            cooldown_ms: cd,
+        });
+        assert!(
+            reset.want_keyframe,
+            "after a reconnect/re-election reset, the first PLI must emit a forced \
+             keyframe immediately even {}ms < cooldown ({}ms) since the last keyframe",
+            first_frame_after_ms - pre_reconnect_emit_ms,
+            cd
+        );
 
-            // One-shot: the reset is consumed, so a SUBSEQUENT early frame (still
-            // inside the cooldown of the keyframe we just emitted) is coalesced
-            // again — the reset does not stick and disable the coalescer.
-            assert!(
-                !reset.swap(false, Ordering::AcqRel),
-                "the reset edge must be one-shot (already consumed)"
-            );
-            last_keyframe_emit_ms = Some(first_frame_after_ms); // we emitted above
-            let next_frame_ms = first_frame_after_ms + 33.0;
-            // pli_pending stays true (the receiver is still requesting).
-            let next_emits = pli_keyframe_allowed(next_frame_ms, last_keyframe_emit_ms, cd);
-            assert!(
-                !next_emits,
-                "after the one-shot reset is consumed, the coalescer must resume \
-                 suppressing PLIs inside the cooldown window"
-            );
-        }
+        // One-shot: the reset is a per-frame edge (the loop already consumed it via
+        // `.swap`), so a SUBSEQUENT early frame — still inside the cooldown of the
+        // keyframe we just emitted, reset NOT re-armed — is coalesced again. The reset
+        // does not stick and disable the coalescer.
+        let next = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: first_frame_after_ms + 33.0,
+            pli_pending: true,
+            is_periodic: false,
+            cooldown_reset: false,
+            last_keyframe_emit_ms: reset.last_keyframe_emit_ms,
+            cooldown_ms: cd,
+        });
+        assert!(
+            !next.want_keyframe,
+            "after the one-shot reset is consumed, the coalescer must resume \
+             suppressing PLIs inside the cooldown window"
+        );
     }
 
     #[test]

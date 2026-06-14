@@ -475,8 +475,22 @@ struct Inner {
     /// quality task — only the RECONNECT path needs this client-side wiring,
     /// because a full reconnect runs `reset_and_start_election` (clearing
     /// `old_active_connection`) and so never drives `reelection_completed_signal`.
-    /// Screen has no equivalent yet (deferred #1311 follow-up, gated on #1322/#1344).
+    /// See [`screen_keyframe_cooldown_reset`](Self::screen_keyframe_cooldown_reset)
+    /// for the SCREEN mirror, armed from the same `Connected` transition.
     camera_keyframe_cooldown_reset: Option<Rc<AtomicBool>>,
+    /// Forced-keyframe cooldown reset for the SCREEN encoder (issue #1311, screen
+    /// half — camera was #1348). A clone of `ScreenEncoder::keyframe_cooldown_reset`,
+    /// wired in by the host after the encoder is built. SET to `true` on the SAME
+    /// `Connected` lifecycle event that arms the camera reset, so both encoders clear
+    /// their `last_keyframe_emit_ms` cooldown clock together on every reconnect and
+    /// the first post-reconnect screen PLI is not coalesced away (screen's cooldown
+    /// is 2000ms — far longer than camera's 250ms, so the suppressed-recovery window
+    /// is worse). `None` until the host wires it (observer mode / native lib callers
+    /// have no screen encoder → no-op). The RE-ELECTION path arms the same
+    /// encoder-owned atom directly from the screen quality task; only the RECONNECT
+    /// path needs this client-side wiring (a full reconnect never drives
+    /// `reelection_completed_signal`).
+    screen_keyframe_cooldown_reset: Option<Rc<AtomicBool>>,
     /// Long Tasks API observer that emits `client_longtask_duration_ms` /
     /// `client_longtask_count` to the diagnostic bus whenever the main
     /// thread blocks for more than 50 ms. Held for its drop side-effect:
@@ -973,10 +987,11 @@ impl VideoCallClient {
                 // LAYER_HINT dispatch arm no-ops while None (fail-open).
                 camera_union_requested_layer: None,
                 screen_union_requested_layer: None,
-                // Issue #1311: None until the host wires in
-                // `CameraEncoder::keyframe_cooldown_reset`; the reconnect reset
-                // no-ops while None.
+                // Issue #1311: None until the host wires in the
+                // `CameraEncoder`/`ScreenEncoder` `keyframe_cooldown_reset` accessors;
+                // the reconnect reset no-ops while None.
                 camera_keyframe_cooldown_reset: None,
+                screen_keyframe_cooldown_reset: None,
                 _long_task_observer: long_task_observer,
                 _render_fps_observer: render_fps_observer,
             })),
@@ -1210,6 +1225,21 @@ impl VideoCallClient {
                                     // `None`); a duplicate vs the quality task's arm is
                                     // idempotent (`.swap(false)` on the consume side).
                                     if let Some(atom) = &inner.camera_keyframe_cooldown_reset {
+                                        atom.store(true, Ordering::Release);
+                                    }
+                                    // SCREEN mirror (issue #1311, screen half): arm the
+                                    // screen encoder's reset on the SAME `Connected`
+                                    // transition so both encoders clear their cooldown
+                                    // clock together. Screen's cooldown is 2000ms (vs
+                                    // camera's 250ms), so a suppressed first post-
+                                    // transition PLI freezes the screen-share for longer.
+                                    // Same invariants as the camera arm: covers BOTH
+                                    // reconnect and re-election (the screen quality task's
+                                    // re-election arm alone would miss a reconnect);
+                                    // un-gates only an already-pending PLI; never forces
+                                    // an unrequested keyframe; idempotent under a
+                                    // duplicate arm.
+                                    if let Some(atom) = &inner.screen_keyframe_cooldown_reset {
                                         atom.store(true, Ordering::Release);
                                     }
                                 } else {
@@ -1955,6 +1985,26 @@ impl VideoCallClient {
             inner.camera_keyframe_cooldown_reset = Some(atom);
         } else {
             warn!("set_camera_keyframe_cooldown_reset: inner busy, skipping wiring");
+        }
+    }
+
+    /// Wire the SCREEN forced-keyframe cooldown reset atom (issue #1311, screen half).
+    ///
+    /// Mirror of
+    /// [`set_camera_keyframe_cooldown_reset`](Self::set_camera_keyframe_cooldown_reset)
+    /// for the SCREEN media-kind; pass
+    /// [`ScreenEncoder::keyframe_cooldown_reset`](crate::ScreenEncoder::keyframe_cooldown_reset).
+    /// The `Connected` lifecycle callback ARMS this on the SAME transition as the
+    /// camera reset, so both encoders clear their forced-keyframe cooldown clock
+    /// together on every reconnect and the first post-reconnect screen PLI is not
+    /// coalesced away. Until wired the reconnect reset is a no-op (`None`); the
+    /// re-election path arms the same atom from the screen quality task with no client
+    /// involvement.
+    pub fn set_screen_keyframe_cooldown_reset(&self, atom: Rc<AtomicBool>) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.screen_keyframe_cooldown_reset = Some(atom);
+        } else {
+            warn!("set_screen_keyframe_cooldown_reset: inner busy, skipping wiring");
         }
     }
 

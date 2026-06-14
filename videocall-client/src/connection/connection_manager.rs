@@ -161,6 +161,34 @@ pub(super) const CPU_OVERLOAD_DRIFT_THRESHOLD_MS: f64 = 500.0;
 /// elevated-RTT detector.
 pub(super) const CPU_OVERLOADED_DURATION_MS: f64 = 5_000.0;
 
+/// RTT-probe pipeline resilience thresholds (issue #522).
+///
+/// Probe cadence is 1 Hz (probe_interval_ms = 1000). With a 5000ms timeout, a
+/// genuinely high-RTT but HEALTHY link (e.g. 1-2s RTT on mobile/satellite)
+/// legitimately has up to ceil(PROBE_TIMEOUT_MS / probe_interval_ms) =
+/// ceil(5000/1000) = 5 probes in flight before the oldest legitimately times
+/// out. We set MAX_INFLIGHT_PROBES = 6 (= 5 + 1 headroom) so a slow-but-healthy
+/// link is never falsely capped/dropped, and STALE_THRESHOLD = 3 consecutive
+/// timeouts so a single transient late response does not flip stale. A
+/// false-positive stale on a slow-but-healthy link is a regression; these
+/// values guard against it. On a 1.5s RTT link, in-flight is about 2 (well
+/// under cap) and probes return before the 5s deadline, so it is NOT flagged
+/// stale.
+///
+/// Dual cadence: during election the probe cadence is faster (~5 Hz / 200ms in
+/// the Testing phase) while prune still runs at 1 Hz, so the in-flight queue
+/// fills faster then and the MAX_INFLIGHT_PROBES cap is the intended safety
+/// valve in that phase (a dropped probe is expendable).
+pub(super) const PROBE_TIMEOUT_MS: f64 = 5000.0; // per-probe deadline
+pub(super) const MAX_INFLIGHT_PROBES: usize = 6; // cap on in-flight probes
+pub(super) const STALE_THRESHOLD: u32 = 3; // consecutive timeouts before stale
+
+/// Pure cap-decision helper extracted so the in-flight cap is unit-testable on
+/// host (a live datagram Connection cannot be constructed off-wasm).
+fn should_drop_probe(in_flight_len: usize) -> bool {
+    in_flight_len >= MAX_INFLIGHT_PROBES
+}
+
 /// Returns a monotonic, high-resolution timestamp in milliseconds using
 /// `performance.now()`. This is immune to NTP adjustments, DST changes, and
 /// user clock manipulation — unlike `js_sys::Date::now()` — making it safe
@@ -295,6 +323,12 @@ pub struct ServerRttMeasurement {
     /// treated as a re-election signal so the user is not silently stuck on
     /// a broken connection (see discussion #539).
     pub consecutive_implausible_discards: u32,
+    /// Monotonic send timestamps (`monotonic_now_ms()`) of probes awaiting a
+    /// response, oldest first.
+    pub in_flight_probes: VecDeque<f64>,
+    /// Count of consecutive probes that hit `PROBE_TIMEOUT_MS` without a
+    /// response; reset to 0 when any response arrives.
+    pub consecutive_probe_timeouts: u32,
 }
 
 #[derive(Debug)]
@@ -474,6 +508,10 @@ pub struct ConnectionManager {
     packets_received: Rc<Cell<u64>>,
     /// Counter for total packets sent (incremented on each outbound packet)
     packets_sent: Rc<Cell<u64>>,
+    /// Monotonic count of RTT probes dropped because the in-flight queue was at
+    /// MAX_INFLIGHT_PROBES (queue cap, issue #522). Read by rtt_probe_dropped_total()
+    /// and surfaced as the rtt_probe_dropped_total diagnostic metric.
+    rtt_probe_dropped_total: Rc<Cell<u64>>,
     /// Timestamp of last metrics calculation
     last_metrics_timestamp_ms: Rc<RefCell<f64>>,
     /// Last calculated packets received per second
@@ -643,6 +681,7 @@ impl ConnectionManager {
             intentionally_disconnected: Rc::new(RefCell::new(false)),
             packets_received: Rc::new(Cell::new(0)),
             packets_sent: Rc::new(Cell::new(0)),
+            rtt_probe_dropped_total: Rc::new(Cell::new(0)),
             last_metrics_timestamp_ms: Rc::new(RefCell::new(js_sys::Date::now())),
             packets_received_per_sec: Rc::new(RefCell::new(0.0)),
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
@@ -857,6 +896,8 @@ impl ConnectionManager {
                             active: false,
                             connected: false,
                             consecutive_implausible_discards: 0,
+                            in_flight_probes: VecDeque::new(),
+                            consecutive_probe_timeouts: 0,
                         },
                     );
                     debug!(
@@ -901,6 +942,8 @@ impl ConnectionManager {
                             active: false,
                             connected: false,
                             consecutive_implausible_discards: 0,
+                            in_flight_probes: VecDeque::new(),
+                            consecutive_probe_timeouts: 0,
                         },
                     );
                     debug!(
@@ -1163,23 +1206,59 @@ impl ConnectionManager {
     /// RTT probes are periodic and expendable — a missed probe just means we
     /// skip one measurement. They use datagrams for lower overhead.
     fn send_rtt_probe(&mut self, connection_id: &str) -> Result<()> {
+        // Scope the immutable borrow of `connection` so it ends before we mutate
+        // `self.rtt_measurements` / `self.packets_sent` below.
+        {
+            let connection = self
+                .connections
+                .get(connection_id)
+                .ok_or_else(|| anyhow!("Connection {connection_id} not found"))?;
+
+            if !connection.is_connected() {
+                return Ok(()); // Skip non-connected connections
+            }
+        }
+
+        // Compute the send timestamp BEFORE the in-flight push — this is the
+        // value we enqueue and that the matching response will clear.
+        let timestamp = monotonic_now_ms();
+
+        // Update connection status + read the current in-flight depth. End this
+        // borrow before mutating other `self` fields below.
+        let at_cap;
+        let len;
+        if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
+            measurement.connected = true;
+            len = measurement.in_flight_probes.len();
+            at_cap = should_drop_probe(len);
+        } else {
+            // No measurement entry means there is nothing to track; skip.
+            return Ok(());
+        }
+
+        if at_cap {
+            self.rtt_probe_dropped_total
+                .set(self.rtt_probe_dropped_total.get().saturating_add(1));
+            trace!(
+                "dropping RTT probe to {connection_id}: {len} already in flight (cap {MAX_INFLIGHT_PROBES})"
+            );
+            return Ok(());
+        }
+
+        let rtt_packet = self.create_rtt_packet(timestamp)?;
+
+        // Enqueue the in-flight slot only AFTER create_rtt_packet succeeds, so a
+        // packet-build failure can't leave a phantom probe that falsely ages
+        // into a timeout. Record the send timestamp so the prune path can age it
+        // out and the response path can clear it.
+        if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
+            measurement.in_flight_probes.push_back(timestamp);
+        }
+
         let connection = self
             .connections
             .get(connection_id)
             .ok_or_else(|| anyhow!("Connection {connection_id} not found"))?;
-
-        if !connection.is_connected() {
-            return Ok(()); // Skip non-connected connections
-        }
-
-        // Update connection status
-        if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
-            measurement.connected = true;
-        }
-
-        let timestamp = monotonic_now_ms();
-        let rtt_packet = self.create_rtt_packet(timestamp)?;
-
         connection.send_packet_datagram(rtt_packet);
         // Count RTT probes in packets_sent so the sent/received rates are symmetric.
         // packets_received already counts inbound RTT echoes; excluding probes from
@@ -1228,6 +1307,15 @@ impl ConnectionManager {
         let rtt = reception_time - sent_timestamp;
         let plausible = (0.0..=RTT_SANITY_MAX_MS).contains(&rtt);
 
+        // Reset consecutive_probe_timeouts to 0 on ANY received response
+        // (plausible or not): a received response means the loop is no longer
+        // fully starved and the pipeline is draining. The
+        // implausibly-huge-RTT-under-starvation symptom is handled by
+        // SUPPRESSION (rtt_probe_stale), not by counting it as a fake
+        // measurement. A late-but-received response still proves draining and
+        // clears its own in-flight slot (retain removes the matching send
+        // timestamp).
+
         // Discard implausible RTT measurements but bump the per-connection
         // streak counter so a sustained discard pattern becomes actionable
         // (rather than silently starving the RTT-degradation watchdog).
@@ -1240,6 +1328,10 @@ impl ConnectionManager {
                 measurement.consecutive_implausible_discards = measurement
                     .consecutive_implausible_discards
                     .saturating_add(1);
+                measurement.consecutive_probe_timeouts = 0;
+                measurement
+                    .in_flight_probes
+                    .retain(|&ts| ts != sent_timestamp);
             }
             return;
         }
@@ -1247,6 +1339,10 @@ impl ConnectionManager {
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
             // Reset the discard streak — we just got a usable measurement.
             measurement.consecutive_implausible_discards = 0;
+            measurement.consecutive_probe_timeouts = 0;
+            measurement
+                .in_flight_probes
+                .retain(|&ts| ts != sent_timestamp);
 
             measurement.measurements.push_back(rtt);
 
@@ -1387,6 +1483,8 @@ impl ConnectionManager {
                                             active: true,
                                             connected: true,
                                             consecutive_implausible_discards: 0,
+                                            in_flight_probes: VecDeque::new(),
+                                            consecutive_probe_timeouts: 0,
                                         },
                                     );
                                 }
@@ -1744,6 +1842,8 @@ impl ConnectionManager {
                         active: true,
                         connected: true,
                         consecutive_implausible_discards: 0,
+                        in_flight_probes: VecDeque::new(),
+                        consecutive_probe_timeouts: 0,
                     },
                 );
             }
@@ -3037,6 +3137,37 @@ impl ConnectionManager {
         for (connection_id, media_packet, reception_time) in responses_to_process {
             self.handle_rtt_response(&connection_id, &media_packet, reception_time);
         }
+
+        // Age out any probes that never got a response THIS tick. Runs AFTER the
+        // drain loop above so a response that arrived this tick clears its own
+        // in-flight slot before we count it as a timeout.
+        self.prune_stale_probes();
+    }
+
+    /// Age out RTT probes that have exceeded [`PROBE_TIMEOUT_MS`] without a
+    /// response, marking the connection's probe pipeline as increasingly stale.
+    ///
+    /// Increment `consecutive_probe_timeouts` on each expiry; it is reset to 0
+    /// in `handle_rtt_response` on ANY received response. So a healthy link that
+    /// occasionally loses one probe but keeps getting others resets before
+    /// reaching `STALE_THRESHOLD`. Called AFTER draining this tick's responses
+    /// (see `process_queued_rtt_responses`) so this-tick responses clear their
+    /// slots first.
+    fn prune_stale_probes(&mut self) {
+        let now = monotonic_now_ms();
+        for measurement in self.rtt_measurements.values_mut() {
+            // `in_flight_probes` is oldest-first, so once the front entry is
+            // within the deadline every later entry is too — we can stop.
+            while let Some(&front) = measurement.in_flight_probes.front() {
+                if now - front > PROBE_TIMEOUT_MS {
+                    measurement.in_flight_probes.pop_front();
+                    measurement.consecutive_probe_timeouts =
+                        measurement.consecutive_probe_timeouts.saturating_add(1);
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     /// Trigger diagnostics reporting (to be called externally at 1Hz)
@@ -3098,10 +3229,22 @@ impl ConnectionManager {
                 metrics.push(metric!("active_connection_id", connection_id.as_str()));
                 metrics.push(metric!("elected_at", *elected_at));
 
+                // Hoist the stale check BEFORE borrowing rtt_measurements below:
+                // `rtt_probe_stale` takes its own immutable borrow of
+                // `rtt_measurements`, so computing it here lets that borrow end
+                // before `get(connection_id)` re-borrows.
+                let stale = self.rtt_probe_stale();
+
                 // Report active connection RTT
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     if let Some(avg_rtt) = measurement.average_rtt {
-                        metrics.push(metric!("active_server_rtt", avg_rtt));
+                        // When stale, suppress active_server_rtt so the 200s
+                        // value never reaches dashboards (issue #522 option A).
+                        // active_server_url/type still emit so the UI still
+                        // shows which server is active.
+                        if !stale {
+                            metrics.push(metric!("active_server_rtt", avg_rtt));
+                        }
                         // SECURITY: redact (strip query + fragment) before emitting
                         // to the diagnostic bus. `measurement.url` carries the room
                         // JWT in `?token=<JWT>&instance_id=<UUID>` — see
@@ -3152,6 +3295,17 @@ impl ConnectionManager {
         metrics.push(metric!(
             "main_thread_drift_ms",
             *self.main_thread_drift_ms.borrow()
+        ));
+
+        // RTT probe pipeline health (issue #522). Emitted in EVERY election
+        // state so dashboards always know whether the active link's probe
+        // pipeline is starved (`rtt_probe_stale`) and how many probes have been
+        // shed at the in-flight cap (`rtt_probe_dropped_total`). Bool-as-u64 per
+        // the convention documented above.
+        metrics.push(metric!("rtt_probe_stale", self.rtt_probe_stale() as u64));
+        metrics.push(metric!(
+            "rtt_probe_dropped_total",
+            self.rtt_probe_dropped_total()
         ));
 
         // Chrome-only: report WASM heap usage for memory pressure diagnosis.
@@ -3733,6 +3887,32 @@ impl ConnectionManager {
         *self.packets_sent_per_sec.borrow()
     }
 
+    /// Total number of RTT probes dropped because the in-flight queue was at
+    /// [`MAX_INFLIGHT_PROBES`] (queue cap, issue #522).
+    pub fn rtt_probe_dropped_total(&self) -> u64 {
+        self.rtt_probe_dropped_total.get()
+    }
+
+    /// Whether the ACTIVE link's RTT probe pipeline is stale (issue #522).
+    ///
+    /// True when the local main thread is CPU-overloaded (probe timing is
+    /// untrustworthy), or when the currently-elected connection has hit
+    /// [`STALE_THRESHOLD`] consecutive probe timeouts.
+    pub fn rtt_probe_stale(&self) -> bool {
+        if self.cpu_overloaded.load(Ordering::Relaxed) {
+            return true;
+        }
+        // Active-only: a backed-up NON-active candidate during election must not
+        // flip the active-link stale signal. Only the Elected connection's probe
+        // pipeline gates active_server_rtt / the stale metric.
+        if let ElectionState::Elected { connection_id, .. } = &self.election_state {
+            if let Some(measurement) = self.rtt_measurements.get(connection_id) {
+                return measurement.consecutive_probe_timeouts >= STALE_THRESHOLD;
+            }
+        }
+        false
+    }
+
     /// Get send queue depth from the active connection (bufferedAmount for WebSocket)
     pub fn get_send_queue_depth(&self) -> Option<u64> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
@@ -3878,6 +4058,7 @@ mod tests {
             intentionally_disconnected: Rc::new(RefCell::new(false)),
             packets_received: Rc::new(Cell::new(0)),
             packets_sent: Rc::new(Cell::new(0)),
+            rtt_probe_dropped_total: Rc::new(Cell::new(0)),
             last_metrics_timestamp_ms: Rc::new(RefCell::new(0.0)),
             packets_received_per_sec: Rc::new(RefCell::new(0.0)),
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
@@ -3916,6 +4097,8 @@ mod tests {
                 active: false,
                 connected: true,
                 consecutive_implausible_discards: 0,
+                in_flight_probes: VecDeque::new(),
+                consecutive_probe_timeouts: 0,
             },
         );
     }
@@ -4994,6 +5177,177 @@ mod tests {
         let m = mgr.rtt_measurements.get("wt_0").unwrap();
         assert_eq!(m.measurements.len(), 1);
         assert!((m.average_rtt.unwrap() - 0.0).abs() < 0.01);
+    }
+
+    // catches removal of MAX_INFLIGHT_PROBES cap
+    #[test]
+    fn rtt_probe_dropped_at_inflight_cap() {
+        // The pure cap-decision helper: at the cap we drop, one below we send.
+        assert!(should_drop_probe(MAX_INFLIGHT_PROBES));
+        assert!(!should_drop_probe(MAX_INFLIGHT_PROBES - 1));
+
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        let before = mgr.rtt_probe_dropped_total();
+
+        // Fill the in-flight queue exactly to the cap.
+        for _ in 0..MAX_INFLIGHT_PROBES {
+            mgr.rtt_measurements
+                .get_mut("wt_0")
+                .unwrap()
+                .in_flight_probes
+                .push_back(monotonic_now_ms());
+        }
+
+        // Simulate the drop branch exactly as send_rtt_probe does: bump the
+        // counter and DO NOT push another in-flight probe. (We cannot call
+        // send_rtt_probe directly off-wasm — it needs a live Connection.)
+        assert!(should_drop_probe(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .in_flight_probes
+                .len()
+        ));
+        mgr.rtt_probe_dropped_total
+            .set(mgr.rtt_probe_dropped_total.get() + 1);
+
+        assert_eq!(mgr.rtt_probe_dropped_total(), before + 1);
+        // The drop must NOT enqueue another probe; the queue stays at the cap.
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .in_flight_probes
+                .len(),
+            MAX_INFLIGHT_PROBES
+        );
+    }
+
+    // catches disabling the PROBE_TIMEOUT_MS prune
+    #[test]
+    fn probe_marked_stale_after_timeout() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "wt_0".to_string(),
+            elected_at: 0.0,
+        };
+
+        // Push STALE_THRESHOLD probes that are all older than PROBE_TIMEOUT_MS,
+        // i.e. genuinely expired.
+        for _ in 0..STALE_THRESHOLD {
+            mgr.rtt_measurements
+                .get_mut("wt_0")
+                .unwrap()
+                .in_flight_probes
+                .push_back(monotonic_now_ms() - PROBE_TIMEOUT_MS - 1000.0);
+        }
+
+        // Stale must come from the prune path, not from the CPU-overload OR.
+        assert!(!mgr.cpu_overloaded.load(Ordering::Relaxed));
+
+        mgr.prune_stale_probes();
+
+        assert!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_probe_timeouts
+                >= STALE_THRESHOLD
+        );
+        assert!(mgr.rtt_probe_stale());
+    }
+
+    // catches removal of reset-on-response
+    #[test]
+    fn stale_clears_when_responses_arrive() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "wt_0".to_string(),
+            elected_at: 0.0,
+        };
+
+        // Force the link into the stale state with a matching in-flight probe.
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .consecutive_probe_timeouts = STALE_THRESHOLD;
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .in_flight_probes
+            .push_back(1000.0);
+
+        assert!(mgr.rtt_probe_stale());
+
+        // A plausible response (rtt = 1100 - 1000 = 100ms) must clear stale.
+        let pkt = MediaPacket {
+            timestamp: 1000.0,
+            ..Default::default()
+        };
+        mgr.handle_rtt_response("wt_0", &pkt, 1100.0);
+
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_probe_timeouts,
+            0
+        );
+        assert!(!mgr.rtt_probe_stale());
+        assert!(mgr
+            .rtt_measurements
+            .get("wt_0")
+            .unwrap()
+            .average_rtt
+            .is_some());
+        // The matching in-flight slot must have been cleared by retain().
+        assert!(!mgr
+            .rtt_measurements
+            .get("wt_0")
+            .unwrap()
+            .in_flight_probes
+            .contains(&1000.0));
+    }
+
+    // catches a too-small prune timeout (would falsely flag a 1.5s healthy link)
+    #[test]
+    fn healthy_high_rtt_link_not_flagged_stale() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "wt_0".to_string(),
+            elected_at: 0.0,
+        };
+
+        // A healthy-but-slow (1.5s RTT) link: probes aged 1500ms are well under
+        // the 5000ms PROBE_TIMEOUT_MS and must NOT be pruned as timed out.
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .in_flight_probes
+            .push_back(monotonic_now_ms() - 1500.0);
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .in_flight_probes
+            .push_back(monotonic_now_ms() - 1500.0);
+
+        mgr.prune_stale_probes();
+
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_probe_timeouts,
+            0
+        );
+        assert!(!mgr.rtt_probe_stale());
+        // 2 in-flight is well under the cap of 6.
+        assert!(!should_drop_probe(2));
     }
 
     // ===================================================================
@@ -6553,6 +6907,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         });
         // old_active_connection is None (no real Connection object).
         *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
@@ -6623,6 +6979,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         });
         *mgr.active_connection_id.borrow_mut() = Some("custom_id".to_string());
 
@@ -6649,6 +7007,8 @@ mod tests {
             active: false,
             connected: false,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         });
 
         mgr.reset_and_start_election().unwrap();
@@ -6786,6 +7146,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         });
         *mgr.active_connection_id.borrow_mut() = Some(old_id.to_string());
         // Synthesise the moved-out old connection slot. We cannot build
@@ -7922,6 +8284,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
         mgr.election_state = ElectionState::Elected {
@@ -7984,6 +8348,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
 
@@ -8048,6 +8414,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
         mgr.election_state = ElectionState::Elected {
@@ -8106,6 +8474,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
         // Set the active connection so `last_known_server` is populated from it.

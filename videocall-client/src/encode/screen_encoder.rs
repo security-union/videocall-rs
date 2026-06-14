@@ -3471,10 +3471,10 @@ mod tests {
         record_screen_restart(RestartReason::Configure);
         record_screen_restart(RestartReason::Other);
 
-        assert!(screen_encoder_restarts_closed_codec() >= before_closed + 1);
-        assert!(screen_encoder_restarts_memory() >= before_memory + 1);
-        assert!(screen_encoder_restarts_configure() >= before_configure + 1);
-        assert!(screen_encoder_restarts_other() >= before_other + 1);
+        assert!(screen_encoder_restarts_closed_codec() > before_closed);
+        assert!(screen_encoder_restarts_memory() > before_memory);
+        assert!(screen_encoder_restarts_configure() > before_configure);
+        assert!(screen_encoder_restarts_other() > before_other);
     }
 
     fn build_test_client() -> VideoCallClient {

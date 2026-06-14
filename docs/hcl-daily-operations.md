@@ -450,6 +450,63 @@ Alerts are defined in `helm/global/hcl-daily-deployment/prometheus/values.yaml`.
 - `ClientUpstreamDropsActive` — client dropping upstream datagrams
 - `RelayOutboundSaturating` — relay dropping >5 packets/sec
 
+### Ingress (`prometheus-ingress` chart)
+
+Prometheus is exposed at `https://prometheus.videocall.fnxlabs.com` via the
+`helm/util/hcl-daily/prometheus-ingress/` chart (sibling of
+`pushgateway-ingress`). Two operational notes:
+
+**Access is IP-restricted.** Prometheus has no authentication, so the ingress
+carries `nginx.ingress.kubernetes.io/whitelist-source-range` (see
+`values.yaml` → `allowedSourceRange`): the CI runner, the K3s node, and the pod
+CIDR. Anything outside that range gets a `403` from nginx. Widen the CIDR list
+only if another internal service needs to query Prometheus directly.
+
+**TLS secret provenance — `videocall-wildcard-tls`:**
+> provenance: **UNKNOWN — manually applied, not cert-manager-managed; TODO
+> confirm owner.** The chart only *consumes* this secret (`values.yaml` →
+> `tlsSecretName`); nothing in this repo creates or renews it. Every other TLS
+> path in the cluster uses a per-host cert-manager `Certificate`, but no
+> `Certificate`/`Issuer` resource for `*.videocall.fnxlabs.com` exists in-repo.
+> The secret must live in the **same namespace the chart deploys to**
+> (`videocall`) — an Ingress can only reference a TLS secret in its own
+> namespace. If the secret is deleted, renamed, or the chart deploys to a
+> different namespace, nginx silently falls back to its self-signed
+> `ingress.local` fake cert on `:443`. **Action: confirm with the cluster owner
+> who/what renews this wildcard before it can expire.** If the wildcard is
+> retired, switch to a dedicated cert (`issuer: letsencrypt-prod` + unique
+> `tlsSecretName` + the `cert-manager.io/issuer` annotation) as the values.yaml
+> comment describes.
+
+**Adopting the hand-applied Ingress into Helm.** The live `prometheus-server`
+Ingress was originally `kubectl apply`-ed by hand, so it has no Helm ownership
+metadata. A first `helm upgrade --install prometheus-ingress` (the pattern
+`scripts/deploy-e2e-scoreboard.sh` uses for the sibling pushgateway) will fail
+with `Ingress "prometheus-server" exists and cannot be imported into the
+current release: invalid ownership metadata` unless you adopt it first. Two
+options:
+
+```bash
+# Option A — patch ownership metadata so Helm adopts the existing object
+# (no downtime; the Ingress keeps serving while it's adopted).
+kubectl -n videocall annotate ingress prometheus-server \
+  meta.helm.sh/release-name=prometheus-ingress \
+  meta.helm.sh/release-namespace=videocall --overwrite
+kubectl -n videocall label ingress prometheus-server \
+  app.kubernetes.io/managed-by=Helm --overwrite
+
+# Option B — delete the hand-applied Ingress, then let Helm recreate it
+# (brief gap in external access while the new Ingress is created).
+kubectl -n videocall delete ingress prometheus-server
+
+# Then install/upgrade the chart:
+helm upgrade --install prometheus-ingress \
+  helm/util/hcl-daily/prometheus-ingress/ -n videocall
+```
+
+Prefer Option A when the endpoint is in use. The pushgateway ingress was
+created by Helm from the start and needs no adoption.
+
 ## 8. Grafana
 
 ### Access

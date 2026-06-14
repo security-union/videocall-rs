@@ -545,9 +545,12 @@ fn process_health_packet_to_metrics_pb(
         let server_url_clean = server_url_clean.as_str();
 
         // For the RTT metric we allow the server_type label to be an empty string when
-        // unknown, because the URL scrub also zeroes active_server_type and dashboards
-        // already treat blank labels as "unknown source". The CLIENT_ACTIVE_SERVER gauge
-        // below keeps its original "unknown" placeholder since it still requires a URL.
+        // unset — dashboards already treat blank labels as "unknown source". Note: the
+        // upstream URL scrub (`client_diagnostics.rs::scrub_client_supplied_urls`) clears
+        // `active_server_url` but does NOT touch `active_server_type`, so this branch
+        // handles the legitimate "client didn't populate type" case. The
+        // CLIENT_ACTIVE_SERVER gauge below keeps its "unknown" placeholder since it still
+        // requires a URL.
         let server_type_for_rtt = health_packet.active_server_type.as_str();
         let server_type_for_active = if health_packet.active_server_type.is_empty() {
             "unknown"
@@ -914,6 +917,7 @@ fn process_health_packet_to_metrics_pb(
             || health_packet.client_gpu_family.is_some()
             || health_packet.client_network_effective_type.is_some()
             || health_packet.client_capability_score.is_some()
+            || health_packet.client_battery_level.is_some()
         {
             let cores_str = health_packet
                 .client_cores
@@ -2696,6 +2700,35 @@ mod tests {
         assert!(
             after > before,
             "HEALTH_REPORTS_TOTAL should be incremented on each health packet"
+        );
+    }
+
+    #[test]
+    fn test_client_info_published_for_battery_only_metadata() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet("s_battery", "m_battery", "alice", HashMap::new());
+        hp.client_battery_level = Some(0.42);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            series_exists(
+                "videocall_client_info",
+                &[
+                    ("meeting_id", "m_battery"),
+                    ("session_id", "s_battery"),
+                    ("display_name", "alice"),
+                    ("cores", ""),
+                    ("architecture", ""),
+                    ("gpu_family", ""),
+                    ("network_effective_type", ""),
+                    ("capability_score", ""),
+                ],
+            ),
+            "battery-only client metadata must publish CLIENT_INFO"
         );
     }
 

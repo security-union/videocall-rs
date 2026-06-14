@@ -67,6 +67,13 @@ pub struct NetEqConfig {
     pub additional_delay_ms: u32,
     /// Disable time stretching (for testing)
     pub for_test_no_time_stretching: bool,
+    /// Skip delay-manager updates on insert (for testing only).
+    ///
+    /// When `true`, `insert_packet` skips the `delay_manager.update()` call and the
+    /// subsequent `statistics.update_buffer_size()` call. This eliminates the per-insert
+    /// O(n log n) sort inside `RelativeArrivalDelayTracker::calculate_relative_packet_arrival_delay`
+    /// that becomes quadratic under test-speed insertion. Production code must never set this.
+    pub for_test_skip_delay_manager: bool,
     /// Bypass NetEQ processing and decode packets directly (for A/B testing)
     pub bypass_mode: bool,
     /// Delay manager configuration
@@ -85,6 +92,7 @@ impl Default for NetEqConfig {
             min_delay_ms: 0,
             additional_delay_ms: 0,
             for_test_no_time_stretching: false,
+            for_test_skip_delay_manager: false,
             bypass_mode: false,
             delay_config: DelayConfig::default(),
             smart_flush_config: SmartFlushConfig::default(),
@@ -330,9 +338,11 @@ impl NetEq {
         }
 
         // Normal NetEQ processing
-        // Update delay manager
-        self.delay_manager
-            .update(packet.header.timestamp, packet.sample_rate, false)?;
+        // Update delay manager (skip when for_test_skip_delay_manager is set — see config doc).
+        if !self.config.for_test_skip_delay_manager {
+            self.delay_manager
+                .update(packet.header.timestamp, packet.sample_rate, false)?;
+        }
 
         // Insert packet into buffer
         let target_delay = self.delay_manager.target_delay_ms();
@@ -340,9 +350,11 @@ impl NetEq {
             self.packet_buffer
                 .insert_packet(packet, &mut self.statistics, target_delay)?;
 
-        // Update statistics
-        self.statistics
-            .update_buffer_size(self.current_buffer_size_ms() as u16, target_delay as u16);
+        // Update statistics (skip alongside delay manager to keep stats consistent).
+        if !self.config.for_test_skip_delay_manager {
+            self.statistics
+                .update_buffer_size(self.current_buffer_size_ms() as u16, target_delay as u16);
+        }
 
         match result {
             BufferReturnCode::Flushed => {
@@ -1036,11 +1048,16 @@ mod tests {
         const STEADY_ITERS: u32 = 60;
         const MEASURE_AFTER: u32 = 10;
 
-        let mut config = NetEqConfig::default();
-        config.sample_rate = SAMPLE_RATE;
-        // Feed every packet's relative delay to the histogram immediately; the default
-        // 500ms resampler would never fire within this short test, leaving target pegged.
-        config.delay_config.resample_interval_ms = None;
+        let config = NetEqConfig {
+            sample_rate: SAMPLE_RATE,
+            // Feed every packet's relative delay to the histogram immediately; the default
+            // 500ms resampler would never fire within this short test, leaving target pegged.
+            delay_config: DelayConfig {
+                resample_interval_ms: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
         let mut neteq = NetEq::new(config).unwrap();
 
         let mut seq: u16 = 0;
@@ -1916,6 +1933,284 @@ mod tests {
             stats.playout_latency_ms > 0,
             "playout_latency_ms should be > 0 after buffering 200ms of audio and decoding, got {}",
             stats.playout_latency_ms
+        );
+    }
+
+    /// Regression guard for issue #623: u16 sequence-number wrap must not flush the buffer
+    /// or disrupt audio decoding at ~21.8 minutes (65536-packet boundary).
+    ///
+    /// Design rationale (see `packet.rs::RtpHeader::sequence_number` doc comment):
+    /// - `sequence_number` is u16 BY DESIGN (RFC 3550 wire format).
+    /// - `is_sequence_newer` uses wrapping_sub with a 0x8000 half-window → wrap-safe.
+    /// - Buffer ordering and flush decisions are driven solely by sample-domain `timestamp`
+    ///   (set per issue #624 as `frame_index * 960` at 48 kHz), never by `sequence_number`.
+    /// - `sequence_number` participates only in the `(timestamp, seq, ssrc)` dedup tuple
+    ///   in `buffer.rs::is_duplicate`; the timestamp dimension prevents false dedup at wrap.
+    ///
+    /// Strategy (lean variant): push 70,010 packets so seq wraps past 65535 → 0 at least once.
+    /// Two costs dominate the naive per-insert-per-get_audio loop:
+    ///   (a) Per-insert: `delay_manager.update()` internally sorts a growing `delay_history`
+    ///       on every call (O(n log n)). Under test-speed insertion (no real inter-arrival
+    ///       gaps), the history fills to thousands of entries and becomes quadratic. Eliminated
+    ///       via `for_test_skip_delay_manager = true` (see config doc and the gate in
+    ///       `insert_packet`). This flag does NOT affect buffer-flush behavior; flush decisions
+    ///       live entirely in `packet_buffer.insert_packet`.
+    ///   (b) Per-insert: payload construction calls 960 `sin()` × 70,010 = ~67M sin() calls.
+    ///       Eliminated by pre-computing a single shared payload before the loop.
+    ///
+    /// `get_audio()` is called only in two phases:
+    ///   1. A batch-drain at i=65490 that empties whatever has accumulated in the buffer,
+    ///      ensuring the buffer is nearly empty before the measurement window opens.
+    ///   2. A dense drain (one call per insert) over the measurement window i=65490..65560,
+    ///      which spans both measurement points (65524 and 65546) and the wrap itself (65536).
+    ///
+    /// During the pre-window stretch (i=0..65489), inserts accumulate freely; the buffer
+    /// auto-partial-flushes on overflow every ~200 packets. Those overflow flushes increment
+    /// `buffer_flushes`, but that is intentional: `flushes_pre_wrap` (read at i=65524) absorbs
+    /// ALL pre-window overflow counts as the baseline. The assertion checks only the DELTA
+    /// between i=65524 and i=65546 — a 22-packet window safely inside the 200-packet overflow
+    /// threshold — so no spurious overflow flush can fire in the measurement interval.
+    ///
+    /// Mutation sensitivity: the wrap-value assertion (at i=65536) checks that a packet
+    /// with `sequence_number == 0` and `timestamp == 65536 * 960 == 62_914_560` is present
+    /// in the buffer immediately after insertion. If `seq` is capped below 65536 (e.g.
+    /// `i % 65535 as u16`), then at i=65536 the seq would be 1, not 0, so the assertion
+    /// `wrap_pkt.sequence_number == 0` fails — the test correctly rejects the mutation.
+    /// The flush-counter and continuity assertions cover orthogonal properties (no spurious
+    /// flush, no decoder stall); together all three assertions are necessary and sufficient.
+    #[test]
+    fn test_seq_wrap_no_buffer_flush() {
+        const TOTAL_FRAMES: u32 = 70_010;
+        const SAMPLE_RATE: u32 = 48_000;
+        const SAMPLES_PER_FRAME: u32 = 960; // 20ms at 48kHz
+
+        // The measurement window straddles the wrap (65535→0 at i=65536).
+        // We open it early enough to drain the backlog before the first measurement point.
+        const DRAIN_WINDOW_START: u32 = 65_490;
+        const DRAIN_WINDOW_END: u32 = 65_560;
+
+        let config = NetEqConfig {
+            sample_rate: SAMPLE_RATE,
+            // Disable time stretching so all decode decisions are Normal; this avoids
+            // incidental buffer drain races that could mask or produce spurious flushes.
+            for_test_no_time_stretching: true,
+            // Skip per-insert delay-manager updates. The delay_manager internally sorts a
+            // growing delay_history on every insert; under test-speed insertion (no real
+            // inter-arrival gaps) the history fills to ~max_history_ms worth of entries and
+            // the sort becomes the dominant O(n log n)-per-insert cost, making the full
+            // 70,010-insert loop take ~22s of CPU time. Skipping the delay-manager does not
+            // affect the seq-wrap correctness property under test: buffer-flush decisions are
+            // driven by `packet_buffer.insert_packet` (smart-flush / overflow logic), not by
+            // the delay manager. The target_delay used as the smart-flush threshold defaults
+            // to K_START_DELAY_MS (80ms) and is frozen at that value throughout the test,
+            // which is conservative and still lets the smart-flush path trigger normally if
+            // the buffer ever exceeds its threshold.
+            for_test_skip_delay_manager: true,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Pre-compute the payload once — 960 sin() calls × 70,010 iterations = another
+        // significant cost. Re-using the same bytes is safe: the wrap test cares about RTP
+        // header fields (seq, timestamp, ssrc), not PCM content.
+        let shared_payload: Vec<u8> = {
+            let mut p = Vec::with_capacity(960 * 4);
+            for i in 0..960usize {
+                let sample = (i as f32 / 960.0 * 2.0 * std::f32::consts::PI * 440.0).sin() * 0.1;
+                p.extend_from_slice(&sample.to_le_bytes());
+            }
+            p
+        };
+
+        let mut normal_frames_after_wrap = 0u32;
+        // Flush count immediately before the wrap boundary (frame 65524, seq=65524).
+        let mut flushes_pre_wrap: u64 = 0;
+        // Flush count immediately after the wrap boundary (frame 65546, seq=10).
+        let mut flushes_post_wrap: Option<u64> = None;
+
+        for i in 0u32..TOTAL_FRAMES {
+            let seq = i as u16; // natural truncation — wraps 65535 → 0 at i=65536
+            let timestamp = i * SAMPLES_PER_FRAME; // monotonic u32, never wraps for 70010 frames
+
+            // Reuse the pre-computed payload; clone is a cheap memcpy vs 960 sin() calls.
+            let header = RtpHeader::new(seq, timestamp, 12345, 96, false);
+            let packet = AudioPacket::new(header, shared_payload.clone(), 48000, 1, 20);
+            neteq.insert_packet(packet).unwrap();
+
+            if i == DRAIN_WINDOW_START {
+                // Batch-drain all accumulated frames before opening the measurement window.
+                // This prevents any in-flight overflow flush from firing inside the window.
+                // The buffer holds at most max_packets_in_buffer (default 200) at this point;
+                // draining 400 frames (200 packets × 2 × 10ms frames each) is a safe upper bound.
+                for _ in 0..400 {
+                    let _ = neteq.get_audio().unwrap();
+                }
+            }
+
+            // WRAP-VALUE ASSERTION: immediately after inserting the wrap-point packet
+            // (i=65536, seq=0 as u16, timestamp=65536*960=62_914_560), confirm it landed
+            // in the buffer with the correct seq and timestamp BEFORE get_audio drains it.
+            //
+            // This assertion is structurally impossible to pass unless seq genuinely wraps
+            // to 0 at i=65536. If seq were capped (e.g. `i % 65535 as u16`), then at
+            // i=65536 the seq would be 1, not 0, so no packet with (seq==0, ts==62_914_560)
+            // would ever exist — peek_next_packet_from_timestamp would either return None or
+            // a packet with a different seq, and the assertion would fail. This pins the
+            // mutation that the flush-counter and continuity assertions alone do not catch.
+            if i == 65536 {
+                const WRAP_TS: u32 = 65536 * SAMPLES_PER_FRAME;
+                let wrap_pkt = neteq.packet_buffer.peek_next_packet_from_timestamp(WRAP_TS);
+                assert!(
+                    wrap_pkt.is_some(),
+                    "post-wrap packet (i=65536, ts={WRAP_TS}) not found in buffer immediately \
+                     after insert — seq wrap caused the packet to be lost or rejected"
+                );
+                let wrap_pkt = wrap_pkt.unwrap();
+                assert_eq!(
+                    wrap_pkt.header.sequence_number, 0u16,
+                    "post-wrap packet at ts={WRAP_TS} has seq={} instead of 0 — \
+                     seq was not allowed to wrap to 0",
+                    wrap_pkt.header.sequence_number
+                );
+                assert_eq!(
+                    wrap_pkt.header.timestamp, WRAP_TS,
+                    "post-wrap packet seq_number=0 has unexpected timestamp {} (expected {WRAP_TS})",
+                    wrap_pkt.header.timestamp
+                );
+            }
+
+            // Dense drain only inside the measurement window so the buffer stays bounded
+            // and we capture Normal frames produced after the wrap.
+            if (DRAIN_WINDOW_START..=DRAIN_WINDOW_END).contains(&i) {
+                let frame = neteq.get_audio().unwrap();
+
+                // Count Normal frames after the wrap point (seq has wrapped past 0).
+                if i > 65536 && frame.speech_type == SpeechType::Normal {
+                    normal_frames_after_wrap += 1;
+                }
+            }
+            // Outside the window: skip get_audio(). The buffer accumulates and auto-flushes
+            // on overflow; those counts are absorbed into flushes_pre_wrap as the baseline.
+
+            // Capture flush count just before the wrap window.
+            if i == 65524 {
+                flushes_pre_wrap = neteq.get_statistics().lifetime.buffer_flushes;
+            }
+
+            // Capture flush count just after the wrap window.
+            if i == 65546 {
+                flushes_post_wrap = Some(neteq.get_statistics().lifetime.buffer_flushes);
+            }
+        }
+
+        // PRIMARY ASSERTION: the buffer-flush counter must not increase across the
+        // u16 seq wrap boundary (65535 → 0). Any flush increment here would indicate
+        // that sequence-number logic (not buffer overflow) triggered the flush.
+        let flushes_post = flushes_post_wrap
+            .expect("post-wrap measurement point must be reached within 70010 frames");
+        assert_eq!(
+            flushes_post, flushes_pre_wrap,
+            "buffer_flushes jumped from {flushes_pre_wrap} to {flushes_post} across the \
+             u16 seq wrap boundary (frames 65524-65546) — seq wrap must not trigger a flush"
+        );
+
+        // CONTINUITY ASSERTION: audio must continue decoding (Normal frames) after the wrap.
+        // Fails if the wrap caused the decoder to stall, reset, or enter permanent expansion.
+        assert!(
+            normal_frames_after_wrap > 0,
+            "zero Normal frames decoded after the seq wrap point — wrap disrupted audio continuity"
+        );
+    }
+
+    /// Adversarial dedup-at-wrap regression for issue #623.
+    ///
+    /// At the u16 sequence-number rollover, two packets that are 65536 apart in the logical
+    /// stream share the same truncated u16 sequence number. With #624's monotonic
+    /// sample-domain timestamps they carry DIFFERENT `header.timestamp` values, so they
+    /// represent genuinely different audio frames and must NOT be treated as duplicates.
+    ///
+    /// Per `buffer.rs::is_duplicate`, dedup is keyed on the TUPLE
+    /// `(timestamp, sequence_number, ssrc)`. Because `timestamp` differs, the wrap-twin
+    /// must NOT be treated as a duplicate of the original — both must be accepted.
+    ///
+    /// Critical mutation check: if `is_duplicate` were changed to compare ONLY
+    /// `sequence_number` (dropping the `timestamp` and `ssrc` guards), the wrap-twin
+    /// (same u16 seq=5, different timestamp) would be falsely deduped and silently discarded,
+    /// and the post-wrap-twin packet count assertion below would fail. That is the exact
+    /// residual risk a u16 seq collision could cause, and this test pins it.
+    ///
+    /// We also verify the TRUE-duplicate path (same seq, same ts, same ssrc) IS deduped,
+    /// proving the dedup check is live and not vacuously skipped.
+    ///
+    /// Timestamp design: we use consecutive sample-domain timestamps (ts=4800 and ts=5760,
+    /// i.e. frames 5 and 6 at 48kHz/960-samples-per-frame). This keeps the inter-arrival
+    /// delta small (960 samples = 20ms at 48kHz), which avoids the u32 overflow in the
+    /// delay manager's `timestamp_delta * 1000 / sample_rate` path that would occur if we
+    /// jumped directly to the literal logical-index timestamp (65541 * 960 = 62,919,360).
+    /// The u16 collision is equally real: seq=5 (u16) == `65541u32 as u16` == 5.
+    #[test]
+    fn test_seq_collision_at_wrap_not_deduped() {
+        let config = NetEqConfig {
+            sample_rate: 48_000,
+            for_test_no_time_stretching: true,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // ── Part 1: TRUE DUPLICATE — same (ts, seq, ssrc) must be deduped ──────────────
+        // Original packet: seq=5, ts=4800 (frame index 5 at 48kHz/960-samp steps).
+        let original_seq: u16 = 5;
+        let original_ts: u32 = 5 * 960; // 4800
+        let original = create_48k_20ms_packet(original_seq, original_ts);
+        neteq.insert_packet(original).unwrap();
+        let count_after_original = neteq.packet_buffer.len();
+
+        // Exact duplicate: same (seq, ts, ssrc). Must be rejected.
+        let true_dup = create_48k_20ms_packet(original_seq, original_ts);
+        neteq.insert_packet(true_dup).unwrap();
+        let count_after_true_dup = neteq.packet_buffer.len();
+
+        assert_eq!(
+            count_after_true_dup, count_after_original,
+            "true duplicate (same seq={original_seq}, ts={original_ts}) must be deduped; \
+             buffer grew from {count_after_original} to {count_after_true_dup}"
+        );
+
+        // ── Part 2: WRAP TWIN — same u16 seq but different timestamp, must NOT be deduped ──
+        //
+        // The wrap-twin carries seq=5 (u16) — the same value as the original — because at
+        // the 65535→0 rollover, logical-index 65541 truncates to u16 value 5.  But its
+        // sample-domain timestamp is 5760 (= 6 * 960), one frame after the original at 4800.
+        // Because timestamp differs, `is_duplicate`'s tuple check must NOT fire: these are
+        // distinct frames.
+        //
+        // Adjacent timestamp (4800 vs 5760) keeps the inter-arrival delta at 960 samples
+        // (20ms at 48kHz), safely below the u32 overflow threshold in the delay manager.
+        //
+        // If is_duplicate keyed on seq alone, these two same-u16-seq packets would collide
+        // and the second would be silently discarded; the timestamp dimension of the dedup
+        // tuple is what saves us at the wrap.
+        //
+        // Dedup-window geometry: the wrap-twin's timestamp (5760) > original's (4800), so
+        // binary search places the twin AFTER the original in the buffer. `is_duplicate`
+        // checks positions [insert_pos-1, insert_pos, insert_pos+1]; insert_pos-1 IS the
+        // original, so the comparison fires and must correctly observe ts mismatch.
+        let wrap_twin_seq: u16 = 5; // same u16 as original_seq — this IS the collision
+        let wrap_twin_ts: u32 = 6 * 960; // 5760, one frame after original — different ts
+        let count_before_twin = neteq.packet_buffer.len();
+        let wrap_twin = create_48k_20ms_packet(wrap_twin_seq, wrap_twin_ts);
+        neteq.insert_packet(wrap_twin).unwrap();
+        let count_after_twin = neteq.packet_buffer.len();
+
+        assert_eq!(
+            count_after_twin,
+            count_before_twin + 1,
+            "wrap-twin (u16 seq={wrap_twin_seq} == original seq={original_seq}, but ts={wrap_twin_ts} \
+             != original ts={original_ts}) must NOT be deduped — buffer should have grown by 1, \
+             went from {count_before_twin} to {count_after_twin}. \
+             MUTATION CHECK: changing is_duplicate in buffer.rs to compare only sequence_number \
+             (dropping the timestamp guard) would make this assertion fail, because the wrap-twin \
+             and original share the same u16 seq value and would be falsely treated as duplicates."
         );
     }
 }

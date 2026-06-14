@@ -1988,7 +1988,7 @@ impl VideoCallClient {
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &self,
-        p75_peer_fps: Rc<AtomicU32>,
+        queue_depth_report: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
@@ -2004,7 +2004,7 @@ impl VideoCallClient {
             if let Some(hr) = &inner.health_reporter {
                 if let Ok(mut reporter) = hr.try_borrow_mut() {
                     reporter.set_encoder_metric_sources(
-                        p75_peer_fps,
+                        queue_depth_report,
                         target_bitrate_kbps,
                         screen_tier,
                         screen_active,

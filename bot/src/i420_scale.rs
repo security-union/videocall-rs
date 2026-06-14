@@ -215,8 +215,8 @@ mod tests {
     #[test]
     fn downscale_1280x720_to_854x480() {
         let src = solid_i420(1280, 720, 64, 200, 32);
-        // 854 is not evenly divisible by 2 — use 854 which gives chroma 427.
-        // Actually for I420, width must be even. AQ tiers use 854 which is even.
+        // 854 is even (chroma plane width = 427). All AQ tier widths are even, so
+        // I420 chroma indexing is safe across the entire tier ladder.
         let dst_w: u32 = 854;
         let dst_h: u32 = 480;
         let mut dst = vec![0u8; (dst_w * dst_h * 3 / 2) as usize];

@@ -280,6 +280,21 @@ lazy_static! {
     )
     .expect("Failed to create neteq_audio_buffer_ms metric");
 
+    /// Per-peer audio playout latency in ms (#1299): how far behind live a receiver's audio
+    /// playout sits — NetEQ's WebRTC-style FILTERED current buffer level (the EWMA-smoothed
+    /// playout buffer the Accelerate gate compares against high_limit). The audio sibling of
+    /// `videocall_video_playout_latency_ms` (#1252). Distinct from `videocall_neteq_audio_buffer_ms`
+    /// (the RAW instantaneous snapshot) and `videocall_neteq_target_delay_ms` (the TARGET, not the
+    /// actual level). 0 = at live; a sustained multi-second value is the #1299 lag. Set
+    /// UNCONDITIONALLY so the gauge recovers to 0 when audio catches back up to live.
+    /// Observability only — no governor/resync attached.
+    pub static ref AUDIO_PLAYOUT_LATENCY_MS: GaugeVec = register_gauge_vec!(
+        "videocall_audio_playout_latency_ms",
+        "Per-peer audio playout latency in ms (how far behind live); NetEQ filtered playout buffer level. Sustained multi-second => #1299 lag",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create audio_playout_latency_ms metric");
+
     /// NetEQ packets waiting for decode
     pub static ref NETEQ_PACKETS_AWAITING_DECODE: GaugeVec = register_gauge_vec!(
         "videocall_neteq_packets_awaiting_decode",

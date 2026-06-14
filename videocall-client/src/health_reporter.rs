@@ -1678,6 +1678,14 @@ impl HealthReporter {
                     // to absorb observed network jitter. This is the real VoIP jitter metric.
                     ns.target_delay_ms = v;
                 }
+                // Audio playout latency (#1299): NetEQ's filtered current buffer level — how far
+                // behind live this peer's audio playout sits. The audio sibling of
+                // VideoStats.playout_latency_ms (#1252). Surfaced straight from the NetEQ stats
+                // JSON top-level (NetEqStats::playout_latency_ms); when the field is absent (older
+                // NetEQ worker) it stays at the proto 0.0 default = "at live". Observability only.
+                if let Some(v) = neteq.get("playout_latency_ms").and_then(|v| v.as_f64()) {
+                    ns.playout_latency_ms = v;
+                }
 
                 // Calculate audio packet loss percentage from WINDOWED rates (not lifetime)
                 // Use expand_per_sec (concealment events/sec) and packets_per_sec (packets/sec)
@@ -2372,6 +2380,105 @@ mod tests {
 
         assert_eq!(stats.fps_received, 0.0);
         assert_eq!(stats.playout_paint_lag_ms, 0.0);
+    }
+
+    /// Build a health packet whose peer carries NetEQ audio stats. `playout_latency_ms` is
+    /// `Some(v)` to include the field in the stats JSON (the shape the NetEQ worker emits at the
+    /// top level of NetEqStats), or `None` to OMIT it entirely (the older-worker / pre-#1299 case).
+    fn health_packet_with_neteq_playout_latency(playout_latency_ms: Option<f64>) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        let mut neteq = json!({
+            "current_buffer_size_ms": 200.0,
+            "target_delay_ms": 80.0,
+            "packets_awaiting_decode": 3.0,
+            "packets_per_sec": 50.0,
+        });
+        if let Some(v) = playout_latency_ms {
+            neteq["playout_latency_ms"] = json!(v);
+        }
+        peer.update_audio_stats(neteq);
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// Audio playout latency (#1299): when NetEQ reports a filtered playout buffer level in the
+    /// stats JSON, it must fold into NetEqStats.playout_latency_ms on the wire. Mirrors the video
+    /// sibling test. Fails if the read in create_health_packet is dropped or reads the wrong key.
+    #[test]
+    fn audio_playout_latency_folds_from_neteq_stats() {
+        let pb = health_packet_with_neteq_playout_latency(Some(1450.0));
+        let neteq = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .neteq_stats
+            .as_ref()
+            .expect("neteq stats must be present");
+
+        assert_eq!(neteq.playout_latency_ms, 1450.0);
+        // Sanity: the metric is distinct from the raw buffer snapshot it travels alongside.
+        assert_eq!(neteq.current_buffer_size_ms, 200.0);
+    }
+
+    /// When the NetEQ stats JSON OMITS playout_latency_ms (older worker / pre-#1299), the proto
+    /// field must stay at its 0.0 default ("at live"), never a stale or fabricated value. Guards
+    /// against the #1338-style false-value trap.
+    #[test]
+    fn audio_playout_latency_defaults_to_zero_when_absent() {
+        let pb = health_packet_with_neteq_playout_latency(None);
+        let neteq = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .neteq_stats
+            .as_ref()
+            .expect("neteq stats must be present");
+
+        assert_eq!(neteq.playout_latency_ms, 0.0);
     }
 
     /// #1032: a cached agent-memory reading rides the HealthPacket on the wire.

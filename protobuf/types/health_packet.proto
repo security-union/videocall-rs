@@ -28,6 +28,19 @@ message NetEqStats {
   // needed to absorb observed network jitter. This IS the network jitter metric;
   // < 30ms = excellent, < 75ms = acceptable, >= 75ms = degraded.
   double target_delay_ms = 5;
+
+  // Audio playout latency (#1299): how far behind live this peer's audio
+  // playout sits, in milliseconds. This is NetEQ's WebRTC-style FILTERED
+  // current buffer level (the EWMA-smoothed playout buffer, updated every
+  // decode tick in get_decision) — the exact value the Accelerate gate
+  // compares against high_limit. It is the audio sibling of
+  // VideoStats.playout_latency_ms (#1252). Distinct from current_buffer_size_ms
+  // (field 1, the RAW instantaneous snapshot) and from target_delay_ms
+  // (field 5, the TARGET, not the actual): when #1299's lag accumulates this
+  // filtered level ratchets up and gates Accelerate off, so this is the field
+  // that makes the audio lag observable. 0 = at live; a sustained multi-second
+  // value is the #1299 lag. Observability only — no governor/resync attached.
+  double playout_latency_ms = 6;
 }
 
 message VideoStats {

@@ -48,9 +48,9 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
-    AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CAPABILITY_SCORE,
-    CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO,
-    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
+    AUDIO_CONCEALMENT_PCT, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE,
+    CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES,
+    CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
     CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL,
     CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE,
     CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE,
@@ -409,6 +409,7 @@ fn remove_per_peer_metrics(
     let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
     let _ = PEER_CAN_SEE.remove_label_values(&labels);
     let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
+    let _ = AUDIO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
     let _ = NETEQ_TARGET_DELAY_MS.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_PER_SEC.remove_label_values(&labels);
@@ -1134,6 +1135,14 @@ fn process_health_packet_to_metrics_pb(
                     NETEQ_TARGET_DELAY_MS
                         .with_label_values(&peer_labels)
                         .set(neteq_stats.target_delay_ms);
+
+                    // Audio playout latency (#1299): how far behind live this peer's audio is
+                    // (NetEQ filtered playout buffer level). Set UNCONDITIONALLY so the gauge
+                    // recovers to 0 when audio catches back up to live — same rationale as the
+                    // video playout gauge below. Audio sibling of videocall_video_playout_latency_ms.
+                    AUDIO_PLAYOUT_LATENCY_MS
+                        .with_label_values(&peer_labels)
+                        .set(neteq_stats.playout_latency_ms);
 
                     if neteq_stats.packets_awaiting_decode != 0.0 {
                         NETEQ_PACKETS_AWAITING_DECODE

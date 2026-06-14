@@ -143,6 +143,15 @@ pub struct NetEqStats {
     /// Number of audio packets received per second (rolling 1s window)
     #[serde(default)]
     pub packets_per_sec: u32,
+    /// Audio playout latency in ms (issue #1299): the WebRTC-style FILTERED current
+    /// buffer level — the EWMA-smoothed playout buffer the Accelerate gate compares
+    /// against `high_limit` in `get_decision`. This is how far behind live the audio
+    /// playout sits; when the #1299 lag accumulates it ratchets up and gates Accelerate
+    /// off. Distinct from `current_buffer_size_ms` (raw instantaneous snapshot) and
+    /// `target_delay_ms` (the target, not the actual). `#[serde(default)]` so older stats
+    /// JSON (pre-#1299) still deserializes. See [`NetEq::filtered_buffer_level_ms`].
+    #[serde(default)]
+    pub playout_latency_ms: u32,
 }
 
 /// Audio frame output from NetEQ
@@ -468,6 +477,8 @@ impl NetEq {
             target_delay_ms: self.delay_manager.target_delay_ms(),
             packets_awaiting_decode: self.packet_buffer.len(),
             packets_per_sec: self.packets_per_sec_snapshot,
+            // Audio playout latency (#1299): surface the live filtered playout buffer level.
+            playout_latency_ms: self.filtered_buffer_level_ms(),
         }
     }
 
@@ -909,6 +920,19 @@ impl NetEq {
         // Use total content duration instead of timestamp span
         // This handles cases where packets have close/identical timestamps
         self.current_buffer_size_samples() as u32 * 1000 / self.config.sample_rate
+    }
+
+    /// Audio playout latency in ms (issue #1299): the WebRTC-style FILTERED current buffer
+    /// level. This reads the same `buffer_level_filter` that `get_decision` updates on every
+    /// decode tick (via `BufferLevelFilter::update`) and then compares against `high_limit`
+    /// to gate Accelerate. It is therefore the live, decision-grade measure of how far behind
+    /// live the audio playout sits — the value that ratchets up under the #1299 lag and gates
+    /// Accelerate off. Read-only: never mutates the filter or any other state, so it is safe to
+    /// call on the stats path. Distinct from `current_buffer_size_ms` (raw instantaneous
+    /// snapshot, which can swing frame-to-frame) and from `target_delay_ms` (the target, not the
+    /// actual level).
+    pub fn filtered_buffer_level_ms(&self) -> u32 {
+        self.buffer_level_filter.filtered_current_level_ms()
     }
 
     /// Get current buffer size in samples
@@ -1733,5 +1757,50 @@ mod tests {
 
         let _ = neteq.get_audio().unwrap();
         assert_eq!(neteq.last_operation, Operation::Normal);
+    }
+
+    /// Audio playout latency metric (issue #1299).
+    ///
+    /// Pins TWO things the metric must do, so it fails if the source is broken:
+    ///   1. `NetEqStats::playout_latency_ms` is wired to the FILTERED playout buffer level
+    ///      (`filtered_buffer_level_ms()`), NOT to a constant, the raw `current_buffer_size_ms`
+    ///      snapshot, or `target_delay_ms`. Asserted by exact equality with the filter accessor.
+    ///   2. It is a LIVE value: after audio is buffered and decode decisions run (which is the
+    ///      only path that calls `BufferLevelFilter::update`), the filtered level — and thus the
+    ///      reported metric — is strictly positive. A mutant that hardcodes 0, or one that reads a
+    ///      filter that is never updated, drives this to 0 and the test fails.
+    #[test]
+    fn audio_playout_latency_ms_tracks_filtered_buffer_level() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut insert_audio = make_insert_audio!();
+
+        // Build a substantial buffer (200ms) so the filtered level is well clear of 0, then pump
+        // several decode decisions so the buffer-level filter converges to the live buffer level.
+        // get_audio() -> get_decision() -> buffer_level_filter.update(...) is the live update path.
+        insert_audio(&mut neteq, 200);
+        for _ in 0..5 {
+            let _ = neteq.get_audio().unwrap();
+        }
+
+        let filtered = neteq.filtered_buffer_level_ms();
+        let stats = neteq.get_statistics();
+
+        // (1) Wiring: the metric is exactly the filtered playout buffer level. This distinguishes
+        // it from current_buffer_size_ms (the raw snapshot) and target_delay_ms (the target).
+        assert_eq!(
+            stats.playout_latency_ms, filtered,
+            "playout_latency_ms must be the filtered buffer level ({filtered}ms), got {}",
+            stats.playout_latency_ms
+        );
+
+        // (2) Liveness: with 200ms buffered and decisions pumped, the filtered level is positive.
+        // This is what kills a hardcoded-0 / never-updated-filter mutant.
+        assert!(
+            stats.playout_latency_ms > 0,
+            "playout_latency_ms should be > 0 after buffering 200ms of audio and decoding, got {}",
+            stats.playout_latency_ms
+        );
     }
 }

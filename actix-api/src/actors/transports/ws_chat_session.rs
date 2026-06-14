@@ -70,7 +70,16 @@ pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 /// * `parsed=true && is_media && anything else (HEARTBEAT, KEYFRAME_REQUEST,
 ///   encrypted/unparseable inner)` → `"media"` — the legacy catch-all so
 ///   existing alerts pivoting on `kind="media"` still see a series.
-fn drop_kind_label(parsed: bool, is_media: bool, media_type: Option<MediaType>) -> &'static str {
+// `pub(crate)` so the metric-taxonomy coverage guard
+// (`metrics::tests::relay_drop_kinds_covers_all_emitted_drop_labels`) can
+// enumerate this emit site's output directly instead of against a hand-copied
+// literal list (issue #1186). Kept in lock-step with the `wt_chat_session`
+// copy — that test asserts both copies agree.
+pub(crate) fn drop_kind_label(
+    parsed: bool,
+    is_media: bool,
+    media_type: Option<MediaType>,
+) -> &'static str {
     if !parsed {
         return "unknown";
     }

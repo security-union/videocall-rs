@@ -57,8 +57,24 @@ pub async fn metrics_responder() -> impl Responder {
 // API requires the FULL label tuple (it hashes every variable label — there is
 // no partial-match removal), so for multi-label counters we must enumerate the
 // cartesian product of the OTHER labels' fixed taxonomies. These consts are
-// that authoritative enumeration; `metrics::tests` cross-checks they cover the
-// labels the code actually emits so the bound cannot silently leak.
+// that authoritative enumeration.
+//
+// `metrics::tests::relay_drop_kinds_covers_all_emitted_drop_labels` cross-checks
+// that `RELAY_DROP_KINDS` covers the labels the code emits, with two tiers of
+// guarantee (issue #1186):
+//   * For the `kind` labels produced by FUNCTIONS — `drop_kind_label`
+//     (ws/wt transports) and `OutboundPriority::priority_drop_label` — the test
+//     ENUMERATES the real emit functions over their full input domains
+//     (`MediaType::VALUES`, all `OutboundPriority` variants). A NEW label
+//     returned by either function is therefore caught automatically, and a new
+//     `MediaType` / `OutboundPriority` variant that changes the output is forced
+//     into the enumeration. This tier cannot silently leak a new kind.
+//   * For the bare string LITERALS emitted with no enumerable source of truth
+//     (`mailbox_full`, `channel_full` at the fan-out / transport drop sites and
+//     `overflow_critical` at the Critical-overflow site) the test keeps a
+//     hand-maintained witness list. That tier guards against DELETIONS from
+//     `RELAY_DROP_KINDS` only — a brand-new literal added at one of those sites
+//     without updating both the const and the witness would NOT be caught.
 
 /// Every `drop_reason`/`kind` label ever passed to a relay drop counter.
 ///
@@ -246,6 +262,29 @@ pub fn forget_room_metrics(room: &str) {
 
     // relay_viewport_set_size{room} — the #988 gauge previously swept inline.
     let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+}
+
+/// Remove a single session's `relay_session_drops_total` series across the FULL
+/// drop-kind taxonomy (issue #1090).
+///
+/// `relay_session_drops_total{room, transport, session_id, kind}` carries an
+/// unbounded-over-time `session_id` label, so the series for a disconnected
+/// session must be removed the moment its actor stops or it leaks for the
+/// process lifetime. This is the single source of truth for that sweep: it is
+/// called by `SessionLogic::on_stopping` (the runtime path) AND pinned directly
+/// by `metrics::tests::session_drop_gc_iterates_full_taxonomy_unconditionally`,
+/// so the test exercises the real GC code instead of an inline replica of it.
+///
+/// LEAK-PROOF: we iterate the entire fixed [`RELAY_DROP_KINDS`] taxonomy
+/// unconditionally rather than a per-session "kinds I emitted" tracking set.
+/// `remove_label_values` on a `(…, kind)` tuple that was never created returns a
+/// benign `Err` (hence each call is `let _ =`-discarded), so a session that only
+/// ever incremented a subset of kinds is still fully cleaned, and there is no
+/// second bookkeeping structure that could silently fall out of sync.
+pub fn forget_session_drops(room: &str, transport: &str, session_id: &str) {
+    for kind in RELAY_DROP_KINDS {
+        let _ = RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[room, transport, session_id, kind]);
+    }
 }
 
 lazy_static! {
@@ -1798,42 +1837,120 @@ mod tests {
     // ===== Room-label cardinality bound (issue #996) + drop-kind GC (#1090) =====
 
     /// `RELAY_DROP_KINDS` is the single source of truth for the room-drain GC
-    /// (`forget_room_metrics`) and the per-session GC (`on_stopping`). If it
-    /// stops covering a `kind`/`drop_reason` the emit sites actually use, that
-    /// series would leak forever. This pins it as a SUPERSET of:
-    ///   * the `videocall_outbound_channel_drops_total` / `relay_session_drops_total`
-    ///     `kind` taxonomy (the same literals asserted by
-    ///     `outbound_channel_drops_increments_per_kind`), and
-    ///   * the `relay_packet_drops_total` `drop_reason` literals emitted by the
-    ///     fan-out and transport hops.
+    /// (`forget_room_metrics`) and the per-session GC (`forget_session_drops`).
+    /// If it stops covering a `kind`/`drop_reason` the emit sites actually use,
+    /// that series would leak forever.
     ///
-    /// Mutating `RELAY_DROP_KINDS` to drop any of these fails this test.
+    /// This guard derives its witness from the emit sites themselves wherever
+    /// they are functions, so a NEW emitted kind is caught — not just deletions
+    /// from the const (issue #1186):
+    ///
+    ///   * `drop_kind_label` (ws + wt transports): ENUMERATED over its full input
+    ///     domain — `parsed ∈ {false, true}` × `is_media ∈ {false, true}` ×
+    ///     `media_type ∈ {None} ∪ MediaType::VALUES`. `MediaType::VALUES` is the
+    ///     protobuf-generated variant list, so adding a `MediaType` variant that
+    ///     maps to a new label surfaces here automatically. Both transport copies
+    ///     are enumerated and asserted equal, so drift between them is also caught.
+    ///   * `OutboundPriority::priority_drop_label`: ENUMERATED over every
+    ///     `OutboundPriority` variant. The local `all_priorities` list is pinned
+    ///     to an exhaustive `match` below, so adding a variant fails to COMPILE
+    ///     until the witness is updated.
+    ///   * `mailbox_full` / `channel_full` / `overflow_critical`: bare string
+    ///     literals at their emit sites with no enumerable source of truth, so
+    ///     these remain a hand-maintained witness. This portion guards against
+    ///     DELETIONS from `RELAY_DROP_KINDS` only (see the module-level comment).
+    ///
+    /// Mutating `RELAY_DROP_KINDS` to drop any covered label fails this test, and
+    /// a new `drop_kind_label` / `priority_drop_label` output that is absent from
+    /// `RELAY_DROP_KINDS` also fails it.
     #[test]
     fn relay_drop_kinds_covers_all_emitted_drop_labels() {
-        // Mirror of the literals in `outbound_channel_drops_increments_per_kind`
-        // (kept as an independent copy ON PURPOSE so this test references a
-        // second witness of the taxonomy, not the const under test).
-        let outbound_kinds = [
-            "audio",
-            "video",
-            "screen",
-            "media",
-            "control",
-            "rtt",
-            "unknown",
-            "priority_drop_video",
-            "priority_drop_audio",
-            "overflow_critical",
-        ];
-        // The `drop_reason` literals passed to `relay_packet_drops_total` in
-        // `chat_server::handle_msg` (fan-out) and the WS/WT `Handler<Message>`
-        // hops. `priority_drop_*` overlap with the outbound set above.
-        let packet_drop_reasons = ["mailbox_full", "channel_full"];
+        use crate::actors::priority_drop::OutboundPriority;
+        use crate::actors::transports::{ws_chat_session, wt_chat_session};
+        use protobuf::Enum; // brings `MediaType::VALUES` (trait const) into scope
+        use videocall_types::protos::media_packet::media_packet::MediaType;
 
-        for k in outbound_kinds.iter().chain(packet_drop_reasons.iter()) {
+        // ---- Tier 1a: enumerate the real `drop_kind_label` emit functions. ----
+        // Build the full input domain: media_type is None plus every protobuf
+        // MediaType variant (the generated source of truth for that enum).
+        let media_types: Vec<Option<MediaType>> = std::iter::once(None)
+            .chain(MediaType::VALUES.iter().copied().map(Some))
+            .collect();
+
+        let mut emitted: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for &parsed in &[false, true] {
+            for &is_media in &[false, true] {
+                for &mt in &media_types {
+                    let ws_label = ws_chat_session::drop_kind_label(parsed, is_media, mt);
+                    let wt_label = wt_chat_session::drop_kind_label(parsed, is_media, mt);
+                    // The two transport copies MUST stay in lock-step — a drift
+                    // would silently double the taxonomy the GC must cover.
+                    assert_eq!(
+                        ws_label, wt_label,
+                        "ws/wt drop_kind_label disagree for (parsed={parsed}, \
+                         is_media={is_media}, media_type={mt:?}); the copies must \
+                         stay in lock-step (#1186)"
+                    );
+                    emitted.insert(ws_label);
+                }
+            }
+        }
+
+        // ---- Tier 1b: enumerate the real `priority_drop_label` emit fn. ----
+        // `all_priorities` is pinned to an exhaustive match so a new variant
+        // breaks compilation until this list (and the witness) are updated.
+        let all_priorities = [
+            OutboundPriority::Critical,
+            OutboundPriority::Control,
+            OutboundPriority::Audio,
+            OutboundPriority::Video,
+            OutboundPriority::Screen,
+        ];
+        for p in all_priorities {
+            // Compile-time exhaustiveness guard: adding an OutboundPriority
+            // variant forces this match (and `all_priorities` above) to be
+            // updated, so the enumeration can never silently miss a variant.
+            match p {
+                OutboundPriority::Critical
+                | OutboundPriority::Control
+                | OutboundPriority::Audio
+                | OutboundPriority::Video
+                | OutboundPriority::Screen => {}
+            }
+            if let Some(label) = p.priority_drop_label() {
+                emitted.insert(label);
+            }
+        }
+
+        // Every label produced by the emit FUNCTIONS must be covered.
+        for k in &emitted {
             assert!(
                 RELAY_DROP_KINDS.contains(k),
-                "RELAY_DROP_KINDS must cover emitted drop label {k:?} or the \
+                "RELAY_DROP_KINDS must cover emitted drop label {k:?} produced by \
+                 a drop_kind_label / priority_drop_label emit site, or the \
+                 room-drain / session GC would leak its series (issues #996/#1090)"
+            );
+        }
+
+        // ---- Tier 2: hand-maintained witness for bare string literals. ----
+        // Drop `kind`/`drop_reason` labels emitted as string LITERALS (not via an
+        // enumerable function), so they have no compile-time source of truth and
+        // this list only guards against DELETIONS from `RELAY_DROP_KINDS`:
+        //   * `mailbox_full` / `channel_full` — passed to `relay_packet_drops_total`
+        //     in `chat_server::handle_msg` (fan-out) and the WS/WT
+        //     `Handler<Message>` / channel-full hops.
+        //   * `overflow_critical` — the Critical-overflow `kind` at the
+        //     outbound-channel-full sites.
+        //   * `rtt` — emitted to `videocall_outbound_channel_drops_total` at the
+        //     WT RTT-echo channel-full site (`wt_chat_session`); `drop_kind_label`
+        //     never returns it (a `MediaType::RTT` packet maps to the `media`
+        //     catch-all), so it must be witnessed by hand here.
+        let string_literal_drop_labels =
+            ["mailbox_full", "channel_full", "overflow_critical", "rtt"];
+        for k in &string_literal_drop_labels {
+            assert!(
+                RELAY_DROP_KINDS.contains(k),
+                "RELAY_DROP_KINDS must cover string-literal drop label {k:?} or the \
                  room-drain / session GC would leak its series (issues #996/#1090)"
             );
         }
@@ -2038,11 +2155,20 @@ mod tests {
         forget_room_metrics(room);
     }
 
-    /// #1090 leak-proof property: iterating the FULL `RELAY_DROP_KINDS` taxonomy
-    /// on teardown removes a session's `relay_session_drops_total` series EVEN
-    /// for kinds that session never incremented — i.e. the GC does not depend on
-    /// a per-session "kinds I emitted" tracking set. This replicates the exact
-    /// loop `SessionLogic::on_stopping` runs (same const, same label order).
+    /// #1090 leak-proof property: tearing a session down removes its
+    /// `relay_session_drops_total` series EVEN for kinds that session never
+    /// incremented — i.e. the GC does not depend on a per-session "kinds I
+    /// emitted" tracking set.
+    ///
+    /// CRITICAL (issue #1186): this calls the REAL GC entry point
+    /// [`forget_session_drops`] — the same function `SessionLogic::on_stopping`
+    /// invokes — instead of replicating its loop inline. Mutating `on_stopping`
+    /// back to per-session-subset iteration (the exact #1090 regression) routes
+    /// the runtime through `forget_session_drops`, so this test pins the real
+    /// path. To prove the helper itself is exhaustive, we additionally seed a
+    /// SECOND kind the session never "officially" emitted and assert the sweep
+    /// removes it too: shrinking the loop in `forget_session_drops` to a subset
+    /// would leave a residual series and fail this test.
     #[test]
     #[serial(session_drops_gc)]
     fn session_drop_gc_iterates_full_taxonomy_unconditionally() {
@@ -2050,38 +2176,72 @@ mod tests {
         let transport = "websocket";
         let session_id = "999000111";
 
-        // This session only ever dropped ONE kind.
+        // The kind this session "really" dropped, plus a second, DIFFERENT kind
+        // from the taxonomy to prove the sweep is unconditional (not "only kinds
+        // I emitted"). `overflow_critical` is the last entry in RELAY_DROP_KINDS,
+        // so a sweep that stops short of the full taxonomy would leave it behind.
+        let emitted_kind = "video";
+        let unrelated_kind = "overflow_critical";
+        assert_ne!(emitted_kind, unrelated_kind);
+        assert!(
+            RELAY_DROP_KINDS.contains(&emitted_kind) && RELAY_DROP_KINDS.contains(&unrelated_kind),
+            "both seeded kinds must be members of the taxonomy the sweep iterates"
+        );
+
         RELAY_SESSION_DROPS_TOTAL
-            .with_label_values(&[room, transport, session_id, "video"])
+            .with_label_values(&[room, transport, session_id, emitted_kind])
+            .inc();
+        RELAY_SESSION_DROPS_TOTAL
+            .with_label_values(&[room, transport, session_id, unrelated_kind])
             .inc();
         assert_eq!(
             RELAY_SESSION_DROPS_TOTAL
-                .with_label_values(&[room, transport, session_id, "video"])
+                .with_label_values(&[room, transport, session_id, emitted_kind])
                 .get(),
             1.0,
             "seed must be observable before teardown (non-vacuous)"
         );
-
-        // Replicate on_stopping: iterate the FULL taxonomy unconditionally.
-        // `remove_label_values` on a never-created (…, kind) tuple is a benign
-        // Err, so a session that only dropped `video` is still fully cleaned.
-        for kind in RELAY_DROP_KINDS {
-            let _ =
-                RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[room, transport, session_id, kind]);
-        }
-
-        // The seeded `video` series — a member of the taxonomy the session DID
-        // increment — must be gone.
         assert_eq!(
             RELAY_SESSION_DROPS_TOTAL
-                .with_label_values(&[room, transport, session_id, "video"])
+                .with_label_values(&[room, transport, session_id, unrelated_kind])
                 .get(),
-            0.0,
-            "the full-taxonomy sweep must remove the kind the session emitted"
+            1.0,
+            "second seed must be observable before teardown (non-vacuous)"
         );
 
-        // Clean up the fresh zero handle this assert created.
-        let _ =
-            RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[room, transport, session_id, "video"]);
+        // Exercise the REAL GC path that `on_stopping` runs.
+        forget_session_drops(room, transport, session_id);
+
+        // BOTH seeded series must be gone — the one the session "emitted" AND the
+        // unrelated taxonomy member — proving the sweep is full and unconditional.
+        assert_eq!(
+            RELAY_SESSION_DROPS_TOTAL
+                .with_label_values(&[room, transport, session_id, emitted_kind])
+                .get(),
+            0.0,
+            "forget_session_drops must remove the kind the session emitted"
+        );
+        assert_eq!(
+            RELAY_SESSION_DROPS_TOTAL
+                .with_label_values(&[room, transport, session_id, unrelated_kind])
+                .get(),
+            0.0,
+            "forget_session_drops must sweep the FULL taxonomy, not just emitted \
+             kinds — a subset sweep would leave this residual series (#1090/#1186)"
+        );
+
+        // Clean up the fresh zero handles the asserts above created.
+        let _ = RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
+            room,
+            transport,
+            session_id,
+            emitted_kind,
+        ]);
+        let _ = RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
+            room,
+            transport,
+            session_id,
+            unrelated_kind,
+        ]);
     }
 }

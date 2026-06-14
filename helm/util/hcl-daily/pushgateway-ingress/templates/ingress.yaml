@@ -4,11 +4,14 @@ metadata:
   name: pushgateway
   namespace: {{ .Release.Namespace }}
   annotations:
-    kubernetes.io/ingress.class: nginx
     cert-manager.io/issuer: {{ .Values.issuer }}
     nginx.ingress.kubernetes.io/ssl-redirect: "true"
     nginx.ingress.kubernetes.io/whitelist-source-range: {{ .Values.allowedSourceRange }}
 spec:
+  # Modern replacement for the deprecated kubernetes.io/ingress.class annotation
+  # (matches the cluster's IngressClass named "nginx"). Kept in sync with the
+  # sibling prometheus-ingress.
+  ingressClassName: {{ .Values.ingressClassName }}
   tls:
     - hosts:
         - {{ .Values.host }}

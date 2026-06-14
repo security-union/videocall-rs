@@ -509,29 +509,13 @@ pub struct VideoCallClient {
     early_seed_timer: Rc<RefCell<Option<Interval>>>,
     /// Forced-keyframe cooldown reset for the CAMERA encoder (issue #1311,
     /// hardened in #1352). A clone of `CameraEncoder::keyframe_cooldown_reset`,
-    /// wired in by the host after the encoder is built. ARMed (`store(true)`) on
-    /// each `Connected` lifecycle event (every reconnect) so the camera encode
-    /// loop clears its `last_keyframe_emit_ms` cooldown clock and the first
-    /// post-reconnect PLI is not coalesced away. `None` when no camera encoder is
-    /// attached (observer mode / native lib callers), in which case the reset is
-    /// a no-op. The RE-ELECTION path arms the same encoder-owned atom directly
-    /// from the camera quality task — only the RECONNECT path needs this
-    /// client-side wiring, because a full reconnect runs `reset_and_start_election`
-    /// (clearing `old_active_connection`) and so never drives
-    /// `reelection_completed_signal`.
-    ///
-    /// HELD HERE (not in `Inner`) on purpose (issue #1352): the `Connected` arm
-    /// must clone the `Rc<AtomicBool>` out and call `store(true, Release)`
-    /// regardless of whether the long `Inner` `try_borrow_mut()` (which also runs
-    /// the layer-preference / union-cap resets) succeeds. Keeping the atom inside
-    /// `Inner`'s `RefCell` made the reset share that borrow — a transient borrow
-    /// conflict at reconnect time silently dropped the reset, degrading to
-    /// pre-#1348 coalescing of the first post-reconnect PLI. This dedicated slot's
-    /// only writer is `set_camera_keyframe_cooldown_reset` (called once at wiring,
-    /// synchronously, never from a connection callback), so its `try_borrow` in
-    /// the `Connected` arm does not contend with `Inner`. Screen has no equivalent
-    /// yet (deferred #1311 follow-up, gated on #1322/#1344).
+    /// wired in by the host after the encoder is built.
     camera_keyframe_cooldown_reset: Rc<RefCell<Option<Rc<AtomicBool>>>>,
+    /// Forced-keyframe cooldown reset for the SCREEN encoder (issue #1311 screen
+    /// half), held outside `Inner` for the same borrow-safety reason as the camera
+    /// slot: a reconnect must be able to arm the encoder-owned atom even if the
+    /// `Inner` mutable borrow used for layer-preference / union-cap reset is busy.
+    screen_keyframe_cooldown_reset: Rc<RefCell<Option<Rc<AtomicBool>>>>,
 }
 
 // `Timeout` (gloo) is not `Debug`; derive a manual impl that elides the
@@ -709,17 +693,25 @@ fn send_layer_preference_via(
 /// harmless (no PLI pending, clock already `None`), and a duplicate vs the
 /// quality task's re-election arm is collapsed by the `.swap(false)` consume on
 /// the encode-loop side.
-fn arm_camera_keyframe_cooldown_reset(slot: &Rc<RefCell<Option<Rc<AtomicBool>>>>) {
+fn arm_keyframe_cooldown_reset_slot(slot: &Rc<RefCell<Option<Rc<AtomicBool>>>>) -> bool {
     let atom = slot.try_borrow().ok().and_then(|slot| slot.clone());
     if let Some(atom) = atom {
         atom.store(true, Ordering::Release);
+        true
+    } else {
+        false
     }
+}
+
+fn arm_camera_keyframe_cooldown_reset(slot: &Rc<RefCell<Option<Rc<AtomicBool>>>>) {
+    let _ = arm_keyframe_cooldown_reset_slot(slot);
 }
 
 fn handle_connected_reconnect_resets(
     inner: &Weak<RefCell<Inner>>,
     early_seed_timer: &Rc<RefCell<Option<Interval>>>,
     camera_keyframe_cooldown_reset: &Rc<RefCell<Option<Rc<AtomicBool>>>>,
+    screen_keyframe_cooldown_reset: &Rc<RefCell<Option<Rc<AtomicBool>>>>,
 ) {
     // On (re)connect the relay also allocated a fresh empty layer-preference map
     // for the new session_id (fail-open -> every layer forwarded). Clear the
@@ -769,6 +761,7 @@ fn handle_connected_reconnect_resets(
     // `Connected` here); a cold-start no-op and a duplicate vs the quality task's
     // arm are both harmless.
     arm_camera_keyframe_cooldown_reset(camera_keyframe_cooldown_reset);
+    let _ = arm_keyframe_cooldown_reset_slot(screen_keyframe_cooldown_reset);
 }
 
 /// Arm the issue-#1179 early-seed sampler if it is not already armed.
@@ -1087,6 +1080,7 @@ impl VideoCallClient {
             // no-ops while None. Held outside `Inner` so the `Connected` arm can
             // arm it independently of the `Inner` borrow (see field doc).
             camera_keyframe_cooldown_reset: Rc::new(RefCell::new(None)),
+            screen_keyframe_cooldown_reset: Rc::new(RefCell::new(None)),
         };
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
@@ -1239,6 +1233,7 @@ impl VideoCallClient {
                 // contended. Cloning the `Rc` is the whole point — the
                 // `store(true)` must not depend on `inner.try_borrow_mut()`.
                 let camera_keyframe_cooldown_reset = self.camera_keyframe_cooldown_reset.clone();
+                let screen_keyframe_cooldown_reset = self.screen_keyframe_cooldown_reset.clone();
                 Callback::from(move |state: ConnectionState| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
@@ -1262,6 +1257,7 @@ impl VideoCallClient {
                                 &inner,
                                 &early_seed_timer,
                                 &camera_keyframe_cooldown_reset,
+                                &screen_keyframe_cooldown_reset,
                             );
 
                             // On (re)connect the session_id changed and the
@@ -2011,6 +2007,26 @@ impl VideoCallClient {
             *slot = Some(atom);
         } else {
             warn!("set_camera_keyframe_cooldown_reset: slot busy, skipping wiring");
+        }
+    }
+
+    /// Wire the SCREEN forced-keyframe cooldown reset atom (issue #1311, screen half).
+    ///
+    /// Mirror of
+    /// [`set_camera_keyframe_cooldown_reset`](Self::set_camera_keyframe_cooldown_reset)
+    /// for the SCREEN media-kind; pass
+    /// [`ScreenEncoder::keyframe_cooldown_reset`](crate::ScreenEncoder::keyframe_cooldown_reset).
+    /// The `Connected` lifecycle callback ARMS this on the SAME transition as the
+    /// camera reset, so both encoders clear their forced-keyframe cooldown clock
+    /// together on every reconnect and the first post-reconnect screen PLI is not
+    /// coalesced away. Until wired the reconnect reset is a no-op (`None`); the
+    /// re-election path arms the same atom from the screen quality task with no client
+    /// involvement.
+    pub fn set_screen_keyframe_cooldown_reset(&self, atom: Rc<AtomicBool>) {
+        if let Ok(mut slot) = self.screen_keyframe_cooldown_reset.try_borrow_mut() {
+            *slot = Some(atom);
+        } else {
+            warn!("set_screen_keyframe_cooldown_reset: slot busy, skipping wiring");
         }
     }
 
@@ -4016,6 +4032,7 @@ mod dedup_tests {
 #[cfg(test)]
 mod cooldown_reset_hardening_tests {
     use super::arm_camera_keyframe_cooldown_reset;
+    use super::arm_keyframe_cooldown_reset_slot;
     use super::handle_connected_reconnect_resets;
     use super::VideoCallClient;
     use super::VideoCallClientOptions;
@@ -4075,19 +4092,27 @@ mod cooldown_reset_hardening_tests {
     #[test]
     fn connected_reset_helper_arms_real_slot_while_real_inner_is_borrowed() {
         let client = build_test_client();
-        let atom = Rc::new(AtomicBool::new(false));
-        client.set_camera_keyframe_cooldown_reset(atom.clone());
+        let camera = Rc::new(AtomicBool::new(false));
+        let screen = Rc::new(AtomicBool::new(false));
+        client.set_camera_keyframe_cooldown_reset(camera.clone());
+        client.set_screen_keyframe_cooldown_reset(screen.clone());
 
         let inner_guard = client.inner.borrow_mut();
         handle_connected_reconnect_resets(
             &Rc::downgrade(&client.inner),
             &client.early_seed_timer,
             &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
         );
 
         assert!(
-            atom.load(Ordering::Acquire),
-            "the real Connected reset helper must arm the cooldown atom even \
+            camera.load(Ordering::Acquire),
+            "the real Connected reset helper must arm the camera cooldown atom even \
+             while the real Inner is mutably borrowed"
+        );
+        assert!(
+            screen.load(Ordering::Acquire),
+            "the real Connected reset helper must arm the screen cooldown atom even \
              while the real Inner is mutably borrowed"
         );
         drop(inner_guard);
@@ -4176,5 +4201,16 @@ mod cooldown_reset_hardening_tests {
             atom.load(Ordering::Acquire),
             "atom was still armed by the call"
         );
+    }
+
+    #[test]
+    fn slot_helper_reports_whether_it_armed_an_atom() {
+        let atom = Rc::new(AtomicBool::new(false));
+        let wired: Rc<RefCell<Option<Rc<AtomicBool>>>> = Rc::new(RefCell::new(Some(atom.clone())));
+        let unwired: Rc<RefCell<Option<Rc<AtomicBool>>>> = Rc::new(RefCell::new(None));
+
+        assert!(arm_keyframe_cooldown_reset_slot(&wired));
+        assert!(atom.load(Ordering::Acquire));
+        assert!(!arm_keyframe_cooldown_reset_slot(&unwired));
     }
 }

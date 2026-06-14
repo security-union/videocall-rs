@@ -355,12 +355,14 @@ async fn test_status_refused_after_meeting_ends() {
 
 #[tokio::test]
 #[serial]
-async fn test_attendee_rejoin_ended_meeting_gets_waiting_for_meeting() {
+async fn test_attendee_join_ended_meeting_rejected_not_active() {
     let pool = get_test_pool().await;
     let room_id = "test-rejoin-ended";
+    // setup_active_meeting uses the create defaults: waiting_room_enabled=true
+    // and end_on_host_leave=true, so the host leaving ends the meeting.
     setup_active_meeting(&pool, room_id).await;
 
-    // Host leaves → meeting ends.
+    // Host leaves → meeting ends (end_on_host_leave=true).
     let app = build_app(pool.clone());
     let req = request_with_cookie(
         "POST",
@@ -382,23 +384,17 @@ async fn test_attendee_rejoin_ended_meeting_gets_waiting_for_meeting() {
     .unwrap();
     let resp = app.oneshot(req).await.unwrap();
 
-    // New behavior: non-host joining a non-active meeting gets
-    // waiting_for_meeting with an observer_token (instead of an error).
-    assert_eq!(resp.status(), StatusCode::OK);
+    // Corrected behavior (issue #742): a non-host joining a terminated meeting
+    // must be rejected with MEETING_NOT_ACTIVE — the same code get_my_status /
+    // get_guest_status already return for an ended meeting — instead of being
+    // stranded in a phantom `waiting_for_meeting` waiting room.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
-    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
-    assert!(body.success);
+    let body: APIResponse<APIError> = response_json(resp).await;
+    assert!(!body.success);
     assert_eq!(
-        body.result.status, "waiting_for_meeting",
-        "Non-host joining ended meeting should get waiting_for_meeting"
-    );
-    assert!(
-        body.result.observer_token.is_some(),
-        "Should receive an observer_token to listen for meeting reactivation"
-    );
-    assert!(
-        body.result.room_token.is_none(),
-        "Should NOT receive a room_token"
+        body.result.code, "MEETING_NOT_ACTIVE",
+        "Non-host joining an ended meeting must be rejected with MEETING_NOT_ACTIVE"
     );
 
     cleanup_test_data(&pool, room_id).await;

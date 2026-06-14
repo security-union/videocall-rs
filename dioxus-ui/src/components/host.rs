@@ -270,14 +270,17 @@ pub fn Host(
         client.set_screen_union_requested_layer(screen.shared_union_requested_layer());
 
         // Forced-keyframe cooldown reset on reconnect (issue #1311). Hand the
-        // camera-owned reset atom to the client so its `Connected` lifecycle
-        // callback clears the encode loop's `last_keyframe_emit_ms` on every
-        // reconnect — the first post-reconnect PLI then emits immediately instead
-        // of being coalesced away by a stale pre-reconnect cooldown timestamp. The
-        // re-election case is handled inside the encoder itself (quality task).
-        // Screen has no equivalent yet (deferred #1311 follow-up, gated on the
-        // screen `last_keyframe_emit_ms` added by #1322/#1344).
+        // camera- and screen-owned reset atoms to the client so its `Connected`
+        // lifecycle callback clears each encode loop's `last_keyframe_emit_ms` on
+        // every reconnect — the first post-reconnect PLI then emits immediately
+        // instead of being coalesced away by a stale pre-reconnect cooldown
+        // timestamp. The re-election case is handled inside each encoder itself
+        // (quality task). Both encoders are armed from the SAME `Connected`
+        // transition so they reset together (camera was #1348; screen is the #1311
+        // follow-up, now unblocked by the screen `last_keyframe_emit_ms` from
+        // #1322/#1344).
         client.set_camera_keyframe_cooldown_reset(camera.keyframe_cooldown_reset());
+        client.set_screen_keyframe_cooldown_reset(screen.keyframe_cooldown_reset());
 
         // Wire adaptive quality tier indices to health reporter for metrics
         client.set_adaptive_tier_sources(

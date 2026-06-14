@@ -21,8 +21,8 @@
 use super::{Decodable, DecodedFrame};
 use crate::frame::FrameBuffer;
 use crate::messages::{
-    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerMessage,
-    FRESHNESS_SKIP_KIND, REQUEST_KEYFRAME_KIND,
+    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerLogMessage,
+    WorkerMessage, FRESHNESS_SKIP_KIND, REQUEST_KEYFRAME_KIND, WORKER_LOG_KIND,
 };
 #[cfg(feature = "wasm")]
 use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
@@ -393,12 +393,46 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
     }
 
     // freshness_skip (issue #1045): the #1020 freshness-deadline outcome, forwarded
-    // from the worker so it lands in uploaded field logs. Re-broadcast as a
-    // DiagEvent with the worker's peer context, mirroring the video_stats path.
+    // from the worker so it lands in uploaded field logs.
+    //
+    // Delivery (issue #1045 follow-up): the upload pipeline captures the main thread's
+    // `console.*` (see `console-log-collector.js`), so the load-bearing delivery is the
+    // re-emitted `console` line below — NOT the DiagEvent. The DiagEvent broadcast goes only
+    // to the in-process diagnostics bus, which has no console bridge: its `"video"` subsystem
+    // is consumed by `health_reporter` (folded into the Prometheus health packet, where every
+    // freshness field hits a catch-all and is dropped) and the diagnostics drawer (rendered to
+    // the DOM, never uploaded) — so on its own it would NOT reach the field logs the issue
+    // targets. This was the same gap fixed for `worker_log` in #1356/#1372; the skip path was
+    // missed there and is corrected here. The DiagEvent is kept for any future structured
+    // consumer, mirroring the other worker->main diagnostics. The `[JITTER_BUFFER]` prefix
+    // matches the grep the field investigation already uses for this signal.
     if let Ok(skip_msg) = serde_wasm_bindgen::from_value::<FreshnessSkipMessage>(js_val.clone()) {
         if skip_msg.kind == FRESHNESS_SKIP_KIND {
             #[cfg(feature = "wasm")]
             {
+                let from = skip_msg.from_peer.clone().unwrap_or_default();
+                let to = skip_msg.to_peer.clone().unwrap_or_default();
+                // `None` keyframe_seq is the keyframe-less held (last-good) case; otherwise the
+                // sequence we skipped forward to.
+                let keyframe = skip_msg
+                    .keyframe_seq
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "none (held last-good)".into());
+                // A skip means the head-of-line frame aged past the playout deadline and stale
+                // frames were evicted to recover — a real degradation signal, surfaced at WARN so
+                // it stands out in field logs. This cannot amplify per tick: the worker only
+                // surfaces a skip for forwarding at most ~once/sec/stream (the rate-limit +
+                // coalescing in `JitterBuffer::record_freshness_skip`, gated on
+                // `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS`), so one console line maps to one
+                // forwarded event, not one per eviction.
+                console::warn_1(
+                    &format!(
+                        "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms dropped={} keyframe_seq={keyframe}",
+                        skip_msg.head_age_ms, skip_msg.dropped
+                    )
+                    .into(),
+                );
+
                 let evt = DiagEvent {
                     subsystem: "video",
                     stream_id: None,
@@ -415,6 +449,68 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                             skip_msg.keyframe_seq.map(|s| s as i64).unwrap_or(-1)
                         ),
                         metric!("dropped", skip_msg.dropped),
+                    ],
+                };
+                let _ = global_sender().try_broadcast(evt);
+            }
+            return true;
+        }
+    }
+
+    // worker_log (issue #1356): a `log::` record emitted INSIDE the decoder worker, forwarded so
+    // it lands in uploaded field logs (the worker's own `log`/`console` output is invisible to the
+    // main-thread capture pipeline). Delivered by re-emitting a real main-thread `console` line
+    // (what the upload pipeline hooks) tagged with the worker's peer context, plus a structured
+    // DiagEvent for future consumers. NOTE on serde ordering: like the branches above we must
+    // deserialize *then* check `kind`, because these worker messages share one JS-object channel
+    // and their field sets overlap (a `RequestKeyframeMessage` is a structural subset, and a
+    // `VideoStatsMessage`'s fields are all optional). `WorkerLogMessage`'s `level`/`target`/
+    // `message` are required strings, so a stats/skip object will NOT deserialize into it — but we
+    // still gate on `WORKER_LOG_KIND` so nothing can be misrouted in either direction.
+    if let Ok(log_msg) = serde_wasm_bindgen::from_value::<WorkerLogMessage>(js_val.clone()) {
+        if log_msg.kind == WORKER_LOG_KIND {
+            #[cfg(feature = "wasm")]
+            {
+                // Deliver into the console-log capture+upload pipeline (issue #1356). That pipeline
+                // hooks the main thread's `console.*`, so the worker record MUST be re-emitted here
+                // as a real console line — that is the load-bearing delivery. (The DiagEvent
+                // broadcast below goes only to the in-process diagnostics bus, which has no console
+                // bridge and no `worker_log` subscriber, so it would NOT reach the upload buffer on
+                // its own; it is kept for any future structured consumer, mirroring the other
+                // worker->main diagnostics.) Map the worker level onto the matching console method
+                // so the captured line keeps its severity.
+                let from = log_msg.from_peer.clone().unwrap_or_default();
+                let to = log_msg.to_peer.clone().unwrap_or_default();
+                let suppressed_note = if log_msg.suppressed > 0 {
+                    format!(" (+{} suppressed)", log_msg.suppressed)
+                } else {
+                    String::new()
+                };
+                let line = format!(
+                    "[worker {} {}] {}->{}: {}{}",
+                    log_msg.level, log_msg.target, from, to, log_msg.message, suppressed_note
+                );
+                match log_msg.level.as_str() {
+                    "ERROR" => console::error_1(&line.into()),
+                    "WARN" => console::warn_1(&line.into()),
+                    _ => console::log_1(&line.into()),
+                }
+
+                let evt = DiagEvent {
+                    subsystem: "worker_log",
+                    stream_id: None,
+                    ts_ms: now_ms(),
+                    metrics: vec![
+                        metric!("event", "worker_log"),
+                        metric!("level", log_msg.level),
+                        metric!("target", log_msg.target),
+                        metric!("message", log_msg.message),
+                        metric!("from_peer", log_msg.from_peer.unwrap_or_default()),
+                        metric!("to_peer", log_msg.to_peer.unwrap_or_default()),
+                        // Records coalesced by the worker's rate limit since the last forwarded
+                        // line (issue #1356); 0 on a normal line. Surfaces dropped volume without
+                        // per-record network amplification.
+                        metric!("suppressed", log_msg.suppressed),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);

@@ -106,7 +106,7 @@ jobs:
         working-directory: rust-repo
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
-        run: cargo clippy -p neteq --tests -- -D warnings
+        run: cargo clippy -p neteq --no-default-features --features web --tests -- -D warnings
 
   wasm-check:
     name: wasm32 check
@@ -136,7 +136,10 @@ jobs:
   wasm-test:
     name: wasm-pack tests
     runs-on: [self-hosted, linux, x64, hcl-ci]
-    timeout-minutes: 15
+    # 20 (not 15): this job now also natively tests `bot`, whose
+    # `env-libvpx-sys` dep compiles libvpx from C source on a cold
+    # CARGO_TARGET_DIR (multi-minute). Matches the backend job's headroom (#1176).
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4.2.0
         with:
@@ -188,3 +191,36 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo test -p videocall-transport --lib
+      # PR #1174 added these three crates to the `paths:` filter (so changes to
+      # them trigger this gate) but only wired `cargo test` for videocall-aq /
+      # videocall-client, leaving these with fmt/clippy but NO test gate — a
+      # regression in their suites could merge green (#1176). They are all
+      # native-host crates (no wasm-only gating), so run their full native test
+      # suites here. `bot` is a native binary crate: `cargo test -p bot` runs
+      # its 15 inline `#[test]` modules plus the `tests/aq_degradation.rs`
+      # integration suite (no `--lib` — that would skip the integration test).
+      - name: cargo test bot (native)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo test -p bot
+      # videocall-netsim's host-testable admission/token-bucket logic is plain
+      # libtest `#[test]` inline in src/shim.rs + src/profiles.rs (18 tests).
+      # `tests/wasm_smoke.rs` is `#![cfg(target_arch = "wasm32")]`, so it
+      # compiles to a no-op on native (no false-fail) and is covered by the
+      # wasm-pack path instead.
+      - name: cargo test videocall-netsim (native)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo test -p videocall-netsim
+      # videocall-meeting-client is a pure native REST client (reqwest/serde)
+      # with `#[test]` response-parsing coverage in src/meetings.rs.
+      - name: cargo test videocall-meeting-client (native)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo test -p videocall-meeting-client
+      # NOTE: vcprobe, videocall-cli, and videocall-sdk are also `paths:`-gated
+      # by #1174 but carry NO test files (confirmed in #1176), so they
+      # intentionally get no test step here — adding one would be a no-op.

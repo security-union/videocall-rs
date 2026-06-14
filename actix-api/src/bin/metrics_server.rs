@@ -48,9 +48,9 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
-    AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CAPABILITY_SCORE,
-    CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO,
-    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
+    AUDIO_CONCEALMENT_PCT, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE,
+    CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES,
+    CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
     CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL,
     CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE,
     CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE,
@@ -64,6 +64,7 @@ use sec_api::metrics::{
     PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
     SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
     TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
+    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
     VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
 };
 
@@ -163,6 +164,25 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
 ///
 /// The caller must hold the `session_tracker` lock; the locked map is passed in to
 /// avoid re-locking (and the resulting deadlock).
+///
+/// SINGLE-REPLICA ASSUMPTION (issue #1075).
+/// This derivation is only correct when `metrics_server` runs as a **single replica**.
+/// The `session_tracker` is a per-process `Arc<Mutex<HashMap<..>>>` (see `SessionTracker`)
+/// populated from the NATS subscription, which uses the queue group
+/// `metrics-server-health-diagnostics` (see `nats_health_consumer`). A queue group
+/// load-balances each health packet to exactly ONE subscriber, so with N replicas every
+/// replica's tracker holds only the subset of sessions whose packets it happened to
+/// receive. Each replica would then write `videocall_meeting_participants{meeting_id}`
+/// for the SAME meeting with its own partial count; because they share label values,
+/// each scrape target reports a partial count and the dashboard value
+/// undercounts / flaps across replicas.
+///
+/// The production deployment IS single-replica: `helm/metrics-api/values.yaml` pins
+/// `serverStats.replicas: 1` and no per-environment override raises it, so this
+/// assumption holds today. If `metrics_server` is ever scaled to >1 replica, this gauge
+/// must be aggregated across replicas at the recording-rule layer instead (e.g. emit a
+/// per-replica partial count keyed by an instance/replica label and `sum by (meeting_id)`
+/// in a Prometheus recording rule, or move the derivation behind a single aggregator).
 fn recompute_meeting_participants(
     tracker: &HashMap<String, SessionInfo>,
     meetings: &HashSet<String>,
@@ -408,6 +428,7 @@ fn remove_per_peer_metrics(
     let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
     let _ = PEER_CAN_SEE.remove_label_values(&labels);
     let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
+    let _ = AUDIO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
     let _ = NETEQ_TARGET_DELAY_MS.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_PER_SEC.remove_label_values(&labels);
@@ -422,6 +443,9 @@ fn remove_per_peer_metrics(
     let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_SEQ_LOSS_PER_SEC.remove_label_values(&labels);
+    let _ = VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
+    let _ = VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
+    let _ = VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
     let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
@@ -1131,6 +1155,14 @@ fn process_health_packet_to_metrics_pb(
                         .with_label_values(&peer_labels)
                         .set(neteq_stats.target_delay_ms);
 
+                    // Audio playout latency (#1299): how far behind live this peer's audio is
+                    // (NetEQ filtered playout buffer level). Set UNCONDITIONALLY so the gauge
+                    // recovers to 0 when audio catches back up to live — same rationale as the
+                    // video playout gauge below. Audio sibling of videocall_video_playout_latency_ms.
+                    AUDIO_PLAYOUT_LATENCY_MS
+                        .with_label_values(&peer_labels)
+                        .set(neteq_stats.playout_latency_ms);
+
                     if neteq_stats.packets_awaiting_decode != 0.0 {
                         NETEQ_PACKETS_AWAITING_DECODE
                             .with_label_values(&peer_labels)
@@ -1171,6 +1203,26 @@ fn process_health_packet_to_metrics_pb(
                             .with_label_values(&peer_labels)
                             .set(video_stats.bitrate_kbps as f64);
                     }
+
+                    // Buffered video playout latency (#1252): how far behind live this peer's
+                    // video is (jitter-buffer backlog + decoder queue), plus its stage-1
+                    // attribution. Set UNCONDITIONALLY so the gauges recover to 0 when the receiver
+                    // catches back up to live — the client only reports a nonzero value while the
+                    // tile is actively receiving (fps_received > 0), so a paused/hidden tile reads
+                    // 0 here rather than a stale latch.
+                    VIDEO_PLAYOUT_LATENCY_MS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_latency_ms);
+                    VIDEO_PLAYOUT_STAGE1_SPAN_MS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_stage1_span_ms);
+                    // Stage-3 paint lag (#1252): decoded-but-unpainted backlog in the worker->main
+                    // postMessage + paint queues. Set UNCONDITIONALLY (same rationale as above) so
+                    // the gauge recovers to 0 when the paint path drains; the client reports a
+                    // nonzero value only while fps_received > 0.
+                    VIDEO_PLAYOUT_PAINT_LAG_MS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_paint_lag_ms);
                 }
 
                 // Screen video metrics (separate from camera)
@@ -1268,7 +1320,16 @@ async fn nats_health_consumer(
     session_tracker: SessionTracker,
     display_name_map: DisplayNameMap,
 ) -> anyhow::Result<()> {
-    // Subscribe to all health diagnostics topics from all regions
+    // Subscribe to all health diagnostics topics from all regions.
+    //
+    // SINGLE-REPLICA ASSUMPTION (issue #1075): this is a NATS *queue group*, so each
+    // health packet is delivered to exactly ONE subscriber in the group. The per-process
+    // `session_tracker` that backs the `videocall_meeting_participants` gauge is therefore
+    // only complete when there is a single `metrics_server` replica subscribed. With >1
+    // replica the packets for one meeting fan out across replicas, each replica counts
+    // only its subset, and the gauge undercounts / flaps. Production runs single-replica
+    // (`helm/metrics-api/values.yaml` pins `serverStats.replicas: 1`). See
+    // `recompute_meeting_participants` for the aggregation strategy required to scale out.
     let queue_group = "metrics-server-health-diagnostics";
     let mut subscription = nats_client
         .queue_subscribe("health.diagnostics.>", queue_group.to_string())

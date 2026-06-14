@@ -189,8 +189,10 @@ pub struct HealthReporter {
     adaptive_video_tier: Rc<RefCell<Rc<AtomicU32>>>,
     /// Adaptive audio tier index from CameraEncoder (0=high, 3=emergency).
     adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
-    /// Encoder p75 peer FPS (f32 bits in AtomicU32).
-    encoder_p75_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Sender-side encoder queue-depth report (f32 bits in AtomicU32) — encoder backpressure, NOT
+    /// p75 peer FPS (the value was always queue depth; see #1231/#1263). Serialized to the
+    /// frozen-named proto field `encoder_p75_peer_fps = 67`, whose name predates the correction.
+    encoder_queue_depth_report: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder PID target bitrate kbps (f32 bits in AtomicU32).
     encoder_target_bitrate_kbps: Rc<RefCell<Rc<AtomicU32>>>,
     /// Screen share quality tier index.
@@ -402,7 +404,7 @@ impl HealthReporter {
             connection_controller: Rc::new(RefCell::new(None)),
             adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            encoder_p75_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_queue_depth_report: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
@@ -513,7 +515,7 @@ impl HealthReporter {
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &mut self,
-        p75_peer_fps: Rc<AtomicU32>,
+        queue_depth_report: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
@@ -525,7 +527,7 @@ impl HealthReporter {
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
     ) {
-        *self.encoder_p75_peer_fps.borrow_mut() = p75_peer_fps;
+        *self.encoder_queue_depth_report.borrow_mut() = queue_depth_report;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
         *self.adaptive_screen_tier.borrow_mut() = screen_tier;
         *self.screen_sharing_active.borrow_mut() = screen_active;
@@ -879,6 +881,27 @@ impl HealthReporter {
                                 video_stats["keyframe_requests_per_sec"] = json!(kf);
                             }
                         }
+                        // Buffered video playout latency (#1252): total across both receive stages
+                        // and its stage-1 attribution. Stored in the camera/screen video_stats
+                        // bucket; folded into the health packet only when fps_received > 0.
+                        "playout_latency_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_latency_ms"] = json!(v);
+                            }
+                        }
+                        "playout_stage1_span_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_stage1_span_ms"] = json!(v);
+                            }
+                        }
+                        // Stage-3 paint lag (#1252): decoded-but-unpainted backlog in the
+                        // worker->main postMessage + paint queues. Same bucket/guard as the two
+                        // latency fields above.
+                        "playout_paint_lag_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_paint_lag_ms"] = json!(v);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1049,7 +1072,7 @@ impl HealthReporter {
         let connection_controller = Rc::downgrade(&self.connection_controller);
         let adaptive_video_tier = self.adaptive_video_tier.clone();
         let adaptive_audio_tier = self.adaptive_audio_tier.clone();
-        let encoder_p75_peer_fps = self.encoder_p75_peer_fps.clone();
+        let encoder_queue_depth_report = self.encoder_queue_depth_report.clone();
         let encoder_target_bitrate_kbps = self.encoder_target_bitrate_kbps.clone();
         let adaptive_screen_tier = self.adaptive_screen_tier.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
@@ -1135,9 +1158,9 @@ impl HealthReporter {
                             };
 
                         // Read encoder decision inputs from shared atomics (f32 bits → f64).
-                        let p75_peer_fps_val =
-                            f32::from_bits(encoder_p75_peer_fps.borrow().load(Ordering::Relaxed))
-                                as f64;
+                        let queue_depth_report_val = f32::from_bits(
+                            encoder_queue_depth_report.borrow().load(Ordering::Relaxed),
+                        ) as f64;
                         let target_bitrate_kbps_val = f32::from_bits(
                             encoder_target_bitrate_kbps.borrow().load(Ordering::Relaxed),
                         ) as f64;
@@ -1223,7 +1246,7 @@ impl HealthReporter {
                             videocall_transport::webtransport::datagram_drop_count(),
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
-                            p75_peer_fps_val,
+                            queue_depth_report_val,
                             target_bitrate_kbps_val,
                             screen_tier_val,
                             screen_active_val,
@@ -1287,7 +1310,7 @@ impl HealthReporter {
         datagram_drops_total: u64,
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
-        encoder_p75_peer_fps: f64,
+        encoder_queue_depth_report: f64,
         encoder_target_bitrate_kbps: f64,
         adaptive_screen_tier: u32,
         screen_sharing_active: bool,
@@ -1363,8 +1386,8 @@ impl HealthReporter {
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
         // Encoder decision inputs (P0)
-        if encoder_p75_peer_fps.is_finite() {
-            pb.encoder_p75_peer_fps = Some(encoder_p75_peer_fps);
+        if encoder_queue_depth_report.is_finite() {
+            pb.encoder_p75_peer_fps = Some(encoder_queue_depth_report);
         }
         pb.adaptive_screen_tier = Some(adaptive_screen_tier);
         pb.screen_sharing_active = Some(screen_sharing_active);
@@ -1655,6 +1678,14 @@ impl HealthReporter {
                     // to absorb observed network jitter. This is the real VoIP jitter metric.
                     ns.target_delay_ms = v;
                 }
+                // Audio playout latency (#1299): NetEQ's filtered current buffer level — how far
+                // behind live this peer's audio playout sits. The audio sibling of
+                // VideoStats.playout_latency_ms (#1252). Surfaced straight from the NetEQ stats
+                // JSON top-level (NetEqStats::playout_latency_ms); when the field is absent (older
+                // NetEQ worker) it stays at the proto 0.0 default = "at live". Observability only.
+                if let Some(v) = neteq.get("playout_latency_ms").and_then(|v| v.as_f64()) {
+                    ns.playout_latency_ms = v;
+                }
 
                 // Calculate audio packet loss percentage from WINDOWED rates (not lifetime)
                 // Use expand_per_sec (concealment events/sec) and packets_per_sec (packets/sec)
@@ -1743,6 +1774,28 @@ impl HealthReporter {
                 }
                 if let Some(v) = video.get("bitrate_kbps").and_then(|v| v.as_u64()) {
                     vs.bitrate_kbps = v;
+                }
+
+                // Buffered video playout latency (#1252). Guard #1 (load-bearing): only fold the
+                // span when fps_received > 0. A DecodeBudget-paused or hidden tile keeps a stale
+                // frame buffered but decodes nothing, so its arrival-time span would read as
+                // latency even though the user isn't waiting on it. fps_received > 0 means frames
+                // are actually being received/decoded, so the lag is real. When fps == 0 the proto
+                // field stays at its 0.0 default, which the server publishes as "at live".
+                if vs.fps_received > 0.0 {
+                    if let Some(v) = video.get("playout_latency_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_latency_ms = v;
+                    }
+                    if let Some(v) = video.get("playout_stage1_span_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_stage1_span_ms = v;
+                    }
+                    // Stage-3 paint lag (#1252): same fps_received > 0 guard — a paused/hidden tile
+                    // decodes nothing and paints nothing, so any residual emitted-vs-painted skew
+                    // is not user-perceived latency. When fps == 0 the field stays at its 0.0
+                    // default => "at live".
+                    if let Some(v) = video.get("playout_paint_lag_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_paint_lag_ms = v;
+                    }
                 }
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 
@@ -2054,7 +2107,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -2132,7 +2185,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -2186,7 +2239,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -2209,6 +2262,223 @@ mod tests {
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    fn health_packet_with_camera_playout_stats(fps_received: f64) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.last_camera_stats = Some(json!({
+            "fps_received": fps_received,
+            "playout_latency_ms": 1500.0,
+            "playout_stage1_span_ms": 1200.0,
+            "playout_paint_lag_ms": 1800.0,
+        }));
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    #[test]
+    fn playout_latency_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_latency_ms, 1500.0);
+        assert_eq!(stats.playout_stage1_span_ms, 1200.0);
+    }
+
+    #[test]
+    fn playout_latency_omitted_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        assert_eq!(stats.playout_latency_ms, 0.0);
+        assert_eq!(stats.playout_stage1_span_ms, 0.0);
+    }
+
+    #[test]
+    fn playout_paint_lag_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_paint_lag_ms, 1800.0);
+    }
+
+    #[test]
+    fn playout_paint_lag_omitted_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        assert_eq!(stats.playout_paint_lag_ms, 0.0);
+    }
+
+    /// Build a health packet whose peer carries NetEQ audio stats. `playout_latency_ms` is
+    /// `Some(v)` to include the field in the stats JSON (the shape the NetEQ worker emits at the
+    /// top level of NetEqStats), or `None` to OMIT it entirely (the older-worker / pre-#1299 case).
+    fn health_packet_with_neteq_playout_latency(playout_latency_ms: Option<f64>) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        let mut neteq = json!({
+            "current_buffer_size_ms": 200.0,
+            "target_delay_ms": 80.0,
+            "packets_awaiting_decode": 3.0,
+            "packets_per_sec": 50.0,
+        });
+        if let Some(v) = playout_latency_ms {
+            neteq["playout_latency_ms"] = json!(v);
+        }
+        peer.update_audio_stats(neteq);
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// Audio playout latency (#1299): when NetEQ reports a filtered playout buffer level in the
+    /// stats JSON, it must fold into NetEqStats.playout_latency_ms on the wire. Mirrors the video
+    /// sibling test. Fails if the read in create_health_packet is dropped or reads the wrong key.
+    #[test]
+    fn audio_playout_latency_folds_from_neteq_stats() {
+        let pb = health_packet_with_neteq_playout_latency(Some(1450.0));
+        let neteq = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .neteq_stats
+            .as_ref()
+            .expect("neteq stats must be present");
+
+        assert_eq!(neteq.playout_latency_ms, 1450.0);
+        // Sanity: the metric is distinct from the raw buffer snapshot it travels alongside.
+        assert_eq!(neteq.current_buffer_size_ms, 200.0);
+    }
+
+    /// When the NetEQ stats JSON OMITS playout_latency_ms (older worker / pre-#1299), the proto
+    /// field must stay at its 0.0 default ("at live"), never a stale or fabricated value. Guards
+    /// against the #1338-style false-value trap.
+    #[test]
+    fn audio_playout_latency_defaults_to_zero_when_absent() {
+        let pb = health_packet_with_neteq_playout_latency(None);
+        let neteq = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .neteq_stats
+            .as_ref()
+            .expect("neteq stats must be present");
+
+        assert_eq!(neteq.playout_latency_ms, 0.0);
     }
 
     /// #1032: a cached agent-memory reading rides the HealthPacket on the wire.
@@ -2253,7 +2523,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,

@@ -195,12 +195,29 @@ export interface ImpairOptions {
  * Point a single BrowserContext's media WebSocket at the toxiproxy listener and
  * pin it to the WebSocket transport (the only impairable path today).
  *
- * Implemented as a `GET /config.js` route patch — the SAME technique
- * `enableSimulcastFlag` uses — because `dioxus-ui/scripts/config.js` *reassigns*
- * `window.__APP_CONFIG` wholesale, which would clobber a plain `addInitScript`
- * override. We fetch the real config.js and append an override that rewrites
- * `wsUrl` to {@link SHAPED_WS_URL}. The committed `config.js` is never touched
- * and the patch is scoped to this context only.
+ * ## Why this patches `config.local.js`, not just `config.js`
+ *
+ * The dioxus UI layers its runtime config in `index.html` in this exact order,
+ * and the wasm reads `window.__APP_CONFIG` only AFTER all of them have run:
+ *
+ *   1. `<script src="/config.js">`  — the committed default; *wholesale-reassigns*
+ *      `window.__APP_CONFIG = ({ ... })`.
+ *   2. a sync-XHR loader for `/config.local.js` (gitignored dev/e2e override) —
+ *      `Object.assign(window.__APP_CONFIG, { ... })`, runs LAST, BEFORE wasm boot.
+ *   3. the wasm module reads `window.__APP_CONFIG.wsUrl` (constants.rs::app_config).
+ *
+ * The e2e stack's `docker/start-dioxus.sh` GENERATES a `config.local.js` that
+ * sets `wsUrl` to `ACTIX_UI_BACKEND_URL` (`ws://localhost:8080`). So a patch that
+ * only rewrites `/config.js` (the old implementation, and what `enableSimulcastFlag`
+ * does) is silently UNDONE by `config.local.js` running afterward — which is why
+ * the degraded receiver was observed connecting straight to `ws://localhost:8080/
+ * lobby` with the proxy having no effect (issue #1355). The override must land on
+ * the LAST layer the app reads, so we intercept `/config.local.js` and append the
+ * `wsUrl` rewrite to it. We also patch `/config.js` (defensively, see below) so
+ * the rewrite still wins if the e2e stack ever stops generating `config.local.js`.
+ *
+ * The committed `config.js` / `config.local.js` files are never touched on disk;
+ * the patch is a per-context Playwright route fulfillment only.
  *
  * MUST be called before the context's first navigation.
  *
@@ -212,31 +229,70 @@ export async function routeDownlinkThroughProxy(
   wsUrl: string = SHAPED_WS_URL,
 ): Promise<void> {
   // Pin to WebSocket so the client cannot elect WebTransport and bypass the
-  // TCP proxy. `vc_transport_preference` is read at boot (context.rs).
+  // TCP proxy. The UI reads the sticky flag under `vc_transport_sticky` and the
+  // preference under `vc_transport_preference` at boot
+  // (dioxus-ui/src/context.rs::load_transport_preference, keys at
+  // context.rs:913-914). The earlier `vc_transport_preference_sticky` key was a
+  // typo the UI never reads, so the pin silently did nothing.
   await context.addInitScript((pref) => {
     try {
       window.localStorage.setItem("vc_transport_preference", pref);
-      window.localStorage.setItem("vc_transport_preference_sticky", "true");
+      window.localStorage.setItem("vc_transport_sticky", "true");
     } catch {
       /* storage may be unavailable pre-navigation on some origins; ignore */
     }
   }, "websocket");
 
-  // Rewrite wsUrl via the same config.js interception pattern as the simulcast
-  // flag helper (full-reassignment-safe).
-  await context.route("**/config.js", async (route) => {
-    const response = await route.fetch();
-    const original = await response.text();
-    const injection = `;window.__APP_CONFIG=Object.assign(window.__APP_CONFIG||{},{"wsUrl":${JSON.stringify(
-      wsUrl,
-    )}});`;
-    const patched = original.trimStart().startsWith("window.__APP_CONFIG")
-      ? original + injection
-      : `window.__APP_CONFIG=window.__APP_CONFIG||{};` + injection;
+  // The override appended to whichever config layer we patch. `Object.assign`
+  // onto the live `window.__APP_CONFIG` (creating it if absent) so the single
+  // `wsUrl` key is rewritten while every other key set by the prior layer is
+  // preserved.
+  const injection = `;window.__APP_CONFIG=Object.assign(window.__APP_CONFIG||{},{"wsUrl":${JSON.stringify(
+    wsUrl,
+  )}});`;
+
+  // AUTHORITATIVE layer: `/config.local.js` runs last, after `config.js`, and
+  // before the wasm reads `__APP_CONFIG` (see the doc comment above). Appending
+  // the override here makes the proxy URL the final value the wasm sees, even
+  // though the e2e-generated `config.local.js` resets `wsUrl` to the relay.
+  await context.route("**/config.local.js", async (route) => {
+    let original = "";
+    try {
+      const response = await route.fetch();
+      // Mirror index.html's sync-XHR loader: only a JS-shaped body is real.
+      // A 200 SPA HTML fallback (charAt(0) === "<") or an empty body is not a
+      // config layer, so we discard it and emit a standalone override instead.
+      if (response.ok()) {
+        const body = (await response.text()).trim();
+        if (body && body.charAt(0) !== "<") {
+          original = body;
+        }
+      }
+    } catch {
+      /* config.local.js may be absent; emit a standalone override below */
+    }
     await route.fulfill({
       status: 200,
       contentType: "application/javascript",
-      body: patched,
+      body: `${original}window.__APP_CONFIG=window.__APP_CONFIG||{};${injection}`,
+    });
+  });
+
+  // DEFENSIVE layer: also rewrite `/config.js` so the override still applies if
+  // the e2e stack ever stops generating a `config.local.js`. The committed
+  // `config.js` starts with COMMENT lines before the `window.__APP_CONFIG = (...)`
+  // assignment, so the old `startsWith("window.__APP_CONFIG")` sniff returned
+  // false and dropped the entire real config body (the bug `enableSimulcastFlag`
+  // still carries). We instead ALWAYS keep the original body and append the
+  // override after it — `config.js` is unconditional-assignment JS regardless of
+  // leading comments, so concatenation is safe.
+  await context.route("**/config.js", async (route) => {
+    const response = await route.fetch();
+    const original = await response.text();
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: original + injection,
     });
   });
 }

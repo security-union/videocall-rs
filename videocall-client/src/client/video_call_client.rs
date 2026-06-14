@@ -464,6 +464,19 @@ struct Inner {
     /// Mirror of `camera_union_requested_layer` for the SCREEN media-kind — a
     /// clone of `ScreenEncoder::shared_union_requested_layer`. `None` until wired.
     screen_union_requested_layer: Option<Rc<AtomicU32>>,
+    /// Forced-keyframe cooldown reset for the CAMERA encoder (issue #1311). A
+    /// clone of `CameraEncoder::keyframe_cooldown_reset`, wired in by the host
+    /// after the encoder is built. SET to `true` on each `Connected` lifecycle
+    /// event (every reconnect) so the camera encode loop clears its
+    /// `last_keyframe_emit_ms` cooldown clock and the first post-reconnect PLI is
+    /// not coalesced away. `None` when no camera encoder is attached (observer
+    /// mode / native lib callers), in which case the reset is a no-op. The
+    /// RE-ELECTION path arms the same encoder-owned atom directly from the camera
+    /// quality task — only the RECONNECT path needs this client-side wiring,
+    /// because a full reconnect runs `reset_and_start_election` (clearing
+    /// `old_active_connection`) and so never drives `reelection_completed_signal`.
+    /// Screen has no equivalent yet (deferred #1311 follow-up, gated on #1322/#1344).
+    camera_keyframe_cooldown_reset: Option<Rc<AtomicBool>>,
     /// Long Tasks API observer that emits `client_longtask_duration_ms` /
     /// `client_longtask_count` to the diagnostic bus whenever the main
     /// thread blocks for more than 50 ms. Held for its drop side-effect:
@@ -960,6 +973,10 @@ impl VideoCallClient {
                 // LAYER_HINT dispatch arm no-ops while None (fail-open).
                 camera_union_requested_layer: None,
                 screen_union_requested_layer: None,
+                // Issue #1311: None until the host wires in
+                // `CameraEncoder::keyframe_cooldown_reset`; the reconnect reset
+                // no-ops while None.
+                camera_keyframe_cooldown_reset: None,
                 _long_task_observer: long_task_observer,
                 _render_fps_observer: render_fps_observer,
             })),
@@ -1171,6 +1188,29 @@ impl VideoCallClient {
                                     }
                                     if let Some(atom) = &inner.screen_union_requested_layer {
                                         atom.store(u32::MAX, Ordering::Relaxed);
+                                    }
+
+                                    // Forced-keyframe cooldown reset (issue #1311).
+                                    // The camera encode loop persists across a full
+                                    // reconnect AND a re-election (the connection is
+                                    // rebuilt / the active server is swapped, but the
+                                    // encoder is never restarted), so its
+                                    // `last_keyframe_emit_ms` carries a stale
+                                    // pre-transition timestamp that could suppress the
+                                    // first recovery PLI for up to one cooldown window
+                                    // (250ms). ARM the encoder-owned reset atom so the
+                                    // encode loop clears that clock on its next frame.
+                                    // This `Connected` arm covers BOTH transitions:
+                                    // a full reconnect and a re-election both end in an
+                                    // election that re-emits `Connected` here (a full
+                                    // reconnect does NOT drive `reelection_completed_signal`,
+                                    // so the camera quality task's re-election arm alone
+                                    // would miss it). A reset on the cold-start connect
+                                    // is a harmless no-op (no PLI pending, clock already
+                                    // `None`); a duplicate vs the quality task's arm is
+                                    // idempotent (`.swap(false)` on the consume side).
+                                    if let Some(atom) = &inner.camera_keyframe_cooldown_reset {
+                                        atom.store(true, Ordering::Release);
                                     }
                                 } else {
                                     warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
@@ -1899,6 +1939,25 @@ impl VideoCallClient {
         }
     }
 
+    /// Wire the CAMERA forced-keyframe cooldown reset atom (issue #1311).
+    ///
+    /// The host calls this with
+    /// [`CameraEncoder::keyframe_cooldown_reset`](crate::CameraEncoder::keyframe_cooldown_reset)
+    /// so the `Connected` lifecycle callback can ARM the SAME atom the camera
+    /// encode loop consumes — clearing its forced-keyframe cooldown clock on every
+    /// reconnect so the first post-reconnect PLI is not coalesced away. Until wired
+    /// the reconnect reset is a no-op (`None`). Same ownership direction as
+    /// [`set_camera_union_requested_layer`](Self::set_camera_union_requested_layer)
+    /// (atom OWNED by the encoder). The re-election path arms the same atom from
+    /// the camera quality task with no client involvement.
+    pub fn set_camera_keyframe_cooldown_reset(&self, atom: Rc<AtomicBool>) {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.camera_keyframe_cooldown_reset = Some(atom);
+        } else {
+            warn!("set_camera_keyframe_cooldown_reset: inner busy, skipping wiring");
+        }
+    }
+
     /// Wire the SCREEN relay layer-union hint atom (issue #1108, Stage 3).
     ///
     /// Mirror of [`set_camera_union_requested_layer`](Self::set_camera_union_requested_layer)
@@ -1929,7 +1988,7 @@ impl VideoCallClient {
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &self,
-        p75_peer_fps: Rc<AtomicU32>,
+        queue_depth_report: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
@@ -1945,7 +2004,7 @@ impl VideoCallClient {
             if let Some(hr) = &inner.health_reporter {
                 if let Ok(mut reporter) = hr.try_borrow_mut() {
                     reporter.set_encoder_metric_sources(
-                        p75_peer_fps,
+                        queue_depth_report,
                         target_bitrate_kbps,
                         screen_tier,
                         screen_active,
@@ -3197,8 +3256,13 @@ impl Inner {
                             // controller converts the max-layer id to a count and
                             // composes it with backpressure + the real ladder depth
                             // (fail-open if the value is the u32::MAX sentinel).
-                            // AUDIO / UNSPECIFIED entries have no simulcast ladder
-                            // and are ignored.
+                            // AUDIO entries are ignored on purpose (#1201): audio
+                            // HAS a 3-rung ladder (#1086), but the publisher never
+                            // acts on a relay AUDIO hint, so the full audio ladder is
+                            // always published (the relay side stops emitting the
+                            // AUDIO union under #1118 N3 / PR #1330). UNSPECIFIED is
+                            // the back-compat default the relay never emits. Ignore
+                            // both (fail-open).
                             for entry in &hint.entries {
                                 match entry.media_kind.enum_value() {
                                     Ok(MediaKind::VIDEO) => {
@@ -3225,9 +3289,12 @@ impl Inner {
                                             );
                                         }
                                     }
-                                    // AUDIO has no simulcast ladder; UNSPECIFIED is
-                                    // the back-compat default the relay never emits.
-                                    // Ignore both (fail-open).
+                                    // AUDIO: deliberately ignored (#1201) — audio
+                                    // has a 3-rung ladder (#1086) but is always
+                                    // published (no hint-driven shed; the relay
+                                    // computes no AUDIO union, #1118 N3). UNSPECIFIED
+                                    // is the back-compat default the relay never
+                                    // emits. Ignore both (fail-open).
                                     _ => {}
                                 }
                             }

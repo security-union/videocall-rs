@@ -517,6 +517,18 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    // Latch: set true the first time the Diagnostics drawer is opened, never
+    // reset. Once the drawer has been opened at least once, CLOSING it keeps a
+    // lightweight `#diagnostics-sidebar` placeholder in the DOM (without the
+    // `visible` class) instead of unmounting the element entirely — symmetric with
+    // `#peer-list-container`, whose outer div always renders. This is what lets the
+    // both-open close flow observe the drawer LOSE `visible` rather than vanish
+    // (a `:not(.visible)` assertion can't match an element that no longer exists).
+    // Gating the placeholder on "ever opened" preserves the never-opened contract
+    // (the element must NOT exist until the drawer is first opened). The heavy
+    // `Diagnostics` component is still only mounted while actually open, so no
+    // diagnostics work runs for the closed placeholder. (issue 1296 both-open close)
+    let mut diagnostics_was_opened = use_signal(|| false);
     // Drawer width state. Both drawers are overlay-only: they float over the
     // tiles and never reflow the grid. Their widths are drag-resizable and
     // persisted to localStorage. Widths are clamped on load in case a value
@@ -844,6 +856,17 @@ pub fn AttendantsComponent(
             device_settings_open.set(false);
             device_settings_initial_section.set(None);
             diagnostics_open.set(true);
+        }
+    });
+
+    // Latch `diagnostics_was_opened` the first time the drawer opens, via ANY path
+    // (toolbar button, deep-link redirect above, etc.). Reading `diagnostics_open`
+    // here subscribes this effect to it; the write is guarded so it only fires once
+    // (and never resets), so it cannot loop. After this latches, closing the drawer
+    // renders the persistent placeholder instead of unmounting. (issue 1296)
+    use_effect(move || {
+        if diagnostics_open() && !diagnostics_was_opened() {
+            diagnostics_was_opened.set(true);
         }
     });
 
@@ -5125,7 +5148,20 @@ pub fn AttendantsComponent(
                     MeetingEndedOverlay { message }
                 }
 
-                // Diagnostics sidebar
+                // Diagnostics sidebar.
+                //
+                // The `#diagnostics-sidebar` ELEMENT must persist in the DOM whether
+                // open or closed — symmetric with `#peer-list-container` above, whose
+                // outer div always renders and only toggles the `visible` class. The
+                // heavy `Diagnostics` component (live NetEq subscriptions, charts,
+                // 4 Hz simulcast interval) is still only MOUNTED while open, so there
+                // is no closed-state work; when closed we render a lightweight empty
+                // placeholder div with the same id but WITHOUT `visible`. Previously
+                // the whole element lived inside `if diagnostics_open()`, so closing
+                // it UNMOUNTED `#diagnostics-sidebar` entirely — which broke the
+                // both-open close flow (a `:not(.visible)` assertion can't match an
+                // element that no longer exists) and was asymmetric with the left
+                // drawer. (issue 1296 both-open close)
                 if diagnostics_open() {
                     Diagnostics {
                         is_open: true,
@@ -5232,6 +5268,27 @@ pub fn AttendantsComponent(
                                 }
                             }
                         },
+                    }
+                } else if diagnostics_was_opened() {
+                    // Closed AFTER having been opened at least once: keep a
+                    // lightweight `#diagnostics-sidebar` placeholder in the DOM (no
+                    // `visible` class, no children) so the both-open close flow can
+                    // observe it lose `visible` rather than vanish. Before the drawer
+                    // is EVER opened this branch does not render, so the never-opened
+                    // contract (`#diagnostics-sidebar` absent until first open) holds.
+                    // The width inline style mirrors the open drawer so a future
+                    // reopen has no layout pop; no children → no diagnostics work runs
+                    // while closed. (issue 1296 both-open close)
+                    div {
+                        id: "diagnostics-sidebar",
+                        class: "",
+                        style: format!("width: {}px", right_width()),
+                        // No `role`/`aria-label` on the EMPTY closed placeholder: a
+                        // labelled landmark with no content would announce an empty
+                        // region to a screen reader. The open `Diagnostics` root
+                        // carries the `role="region"` + label; the placeholder is a
+                        // pure DOM-presence shim so the both-open close flow can see
+                        // the element lose `visible` rather than vanish. (issue 1296)
                     }
                 }
 

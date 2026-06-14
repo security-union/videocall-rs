@@ -225,15 +225,25 @@ test.describe("Pre-join auto-shows device selectors without auto-joining (issue 
     await startOrJoinButton(page).waitFor({ timeout: 30_000 });
 
     const requesting = page.getByText(REQUESTING_COPY);
-    const sawRequestingCopy = await requesting
+    // Snapshot the text ATOMICALLY at observation time. `getByText(REQUESTING_
+    // COPY)` already filters by the exact new wording, so a successful
+    // `waitFor({state:"visible"})` on it is itself proof the new copy appeared.
+    // We must NOT re-assert with a SECOND DOM round-trip (`toHaveText`) afterward:
+    // the near-instant fake-UI auto-grant can clear the prompt between the
+    // waitFor resolving and the re-read, detaching the element and turning the
+    // "element(s) not found" detach into a spurious failure. Capturing the
+    // textContent in the same observation (best-effort) keeps the new-wording
+    // contract without the race.
+    const seenCopy = await requesting
       .waitFor({ state: "visible", timeout: 1_500 })
-      .then(() => true)
-      .catch(() => false);
-    if (sawRequestingCopy) {
-      // If we caught the in-flight window, it must carry the new wording and the
-      // OLD pre-1134 "Allow camera & microphone to preview..."-style copy must
-      // not be the one in use (the new copy is the only prompt text now).
-      await expect(requesting).toHaveText(REQUESTING_COPY);
+      .then(() => requesting.textContent().catch(() => null))
+      .catch(() => null);
+    if (seenCopy !== null) {
+      // If we caught the in-flight window, it must carry the new wording (issue
+      // 1134) — never the OLD pre-1134 "Allow camera & microphone to preview…"
+      // copy. The locator's own text filter already guarantees this; the captured
+      // string is asserted for an explicit, non-racy record of the contract.
+      expect(seenCopy.trim()).toBe(REQUESTING_COPY);
     }
 
     // Unconditional contract: the auto-request resolves to the granted state.

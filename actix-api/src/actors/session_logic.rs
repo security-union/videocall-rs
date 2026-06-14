@@ -109,11 +109,22 @@ pub struct CongestionTracker {
     /// Total drops since the last stale-entry cleanup. Cleanup runs every
     /// [`CLEANUP_INTERVAL`] drops to amortize the cost of `retain()`.
     total_drops: u32,
+    /// Value of [`total_drops`](Self::total_drops) the last time the #1320
+    /// cap-pressure forced sweep ran. Gates that sweep to the same amortized
+    /// [`CLEANUP_INTERVAL`] cadence as the unconditional cleanup so that under a
+    /// sustained flood of distinct new `sender_session_id`s on an already-full
+    /// receiver we do NOT run an O(n) `retain()` on every dropped packet (#1349).
+    last_forced_sweep_drops: u32,
     /// Most recent instant at which this receiver crossed the drop threshold
     /// for *any* sender. Used by [`CongestionTracker::is_actively_congested`]
     /// to relax the KEYFRAME_REQUEST rate limiter so a frozen receiver can
     /// recover (issue #979).
     last_congestion: Option<Instant>,
+    /// Test-only count of how many times the #1320 cap-pressure forced sweep was
+    /// actually invoked. Lets the #1349 gating test assert the sweep does NOT run
+    /// on every at-cap drop without depending on internal eviction side effects.
+    #[cfg(test)]
+    forced_sweep_count: u32,
 }
 
 impl Default for CongestionTracker {
@@ -147,7 +158,10 @@ impl CongestionTracker {
         Self {
             senders: HashMap::new(),
             total_drops: 0,
+            last_forced_sweep_drops: 0,
             last_congestion: None,
+            #[cfg(test)]
+            forced_sweep_count: 0,
         }
     }
 
@@ -174,8 +188,11 @@ impl CongestionTracker {
     /// prevents unbounded growth when transient participants leave while
     /// avoiding an O(n) `retain()` on every single drop. As a defense-in-depth
     /// backstop the map is ALSO hard-capped at [`MAX_TRACKED_SENDERS`] (#1320):
-    /// at the cap a NEW sender is refused (after one forced stale sweep) so the
-    /// map cannot grow unbounded between amortized passes.
+    /// at the cap a NEW sender is refused so the map cannot grow unbounded
+    /// between amortized passes. The cap-pressure reclaim sweep is itself gated
+    /// to the [`CLEANUP_INTERVAL`] cadence (#1349) so a flood of distinct new
+    /// senders against a saturated receiver stays O(1) per drop rather than
+    /// triggering a full `retain()` on each packet.
     pub fn record_drop(&mut self, sender_session_id: u64) -> Option<u64> {
         let now = Instant::now();
 
@@ -187,8 +204,8 @@ impl CongestionTracker {
 
         // #1320: hard entry-count bound as defense-in-depth on top of the
         // amortized time-based cleanup above. If we are at the cap and this is a
-        // NEW sender, force an immediate stale sweep first; if STILL at the cap
-        // afterward, skip tracking this drop rather than grow the map unbounded.
+        // NEW sender, try once to reclaim space, then either admit (if room was
+        // freed) or skip tracking this drop rather than grow the map unbounded.
         // An ALREADY-tracked sender is never refused (its window/notify state and
         // the #979 keyframe-relax path it feeds are untouched). Refusing a brand
         // new sender only when the cap is genuinely full is harmless: at that
@@ -196,10 +213,33 @@ impl CongestionTracker {
         // sources, `last_congestion` is already being driven, and
         // `is_actively_congested()` already returns true — so the dropped
         // tracking for one more sender costs nothing the relax path needs.
+        //
+        // #1349: the reclaim sweep is GATED to the same amortized CLEANUP_INTERVAL
+        // cadence as the unconditional cleanup above, keyed off `total_drops`.
+        // `sender_session_id` is the publisher-controlled outer
+        // `PacketWrapper.session_id` (see the MAX_TRACKED_SENDERS doc), so a
+        // malicious publisher can present a distinct NEW id on every dropped
+        // packet to a saturated receiver. Without the gate that adversarial path
+        // would run a full O(<=MAX_TRACKED_SENDERS) `retain()` PER PACKET — a
+        // self-inflicted O(n)-per-drop on exactly the case the cap backstops.
+        // Gating makes the steady-state at-cap drop O(1): the sweep runs at most
+        // once per CLEANUP_INTERVAL drops, and between sweeps an over-cap new
+        // sender is simply refused. The memory bound is unaffected — the map only
+        // ever grows when a sweep has actually freed a slot, never on the
+        // gated-off path.
         if self.senders.len() >= MAX_TRACKED_SENDERS
             && !self.senders.contains_key(&sender_session_id)
         {
-            self.evict_stale_senders(now);
+            let due_for_sweep =
+                self.total_drops.wrapping_sub(self.last_forced_sweep_drops) >= CLEANUP_INTERVAL;
+            if due_for_sweep {
+                self.last_forced_sweep_drops = self.total_drops;
+                #[cfg(test)]
+                {
+                    self.forced_sweep_count += 1;
+                }
+                self.evict_stale_senders(now);
+            }
             if self.senders.len() >= MAX_TRACKED_SENDERS
                 && !self.senders.contains_key(&sender_session_id)
             {
@@ -875,6 +915,66 @@ mod tests {
             "an already-tracked sender must keep being recorded at the cap"
         );
         assert_eq!(tracker.senders.len(), MAX_TRACKED_SENDERS);
+    }
+
+    /// #1349: the cap-pressure forced sweep must NOT run on every at-cap drop.
+    /// Under a flood of distinct NEW (publisher-forgeable) `sender_session_id`s
+    /// against an already-full receiver, the forced `retain()` is gated to the
+    /// amortized `CLEANUP_INTERVAL` cadence so the steady-state at-cap drop is
+    /// O(1) — never an O(n) sweep per packet.
+    ///
+    /// Mutation coverage: if the `due_for_sweep` gate is removed (sweep runs
+    /// unconditionally, the pre-#1349 behavior), `forced_sweep_count` would equal
+    /// the number of at-cap new-sender drops and the `<= 1` assert below fails.
+    /// The map-bound asserts also pin the #1320 invariant the gate must preserve.
+    #[test]
+    fn test_congestion_tracker_forced_sweep_gated_at_cap() {
+        let mut tracker = CongestionTracker::new();
+        let now = Instant::now();
+
+        // Fill to the cap with FRESH (non-stale) entries so the stale sweep can
+        // never reclaim a slot: every new sender below is genuinely refused.
+        for id in 0..MAX_TRACKED_SENDERS as u64 {
+            tracker.senders.insert(
+                id,
+                SenderDropState {
+                    drop_count: 0,
+                    window_start: now,
+                    last_notify: None,
+                },
+            );
+        }
+        assert_eq!(tracker.senders.len(), MAX_TRACKED_SENDERS);
+        assert_eq!(tracker.forced_sweep_count, 0);
+
+        // Flood the saturated receiver with a burst of DISTINCT new senders that
+        // stays strictly below CLEANUP_INTERVAL. With the #1349 gate the forced
+        // sweep fires at most once across the whole burst; without it (sweep per
+        // packet) it would fire `burst` times.
+        let burst = CLEANUP_INTERVAL - 1;
+        let base = MAX_TRACKED_SENDERS as u64;
+        for i in 0..burst as u64 {
+            assert_eq!(
+                tracker.record_drop(base + i),
+                None,
+                "an over-cap new sender must always be refused"
+            );
+        }
+
+        assert!(
+            tracker.forced_sweep_count <= 1,
+            "forced sweep ran {} times over {} at-cap drops; it must be gated to \
+             the CLEANUP_INTERVAL cadence (<= 1), not run per packet",
+            tracker.forced_sweep_count,
+            burst
+        );
+        // The bound the gate must preserve: the map never grew past the cap and
+        // no over-cap sender was admitted.
+        assert_eq!(
+            tracker.senders.len(),
+            MAX_TRACKED_SENDERS,
+            "the map must remain bounded at MAX_TRACKED_SENDERS under flood"
+        );
     }
 
     // =====================================================================

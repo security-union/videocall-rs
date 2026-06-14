@@ -66,6 +66,29 @@ pub fn unistream_drop_count() -> u64 {
     UNISTREAM_DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// Record one dropped persistent-unistream media frame: increment
+/// [`UNISTREAM_DROP_COUNT`] by one.
+///
+/// This is the single write path for the drop counter, extracted from the
+/// `send_on_persistent_stream` error handler so the increment — the exact
+/// side effect the encoder AQ self-shed (#1104) consumes — can be exercised
+/// by a NATIVE `#[test]` without standing up the wasm-only JS WritableStream
+/// machinery. It is the drop-counter sibling of [`record_ready_stall`] (which
+/// already had such a seam for the saturation counter); before this extraction
+/// the drop counter had no host-testable write path, so a mutation that
+/// stopped incrementing it (or incremented the wrong counter) had no native
+/// test to catch it. The wasm send path now calls THIS function, so the
+/// counter the encoder reads via [`unistream_drop_count`] is the same one the
+/// test drives.
+///
+/// The caller remains responsible for the gate that depends on wasm/`Rc`
+/// runtime state — only counting failures at the write stage, i.e. after a
+/// writer was acquired (`captured_token.is_some()`) — because that condition
+/// cannot be made pure. See the gating rationale at the call site.
+fn record_unistream_drop() {
+    UNISTREAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
 /// Cumulative count of "slow `writer.ready()`" events on the persistent
 /// unidirectional media streams (`send_on_persistent_stream`): each time a
 /// single `JsFuture::from(writer.ready()).await` on an ESTABLISHED media stream
@@ -1053,7 +1076,7 @@ impl WebTransportTask {
                 // Incremented before eviction so the count reflects the dropped
                 // frame regardless of the eviction race outcome below.
                 if captured_token.is_some() {
-                    UNISTREAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
+                    record_unistream_drop();
                 }
                 // Stream is broken — remove it from the map so the next
                 // send for this key opens a fresh stream.  We compare
@@ -1753,6 +1776,83 @@ mod framing_tests {
             after - before,
             K,
             "K above-threshold stalls must produce exactly K increments",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // WebTransport unistream-DROP signal (#1104 / #509 parity audit).
+    //
+    // These pin the INCREMENT side of the drop signal — the WT analogue of
+    // the WS send-buffer drop that the encoder AQ self-shed (#1104) consumes
+    // via `videocall_aq::evaluate_self_congestion`. Before the
+    // `record_unistream_drop` extraction the drop counter's only write path
+    // was inline in the wasm-only `send_on_persistent_stream` `spawn_local`,
+    // so NO native test could fail if that write was deleted or pointed at the
+    // wrong counter. The seam closes that regression-coverage gap on the host
+    // target (deliberately NOT `#[wasm_bindgen_test]`, which is known to
+    // silently no-op on this dev box — a false green).
+    //
+    // The DECISION side (window/threshold over this counter) is pinned by the
+    // `videocall-aq` `evaluate_self_congestion` tests parameterised with
+    // `WT_SELF_CONGESTION_*`, and the two halves are tied together end-to-end
+    // by the `videocall-client` `wt_backpressure_wiring` integration test.
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// Serialises the tests that mutate the process-global
+    /// `UNISTREAM_DROP_COUNT` so their before/after deltas are not corrupted by
+    /// parallel test execution. Separate from `STALL_COUNTER_GUARD`: the two
+    /// counters are independent, so the drop tests and stall tests never need
+    /// to exclude each other, only their own siblings.
+    static DROP_COUNTER_GUARD: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn record_unistream_drop_increments_counter_once() {
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_DROP_COUNT.load(Ordering::Relaxed);
+
+        record_unistream_drop();
+
+        let after = UNISTREAM_DROP_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            1,
+            "one recorded drop must increment the counter exactly once",
+        );
+        // The public accessor (the AQ consumer's entry point) must observe the
+        // same value, proving the seam writes the counter the consumer reads.
+        // A mutation that incremented a DIFFERENT counter (e.g. the stall
+        // counter) would leave this accessor flat and fail here.
+        assert_eq!(
+            unistream_drop_count(),
+            after,
+            "public accessor must reflect the recorded drop",
+        );
+    }
+
+    #[test]
+    fn record_unistream_drop_accumulates_across_repeated_drops() {
+        // The consumer's window test reads "N drops in the window," so K
+        // recorded drops must produce exactly K increments — the property the
+        // inline-vs-extracted refactor must preserve so a sustained cluster of
+        // failed media-frame writes trips the self-shed.
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let before = UNISTREAM_DROP_COUNT.load(Ordering::Relaxed);
+
+        const K: u64 = 7;
+        for _ in 0..K {
+            record_unistream_drop();
+        }
+
+        let after = UNISTREAM_DROP_COUNT.load(Ordering::Relaxed);
+        assert_eq!(
+            after - before,
+            K,
+            "K recorded drops must produce exactly K increments",
+        );
+        assert_eq!(
+            unistream_drop_count(),
+            after,
+            "public accessor must reflect all recorded drops",
         );
     }
 }

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: prometheus-ingress
+description: Ingress for the HCL daily-build Prometheus server (TLS-terminated)
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

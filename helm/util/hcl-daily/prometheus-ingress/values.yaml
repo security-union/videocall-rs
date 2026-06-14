@@ -1,0 +1,18 @@
+host: prometheus.videocall.fnxlabs.com
+serviceName: prometheus-server
+servicePort: 80
+# Reuse the existing namespace wildcard cert (*.videocall.fnxlabs.com), which
+# already covers this host — no dedicated cert-manager issuance required. The
+# sibling pushgateway-ingress mints its own cert via `issuer`; this one shares
+# the wildcard instead. If the wildcard is ever retired, switch to a dedicated
+# cert by setting `issuer: letsencrypt-prod` and a unique `tlsSecretName`, and
+# add the matching cert-manager.io/issuer annotation in templates/ingress.yaml.
+tlsSecretName: videocall-wildcard-tls
+# Modern ingress-class selector (replaces the deprecated
+# kubernetes.io/ingress.class annotation). Matches the cluster IngressClass.
+ingressClassName: nginx
+# CI runner (videocallci.fnxlabs.com) + K3s node + pod CIDR (local cluster
+# traffic). Same set the sibling pushgateway-ingress whitelists. Prometheus has
+# no auth, so anything outside this range gets a 403 from nginx. Widen only if
+# another internal service needs to query Prometheus directly.
+allowedSourceRange: "10.190.252.135/32,10.190.252.83/32,10.42.0.0/16"

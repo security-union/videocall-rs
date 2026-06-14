@@ -1,0 +1,37 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: prometheus-server
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    # TLS terminates with the real *.videocall.fnxlabs.com wildcard cert
+    # (referenced via .Values.tlsSecretName), so redirect plain HTTP to HTTPS
+    # like the sibling grafana / pushgateway ingresses. This ingress previously
+    # had no tls block at all, so nginx served its default self-signed
+    # "ingress.local" fake cert on :443 — fixed here.
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # Restrict access to the CI runner + K3s node + pod CIDR. Prometheus has no
+    # auth, so an open ingress would leak metric enumeration, target inventory,
+    # scrape config, and an expensive-query DoS surface. Mirrors the sibling
+    # pushgateway-ingress whitelist (same .Values.allowedSourceRange CIDRs).
+    nginx.ingress.kubernetes.io/whitelist-source-range: {{ .Values.allowedSourceRange }}
+spec:
+  # Modern replacement for the deprecated kubernetes.io/ingress.class annotation
+  # (matches the cluster's IngressClass named "nginx", controller
+  # k8s.io/ingress-nginx). Kept in sync with the sibling pushgateway-ingress.
+  ingressClassName: {{ .Values.ingressClassName }}
+  tls:
+    - hosts:
+        - {{ .Values.host }}
+      secretName: {{ .Values.tlsSecretName }}
+  rules:
+    - host: {{ .Values.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ .Values.serviceName }}
+                port:
+                  number: {{ .Values.servicePort }}

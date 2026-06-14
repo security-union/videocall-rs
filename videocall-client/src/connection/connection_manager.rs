@@ -161,6 +161,52 @@ pub(super) const CPU_OVERLOAD_DRIFT_THRESHOLD_MS: f64 = 500.0;
 /// elevated-RTT detector.
 pub(super) const CPU_OVERLOADED_DURATION_MS: f64 = 5_000.0;
 
+/// Cumulative CPU-stall suppression budget (issue #572). Once the watchdog in
+/// [`ConnectionManager::check_rtt_degradation`] has spent more than this many
+/// milliseconds — summed across every suppression window within a single
+/// session, NOT reset on each falling edge — suppressing re-election, it
+/// escalates to a full fresh-token reconnect instead of staying latched.
+///
+/// **Why 60 s (real-world high-latency / low-power clients, not localhost).**
+/// The suppression guard (PR #571) is correct for transient main-thread
+/// stalls: a low-power phone or a Chromebook on a congested CPU produces
+/// synthetic "RTT" spikes that are local artifacts, not network signal, and
+/// re-electing on them causes the user-visible cascades from discussion #562.
+/// But a client that is BOTH chronically CPU-overloaded AND on a genuinely
+/// degraded link (200 ms+ RTT, packet loss, mobile/satellite) can keep the
+/// latch engaged indefinitely — the guard never releases, so the existing
+/// re-election triggers never fire, and the user's only recovery is a manual
+/// page reload. 60 s is long enough that no realistic burst of scheduling
+/// jitter on a slow device accumulates to it (each suppression window on a
+/// recovering device is seconds, separated by quiet gaps that reset the
+/// accumulator via [`SUPPRESSION_RESET_QUIET_MS`]), yet short enough that a
+/// truly wedged client recovers automatically within ~1 minute rather than
+/// being stranded. The escalation uses the fresh-token reconnect path (a new
+/// `ConnectionManager` with refreshed URLs), so it can recover from causes a
+/// cached-URL re-election cannot — including an expired room token on a link
+/// that has been distressed for a full minute.
+pub(super) const MAX_SUSTAINED_SUPPRESSION_MS: f64 = 60_000.0;
+
+/// Quiet window (issue #572) that must elapse with NO active suppression
+/// before [`ConnectionManager::check_rtt_degradation`] clears the cumulative
+/// [`MAX_SUSTAINED_SUPPRESSION_MS`] accumulator back to zero.
+///
+/// **Why 30 s (real-world clients, not localhost).** The accumulator sums
+/// suppression across multiple windows so that a client flapping in and out of
+/// CPU stall every few seconds — common on a thermally throttled phone or a
+/// background-tab Chromebook — still escalates instead of resetting its budget
+/// on each brief recovery. We only forgive the accumulated budget once the
+/// client has demonstrably been healthy for a sustained stretch. 30 s is half
+/// the panic budget and comfortably longer than the
+/// [`CPU_OVERLOADED_DURATION_MS`] (5 s) post-stall drain window plus a few
+/// re-election sample cycles, so a device that has genuinely recovered (not
+/// merely paused between stall bursts) gets a clean slate, while a device that
+/// keeps relapsing inside the quiet window keeps its accumulated budget and
+/// marches toward escalation. Tying it to wall-time rather than tick count
+/// keeps the behaviour correct across the variable 1 Hz cadence on a stalled
+/// main thread.
+pub(super) const SUPPRESSION_RESET_QUIET_MS: f64 = 30_000.0;
+
 /// RTT-probe pipeline resilience thresholds (issue #522).
 ///
 /// Probe cadence is 1 Hz (probe_interval_ms = 1000). With a 5000ms timeout, a
@@ -187,6 +233,27 @@ pub(super) const STALE_THRESHOLD: u32 = 3; // consecutive timeouts before stale
 /// host (a live datagram Connection cannot be constructed off-wasm).
 fn should_drop_probe(in_flight_len: usize) -> bool {
     in_flight_len >= MAX_INFLIGHT_PROBES
+}
+
+/// Pure decision helper for the CPU-stall suppression panic threshold (issue
+/// #572): returns `true` iff the cumulative suppression budget `total_ms` has
+/// exceeded the configured ceiling `max_ms`, meaning
+/// [`ConnectionManager::check_rtt_degradation`] must escalate to a full
+/// fresh-token reconnect instead of staying latched.
+///
+/// Extracted as a side-effect-free function — mirroring
+/// [`ConnectionManager::decide_post_rebase_retry_action`] — because the
+/// escalation site reads [`monotonic_now_ms`], which is `Instant`-derived and
+/// unmockable on host. Driving this helper with injected values lets a unit
+/// test assert the boundary behaviour (`<` budget vs `>=` budget) precisely
+/// without invoking the wasm-only `ConnectionState::Failed` emission.
+///
+/// Boundary contract: the comparison is strictly greater-than, so a total
+/// exactly equal to `max_ms` does NOT escalate; only a total that has spent
+/// strictly more than the budget does. This matches the doc-stated "exceeds"
+/// wording on [`MAX_SUSTAINED_SUPPRESSION_MS`].
+fn suppression_escalation_action(total_ms: f64, max_ms: f64) -> bool {
+    total_ms > max_ms
 }
 
 /// Returns a monotonic, high-resolution timestamp in milliseconds using
@@ -613,6 +680,27 @@ pub struct ConnectionManager {
     /// the stall lasted. Cleared back to `None` on the falling edge.
     /// Single-threaded access — no atomic needed.
     suppression_started_at_ms: Option<f64>,
+
+    /// Cumulative milliseconds of CPU-stall suppression accumulated across the
+    /// life of the suppression latch within this session (issue #572). Each
+    /// falling edge adds the window that just ended; this is deliberately NOT
+    /// reset on the falling edge, so a client that flaps in and out of stall
+    /// still marches toward the [`MAX_SUSTAINED_SUPPRESSION_MS`] panic
+    /// threshold. It is reset to `0.0` only after a sustained quiet stretch
+    /// (no suppression for [`SUPPRESSION_RESET_QUIET_MS`]) — meaning the client
+    /// has genuinely recovered — or after an escalation fires. When it exceeds
+    /// the budget, `check_rtt_degradation` escalates to a full fresh-token
+    /// reconnect rather than staying latched indefinitely.
+    total_suppression_duration_ms: f64,
+
+    /// Monotonic-millis timestamp of the most recent suppression falling edge
+    /// (issue #572), i.e. the last time suppression released. `None` until the
+    /// first release. Used by the quiet-window reset gate: on a non-suppressed
+    /// tick, if `now - last_suppression_release_at_ms` exceeds
+    /// [`SUPPRESSION_RESET_QUIET_MS`], the cumulative
+    /// [`total_suppression_duration_ms`] accumulator is cleared. Single-threaded
+    /// access — no atomic needed.
+    last_suppression_release_at_ms: Option<f64>,
 }
 
 fn should_filter_self_packet(packet: &PacketWrapper, own_session_id: Option<u64>) -> bool {
@@ -698,6 +786,8 @@ impl ConnectionManager {
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
             suppression_started_at_ms: None,
+            total_suppression_duration_ms: 0.0,
+            last_suppression_release_at_ms: None,
         };
 
         Ok(manager)
@@ -2408,6 +2498,34 @@ impl ConnectionManager {
             // artifacts, not network evidence — they must not carry over.
             self.degradation_counter = 0;
             self.was_suppressed_last_check = true;
+
+            // --- Panic-threshold escalation (issue #572) -------------------
+            // A client that is BOTH CPU-stalled AND network-distressed can
+            // stay latched here forever — the falling edge that would
+            // accumulate the window never arrives. So we evaluate the budget
+            // LIVE on every suppressed tick: cumulative budget already banked
+            // from prior windows PLUS the current still-open window
+            // (`now - suppression_started_at_ms`). When that crosses
+            // MAX_SUSTAINED_SUPPRESSION_MS, we escalate to a full fresh-token
+            // reconnect rather than waiting indefinitely for a manual reload.
+            let open_window_ms = self
+                .suppression_started_at_ms
+                .map(|started| now - started)
+                .unwrap_or(0.0);
+            let live_cumulative_ms = self.total_suppression_duration_ms + open_window_ms;
+            if suppression_escalation_action(live_cumulative_ms, MAX_SUSTAINED_SUPPRESSION_MS) {
+                self.escalate_suppression_to_full_reconnect(live_cumulative_ms);
+                // Re-stamp the open window to `now` so the live cumulative
+                // restarts from zero. The latch stays engaged (we have not hit
+                // a falling edge), so without this the NEXT tick would recompute
+                // `open_window_ms` from the original, now-ancient start — still
+                // > MAX_SUSTAINED_SUPPRESSION_MS — and re-escalate every 1 Hz
+                // tick, spamming `Failed`/`on_connection_lost` and triggering
+                // reconnect storms. Re-stamping makes the escalation genuinely
+                // one-shot: a fresh full budget must accumulate before the next
+                // one fires. `escalate_*` already zeroed the banked total.
+                self.suppression_started_at_ms = Some(now);
+            }
             return false;
         }
 
@@ -2425,6 +2543,47 @@ impl ConnectionManager {
                 suppression_duration_ms, active_id,
             );
             self.suppression_started_at_ms = None;
+
+            // Accumulate the window that just ended into the cumulative budget
+            // (issue #572). This is deliberately NOT reset on the falling edge:
+            // a client that flaps in and out of stall keeps banking time so it
+            // still marches toward MAX_SUSTAINED_SUPPRESSION_MS. Stamp the
+            // release time so the quiet-window reset gate below can later
+            // forgive the budget once the client has been healthy long enough.
+            self.total_suppression_duration_ms += suppression_duration_ms;
+            self.last_suppression_release_at_ms = Some(now);
+
+            // Re-check the panic threshold after accumulation: a final window
+            // can be the one that pushes the cumulative total over budget even
+            // though no single suppressed tick did (e.g. the live check used a
+            // slightly earlier `now`). Escalate here too so we never strand a
+            // client that just barely crossed the line on release.
+            if suppression_escalation_action(
+                self.total_suppression_duration_ms,
+                MAX_SUSTAINED_SUPPRESSION_MS,
+            ) {
+                self.escalate_suppression_to_full_reconnect(self.total_suppression_duration_ms);
+            }
+        } else if self.total_suppression_duration_ms > 0.0 {
+            // Not a falling edge and no active suppression: if the client has
+            // been quiet (no suppression) for longer than
+            // SUPPRESSION_RESET_QUIET_MS since the last release, it has
+            // genuinely recovered — forgive the accumulated budget so a brief
+            // future stall does not inherit stale time and escalate spuriously
+            // (issue #572). A client that keeps relapsing inside the quiet
+            // window never reaches this branch and retains its budget.
+            let quiet_for_ms = self
+                .last_suppression_release_at_ms
+                .map(|released| now - released)
+                .unwrap_or(f64::INFINITY);
+            if quiet_for_ms > SUPPRESSION_RESET_QUIET_MS {
+                debug!(
+                    "CPU-stall suppression budget reset: {:.0}ms quiet since last release \
+                     exceeds {:.0}ms — clearing cumulative {:.0}ms accumulator",
+                    quiet_for_ms, SUPPRESSION_RESET_QUIET_MS, self.total_suppression_duration_ms,
+                );
+                self.total_suppression_duration_ms = 0.0;
+            }
         }
         self.was_suppressed_last_check = false;
 
@@ -2531,6 +2690,63 @@ impl ConnectionManager {
         }
 
         false
+    }
+
+    /// Escalate a stuck CPU-stall suppression latch to a full fresh-token
+    /// reconnect (issue #572).
+    ///
+    /// Called from [`Self::check_rtt_degradation`] when the cumulative
+    /// suppression budget has exceeded [`MAX_SUSTAINED_SUPPRESSION_MS`]. A
+    /// client that is BOTH chronically CPU-overloaded AND on a genuinely
+    /// degraded link can otherwise keep the suppression guard engaged forever:
+    /// the existing re-election triggers never fire, and the only recovery is a
+    /// manual page reload. This breaks that deadlock.
+    ///
+    /// **Why a full reconnect, not `start_reelection` / `reset_and_start_election`.**
+    /// An internal re-election reuses the *cached* candidate URLs. After a full
+    /// minute of distress the room token may have expired, and the same
+    /// brokenness that caused the stall is still present — a cached-URL
+    /// re-election would simply re-fail. Instead we emit
+    /// [`ConnectionState::Failed`], which `VideoCallClient` maps to
+    /// `on_connection_lost` and the dioxus-ui `schedule_reconnect` handler then
+    /// drives through `refresh_room_token` — the fresh-token path that builds a
+    /// brand-new `ConnectionManager` with re-issued URLs. (Verified chain:
+    /// `video_call_client.rs` `ConnectionState::Failed` arm → `on_connection_lost`
+    /// → `attendants.rs::schedule_reconnect` → `meeting_api::refresh_room_token`.)
+    ///
+    /// The cumulative accumulator is reset to zero here so the `error!` log and
+    /// the `Failed` emission fire exactly once per exhausted budget rather than
+    /// every subsequent 1 Hz tick while the UI is tearing down and rebuilding
+    /// the connection. The `error!` level is unconditionally enabled under the
+    /// wasm logger's default `Info` ceiling (and any level short of an explicit
+    /// `Off`), so this escalation is always visible in support logs.
+    fn escalate_suppression_to_full_reconnect(&mut self, total_suppression_ms: f64) {
+        error!(
+            "CPU-stall suppression budget exhausted ({:.0}s cumulative) — escalating to full reconnect",
+            total_suppression_ms / 1000.0,
+        );
+
+        // SECURITY: redact the active server URL before it leaves the manager —
+        // `measurement.url` carries the room JWT in its query string. Mirrors
+        // the redaction on the `ElectionState::Failed` arm of
+        // `get_connection_state` and the reconnection-loop `Failed` emissions.
+        let last_known_server = self
+            .active_connection_id
+            .borrow()
+            .as_deref()
+            .and_then(|id| self.rtt_measurements.get(id))
+            .map(|m| url_redact::redact_for_diag(m.url.as_str()));
+
+        self.options.on_state_changed.emit(ConnectionState::Failed {
+            error: "cpu-stall suppression budget exhausted".to_string(),
+            last_known_server,
+        });
+
+        // Reset the accumulator so the escalation is one-shot: the next tick's
+        // live cumulative starts from zero and will not re-fire while the UI
+        // tears down and rebuilds this manager via the fresh-token path.
+        self.total_suppression_duration_ms = 0.0;
+        self.last_suppression_release_at_ms = Some(monotonic_now_ms());
     }
 
     /// Begin a re-election: create fresh candidate connections while keeping
@@ -4075,6 +4291,8 @@ mod tests {
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
             suppression_started_at_ms: None,
+            total_suppression_duration_ms: 0.0,
+            last_suppression_release_at_ms: None,
         }
     }
 
@@ -5932,6 +6150,298 @@ mod tests {
         assert!(
             (1_000.0..=5_000.0).contains(&LAST_INBOUND_LIVENESS_MS),
             "liveness window should be 1-5 s"
+        );
+    }
+
+    // ===================================================================
+    // 5c. CPU-stall suppression panic-threshold escalation (issue #572)
+    //
+    // When a client is BOTH CPU-stalled AND network-distressed, the PR #571
+    // suppression latch can stay engaged indefinitely. These tests cover the
+    // escalation that breaks that deadlock: a cumulative budget
+    // (MAX_SUSTAINED_SUPPRESSION_MS) that, when exhausted, emits
+    // ConnectionState::Failed to drive the dioxus-ui fresh-token reconnect.
+    // ===================================================================
+
+    /// Helper: wire an `on_state_changed` sink onto `mgr` and return the shared
+    /// vec the escalation path will push `ConnectionState` values into. Mirrors
+    /// the `forwarded_packets_for` capture pattern for `on_inbound_media`.
+    fn capture_state_changes(mgr: &mut ConnectionManager) -> Rc<RefCell<Vec<ConnectionState>>> {
+        let sink = Rc::new(RefCell::new(Vec::<ConnectionState>::new()));
+        let sink_for_cb = sink.clone();
+        mgr.options.on_state_changed = Callback::from(move |state: ConnectionState| {
+            sink_for_cb.borrow_mut().push(state);
+        });
+        sink
+    }
+
+    #[test]
+    fn suppression_escalation_action_flips_exactly_at_budget_boundary() {
+        // The pure decision helper is the single source of truth for the panic
+        // threshold. The escalation site reads `monotonic_now_ms()` (Instant-
+        // derived, unmockable on host), so this is where the boundary contract
+        // is actually pinned.
+        let max = MAX_SUSTAINED_SUPPRESSION_MS;
+
+        // Well below budget: never escalate.
+        assert!(
+            !suppression_escalation_action(0.0, max),
+            "zero suppression must not escalate"
+        );
+        assert!(
+            !suppression_escalation_action(max / 2.0, max),
+            "half the budget must not escalate"
+        );
+
+        // Exactly at the budget: the contract is strict greater-than, so a
+        // total exactly equal to the ceiling does NOT escalate. (If someone
+        // weakens `>` to `>=`, this assertion fails.)
+        assert!(
+            !suppression_escalation_action(max, max),
+            "a total exactly equal to MAX_SUSTAINED_SUPPRESSION_MS must NOT escalate"
+        );
+
+        // Just above the budget: escalate. (If someone flips the comparison
+        // direction, this assertion fails.) Use the smallest representable
+        // step above the boundary to prove the flip is exactly at MAX, not at
+        // some larger fudge value.
+        let just_above = max + f64::EPSILON * max;
+        assert!(
+            suppression_escalation_action(just_above, max),
+            "a total strictly above MAX_SUSTAINED_SUPPRESSION_MS must escalate"
+        );
+        assert!(
+            suppression_escalation_action(max + 1.0, max),
+            "a total 1ms over budget must escalate"
+        );
+    }
+
+    #[test]
+    fn sustained_suppression_escalates_with_connection_failed_state() {
+        // Directly seed the cumulative accumulator past budget, then drive ONE
+        // suppressed tick. The live-cumulative check inside the suppressed
+        // branch must fire the escalation, which emits ConnectionState::Failed
+        // with the documented error string — the signal dioxus-ui maps to the
+        // fresh-token reconnect.
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        // Two servers + elevated RTT + recent inbound => the elevated-RTT
+        // trigger "would have fired", so the suppressed branch is entered.
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_inbound_now(&mut mgr, "wt_0");
+
+        // Seed the budget strictly over the ceiling so the escalation fires on
+        // this tick regardless of the (near-zero) open-window duration. This is
+        // the indefinite-latch scenario: the falling edge that would normally
+        // accumulate never arrives, so the live check must carry the decision.
+        mgr.total_suppression_duration_ms = MAX_SUSTAINED_SUPPRESSION_MS + 1.0;
+
+        // The tick still returns false (suppression wins — we do NOT re-elect
+        // on cached URLs), but it must have emitted the escalation state.
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "suppressed tick must not return a re-election trigger"
+        );
+
+        let states = captured.borrow();
+        assert_eq!(
+            states.len(),
+            1,
+            "exactly one ConnectionState must be emitted on escalation"
+        );
+        match &states[0] {
+            ConnectionState::Failed { error, .. } => {
+                assert_eq!(
+                    error, "cpu-stall suppression budget exhausted",
+                    "escalation must emit the documented Failed error string \
+                     (drives on_connection_lost -> schedule_reconnect -> refresh_room_token)"
+                );
+            }
+            other => panic!("expected ConnectionState::Failed on escalation, got {other:?}"),
+        }
+        drop(states);
+
+        // One-shot: the accumulator is reset on escalation so the NEXT tick
+        // does not re-emit Failed every second while the UI rebuilds.
+        assert_eq!(
+            mgr.total_suppression_duration_ms, 0.0,
+            "escalation must reset the cumulative accumulator (one-shot)"
+        );
+        // Drive a second suppressed tick — no new state should be emitted now
+        // that the budget is back at zero.
+        assert!(!mgr.check_rtt_degradation());
+        assert_eq!(
+            captured.borrow().len(),
+            1,
+            "escalation must fire exactly once, not on every subsequent tick"
+        );
+    }
+
+    #[test]
+    fn suppression_budget_resets_after_quiet_window() {
+        // After a sustained quiet stretch (no suppression for longer than
+        // SUPPRESSION_RESET_QUIET_MS), a non-suppressed tick must forgive the
+        // accumulated budget so a brief future stall does not inherit stale
+        // time and escalate spuriously.
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        // RTT BELOW threshold (max(50*3,50)=150) AND stale inbound AND no
+        // cpu_overloaded => this tick is NOT suppressed and does NOT fire.
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+        mark_inbound_stale(&mut mgr, "wt_0");
+
+        // Seed a non-trivial accumulated budget and a release stamp far enough
+        // in the past that the quiet window has elapsed.
+        let now = monotonic_now_ms();
+        mgr.total_suppression_duration_ms = 40_000.0;
+        mgr.last_suppression_release_at_ms = Some(now - (SUPPRESSION_RESET_QUIET_MS + 5_000.0));
+        // Not a falling edge — we were not suppressed last tick.
+        mgr.was_suppressed_last_check = false;
+
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "below-threshold tick must not trigger re-election"
+        );
+        assert_eq!(
+            mgr.total_suppression_duration_ms, 0.0,
+            "a sustained quiet window must clear the cumulative accumulator"
+        );
+        assert!(
+            captured.borrow().is_empty(),
+            "a quiet-window reset must NOT emit any ConnectionState"
+        );
+    }
+
+    #[test]
+    fn suppression_budget_preserved_when_quiet_window_not_elapsed() {
+        // Negative control for the reset gate: if the client has been quiet for
+        // LESS than SUPPRESSION_RESET_QUIET_MS, the accumulated budget must be
+        // preserved (a client that keeps relapsing inside the window must still
+        // march toward escalation rather than getting a free reset every brief
+        // recovery).
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+        mark_inbound_stale(&mut mgr, "wt_0");
+
+        let now = monotonic_now_ms();
+        mgr.total_suppression_duration_ms = 40_000.0;
+        // Released only half the quiet window ago — NOT long enough to reset.
+        mgr.last_suppression_release_at_ms = Some(now - (SUPPRESSION_RESET_QUIET_MS / 2.0));
+        mgr.was_suppressed_last_check = false;
+
+        assert!(!mgr.check_rtt_degradation());
+        assert!(
+            (mgr.total_suppression_duration_ms - 40_000.0).abs() < 1.0,
+            "budget must be preserved when the quiet window has not yet elapsed"
+        );
+        assert!(captured.borrow().is_empty());
+    }
+
+    #[test]
+    fn falling_edge_accumulates_window_and_can_escalate() {
+        // The falling-edge accumulation path: a window that ends just below
+        // budget, followed by a second window whose accumulation pushes the
+        // cumulative total over budget, must escalate on the falling edge
+        // (re-checked after accumulation, per the issue's deliverable 5).
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+
+        // Seed prior banked budget just under the ceiling, and open a
+        // suppression window that started a known duration ago so the falling
+        // edge accumulates a deterministic, escalation-pushing increment.
+        let now = monotonic_now_ms();
+        mgr.total_suppression_duration_ms = MAX_SUSTAINED_SUPPRESSION_MS - 100.0;
+        mgr.was_suppressed_last_check = true;
+        // Window started 5s ago: falling-edge accumulation adds ~5000ms, well
+        // over the remaining 100ms of headroom.
+        mgr.suppression_started_at_ms = Some(now - 5_000.0);
+
+        // Make THIS tick a falling edge: stale inbound + no cpu_overloaded +
+        // RTT below threshold so the suppression condition is false.
+        mgr.rtt_measurements.get_mut("wt_0").unwrap().average_rtt = Some(80.0);
+        mark_inbound_stale(&mut mgr, "wt_0");
+
+        assert!(!mgr.check_rtt_degradation());
+
+        let states = captured.borrow();
+        assert_eq!(
+            states.len(),
+            1,
+            "falling-edge accumulation that crosses budget must escalate exactly once"
+        );
+        assert!(
+            matches!(&states[0], ConnectionState::Failed { error, .. }
+                if error == "cpu-stall suppression budget exhausted"),
+            "falling-edge escalation must emit the documented Failed state"
+        );
+    }
+
+    #[test]
+    fn indefinite_latch_escalates_only_once_per_budget() {
+        // Regression guard for the primary target scenario (issue #572): a
+        // client wedged in a single NEVER-ENDING suppression window (no falling
+        // edge ever arrives). The live-tick escalation must be one-shot: after
+        // it fires, it must NOT re-fire on every subsequent 1 Hz tick (which
+        // would spam ConnectionState::Failed -> on_connection_lost and trigger
+        // reconnect storms). The fix re-stamps `suppression_started_at_ms` to
+        // `now` on escalation so the live cumulative restarts from zero.
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        // Elevated RTT + recent inbound => the latch stays engaged every tick
+        // (would_have_fired && recent_inbound). No falling edge will occur.
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_inbound_now(&mut mgr, "wt_0");
+
+        // Simulate a window that opened well over the budget ago, with nothing
+        // banked yet — exactly the indefinite-latch shape. The first suppressed
+        // tick's live cumulative (open window alone) exceeds the budget.
+        let now = monotonic_now_ms();
+        mgr.was_suppressed_last_check = true;
+        mgr.suppression_started_at_ms = Some(now - (MAX_SUSTAINED_SUPPRESSION_MS + 5_000.0));
+        mgr.total_suppression_duration_ms = 0.0;
+
+        // Tick 1: escalates once.
+        assert!(!mgr.check_rtt_degradation());
+        assert_eq!(
+            captured.borrow().len(),
+            1,
+            "first over-budget suppressed tick must escalate exactly once"
+        );
+
+        // Ticks 2..N: the latch is still engaged (no falling edge), but the
+        // open window was re-stamped to ~now, so the live cumulative is back
+        // near zero and must NOT re-escalate. Without the re-stamp fix, the
+        // ancient start would make every tick re-escalate.
+        for _ in 0..5 {
+            assert!(!mgr.check_rtt_degradation());
+        }
+        assert_eq!(
+            captured.borrow().len(),
+            1,
+            "a sustained latch must escalate ONCE per budget, not every tick \
+             (re-stamp of suppression_started_at_ms makes it one-shot)"
         );
     }
 

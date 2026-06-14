@@ -71,8 +71,20 @@ jobs:
         # Removes any volumes not attached to a running container (including
         # stale volumes from prior runs). Safe: Docker refuses to remove
         # in-use volumes regardless of this command.
+        #
+        # Try sudo-less first (the runner is typically in the docker group),
+        # fall back to non-interactive `sudo -n`, then a LOUD warning — never a
+        # silent `|| true`. A bare `sudo ... || true` here was the #1247 failure
+        # mode: when the runner has no passwordless sudo, sudo aborts and
+        # `|| true` swallows it, so the prune silently no-ops. Same sudo-less-
+        # first approach as ci-host-janitor-hcl.yaml (PR #1370); we use `sudo -n`
+        # in the fallback (vs the janitor's bare `sudo`) so it never blocks on a
+        # password prompt.
         working-directory: backend-repo
-        run: sudo docker volume prune -f || true
+        run: |
+          docker volume prune -f \
+            || sudo -n docker volume prune -f \
+            || echo "::warning::volume prune failed (no passwordless sudo and runner not in docker group?) — stale volumes not reclaimed; see #1247"
 
       - name: Free disk space before heavy build
         # The `cargo tests` job was running the host out of disk ("No space
@@ -124,21 +136,65 @@ jobs:
         # ONLY dirs older than 24h (`-mmin +1440`, matching the build-logs
         # janitor precedent in daily-build-images-hcl.yaml) so an in-flight
         # browser's dir — at most ~1h old for the longest full suite — is NEVER
-        # touched. `2>/dev/null || true` keeps a sweep hiccup non-fatal.
+        # touched.
+        #
+        # #1247 — DO NOT swallow the prune failure. The previous version ran
+        # `sudo docker system prune -af || true`; when the runner has no
+        # passwordless sudo, `sudo` aborts ("a password is required") and the
+        # `|| true` swallowed the abort, so the prune NEVER ran and the disk
+        # stayed full — `cargo tests` then died with ENOSPC ("No space left on
+        # device") masquerading as a `linking with cc failed` error. Fixes:
+        #   1. Run the reclaim sudo-less FIRST (the runner is typically in the
+        #      docker group, and /tmp dirs are owned by the runner's own browser
+        #      processes), falling back to NON-INTERACTIVE `sudo -n` (never
+        #      blocks on a password prompt), then a LOUD `::warning::`. Same
+        #      sudo-less-first approach as ci-host-janitor-hcl.yaml (PR #1370),
+        #      which already cleans /tmp on a schedule (it uses bare `sudo` in
+        #      its fallback; `sudo -n` here is the fail-fast variant).
+        #   2. VERIFY, don't assume: capture free space before/after and emit a
+        #      `::warning::` if the disk did not shrink while it was already
+        #      tight, so a no-op prune is VISIBLE instead of a false green.
+        # If `::warning::` lines keep appearing, the host needs a passwordless
+        # `/etc/sudoers.d` NOPASSWD entry for docker (or the runner user added
+        # to the docker group) — host config outside this repo (see #1247).
         working-directory: backend-repo
         run: |
+          # KiB available on the root FS, used for the before/after assertion.
+          avail_kib() { df -P / | awk 'NR==2 {print $4}'; }
+          before_kib="$(avail_kib)"
+
           echo "=== Disk usage BEFORE cleanup ==="
           df -h || true
           echo "=== Docker disk usage BEFORE cleanup ==="
-          sudo docker system df || true
+          docker system df || sudo -n docker system df || true
+
           echo "=== Sweeping STALE (>24h) leaked Chromium temp profile dirs in /tmp ==="
-          sudo find /tmp -maxdepth 1 -name "org.chromium.Chromium.scoped_dir.*" -type d -mmin +1440 -exec rm -rf {} \; 2>/dev/null || true
+          # Runner's own browser processes own these dirs, so try sudo-less first.
+          find /tmp -maxdepth 1 -name "org.chromium.Chromium.scoped_dir.*" -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null \
+            || sudo -n find /tmp -maxdepth 1 -name "org.chromium.Chromium.scoped_dir.*" -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null \
+            || echo "::warning::Chromium /tmp sweep failed (no passwordless sudo?) — stale browser temp dirs not reclaimed; see #1247"
+
           echo "=== Pruning ALL unused images + stopped containers + networks + build cache (volumes preserved) ==="
-          sudo docker system prune -af || true
+          # sudo-less FIRST, NON-INTERACTIVE sudo fallback (`-n` => fail fast, no
+          # password hang), then LOUD warning. No bare `|| true` — see #1247.
+          docker system prune -af \
+            || sudo -n docker system prune -af \
+            || echo "::warning::docker system prune FAILED (no passwordless sudo and runner not in docker group?) — disk NOT reclaimed; cargo tests may OOD. Host needs NOPASSWD docker or runner in docker group; see #1247"
+
           echo "=== Disk usage AFTER cleanup ==="
           df -h || true
           echo "=== Docker disk usage AFTER cleanup ==="
-          sudo docker system df || true
+          docker system df || sudo -n docker system df || true
+
+          # VERIFY the reclaim actually freed space. Only warn when the disk was
+          # already tight (<25 GiB free) AND nothing was reclaimed — on a roomy
+          # host a no-op prune is expected and not worth a warning. 25 GiB floor
+          # is just above the ~18 GiB at which #1247's compile hit ENOSPC.
+          after_kib="$(avail_kib)"
+          tight_kib=$((25 * 1024 * 1024))
+          if [ "$after_kib" -lt "$tight_kib" ] && [ "$after_kib" -le "$before_kib" ]; then
+            echo "::warning::Disk still tight after cleanup: ${after_kib} KiB free (was ${before_kib} KiB), under the 25 GiB headroom floor and NOT reduced — prune likely a no-op (sudo password? see #1247). cargo tests may fail with ENOSPC."
+          fi
 
       - name: Pre-create target dirs to prevent Docker from initializing them as root
         working-directory: backend-repo

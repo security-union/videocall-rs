@@ -961,7 +961,7 @@ mod tests {
             target_delay_ms: target_ms,
             packets_awaiting_decode: packets_awaiting,
             packets_per_sec: 0,
-            playout_latency_ms: 0, // #1299: not exercised by this sample helper
+            playout_latency_ms: 0, // Issue 1299: not exercised by this sample helper
         };
         raw.network.expand_rate = expand_q14;
         raw.network.reorder_rate_permyriad = reorder_permyriad;
@@ -1055,7 +1055,7 @@ mod tests {
             target_delay_ms: 100,
             packets_awaiting_decode: 5,
             packets_per_sec: 42,
-            playout_latency_ms: 0, // #1299: not exercised by this test
+            playout_latency_ms: 0, // Issue 1299: not exercised by this test
         };
         raw.network.expand_rate = 4096;
         raw.network.reorder_rate_permyriad = 30;

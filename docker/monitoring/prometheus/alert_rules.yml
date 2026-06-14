@@ -40,3 +40,51 @@ groups:
     annotations:
       summary: "Health reports not being received"
       description: "Health report rate is very low, diagnostics system may be failing"
+
+# =====================================================================
+# videocall.playout_latency (#1252 / #1339)
+#
+# Per-session buffered playout latency. videocall_video_playout_latency_ms
+# (PR #1337) measures how far behind live a receiver's decoded video is
+# (jitter-buffer backlog + decoder queue). Keyed on session_id; reported
+# only while the tile is actively receiving (fps_received > 0), so an idle
+# tile reports 0 and never trips these alerts.
+# =====================================================================
+- name: videocall.playout_latency
+  rules:
+  # WARN band: 600ms <= latency < 1800ms. Strictly below 1800 so this never
+  # fires concurrently with the critical alert on the same series.
+  - alert: VideoPlayoutLatencyElevated
+    expr: videocall_video_playout_latency_ms >= 600 and videocall_video_playout_latency_ms < 1800
+    for: 30s
+    labels:
+      severity: warning
+      component: video-playout
+    annotations:
+      summary: "Video playout latency elevated (600-1800ms)"
+      description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Approaching the #1252 lag threshold."
+
+  # CRITICAL: latency > 1800ms sustained for > 10s — the #1252 lag.
+  - alert: VideoPlayoutLatencyHigh
+    expr: videocall_video_playout_latency_ms > 1800
+    for: 10s
+    labels:
+      severity: critical
+      component: video-playout
+    annotations:
+      summary: "Video playout latency > 1800ms (#1252 lag)"
+      description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Audio-ahead-of-video lag (#1252)."
+
+  # AUDIO sibling. DEPENDS ON #1360 (videocall_audio_playout_latency_ms)
+  # merging — inert until that gauge exists. NetEQ buffer scale differs from
+  # the video jitter buffer, so this 1800ms threshold is inherited from video
+  # and LIKELY NEEDS FIELD TUNING against videocall_neteq_target_delay_ms.
+  - alert: AudioPlayoutLatencyHigh
+    expr: videocall_audio_playout_latency_ms > 1800
+    for: 10s
+    labels:
+      severity: warning
+      component: audio-playout
+    annotations:
+      summary: "Audio playout latency > 1800ms (threshold needs NetEQ tuning)"
+      description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} (session {{ $labels.session_id }}) audio is {{ $value | printf \"%.0f\" }}ms behind live. Threshold inherited from video, pending NetEQ tuning (#1360)."

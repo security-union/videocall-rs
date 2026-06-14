@@ -4009,6 +4009,238 @@
           "type": "timeseries"
         }
       ]
+    },
+    {
+      "collapsed": true,
+      "datasource": {
+        "type": "prometheus"
+      },
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 204
+      },
+      "id": 80,
+      "panels": [
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "description": "Per-session buffered VIDEO playout latency (#1252): how far behind live a receiver's decoded video is. Total (videocall_video_playout_latency_ms) spans jitter-buffer backlog (stage 1) + WebCodecs decoder queue (stage 2); the stage-1 span (videocall_video_playout_stage1_span_ms) is overlaid so #1024-style fixes can be read as REMOVED backlog (both drop together) vs RELOCATED into the decoder queue (total stays high while stage-1 drops). Thresholds: yellow >=600ms, red >=1800ms (the #1252 audio-ahead-of-video lag). max_over_time[1m] surfaces the sustained worst-case per session_id.",
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 2,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 600
+                  },
+                  {
+                    "color": "red",
+                    "value": 1800
+                  }
+                ]
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 205
+          },
+          "id": 81,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "max_over_time(videocall_video_playout_latency_ms{meeting_id=~\"$meeting\"}[1m])",
+              "legendFormat": "total: {{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "refId": "A"
+            },
+            {
+              "expr": "max_over_time(videocall_video_playout_stage1_span_ms{meeting_id=~\"$meeting\"}[1m])",
+              "legendFormat": "stage1: {{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "refId": "B"
+            }
+          ],
+          "title": "Video Playout Latency: Total vs Stage-1 (#1252)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "description": "Per-session stage-3 paint lag (#1338): worker frames_emitted minus main-thread frames_painted, i.e. the postMessage + paint-queue span DOWNSTREAM of the jitter buffer. Read alongside the Total-vs-Stage-1 panel: if total playout latency stays high while stage-1 is low and THIS rises, the backlog has relocated into the main-thread paint queue (H2), not the jitter buffer (H1). max_over_time[1m] per session_id.",
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 2,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 600
+                  },
+                  {
+                    "color": "red",
+                    "value": 1800
+                  }
+                ]
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 12,
+            "y": 205
+          },
+          "id": 82,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "max_over_time(videocall_video_playout_paint_lag_ms{meeting_id=~\"$meeting\"}[1m])",
+              "legendFormat": "{{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Video Playout Paint Lag — Stage 3 (#1338)",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus"
+          },
+          "description": "Per-session buffered AUDIO playout latency (companion to the video panel). DEPENDS ON #1360 (videocall_audio_playout_latency_ms) merging into PR-staging — the gauge is declared on that branch and this panel will read empty until it lands. NOTE: audio playout is governed by the NetEQ adaptive jitter buffer, whose scale differs from the video jitter buffer; the 600/1800ms threshold bands are inherited from the video panel as a starting point and likely need field tuning against videocall_neteq_target_delay_ms. max_over_time[1m] per session_id.",
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "lineWidth": 2,
+                "showPoints": "never",
+                "stacking": {
+                  "mode": "none"
+                }
+              },
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green",
+                    "value": null
+                  },
+                  {
+                    "color": "yellow",
+                    "value": 600
+                  },
+                  {
+                    "color": "red",
+                    "value": 1800
+                  }
+                ]
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 213
+          },
+          "id": 83,
+          "options": {
+            "legend": {
+              "calcs": [
+                "last",
+                "min",
+                "max"
+              ],
+              "displayMode": "table",
+              "placement": "bottom"
+            },
+            "tooltip": {
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "targets": [
+            {
+              "expr": "max_over_time(videocall_audio_playout_latency_ms{meeting_id=~\"$meeting\"}[1m])",
+              "legendFormat": "{{session_id}} {{reporter_name}} sees {{peer_name}}",
+              "refId": "A"
+            }
+          ],
+          "title": "Audio Playout Latency (#1360 — pending merge)",
+          "type": "timeseries"
+        }
+      ],
+      "title": "Playout Latency (#1252 / #1339)",
+      "type": "row"
     }
   ],
   "refresh": "5s",

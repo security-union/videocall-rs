@@ -733,6 +733,23 @@ pub(crate) fn apply_heartbeat_enabled_flag(
     }
 }
 
+/// Issue #508 (instrumentation): age in ms since a `last_*_frame_ms` stamp,
+/// or `-1` when the stamp is `0` ("no frame of this kind ever observed").
+///
+/// `saturating_sub` guards the unlikely `now < last` clock-skew case (treated
+/// as age 0 rather than wrapping). Returns `i64` so the "never seen" sentinel
+/// (`-1`) is distinguishable in the log from a genuine age of 0ms; a positive
+/// value is the milliseconds since the last packet of that kind reached the
+/// per-peer decode body. Pure function so it can be unit-tested without a
+/// `Peer`.
+fn age_ms_since(now: u64, last_frame_ms: u64) -> i64 {
+    if last_frame_ms == 0 {
+        -1
+    } else {
+        now.saturating_sub(last_frame_ms) as i64
+    }
+}
+
 /// Resolve a CONTINUOUS live-stream (audio / camera-video) enabled flag
 /// against a heartbeat, using the short [`LIVE_STREAM_FRESH_WINDOW_MS`] so a
 /// real mute / camera-off reflects on remote peers sub-second.
@@ -2287,6 +2304,14 @@ impl PeerDecodeManager {
             // per dead peer). See Phase 6 watchdog-cascade fix.
             self.invalidate_sorted_string_keys();
             self.on_peers_removed_batch.emit(removed_ids.clone());
+            // Issue #508 (instrumentation only): the heartbeat watchdog is a
+            // SECOND peer-leave path (it does NOT call `delete_peer`). Snapshot
+            // the remaining peers once per removal pass so a watchdog-driven
+            // cascade is covered too. `departed_session_id=0` is the sentinel:
+            // the watchdog removes by predicate, so there is no single id; the
+            // departed sids are in the `removed_ids` already logged via the
+            // batch callback. Pure read; alters no teardown ordering.
+            self.log_peer_leave_decode_snapshot(0, "run_peer_monitor");
         }
         removed_ids
     }
@@ -2922,6 +2947,94 @@ impl PeerDecodeManager {
         Ok(())
     }
 
+    /// Issue #508 (instrumentation only): emit ONE diagnostic snapshot of every
+    /// REMAINING connected peer's decode state at the instant a peer leaves.
+    ///
+    /// Purpose: the next time a peer-leave triggers a receiver-side FPS collapse
+    /// (~25 -> 2-3 FPS) on the *remaining* peers, the console logs must let an
+    /// analyst decide WHY, between two hypotheses:
+    ///
+    ///   * **Mechanism A (teardown invalidated the decode path)** — frames are
+    ///     still ARRIVING for a remaining peer (its `last_*_frame_ms` keeps
+    ///     advancing past this snapshot) but the tile stops PAINTING. The
+    ///     received-side clock stays fresh while the painted FPS metric
+    ///     (`fps_received` / canvas repaints / "Resized canvas to …") goes quiet.
+    ///   * **Mechanism B (main-thread starvation, #510 re-render storm)** — the
+    ///     received-side clock ALSO goes stale across ALL remaining peers at once:
+    ///     packets stop being processed because the event loop is saturated, so
+    ///     `last_*_frame_ms` ages out for everyone simultaneously.
+    ///
+    /// To support that disambiguation this logs, per remaining peer, the
+    /// **age (ms) since the last media packet of each kind reached the per-peer
+    /// decode body** (`now_ms() - peer.last_{video,audio,screen}_frame_ms`).
+    /// These three fields are stamped in the decode body (`decode_media_packet`,
+    /// `self.last_*_frame_ms = now`) *before* the visibility gate and the actual
+    /// `VideoPeerDecoder::decode()` call, so they are a RECEIVED-side signal:
+    /// "a packet for this stream arrived and passed sequence tracking". They are
+    /// NOT a painted signal. Diverging this received clock against the existing
+    /// painted-FPS series (`fps_received` events + the per-resize
+    /// `"Resized canvas to WxH"` debug line in `peer_decoder.rs`) is exactly the
+    /// A-vs-B test: received-fresh + painted-quiet = A; received-stale-for-all
+    /// = B.
+    ///
+    /// Also logged per peer, all cheap synchronous reads of existing state — no
+    /// new counters, no behavior change:
+    ///   * `visible` — whether this receiver is even ATTEMPTING to decode/paint
+    ///     this peer's video (a `false` here explains a quiet canvas WITHOUT
+    ///     implicating teardown).
+    ///   * `video_enabled` / `screen_enabled` — decoder-active flags.
+    ///   * `video_kf_wait` / `screen_kf_wait` — `is_waiting_for_keyframe()`: a
+    ///     stuck decoder waiting on a keyframe (received frames but nothing
+    ///     decodable) is another flavor of A.
+    ///   * `selected_video_layer` and the video/screen `canvas_id`s — so the
+    ///     analyst can line this snapshot up against the canvas-resize debug
+    ///     lines (which carry no peer identity) by id + timestamp.
+    ///
+    /// `departed_session_id` is the peer that just left; `remaining` is the count
+    /// of peers still connected after the removal.
+    ///
+    /// This runs ONLY on the rare peer-leave / clear / watchdog-timeout paths,
+    /// never per frame. The small loop here is bounded by the meeting size and is
+    /// acceptable because peer-leave is an infrequent event. The grep tag
+    /// `PEER_LEAVE_DECODE_SNAPSHOT` is unique (verified not keyed on by
+    /// `scripts/parse_meeting_console_logs.sh`).
+    fn log_peer_leave_decode_snapshot(&self, departed_session_id: u64, trigger: &str) {
+        let now = now_ms();
+        let remaining = self.connected_peers.ordered_keys().len();
+        log::info!(
+            "PEER_LEAVE_DECODE_SNAPSHOT trigger={trigger} departed_session_id={departed_session_id} remaining={remaining}"
+        );
+        for sid in self.connected_peers.ordered_keys() {
+            let Some(peer) = self.connected_peers.get(sid) else {
+                continue;
+            };
+            // Age (ms) since the last packet of each kind reached the decode
+            // body; `-1` means "no frame of this kind ever seen" (see
+            // `age_ms_since`).
+            let video_age_ms = age_ms_since(now, peer.last_video_frame_ms);
+            let audio_age_ms = age_ms_since(now, peer.last_audio_frame_ms);
+            let screen_age_ms = age_ms_since(now, peer.last_screen_frame_ms);
+            log::info!(
+                "PEER_LEAVE_DECODE_SNAPSHOT_PEER session_id={sid} visible={visible} \
+                 video_enabled={video_enabled} screen_enabled={screen_enabled} \
+                 audio_enabled={audio_enabled} video_age_ms={video_age_ms} \
+                 audio_age_ms={audio_age_ms} screen_age_ms={screen_age_ms} \
+                 video_kf_wait={video_kf_wait} screen_kf_wait={screen_kf_wait} \
+                 selected_video_layer={selected_video_layer} video_canvas={video_canvas} \
+                 screen_canvas={screen_canvas}",
+                visible = peer.visible,
+                video_enabled = peer.video_enabled,
+                screen_enabled = peer.screen_enabled,
+                audio_enabled = peer.audio_enabled,
+                video_kf_wait = peer.video.is_waiting_for_keyframe(),
+                screen_kf_wait = peer.screen.is_waiting_for_keyframe(),
+                selected_video_layer = peer.selected_video_layer,
+                video_canvas = peer.video_canvas_id,
+                screen_canvas = peer.screen_canvas_id,
+            );
+        }
+    }
+
     pub fn delete_peer(&mut self, session_id: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
             if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
@@ -2941,6 +3054,11 @@ impl PeerDecodeManager {
             // subscribers can coalesce on it without subscribing to two
             // separate notifications.
             self.on_peers_removed_batch.emit(vec![sid_str]);
+            // Issue #508 (instrumentation only): snapshot the REMAINING peers'
+            // decode state right after this single-peer removal. Pure read of
+            // `self.connected_peers`; emits no events and alters no teardown
+            // ordering — the departed peer is already removed above.
+            self.log_peer_leave_decode_snapshot(session_id, "delete_peer");
         }
     }
 
@@ -2972,6 +3090,12 @@ impl PeerDecodeManager {
         self.invalidate_sorted_string_keys();
         if !removed_ids.is_empty() {
             self.on_peers_removed_batch.emit(removed_ids);
+            // Issue #508 (instrumentation only): connection-drop / bulk-clear
+            // path. After draining there are no remaining peers, so the loop
+            // body emits nothing — the header line (`remaining=0`) still serves
+            // as a correlatable "all peers cleared" marker distinct from a
+            // single-peer leave. Pure read; no teardown-order change.
+            self.log_peer_leave_decode_snapshot(0, "clear_all_peers");
         }
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
@@ -7765,5 +7889,25 @@ mod tests {
             before,
             "rejected media type must not bump the counter"
         );
+    }
+
+    // -- Issue #508: age_ms_since (PEER_LEAVE_DECODE_SNAPSHOT age field) -----
+
+    /// Plain `#[test]` (NOT `#[wasm_bindgen_test]`): `age_ms_since` is pure
+    /// arithmetic with no JS/wasm dependency, so this runs under host
+    /// `cargo test` even on this box's wasm harness (which silently no-ops
+    /// `#[wasm_bindgen_test]`). The asserts reference real subtraction against
+    /// distinct inputs, so mutating the helper (e.g. dropping the `0` sentinel,
+    /// or swapping operands) makes them fail.
+    #[test]
+    fn age_ms_since_sentinel_and_arithmetic() {
+        // `0` stamp means "no frame of this kind ever observed" -> -1 sentinel,
+        // distinct from a genuine age of 0ms.
+        assert_eq!(age_ms_since(1000, 0), -1, "0 stamp must map to -1 sentinel");
+        // Genuine age = now - last.
+        assert_eq!(age_ms_since(1000, 1000), 0, "same instant is age 0, not -1");
+        assert_eq!(age_ms_since(5000, 1000), 4000, "age is now - last");
+        // Clock skew (now < last) saturates to 0 rather than wrapping.
+        assert_eq!(age_ms_since(900, 1000), 0, "now < last must saturate to 0");
     }
 }

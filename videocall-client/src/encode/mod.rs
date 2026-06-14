@@ -25,6 +25,7 @@ mod transform;
 
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::Arc;
 
 use crate::VideoCallClient;
 use videocall_types::Callback;
@@ -63,6 +64,10 @@ pub trait MicrophoneEncoderTrait {
     fn set_user_layer_ceiling(&self, ceiling: Option<u32>);
     /// The current user SEND audio layer-ceiling (layer COUNT), or `None` for Auto.
     fn user_layer_ceiling(&self) -> Option<u32>;
+    /// Share the CONGESTION-driven audio layer-ceiling atom (issue #621) so a
+    /// self-targeted server CONGESTION signal cuts the audio simulcast ladder to
+    /// base-only. See [`MicrophoneEncoder::set_congestion_layer_ceiling`].
+    fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>);
 }
 
 // Implement trait for Safari microphone encoder
@@ -93,6 +98,10 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
     fn user_layer_ceiling(&self) -> Option<u32> {
         self.user_layer_ceiling()
+    }
+
+    fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>) {
+        self.set_congestion_layer_ceiling(ceiling)
     }
 }
 

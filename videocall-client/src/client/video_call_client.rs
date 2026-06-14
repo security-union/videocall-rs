@@ -447,6 +447,25 @@ struct Inner {
     /// self-targeted CONGESTION sets BOTH so both publishers step down. Like the
     /// split `force_camera_keyframe` / `force_screen_keyframe` flags above.
     screen_congestion_step_down_requested: Arc<AtomicBool>,
+    /// CONGESTION-driven AUDIO simulcast layer-ceiling (issue #621). Unlike the
+    /// camera/screen `AtomicBool` step-down FLAGS above — which are consumed
+    /// (`swap(false)`) by an encoder AQ loop — this is a layer-COUNT atom shared
+    /// with the microphone encoder (`u32::MAX` = fail-open / no congestion cap).
+    /// On a self-targeted CONGESTION the dispatch stores `1` (base-only),
+    /// dropping every upper audio simulcast layer on the next frame — the audio
+    /// analogue of the camera's aggressive `force_congestion_cut`, but via the
+    /// layer-ceiling lever because the Opus AudioWorklet cannot reconfigure
+    /// bitrate live.
+    ///
+    /// A direct atomic store (NOT a consume-once flag) because the mic encoder has
+    /// NO AQ loop of its own — audio tier decisions are normally driven by the
+    /// CAMERA's AQ loop, which is NOT running when the publisher is audio-only.
+    /// Driving the ceiling directly here means the cut works regardless of camera
+    /// state. The mic encoder owns a self-contained recovery timer that climbs
+    /// this back up after a cooldown. Reset to `u32::MAX` on reconnect (see the
+    /// `Connected` handler) so a stale cut from the old session does not suppress
+    /// audio on a fresh one.
+    audio_congestion_layer_ceiling: Arc<AtomicU32>,
     /// Signal set by `ConnectionManager` when a re-election completes. The
     /// camera encoder reads and clears this to suppress crash ceiling arming.
     reelection_completed_signal: Rc<AtomicBool>,
@@ -745,6 +764,17 @@ fn handle_connected_reconnect_resets(
             if let Some(atom) = &inner.screen_union_requested_layer {
                 atom.store(u32::MAX, Ordering::Relaxed);
             }
+            // CONGESTION-driven audio layer-ceiling reset (issue #621). A cut left
+            // over from the OLD relay/session must not keep the audio ladder pinned
+            // to base-only against a FRESH session, so reset it to the fail-open
+            // sentinel. The next self-targeted CONGESTION (if any) re-cuts it. Same
+            // reconnect-reset precedent as the union caps above. (The mic encoder's
+            // recovery timer would also climb it back, but resetting here means a
+            // fresh session starts at the full ladder immediately rather than
+            // waiting out a cooldown carried over from the old session.)
+            inner
+                .audio_congestion_layer_ceiling
+                .store(u32::MAX, Ordering::Relaxed);
         } else {
             warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
         }
@@ -986,6 +1016,9 @@ impl VideoCallClient {
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
         let screen_congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+        // CONGESTION-driven audio layer-ceiling (issue #621). Fail-open
+        // (u32::MAX = no congestion cap) until a self-targeted CONGESTION cuts it.
+        let audio_congestion_layer_ceiling = Arc::new(AtomicU32::new(u32::MAX));
         let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
         // Phase 8a / TELEM-1: register a Long Tasks API observer once per
@@ -1060,6 +1093,7 @@ impl VideoCallClient {
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 screen_congestion_step_down_requested: screen_congestion_step_down_requested
                     .clone(),
+                audio_congestion_layer_ceiling: audio_congestion_layer_ceiling.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
                 // Relay layer-union hint atoms (issue #1108, Stage 3). None until
                 // the host wires in the camera/screen encoder accessors; the
@@ -1958,6 +1992,20 @@ impl VideoCallClient {
             .clone()
     }
 
+    /// Returns a shared reference to the CONGESTION-driven AUDIO layer-ceiling
+    /// atom (issue #621).
+    ///
+    /// Pass this to `MicrophoneEncoder::set_congestion_layer_ceiling` so a
+    /// self-targeted CONGESTION signal cuts the audio simulcast ladder to
+    /// base-only and the mic encoder's recovery timer can climb it back. This is
+    /// a layer-COUNT atom (`u32::MAX` = fail-open), NOT a consume-once flag like
+    /// [`congestion_step_down_flag`](Self::congestion_step_down_flag): the mic
+    /// encoder has no AQ loop of its own, so the dispatch drives this directly and
+    /// the cut works even when the camera is off (audio-only).
+    pub fn audio_congestion_layer_ceiling(&self) -> Arc<AtomicU32> {
+        self.inner.borrow().audio_congestion_layer_ceiling.clone()
+    }
+
     /// Returns a shared reference to the re-election completed signal.
     ///
     /// Pass this to `CameraEncoder` so that re-election events reach the
@@ -2627,6 +2675,43 @@ impl Inner {
         true
     }
 
+    /// Apply every publisher-side quality cut triggered by a SELF-TARGETED server
+    /// CONGESTION signal.
+    ///
+    /// The CONGESTION signal targets a SESSION, not a media-kind — the relay is
+    /// dropping our outbound packets regardless of which stream they belong to —
+    /// so EVERY live publisher must back off:
+    ///   * VIDEO + SCREEN (issue #1199): set each encoder's own step-down FLAG.
+    ///     Separate flags (not one shared atom) so each encoder's AQ loop consumes
+    ///     its own with `swap(false)` and they never race; the AQ loop turns the
+    ///     edge into an aggressive multi-tier `force_congestion_cut`.
+    ///   * AUDIO (issue #621): drive the audio congestion layer-ceiling DIRECTLY
+    ///     to base-only (count `1`). Unlike video/screen this is NOT a consume-once
+    ///     flag, because the mic encoder has no AQ loop of its own (audio tier
+    ///     decisions are normally driven by the CAMERA's AQ loop, which is not
+    ///     running when the publisher is audio-only). A direct store makes the
+    ///     audio cut take effect on the next frame regardless of camera state; the
+    ///     mic encoder's self-contained recovery timer climbs the ceiling back up
+    ///     after a cooldown.
+    ///
+    /// Extracted as a `&self` helper so the dispatch arm and the host-side unit
+    /// test exercise the EXACT same coordinated side-effects.
+    fn apply_self_congestion_cut(&self) {
+        self.congestion_step_down_requested
+            .store(true, Ordering::Release);
+        self.screen_congestion_step_down_requested
+            .store(true, Ordering::Release);
+        // `Relaxed` (not `Release` like the two flags above) is deliberate and
+        // consistent with every other access to this atom: it is a plain shared
+        // level read live by the mic publish gate + recovery timer, with no
+        // cross-thread handoff to order against (single-threaded wasm). The
+        // video/screen flags use `Release` only to pair with the `swap(false)`
+        // `AcqRel` consume in their AQ loops; the audio ceiling has no such
+        // consume, so do not "upgrade" this to `Release`.
+        self.audio_congestion_layer_ceiling
+            .store(1, Ordering::Relaxed);
+    }
+
     /// Returns the [`PeerStatus`] of the (possibly newly-created) peer so the
     /// caller can react to a fresh join — specifically the `on_inbound_media`
     /// closure arms the issue-#1179 early-seed timer exactly once when the first
@@ -3278,17 +3363,7 @@ impl Inner {
                         "Received CONGESTION signal targeting us (session: {}), requesting quality step-down",
                         response.session_id,
                     );
-                    // Set BOTH the camera and screen step-down flags (issue
-                    // #1199). The CONGESTION signal targets a SESSION, not a
-                    // media-kind — the relay is dropping our outbound packets
-                    // regardless of which stream they belong to — so every live
-                    // publisher must back off. Separate flags (not one shared
-                    // atom) so each encoder's AQ loop consumes its own with
-                    // `swap(false)` and they never race.
-                    self.congestion_step_down_requested
-                        .store(true, Ordering::Release);
-                    self.screen_congestion_step_down_requested
-                        .store(true, Ordering::Release);
+                    self.apply_self_congestion_cut();
                 } else {
                     debug!(
                         "Ignoring cross-session CONGESTION signal for session {} (our session: {:?})",
@@ -4212,5 +4287,106 @@ mod cooldown_reset_hardening_tests {
         assert!(arm_keyframe_cooldown_reset_slot(&wired));
         assert!(atom.load(Ordering::Acquire));
         assert!(!arm_keyframe_cooldown_reset_slot(&unwired));
+    }
+
+    /// Issue #621 acceptance: a self-targeted CONGESTION cut must fire the VIDEO
+    /// step-down flag AND cut the AUDIO congestion layer-ceiling to base-only — in
+    /// one coordinated action (the screen flag too, #1199). Drives the exact
+    /// `apply_self_congestion_cut` path the CONGESTION dispatch arm calls, on a
+    /// real host-built `Inner`.
+    #[test]
+    fn self_congestion_cut_fires_both_video_and_audio() {
+        let client = build_test_client();
+
+        let inner = client.inner.borrow();
+        // Preconditions: video/screen flags clear, audio ceiling fail-open.
+        assert!(
+            !inner.congestion_step_down_requested.load(Ordering::Acquire),
+            "precondition: camera flag starts clear"
+        );
+        assert!(
+            !inner
+                .screen_congestion_step_down_requested
+                .load(Ordering::Acquire),
+            "precondition: screen flag starts clear"
+        );
+        assert_eq!(
+            inner.audio_congestion_layer_ceiling.load(Ordering::Relaxed),
+            u32::MAX,
+            "precondition: audio congestion ceiling starts fail-open"
+        );
+
+        inner.apply_self_congestion_cut();
+
+        // BOTH the video step-down (force_video_step_down's edge, via the flag the
+        // camera AQ loop turns into force_congestion_cut) AND the audio cut fire.
+        assert!(
+            inner.congestion_step_down_requested.load(Ordering::Acquire),
+            "self-targeted CONGESTION must set the camera step-down flag"
+        );
+        assert!(
+            inner
+                .screen_congestion_step_down_requested
+                .load(Ordering::Acquire),
+            "self-targeted CONGESTION must set the screen step-down flag (#1199)"
+        );
+        assert_eq!(
+            inner.audio_congestion_layer_ceiling.load(Ordering::Relaxed),
+            1,
+            "self-targeted CONGESTION must cut the AUDIO ceiling to base-only (#621)"
+        );
+    }
+
+    /// Issue #621: the audio congestion cut must be observable through the public
+    /// `audio_congestion_layer_ceiling()` accessor the host wires into the mic
+    /// encoder — proving the SAME atom the mic reads is the one the dispatch cuts.
+    #[test]
+    fn self_congestion_cut_visible_via_public_accessor() {
+        let client = build_test_client();
+        let shared = client.audio_congestion_layer_ceiling();
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            u32::MAX,
+            "shared atom starts fail-open"
+        );
+        client.inner.borrow().apply_self_congestion_cut();
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            1,
+            "the cut is visible on the atom shared with the mic encoder"
+        );
+    }
+
+    /// Issue #621: a reconnect must reset the audio congestion ceiling back to
+    /// fail-open so a stale cut from the OLD session does not pin the audio ladder
+    /// to base-only against a FRESH session.
+    #[test]
+    fn reconnect_resets_audio_congestion_ceiling() {
+        let client = build_test_client();
+        // Simulate an active cut left over from the previous session.
+        client.inner.borrow().apply_self_congestion_cut();
+        assert_eq!(
+            client
+                .audio_congestion_layer_ceiling()
+                .load(Ordering::Relaxed),
+            1,
+            "precondition: a cut is active"
+        );
+
+        // The real Connected/reconnect reset path.
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+        );
+
+        assert_eq!(
+            client
+                .audio_congestion_layer_ceiling()
+                .load(Ordering::Relaxed),
+            u32::MAX,
+            "reconnect must reset the audio congestion ceiling to fail-open"
+        );
     }
 }

@@ -307,9 +307,31 @@ async fn join_as_attendee(
             return Ok(Json(APIResponse::ok(resp)));
         }
 
-        // Meeting exists but isn't active yet. Return a "waiting_for_meeting"
-        // status with an observer token so the client can receive a push
-        // notification when the host activates the meeting.
+        // An `ended` meeting that reached this point could NOT be
+        // auto-activated by this joiner (the block above already re-opens the
+        // only reopenable case: a non-guest, WR-off, `end_on_host_leave=false`
+        // meeting). Anything still `ended` here is terminal for this caller —
+        // e.g. the host left with `end_on_host_leave=true` (issue #742), or a
+        // guest / WR-on joiner hit a meeting that only the host may restart.
+        //
+        // Returning `waiting_for_meeting` here would strand the joiner in a
+        // phantom waiting room for a server-ended meeting, contradicting both
+        // the `ended_at` timestamp and the host's `end_on_host_leave` policy.
+        // Reject with the same `MEETING_NOT_ACTIVE` that the status-polling
+        // endpoints (`get_my_status`, `get_guest_status`) already return for an
+        // `ended` meeting, so the join and status paths agree on the wire.
+        //
+        // Note: a host re-joining never reaches `join_as_attendee` — the host
+        // branch in `join_meeting` re-activates the meeting via `activate()` —
+        // so this guard does not block the host from restarting the session.
+        if current_state == "ended" {
+            return Err(AppError::meeting_not_active(meeting_id));
+        }
+
+        // Meeting exists but isn't active yet (state is `idle` — created but the
+        // host has not started it). Return a "waiting_for_meeting" status with
+        // an observer token so the client can receive a push notification when
+        // the host activates the meeting.
         let dn = display_name.unwrap_or(fallback_display_name);
         let observer =
             generate_observer_token(&state.jwt_secret, user_id, meeting_id, dn, is_guest)?;

@@ -3644,16 +3644,37 @@ impl CameraEncoder {
 
 #[cfg(test)]
 mod tests {
+    use super::RestartReason;
     use super::{
-        build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
-        frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
-        layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin, pli_keyframe_allowed,
-        shed_reason, should_pin_single_layer_low, should_teardown_shed_layer, LayerView,
-        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
-        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
-        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        build_simulcast_layers, camera_encoder_restarts_closed_codec,
+        camera_encoder_restarts_configure, camera_encoder_restarts_memory,
+        camera_encoder_restarts_other, clamp_layer_count, encoders_to_build,
+        format_layer_transition, frame_is_healthy, initial_active_layer_count,
+        is_fatal_encoder_error_message, layer_ceiling_to_count, loop_is_superseded,
+        next_single_layer_pin, pli_keyframe_allowed, record_camera_restart, shed_reason,
+        should_pin_single_layer_low, should_teardown_shed_layer, LayerView, SimulcastLayerInfo,
+        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
+
+    #[test]
+    fn record_camera_restart_increments_each_reason_counter() {
+        let before_closed = camera_encoder_restarts_closed_codec();
+        let before_memory = camera_encoder_restarts_memory();
+        let before_configure = camera_encoder_restarts_configure();
+        let before_other = camera_encoder_restarts_other();
+
+        record_camera_restart(RestartReason::ClosedCodec);
+        record_camera_restart(RestartReason::Memory);
+        record_camera_restart(RestartReason::Configure);
+        record_camera_restart(RestartReason::Other);
+
+        assert!(camera_encoder_restarts_closed_codec() >= before_closed + 1);
+        assert!(camera_encoder_restarts_memory() >= before_memory + 1);
+        assert!(camera_encoder_restarts_configure() >= before_configure + 1);
+        assert!(camera_encoder_restarts_other() >= before_other + 1);
+    }
 
     #[test]
     fn simulcast_layers_emit_shed_rungs_with_zero_bitrate() {

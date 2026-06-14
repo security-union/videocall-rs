@@ -716,6 +716,61 @@ fn arm_camera_keyframe_cooldown_reset(slot: &Rc<RefCell<Option<Rc<AtomicBool>>>>
     }
 }
 
+fn handle_connected_reconnect_resets(
+    inner: &Weak<RefCell<Inner>>,
+    early_seed_timer: &Rc<RefCell<Option<Interval>>>,
+    camera_keyframe_cooldown_reset: &Rc<RefCell<Option<Rc<AtomicBool>>>>,
+) {
+    // On (re)connect the relay also allocated a fresh empty layer-preference map
+    // for the new session_id (fail-open -> every layer forwarded). Clear the
+    // sender's last-sent memory so the NEXT peer-monitor tick re-sends the
+    // current per-peer desired layers unconditionally and downlink-aware
+    // filtering resumes (issue #989, Phase 2). We reset here rather than
+    // re-send inline because the desired map is recomputed from live per-peer
+    // health on the tick.
+    // Issue #1179, Part B: drop any armed early-seed timer so the next inbound
+    // packet re-arms a fresh 30s window against the new session. Dropping the
+    // Interval cancels the underlying browser timer.
+    if let Ok(mut slot) = early_seed_timer.try_borrow_mut() {
+        *slot = None;
+    }
+
+    if let Some(inner) = Weak::upgrade(inner) {
+        if let Ok(mut inner) = inner.try_borrow_mut() {
+            inner.layer_preference_sender.reset_for_reconnect();
+
+            // Relay layer-union cap reset (issue #1108, Stage 3). The NEW
+            // relay/session starts with an empty receiver set -> no union yet ->
+            // it would publish nothing (fail-open). Until its first LAYER_HINT
+            // lands, a cap left over from the OLD relay must not keep suppressing
+            // our ladder against a fresh session, so reset both kinds to the
+            // u32::MAX fail-open sentinel. The next LAYER_HINT (if any)
+            // re-establishes the cap. Same precedent as the layer_preference_sender
+            // reset above.
+            if let Some(atom) = &inner.camera_union_requested_layer {
+                atom.store(u32::MAX, Ordering::Relaxed);
+            }
+            if let Some(atom) = &inner.screen_union_requested_layer {
+                atom.store(u32::MAX, Ordering::Relaxed);
+            }
+        } else {
+            warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
+        }
+    }
+
+    // Forced-keyframe cooldown reset (issue #1311, hardened in #1352). Run
+    // OUTSIDE the `Inner` `try_borrow_mut()` block above on purpose: a full
+    // reconnect relies SOLELY on this client-side arm (the encoder's
+    // re-election re-arm does not fire on a plain reconnect), and nesting it
+    // inside the `Inner` borrow meant a transient conflict at reconnect time
+    // silently dropped the reset. The helper clones the encoder-owned atom out
+    // of its own slot and stores `true` independently of any `Inner` borrow.
+    // This arm covers BOTH a full reconnect and a re-election (both re-emit
+    // `Connected` here); a cold-start no-op and a duplicate vs the quality task's
+    // arm are both harmless.
+    arm_camera_keyframe_cooldown_reset(camera_keyframe_cooldown_reset);
+}
+
 /// Arm the issue-#1179 early-seed sampler if it is not already armed.
 ///
 /// Idempotent: `on_inbound_media` fires per-packet, so this guards on the slot
@@ -1203,63 +1258,11 @@ impl VideoCallClient {
                         ConnectionState::Connected { .. } => {
                             on_connected.emit(());
 
-                            // On (re)connect the relay also allocated a fresh
-                            // empty layer-preference map for the new session_id
-                            // (fail-open → every layer forwarded). Clear the
-                            // sender's last-sent memory so the NEXT peer-monitor
-                            // tick re-sends the current per-peer desired layers
-                            // unconditionally and downlink-aware filtering
-                            // resumes (issue #989, Phase 2). We reset here rather
-                            // than re-send inline because the desired map is
-                            // recomputed from live per-peer health on the tick.
-                            // Issue #1179, Part B: drop any armed early-seed
-                            // timer so the next inbound packet re-arms a fresh
-                            // 30s window against the new session. Dropping the
-                            // Interval cancels the underlying browser timer.
-                            if let Ok(mut slot) = early_seed_timer.try_borrow_mut() {
-                                *slot = None;
-                            }
-
-                            if let Some(inner) = Weak::upgrade(&inner) {
-                                if let Ok(mut inner) = inner.try_borrow_mut() {
-                                    inner.layer_preference_sender.reset_for_reconnect();
-
-                                    // Relay layer-union cap reset (issue #1108,
-                                    // Stage 3). The NEW relay/session starts with
-                                    // an empty receiver set → no union yet → it
-                                    // would publish nothing (fail-open). Until its
-                                    // first LAYER_HINT lands, a cap left over from
-                                    // the OLD relay must not keep suppressing our
-                                    // ladder against a fresh session, so reset both
-                                    // kinds to the u32::MAX fail-open sentinel. The
-                                    // next LAYER_HINT (if any) re-establishes the
-                                    // cap. Same precedent as the
-                                    // layer_preference_sender reset above.
-                                    if let Some(atom) = &inner.camera_union_requested_layer {
-                                        atom.store(u32::MAX, Ordering::Relaxed);
-                                    }
-                                    if let Some(atom) = &inner.screen_union_requested_layer {
-                                        atom.store(u32::MAX, Ordering::Relaxed);
-                                    }
-                                } else {
-                                    warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
-                                }
-                            }
-
-                            // Forced-keyframe cooldown reset (issue #1311,
-                            // hardened in #1352). Run OUTSIDE the `Inner`
-                            // `try_borrow_mut()` block above on purpose: a full
-                            // reconnect relies SOLELY on this client-side arm
-                            // (the encoder's re-election re-arm does not fire on a
-                            // plain reconnect), and nesting it inside the `Inner`
-                            // borrow meant a transient conflict at reconnect time
-                            // silently dropped the reset. The helper clones the
-                            // encoder-owned atom out of its own slot and stores
-                            // `true` independently of any `Inner` borrow. This arm
-                            // covers BOTH a full reconnect and a re-election (both
-                            // re-emit `Connected` here); a cold-start no-op and a
-                            // duplicate vs the quality task's arm are both harmless.
-                            arm_camera_keyframe_cooldown_reset(&camera_keyframe_cooldown_reset);
+                            handle_connected_reconnect_resets(
+                                &inner,
+                                &early_seed_timer,
+                                &camera_keyframe_cooldown_reset,
+                            );
 
                             // On (re)connect the session_id changed and the
                             // relay allocated a fresh empty viewport (fail-open
@@ -4007,16 +4010,88 @@ mod dedup_tests {
 /// These are plain `#[test]`s (NOT `#[wasm_bindgen_test]`) on purpose: per the
 /// project's CI notes, `#[wasm_bindgen_test]` can silently no-op on some runners,
 /// so a wasm-only assertion would be a false green. They drive the REAL source
-/// helper [`arm_camera_keyframe_cooldown_reset`] — the exact function the
-/// `Connected` lifecycle arm calls — against the SAME slot type the live code
-/// holds (`Rc<RefCell<Option<Rc<AtomicBool>>>>`). The helper touches no browser
-/// API, so it runs unchanged on the host target.
+/// helpers the `Connected` lifecycle arm calls against the SAME slot type the
+/// live code holds (`Rc<RefCell<Option<Rc<AtomicBool>>>>`). The reset path
+/// touches no browser API, so it runs unchanged on the host target.
 #[cfg(test)]
 mod cooldown_reset_hardening_tests {
     use super::arm_camera_keyframe_cooldown_reset;
+    use super::handle_connected_reconnect_resets;
+    use super::VideoCallClient;
+    use super::VideoCallClientOptions;
     use std::cell::RefCell;
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use videocall_types::Callback;
+
+    fn build_test_client() -> VideoCallClient {
+        VideoCallClient::new(VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            on_peer_added: Callback::noop(),
+            on_peer_first_frame: Callback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: Callback::from(|id| id),
+            get_peer_screen_canvas_id: Callback::from(|id| id),
+            user_id: "test-user".to_string(),
+            display_name: "test".to_string(),
+            meeting_id: "test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_connected: Callback::noop(),
+            on_connection_lost: Callback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            on_participant_kicked: None,
+            on_peer_event: None,
+            decode_media: true,
+            is_guest: false,
+            allow_post_rebase_retry: true,
+        })
+    }
+
+    #[test]
+    fn connected_reset_helper_arms_real_slot_while_real_inner_is_borrowed() {
+        let client = build_test_client();
+        let atom = Rc::new(AtomicBool::new(false));
+        client.set_camera_keyframe_cooldown_reset(atom.clone());
+
+        let inner_guard = client.inner.borrow_mut();
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+        );
+
+        assert!(
+            atom.load(Ordering::Acquire),
+            "the real Connected reset helper must arm the cooldown atom even \
+             while the real Inner is mutably borrowed"
+        );
+        drop(inner_guard);
+    }
 
     /// The whole point of #1352: the reset must fire on a reconnect even when
     /// `Inner` is borrowed at that instant. Because the atom now lives in its

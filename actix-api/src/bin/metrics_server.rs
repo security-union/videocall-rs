@@ -1589,6 +1589,26 @@ mod tests {
         false
     }
 
+    fn gauge_value(metric_name: &str, expected_labels: &[(&str, &str)]) -> Option<f64> {
+        let families = prometheus::gather();
+        for family in families {
+            if family.get_name() == metric_name {
+                for metric in family.get_metric() {
+                    let labels_match = expected_labels.iter().all(|(lname, lval)| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.get_name() == *lname && label.get_value() == *lval)
+                    });
+                    if labels_match {
+                        return Some(metric.get_gauge().get_value());
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Helper function to create test peer stats with NetEQ data (protobuf)
     fn create_test_peer_stats(
         peer_id: &str,
@@ -1962,6 +1982,62 @@ mod tests {
                 ("to_peer", "bob"),
             ],
         ));
+    }
+
+    #[test]
+    fn encoder_restart_metric_expands_cumulative_fields_and_gc_removes_series() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let meeting_id = "meeting_restart_metric";
+        let session_id = "session_restart_metric";
+        let reporting_user_id = "alice";
+        let mut hp =
+            create_test_health_packet(session_id, meeting_id, reporting_user_id, HashMap::new());
+        hp.camera_encoder_restarts_closed_codec = Some(3);
+        hp.screen_encoder_restarts_configure = Some(5);
+
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        let camera_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("kind", "camera"),
+            ("reason", "closed_codec"),
+        ];
+        let screen_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("kind", "screen"),
+            ("reason", "configure"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_encoder_restart_total", &camera_labels),
+            Some(3.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_restart_total", &screen_labels),
+            Some(5.0)
+        );
+
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
+        let info = {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(
+            !series_exists("videocall_encoder_restart_total", &camera_labels),
+            "camera restart series must be removed by session GC"
+        );
+        assert!(
+            !series_exists("videocall_encoder_restart_total", &screen_labels),
+            "screen restart series must be removed by session GC"
+        );
     }
 
     #[test]

@@ -984,6 +984,121 @@ mod tests {
         AudioPacket::new(header, payload, 16000, 1, duration_ms)
     }
 
+    /// Build a self-consistent 48kHz / 1ch / 20ms audio packet whose payload sample
+    /// count (960 f32 samples), `sample_rate` (48000), `channels` (1) and `duration_ms`
+    /// (20) all agree. Mirrors the production decoder frame (48kHz, 20ms = 960 samples)
+    /// rather than reusing the 16kHz/160-sample `create_test_packet` helper.
+    fn create_48k_20ms_packet(seq: u16, ts: u32) -> AudioPacket {
+        let header = RtpHeader::new(seq, ts, 12345, 96, false);
+        // 960 samples * 4 bytes = 3840 bytes of raw little-endian f32 PCM (20ms @ 48kHz).
+        let mut payload = Vec::with_capacity(960 * 4);
+        for i in 0..960 {
+            let sample = (i as f32 / 960.0 * 2.0 * std::f32::consts::PI * 440.0).sin() * 0.1;
+            payload.extend_from_slice(&sample.to_le_bytes());
+        }
+        AudioPacket::new(header, payload, 48000, 1, 20)
+    }
+
+    /// Regression guard for issue #624: NetEQ's `delay_manager` treats the per-packet
+    /// RTP `timestamp` as a SAMPLE COUNTER. The videocall-client decoder was fixed to
+    /// advance consecutive 20ms frames by +960 SAMPLES at 48kHz (sample-domain) instead
+    /// of +20 (ms-domain). This test proves that sample-domain stepping keeps NetEQ's
+    /// target delay and expansion near zero for a steady, on-time stream.
+    ///
+    /// Mechanism (see `delay_manager.rs::RelativeArrivalDelayTracker::update`):
+    /// `expected_iat_ms = (timestamp - last_timestamp) * 1000 / sample_rate`, compared
+    /// against the real wall-clock inter-arrival gap. With +960 sample steps at 48kHz,
+    /// `expected_iat_ms = 960 * 1000 / 48000 = 20ms`, which matches the real ~20ms frame
+    /// cadence, so the measured jitter is ~0 and `target_delay_ms` stays at one bucket
+    /// (20ms). If the decoder regressed to ms-domain (+20), `expected_iat_ms` would
+    /// truncate to `20 * 1000 / 48000 = 0ms`, the on-time arrivals would register as
+    /// +20ms of positive jitter, and `target_delay_ms` would climb to 40ms — tripping
+    /// the `<= 30` bound below. Observed steady-state values during development:
+    /// sample-domain (+960) -> target_delay_ms = 20; ms-domain (+20) -> 40.
+    ///
+    /// `resample_interval_ms` is set to `None` so each packet's relative delay is fed to
+    /// the histogram immediately (the default 500ms resampler never fires inside a short
+    /// test, leaving the histogram empty and pegging target at its 2000ms ceiling). A real
+    /// ~20ms per-iteration sleep is required so the wall-clock inter-arrival gap is
+    /// realistic; `insert_packet` derives arrival time from `Instant::now()` internally
+    /// and exposes no injectable clock.
+    #[test]
+    fn test_sample_domain_timestamps_keep_expand_near_zero() {
+        // 20ms @ 48kHz = 960 samples. Sample-domain step the decoder fix produces.
+        const SAMPLE_RATE: u32 = 48000;
+        const FRAME_DURATION_MS: u32 = 20;
+        // Sample-domain RTP-timestamp step for a 20ms frame at 48kHz = 960 samples.
+        const SAMPLE_DOMAIN_STEP: u32 = SAMPLE_RATE / 1000 * FRAME_DURATION_MS;
+        // Bound sits halfway between the sample-domain steady value (20ms, one bucket)
+        // and the ms-domain regression value (40ms); robust to one 20ms bucket of jitter.
+        const TARGET_DELAY_BOUND_MS: u32 = 30;
+        const WARMUP_PACKETS: u32 = 8;
+        const STEADY_ITERS: u32 = 60;
+        const MEASURE_AFTER: u32 = 10;
+
+        let mut config = NetEqConfig::default();
+        config.sample_rate = SAMPLE_RATE;
+        // Feed every packet's relative delay to the histogram immediately; the default
+        // 500ms resampler would never fire within this short test, leaving target pegged.
+        config.delay_config.resample_interval_ms = None;
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut seq: u16 = 0;
+        let mut timestamp: u32 = 0;
+
+        // Warm-up: prime the jitter buffer with on-time packets so it never starves
+        // during measurement. No frames pulled here so a small cushion accumulates.
+        for _ in 0..WARMUP_PACKETS {
+            let packet = create_48k_20ms_packet(seq, timestamp);
+            neteq.insert_packet(packet).unwrap();
+            seq += 1;
+            timestamp += SAMPLE_DOMAIN_STEP;
+            sleep(Duration::from_millis(FRAME_DURATION_MS as u64));
+        }
+
+        let mut expand_frames = 0u32;
+        let mut max_steady_target_ms = 0u32;
+        let mut max_steady_expand_rate = 0u16;
+
+        // Steady state: insert one packet, pull one frame, sleep ~20ms, in lockstep.
+        for i in 0..STEADY_ITERS {
+            let packet = create_48k_20ms_packet(seq, timestamp);
+            neteq.insert_packet(packet).unwrap();
+
+            let frame = neteq.get_audio().unwrap();
+            if frame.speech_type == SpeechType::Expand {
+                expand_frames += 1;
+            }
+
+            let stats = neteq.get_statistics();
+            if i >= MEASURE_AFTER {
+                max_steady_target_ms = max_steady_target_ms.max(stats.target_delay_ms);
+                max_steady_expand_rate = max_steady_expand_rate.max(stats.network.expand_rate);
+            }
+
+            seq += 1;
+            timestamp += SAMPLE_DOMAIN_STEP;
+            sleep(Duration::from_millis(FRAME_DURATION_MS as u64));
+        }
+
+        // Sample-domain stepping keeps the target delay at one bucket (~20ms). If the
+        // decoder regressed to ms-domain (+20), this would be 40ms and fail.
+        assert!(
+            max_steady_target_ms <= TARGET_DELAY_BOUND_MS,
+            "sample-domain (+{SAMPLE_DOMAIN_STEP}) target_delay_ms should stay <= {TARGET_DELAY_BOUND_MS}ms, got {max_steady_target_ms}ms (ms-domain regression pushes this to ~40ms)"
+        );
+
+        // A steady on-time stream must not trigger any expansion/concealment.
+        assert_eq!(
+            max_steady_expand_rate, 0,
+            "steady on-time stream should produce zero expand_rate (Q14), got {max_steady_expand_rate}"
+        );
+        assert_eq!(
+            expand_frames, 0,
+            "steady on-time stream should produce zero Expand frames, got {expand_frames}"
+        );
+    }
+
     #[test]
     fn test_neteq_creation() {
         let config = NetEqConfig::default();

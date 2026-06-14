@@ -23,6 +23,21 @@ use web_sys::{AudioContext, AudioWorkletNode, MessageEvent, Worker};
 
 const WORKLET_CODE: &str = include_str!("../scripts/pcmPlayerWorker.js");
 
+/// Number of audio samples in one Opus frame at the negotiated sample rate.
+/// 48000 Hz / 1000 ms * 20 ms = 960 samples per 20 ms frame. NetEQ's
+/// delay manager treats the packet `timestamp` field as a sample counter, so
+/// consecutive frames must advance by exactly this many samples.
+const SAMPLES_PER_AUDIO_FRAME: u32 = AUDIO_SAMPLE_RATE / 1000 * OPUS_FRAME_DURATION_MS;
+
+/// Derive a NetEQ sample-domain RTP timestamp from the monotonic packet
+/// sequence number. Using the sequence (not the wall-clock `packet.timestamp`)
+/// makes the timestamp immune to the browser-ms vs CLI-micros encoder
+/// divergence: each sequence step is exactly one Opus frame = +960 samples.
+/// Wraps in the u32 domain like a real RTP timestamp.
+fn seq_to_sample_timestamp(seq: u64) -> u32 {
+    (seq as u32).wrapping_mul(SAMPLES_PER_AUDIO_FRAME)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 enum WorkerMsg {
@@ -706,12 +721,13 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                                 self.peer_id
                             );
                             self.record_sequence(redundant_seq as u64);
-                            // Inject the recovered frame with its original sequence and
-                            // an earlier timestamp (one Opus frame before the primary).
+                            // Inject the recovered frame with its original sequence and a
+                            // sample-domain timestamp derived from the recovered frame's own
+                            // sequence number (which is one Opus frame, +960 samples, before
+                            // the primary's).
                             let recovered_insert = WorkerMsg::Insert {
                                 seq: redundant_seq as u16,
-                                timestamp: (packet.timestamp as u32)
-                                    .saturating_sub(OPUS_FRAME_DURATION_MS),
+                                timestamp: seq_to_sample_timestamp(redundant_seq as u64),
                                 payload: redundant_data,
                             };
                             self.send_worker_message(recovered_insert);
@@ -720,7 +736,7 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                         // Now send the primary frame.
                         let insert = WorkerMsg::Insert {
                             seq: seq as u16,
-                            timestamp: packet.timestamp as u32,
+                            timestamp: seq_to_sample_timestamp(seq),
                             payload: primary,
                         };
                         self.send_worker_message(insert);
@@ -734,7 +750,7 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                         );
                         let insert = WorkerMsg::Insert {
                             seq: seq as u16,
-                            timestamp: packet.timestamp as u32,
+                            timestamp: seq_to_sample_timestamp(seq),
                             payload: packet.data.clone(),
                         };
                         self.send_worker_message(insert);
@@ -743,7 +759,7 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                     // Standard (non-RED) audio packet.
                     let insert = WorkerMsg::Insert {
                         seq: seq as u16,
-                        timestamp: packet.timestamp as u32,
+                        timestamp: seq_to_sample_timestamp(seq),
                         payload: packet.data.clone(),
                     };
                     self.send_worker_message(insert);
@@ -1040,5 +1056,27 @@ mod tests {
         // Sequence 10 should have been evicted
         assert!(!received.contains(&10));
         assert_eq!(received.len(), capacity);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn seq_maps_to_sample_domain_timestamp() {
+        // The constant must resolve to exactly one Opus frame at 48 kHz.
+        assert_eq!(SAMPLES_PER_AUDIO_FRAME, 960);
+
+        // Each sequence step advances by exactly one Opus frame (+960 samples),
+        // which is what NetEQ's delay manager expects from the timestamp field.
+        assert_eq!(seq_to_sample_timestamp(0), 0);
+        assert_eq!(seq_to_sample_timestamp(1), 960);
+        assert_eq!(seq_to_sample_timestamp(2), 1920);
+
+        // The timestamp wraps in the u32 domain like a real RTP timestamp:
+        // 4_500_000 * 960 = 4_320_000_000, which exceeds u32::MAX. After wrapping
+        // (minus 4_294_967_296) the result is 25_032_704.
+        assert_eq!(seq_to_sample_timestamp(4_500_000), 25_032_704);
     }
 }

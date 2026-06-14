@@ -284,20 +284,119 @@ pub(super) fn monotonic_now_ms() -> f64 {
     epoch.elapsed().as_secs_f64() * 1000.0
 }
 
-/// Cumulative count of connections lost during the handshake phase.
-static CONNECTION_HANDSHAKE_FAILURES: AtomicU64 = AtomicU64::new(0);
+// Connection-loss reason counters, SPLIT BY TRANSPORT (#509 parity audit,
+// item #4). WebTransport is the production-default transport (cc7tp had 8/8
+// participants on WT, 0 on WS), so a global counter cannot answer the audit's
+// core question — "is WT >> WS in handshake failures or session drops?" —
+// because a WS-heavy and a WT-heavy regression are indistinguishable in one
+// number. Splitting the in-memory counters per transport makes that
+// comparison observable LOCALLY (perf panel / console) with zero protobuf or
+// server change.
+//
+// SCOPE BOUNDARY (deliberate): the SPLIT is client-side only. The values
+// reported OVER THE WIRE stay the COMBINED totals via
+// `connection_handshake_failures()` / `connection_session_drops()` below,
+// which feed the EXISTING protobuf fields `connection_handshake_failures_total`
+// / `connection_session_drops_total` unchanged. Emitting the per-transport
+// split to the relay would require NEW protobuf fields + a docker regen, which
+// is explicitly out of scope for this audit (a prior protobuf-regen attempt in
+// this batch caused churn). Wiring the split to telemetry is the documented
+// follow-up.
+//
+// Transport is known statically at counter-increment time: the two
+// `create_connection_lost_callback` call sites (WS at the WebSocket loop, WT
+// at the WebTransport loop) each pass a fixed `is_webtransport`, mirroring the
+// `is_webtransport: false` / `is_webtransport: true` they already set on the
+// `Connected` state — so no runtime transport detection is introduced.
 
-/// Cumulative count of connections lost after the session was established.
-static CONNECTION_SESSION_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative WebTransport connections lost during the handshake phase.
+static CONNECTION_HANDSHAKE_FAILURES_WT: AtomicU64 = AtomicU64::new(0);
 
-/// Returns the cumulative number of handshake failures since process start.
-pub fn connection_handshake_failures() -> u64 {
-    CONNECTION_HANDSHAKE_FAILURES.load(Ordering::Relaxed)
+/// Cumulative WebSocket connections lost during the handshake phase.
+static CONNECTION_HANDSHAKE_FAILURES_WS: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative WebTransport connections lost after the session was established.
+static CONNECTION_SESSION_DROPS_WT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative WebSocket connections lost after the session was established.
+static CONNECTION_SESSION_DROPS_WS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one connection-loss handshake failure against the per-transport
+/// counter selected by `is_webtransport`. Single write path so the increment
+/// is host-testable and the WT/WS split cannot drift from the callback.
+fn record_handshake_failure(is_webtransport: bool) {
+    if is_webtransport {
+        CONNECTION_HANDSHAKE_FAILURES_WT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CONNECTION_HANDSHAKE_FAILURES_WS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
-/// Returns the cumulative number of session drops since process start.
+/// Record one post-handshake session drop against the per-transport counter
+/// selected by `is_webtransport`. Single write path; see
+/// [`record_handshake_failure`].
+fn record_session_drop(is_webtransport: bool) {
+    if is_webtransport {
+        CONNECTION_SESSION_DROPS_WT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CONNECTION_SESSION_DROPS_WS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Returns the cumulative number of handshake failures since process start,
+/// COMBINED across both transports. This is the value reported over the wire
+/// (the protobuf `connection_handshake_failures_total` field is unchanged), so
+/// the split is purely additive — the sum is byte-identical to the pre-split
+/// single counter.
+pub fn connection_handshake_failures() -> u64 {
+    CONNECTION_HANDSHAKE_FAILURES_WT.load(Ordering::Relaxed)
+        + CONNECTION_HANDSHAKE_FAILURES_WS.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of session drops since process start,
+/// COMBINED across both transports. Reported over the wire unchanged; see
+/// [`connection_handshake_failures`].
 pub fn connection_session_drops() -> u64 {
-    CONNECTION_SESSION_DROPS.load(Ordering::Relaxed)
+    CONNECTION_SESSION_DROPS_WT.load(Ordering::Relaxed)
+        + CONNECTION_SESSION_DROPS_WS.load(Ordering::Relaxed)
+}
+
+// The four per-transport readers below are a PUBLIC observability surface
+// (#509 item #4): they expose the WT/WS split for the perf panel / console and
+// the documented telemetry follow-up. They are exercised by the native unit
+// tests, but no PRODUCTION (wasm) call site consumes them yet — the wire still
+// reports the combined totals (`connection_*` above) to avoid a protobuf change
+// — so the wasm build legitimately sees them as dead. `#[allow(dead_code)]`
+// keeps the public API intact until the follow-up wires them to telemetry,
+// without a blanket crate-level allow.
+
+/// Returns the cumulative number of WebTransport handshake failures since
+/// process start. Client-side observability only (not reported over the wire);
+/// see the scope-boundary note above.
+#[allow(dead_code)]
+pub fn connection_handshake_failures_wt() -> u64 {
+    CONNECTION_HANDSHAKE_FAILURES_WT.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of WebSocket handshake failures since process
+/// start. Client-side observability only.
+#[allow(dead_code)]
+pub fn connection_handshake_failures_ws() -> u64 {
+    CONNECTION_HANDSHAKE_FAILURES_WS.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of WebTransport session drops since process
+/// start. Client-side observability only.
+#[allow(dead_code)]
+pub fn connection_session_drops_wt() -> u64 {
+    CONNECTION_SESSION_DROPS_WT.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of WebSocket session drops since process
+/// start. Client-side observability only.
+#[allow(dead_code)]
+pub fn connection_session_drops_ws() -> u64 {
+    CONNECTION_SESSION_DROPS_WS.load(Ordering::Relaxed)
 }
 
 // Transport re-election outcome counters (dashboard audit Tier B #3;
@@ -967,8 +1066,11 @@ impl ConnectionManager {
                 webtransport_url: String::new(), // Not used for WebSocket
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
-                on_connection_lost: self
-                    .create_connection_lost_callback(conn_id.clone(), url.clone()),
+                on_connection_lost: self.create_connection_lost_callback(
+                    conn_id.clone(),
+                    url.clone(),
+                    false, // WebSocket
+                ),
                 peer_monitor: self.options.peer_monitor.clone(),
             };
 
@@ -1013,8 +1115,11 @@ impl ConnectionManager {
                 webtransport_url: url.clone(),
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
-                on_connection_lost: self
-                    .create_connection_lost_callback(conn_id.clone(), url.clone()),
+                on_connection_lost: self.create_connection_lost_callback(
+                    conn_id.clone(),
+                    url.clone(),
+                    true, // WebTransport
+                ),
                 peer_monitor: self.options.peer_monitor.clone(),
             };
 
@@ -1201,6 +1306,7 @@ impl ConnectionManager {
         &self,
         connection_id: String,
         server_url: String,
+        is_webtransport: bool,
     ) -> Callback<ConnectionLostReason> {
         let on_state_changed = self.options.on_state_changed.clone();
         let active_connection_id = self.active_connection_id.clone();
@@ -1226,15 +1332,25 @@ impl ConnectionManager {
                 return;
             }
 
-            // Classify and count the loss reason.
+            // Classify and count the loss reason. The counter is split by
+            // transport (#509 item #4): `is_webtransport` is fixed per call
+            // site (WS vs WT loop), so the increment lands on the matching
+            // per-transport counter. The combined total (what the wire reports)
+            // is unchanged — see the counter-block scope note.
             match &reason {
                 ConnectionLostReason::HandshakeFailed(msg) => {
-                    warn!("Active connection {connection_id} lost [HANDSHAKE FAILED]: {msg}");
-                    CONNECTION_HANDSHAKE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Active {} connection {connection_id} lost [HANDSHAKE FAILED]: {msg}",
+                        if is_webtransport { "WT" } else { "WS" },
+                    );
+                    record_handshake_failure(is_webtransport);
                 }
                 ConnectionLostReason::SessionDropped(msg) => {
-                    warn!("Active connection {connection_id} lost [SESSION DROPPED]: {msg}");
-                    CONNECTION_SESSION_DROPS.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Active {} connection {connection_id} lost [SESSION DROPPED]: {msg}",
+                        if is_webtransport { "WT" } else { "WS" },
+                    );
+                    record_session_drop(is_webtransport);
                 }
             }
 
@@ -9024,6 +9140,129 @@ mod tests {
         assert_eq!(
             url, "https://webtransport.example.com:4433/lobby",
             "redacted last_known_server must equal scheme://host:port/path with no query/fragment"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-transport connection-loss counter split (#509 parity audit, item #4)
+    //
+    // These pin the two contracts the split must uphold:
+    //   1. The `record_*(is_webtransport)` write path lands on the counter that
+    //      matches the transport — a mutation that swapped the WT/WS branches
+    //      (or that always wrote one transport) is caught.
+    //   2. The COMBINED public reader (what the wire reports, unchanged) equals
+    //      WT + WS exactly, so the split is byte-identical to the pre-split
+    //      single counter from the relay's point of view.
+    //
+    // The counters are process-global `AtomicU64`, so the tests serialize on a
+    // shared lock and assert on the DELTA (load before/after) — robust to any
+    // residual cross-test increment, matching the `REELECTION_TEST_LOCK`
+    // convention above.
+    // -----------------------------------------------------------------------
+    static LOSS_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn handshake_failure_increments_only_the_matching_transport() {
+        let _guard = LOSS_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let wt_before = connection_handshake_failures_wt();
+        let ws_before = connection_handshake_failures_ws();
+        let combined_before = connection_handshake_failures();
+
+        record_handshake_failure(true); // WebTransport
+
+        assert_eq!(
+            connection_handshake_failures_wt() - wt_before,
+            1,
+            "a WT handshake failure must increment the WT counter"
+        );
+        assert_eq!(
+            connection_handshake_failures_ws() - ws_before,
+            0,
+            "a WT handshake failure must NOT increment the WS counter (caught a swapped branch)"
+        );
+        assert_eq!(
+            connection_handshake_failures() - combined_before,
+            1,
+            "the combined reader (wire-reported) must reflect the WT increment"
+        );
+
+        let combined_after_wt = connection_handshake_failures();
+        record_handshake_failure(false); // WebSocket
+
+        assert_eq!(
+            connection_handshake_failures_ws() - ws_before,
+            1,
+            "a WS handshake failure must increment the WS counter"
+        );
+        assert_eq!(
+            connection_handshake_failures_wt() - wt_before,
+            1,
+            "the WS increment must NOT touch the WT counter"
+        );
+        assert_eq!(
+            connection_handshake_failures() - combined_after_wt,
+            1,
+            "the combined reader must also reflect the WS increment"
+        );
+    }
+
+    #[test]
+    fn session_drop_increments_only_the_matching_transport() {
+        let _guard = LOSS_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let wt_before = connection_session_drops_wt();
+        let ws_before = connection_session_drops_ws();
+        let combined_before = connection_session_drops();
+
+        record_session_drop(false); // WebSocket
+
+        assert_eq!(
+            connection_session_drops_ws() - ws_before,
+            1,
+            "a WS session drop must increment the WS counter"
+        );
+        assert_eq!(
+            connection_session_drops_wt() - wt_before,
+            0,
+            "a WS session drop must NOT increment the WT counter (caught a swapped branch)"
+        );
+        assert_eq!(
+            connection_session_drops() - combined_before,
+            1,
+            "the combined reader (wire-reported) must reflect the WS increment"
+        );
+    }
+
+    #[test]
+    fn combined_reader_equals_sum_of_both_transports() {
+        // The wire-reporting invariant: the combined reader the health packet
+        // uses MUST equal WT + WS. A mutation that made the combined reader read
+        // only one transport (re-introducing the original single-counter blind
+        // spot) is caught here. Assert the invariant holds across a mixed burst.
+        let _guard = LOSS_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        record_handshake_failure(true);
+        record_handshake_failure(false);
+        record_handshake_failure(true);
+        record_session_drop(false);
+        record_session_drop(true);
+
+        assert_eq!(
+            connection_handshake_failures(),
+            connection_handshake_failures_wt() + connection_handshake_failures_ws(),
+            "combined handshake-failure reader must equal WT + WS"
+        );
+        assert_eq!(
+            connection_session_drops(),
+            connection_session_drops_wt() + connection_session_drops_ws(),
+            "combined session-drop reader must equal WT + WS"
         );
     }
 }

@@ -825,6 +825,72 @@ fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Opti
     *slot_borrow = Some(interval);
 }
 
+/// Source of the camera/screen forced-keyframe cooldown-reset atoms (issue #1311
+/// / #1352). Implemented by [`Inner`]; the trait lets the reset logic — and its
+/// native test — operate on any holder of the two `Option<Rc<AtomicBool>>` atoms
+/// without constructing a full [`VideoCallClient`].
+trait KeyframeCooldownResetSource {
+    fn camera_keyframe_cooldown_reset(&self) -> &Option<Rc<AtomicBool>>;
+    fn screen_keyframe_cooldown_reset(&self) -> &Option<Rc<AtomicBool>>;
+}
+
+impl KeyframeCooldownResetSource for Inner {
+    fn camera_keyframe_cooldown_reset(&self) -> &Option<Rc<AtomicBool>> {
+        &self.camera_keyframe_cooldown_reset
+    }
+    fn screen_keyframe_cooldown_reset(&self) -> &Option<Rc<AtomicBool>> {
+        &self.screen_keyframe_cooldown_reset
+    }
+}
+
+/// Arm the camera AND screen forced-keyframe cooldown-reset atoms on a
+/// `Connected` transition (issue #1311 / #1352).
+///
+/// #1352: the `store(true, Release)` that arms each atom must NOT depend on the
+/// `try_borrow_mut` that the `Connected` arm takes for the layer-preference /
+/// union-cap resets. A full reconnect's ONLY cooldown-reset mechanism is this
+/// client-side store (a full reconnect runs `reset_and_start_election`, clearing
+/// `old_active_connection`, so it never drives `reelection_completed_signal`).
+/// If the store were gated behind that mutable borrow, a RefCell borrow conflict
+/// at this instant would SILENTLY drop the reset on exactly the recovery path
+/// the feature hardens.
+///
+/// This helper therefore CLONES the atoms out under a SHORT immutable borrow and
+/// performs the stores on the clones AFTER that borrow is released — independent
+/// of any mutable borrow held before/after the call. A shared borrow held
+/// elsewhere (the realistic conflict that makes `try_borrow_mut` fail) does NOT
+/// block this immutable lookup, so the reset survives. Each atom stays
+/// single-consumer in its OWN encode loop (camera's owned by `CameraEncoder`,
+/// screen's by `ScreenEncoder`, each `.swap(false)`-consumed), so storing from
+/// here re-introduces no shared-signal race. `None` atoms (observer / native
+/// callers with no encoder) are a no-op.
+///
+/// Returns `(camera_armed, screen_armed)` for test assertions.
+fn arm_keyframe_cooldown_resets<T: KeyframeCooldownResetSource>(cell: &RefCell<T>) -> (bool, bool) {
+    // Lookup ONLY (clone the Rc handles), then drop the borrow before storing.
+    let (camera_atom, screen_atom) = match cell.try_borrow() {
+        Ok(inner) => (
+            inner.camera_keyframe_cooldown_reset().clone(),
+            inner.screen_keyframe_cooldown_reset().clone(),
+        ),
+        Err(_) => {
+            warn!("keyframe cooldown reset: inner busy on lookup, skipping arm");
+            (None, None)
+        }
+    };
+    // Stores happen with NO borrow of `cell` held — a concurrent mutable borrow
+    // taken by the caller cannot lose them.
+    let camera_armed = camera_atom.is_some();
+    if let Some(atom) = &camera_atom {
+        atom.store(true, Ordering::Release);
+    }
+    let screen_armed = screen_atom.is_some();
+    if let Some(atom) = &screen_atom {
+        atom.store(true, Ordering::Release);
+    }
+    (camera_armed, screen_armed)
+}
+
 fn resolve_display_name(event: &str, packet: &MeetingPacket, user_id: &str) -> String {
     if packet.display_name.is_empty() {
         warn!(
@@ -1184,6 +1250,33 @@ impl VideoCallClient {
                             }
 
                             if let Some(inner) = Weak::upgrade(&inner) {
+                                // Forced-keyframe cooldown reset (issue #1311 / #1352).
+                                // The camera AND screen encode loops persist across a
+                                // full reconnect AND a re-election (the connection is
+                                // rebuilt / the active server is swapped, but the
+                                // encoders are never restarted), so their
+                                // `last_keyframe_emit_ms` carries a stale pre-transition
+                                // timestamp that could suppress the first recovery PLI
+                                // for up to one cooldown window (camera 250ms, screen
+                                // 2000ms — the longer screen window freezes the share
+                                // longer).
+                                //
+                                // #1352: arm BOTH resets here, BEFORE and
+                                // INDEPENDENTLY of the `try_borrow_mut` below — the
+                                // store does not need the mutable borrow, only the
+                                // `Option` lookup does. If the store lived inside that
+                                // block, a RefCell borrow conflict at this instant would
+                                // SILENTLY drop the reset on exactly the recovery path
+                                // the feature hardens (a full reconnect's ONLY
+                                // cooldown-reset mechanism is this client-side store —
+                                // it never drives `reelection_completed_signal`). See
+                                // `arm_keyframe_cooldown_resets` for the full rationale
+                                // and the single-consumer / no-op invariants. This
+                                // `Connected` arm covers BOTH transitions; a cold-start
+                                // arm is a harmless no-op and a duplicate vs the quality
+                                // task's arm is idempotent (`.swap(false)` consume side).
+                                arm_keyframe_cooldown_resets(inner.as_ref());
+
                                 if let Ok(mut inner) = inner.try_borrow_mut() {
                                     inner.layer_preference_sender.reset_for_reconnect();
 
@@ -1203,44 +1296,6 @@ impl VideoCallClient {
                                     }
                                     if let Some(atom) = &inner.screen_union_requested_layer {
                                         atom.store(u32::MAX, Ordering::Relaxed);
-                                    }
-
-                                    // Forced-keyframe cooldown reset (issue #1311).
-                                    // The camera encode loop persists across a full
-                                    // reconnect AND a re-election (the connection is
-                                    // rebuilt / the active server is swapped, but the
-                                    // encoder is never restarted), so its
-                                    // `last_keyframe_emit_ms` carries a stale
-                                    // pre-transition timestamp that could suppress the
-                                    // first recovery PLI for up to one cooldown window
-                                    // (250ms). ARM the encoder-owned reset atom so the
-                                    // encode loop clears that clock on its next frame.
-                                    // This `Connected` arm covers BOTH transitions:
-                                    // a full reconnect and a re-election both end in an
-                                    // election that re-emits `Connected` here (a full
-                                    // reconnect does NOT drive `reelection_completed_signal`,
-                                    // so the camera quality task's re-election arm alone
-                                    // would miss it). A reset on the cold-start connect
-                                    // is a harmless no-op (no PLI pending, clock already
-                                    // `None`); a duplicate vs the quality task's arm is
-                                    // idempotent (`.swap(false)` on the consume side).
-                                    if let Some(atom) = &inner.camera_keyframe_cooldown_reset {
-                                        atom.store(true, Ordering::Release);
-                                    }
-                                    // SCREEN mirror (issue #1311, screen half): arm the
-                                    // screen encoder's reset on the SAME `Connected`
-                                    // transition so both encoders clear their cooldown
-                                    // clock together. Screen's cooldown is 2000ms (vs
-                                    // camera's 250ms), so a suppressed first post-
-                                    // transition PLI freezes the screen-share for longer.
-                                    // Same invariants as the camera arm: covers BOTH
-                                    // reconnect and re-election (the screen quality task's
-                                    // re-election arm alone would miss a reconnect);
-                                    // un-gates only an already-pending PLI; never forces
-                                    // an unrequested keyframe; idempotent under a
-                                    // duplicate arm.
-                                    if let Some(atom) = &inner.screen_keyframe_cooldown_reset {
-                                        atom.store(true, Ordering::Release);
                                     }
                                 } else {
                                     warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
@@ -3994,6 +4049,117 @@ mod dedup_tests {
              to the renaming tab only — sibling tabs of the same authed \
              user must NOT overwrite their own display name signal. \
              Regression guard for HCL #828."
+        );
+    }
+}
+
+#[cfg(test)]
+mod keyframe_cooldown_reset_tests {
+    //! Issue #1352: hardening of the #1311/#1348 forced-keyframe cooldown reset.
+    //!
+    //! These run NATIVELY (`#[cfg(test)]`, not the wasm-only gate used by the
+    //! other test modules in this file) so `cargo test -p videocall-client`
+    //! actually executes them. They pin the structural contract of
+    //! [`arm_keyframe_cooldown_resets`] — the exact helper the `Connected`
+    //! lifecycle arm calls — WITHOUT constructing a full `VideoCallClient`
+    //! (which needs a browser): the reset store must NOT depend on the mutable
+    //! borrow the `Connected` arm takes, so a RefCell borrow conflict at that
+    //! instant cannot silently drop the reset on the reconnect recovery path.
+    use super::*;
+
+    /// Minimal stand-in for `Inner`'s two cooldown-reset atoms.
+    struct FakeInner {
+        camera: Option<Rc<AtomicBool>>,
+        screen: Option<Rc<AtomicBool>>,
+    }
+
+    impl KeyframeCooldownResetSource for FakeInner {
+        fn camera_keyframe_cooldown_reset(&self) -> &Option<Rc<AtomicBool>> {
+            &self.camera
+        }
+        fn screen_keyframe_cooldown_reset(&self) -> &Option<Rc<AtomicBool>> {
+            &self.screen
+        }
+    }
+
+    /// Both atoms are armed on the happy path (no conflicting borrow).
+    #[test]
+    fn arms_both_atoms_when_present() {
+        let camera = Rc::new(AtomicBool::new(false));
+        let screen = Rc::new(AtomicBool::new(false));
+        let cell = RefCell::new(FakeInner {
+            camera: Some(camera.clone()),
+            screen: Some(screen.clone()),
+        });
+
+        let (camera_armed, screen_armed) = arm_keyframe_cooldown_resets(&cell);
+
+        assert!(camera_armed && screen_armed, "both atoms must report armed");
+        assert!(
+            camera.load(Ordering::Acquire),
+            "camera cooldown reset must be armed"
+        );
+        assert!(
+            screen.load(Ordering::Acquire),
+            "screen cooldown reset must be armed"
+        );
+    }
+
+    /// #1352 core regression: a SHARED borrow of `inner` is held while the reset
+    /// fires (exactly the situation that makes the `Connected` arm's
+    /// `try_borrow_mut` fail). The reset MUST still arm both atoms.
+    ///
+    /// This is the mutation target: if `arm_keyframe_cooldown_resets` is changed
+    /// to look the atoms up under `try_borrow_mut` (i.e. the store moves back
+    /// inside the mutable-borrow path — the #1352 bug), `try_borrow_mut` returns
+    /// Err while this shared borrow is live, the atoms are NOT armed, and these
+    /// asserts fail. With the immutable-lookup-then-store-outside design they
+    /// pass, because a shared borrow does not block another shared borrow.
+    #[test]
+    fn arms_both_atoms_even_while_inner_is_borrowed() {
+        let camera = Rc::new(AtomicBool::new(false));
+        let screen = Rc::new(AtomicBool::new(false));
+        let cell = RefCell::new(FakeInner {
+            camera: Some(camera.clone()),
+            screen: Some(screen.clone()),
+        });
+
+        // Simulate the realistic conflict: another reader holds a shared borrow
+        // of `inner` at the instant the `Connected` arm runs. The OLD code's
+        // `try_borrow_mut` would fail here and DROP the reset.
+        let held = cell.borrow();
+
+        let (camera_armed, screen_armed) = arm_keyframe_cooldown_resets(&cell);
+
+        assert!(
+            camera_armed && screen_armed,
+            "reset must be armed even while a shared borrow of inner is held \
+             (#1352: the store must not depend on a mutable borrow)"
+        );
+        assert!(
+            camera.load(Ordering::Acquire),
+            "camera reset lost under concurrent borrow (#1352 regression)"
+        );
+        assert!(
+            screen.load(Ordering::Acquire),
+            "screen reset lost under concurrent borrow (#1352 regression)"
+        );
+
+        drop(held);
+    }
+
+    /// `None` atoms (observer mode / native callers with no encoder) are a no-op,
+    /// not a panic, and report not-armed.
+    #[test]
+    fn no_op_when_atoms_absent() {
+        let cell = RefCell::new(FakeInner {
+            camera: None,
+            screen: None,
+        });
+        let (camera_armed, screen_armed) = arm_keyframe_cooldown_resets(&cell);
+        assert!(
+            !camera_armed && !screen_armed,
+            "absent atoms must report not-armed"
         );
     }
 }

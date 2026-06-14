@@ -425,8 +425,9 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
 
     // worker_log (issue #1356): a `log::` record emitted INSIDE the decoder worker, forwarded so
     // it lands in uploaded field logs (the worker's own `log`/`console` output is invisible to the
-    // main-thread capture pipeline). Re-broadcast as a DiagEvent with the worker's peer context,
-    // mirroring the freshness_skip path. NOTE on serde ordering: like the branches above we must
+    // main-thread capture pipeline). Delivered by re-emitting a real main-thread `console` line
+    // (what the upload pipeline hooks) tagged with the worker's peer context, plus a structured
+    // DiagEvent for future consumers. NOTE on serde ordering: like the branches above we must
     // deserialize *then* check `kind`, because these worker messages share one JS-object channel
     // and their field sets overlap (a `RequestKeyframeMessage` is a structural subset, and a
     // `VideoStatsMessage`'s fields are all optional). `WorkerLogMessage`'s `level`/`target`/
@@ -436,6 +437,31 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
         if log_msg.kind == WORKER_LOG_KIND {
             #[cfg(feature = "wasm")]
             {
+                // Deliver into the console-log capture+upload pipeline (issue #1356). That pipeline
+                // hooks the main thread's `console.*`, so the worker record MUST be re-emitted here
+                // as a real console line — that is the load-bearing delivery. (The DiagEvent
+                // broadcast below goes only to the in-process diagnostics bus, which has no console
+                // bridge and no `worker_log` subscriber, so it would NOT reach the upload buffer on
+                // its own; it is kept for any future structured consumer, mirroring the other
+                // worker->main diagnostics.) Map the worker level onto the matching console method
+                // so the captured line keeps its severity.
+                let from = log_msg.from_peer.clone().unwrap_or_default();
+                let to = log_msg.to_peer.clone().unwrap_or_default();
+                let suppressed_note = if log_msg.suppressed > 0 {
+                    format!(" (+{} suppressed)", log_msg.suppressed)
+                } else {
+                    String::new()
+                };
+                let line = format!(
+                    "[worker {} {}] {}->{}: {}{}",
+                    log_msg.level, log_msg.target, from, to, log_msg.message, suppressed_note
+                );
+                match log_msg.level.as_str() {
+                    "ERROR" => console::error_1(&line.into()),
+                    "WARN" => console::warn_1(&line.into()),
+                    _ => console::log_1(&line.into()),
+                }
+
                 let evt = DiagEvent {
                     subsystem: "worker_log",
                     stream_id: None,

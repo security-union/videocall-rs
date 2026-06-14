@@ -526,9 +526,12 @@ fn process_health_packet_to_metrics_pb(
         let server_url_clean = server_url_clean.as_str();
 
         // For the RTT metric we allow the server_type label to be an empty string when
-        // unknown, because the URL scrub also zeroes active_server_type and dashboards
-        // already treat blank labels as "unknown source". The CLIENT_ACTIVE_SERVER gauge
-        // below keeps its original "unknown" placeholder since it still requires a URL.
+        // unset — dashboards already treat blank labels as "unknown source". Note: the
+        // upstream URL scrub (`client_diagnostics.rs::scrub_client_supplied_urls`) clears
+        // `active_server_url` but does NOT touch `active_server_type`, so this branch
+        // handles the legitimate "client didn't populate type" case. The
+        // CLIENT_ACTIVE_SERVER gauge below keeps its "unknown" placeholder since it still
+        // requires a URL.
         let server_type_for_rtt = health_packet.active_server_type.as_str();
         let server_type_for_active = if health_packet.active_server_type.is_empty() {
             "unknown"
@@ -895,6 +898,7 @@ fn process_health_packet_to_metrics_pb(
             || health_packet.client_gpu_family.is_some()
             || health_packet.client_network_effective_type.is_some()
             || health_packet.client_capability_score.is_some()
+            || health_packet.client_battery_level.is_some()
         {
             let cores_str = health_packet
                 .client_cores

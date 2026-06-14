@@ -20,6 +20,8 @@ permissions:
   pull-requests: write
   issues: write
 
+# workflow_dispatch deliberately groups by github.ref_name (not inputs.branch) so a
+# manual rerun can cancel-in-progress an automated push run on the same branch.
 concurrency:
   group: e2e-hcl-${{ github.event_name == 'issue_comment' && github.event.issue.number || github.ref_name }}
   cancel-in-progress: true
@@ -426,9 +428,17 @@ jobs:
 
           MESSAGE="❌ *E2E Tests FAILED* on \`${BRANCH}\` (\`${SHORT_SHA}\`)\n\n📊 Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}\n⏱️ Duration: ${DURATION}s${PR_INFO}\n🔗 ${RUN_URL}\n📈 ${DASHBOARD_URL}"
 
+          # JSON-encode the payload with jq so a PR title / branch name containing
+          # ", \, backticks, newlines, or control chars can't produce invalid JSON
+          # (Google Chat rejects malformed payloads with 400, silently dropping the
+          # failure alert — exactly when the team most needs it; see #770).
+          # printf '%b' first expands the \n escapes in MESSAGE to real newlines;
+          # `jq -Rsc` then slurps the whole (multi-line) string and emits a fully
+          # escaped JSON string, preserving the rendered newlines.
+          PAYLOAD=$(printf '%b' "${MESSAGE}" | jq -Rsc '{text: .}')
           curl -X POST "${GCHAT_WEBHOOK_URL}" \
             -H 'Content-Type: application/json' \
-            -d "{\"text\": \"${MESSAGE}\"}" || echo "Google Chat notification failed (non-fatal)"
+            -d "${PAYLOAD}" || echo "Google Chat notification failed (non-fatal)"
 
       - name: Dump docker logs on failure
         if: failure()

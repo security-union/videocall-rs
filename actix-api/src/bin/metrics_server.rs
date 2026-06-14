@@ -56,16 +56,16 @@ use sec_api::metrics::{
     CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE,
     DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N,
     DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS,
-    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_TARGET_BITRATE_KBPS,
-    HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL,
-    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
-    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
-    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
-    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL,
+    ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC,
+    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
+    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
+    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
+    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
+    VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
+    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -300,6 +300,19 @@ fn remove_session_metrics(session_info: &SessionInfo) {
             &session_info.session_id,
             result,
         ]);
+    }
+    // #527: encoder restart series (meeting_id, session_id, kind, reason). Remove
+    // the full bounded cartesian (2 kinds × 4 reasons) for this session so the
+    // session_id label leaves no residual series on disconnect.
+    for kind in ["camera", "screen"] {
+        for reason in ["closed_codec", "memory", "configure", "other"] {
+            let _ = ENCODER_RESTART_TOTAL.remove_label_values(&[
+                &session_info.meeting_id,
+                &session_info.session_id,
+                kind,
+                reason,
+            ]);
+        }
     }
     // TELEM-7: remove CLIENT_INFO using stored label values
     if let Some(ref info_labels) = session_info.client_info_labels {
@@ -721,6 +734,60 @@ fn process_health_packet_to_metrics_pb(
             if let Some(total) = value {
                 CLIENT_REELECTION_TOTAL
                     .with_label_values(&[meeting_id, session_id, result])
+                    .set(total as f64);
+            }
+        }
+
+        // #527: encoder auto-restart cycles, expanded into a single labeled
+        // gauge videocall_encoder_restart_total{kind, reason}. Same set()-to-
+        // cumulative convention as the re-election counter above. Each field is
+        // absent until the encoder has actually restarted for that reason, so a
+        // series only appears once a restart of that (kind, reason) has occurred.
+        for (kind, reason, value) in [
+            (
+                "camera",
+                "closed_codec",
+                health_packet.camera_encoder_restarts_closed_codec,
+            ),
+            (
+                "camera",
+                "memory",
+                health_packet.camera_encoder_restarts_memory,
+            ),
+            (
+                "camera",
+                "configure",
+                health_packet.camera_encoder_restarts_configure,
+            ),
+            (
+                "camera",
+                "other",
+                health_packet.camera_encoder_restarts_other,
+            ),
+            (
+                "screen",
+                "closed_codec",
+                health_packet.screen_encoder_restarts_closed_codec,
+            ),
+            (
+                "screen",
+                "memory",
+                health_packet.screen_encoder_restarts_memory,
+            ),
+            (
+                "screen",
+                "configure",
+                health_packet.screen_encoder_restarts_configure,
+            ),
+            (
+                "screen",
+                "other",
+                health_packet.screen_encoder_restarts_other,
+            ),
+        ] {
+            if let Some(total) = value {
+                ENCODER_RESTART_TOTAL
+                    .with_label_values(&[meeting_id, session_id, kind, reason])
                     .set(total as f64);
             }
         }

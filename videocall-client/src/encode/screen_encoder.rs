@@ -51,7 +51,9 @@ use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
 use super::classify_encode_error::classify_encode_error;
+use super::classify_encode_error::restart_reason_from_message;
 use super::classify_encode_error::EncodeErrorBucket;
+use super::classify_encode_error::RestartReason;
 use super::encoder_state::{pli_keyframe_allowed, EncoderState};
 use super::transform::transform_screen_chunk;
 use crate::crypto::aes::Aes128State;
@@ -124,6 +126,14 @@ static SCREEN_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
 static SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
 static SCREEN_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
 static SCREEN_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
+// Screen encoder auto-RESTART cycles (issue #527), partitioned by reason. Bumped
+// once per `restart_count += 1`, NOT per error event. Exported as
+// `videocall_encoder_restart_total{kind="screen", reason}`. Cold start and
+// user-initiated stop do NOT bump these. Mirrors the camera counters.
+static SCREEN_ENCODER_RESTARTS_CLOSED_CODEC: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_RESTARTS_MEMORY: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_RESTARTS_CONFIGURE: AtomicU64 = AtomicU64::new(0);
+static SCREEN_ENCODER_RESTARTS_OTHER: AtomicU64 = AtomicU64::new(0);
 // Cumulative count of upper-rung `VideoEncoder`s torn down after a sustained
 // shed dwell (issue #1230). Bumped once per `extra_layers` rung freed; the base
 // screen layer is never torn down. Mirrors the camera counter.
@@ -143,6 +153,46 @@ pub fn screen_encoder_errors_generic() -> u64 {
 }
 pub fn screen_encoder_frames_submitted_ok() -> u64 {
     SCREEN_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
+}
+
+/// Cumulative screen encoder auto-restart cycles classified as a closed/invalid
+/// codec (issue #527). See [`record_screen_restart`].
+pub fn screen_encoder_restarts_closed_codec() -> u64 {
+    SCREEN_ENCODER_RESTARTS_CLOSED_CODEC.load(Ordering::Relaxed)
+}
+/// Cumulative screen encoder auto-restart cycles classified as a memory fault.
+pub fn screen_encoder_restarts_memory() -> u64 {
+    SCREEN_ENCODER_RESTARTS_MEMORY.load(Ordering::Relaxed)
+}
+/// Cumulative screen encoder auto-restart cycles caused by a fatal `configure()`
+/// or an encoder found already-closed at a reconfigure/guard point.
+pub fn screen_encoder_restarts_configure() -> u64 {
+    SCREEN_ENCODER_RESTARTS_CONFIGURE.load(Ordering::Relaxed)
+}
+/// Cumulative screen encoder auto-restart cycles with no codec/memory/configure
+/// cause (capture-acquisition failures and unclassified errors).
+pub fn screen_encoder_restarts_other() -> u64 {
+    SCREEN_ENCODER_RESTARTS_OTHER.load(Ordering::Relaxed)
+}
+
+/// Record one screen encoder auto-restart cycle, partitioned by [`RestartReason`]
+/// (issue #527). Call at EACH `restart_count += 1` site. Cold start and
+/// user-initiated stop must NOT call this.
+fn record_screen_restart(reason: RestartReason) {
+    let counter = match reason {
+        RestartReason::ClosedCodec => &SCREEN_ENCODER_RESTARTS_CLOSED_CODEC,
+        RestartReason::Memory => &SCREEN_ENCODER_RESTARTS_MEMORY,
+        RestartReason::Configure => &SCREEN_ENCODER_RESTARTS_CONFIGURE,
+        RestartReason::Other => &SCREEN_ENCODER_RESTARTS_OTHER,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    // `trace!` (off by default) so this adds no production noise; it records the
+    // exact `reason` label the metric uses (RestartReason::as_label) for local
+    // debugging and is NOT a periodic/analyzer-consumed line.
+    log::trace!(
+        "screen encoder restart recorded (reason={})",
+        reason.as_label()
+    );
 }
 /// Cumulative count of upper-rung simulcast `VideoEncoder`s torn down after a
 /// sustained shed dwell (issue #1230). Pure observability hook, mirrors the
@@ -2243,6 +2293,8 @@ impl ScreenEncoder {
                 Err(e) => {
                     let msg = format!("Failed to create video encoder: {e:?}");
                     error!("ScreenEncoder: {msg} (restart {restart_count})");
+                    // #527: classify by the create error message (memory/other).
+                    record_screen_restart(restart_reason_from_message(&msg));
                     restart_count += 1;
                     continue 'restart;
                 }
@@ -2259,6 +2311,7 @@ impl ScreenEncoder {
                 SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                 let msg = format!("Error configuring screen encoder: {e:?}");
                 error!("ScreenEncoder: {msg} (restart {restart_count})");
+                record_screen_restart(RestartReason::Configure);
                 restart_count += 1;
                 continue 'restart;
             }
@@ -2424,6 +2477,10 @@ impl ScreenEncoder {
                                 let _ = built.encoder.close();
                             }
                             let _ = screen_encoder.close();
+                            // #527: build_extra_layer drops the specific error;
+                            // the failure is a create-or-fatal-configure at the
+                            // build stage, so attribute it to `configure`.
+                            record_screen_restart(RestartReason::Configure);
                             restart_count += 1;
                             continue 'restart;
                         }
@@ -2537,6 +2594,7 @@ impl ScreenEncoder {
                 // --- Guard: skip reconfigure if encoder is already closed ---
                 if screen_encoder.state() == CodecState::Closed {
                     log::warn!("ScreenEncoder: encoder found in closed state, triggering restart");
+                    record_screen_restart(RestartReason::ClosedCodec);
                     restart_count += 1;
                     break 'encode;
                 }
@@ -2583,6 +2641,7 @@ impl ScreenEncoder {
                         log::warn!(
                             "ScreenEncoder: encoder closed before tier reconfigure, restarting"
                         );
+                        record_screen_restart(RestartReason::ClosedCodec);
                         restart_count += 1;
                         break 'encode;
                     }
@@ -2598,6 +2657,7 @@ impl ScreenEncoder {
                         SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                         error!("Error reconfiguring screen encoder for tier change: {e:?}");
                         if is_fatal_encoder_error(&e) {
+                            record_screen_restart(RestartReason::Configure);
                             restart_count += 1;
                             break 'encode;
                         }
@@ -2627,6 +2687,7 @@ impl ScreenEncoder {
                         log::warn!(
                             "ScreenEncoder: encoder closed before bitrate reconfigure, restarting"
                         );
+                        record_screen_restart(RestartReason::ClosedCodec);
                         restart_count += 1;
                         break 'encode;
                     }
@@ -2642,6 +2703,7 @@ impl ScreenEncoder {
                         SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                         error!("Error configuring screen encoder: {e:?}");
                         if is_fatal_encoder_error(&e) {
+                            record_screen_restart(RestartReason::Configure);
                             restart_count += 1;
                             break 'encode;
                         }
@@ -2715,6 +2777,10 @@ impl ScreenEncoder {
                             }
                         }
                         if build_failed {
+                            // #527: build_extra_layer drops the specific error; a
+                            // lazy rung build failure is a create-or-fatal-configure
+                            // at the build stage → attribute to `configure`.
+                            record_screen_restart(RestartReason::Configure);
                             restart_count += 1;
                             break 'encode;
                         }
@@ -2820,6 +2886,7 @@ impl ScreenEncoder {
                                     .fetch_add(1, Ordering::Relaxed);
                                 error!("Error reconfiguring base screen layer bitrate: {e:?}");
                                 if is_fatal_encoder_error(&e) {
+                                    record_screen_restart(RestartReason::Configure);
                                     restart_count += 1;
                                     break 'encode;
                                 }
@@ -2910,6 +2977,7 @@ impl ScreenEncoder {
                                     "ScreenEncoder: encoder closed before dimension reconfigure, restarting"
                                 );
                                 video_frame.close();
+                                record_screen_restart(RestartReason::ClosedCodec);
                                 fatal_encode_exit = true;
                                 restart_count += 1;
                                 break 'encode;
@@ -2930,6 +2998,7 @@ impl ScreenEncoder {
                                 );
                                 if is_fatal_encoder_error(&e) {
                                     video_frame.close();
+                                    record_screen_restart(RestartReason::Configure);
                                     fatal_encode_exit = true;
                                     restart_count += 1;
                                     break 'encode;
@@ -3028,6 +3097,10 @@ impl ScreenEncoder {
                                         "ScreenEncoder: fatal encode error (restart {restart_count}): {e:?}"
                                     );
                                     video_frame.close();
+                                    // #527: reuse the same message classification as
+                                    // the error counter just bumped above so the
+                                    // restart reason agrees (closed_codec vs memory).
+                                    record_screen_restart(restart_reason_from_message(&msg));
                                     fatal_encode_exit = true;
                                     restart_count += 1;
                                     break 'encode;
@@ -3079,6 +3152,7 @@ impl ScreenEncoder {
                                         layer.layer_id
                                     );
                                     video_frame.close();
+                                    record_screen_restart(RestartReason::ClosedCodec);
                                     fatal_encode_exit = true;
                                     restart_count += 1;
                                     break 'encode;
@@ -3112,6 +3186,7 @@ impl ScreenEncoder {
                                             layer.layer_id
                                         );
                                         video_frame.close();
+                                        record_screen_restart(RestartReason::Configure);
                                         fatal_encode_exit = true;
                                         restart_count += 1;
                                         break 'encode;
@@ -3206,6 +3281,16 @@ impl ScreenEncoder {
             }
 
             log::warn!("ScreenEncoder: restarting with a fresh screen capture stream");
+            // #527: this fallthrough is the non-fatal-encode restart path — the
+            // 'encode loop exited via a stream-level break (e.g. read error /
+            // "stream ended") rather than a codec/memory/configure fault, so the
+            // reason is `other`. NOTE: a few in-loop reconfigure `break 'encode`
+            // sites also bump `restart_count` inline before breaking and then fall
+            // through here (a pre-existing `restart_count` double-bump toward
+            // MAX_RESTARTS, unrelated to #527); recording here as well keeps the
+            // restart counter and this metric in lockstep rather than introducing
+            // a new divergence.
+            record_screen_restart(RestartReason::Other);
             restart_count += 1;
             continue 'restart;
         } // end 'restart

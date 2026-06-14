@@ -43,6 +43,18 @@ static CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
+// Encoder auto-RESTART cycles (issue #527), partitioned by reason. Bumped once
+// per `restart_count += 1` (the loop re-enters `'restart`), NOT per error event:
+// distinct from the *_ERRORS_* counters above, which count fault occurrences
+// (one restart may follow several classified errors, and a restart may have no
+// classified error, e.g. a getUserMedia failure). Exported as
+// `videocall_encoder_restart_total{kind="camera", reason}`. Cold start (the
+// first `'restart` iteration with `restart_count == 0`) and user-initiated
+// `stop()`/supersede returns do NOT bump these.
+static CAMERA_ENCODER_RESTARTS_CLOSED_CODEC: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_RESTARTS_MEMORY: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_RESTARTS_CONFIGURE: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_RESTARTS_OTHER: AtomicU64 = AtomicU64::new(0);
 // Cumulative count of upper-rung `VideoEncoder`s torn down after a sustained
 // shed dwell (issue #1230). Bumped once per rung freed in the encode loop; the
 // freed encoder + its ~100KB output buffer are reclaimed and the existing lazy
@@ -63,6 +75,47 @@ pub fn camera_encoder_errors_generic() -> u64 {
 }
 pub fn camera_encoder_frames_submitted_ok() -> u64 {
     CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
+}
+
+/// Cumulative camera encoder auto-restart cycles classified as a closed/invalid
+/// codec (issue #527). See [`record_camera_restart`].
+pub fn camera_encoder_restarts_closed_codec() -> u64 {
+    CAMERA_ENCODER_RESTARTS_CLOSED_CODEC.load(Ordering::Relaxed)
+}
+/// Cumulative camera encoder auto-restart cycles classified as a memory fault.
+pub fn camera_encoder_restarts_memory() -> u64 {
+    CAMERA_ENCODER_RESTARTS_MEMORY.load(Ordering::Relaxed)
+}
+/// Cumulative camera encoder auto-restart cycles caused by a fatal `configure()`
+/// or an encoder found already-closed at a reconfigure/guard point.
+pub fn camera_encoder_restarts_configure() -> u64 {
+    CAMERA_ENCODER_RESTARTS_CONFIGURE.load(Ordering::Relaxed)
+}
+/// Cumulative camera encoder auto-restart cycles with no codec/memory/configure
+/// cause (media-acquisition failures and unclassified errors).
+pub fn camera_encoder_restarts_other() -> u64 {
+    CAMERA_ENCODER_RESTARTS_OTHER.load(Ordering::Relaxed)
+}
+
+/// Record one camera encoder auto-restart cycle, partitioned by [`RestartReason`]
+/// (issue #527). Call this at EACH `restart_count += 1` site, with the reason
+/// that triggered the restart. Cold start and user-initiated stop must NOT call
+/// this (they do not bump `restart_count`).
+fn record_camera_restart(reason: RestartReason) {
+    let counter = match reason {
+        RestartReason::ClosedCodec => &CAMERA_ENCODER_RESTARTS_CLOSED_CODEC,
+        RestartReason::Memory => &CAMERA_ENCODER_RESTARTS_MEMORY,
+        RestartReason::Configure => &CAMERA_ENCODER_RESTARTS_CONFIGURE,
+        RestartReason::Other => &CAMERA_ENCODER_RESTARTS_OTHER,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    // `trace!` (off by default) so this adds no production noise; it records the
+    // exact `reason` label the metric uses (RestartReason::as_label) for local
+    // debugging and is NOT a periodic/analyzer-consumed line.
+    log::trace!(
+        "camera encoder restart recorded (reason={})",
+        reason.as_label()
+    );
 }
 /// Cumulative count of upper-rung simulcast `VideoEncoder`s torn down after a
 /// sustained shed dwell (issue #1230). A pure observability hook: it lets
@@ -96,7 +149,9 @@ use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
-use super::classify_encode_error::{classify_encode_error, EncodeErrorBucket};
+use super::classify_encode_error::{
+    classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
+};
 use super::encoder_state::{pli_keyframe_allowed, EncoderState};
 use super::transform::transform_video_chunk;
 
@@ -2206,6 +2261,7 @@ impl CameraEncoder {
                         if let Some(cb) = &on_error {
                             cb.emit(msg);
                         }
+                        record_camera_restart(RestartReason::Other);
                         restart_count += 1;
                         continue 'restart;
                     }
@@ -2242,6 +2298,7 @@ impl CameraEncoder {
                             if let Some(cb) = &on_error {
                                 cb.emit(msg);
                             }
+                            record_camera_restart(RestartReason::Other);
                             restart_count += 1;
                             continue 'restart;
                         }
@@ -2255,6 +2312,7 @@ impl CameraEncoder {
                         if let Some(cb) = &on_error {
                             cb.emit(msg);
                         }
+                        record_camera_restart(RestartReason::Other);
                         restart_count += 1;
                         continue 'restart;
                     }
@@ -2621,6 +2679,9 @@ impl CameraEncoder {
                                 let _ = built.encoder.close();
                             }
                             stop_media_stream_tracks(&device);
+                            // Classify by the create error message BEFORE it is
+                            // moved into the on_error callback (memory vs other).
+                            record_camera_restart(restart_reason_from_message(&msg));
                             if let Some(cb) = &on_error {
                                 cb.emit(msg);
                             }
@@ -2632,6 +2693,7 @@ impl CameraEncoder {
                                 let _ = built.encoder.close();
                             }
                             stop_media_stream_tracks(&device);
+                            record_camera_restart(RestartReason::Configure);
                             restart_count += 1;
                             continue 'restart;
                         }
@@ -2748,6 +2810,7 @@ impl CameraEncoder {
                         .any(|l| l.encoder.state() == CodecState::Closed)
                     {
                         log::warn!("CameraEncoder: an encoder state is Closed, triggering restart");
+                        record_camera_restart(RestartReason::ClosedCodec);
                         restart_count += 1;
                         break 'encode;
                     }
@@ -2782,7 +2845,9 @@ impl CameraEncoder {
                     {
                         let want = encoders_to_build(local_active_layers, n_layers);
                         let already_built = layers.len();
-                        let mut build_failed = false;
+                        // Restart reason captured from the failing build (issue
+                        // #527); `None` while the rung builds succeed.
+                        let mut build_failed: Option<RestartReason> = None;
                         for (offset, &initial_seq) in
                             sequence_numbers[already_built..want].iter().enumerate()
                         {
@@ -2808,7 +2873,7 @@ impl CameraEncoder {
                                     );
                                     layers.push(le);
                                 }
-                                Err(_) => {
+                                Err(e) => {
                                     // VideoEncoder::new or a fatal configure failed
                                     // for the newly-activated rung. Restart the
                                     // whole encode cycle (the normal 'encode
@@ -2817,12 +2882,21 @@ impl CameraEncoder {
                                         "CameraEncoder: failed to lazily construct simulcast layer {}, restarting",
                                         layer_idx
                                     );
-                                    build_failed = true;
+                                    // #527: classify by the build error variant —
+                                    // a create failure carries a message (memory/
+                                    // other), a fatal configure is structural.
+                                    build_failed = Some(match &e {
+                                        LayerBuildError::CreateFailed(msg) => {
+                                            restart_reason_from_message(msg)
+                                        }
+                                        LayerBuildError::ConfigureFatal => RestartReason::Configure,
+                                    });
                                     break;
                                 }
                             }
                         }
-                        if build_failed {
+                        if let Some(reason) = build_failed {
+                            record_camera_restart(reason);
                             restart_count += 1;
                             break 'encode;
                         }
@@ -2957,7 +3031,10 @@ impl CameraEncoder {
                     //    Layers with layer_id >= active count are skipped entirely
                     //    (not reconfigured, not encoded) so a dropped top layer
                     //    costs no encode CPU.
-                    let mut fatal_reconfigure = false;
+                    // Restart reason captured from a fatal reconfigure cause
+                    // (issue #527): a closed-codec guard vs a fatal configure().
+                    // `None` while reconfigure succeeds.
+                    let mut fatal_reconfigure: Option<RestartReason> = None;
                     for layer in layers.iter_mut() {
                         // Simulcast: skip inactive (shed) top layers entirely.
                         if simulcast && (layer.layer_id as usize) >= local_active_layers {
@@ -2978,7 +3055,7 @@ impl CameraEncoder {
                             if new_layer_bitrate > 0 && new_layer_bitrate != layer.local_bitrate {
                                 if layer.encoder.state() == CodecState::Closed {
                                     log::warn!("CameraEncoder: encoder closed before per-layer bitrate reconfigure (layer {})", layer.layer_id);
-                                    fatal_reconfigure = true;
+                                    fatal_reconfigure = Some(RestartReason::ClosedCodec);
                                     break;
                                 }
                                 layer.local_bitrate = new_layer_bitrate;
@@ -2988,7 +3065,7 @@ impl CameraEncoder {
                                         .fetch_add(1, Ordering::Relaxed);
                                     if is_fatal_encoder_error(&e) {
                                         error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                        fatal_reconfigure = true;
+                                        fatal_reconfigure = Some(RestartReason::Configure);
                                         break;
                                     }
                                     error!(
@@ -3005,7 +3082,7 @@ impl CameraEncoder {
                             // Guard: do not configure a closed encoder.
                             if layer.encoder.state() == CodecState::Closed {
                                 log::warn!("CameraEncoder: encoder closed before tier reconfigure (layer {})", layer.layer_id);
-                                fatal_reconfigure = true;
+                                fatal_reconfigure = Some(RestartReason::ClosedCodec);
                                 break;
                             }
 
@@ -3053,7 +3130,7 @@ impl CameraEncoder {
                                     .fetch_add(1, Ordering::Relaxed);
                                 if is_fatal_encoder_error(&e) {
                                     error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                    fatal_reconfigure = true;
+                                    fatal_reconfigure = Some(RestartReason::Configure);
                                     break;
                                 }
                                 error!("Error reconfiguring camera encoder for tier change (layer {}): {e:?}", layer.layer_id);
@@ -3067,7 +3144,7 @@ impl CameraEncoder {
                             // Guard: do not configure a closed encoder.
                             if layer.encoder.state() == CodecState::Closed {
                                 log::warn!("CameraEncoder: encoder closed before bitrate reconfigure (layer {})", layer.layer_id);
-                                fatal_reconfigure = true;
+                                fatal_reconfigure = Some(RestartReason::ClosedCodec);
                                 break;
                             }
                             log::info!(
@@ -3081,7 +3158,7 @@ impl CameraEncoder {
                                     .fetch_add(1, Ordering::Relaxed);
                                 if is_fatal_encoder_error(&e) {
                                     error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                    fatal_reconfigure = true;
+                                    fatal_reconfigure = Some(RestartReason::Configure);
                                     break;
                                 }
                                 error!(
@@ -3094,7 +3171,8 @@ impl CameraEncoder {
                             layer.local_bitrate = new_current_bitrate;
                         }
                     }
-                    if fatal_reconfigure {
+                    if let Some(reason) = fatal_reconfigure {
+                        record_camera_restart(reason);
                         restart_count += 1;
                         break 'encode;
                     }
@@ -3238,7 +3316,10 @@ impl CameraEncoder {
                             let frame_width = video_frame.display_width();
                             let frame_height = video_frame.display_height();
 
-                            let mut fatal_encode = false;
+                            // Restart reason captured from a fatal per-frame
+                            // encode/reconfigure cause (issue #527). `None` while
+                            // the frame encodes cleanly.
+                            let mut fatal_encode: Option<RestartReason> = None;
                             // Health is anchored to the BASE layer (layer_id == 0),
                             // NOT "≥1 layer encoded". Every receiver currently decodes
                             // only layer 0 (receiver default `selected_video_layer = 0`),
@@ -3315,7 +3396,7 @@ impl CameraEncoder {
                                         // Guard: do not configure a closed encoder.
                                         if layer.encoder.state() == CodecState::Closed {
                                             log::warn!("CameraEncoder: encoder closed before per-layer dimension reconfigure (layer {})", layer.layer_id);
-                                            fatal_encode = true;
+                                            fatal_encode = Some(RestartReason::ClosedCodec);
                                             break;
                                         }
 
@@ -3349,7 +3430,7 @@ impl CameraEncoder {
                                                 .fetch_add(1, Ordering::Relaxed);
                                             if is_fatal_encoder_error(&e) {
                                                 error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                                fatal_encode = true;
+                                                fatal_encode = Some(RestartReason::Configure);
                                                 break;
                                             }
                                             error!("Error reconfiguring camera layer for dimension change (layer {}): {e:?}", layer.layer_id);
@@ -3385,7 +3466,7 @@ impl CameraEncoder {
                                         // Guard: do not configure a closed encoder.
                                         if layer.encoder.state() == CodecState::Closed {
                                             log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
-                                            fatal_encode = true;
+                                            fatal_encode = Some(RestartReason::ClosedCodec);
                                             break;
                                         }
 
@@ -3406,7 +3487,7 @@ impl CameraEncoder {
                                                 .fetch_add(1, Ordering::Relaxed);
                                             if is_fatal_encoder_error(&e) {
                                                 error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                                fatal_encode = true;
+                                                fatal_encode = Some(RestartReason::Configure);
                                                 break;
                                             }
                                             error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
@@ -3461,7 +3542,11 @@ impl CameraEncoder {
                                         }
                                         if is_fatal_encoder_error(&e) {
                                             error!("CameraEncoder: fatal encode error (layer {}, restart {restart_count}): {e:?}", layer.layer_id);
-                                            fatal_encode = true;
+                                            // #527: reuse the same message classification
+                                            // as the error counter just bumped above so the
+                                            // restart reason agrees with the error bucket
+                                            // (closed_codec vs memory).
+                                            fatal_encode = Some(restart_reason_from_message(&msg));
                                             break;
                                         }
                                         error!(
@@ -3517,7 +3602,8 @@ impl CameraEncoder {
                                 encoded_ok_this_cycle = true;
                             }
 
-                            if fatal_encode {
+                            if let Some(reason) = fatal_encode {
+                                record_camera_restart(reason);
                                 restart_count += 1;
                                 break 'encode;
                             }

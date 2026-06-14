@@ -83,12 +83,10 @@ pub struct ViewportSender {
     /// Counter for total VIEWPORT packets sent.
     pub viewports_sent: Arc<AtomicU64>,
     /// When the last *reconnect re-assert* (via [`Self::resend_on_reconnect`])
-    /// went out. A secondary bound on a genuine re-assert; `None` until the first
-    /// re-assert. The primary steady-state suppression is the change-token gate in
-    /// [`Self::resend_on_reconnect`] (re-assert only when the visible set differs
-    /// from [`Self::last_sent`]), so on a stable connection this rate-limit is
-    /// never reached. The change-driven [`Self::on_source_seen`] path is NOT gated
-    /// by this — it only fires when the visible set genuinely changes.
+    /// went out. Rate-limits the re-assert so a frequent reconnect/diagnostic
+    /// hook cannot spam identical VIEWPORTs. `None` until the first re-assert.
+    /// The change-driven [`Self::on_source_seen`] path is NOT gated by this —
+    /// it only fires when the visible set genuinely changes.
     last_resend: Option<Instant>,
 }
 
@@ -158,51 +156,31 @@ impl ViewportSender {
         self.flush_pending("change");
     }
 
-    /// Re-assert the viewport off the periodic reset / reconnect hook.
+    /// Re-assert the CURRENT viewport after a reconnect / re-election.
     ///
     /// On disconnect the relay drops this bot's viewport subscription and a
     /// reconnect allocates a fresh empty viewport (fail-open → the bot starts
     /// receiving ALL video again, silently under-filtered). The browser client
     /// re-sends its viewport on the `Connected` state edge for exactly this
-    /// reason (`video_call_client.rs::reset_for_reconnect`); the bot has no such
-    /// connection-state event, so it drives this off the 10s diagnostic `reset()`
-    /// hook instead.
-    ///
-    /// # Why this is change-gated, not unconditional (#1006)
-    ///
-    /// The hook firing this is the *steady-state* 10s reset tick, not a real
-    /// reconnect edge — so on a stable connection it fires forever. An earlier
-    /// design re-sent the current set *unconditionally* on every call, rate-limited
-    /// only by [`MIN_RESEND_INTERVAL`] (5s). Because the reset cadence (10s) is
-    /// strictly greater than that limit, the rate-limit never suppressed a healthy
-    /// tick, so every bot re-sent its UNCHANGED viewport every 10s for the whole
-    /// run even with zero reconnects. That made `relay_viewport_updates_total`
-    /// `{outcome="accepted"}` and the bot `viewports_sent` counter climb
-    /// continuously, blunting them as the "client re-subscribed after a flap"
-    /// triage signal #988/#998 exist to provide.
-    ///
-    /// The fix is a *change token*: a re-assert only goes out when the visible
-    /// subset actually differs from what was last accepted by the relay
-    /// ([`Self::last_sent`]), or when a previously-failed send is still pending.
-    /// In steady state with an unchanged visible set this is a pure no-op, so the
-    /// counters read true. The genuine-recovery paths are preserved:
-    ///   - a failed first/initial send is still retried here, and
-    ///   - if the visible set ever diverges from `last_sent` without
-    ///     [`Self::on_source_seen`] having re-sent it (e.g. a future reconnect
-    ///     path that clears `last_sent` to force re-subscription), it is re-sent.
+    /// reason (`video_call_client.rs::reset_for_reconnect`); the bot mirrors
+    /// that intent here.
     ///
     /// This is a no-op when:
     ///   - legacy mode (`visible_count == None`) — the bot never filters,
     ///   - nothing has ever been sent and no failed send is pending — there is no
     ///     prior viewport to restore, so a first-connect caller never double-sends,
+    ///     and
     ///   - the current visible subset is empty — an empty VIEWPORT is a relay
-    ///     no-op (fail-open), and
-    ///   - the visible subset is unchanged since the last accepted send (the
-    ///     change-token gate — the steady-state case #1006 stops emitting).
+    ///     no-op (fail-open).
     ///
-    /// Any genuine re-assert is still rate-limited by [`MIN_RESEND_INTERVAL`].
-    /// The `known_sources` set is deliberately preserved across the reset, so a
-    /// re-send reflects exactly what the bot was rendering.
+    /// Unlike the change-driven [`Self::on_source_seen`], this re-sends the
+    /// current set *unconditionally* (the relay's copy is stale even though the
+    /// local set is unchanged), and it also retries a pending send that previously
+    /// failed because the outbound channel was full. Both paths are rate-limited
+    /// by [`MIN_RESEND_INTERVAL`] so a periodic reconnect hook cannot spam
+    /// identical packets. The `known_sources` set is deliberately preserved
+    /// across the reconnect, so the re-send reflects exactly what the bot was
+    /// rendering before the drop.
     pub fn resend_on_reconnect(&mut self) {
         // Legacy mode → nothing to restore.
         if self.visible_count.is_none() {
@@ -234,16 +212,6 @@ impl ViewportSender {
 
         let visible = self.compute_visible();
         if visible.is_empty() {
-            return;
-        }
-
-        // Change-token gate (#1006): suppress the steady-state re-assert. The
-        // visible set is unchanged since the relay last accepted it, so resending
-        // would only inflate the "re-subscribed" counters without conveying new
-        // information. A genuine reconnect that needs re-subscription must signal
-        // it by changing the visible set or clearing `last_sent`; until then this
-        // is a no-op, which is exactly what makes the counters read true.
-        if visible == self.last_sent {
             return;
         }
 
@@ -417,15 +385,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn steady_state_reset_ticks_do_not_resend() {
-        // #1006: the reset hook fires `resend_on_reconnect` every 10s even on a
-        // perfectly stable connection. With the visible set unchanged since the
-        // relay last accepted it, NONE of those ticks may emit — otherwise the
-        // bot inflates `viewports_sent` / `relay_viewport_updates_total` forever
-        // and ruins them as a "re-subscribed after a flap" signal.
-        //
-        // This MUST fail if the change-token gate is removed: an unconditional
-        // re-send (the old behaviour) would emit one packet per call below.
+    async fn reconnect_resends_current_viewport() {
+        // After a viewport is established, a reconnect must re-assert the SAME
+        // current visible subset unconditionally (the relay forgot it on the
+        // drop), even though the local set did not change. This is the #988
+        // fidelity fix: without it the bot silently receives all video again.
         let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
         let mut vs = ViewportSender::new("bot-1".to_string(), Some(2), tx);
 
@@ -437,49 +401,8 @@ mod tests {
         assert_eq!(ids, vec![10, 20]);
         assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 2);
 
-        // Simulate many 10s reset ticks with nothing changed. Each call must be a
-        // no-op. We clear `last_resend` between calls so the MIN_RESEND_INTERVAL
-        // rate-limit is NOT what's doing the suppression — this proves the
-        // change-token gate alone holds across cadence > rate-limit. (In the real
-        // bot the 10s cadence already exceeds the 5s limit, so the rate-limit
-        // never fires either; this makes the test independent of that timing.)
-        for _ in 0..5 {
-            vs.last_resend = None;
-            vs.resend_on_reconnect();
-            assert!(
-                rx.try_recv().is_err(),
-                "steady-state reset tick must not re-send an unchanged viewport"
-            );
-        }
-        assert_eq!(
-            vs.viewports_sent.load(Ordering::Relaxed),
-            2,
-            "no re-asserts may have been emitted in steady state"
-        );
-    }
-
-    #[tokio::test]
-    async fn reconnect_resends_when_relay_subscription_lost() {
-        // A GENUINE reconnect (relay forgot our viewport) must still re-assert the
-        // current subset. We model "the relay forgot us" by clearing `last_sent`
-        // (the change token), which is the divergence that the gate keys off. The
-        // #988 fidelity guarantee — recover viewport filtering after a real drop —
-        // is preserved; only the redundant steady-state re-send (#1006) is gone.
-        let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
-        let mut vs = ViewportSender::new("bot-1".to_string(), Some(2), tx);
-
-        vs.on_source_seen(10); // [10]
-        vs.on_source_seen(20); // [10, 20]
-        let (_, ids) = parse_sent(&rx.try_recv().expect("emit 1").bytes);
-        assert_eq!(ids, vec![10]);
-        let (_, ids) = parse_sent(&rx.try_recv().expect("emit 2").bytes);
-        assert_eq!(ids, vec![10, 20]);
-        assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 2);
-
-        // Relay-forgot-us: the change token diverges from the current visible set.
-        // `known_sources` is preserved (mirrors InboundStats::reset take/restore),
-        // so the re-assert re-sends the current [10, 20] subset.
-        vs.last_sent.clear();
+        // Reconnect: known_sources is preserved (mirrors InboundStats::reset
+        // take/restore), so the re-assert re-sends the current [10, 20] subset.
         vs.resend_on_reconnect();
         let (uid, ids) = parse_sent(&rx.try_recv().expect("reconnect re-send").bytes);
         assert_eq!(uid, b"bot-1");
@@ -545,12 +468,9 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_resend_is_rate_limited() {
-        // Two GENUINE re-asserts in quick succession (well under
-        // MIN_RESEND_INTERVAL) must collapse to a single packet on the wire — a
-        // frequent reconnect hook cannot spam identical VIEWPORTs. Each re-assert
-        // here is made genuine by clearing the change token (`last_sent`); the
-        // rate-limit is then the only thing that can suppress the second one,
-        // which is precisely what this test pins.
+        // Two reconnect re-asserts in quick succession (well under
+        // MIN_RESEND_INTERVAL) must collapse to a single packet on the wire —
+        // a frequent reconnect/diagnostic hook cannot spam identical VIEWPORTs.
         let (tx, mut rx) = mpsc::channel::<OutboundFrame>(16);
         let mut vs = ViewportSender::new("bot-1".to_string(), Some(2), tx);
 
@@ -558,16 +478,12 @@ mod tests {
         assert!(rx.try_recv().is_ok());
         assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 1);
 
-        // First genuine re-assert: change token cleared → emits.
-        vs.last_sent.clear();
         vs.resend_on_reconnect();
         let (_, ids) = parse_sent(&rx.try_recv().expect("first re-assert").bytes);
         assert_eq!(ids, vec![7]);
         assert_eq!(vs.viewports_sent.load(Ordering::Relaxed), 2);
 
-        // Immediately again, also genuine (token cleared) but inside the
-        // rate-limit window → suppressed by MIN_RESEND_INTERVAL, not the token.
-        vs.last_sent.clear();
+        // Immediately again: inside the rate-limit window → suppressed.
         vs.resend_on_reconnect();
         assert!(
             rx.try_recv().is_err(),

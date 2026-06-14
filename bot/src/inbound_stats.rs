@@ -431,16 +431,12 @@ impl InboundStats {
         // connection. `resend_on_reconnect` is therefore idempotent and guarded:
         // it no-ops until a viewport has actually been established (`has_sent`),
         // so a bot that just connected and has not yet rendered anyone never
-        // double-sends. It is also change-token-gated (#1006): on a stable
-        // connection with an unchanged visible set it re-asserts NOTHING, so the
-        // 10s cadence cannot inflate `viewports_sent` /
-        // `relay_viewport_updates_total{outcome="accepted"}` and ruin them as a
-        // "re-subscribed after a flap" signal. The `known_sources` set is
-        // preserved across reset (it is take/restored above), so a genuine
-        // re-assert reflects exactly the subset the bot was rendering. Net effect:
-        // a steady connection emits no redundant re-asserts, while a genuine
-        // subscription loss (visible set diverges from the relay's last-accepted
-        // copy) is still healed within one reset window.
+        // double-sends, and it is rate-limited (MIN_RESEND_INTERVAL) so the 10s
+        // cadence cannot spam identical packets. The `known_sources` set is
+        // preserved across reset (it is take/restored above), so the re-assert
+        // reflects exactly the subset the bot was rendering. Net effect: any
+        // subscription loss is healed within one reset window, while a steady
+        // connection re-asserts a tiny control packet at most once per window.
         if let Some(ref mut vs) = self.viewport_sender {
             vs.resend_on_reconnect();
         }
@@ -448,13 +444,8 @@ impl InboundStats {
         // Same re-assert for the layer-preference signal (#1083-A2): the relay
         // drops a receiver's recorded layer preference on disconnect, and a
         // reconnect leaves it empty (fail-open → the bot silently receives the
-        // full ladder again). `resend_on_reconnect` here is idempotent, guarded on
-        // `has_sent`, and rate-limited by MIN_RESEND_INTERVAL. NOTE: unlike the
-        // viewport re-assert above, this path is NOT yet change-token-gated, so on
-        // a stable connection it can still re-assert once per reset window. That
-        // is acceptable today because the layer-preference sender is OFF by
-        // default (only active under `--pin-layer`); the #1006 change-token fix
-        // should be mirrored here if it is ever enabled in steady-state runs.
+        // full ladder again). `resend_on_reconnect` is idempotent, guarded on
+        // `has_sent`, and rate-limited, exactly like the viewport re-assert.
         if let Some(ref mut lps) = self.layer_preference_sender {
             lps.resend_on_reconnect();
         }

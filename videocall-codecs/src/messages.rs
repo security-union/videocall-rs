@@ -130,9 +130,11 @@ pub const FRESHNESS_SKIP_KIND: &str = "freshness_skip";
 /// The jitter buffer's freshness deadline (#1020) runs INSIDE the decoder worker,
 /// whose `log`/`console` output the main-thread console-log capture+upload pipeline
 /// never sees — so in the field we could not confirm the freeze fix actually fired.
-/// The worker posts this the instant a skip occurs; the main thread re-broadcasts it
-/// as a `DiagEvent` (`handle_worker_diag_message`) so it lands in uploaded logs with
-/// the worker's `from_peer`/`to_peer` context. Mirrors `VideoStatsMessage`'s path.
+/// The worker posts this the instant a skip occurs; the main thread re-emits it
+/// as a real `console.warn` line (the load-bearing upload path) and also keeps a
+/// `DiagEvent` broadcast for structured in-process consumers. Both carry the
+/// worker's `from_peer`/`to_peer` context. Mirrors `VideoStatsMessage`'s
+/// worker->main forwarding shape, with console delivery added for field logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FreshnessSkipMessage {
     pub kind: String,

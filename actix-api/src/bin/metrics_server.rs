@@ -2676,6 +2676,35 @@ mod tests {
     }
 
     #[test]
+    fn test_client_info_published_for_battery_only_metadata() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet("s_battery", "m_battery", "alice", HashMap::new());
+        hp.client_battery_level = Some(0.42);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            series_exists(
+                "videocall_client_info",
+                &[
+                    ("meeting_id", "m_battery"),
+                    ("session_id", "s_battery"),
+                    ("display_name", "alice"),
+                    ("cores", ""),
+                    ("architecture", ""),
+                    ("gpu_family", ""),
+                    ("network_effective_type", ""),
+                    ("capability_score", ""),
+                ],
+            ),
+            "battery-only client metadata must publish CLIENT_INFO"
+        );
+    }
+
+    #[test]
     fn test_display_name_map_cleanup() {
         let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
         let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));

@@ -507,24 +507,16 @@ impl SessionLogic {
         // `(room, transport, session_id, kind)` tuple the moment this session
         // disconnects keeps the live series count bounded to active sessions.
         //
-        // LEAK-PROOF (issue #1090): we iterate the FULL fixed `kind` taxonomy
-        // [`crate::metrics::RELAY_DROP_KINDS`] UNCONDITIONALLY rather than a
-        // per-session "kinds I emitted" tracking set. `remove_label_values` on a
-        // `(…, kind)` tuple that was never created returns a benign `Err`, so
-        // the discarded result is intentional. This removes the dependency on
-        // tracking-set completeness: even if a future drop site introduces a new
-        // `kind`, adding it to `RELAY_DROP_KINDS` (the single source of truth the
-        // emit sites are documented against) keeps cleanup exhaustive — there is
-        // no second bookkeeping structure that could silently fall out of sync.
+        // LEAK-PROOF (issue #1090): `forget_session_drops` iterates the FULL fixed
+        // `kind` taxonomy [`crate::metrics::RELAY_DROP_KINDS`] UNCONDITIONALLY
+        // rather than a per-session "kinds I emitted" tracking set, so a session
+        // that only ever incremented a subset of kinds is still fully cleaned.
+        // The sweep lives in `metrics` as the single source of truth so the #1090
+        // GC test pins this exact code path rather than an inline copy of it
+        // (issue #1186): reverting this to a per-session subset would fail that
+        // test.
         let session_id = self.id.to_string();
-        for kind in crate::metrics::RELAY_DROP_KINDS {
-            let _ = crate::metrics::RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
-                &self.room,
-                &self.transport,
-                &session_id,
-                kind,
-            ]);
-        }
+        crate::metrics::forget_session_drops(&self.room, &self.transport, &session_id);
         send_connection_ended(&self.tracker_sender, self.id);
         self.addr.do_send(Disconnect {
             session: self.id,

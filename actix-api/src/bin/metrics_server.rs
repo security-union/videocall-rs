@@ -164,6 +164,25 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
 ///
 /// The caller must hold the `session_tracker` lock; the locked map is passed in to
 /// avoid re-locking (and the resulting deadlock).
+///
+/// SINGLE-REPLICA ASSUMPTION (issue #1075).
+/// This derivation is only correct when `metrics_server` runs as a **single replica**.
+/// The `session_tracker` is a per-process `Arc<Mutex<HashMap<..>>>` (see `SessionTracker`)
+/// populated from the NATS subscription, which uses the queue group
+/// `metrics-server-health-diagnostics` (see `nats_health_consumer`). A queue group
+/// load-balances each health packet to exactly ONE subscriber, so with N replicas every
+/// replica's tracker holds only the subset of sessions whose packets it happened to
+/// receive. Each replica would then write `videocall_meeting_participants{meeting_id}`
+/// for the SAME meeting with its own partial count; because they share label values,
+/// each scrape target reports a partial count and the dashboard value
+/// undercounts / flaps across replicas.
+///
+/// The production deployment IS single-replica: `helm/metrics-api/values.yaml` pins
+/// `serverStats.replicas: 1` and no per-environment override raises it, so this
+/// assumption holds today. If `metrics_server` is ever scaled to >1 replica, this gauge
+/// must be aggregated across replicas at the recording-rule layer instead (e.g. emit a
+/// per-replica partial count keyed by an instance/replica label and `sum by (meeting_id)`
+/// in a Prometheus recording rule, or move the derivation behind a single aggregator).
 fn recompute_meeting_participants(
     tracker: &HashMap<String, SessionInfo>,
     meetings: &HashSet<String>,
@@ -1301,7 +1320,16 @@ async fn nats_health_consumer(
     session_tracker: SessionTracker,
     display_name_map: DisplayNameMap,
 ) -> anyhow::Result<()> {
-    // Subscribe to all health diagnostics topics from all regions
+    // Subscribe to all health diagnostics topics from all regions.
+    //
+    // SINGLE-REPLICA ASSUMPTION (issue #1075): this is a NATS *queue group*, so each
+    // health packet is delivered to exactly ONE subscriber in the group. The per-process
+    // `session_tracker` that backs the `videocall_meeting_participants` gauge is therefore
+    // only complete when there is a single `metrics_server` replica subscribed. With >1
+    // replica the packets for one meeting fan out across replicas, each replica counts
+    // only its subset, and the gauge undercounts / flaps. Production runs single-replica
+    // (`helm/metrics-api/values.yaml` pins `serverStats.replicas: 1`). See
+    // `recompute_meeting_participants` for the aggregation strategy required to scale out.
     let queue_group = "metrics-server-health-diagnostics";
     let mut subscription = nats_client
         .queue_subscribe("health.diagnostics.>", queue_group.to_string())

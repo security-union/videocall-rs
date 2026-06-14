@@ -218,7 +218,16 @@ fn build_outbound(data: Vec<u8>, is_media: bool, is_audio: bool) -> WtOutbound {
 ///
 /// Extracted as a free function so the mapping can be unit-tested
 /// without spinning up a real `WtChatSession`.
-fn drop_kind_label(parsed: bool, is_media: bool, media_type: Option<MediaType>) -> &'static str {
+///
+/// `pub(crate)` so the metric-taxonomy coverage guard
+/// (`metrics::tests::relay_drop_kinds_covers_all_emitted_drop_labels`) can
+/// enumerate this emit site's output directly (issue #1186). Kept in lock-step
+/// with the `ws_chat_session` copy — that test asserts both copies agree.
+pub(crate) fn drop_kind_label(
+    parsed: bool,
+    is_media: bool,
+    media_type: Option<MediaType>,
+) -> &'static str {
     if !parsed {
         return "unknown";
     }

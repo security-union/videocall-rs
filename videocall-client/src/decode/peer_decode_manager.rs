@@ -1188,14 +1188,19 @@ impl Peer {
     ///     that assertion by treating this window as congested for the chooser's
     ///     purposes ONLY.
     ///
-    /// Everything else is identical to `seed_early_congestion`: the clamp to the
-    /// user's per-kind receive bounds, the `selected_*_layer` decode-guard write,
-    /// the sequence-tracker reanchor on an actual layer switch, and AUDIO being
-    /// proxied by the VIDEO downlink. The real `last_video_downlink` /
-    /// `last_screen_downlink` telemetry is deliberately LEFT UNTOUCHED — the
-    /// synthetic value is local to this call and never written back, so the next
-    /// real-sample tick (`choose`) and the early-seed path keep observing genuine
-    /// link health.
+    /// The VIDEO and SCREEN handling is identical to `seed_early_congestion`: the
+    /// clamp to the user's per-kind receive bounds, the `selected_*_layer`
+    /// decode-guard write, and the sequence-tracker reanchor on an actual layer
+    /// switch. The real `last_video_downlink` / `last_screen_downlink` telemetry is
+    /// deliberately LEFT UNTOUCHED — the synthetic value is local to this call and
+    /// never written back, so the next real-sample tick (`choose`) and the
+    /// early-seed path keep observing genuine link health.
+    ///
+    /// AUDIO is the ONE intentional divergence from `seed_early_congestion`: it is
+    /// NOT stepped down here. Audio is priority-protected (the relay's emergency
+    /// mailbox-shed exempts it too), its base-layer bitrate is small, and keeping
+    /// voice clear while video degrades is the DESIRED behavior under downlink
+    /// congestion. See the AUDIO note in the body.
     ///
     /// Because it reuses `observe_early_congestion`, a chooser already constrained
     /// (by a prior real step-down or a prior DOWNLINK_CONGESTION) returns `false`
@@ -1260,18 +1265,17 @@ impl Peer {
             seeded = true;
         }
 
-        // AUDIO — proxied by the VIDEO downlink in `seed_early_congestion`; here
-        // the synthetic sample stands in for it so audio steps down in lockstep.
-        let ah = self.audio_layer_availability.highest_available(now_ms);
-        if self
-            .audio_layer_chooser
-            .observe_early_congestion(synthetic, ah, now_ms)
-        {
-            self.selected_audio_layer = bounds
-                .for_kind(PrefMediaKind::Audio)
-                .clamp(self.audio_layer_chooser.current());
-            seeded = true;
-        }
+        // AUDIO — deliberately NOT stepped down (#1219 Half 2). This is the one
+        // intentional divergence from `seed_early_congestion` (which DOES proxy
+        // audio off the video downlink). The relay's emergency mailbox-shed
+        // (chat_server.rs `is_shed_candidate`) exempts AUDIO for the same reason:
+        // audio is priority-protected, and "video froze but voice stayed clear"
+        // is the DESIRED degradation under downlink congestion, not a bug. Audio's
+        // base-layer bitrate is small relative to video, so holding it costs
+        // little bandwidth while preserving the call's usability. Stepping audio
+        // down here would fight the very goal of #1219 (don't make the experience
+        // worse than it has to be). The audio chooser still adapts on its own via
+        // the normal `tick_audio_layer_chooser` path if real loss appears.
 
         seeded
     }
@@ -6255,6 +6259,30 @@ mod tests {
             desired.get(&(700, PrefMediaKind::Video)).copied(),
             Some(1),
             "DOWNLINK_CONGESTION must advertise video stepped down to layer 1"
+        );
+
+        // AUDIO PROTECTION (#1219 Half 2): audio is priority-protected and must
+        // NOT be stepped down by the DOWNLINK_CONGESTION seed — only video/screen
+        // are. The initial clean `tick_layer_choosers(1500)` brought the audio
+        // chooser to the top (2) too; the seed must have LEFT it there, and the
+        // published map must carry NO audio entry.
+        //
+        // MUTATION CHECK: re-add an audio `observe_early_congestion` branch to
+        // `Peer::seed_downlink_congestion` and this fails — audio drops to 1 and an
+        // audio entry appears in `desired`.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "audio must stay at the top — DOWNLINK_CONGESTION does not shed audio"
+        );
+        assert_eq!(
+            desired.get(&(700, PrefMediaKind::Audio)).copied(),
+            None,
+            "DOWNLINK_CONGESTION must advertise NO audio preference (audio protected)"
         );
     }
 

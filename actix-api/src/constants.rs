@@ -750,6 +750,19 @@ pub const DOWNLINK_CONGESTION_DROP_THRESHOLD: u32 = 10;
 /// spans roughly 600 ms of clean drain at typical packet rates. This is long
 /// enough to be confident the stall was transient, short enough to restore full
 /// quality within ~1 second of recovery.
+///
+/// DELIBERATE TRADEOFF — recovery is STRICTLY CONSECUTIVE (any single `Full`
+/// drop resets the success streak to 0 in `DownlinkShedState::on_full_drop`).
+/// On a chronically lossy downlink that drops, say, one packet every ~40 sends,
+/// the receiver may NEVER accumulate 50 clean-in-a-row and so stays in
+/// relay-side shedding (base-layer-only video) for an extended period. This is
+/// INTENTIONAL and fail-safe: such a link genuinely cannot sustain the upper
+/// layers, audio is never shed (priority-protected), and the base layer is
+/// always forwarded, so the call stays usable. A windowed/decaying success
+/// count would recover more gracefully on steady-low-loss links but risks
+/// flapping; the consecutive rule is the conservative choice. Do NOT switch to
+/// a windowed count without a netsim sweep (#1080 rig) confirming it does not
+/// oscillate on a marginal link.
 pub const DOWNLINK_CONGESTION_SUCCESS_WINDOW: u32 = 50;
 
 #[cfg(test)]

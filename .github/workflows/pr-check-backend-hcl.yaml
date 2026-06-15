@@ -35,17 +35,16 @@ jobs:
   test:
     name: cargo tests
     runs-on: [self-hosted, linux, x64, hcl-ci]
-    # 35, not 20 (#1247): on a cold-cargo-cache runner this job legitimately
-    # exceeds 20 min even though every test PASSES. Verified on PR #1400's red
-    # check (run 189279, videocallci-3): the on-path `docker system prune -af`
-    # cost ~3 min (02:07:54->02:10:45, reclaimed 10.57 GB — it did NOT fail, and
-    # the disk was healthy at 203 GB free) and the workspace then cold-compiled
-    # (`hkdf` rebuilt 4x under CARGO_INCREMENTAL=0); at the 20-min cap the suite
-    # was still mid-run with 0 failures. So 20 min was producing FALSE reds on a
-    # green suite. 35 covers the cold-cache + on-path-prune worst case with
-    # headroom; warm-cache runs finish well under it. Tunable back down once the
-    # heavier fixes land (move the prune to the scheduled ci-host-janitor so it's
-    # off the test critical path, and/or sccache) — tracked in #1247.
+    # 35, not 20 (#1247) — a BACKSTOP, not the fix. The real fixes are in this PR: the
+    # ~3-min on-path `docker system prune` is now GATED (skipped unless disk < 50 GiB) and
+    # cache-preserving (see the "Free disk space" step), and the daily ci-host-janitor owns
+    # steady-state cleanup — so the common run no longer pays prune cost and builds stay warm.
+    # 20 min was still producing FALSE reds on a GREEN suite though (verified on PR #1400's
+    # red check, run 189279/videocallci-3: 0 failures, killed mid-run at the cap): the
+    # remaining slowness is a cold CARGO compile (`hkdf` rebuilt 4x under CARGO_INCREMENTAL=0,
+    # host-side target not cached), which is independent of docker. 35 gives that cold-compile
+    # case headroom; warm runs finish well under it. Tunable back to ~20 once a cargo target
+    # cache / sccache lands — tracked in #1247.
     timeout-minutes: 35
     concurrency:
       group: hcl-ci-backend
@@ -106,29 +105,22 @@ jobs:
         # the *previous* tagged dev image orphaned (untagged-by-overwrite or
         # simply no longer referenced), and the BuildKit cache grows unbounded.
         #
-        # ESCALATION: a prior dangling-only prune (`docker image prune -f` +
-        # `docker builder prune -f`) was validated in CI and freed essentially
-        # nothing — the root disk was 100% full (500G/500G before AND after).
-        # The 500G is held by *tagged but unused* images (orphaned Nix dev
-        # images) that dangling-only pruning cannot touch. So we escalate to
-        # `docker system prune -af`.
+        # APPROACH (#1247): the daily `ci-host-janitor-hcl.yaml` now OWNS steady-state
+        # daemon-wide cleanup — it reclaims the real hog (orphaned *tagged but unused* Nix
+        # dev images, which dangling-only pruning cannot touch) with `image prune -af`, and
+        # bounds the BuildKit cache (`builder prune --filter until=168h`) instead of nuking it.
+        # This per-job step is therefore only a GATED safety net (see the run block): it prunes
+        # ONLY when the disk is already tight (< 50 GiB free), and even then uses that SAME
+        # cache-preserving image + bounded-builder prune — NOT `docker system prune -af`.
         #
-        # SHARED, SELF-HOSTED RUNNER SAFETY:
-        # This host runs 4 hcl-ci runners against ONE docker daemon.
-        #   * `-af` removes ALL images not *currently in use* by a container
-        #     (plus stopped containers, unused networks, and build cache).
-        #     "Unused" means not referenced by a running/created container —
-        #     so every other concurrent job's running containers AND their
-        #     images are preserved. A concurrent job that merely *expected* a
-        #     cached image it isn't actively running will re-pull/rebuild it:
-        #     slower, not broken.
-        #   * `--volumes` is deliberately OMITTED. Named volumes (postgres/nats
-        #     data, the Nix store and cargo caches used by other runners) are
-        #     NEVER deleted by this step. Volume reclamation stays scoped to
-        #     the per-runner steps above (`compose down -v` + `volume prune`).
-        # The `df -h` / `docker system df` brackets give visibility into how
-        # much was reclaimed; `|| true` ensures a cleanup hiccup never fails
-        # the test job.
+        # Why this changed: the old step ran `system prune -af` UNCONDITIONALLY (every job,
+        # even at 173 GiB free), which (a) cost ~3 min on the test critical path — a top
+        # contributor to the 20-min timeout — and (b) nuked the shared BuildKit cache that all
+        # 4 co-located hcl-ci runners reuse, forcing cold multi-GB Nix image rebuilds. Gating
+        # it + dropping the cache-nuke fixes both. `--volumes` stays OMITTED (postgres/nats
+        # data + the Nix store / cargo caches are never touched here; volume reclamation is the
+        # per-runner `compose down -v` + `volume prune` steps above). The `df`/`docker system df`
+        # brackets give before/after visibility; cleanup is loud-on-failure (no bare `|| true`).
         #
         # LEAKED CHROMIUM TEMP DIRS (the failure this job actually died from):
         # The Playwright/Chromium E2E jobs (`e2e-hcl.yaml`) run on this SAME
@@ -185,12 +177,28 @@ jobs:
             || sudo -n find /tmp -maxdepth 1 -name "org.chromium.Chromium.scoped_dir.*" -type d -mmin +1440 -exec rm -rf {} + 2>/dev/null \
             || echo "::warning::Chromium /tmp sweep failed (no passwordless sudo?) — stale browser temp dirs not reclaimed; see #1247"
 
-          echo "=== Pruning ALL unused images + stopped containers + networks + build cache (volumes preserved) ==="
-          # sudo-less FIRST, NON-INTERACTIVE sudo fallback (`-n` => fail fast, no
-          # password hang), then LOUD warning. No bare `|| true` — see #1247.
-          docker system prune -af \
-            || sudo -n docker system prune -af \
-            || echo "::warning::docker system prune FAILED (no passwordless sudo and runner not in docker group?) — disk NOT reclaimed; cargo tests may OOD. Host needs NOPASSWD docker or runner in docker group; see #1247"
+          # GATED, cache-PRESERVING prune (#1247). The daily ci-host-janitor now owns
+          # steady-state daemon-wide cleanup; this per-job step only intervenes when the disk
+          # is genuinely tight, so the common run pays NO prune cost and the shared BuildKit
+          # cache the other 3 co-located runners reuse is preserved.
+          #   * Gate at 50 GiB free (2x the 25 GiB ENOSPC headroom floor): skip entirely when
+          #     there's room. The old code pruned UNCONDITIONALLY — ~3 min even at 173 GiB
+          #     free — a top contributor to the 20-min timeout.
+          #   * When it fires, use `image prune -af` (reclaims orphaned *tagged* Nix dev
+          #     images — the real hog) + a BOUNDED `builder prune --filter until=168h` (trim
+          #     >7d cache, keep recent warm), NOT `system prune -af` whose build-cache nuke
+          #     forced cold multi-GB Nix rebuilds.
+          #   * sudo-less FIRST, NON-INTERACTIVE `sudo -n` fallback, then a LOUD warning —
+          #     never a bare `|| true` (see #1247).
+          gate_kib=$((50 * 1024 * 1024))
+          if [ "$before_kib" -lt "$gate_kib" ]; then
+            echo "=== Disk tight (< 50 GiB free) — reclaiming unused images + bounding build cache (cache-preserving) ==="
+            ( docker image prune -af && docker builder prune -f --filter until=168h ) \
+              || ( sudo -n docker image prune -af && sudo -n docker builder prune -f --filter until=168h ) \
+              || echo "::warning::docker prune FAILED (no passwordless sudo and runner not in docker group?) — disk NOT reclaimed; cargo tests may OOD. Host needs NOPASSWD docker or runner in docker group; see #1247"
+          else
+            echo "Disk healthy ($((before_kib / 1024 / 1024)) GiB free >= 50 GiB) — skipping prune to preserve the shared BuildKit cache; daily ci-host-janitor owns steady-state cleanup."
+          fi
 
           echo "=== Disk usage AFTER cleanup ==="
           df -h || true

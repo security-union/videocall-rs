@@ -489,6 +489,12 @@ test.describe("Screen share right panel layout", () => {
       uiURL,
     );
     await guest1Ctx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+    // Enable camera on all guests so they publish real video. The prejoin
+    // camera defaults to OFF; without this the peers join camera-off and
+    // is_video_enabled_for_peer returns false → plain "Video Disabled"
+    // placeholder instead of the --paused avatar we're testing.
+    // (Pattern: simulcast-per-receiver.spec.ts:343, signal-quality-peer-transport.spec.ts:58)
+    await guest1Ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
 
     const guest2Ctx = await createAuthenticatedContext(
       browser3,
@@ -496,6 +502,7 @@ test.describe("Screen share right panel layout", () => {
       "SSBudgetGuest2",
       uiURL,
     );
+    await guest2Ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
 
     const guest3Ctx = await createAuthenticatedContext(
       browser4,
@@ -503,6 +510,7 @@ test.describe("Screen share right panel layout", () => {
       "SSBudgetGuest3",
       uiURL,
     );
+    await guest3Ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
 
     const hostPage = await hostCtx.newPage();
     const guest1Page = await guest1Ctx.newPage();
@@ -531,6 +539,14 @@ test.describe("Screen share right panel layout", () => {
       // Wait for all 3 remote peer tiles to appear on the host.
       const gridTiles = hostPage.locator("#grid-container .grid-item");
       await expect(gridTiles.nth(2)).toBeVisible({ timeout: 30_000 });
+
+      // Precondition: verify the host sees live peer video (canvases) before
+      // entering screen share. If cameras didn't publish, canvasCount = 0
+      // and the paused-avatar assertion below would fail for the wrong reason.
+      const liveCanvases = hostPage.locator(".grid-item canvas");
+      await expect(liveCanvases.first()).toBeVisible({ timeout: 15_000 });
+      const preSSCanvasCount = await liveCanvases.count();
+      expect(preSSCanvasCount).toBeGreaterThanOrEqual(2);
 
       // Guest 1 starts screen sharing → host sees SS split layout.
       const shareActivated = await startScreenShare(guest1Page, hostPage);

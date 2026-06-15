@@ -53,7 +53,8 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
-    RELAY_CONGESTION_FILTERED_TOTAL, RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
+    RELAY_CONGESTION_FILTERED_TOTAL, RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL,
+    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
     RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
     RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
@@ -4615,9 +4616,11 @@ fn handle_msg(
         // DOWNLINK_CONGESTION unicast filter (#1219 Half 2). Same model as the
         // CONGESTION filter above: relay-authored, self-addressed to a specific
         // receiver. Drop for every other session in the room — only the target
-        // receiver needs to see it.
+        // receiver needs to see it. Counted on its OWN metric (not the CONGESTION
+        // sibling) so the two relay-authored unicast packet classes stay
+        // distinguishable on dashboards.
         if is_downlink_congestion && !subject_self && !inner_session_self {
-            RELAY_CONGESTION_FILTERED_TOTAL
+            RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
                 .with_label_values(&[&room])
                 .inc();
             return Ok(());

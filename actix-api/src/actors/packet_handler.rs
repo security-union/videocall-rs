@@ -1027,6 +1027,25 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_downlink_congestion_packet_as_dropped() {
+        // #1219 Half 2: DOWNLINK_CONGESTION is relay-authored-only (the relay
+        // emits it on a receiver's own subject when that receiver's mailbox
+        // drops cross the threshold). A client-sent one is always forged and is
+        // the PRIMARY trust boundary for the signal: if accepted and reflected,
+        // a malicious client could trick OTHER receivers into stepping their
+        // video layers down (denial-of-quality). It must be dropped at ingest —
+        // symmetric with the CONGESTION and LAYER_HINT drops above. This test
+        // pins that drop: deleting the guard in `classify_packet` must fail here.
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::DOWNLINK_CONGESTION.into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+    }
+
+    #[test]
     fn test_classify_keyframe_request() {
         // Build a KEYFRAME_REQUEST aimed at "alice" so we can also verify
         // that the inner MediaPacket.user_id is propagated through to the

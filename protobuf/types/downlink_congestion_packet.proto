@@ -5,9 +5,9 @@ syntax = "proto3";
 //
 // Carried inside a PacketWrapper whose `packet_type` is DOWNLINK_CONGESTION.
 // The relay emits this when a receiver's inbound fan-out mailbox has been
-// dropping packets (consecutive drops cross the MAILBOX_DROP_THRESHOLD). The
-// receiver should reduce its layer preferences to adapt to available downlink
-// bandwidth.
+// dropping packets (consecutive drops cross DOWNLINK_CONGESTION_DROP_THRESHOLD).
+// The receiver should reduce its layer preferences to adapt to available
+// downlink bandwidth.
 //
 // SCOPE: there is intentionally NO source/session id in this message. The
 // packet is delivered on the RECEIVER's OWN per-session subject

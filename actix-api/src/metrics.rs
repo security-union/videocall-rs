@@ -1696,6 +1696,25 @@ lazy_static! {
         &["transport"]
     )
     .expect("Failed to create relay_downlink_shed_total metric");
+
+    /// DOWNLINK_CONGESTION control packets dropped by the relay's unicast filter
+    /// because they did not target the receiving session (#1219 Half 2).
+    ///
+    /// The relay publishes DOWNLINK_CONGESTION on the target receiver's OWN
+    /// per-session subject, but the `room.{room}.*` NATS wildcard fans every
+    /// packet out to every session; this counts the non-target copies dropped
+    /// before they reach a transport. Kept SEPARATE from
+    /// `relay_congestion_filtered_total` (the sender-keyed CONGESTION sibling) so
+    /// the two relay-authored unicast packet classes stay distinguishable on the
+    /// dashboards — they have different root causes and fan-out shapes.
+    ///
+    /// CARDINALITY: bounded — `room` only, same as the CONGESTION sibling.
+    pub static ref RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_congestion_filtered_total",
+        "DOWNLINK_CONGESTION packets dropped by the unicast filter (not targeting this session) (#1219)",
+        &["room"]
+    )
+    .expect("Failed to create relay_downlink_congestion_filtered_total metric");
 }
 
 // =============================================================================

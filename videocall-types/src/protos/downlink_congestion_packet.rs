@@ -29,9 +29,9 @@ const _PROTOBUF_VERSION_CHECK: () = ::protobuf::VERSION_3_7_2;
 ///
 ///  Carried inside a PacketWrapper whose `packet_type` is DOWNLINK_CONGESTION.
 ///  The relay emits this when a receiver's inbound fan-out mailbox has been
-///  dropping packets (consecutive drops cross the MAILBOX_DROP_THRESHOLD). The
-///  receiver should reduce its layer preferences to adapt to available downlink
-///  bandwidth.
+///  dropping packets (consecutive drops cross DOWNLINK_CONGESTION_DROP_THRESHOLD).
+///  The receiver should reduce its layer preferences to adapt to available
+///  downlink bandwidth.
 ///
 ///  SCOPE: there is intentionally NO source/session id in this message. The
 ///  packet is delivered on the RECEIVER's OWN per-session subject
@@ -151,16 +151,16 @@ impl ::protobuf::reflect::ProtobufValue for DownlinkCongestionPacket {
 
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n&types/downlink_congestion_packet.proto\"\x1a\n\x18DownlinkCongestionP\
-    acketJ\xb1\x0b\n\x06\x12\x04\0\0\x1b\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\
-    \n\x90\x0b\n\x02\x04\0\x12\x04\x18\0\x1b\x01\x1a\xe7\t\x20Relay\x20->\
+    acketJ\xb9\x0b\n\x06\x12\x04\0\0\x1b\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\
+    \n\x98\x0b\n\x02\x04\0\x12\x04\x18\0\x1b\x01\x1a\xef\t\x20Relay\x20->\
     \x20receiver\x20control\x20payload\x20(#1219\x20Half\x202;\x20receiver\
     \x20downlink\x20congestion\n\x20signal).\n\n\x20Carried\x20inside\x20a\
     \x20PacketWrapper\x20whose\x20`packet_type`\x20is\x20DOWNLINK_CONGESTION\
     .\n\x20The\x20relay\x20emits\x20this\x20when\x20a\x20receiver's\x20inbou\
     nd\x20fan-out\x20mailbox\x20has\x20been\n\x20dropping\x20packets\x20(con\
-    secutive\x20drops\x20cross\x20the\x20MAILBOX_DROP_THRESHOLD).\x20The\n\
-    \x20receiver\x20should\x20reduce\x20its\x20layer\x20preferences\x20to\
-    \x20adapt\x20to\x20available\x20downlink\n\x20bandwidth.\n\n\x20SCOPE:\
+    secutive\x20drops\x20cross\x20DOWNLINK_CONGESTION_DROP_THRESHOLD).\n\x20\
+    The\x20receiver\x20should\x20reduce\x20its\x20layer\x20preferences\x20to\
+    \x20adapt\x20to\x20available\n\x20downlink\x20bandwidth.\n\n\x20SCOPE:\
     \x20there\x20is\x20intentionally\x20NO\x20source/session\x20id\x20in\x20\
     this\x20message.\x20The\n\x20packet\x20is\x20delivered\x20on\x20the\x20R\
     ECEIVER's\x20OWN\x20per-session\x20subject\n\x20(room.{room}.{receiver_s\

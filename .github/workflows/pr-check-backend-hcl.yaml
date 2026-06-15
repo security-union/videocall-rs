@@ -1,6 +1,7 @@
 name: Backend Tests (HCL)
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [hcl-main, PR-staging]
     paths:
@@ -223,11 +224,57 @@ jobs:
         working-directory: backend-repo
         run: scripts/regen-dev-cert.sh --force
 
+      - name: Set up sccache build cache (best-effort; #1414 / #1247)
+        # Warms the cold cargo compile that remains after the prune was gated (deps like hkdf
+        # rebuilt from scratch under CARGO_INCREMENTAL=0). The per-runner CARGO_TARGET_DIR on
+        # the test step only stays warm on the SAME runner; sccache adds a HOST-SHARED cache so
+        # a PR landing on any of the 4 co-located hcl-ci runners hits a warm cache (sccache hits
+        # are content-addressed, so concurrent sharing across runners is safe). SCCACHE_CACHE_SIZE
+        # bounds it so the cache can't refill the disk (the #1247 concern); the gated prune never
+        # touches SCCACHE_DIR. sccache requires CARGO_INCREMENTAL=0 — already set in the job env.
+        #
+        # BEST-EFFORT: `set +e` + `exit 0` mean any failure (binary missing / download blocked)
+        # just leaves RUSTC_WRAPPER unset and the build runs exactly as before — NO regression.
+        # The pinned musl binary + URL + inner path were verified against the v0.15.0 release.
+        run: |
+          set +e
+          bin=/var/lib/ci/bin/sccache
+          ver=v0.15.0
+          mkdir -p /var/lib/ci/bin /var/lib/ci/sccache
+          scc="$(command -v sccache)"; { [ -z "$scc" ] && [ -x "$bin" ]; } && scc="$bin"
+          if [ -z "$scc" ]; then
+            url="https://github.com/mozilla/sccache/releases/download/${ver}/sccache-${ver}-x86_64-unknown-linux-musl.tar.gz"
+            if curl -fsSL "$url" -o /tmp/sccache.tgz && tar -xzf /tmp/sccache.tgz -C /tmp; then
+              install -m0755 "/tmp/sccache-${ver}-x86_64-unknown-linux-musl/sccache" "$bin" && scc="$bin"
+            fi
+          fi
+          if [ -n "$scc" ] && "$scc" --version >/dev/null 2>&1; then
+            {
+              echo "RUSTC_WRAPPER=$scc"
+              echo "SCCACHE_DIR=/var/lib/ci/sccache"
+              echo "SCCACHE_CACHE_SIZE=20G"
+              echo "SCCACHE_IDLE_TIMEOUT=0"
+            } >> "$GITHUB_ENV"
+            echo "sccache enabled: $("$scc" --version)"
+          else
+            echo "::warning::sccache unavailable — building without the cache wrapper (no regression); see #1414"
+          fi
+          exit 0
+
       - name: Run backend tests
         working-directory: backend-repo
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: make tests_run
+
+      - name: sccache stats
+        if: always()
+        # Hit-rate visibility (and proof the cache engaged). Non-fatal; no-op when sccache
+        # wasn't set up (RUSTC_WRAPPER unset).
+        run: |
+          set +e
+          [ -n "${RUSTC_WRAPPER:-}" ] && "$RUSTC_WRAPPER" --show-stats
+          exit 0
 
       - name: Teardown
         if: always()

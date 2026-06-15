@@ -545,3 +545,34 @@ async fn creator_keeps_host_on_leave_when_eohl_off() {
 
     cleanup_test_data(&pool, room_id).await;
 }
+
+/// Host-last-out pin: with end_on_host_leave=OFF, the host leaving
+/// as the SOLE admitted participant must keep the meeting alive. This is the
+/// path the collapsed leave logic broke — it dropped Rule (b) and fell through
+/// to the empty-room end (`count_admitted == 0 → end`). Here the host is
+/// alone, so `count_admitted` becomes 0 on leave: only Rule (b) keeps it alive.
+#[tokio::test]
+#[serial]
+async fn eohl_off_sole_host_leave_keeps_meeting_alive() {
+    let pool = get_test_pool().await;
+    let room_id = "test-eohl-off-sole-host-leave-keeps";
+    cleanup_test_data(&pool, room_id).await;
+    create_meeting_with_eohl(&pool, room_id, false).await;
+    // Only the host joins — they are the single admitted participant.
+    join(&pool, room_id, HOST).await;
+
+    let resp = leave(&pool, room_id, HOST).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_ne!(
+        fetch_meeting_state(&pool, room_id).await.as_deref(),
+        Some("ended"),
+        "eohl=off: the sole host leaving must NOT end the meeting (Rule b), \
+         even though the room is now empty"
+    );
+    assert!(
+        fetch_is_host(&pool, room_id, HOST).await,
+        "eohl=off: the host keeps is_host after leaving so a rejoin returns them as host"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}

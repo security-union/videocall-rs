@@ -3079,8 +3079,19 @@ impl Inner {
                                 "Received HOST_GRANTED: room={}, target=\"{}\"",
                                 meeting_packet.room_id, target_str
                             );
-                            if let Some(cb) = &self.options.on_host_granted {
-                                cb.emit(target_str);
+                            // Dedup across dual-transport overlap (WebTransport +
+                            // WebSocket both deliver the same packet during failover),
+                            // matching the other host-action events. Without this the
+                            // UI fires the host-change toast twice.
+                            if !self.is_duplicate_host_action("host_granted", &target_str) {
+                                if let Some(cb) = &self.options.on_host_granted {
+                                    cb.emit(target_str);
+                                }
+                            } else {
+                                debug!(
+                                    "Suppressed duplicate HOST_GRANTED for target=\"{}\"",
+                                    target_str
+                                );
                             }
                         }
                         Ok(MeetingEventType::HOST_REVOKED) => {
@@ -3090,8 +3101,17 @@ impl Inner {
                                 "Received HOST_REVOKED: room={}, target=\"{}\"",
                                 meeting_packet.room_id, target_str
                             );
-                            if let Some(cb) = &self.options.on_host_revoked {
-                                cb.emit(target_str);
+                            // Dedup across dual-transport overlap, matching HOST_GRANTED
+                            // and the other host-action events.
+                            if !self.is_duplicate_host_action("host_revoked", &target_str) {
+                                if let Some(cb) = &self.options.on_host_revoked {
+                                    cb.emit(target_str);
+                                }
+                            } else {
+                                debug!(
+                                    "Suppressed duplicate HOST_REVOKED for target=\"{}\"",
+                                    target_str
+                                );
                             }
                         }
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {

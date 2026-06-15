@@ -803,7 +803,11 @@ pub fn generate_for_peer(
                             }
                         }
                         // Three-dot host control menu (visible on hover, only for host)
-                        if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
+                        if on_mute.is_some()
+                            || on_disable_video.is_some()
+                            || on_kick.is_some()
+                            || on_transfer_host.is_some()
+                        {
                             {
                                 rsx! {
                                     div { class: "tile-mute-menu-wrapper",
@@ -993,7 +997,11 @@ pub fn generate_for_peer(
                             }
                         }
                         // Three-dot host control menu (visible on hover, only for host)
-                        if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
+                        if on_mute.is_some()
+                            || on_disable_video.is_some()
+                            || on_kick.is_some()
+                            || on_transfer_host.is_some()
+                        {
                             {
                                 rsx! {
                                     div { class: "tile-mute-menu-wrapper",
@@ -1300,7 +1308,11 @@ pub fn generate_for_peer(
                                 }
                             }
                             // Three-dot host control menu (visible on hover, only for host)
-                            if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
+                            if on_mute.is_some()
+                                || on_disable_video.is_some()
+                                || on_kick.is_some()
+                                || on_transfer_host.is_some()
+                            {
                                 {
                                     rsx! {
                                         div { class: "tile-mute-menu-wrapper",

@@ -308,22 +308,22 @@ pub async fn transfer_host(
     }
 
     // Promotion event first so no client observes a transient hostless gap.
-    nats_events::publish_host_granted(state.nats.as_ref(), &meeting_id, &body.user_id, &user_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                "NATS publish failed for HOST_GRANTED (transfer) in room {meeting_id}: {e}"
-            );
-            AppError::internal("failed to broadcast host-granted event")
-        })?;
-    nats_events::publish_host_revoked(state.nats.as_ref(), &meeting_id, &user_id, &user_id)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                "NATS publish failed for HOST_REVOKED (transfer) in room {meeting_id}: {e}"
-            );
-            AppError::internal("failed to broadcast host-revoked event")
-        })?;
+    if let Err(e) =
+        nats_events::publish_host_granted(state.nats.as_ref(), &meeting_id, &body.user_id, &user_id)
+            .await
+    {
+        tracing::error!(
+            "NATS publish failed for HOST_GRANTED (transfer) in room {meeting_id}: {e}"
+        );
+    }
+    if let Err(e) =
+        nats_events::publish_host_revoked(state.nats.as_ref(), &meeting_id, &user_id, &user_id)
+            .await
+    {
+        tracing::error!(
+            "NATS publish failed for HOST_REVOKED (transfer) in room {meeting_id}: {e}"
+        );
+    }
 
     // Two internal fanout events so chat_server updates both users' cached
     // is_host flags across all sessions: target true, caller false.

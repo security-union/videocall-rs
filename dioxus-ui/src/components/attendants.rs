@@ -1308,25 +1308,34 @@ pub fn AttendantsComponent(
                     })));
                 }
             })),
-            on_participant_kicked: Some(VcCallback::from(move |_: ()| {
-                let mut meeting_ended_message = meeting_ended_message;
-                let mut mic_enabled = mic_enabled;
-                let mut video_enabled = video_enabled;
-                let mut pending_mic_enable = pending_mic_enable;
-                let mut pending_video_enable = pending_video_enable;
-                let mut screen_share_state = screen_share_state;
-                meeting_ended_message.set(Some(
-                    "You have been removed from the meeting by the host.".to_string(),
-                ));
-                mic_enabled.set(false);
-                video_enabled.set(false);
-                pending_mic_enable.set(false);
-                pending_video_enable.set(false);
-                screen_share_state.set(ScreenShareState::Idle);
-                log::info!("PARTICIPANT_KICKED: removed from meeting by host");
-                if let Some(client) = client_for_kick.borrow().as_ref() {
-                    if let Err(e) = client.disconnect() {
-                        log::warn!("PARTICIPANT_KICKED: disconnect failed: {e}");
+            on_participant_kicked: Some(VcCallback::from({
+                let self_uid = user_id_for_host_events.clone();
+                move |_: ()| {
+                    if host_set_signal.peek().contains(&self_uid) {
+                        log::warn!(
+                            "PARTICIPANT_KICKED: ignored — local user is currently the host"
+                        );
+                        return;
+                    }
+                    let mut meeting_ended_message = meeting_ended_message;
+                    let mut mic_enabled = mic_enabled;
+                    let mut video_enabled = video_enabled;
+                    let mut pending_mic_enable = pending_mic_enable;
+                    let mut pending_video_enable = pending_video_enable;
+                    let mut screen_share_state = screen_share_state;
+                    meeting_ended_message.set(Some(
+                        "You have been removed from the meeting by the host.".to_string(),
+                    ));
+                    mic_enabled.set(false);
+                    video_enabled.set(false);
+                    pending_mic_enable.set(false);
+                    pending_video_enable.set(false);
+                    screen_share_state.set(ScreenShareState::Idle);
+                    log::info!("PARTICIPANT_KICKED: removed from meeting by host");
+                    if let Some(client) = client_for_kick.borrow().as_ref() {
+                        if let Err(e) = client.disconnect() {
+                            log::warn!("PARTICIPANT_KICKED: disconnect failed: {e}");
+                        }
                     }
                 }
             })),

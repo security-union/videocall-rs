@@ -1135,27 +1135,37 @@ impl HealthReporter {
                         let active_rtt = Weak::upgrade(&active_server_rtt_ms)
                             .and_then(|rc| rc.try_borrow().ok().and_then(|v| *v));
 
-                        // Get communication metrics from connection controller
-                        let (send_queue_bytes, packets_received_per_sec, packets_sent_per_sec) =
-                            if let Some(cc_rc) = Weak::upgrade(&connection_controller) {
-                                if let Ok(cc_opt) = cc_rc.try_borrow() {
-                                    if let Some(cc) = cc_opt.as_ref() {
-                                        // Calculate latest packet rates
-                                        cc.calculate_packet_rates();
-                                        (
-                                            cc.get_send_queue_depth(),
-                                            Some(cc.get_packets_received_per_sec()),
-                                            Some(cc.get_packets_sent_per_sec()),
-                                        )
-                                    } else {
-                                        (None, None, None)
-                                    }
+                        // Get communication metrics from connection controller.
+                        // #522: also read the RTT-probe resilience counters
+                        // (cumulative since process start) so they can be emitted
+                        // on the health packet.
+                        let (
+                            send_queue_bytes,
+                            packets_received_per_sec,
+                            packets_sent_per_sec,
+                            rtt_probe_dropped_total,
+                            rtt_probe_stale_suppressions_total,
+                        ) = if let Some(cc_rc) = Weak::upgrade(&connection_controller) {
+                            if let Ok(cc_opt) = cc_rc.try_borrow() {
+                                if let Some(cc) = cc_opt.as_ref() {
+                                    // Calculate latest packet rates
+                                    cc.calculate_packet_rates();
+                                    (
+                                        cc.get_send_queue_depth(),
+                                        Some(cc.get_packets_received_per_sec()),
+                                        Some(cc.get_packets_sent_per_sec()),
+                                        cc.rtt_probe_dropped_total(),
+                                        cc.rtt_probe_stale_suppressions_total(),
+                                    )
                                 } else {
-                                    (None, None, None)
+                                    (None, None, None, 0, 0)
                                 }
                             } else {
-                                (None, None, None)
-                            };
+                                (None, None, None, 0, 0)
+                            }
+                        } else {
+                            (None, None, None, 0, 0)
+                        };
 
                         // Read encoder decision inputs from shared atomics (f32 bits → f64).
                         let queue_depth_report_val = f32::from_bits(
@@ -1258,6 +1268,8 @@ impl HealthReporter {
                             drained_dwells,
                             connection_handshake_failures(),
                             connection_session_drops(),
+                            rtt_probe_dropped_total,
+                            rtt_probe_stale_suppressions_total,
                             [
                                 reelection_proceeded_total(),
                                 reelection_aborted_total(),
@@ -1323,6 +1335,10 @@ impl HealthReporter {
         dwell_samples: Vec<(String, f64)>,
         handshake_failures_total: u64,
         session_drops_total: u64,
+        // RTT-probe resilience signals (#522), read from the ConnectionManager
+        // via the connection controller. Cumulative since process start.
+        rtt_probe_dropped_total: u64,
+        rtt_probe_stale_suppressions_total: u64,
         // Cumulative re-election outcome totals (Tier B #3), in the fixed order
         // [proceeded, aborted, preserved, failed]. Cumulative since process
         // start — the relay maps these onto a GaugeVec it .set()s, so the
@@ -1499,6 +1515,15 @@ impl HealthReporter {
         }
         if session_drops_total > 0 {
             pb.connection_session_drops_total = Some(session_drops_total);
+        }
+
+        // RTT-probe resilience signals (#522). Cumulative, gated on > 0 like the
+        // connection-loss counters above.
+        if rtt_probe_dropped_total > 0 {
+            pb.rtt_probe_dropped_total = Some(rtt_probe_dropped_total);
+        }
+        if rtt_probe_stale_suppressions_total > 0 {
+            pb.rtt_probe_stale_suppressions_total = Some(rtt_probe_stale_suppressions_total);
         }
 
         // Re-election outcome counters (Tier B #3). Only attach a field when its
@@ -2119,6 +2144,8 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -2197,6 +2224,8 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -2208,6 +2237,109 @@ mod tests {
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #522: build a HealthPacket through the production path with the given
+    /// RTT-probe resilience counters, then round-trip it through protobuf so the
+    /// assertions are on exactly what goes on the wire. The two counters are
+    /// threaded into the `rtt_probe_dropped_total` / `rtt_probe_stale_suppressions_total`
+    /// positional args (immediately after `session_drops_total`, before the
+    /// reelection-totals array) — the same positions the production call site
+    /// fills from the connection controller.
+    fn health_packet_with_rtt_probe_signals(
+        rtt_probe_dropped_total: u64,
+        rtt_probe_stale_suppressions_total: u64,
+    ) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_queue_depth_report
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0, // handshake_failures_total
+            0, // session_drops_total
+            rtt_probe_dropped_total,
+            rtt_probe_stale_suppressions_total,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #522: nonzero RTT-probe resilience counters must be emitted on the wire as
+    /// the protobuf optional fields with exactly the values passed in.
+    ///
+    /// MUTATION: deleting either `pb.rtt_probe_dropped_total = Some(...)` or
+    /// `pb.rtt_probe_stale_suppressions_total = Some(...)` assignment in
+    /// `create_health_packet` makes the corresponding field decode as `None`,
+    /// failing the matching `Some(7)` / `Some(3)` assertion below.
+    #[test]
+    fn create_health_packet_emits_nonzero_rtt_probe_signals() {
+        let pb = health_packet_with_rtt_probe_signals(7, 3);
+        assert_eq!(
+            pb.rtt_probe_dropped_total,
+            Some(7),
+            "nonzero rtt_probe_dropped_total must round-trip as Some(7)"
+        );
+        assert_eq!(
+            pb.rtt_probe_stale_suppressions_total,
+            Some(3),
+            "nonzero rtt_probe_stale_suppressions_total must round-trip as Some(3)"
+        );
+    }
+
+    /// #522: zero counters must be omitted (gated on `> 0`), so they decode as
+    /// `None` — keeping the common-case packet small.
+    ///
+    /// MUTATION: removing the `> 0` gate (always assigning `Some`) makes these
+    /// fields decode as `Some(0)`, failing the `None` assertions below.
+    #[test]
+    fn create_health_packet_omits_zero_rtt_probe_signals() {
+        let pb = health_packet_with_rtt_probe_signals(0, 0);
+        assert_eq!(
+            pb.rtt_probe_dropped_total, None,
+            "zero rtt_probe_dropped_total must be omitted (None) per the > 0 gate"
+        );
+        assert_eq!(
+            pb.rtt_probe_stale_suppressions_total, None,
+            "zero rtt_probe_stale_suppressions_total must be omitted (None) per the > 0 gate"
+        );
     }
 
     /// #1032: build a HealthPacket through the production path with the given
@@ -2251,6 +2383,8 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -2307,6 +2441,8 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -2432,6 +2568,8 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -2535,6 +2673,8 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,

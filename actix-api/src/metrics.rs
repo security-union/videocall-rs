@@ -739,6 +739,29 @@ lazy_static! {
     )
     .expect("Failed to create keyframe_requests_sent_total metric");
 
+    /// RTT-probe drop backpressure (#522): cumulative count of RTT probes the
+    /// client dropped because the in-flight probe queue was at its cap, as of the
+    /// latest client health snapshot. GaugeVec set() to the client's cumulative
+    /// value (NOT inc()); chart with rate()/increase(). See the CLIENT_REELECTION_TOTAL
+    /// type-decision note.
+    pub static ref RTT_PROBE_DROPPED_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_rtt_probe_dropped_total",
+        "Cumulative RTT probes dropped at the client's in-flight queue cap (#522 backpressure) as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create rtt_probe_dropped_total metric");
+
+    /// RTT-probe stale-suppression count (#522): cumulative count of 1 Hz client
+    /// diagnostics ticks on which the active link's RTT-probe pipeline was stale and
+    /// active_server_rtt was suppressed, as of the latest client health snapshot.
+    /// GaugeVec set() to the client's cumulative value (NOT inc()).
+    pub static ref RTT_PROBE_STALE_SUPPRESSIONS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_rtt_probe_stale_suppressions_total",
+        "Cumulative client diagnostics ticks where the active link's RTT-probe pipeline was stale and active_server_rtt was suppressed (#522) as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create rtt_probe_stale_suppressions_total metric");
+
     /// Cumulative transport re-election outcomes reported by the client
     /// (dashboard audit Tier B #3; discussion #562).
     ///

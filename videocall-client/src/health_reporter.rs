@@ -907,8 +907,10 @@ impl HealthReporter {
                             }
                         }
                         // Resync-to-live governor skips (#1252): lifetime cumulative COUNTER (u64),
-                        // not an ms gauge. Same camera/screen bucket as the playout fields above, but
-                        // folded UNCONDITIONALLY downstream (a counter must report even at fps 0).
+                        // not an ms gauge. Stored in the camera/screen bucket that emitted the
+                        // worker stat. The health packet currently exports this counter from the
+                        // camera video_stats path only; screen-share export can be added when the
+                        // server consumes the sibling screen_video_stats playout fields.
                         "playout_skip_to_live_total" => {
                             if let MetricValue::U64(v) = &metric.value {
                                 video_stats["playout_skip_to_live_total"] = json!(v);
@@ -1872,11 +1874,12 @@ impl HealthReporter {
                         vs.playout_paint_lag_ms = v;
                     }
                 }
-                // Resync-to-live governor skips (#1252): folded UNCONDITIONALLY, OUTSIDE the
-                // fps_received > 0 gate above. The ms gauges are gated because a paused/hidden tile
-                // decodes nothing and any residual span isn't user-perceived latency. This is a
-                // cumulative COUNTER, not a gauge — it must keep reporting its lifetime value even
-                // when fps == 0, or a stream that fell idle would appear to "un-fire" the governor.
+                // Resync-to-live governor skips (#1252): folded UNCONDITIONALLY for camera video,
+                // OUTSIDE the fps_received > 0 gate above. The ms gauges are gated because a
+                // paused/hidden tile decodes nothing and any residual span isn't user-perceived
+                // latency. This is a cumulative COUNTER, not a gauge — it must keep reporting its
+                // lifetime value even when fps == 0, or a stream that fell idle would appear to
+                // "un-fire" the governor.
                 if let Some(v) = video
                     .get("playout_skip_to_live_total")
                     .and_then(|v| v.as_u64())
@@ -1907,7 +1910,9 @@ impl HealthReporter {
                 }
             }
 
-            // Screen share video mapping (new field, separate from camera)
+            // Screen share video mapping (new field, separate from camera). This mirrors the
+            // pre-existing screen export surface: fps/buffered/decoded/bitrate only. The camera
+            // playout/governor fields above are not exported for screen share in this pass.
             if let Some(screen) = &health_data.last_screen_stats {
                 let mut svs = PbVideoStats::new();
                 if let Some(v) = screen.get("fps_received").and_then(|v| v.as_f64()) {

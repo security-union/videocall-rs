@@ -60,6 +60,7 @@ use crate::metrics::{
     RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE,
     RELAY_VIEWPORT_UPDATES_TOTAL,
 };
+use videocall_types::protos::downlink_congestion_packet::DownlinkCongestionPacket;
 use videocall_types::protos::layer_hint_packet::layer_hint_packet::Entry as LayerHintEntry;
 use videocall_types::protos::layer_hint_packet::LayerHintPacket;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
@@ -3471,7 +3472,14 @@ impl Handler<JoinRoom> for ChatServer {
                     // Build the forwarding closure once; it is cheap to call
                     // per packet and avoids re-cloning the config on every
                     // message.
-                    let forward = handle_msg(
+                    // `emit_downlink_congestion` is a shared flag the (synchronous)
+                    // forwarding closure raises when this receiver crosses into
+                    // downlink-shedding mode. The closure cannot publish itself
+                    // (it is on the hot path and cannot `.await`), so the async loop
+                    // below reads-and-clears the flag after each `forward(...)` call
+                    // and performs the actual NATS publish off the hot path (#1219
+                    // Half 2).
+                    let (forward, emit_downlink_congestion) = handle_msg(
                         session_recipient.clone(),
                         room_clone.clone(),
                         session_clone,
@@ -3580,6 +3588,72 @@ impl Handler<JoinRoom> for ChatServer {
                         if let Err(e) = forward(msg, parsed.as_ref()) {
                             error!("Error handling message: {}", e);
                             break;
+                        }
+
+                        // --- #1219 Half 2: publish the DOWNLINK_CONGESTION signal ---
+                        //
+                        // The synchronous `forward` closure raised this flag if (and
+                        // only if) this receiver just crossed into downlink-shedding
+                        // mode. It debounces to once per stall episode internally
+                        // (`signal_emitted`), so the flag is set at most once per
+                        // episode. We publish here — in the async loop, off the hot
+                        // path — to the receiver's OWN per-session subject
+                        // (`self_subject` == `room.{room}.{session}`) with the
+                        // receiver's `session_id` stamped, so the closure's
+                        // `is_downlink_congestion` self-echo carve-out and the unicast
+                        // filter deliver it back to exactly this receiver's client.
+                        // `swap(false, ..)` reads-and-clears in one step so a
+                        // transient flag never re-fires on the next packet.
+                        if emit_downlink_congestion
+                            .swap(false, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            // The message is intentionally empty: the packet TYPE is
+                            // the signal (see downlink_congestion_packet.proto).
+                            let inner = DownlinkCongestionPacket::new();
+
+                            match inner.write_to_bytes() {
+                                Ok(data) => {
+                                    let mut wrapper = PacketWrapper::new();
+                                    wrapper.packet_type = PacketType::DOWNLINK_CONGESTION.into();
+                                    // Stamp the RECEIVER's session so the self-echo
+                                    // carve-out (`is_downlink_congestion`) and unicast
+                                    // filter route it to exactly this receiver.
+                                    wrapper.session_id = session_clone;
+                                    wrapper.user_id = user_id_clone.clone().into_bytes();
+                                    wrapper.data = data;
+
+                                    match wrapper.write_to_bytes() {
+                                        Ok(bytes) => {
+                                            if let Err(e) = nc2
+                                                .publish(self_subject.clone(), bytes.into())
+                                                .await
+                                            {
+                                                warn!(
+                                                    "Failed to publish DOWNLINK_CONGESTION for \
+                                                     session {} in room {}: {}",
+                                                    session_clone, room_clone, e
+                                                );
+                                            } else {
+                                                info!(
+                                                    "Published DOWNLINK_CONGESTION to session {} \
+                                                     (room: {}) (#1219)",
+                                                    session_clone, room_clone
+                                                );
+                                            }
+                                        }
+                                        Err(e) => warn!(
+                                            "Failed to serialize DOWNLINK_CONGESTION \
+                                             PacketWrapper for session {} in room {}: {}",
+                                            session_clone, room_clone, e
+                                        ),
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    "Failed to serialize DownlinkCongestionPacket for session \
+                                     {} in room {}: {}",
+                                    session_clone, room_clone, e
+                                ),
+                            }
                         }
                     }
                 }
@@ -4224,7 +4298,13 @@ fn try_intercept_display_name_change(
 // (recipient, room, session id, observer flag, user id, viewport set, layer
 // prefs, and now the receiver transport for mailbox-drop attribution). Grouping
 // them into a struct would not improve clarity for a single internal builder.
-#[allow(clippy::too_many_arguments)]
+// Returns a `(closure, emit_flag)` pair. The closure is the per-packet forwarder
+// (its return type stays `Result<(), io::Error>` so every existing call site is
+// unchanged); the `Arc<AtomicBool>` is the out-of-band DOWNLINK_CONGESTION emit
+// signal the SYNC closure raises and the ASYNC NATS loop drains+publishes (#1219
+// Half 2). `type_complexity` is allowed because the `impl Fn` half cannot be
+// hoisted into a `type` alias, and the two-element tuple is self-documenting.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
@@ -4234,7 +4314,10 @@ fn handle_msg(
     desired_streams: DesiredStreams,
     layer_prefs: LayerPrefs,
     transport: String,
-) -> impl Fn(async_nats::Message, Option<&PacketWrapper>) -> Result<(), std::io::Error> {
+) -> (
+    impl Fn(async_nats::Message, Option<&PacketWrapper>) -> Result<(), std::io::Error>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     // `parsed` is the PacketWrapper decoded ONCE per packet by the NATS loop
     // and shared with every consumer (display-name interceptor, viewport
     // interceptor, and this closure). Decoding here as well would double the
@@ -4257,13 +4340,34 @@ fn handle_msg(
         RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL,
     };
     use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Arc;
 
     let consecutive_drops: Cell<u32> = Cell::new(0);
     let consecutive_successes: Cell<u32> = Cell::new(0);
     let is_shedding: Cell<bool> = Cell::new(false);
     let signal_emitted: Cell<bool> = Cell::new(false);
 
-    move |msg, parsed| {
+    // --- #1219 Half 2: emit-DOWNLINK_CONGESTION handoff ---
+    //
+    // The forwarding closure is SYNCHRONOUS and runs on the relay's hottest path
+    // (every packet × every receiver), so it cannot `.await` a NATS publish. When
+    // the receiver crosses into shedding mode the closure raises this shared flag;
+    // the async NATS loop that owns `nc2`/`self_subject` reads-and-clears it after
+    // each `forward(...)` call and performs the actual publish off the hot path.
+    //
+    // `Arc<AtomicBool>` (not the cheaper `Rc<Cell<bool>>`) because the NATS loop
+    // runs inside `tokio::spawn`, whose future must be `Send` — `Rc` is not `Send`
+    // and would fail to compile there. The flag is set at most once per stall
+    // episode (`signal_emitted` debounces it), so the atomic store/load is off the
+    // genuine hot path. The closure holds one clone (moved into it); the loop keeps
+    // the other.
+    let emit_downlink_congestion: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let emit_flag = Arc::clone(&emit_downlink_congestion);
+
+    let forward = move |msg: async_nats::Message,
+                        parsed: Option<&PacketWrapper>|
+          -> Result<(), std::io::Error> {
         let is_congestion = parsed
             .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
             .unwrap_or(false);
@@ -4876,18 +4980,22 @@ fn handle_msg(
                         // The signal is published to the receiver's own NATS subject
                         // so it arrives via the normal subscription loop and passes
                         // through the self-echo carve-out above.
+                        //
+                        // This closure is synchronous and on the hot path, so it
+                        // cannot publish directly. Instead it raises the shared
+                        // `emit_downlink_congestion` flag; the async NATS loop reads
+                        // and clears it after this call and performs the publish.
+                        // `signal_emitted` debounces to exactly once per stall
+                        // episode (reset only on sustained recovery below), so the
+                        // loop publishes a single DOWNLINK_CONGESTION per episode.
                         if !signal_emitted.get() {
                             signal_emitted.set(true);
+                            emit_flag.store(true, AtomicOrdering::Relaxed);
                             info!(
-                                "DOWNLINK_CONGESTION signal armed for session {} (room: {}) — \
-                                 client-side consumption is a separate PR (#1219)",
+                                "DOWNLINK_CONGESTION signal queued for session {} (room: {}) — \
+                                 relay will publish to the receiver's own subject (#1219)",
                                 session, room
                             );
-                            // NOTE: Actual NATS publish of the DOWNLINK_CONGESTION
-                            // packet is deferred to a follow-up PR that wires the
-                            // NATS client handle into this closure (requires passing
-                            // nc.clone() into handle_msg). The shedding logic above
-                            // is the critical path and is active NOW.
                         }
                     }
                 }
@@ -4919,7 +5027,9 @@ fn handle_msg(
             }
         }
         Ok(())
-    }
+    };
+
+    (forward, emit_downlink_congestion)
 }
 
 // ==========================================================================
@@ -6431,7 +6541,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room1".to_string(),
             9001,
@@ -6465,7 +6575,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room2".to_string(),
             9002,
@@ -6499,7 +6609,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room3".to_string(),
             9003,
@@ -6533,7 +6643,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room4".to_string(),
             9004,
@@ -6567,7 +6677,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room5".to_string(),
             9005,
@@ -6602,7 +6712,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room7".to_string(),
             9007,
@@ -6636,7 +6746,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room8".to_string(),
             9008,
@@ -6670,7 +6780,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room6".to_string(),
             9006,
@@ -6718,7 +6828,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "selfskip-room".to_string(),
             7777,
@@ -6757,7 +6867,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "reconnect-room".to_string(),
             8888,
@@ -6801,7 +6911,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "congestion-room".to_string(),
             5555,
@@ -6839,7 +6949,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "congestion-inner-room".to_string(),
             6666,
@@ -6894,7 +7004,7 @@ mod tests {
 
         // This receiver is session 7777. The CONGESTION targets sender 5555
         // (published on `room.{room}.5555` with inner session_id 5555).
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             room.to_string(),
             7777, // bystander receiver — NOT the target
@@ -6949,7 +7059,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "layerhint-room".to_string(),
             5151,
@@ -6993,7 +7103,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "layerhint-inner-room".to_string(),
             6161,
@@ -7036,7 +7146,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "layerhint-room".to_string(),
             5151,
@@ -7076,7 +7186,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "media-self-room".to_string(),
             4242,
@@ -7116,7 +7226,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "zero-session-room".to_string(),
             0,
@@ -7170,7 +7280,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "peer-event-room".to_string(),
             1111,
@@ -7204,7 +7314,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "peer-event-room".to_string(),
             2222,
@@ -7238,7 +7348,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "peer-event-room".to_string(),
             3333,
@@ -7272,7 +7382,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "peer-event-room".to_string(),
             4444,
@@ -7326,7 +7436,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "disc-room".to_string(),
             7001,
@@ -7363,7 +7473,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "disc-room".to_string(),
             7001,
@@ -7401,7 +7511,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "disc-room".to_string(),
             7001,
@@ -7603,7 +7713,7 @@ mod tests {
         .start();
 
         // Receiver renders sessions {200, 300}; video from 999 is off-screen.
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7645,7 +7755,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7685,7 +7795,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7719,7 +7829,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7755,7 +7865,7 @@ mod tests {
         .start();
 
         // Empty set = no viewport signal yet = fail-open.
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7791,7 +7901,7 @@ mod tests {
 
         // Off-screen sender, but AUDIO must NEVER be filtered (security:
         // off-screen speakers must be heard).
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7826,7 +7936,7 @@ mod tests {
         .start();
 
         // SCREEN is not governed by the camera-tile viewport.
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7862,7 +7972,7 @@ mod tests {
 
         // UNSPECIFIED (e.g. an older client) must fail open even with an
         // active viewport set and an off-screen source.
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7899,7 +8009,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -11535,7 +11645,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11571,7 +11681,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11606,7 +11716,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11643,7 +11753,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11682,7 +11792,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11757,7 +11867,7 @@ mod tests {
 
         // Unique room → fresh, isolated counter series.
         let room = "per-layer-room-l2";
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             room.to_string(),
             100,
@@ -11815,7 +11925,7 @@ mod tests {
         .start();
 
         let room = "per-layer-room-drop";
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             room.to_string(),
             100,
@@ -11865,7 +11975,7 @@ mod tests {
         .start();
 
         let room = "per-layer-room-other";
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             room.to_string(),
             100,
@@ -12047,7 +12157,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12083,7 +12193,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12119,7 +12229,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12156,7 +12266,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12202,7 +12312,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12244,7 +12354,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12286,7 +12396,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12356,7 +12466,7 @@ mod tests {
              path takes the read lock and exercises the fail-open arm"
         );
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12490,7 +12600,7 @@ mod tests {
         let prefs = empty_layer_prefs();
         assert!(!prefs.has_any(), "precondition: prefs start empty");
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,

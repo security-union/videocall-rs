@@ -882,15 +882,12 @@ test.describe("Display name live update", () => {
       await page.goto("/");
       await page.waitForTimeout(2000);
 
-      // The username should still be pre-populated via the raw fallback
+      // The username should still be pre-populated via the raw fallback.
+      // This assertion is the load-bearing check: it fails on un-fixed code
+      // (corrupted CBOR + no fallback → empty field) and passes only when
+      // load_display_name_from_storage falls through to vc_display_name_raw.
       await expect(usernameInput).toBeVisible({ timeout: 10_000 });
-      // Verify the raw key survived the CBOR corruption — the fallback
-      // path reads from vc_display_name_raw when the CBOR key fails to
-      // deserialize.
-      const rawKeyAfterCorruption = await page.evaluate(() => {
-        return localStorage.getItem("vc_display_name_raw");
-      });
-      expect(rawKeyAfterCorruption).toBe(displayName);
+      await expect(usernameInput).toHaveValue(displayName, { timeout: 5_000 });
     } finally {
       await browser.close();
     }

@@ -3057,7 +3057,7 @@ impl Handler<JoinRoom> for ChatServer {
                 if let Some(members) = self.room_members.get_mut(&room) {
                     reconnect_display_name = members
                         .iter()
-                        .find(|m| m.session == pending.old_session)
+                        .find(|m| m.session == pending.old_session && m.user_id == user_id)
                         .map(|m| m.display_name.clone());
                     members.retain(|m| m.session != pending.old_session);
                 }

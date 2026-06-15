@@ -1,6 +1,7 @@
 name: Backend Tests (HCL)
 
 on:
+  workflow_dispatch:
   pull_request:
     branches: [hcl-main, PR-staging]
     paths:

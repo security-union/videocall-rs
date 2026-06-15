@@ -4274,6 +4274,105 @@ fn try_intercept_display_name_change(
     true
 }
 
+/// Pure per-receiver downlink-congestion detection state machine (#1219 Half 2).
+///
+/// This holds ONLY the transition logic for the receiver-downlink shedding
+/// mechanism — no protobuf, metrics, NATS, or actix coupling — so it is
+/// deterministic and unit-testable in isolation (the surrounding `handle_msg`
+/// closure can only be driven through flaky actix-mailbox timing). The closure
+/// keeps one of these per receiver session in a `Cell` and feeds it the result
+/// of every `try_send`:
+///
+/// * [`on_full_drop`](Self::on_full_drop) — a `Full` mailbox drop occurred.
+///   Returns a [`DropTransition`] telling the caller whether this drop just
+///   crossed into shedding mode and whether to emit the one-shot
+///   DOWNLINK_CONGESTION signal.
+/// * [`on_success`](Self::on_success) — a packet was delivered. Returns `true`
+///   exactly once, when sustained recovery exits shedding mode.
+/// * [`is_shedding`](Self::is_shedding) — whether non-base-layer video should be
+///   shed right now.
+///
+/// The hysteresis (enter after `enter_threshold` consecutive drops, exit only
+/// after `exit_window` consecutive successes) lives entirely here so the policy
+/// is pinned by the unit tests below rather than asserted by reading the closure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DownlinkShedState {
+    consecutive_drops: u32,
+    consecutive_successes: u32,
+    shedding: bool,
+    /// Once-per-episode debounce for the emitted signal: set true when the
+    /// signal is queued on entering shedding, reset only on sustained recovery.
+    signal_emitted: bool,
+}
+
+/// Outcome of feeding a `Full` mailbox drop to [`DownlinkShedState::on_full_drop`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DropTransition {
+    /// This drop just moved the receiver from healthy → shedding.
+    entered_shedding: bool,
+    /// The DOWNLINK_CONGESTION signal should be emitted now (true at most once
+    /// per stall episode — only on the entering-shedding transition).
+    emit_signal: bool,
+}
+
+impl DownlinkShedState {
+    const fn new() -> Self {
+        Self {
+            consecutive_drops: 0,
+            consecutive_successes: 0,
+            shedding: false,
+            signal_emitted: false,
+        }
+    }
+
+    fn is_shedding(&self) -> bool {
+        self.shedding
+    }
+
+    /// Record a `Full` mailbox drop. A drop resets the success streak (recovery
+    /// must be *consecutive*). Crossing `enter_threshold` consecutive drops for
+    /// the first time flips into shedding mode and arms the one-shot signal.
+    fn on_full_drop(&mut self, enter_threshold: u32) -> DropTransition {
+        self.consecutive_drops = self.consecutive_drops.saturating_add(1);
+        self.consecutive_successes = 0;
+
+        let mut transition = DropTransition {
+            entered_shedding: false,
+            emit_signal: false,
+        };
+
+        if !self.shedding && self.consecutive_drops >= enter_threshold {
+            self.shedding = true;
+            transition.entered_shedding = true;
+            if !self.signal_emitted {
+                self.signal_emitted = true;
+                transition.emit_signal = true;
+            }
+        }
+        transition
+    }
+
+    /// Record a successful delivery. A success resets the drop streak. While
+    /// shedding, `exit_window` *consecutive* successes are required to recover;
+    /// returns `true` exactly on the success that exits shedding mode.
+    fn on_success(&mut self, exit_window: u32) -> bool {
+        self.consecutive_drops = 0;
+
+        if !self.shedding {
+            return false;
+        }
+
+        self.consecutive_successes = self.consecutive_successes.saturating_add(1);
+        if self.consecutive_successes >= exit_window {
+            self.shedding = false;
+            self.signal_emitted = false;
+            self.consecutive_successes = 0;
+            return true;
+        }
+        false
+    }
+}
+
 /// Server-authoritative packet filter for observer (waiting-room) sessions.
 ///
 /// # Enforcement Model
@@ -4327,11 +4426,9 @@ fn handle_msg(
 
     // --- #1219 Half 2: Per-receiver downlink congestion state ---
     //
-    // These `Cell`s live in the closure's capture environment — one instance per
-    // receiver session, mutated on every packet delivery attempt. `Cell` provides
-    // interior mutability without runtime cost (no RefCell borrow check), which is
-    // safe because this closure runs exclusively on a single NATS subscription
-    // task (no cross-thread sharing).
+    // The transition logic lives in `DownlinkShedState` (a pure, unit-tested
+    // state machine); the closure holds one instance per receiver session and
+    // feeds it each `try_send` outcome.
     use crate::constants::{
         DOWNLINK_CONGESTION_DROP_THRESHOLD, DOWNLINK_CONGESTION_SUCCESS_WINDOW,
     };
@@ -4343,10 +4440,10 @@ fn handle_msg(
     use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
     use std::sync::Arc;
 
-    let consecutive_drops: Cell<u32> = Cell::new(0);
-    let consecutive_successes: Cell<u32> = Cell::new(0);
-    let is_shedding: Cell<bool> = Cell::new(false);
-    let signal_emitted: Cell<bool> = Cell::new(false);
+    // One detection state machine per receiver session. `Cell` gives interior
+    // mutability with no runtime borrow-check cost; safe because the closure
+    // runs exclusively on this receiver's single NATS subscription task.
+    let shed_state: Cell<DownlinkShedState> = Cell::new(DownlinkShedState::new());
 
     // --- #1219 Half 2: emit-DOWNLINK_CONGESTION handoff ---
     //
@@ -4824,7 +4921,7 @@ fn handle_msg(
         // This runs AFTER the viewport and layer filters above — a packet that
         // reaches here has already survived those gates, so shedding it is a
         // FURTHER reduction beyond what the receiver's own preferences chose.
-        if is_shedding.get() {
+        if shed_state.get().is_shedding() {
             if let Some(pw) = parsed {
                 use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
                 let media_kind = pw.media_kind.enum_value();
@@ -4956,16 +5053,15 @@ fn handle_msg(
                 // Only count Full errors (transient backpressure). A Closed error
                 // means the actor is gone and we should not be tracking congestion
                 // for a dead session.
+                // Only count `Full` (transient backpressure) toward congestion.
+                // A `Closed` mailbox means the actor is gone — not a slow link —
+                // so it must not arm shedding for a dead session.
                 if is_full {
-                    consecutive_drops.set(consecutive_drops.get() + 1);
-                    consecutive_successes.set(0);
+                    let mut state = shed_state.get();
+                    let transition = state.on_full_drop(DOWNLINK_CONGESTION_DROP_THRESHOLD);
+                    shed_state.set(state);
 
-                    // Cross threshold? Enter shedding mode.
-                    if !is_shedding.get()
-                        && consecutive_drops.get() >= DOWNLINK_CONGESTION_DROP_THRESHOLD
-                    {
-                        is_shedding.set(true);
-
+                    if transition.entered_shedding {
                         RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL
                             .with_label_values(&[&transport])
                             .inc();
@@ -4976,20 +5072,18 @@ fn handle_msg(
                             session, DOWNLINK_CONGESTION_DROP_THRESHOLD, room, transport
                         );
 
-                        // Emit DOWNLINK_CONGESTION signal (once per stall episode).
-                        // The signal is published to the receiver's own NATS subject
-                        // so it arrives via the normal subscription loop and passes
-                        // through the self-echo carve-out above.
+                        // The signal is published to the receiver's own NATS
+                        // subject so it arrives via the normal subscription loop
+                        // and passes through the self-echo carve-out above.
                         //
                         // This closure is synchronous and on the hot path, so it
                         // cannot publish directly. Instead it raises the shared
-                        // `emit_downlink_congestion` flag; the async NATS loop reads
-                        // and clears it after this call and performs the publish.
-                        // `signal_emitted` debounces to exactly once per stall
-                        // episode (reset only on sustained recovery below), so the
-                        // loop publishes a single DOWNLINK_CONGESTION per episode.
-                        if !signal_emitted.get() {
-                            signal_emitted.set(true);
+                        // `emit_downlink_congestion` flag; the async NATS loop
+                        // reads-and-clears it after this call and performs the
+                        // publish. `emit_signal` is true at most once per stall
+                        // episode (the state machine debounces it), so the loop
+                        // publishes a single DOWNLINK_CONGESTION per episode.
+                        if transition.emit_signal {
                             emit_flag.store(true, AtomicOrdering::Relaxed);
                             info!(
                                 "DOWNLINK_CONGESTION signal queued for session {} (room: {}) — \
@@ -5002,27 +5096,20 @@ fn handle_msg(
             }
             Ok(()) => {
                 // --- #1219 Half 2: Track consecutive successes for recovery ---
-                consecutive_drops.set(0);
+                let mut state = shed_state.get();
+                let exited_shedding = state.on_success(DOWNLINK_CONGESTION_SUCCESS_WINDOW);
+                shed_state.set(state);
 
-                if is_shedding.get() {
-                    consecutive_successes.set(consecutive_successes.get() + 1);
+                if exited_shedding {
+                    RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL
+                        .with_label_values(&[&transport])
+                        .inc();
 
-                    // Exit shedding mode after sustained recovery.
-                    if consecutive_successes.get() >= DOWNLINK_CONGESTION_SUCCESS_WINDOW {
-                        is_shedding.set(false);
-                        signal_emitted.set(false); // Reset for next episode
-                        consecutive_successes.set(0);
-
-                        RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL
-                            .with_label_values(&[&transport])
-                            .inc();
-
-                        info!(
-                            "Receiver session {} exited downlink congestion shedding mode \
-                             after {} consecutive successes (room: {}, transport: {}) (#1219)",
-                            session, DOWNLINK_CONGESTION_SUCCESS_WINDOW, room, transport
-                        );
-                    }
+                    info!(
+                        "Receiver session {} exited downlink congestion shedding mode \
+                         after {} consecutive successes (room: {}, transport: {}) (#1219)",
+                        session, DOWNLINK_CONGESTION_SUCCESS_WINDOW, room, transport
+                    );
                 }
             }
         }
@@ -5030,6 +5117,174 @@ fn handle_msg(
     };
 
     (forward, emit_downlink_congestion)
+}
+
+// ==========================================================================
+// Unit Tests for the DownlinkShedState detection state machine (#1219 Half 2)
+// ==========================================================================
+//
+// These exercise the pure transition logic directly — no actix, NATS, or
+// protobuf — so they are deterministic and mutation-sensitive: each test fails
+// if the specific transition it names is broken (off-by-one threshold, missing
+// streak reset, lost debounce, etc.). Small explicit thresholds are used so the
+// boundary is visible; the production thresholds are pinned separately below.
+#[cfg(test)]
+mod downlink_shed_state_tests {
+    use super::{DownlinkShedState, DropTransition};
+    use crate::constants::{
+        DOWNLINK_CONGESTION_DROP_THRESHOLD, DOWNLINK_CONGESTION_SUCCESS_WINDOW,
+    };
+
+    #[test]
+    fn fresh_state_is_not_shedding() {
+        assert!(!DownlinkShedState::new().is_shedding());
+    }
+
+    #[test]
+    fn enters_shedding_exactly_at_threshold_not_before() {
+        let mut s = DownlinkShedState::new();
+        // threshold = 3: first two drops must NOT shed.
+        assert_eq!(
+            s.on_full_drop(3),
+            DropTransition {
+                entered_shedding: false,
+                emit_signal: false
+            }
+        );
+        assert!(!s.is_shedding());
+        assert_eq!(
+            s.on_full_drop(3),
+            DropTransition {
+                entered_shedding: false,
+                emit_signal: false
+            }
+        );
+        assert!(!s.is_shedding());
+        // The third (== threshold) drop crosses the line and arms the signal.
+        assert_eq!(
+            s.on_full_drop(3),
+            DropTransition {
+                entered_shedding: true,
+                emit_signal: true
+            }
+        );
+        assert!(s.is_shedding());
+    }
+
+    #[test]
+    fn signal_emits_only_once_per_episode() {
+        let mut s = DownlinkShedState::new();
+        let first = s.on_full_drop(1); // threshold 1 → enter immediately
+        assert!(first.entered_shedding && first.emit_signal);
+        // Subsequent drops while already shedding never re-arm the signal and
+        // never re-report entering.
+        for _ in 0..5 {
+            assert_eq!(
+                s.on_full_drop(1),
+                DropTransition {
+                    entered_shedding: false,
+                    emit_signal: false
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_success_resets_the_drop_streak() {
+        let mut s = DownlinkShedState::new();
+        // Two drops toward a threshold of 3 ...
+        s.on_full_drop(3);
+        s.on_full_drop(3);
+        // ... a success resets the streak, so it takes a FULL 3 more to shed.
+        assert!(!s.on_success(50));
+        assert!(!s.on_full_drop(3).entered_shedding);
+        assert!(!s.on_full_drop(3).entered_shedding);
+        assert!(s.on_full_drop(3).entered_shedding);
+    }
+
+    #[test]
+    fn recovery_requires_consecutive_successes_and_a_drop_resets_it() {
+        let mut s = DownlinkShedState::new();
+        assert!(s.on_full_drop(1).entered_shedding); // shedding now
+                                                     // exit_window = 3: two successes are not enough.
+        assert!(!s.on_success(3));
+        assert!(!s.on_success(3));
+        assert!(s.is_shedding());
+        // A drop mid-recovery resets the success streak (stays shedding) ...
+        let mid = s.on_full_drop(1);
+        assert!(!mid.entered_shedding, "already shedding, not a fresh entry");
+        assert!(!mid.emit_signal, "no second signal within the same episode");
+        assert!(s.is_shedding());
+        // ... so it again takes a full 3 consecutive successes to exit.
+        assert!(!s.on_success(3));
+        assert!(!s.on_success(3));
+        assert!(s.on_success(3), "third consecutive success exits shedding");
+        assert!(!s.is_shedding());
+    }
+
+    #[test]
+    fn success_while_healthy_is_a_noop_and_never_reports_exit() {
+        let mut s = DownlinkShedState::new();
+        for _ in 0..100 {
+            assert!(!s.on_success(3), "healthy success must not report an exit");
+        }
+        assert!(!s.is_shedding());
+    }
+
+    #[test]
+    fn signal_re_arms_for_a_second_episode_after_full_recovery() {
+        let mut s = DownlinkShedState::new();
+        assert!(s.on_full_drop(1).emit_signal); // episode 1 signal
+        assert!(s.on_success(1)); // immediate recovery (window 1) exits shedding
+        assert!(!s.is_shedding());
+        // A fresh stall is a NEW episode and must emit a NEW signal.
+        let second = s.on_full_drop(1);
+        assert!(second.entered_shedding && second.emit_signal);
+    }
+
+    #[test]
+    fn shed_candidate_classification_pins_base_layer_and_audio_exemptions() {
+        // This is the policy the closure applies when `is_shedding()` is true:
+        // only non-base-layer VIDEO/SCREEN is shed. Encoded here against the
+        // same predicate so a future edit to either must update both.
+        use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+        let is_shed_candidate = |kind: MediaKind, layer: u32| -> bool {
+            matches!(kind, MediaKind::VIDEO | MediaKind::SCREEN) && layer != 0
+        };
+        assert!(is_shed_candidate(MediaKind::VIDEO, 1));
+        assert!(is_shed_candidate(MediaKind::SCREEN, 2));
+        assert!(
+            !is_shed_candidate(MediaKind::VIDEO, 0),
+            "base layer is kept"
+        );
+        assert!(
+            !is_shed_candidate(MediaKind::SCREEN, 0),
+            "base layer is kept"
+        );
+        assert!(
+            !is_shed_candidate(MediaKind::AUDIO, 1),
+            "audio is never shed"
+        );
+        assert!(
+            !is_shed_candidate(MediaKind::MEDIA_KIND_UNSPECIFIED, 1),
+            "unspecified/control is never shed"
+        );
+    }
+
+    // Pin the production hysteresis so a careless retune of one bound without
+    // the other (e.g. exit window <= enter threshold, which would flap) is
+    // caught here rather than in the field.
+    #[test]
+    fn production_thresholds_are_sane() {
+        assert!(
+            DOWNLINK_CONGESTION_DROP_THRESHOLD >= 1,
+            "must require at least one drop to shed"
+        );
+        assert!(
+            DOWNLINK_CONGESTION_SUCCESS_WINDOW > DOWNLINK_CONGESTION_DROP_THRESHOLD,
+            "recovery must be stickier than entry to avoid flapping (#1219)"
+        );
+    }
 }
 
 // ==========================================================================

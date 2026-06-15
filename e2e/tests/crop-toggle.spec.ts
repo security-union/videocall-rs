@@ -17,6 +17,10 @@ import { waitForServices } from "../helpers/wait-for-services";
  *
  * Per-tile isolation: the `cropped_tiles` HashMap is keyed by canvas ID,
  * so toggling on one tile must not affect another.
+ *
+ * NOTE: The crop button exists only on peer tiles (`.grid-item` with a
+ * `<canvas>`), NOT on the self-view (which is a `<video>` element with no
+ * crop control). All tests below use mock peers to produce real peer tiles.
  */
 
 test.describe("Crop toggle", () => {
@@ -63,33 +67,6 @@ test.describe("Crop toggle", () => {
   }
 
   /**
-   * Locate the self-view tile (`.host`) which always has a canvas when
-   * `--use-fake-device-for-media-stream` is active, hover it to reveal
-   * the crop button, and return the tile locator.
-   */
-  async function hoverHostTile(page: Page): Promise<{
-    tile: ReturnType<Page["locator"]>;
-    cropBtn: ReturnType<Page["locator"]>;
-    canvas: ReturnType<Page["locator"]>;
-  }> {
-    const tile = page.locator(".host");
-    await expect(tile).toBeVisible({ timeout: 10_000 });
-
-    // Wait for the canvas inside the host tile to appear (video must be on).
-    const canvas = tile.locator("canvas").first();
-    await expect(canvas).toBeVisible({ timeout: 15_000 });
-
-    // Hover the tile to reveal the crop button.
-    await tile.hover();
-    await page.waitForTimeout(300);
-
-    const cropBtn = tile.locator(".crop-icon").first();
-    await expect(cropBtn).toBeVisible({ timeout: 5_000 });
-
-    return { tile, cropBtn, canvas };
-  }
-
-  /**
    * Add mock peers via the Mock Peers popover.
    * Returns false and calls test.skip() if mock peers are not available.
    */
@@ -110,26 +87,64 @@ test.describe("Crop toggle", () => {
     }
 
     await mockBtn.first().click();
+    await expect(page.locator(".mock-peers-popover input[type='number']")).toBeVisible({
+      timeout: 5_000,
+    });
+    await page.locator(".mock-peers-popover input[type='number']").fill(String(count));
     await page.waitForTimeout(500);
 
-    const countInput = page.locator(".mock-peers-popover input[type='number']");
-    await expect(countInput).toBeVisible({ timeout: 5_000 });
-    await countInput.fill(String(count));
-    await page.waitForTimeout(500);
-
-    const closeButton = page.locator(".mock-peers-popover-close");
-    await closeButton.click();
+    await page.locator(".mock-peers-popover-close").click();
     await page.waitForTimeout(1000);
     return true;
   }
 
+  /**
+   * Wait for at least `min` peer tiles with a canvas to appear, then
+   * return the first one with its crop button and canvas locators.
+   * Hover is performed to reveal the crop icon.
+   */
+  async function getPeerTileWithCrop(
+    page: Page,
+    min: number = 1,
+  ): Promise<{
+    tile: ReturnType<Page["locator"]>;
+    cropBtn: ReturnType<Page["locator"]>;
+    canvas: ReturnType<Page["locator"]>;
+    allTiles: ReturnType<Page["locator"]>;
+  }> {
+    const allTiles = page.locator(".grid-item:has(canvas)");
+    await expect(allTiles.first()).toBeVisible({ timeout: 15_000 });
+
+    const count = await allTiles.count();
+    if (count < min) {
+      throw new Error(`Need at least ${min} peer tiles with canvas, found ${count}`);
+    }
+
+    const tile = allTiles.first();
+    await tile.hover();
+
+    const cropBtn = tile.locator(".crop-icon").first();
+    await expect(cropBtn).toBeVisible({ timeout: 5_000 });
+
+    const canvas = tile.locator("canvas").first();
+    await expect(canvas).toBeVisible({ timeout: 5_000 });
+
+    return { tile, cropBtn, canvas, allTiles };
+  }
+
   // ────────────────────────────────────────────────────────────────────────
   // Test 1: Default state is cropped (fill mode)
+  //
+  // Uses a mock peer tile (the self-view is a <video>, not <canvas>,
+  // and has no crop control).
   // ────────────────────────────────────────────────────────────────────────
   test("default state is cropped (fill mode)", async ({ page }) => {
     await joinMeeting(page, "default_cropped");
 
-    const { cropBtn, canvas } = await hoverHostTile(page);
+    const added = await addMockPeers(page, 1);
+    if (!added) return;
+
+    const { cropBtn, canvas } = await getPeerTileWithCrop(page);
 
     // The crop button should have the `active` class by default (cropped mode).
     await expect(cropBtn).toHaveClass(/\bactive\b/, { timeout: 5_000 });
@@ -140,11 +155,18 @@ test.describe("Crop toggle", () => {
 
   // ────────────────────────────────────────────────────────────────────────
   // Test 2: Click flips to uncropped (letterboxed)
+  //
+  // Asserts computed object-fit: contain and object-position: 50% 50%
+  // unconditionally — global.css:2907-2908 guarantees these values for
+  // the `.uncropped` class.
   // ────────────────────────────────────────────────────────────────────────
   test("click flips to uncropped (letterboxed)", async ({ page }) => {
     await joinMeeting(page, "click_uncrop");
 
-    const { tile, cropBtn, canvas } = await hoverHostTile(page);
+    const added = await addMockPeers(page, 1);
+    if (!added) return;
+
+    const { tile, cropBtn, canvas } = await getPeerTileWithCrop(page);
 
     // Sanity: starts in cropped/active state.
     await expect(cropBtn).toHaveClass(/\bactive\b/, { timeout: 5_000 });
@@ -152,11 +174,9 @@ test.describe("Crop toggle", () => {
 
     // Click the crop button to toggle to uncropped.
     await cropBtn.click();
-    await page.waitForTimeout(300);
 
     // Re-hover to keep the button visible after re-render.
     await tile.hover();
-    await page.waitForTimeout(300);
 
     // Button should lose the `active` class.
     const cropBtnAfter = tile.locator(".crop-icon").first();
@@ -167,22 +187,14 @@ test.describe("Crop toggle", () => {
     const canvasAfter = tile.locator("canvas").first();
     await expect(canvasAfter).toHaveClass(/\buncropped\b/, { timeout: 5_000 });
 
-    // Verify computed object-fit is `contain`.
+    // Unconditional computed-style checks (global.css .uncropped rule).
     const objectFit = await canvasAfter.evaluate((el) => window.getComputedStyle(el).objectFit);
-    // The uncropped class may or may not have an explicit CSS rule; if the
-    // base canvas rule applies `cover`, skip this assertion. But if the
-    // implementation sets `contain`, verify it.
-    if (objectFit === "contain") {
-      expect(objectFit).toBe("contain");
-    }
+    expect(objectFit).toBe("contain");
 
-    // Verify computed object-position is centered (50% 50% or center center).
     const objectPosition = await canvasAfter.evaluate(
       (el) => window.getComputedStyle(el).objectPosition,
     );
-    if (objectPosition === "50% 50%" || objectPosition === "center center") {
-      expect(["50% 50%", "center center"]).toContain(objectPosition);
-    }
+    expect(["50% 50%", "center center"]).toContain(objectPosition);
   });
 
   // ────────────────────────────────────────────────────────────────────────
@@ -194,21 +206,20 @@ test.describe("Crop toggle", () => {
   test("second click restores cropped", async ({ page }) => {
     await joinMeeting(page, "double_toggle");
 
-    const { tile, cropBtn } = await hoverHostTile(page);
+    const added = await addMockPeers(page, 1);
+    if (!added) return;
+
+    const { tile, cropBtn } = await getPeerTileWithCrop(page);
 
     // First click: cropped -> uncropped.
     await cropBtn.click();
-    await page.waitForTimeout(300);
     await tile.hover();
-    await page.waitForTimeout(300);
 
     // Second click: uncropped -> cropped.
     const cropBtnMid = tile.locator(".crop-icon").first();
     await expect(cropBtnMid).toBeVisible({ timeout: 5_000 });
     await cropBtnMid.click();
-    await page.waitForTimeout(300);
     await tile.hover();
-    await page.waitForTimeout(300);
 
     // Button should have `active` class again.
     const cropBtnFinal = tile.locator(".crop-icon").first();
@@ -244,11 +255,9 @@ test.describe("Crop toggle", () => {
     const added = await addMockPeers(page, 2);
     if (!added) return;
 
-    // Wait for peer tiles to render.
-    await page.waitForTimeout(3000);
-
     // Find all grid-item tiles that have a canvas (video-on peers).
     const peerTiles = page.locator(".grid-item:has(canvas)");
+    await expect(peerTiles.first()).toBeVisible({ timeout: 15_000 });
     const tileCount = await peerTiles.count();
 
     // We need at least 2 peer tiles for isolation testing.
@@ -262,7 +271,6 @@ test.describe("Crop toggle", () => {
 
     // Hover first tile and click its crop button.
     await firstTile.hover();
-    await page.waitForTimeout(300);
     const firstCropBtn = firstTile.locator(".crop-icon").first();
     await expect(firstCropBtn).toBeVisible({ timeout: 5_000 });
 
@@ -274,11 +282,9 @@ test.describe("Crop toggle", () => {
 
     // Toggle the first tile to uncropped.
     await firstCropBtn.click();
-    await page.waitForTimeout(300);
 
     // Re-hover first tile and verify it toggled.
     await firstTile.hover();
-    await page.waitForTimeout(300);
     const firstCropBtnAfter = firstTile.locator(".crop-icon").first();
     await expect(firstCropBtnAfter).not.toHaveClass(/\bactive\b/, { timeout: 5_000 });
     await expect(firstTile.locator("canvas").first()).toHaveClass(/\buncropped\b/, {
@@ -287,7 +293,6 @@ test.describe("Crop toggle", () => {
 
     // Now verify the second tile is STILL in cropped/active state.
     await secondTile.hover();
-    await page.waitForTimeout(300);
     const secondCropBtn = secondTile.locator(".crop-icon").first();
     await expect(secondCropBtn).toBeVisible({ timeout: 5_000 });
     await expect(secondCropBtn).toHaveClass(/\bactive\b/, { timeout: 5_000 });
@@ -349,7 +354,6 @@ test.describe("Crop toggle", () => {
 
     // Click the screen share button.
     await page.locator(".video-controls-container").hover();
-    await page.waitForTimeout(300);
     const shareButton = page.locator("button.video-control-button", {
       has: page.locator(".tooltip", { hasText: "Share Screen" }),
     });
@@ -391,7 +395,6 @@ test.describe("Crop toggle", () => {
 
     if (ssTileVisible) {
       await ssTile.hover();
-      await page.waitForTimeout(300);
 
       const ssCropBtn = ssTile.locator(".crop-icon").first();
       const cropBtnVisible = await ssCropBtn.isVisible().catch(() => false);

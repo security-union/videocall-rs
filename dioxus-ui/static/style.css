@@ -4006,34 +4006,28 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* Screen share split-layout — right-panel peer video tile.
-   Height-driven sizing mirrors `.grid-item`: the tile fills the grid-auto-row
-   height set by the parent right-panel, derives its width from
-   `aspect-ratio: 3 / 2` (the max ratio we accept), and is clamped by
-   `max-width: 100%` so narrow grid cells (2-column layout) still fill their
-   full width.
-   HCL issues #3 + #4: the parent right-panel now sizes columns to
-   `ss_tile_h * 1.5` px instead of `1fr`, so each grid cell is exactly the
-   tile's natural 3:2 footprint. With `place-self: stretch` (not the prior
-   `center`) the tile fills its cell edge-to-edge, leaving the inter-tile
-   gap exactly `8px` and packing all tiles to the left edge of the panel.
-   The dominant shared-content tile (`.split-screen-tile`) intentionally
-   does NOT get this cap — it stays as a large, dominant display. */
+   The parent `.ss-peer-panel` is a flex-wrap container; each tile gets
+   `flex: 1 1 160px` so tiles grow to fill available width with a 160px
+   flex basis, collapsing to one column when the panel is narrow.
+   `aspect-ratio: 3 / 2` derives height from width. Off-budget tiles
+   render with `force_avatar: true` (avatar placeholder, no decode) —
+   the decode budget caps live decoders just as the normal grid does
+   (issue 987). */
 .split-peer-tile {
-  width: 100%;
-  height: 100%;
+  position: relative;
+  flex: 1 1 160px;
   max-width: 100%;
-  max-height: 100%;
   aspect-ratio: 3 / 2;
-  place-self: stretch;
   min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: visible; /* allow speaking glow box-shadow to extend beyond tile */
+  overflow: hidden;
   background-color: var(--surface-elevated);
   border: 2px solid var(--grid-item-border);
   border-radius: var(--radius-lg);
+  box-sizing: border-box;
   /* Speaking glow transition is driven by inline style from Rust speak_style(). */
 }
 
@@ -4055,6 +4049,101 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: var(--gradient-fade-video);
   pointer-events: none;
   z-index: 1;
+}
+
+/* ── Screen-share right panel ─────────────────────────────────────────
+   CSS flex-wrap panel. Tiles auto-wrap into as many columns as fit;
+   scrolls vertically when rows exceed height. */
+.ss-peer-panel {
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 14px;
+  align-content: flex-start;
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+.ss-peer-panel::-webkit-scrollbar { width: 6px; }
+.ss-peer-panel::-webkit-scrollbar-track { background: transparent; }
+.ss-peer-panel::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+.ss-peer-panel::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+
+/* ── Split-peer tile internals ───────────────────────────────────────
+   Fixed sizes that don't depend on --tile-h / --tile-w CSS vars.
+   These override the grid-item defaults which use calc(var(--tile-h)). */
+
+/* Name label — wraps "(Host)" to its own line via flex-wrap */
+.split-peer-tile .floating-name {
+  top: 6px;
+  left: 6px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  gap: 2px;
+  font-size: 13px;
+  max-width: 70%;
+  white-space: normal;
+  text-overflow: clip;
+  overflow: visible;
+  line-height: 1.3;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+/* "(Host)" label: wraps below name via flex-basis: 100% */
+.split-peer-tile .host-indicator {
+  flex-basis: 100%;
+  display: block !important;
+  font-size: 10px !important;
+  margin-left: 0 !important;
+  margin-top: 1px;
+  color: var(--text-quaternary) !important;
+  line-height: 1.2;
+}
+
+/* Placeholder (camera-off) */
+.split-peer-tile .placeholder-content {
+  gap: 0.4rem;
+}
+.split-peer-tile .placeholder-content svg {
+  width: 40px;
+  height: 40px;
+}
+.split-peer-tile .placeholder-text {
+  font-size: 0.75rem;
+}
+
+/* Top icon bar */
+.split-peer-tile .tile-top-icons {
+  top: 4px;
+  right: 4px;
+  gap: 3px;
+}
+/* All icon buttons: uniform 22×22 containers, 14×14 SVGs */
+.split-peer-tile .audio-indicator,
+.split-peer-tile .signal-indicator,
+.split-peer-tile .pin-icon,
+.split-peer-tile .crop-icon,
+.split-peer-tile .tile-mute-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+}
+.split-peer-tile .audio-indicator svg,
+.split-peer-tile .signal-indicator svg,
+.split-peer-tile .pin-icon svg,
+.split-peer-tile .crop-icon svg,
+.split-peer-tile .tile-mute-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.split-peer-tile .guest-badge {
+  font-size: 0.65em;
+  padding: 1px 5px;
 }
 
 /* Local screen-share preview — rendered below camera inside .host */

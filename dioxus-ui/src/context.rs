@@ -1272,6 +1272,7 @@ pub fn apply_theme_to_dom(theme: Theme) {
     {
         let _ = root.set_attribute("data-theme", resolved);
     }
+    crate::theme_file::apply_theme_file_tokens(resolved);
 }
 
 /// Persist theme to localStorage and apply `data-theme` on `<html>`.

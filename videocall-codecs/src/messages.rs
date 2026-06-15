@@ -71,6 +71,13 @@ pub struct VideoStatsMessage {
     /// `frames_emitted - frames_painted` so the backlog isn't hidden by the FIFO delay that
     /// the worker's own stats message rides through.
     pub playout_paint_lag_ms: Option<f64>,
+    /// Cumulative count of resync-to-live governor skips (issue #1252): how many times the
+    /// decode-side governor jumped this stream forward to live to shed accumulated lag. A COUNTER,
+    /// not a gauge: it rises within a decoder-pipeline lifetime and is preserved across `flush()`,
+    /// but resets to 0 when the pipeline is rebuilt (`reset_pipeline()` on decoder-error recovery).
+    /// Consume via `increase()`/`rate()`, which tolerate the reset; a rising value proves the
+    /// governor fired in the field.
+    pub playout_skip_to_live_total: Option<u64>,
 }
 
 impl VideoStatsMessage {
@@ -81,6 +88,7 @@ impl VideoStatsMessage {
         playout_latency_ms: f64,
         playout_stage1_span_ms: f64,
         playout_paint_lag_ms: f64,
+        playout_skip_to_live_total: u64,
     ) -> Self {
         Self {
             kind: "video_stats".to_string(),
@@ -90,6 +98,7 @@ impl VideoStatsMessage {
             playout_latency_ms: Some(playout_latency_ms),
             playout_stage1_span_ms: Some(playout_stage1_span_ms),
             playout_paint_lag_ms: Some(playout_paint_lag_ms),
+            playout_skip_to_live_total: Some(playout_skip_to_live_total),
         }
     }
 }
@@ -300,7 +309,7 @@ mod worker_log_disambiguation_tests {
         // fields (level/target/message) are absent from every other message, so none of them can
         // deserialize into WorkerLogMessage at all -> the branch is structurally unable to swallow
         // them, independent of the kind guard.
-        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0);
+        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
         );

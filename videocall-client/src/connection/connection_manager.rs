@@ -678,6 +678,10 @@ pub struct ConnectionManager {
     /// MAX_INFLIGHT_PROBES (queue cap, issue #522). Read by rtt_probe_dropped_total()
     /// and surfaced as the rtt_probe_dropped_total diagnostic metric.
     rtt_probe_dropped_total: Rc<Cell<u64>>,
+    /// Monotonic count of 1 Hz diagnostics ticks on which the active link's
+    /// RTT-probe pipeline was stale and so `active_server_rtt` was suppressed in
+    /// `build_main_diagnostic_metrics`. Observability-only (#522).
+    rtt_probe_stale_suppressions_total: Rc<Cell<u64>>,
     /// Timestamp of last metrics calculation
     last_metrics_timestamp_ms: Rc<RefCell<f64>>,
     /// Last calculated packets received per second
@@ -869,6 +873,7 @@ impl ConnectionManager {
             packets_received: Rc::new(Cell::new(0)),
             packets_sent: Rc::new(Cell::new(0)),
             rtt_probe_dropped_total: Rc::new(Cell::new(0)),
+            rtt_probe_stale_suppressions_total: Rc::new(Cell::new(0)),
             last_metrics_timestamp_ms: Rc::new(RefCell::new(js_sys::Date::now())),
             packets_received_per_sec: Rc::new(RefCell::new(0.0)),
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
@@ -3537,6 +3542,17 @@ impl ConnectionManager {
     fn build_main_diagnostic_metrics(&self) -> Vec<Metric> {
         let mut metrics = Vec::new();
 
+        // #522: take ONE stale snapshot per tick and reuse it everywhere below
+        // (the Elected-branch `active_server_rtt` suppression and the
+        // `rtt_probe_stale` emit). `rtt_probe_stale()` reads `cpu_overloaded`
+        // via `Ordering::Relaxed`; computing it once removes the drift window
+        // where separate Relaxed loads could disagree within a single tick.
+        // Borrow-safe: `rtt_probe_stale()` takes its OWN immutable borrow of
+        // `rtt_measurements` that ends before it returns, so this snapshot does
+        // not conflict with the later `rtt_measurements.get(..)` re-borrow in
+        // the Elected branch.
+        let rtt_probe_stale = self.rtt_probe_stale();
+
         // Report current election state
         match &self.election_state {
             ElectionState::Testing {
@@ -3561,20 +3577,18 @@ impl ConnectionManager {
                 metrics.push(metric!("active_connection_id", connection_id.as_str()));
                 metrics.push(metric!("elected_at", *elected_at));
 
-                // Hoist the stale check BEFORE borrowing rtt_measurements below:
-                // `rtt_probe_stale` takes its own immutable borrow of
-                // `rtt_measurements`, so computing it here lets that borrow end
-                // before `get(connection_id)` re-borrows.
-                let stale = self.rtt_probe_stale();
-
-                // Report active connection RTT
+                // Report active connection RTT. Reuse the single per-tick
+                // `rtt_probe_stale` snapshot taken at the top of this function
+                // (computed BEFORE borrowing `rtt_measurements`, so its own
+                // immutable borrow has already ended and does not conflict with
+                // the `get(connection_id)` re-borrow below).
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     if let Some(avg_rtt) = measurement.average_rtt {
                         // When stale, suppress active_server_rtt so the 200s
                         // value never reaches dashboards (issue #522 option A).
                         // active_server_url/type still emit so the UI still
                         // shows which server is active.
-                        if !stale {
+                        if !rtt_probe_stale {
                             metrics.push(metric!("active_server_rtt", avg_rtt));
                         }
                         // SECURITY: redact (strip query + fragment) before emitting
@@ -3634,7 +3648,7 @@ impl ConnectionManager {
         // pipeline is starved (`rtt_probe_stale`) and how many probes have been
         // shed at the in-flight cap (`rtt_probe_dropped_total`). Bool-as-u64 per
         // the convention documented above.
-        metrics.push(metric!("rtt_probe_stale", self.rtt_probe_stale() as u64));
+        metrics.push(metric!("rtt_probe_stale", rtt_probe_stale as u64));
         metrics.push(metric!(
             "rtt_probe_dropped_total",
             self.rtt_probe_dropped_total()
@@ -3686,6 +3700,27 @@ impl ConnectionManager {
             self.active_connection_id.borrow(),
             self.election_state
         );
+
+        // #522: count this tick as a stale-suppression event when the active link's
+        // RTT-probe pipeline is stale (which suppresses active_server_rtt in
+        // build_main_diagnostic_metrics). Observability-only — increments a Cell via a
+        // shared ref, no control-flow or re-election behavior change.
+        //
+        // This guard takes its own `rtt_probe_stale()` snapshot rather than
+        // threading one in (the builder has no-arg unit-test callers, so its
+        // signature stays unchanged). That is exact: on the single-threaded WASM
+        // diagnostics tick, nothing mutates `cpu_overloaded`,
+        // `election_state`, or any `consecutive_probe_timeouts` between this
+        // snapshot and the builder's snapshot taken on the very next line, so
+        // the counted event always matches the suppression decision the builder
+        // makes for the same tick.
+        if self.rtt_probe_stale() {
+            self.rtt_probe_stale_suppressions_total.set(
+                self.rtt_probe_stale_suppressions_total
+                    .get()
+                    .saturating_add(1),
+            );
+        }
 
         let metrics = self.build_main_diagnostic_metrics();
 
@@ -4225,6 +4260,11 @@ impl ConnectionManager {
         self.rtt_probe_dropped_total.get()
     }
 
+    /// Monotonic count of stale-suppression ticks (#522). See the field doc.
+    pub fn rtt_probe_stale_suppressions_total(&self) -> u64 {
+        self.rtt_probe_stale_suppressions_total.get()
+    }
+
     /// Whether the ACTIVE link's RTT probe pipeline is stale (issue #522).
     ///
     /// True when the local main thread is CPU-overloaded (probe timing is
@@ -4391,6 +4431,7 @@ mod tests {
             packets_received: Rc::new(Cell::new(0)),
             packets_sent: Rc::new(Cell::new(0)),
             rtt_probe_dropped_total: Rc::new(Cell::new(0)),
+            rtt_probe_stale_suppressions_total: Rc::new(Cell::new(0)),
             last_metrics_timestamp_ms: Rc::new(RefCell::new(0.0)),
             packets_received_per_sec: Rc::new(RefCell::new(0.0)),
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
@@ -6091,6 +6132,65 @@ mod tests {
         assert!(
             mgr.check_rtt_degradation(),
             "with cpu_overloaded cleared and stale inbound, trigger must fire"
+        );
+    }
+
+    // #522: the stale-suppression counter must advance by exactly one on every
+    // 1 Hz diagnostics tick on which `rtt_probe_stale()` is true (the same
+    // predicate that suppresses `active_server_rtt`), and must NOT advance when
+    // the link is healthy. We drive the REAL `report_diagnostics` — it is
+    // native-safe: `now_ms()` uses `SystemTime` off-wasm, and on native targets
+    // `global_sender()` has no receiver, so `try_broadcast` returns an Err that
+    // `report_diagnostics` logs and swallows (it never panics or blocks). The
+    // increment runs at the top of `report_diagnostics`, before the broadcast,
+    // so it executes regardless of receiver state. We toggle staleness via
+    // `cpu_overloaded`, the same knob the existing suppression tests use.
+    //
+    // MUTATION: deleting the `if self.rtt_probe_stale() { ...set... }` block in
+    // `report_diagnostics` makes the counter stay 0 forever, so both the `== 1`
+    // and `== 2` assertions below fail. Removing only the guard (always
+    // incrementing) makes the healthy-tick assertion (`still 0`) fail.
+    #[test]
+    fn report_diagnostics_counts_stale_suppression_ticks() {
+        let mgr = make_test_manager();
+        assert_eq!(
+            mgr.rtt_probe_stale_suppressions_total(),
+            0,
+            "counter must start at 0"
+        );
+
+        // Healthy link (cpu_overloaded not set, no Elected stale timeouts):
+        // rtt_probe_stale() == false, so a tick must NOT advance the counter.
+        assert!(
+            !mgr.rtt_probe_stale(),
+            "precondition: a fresh test manager must not be stale"
+        );
+        mgr.report_diagnostics();
+        assert_eq!(
+            mgr.rtt_probe_stale_suppressions_total(),
+            0,
+            "a non-stale tick must NOT advance the suppression counter (proves the guard)"
+        );
+
+        // Force staleness via the CPU-overload signal (same mechanism the
+        // existing suppression tests use). Each subsequent tick must advance the
+        // counter by exactly one.
+        mgr.cpu_overloaded.store(true, Ordering::Relaxed);
+        assert!(
+            mgr.rtt_probe_stale(),
+            "precondition: cpu_overloaded must make rtt_probe_stale() true"
+        );
+        mgr.report_diagnostics();
+        assert_eq!(
+            mgr.rtt_probe_stale_suppressions_total(),
+            1,
+            "first stale tick must advance the counter to 1"
+        );
+        mgr.report_diagnostics();
+        assert_eq!(
+            mgr.rtt_probe_stale_suppressions_total(),
+            2,
+            "second stale tick must advance the counter to 2 (proves +1 per stale tick)"
         );
     }
 

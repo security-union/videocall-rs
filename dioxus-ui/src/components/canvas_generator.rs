@@ -921,196 +921,6 @@ pub fn generate_for_peer(
         };
     }
 
-    // Full-bleed single peer (no screen share)
-    if full_bleed && !is_screen_share_enabled_for_peer {
-        let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
-        let div_id_mobile = (*peer_video_div_id).clone();
-        let div_id_pin = (*peer_video_div_id).clone();
-        let canvas_id_crop = key.clone();
-        let key_clone = key.clone();
-        let peer_display_name_fb = peer_display_name.clone();
-        let peer_user_id_for_pin = peer_user_id.clone();
-        let title = if is_host {
-            format!("Host: {peer_user_id}")
-        } else {
-            peer_user_id.clone()
-        };
-        let full_bleed_class = if is_video_enabled_for_peer {
-            "canvas-container video-on"
-        } else {
-            "canvas-container"
-        };
-        let full_bleed_grid_class = if show_signal_popup {
-            "grid-item full-bleed signal-popup-open"
-        } else {
-            "grid-item full-bleed"
-        };
-        // HCL follow-up 957 (@token-exempt): anchor the popup on the
-        // tile's signal-quality button (id below) so the popup overlays
-        // the button's top-left corner on first open. `fb_name_id` is
-        // kept so the fallback walker still has a tile-relative
-        // `.floating-name` to land on if the button lookup misses.
-        let fb_name_id = format!("{}-name", &*peer_video_div_id);
-        let fb_signal_btn_id = format!("{}-signal-btn", &*peer_video_div_id);
-        let fb_anchor_id = fb_signal_btn_id.clone();
-        return rsx! {
-            div {
-                class: "{full_bleed_grid_class}{speaking_class}",
-                id: "{peer_video_div_id}",
-                "data-tile-root": "true",
-                style: "{tile_style}",
-                div {
-                    class: "{full_bleed_class}",
-                    onclick: move |_| {
-                        if is_mobile_viewport() {
-                            toggle_pinned_div(&div_id_mobile);
-                        }
-                    },
-                    if is_video_enabled_for_peer {
-                        UserVideo { id: key_clone.clone(), hidden: false }
-                    } else {
-                        div {
-                            class: "",
-                            div {
-                                class: "placeholder-content",
-                                PeerIcon {}
-                                span { class: "placeholder-text", "Camera Off" }
-                            }
-                        }
-                    }
-                    h4 {
-                        id: "{fb_name_id}",
-                        class: "floating-name",
-                        title: "{title}",
-                        dir: "auto",
-                        "{peer_display_name_fb}"
-                        if is_host {
-                            CrownIcon {}
-                        }
-                        if is_guest {
-                            span { class: "guest-badge", "Guest" }
-                        }
-                    }
-                    div {
-                        class: "tile-top-icons",
-                        // Mic icon (rightmost via row-reverse, always visible)
-                        div {
-                            class: "{audio_speaking_class}",
-                            style: "{mic_inline_style}",
-                            MicIcon { muted: !is_audio_enabled_for_peer }
-                        }
-                        // Signal icon (always visible, clickable)
-                        button {
-                            id: "{fb_signal_btn_id}",
-                            class: "signal-indicator",
-                            "aria-label": "Show signal quality",
-                            onclick: move |_| on_toggle_signal_popup.call(()),
-                            SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
-                        }
-                        // Crop (visible on hover only)
-                        if is_video_enabled_for_peer {
-                            {
-                                let crop_class = canvas_id_crop.clone();
-                                rsx! {
-                                    button {
-                                        onclick: move |_| toggle_canvas_crop(&canvas_id_crop, cropped_tiles),
-                                        class: if is_canvas_letterboxed(&crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
-                                        CropIcon {}
-                                    }
-                                }
-                            }
-                        }
-                        // Three-dot host control menu (visible on hover, only for host)
-                        if on_mute.is_some()
-                            || on_disable_video.is_some()
-                            || on_kick.is_some()
-                            || on_transfer_host.is_some()
-                        {
-                            {
-                                rsx! {
-                                    div { class: "tile-mute-menu-wrapper",
-                                        button {
-                                            class: "tile-mute-btn",
-                                            title: "Host actions",
-                                            "aria-label": "Host actions",
-                                            onclick: move |e: MouseEvent| {
-                                                e.stop_propagation();
-                                                show_tile_menu.set(!show_tile_menu());
-                                            },
-                                            svg {
-                                                xmlns: "http://www.w3.org/2000/svg",
-                                                width: "16",
-                                                height: "16",
-                                                view_box: "0 0 24 24",
-                                                fill: "none",
-                                                stroke: "currentColor",
-                                                stroke_width: "2",
-                                                stroke_linecap: "round",
-                                                stroke_linejoin: "round",
-                                                circle { cx: "12", cy: "12", r: "1" }
-                                                circle { cx: "12", cy: "5", r: "1" }
-                                                circle { cx: "12", cy: "19", r: "1" }
-                                            }
-                                        }
-                                        if show_tile_menu() {
-                                            div {
-                                                style: "position: fixed; inset: 0; z-index: 99;",
-                                                onclick: move |_| show_tile_menu.set(false),
-                                            }
-                                            div { class: "tile-context-menu",
-                                                {mute_menu_item(on_mute, show_tile_menu)}
-                                                {disable_video_menu_item(on_disable_video, show_tile_menu)}
-                                                {kick_menu_item(on_kick, show_tile_menu)}
-                                                {host_promotion_menu_items(on_transfer_host, show_tile_menu)}
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Pin (leftmost via row-reverse, visible on hover / when speaking)
-                        button {
-                            onclick: move |_| {
-                                toggle_pinned_div(&div_id_pin);
-                                on_toggle_pin.call(peer_user_id_for_pin.clone());
-                            },
-                            class: "pin-icon",
-                            PushPinIcon {}
-                        }
-                    }
-                }
-                // Popup hoisted out of `.canvas-container` so PR #923's // @token-exempt: PR ref, not a color
-                // border-radius `overflow: hidden` clip cannot crop it.
-                if show_signal_popup {
-                    {
-                        let h = signal_history.clone();
-                        let popup_peer_id = key.clone();
-                        let popup_peer_name = peer_display_name.clone();
-                        let popup_transport = signal_transport.clone();
-                        let popup_receive_diag = signal_receive_diag.clone();
-                        let popup_anchor = fb_anchor_id.clone();
-                        rsx! {
-                            SignalQualityPopup {
-                                peer_id: popup_peer_id,
-                                peer_name: popup_peer_name,
-                                history: h,
-                                meeting_start_ms,
-                                transport: popup_transport,
-                                anchor_id: popup_anchor,
-                                meter_mode: signal_meter_mode,
-                                receive_diag: popup_receive_diag,
-                                free_position: signal_free_position,
-                                on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
-                                on_reanchor: move |_| on_reanchor_signal_popup.call(()),
-                                on_close: move |_| on_close_signal_popup.call(()),
-                            }
-                        }
-                    }
-                }
-            }
-        };
-    }
-
     // Regular grid tile, optionally with screen share tile
     let screen_share_css = if client.is_awaiting_peer_screen_frame(key) {
         "grid-item hidden"
@@ -1202,11 +1012,24 @@ pub fn generate_for_peer(
             // (`.grid-item.off-budget-tile`). Empty string in the no-cap path,
             // so the rendered class list is unchanged when no budget is active.
             let off_budget_class = if force_avatar { " off-budget-tile" } else { "" };
-            let grid_item_class = if show_signal_popup {
-                "grid-item signal-popup-open"
-            } else {
-                "grid-item"
-            };
+            // issue 508: the surviving single peer (full_bleed) is now rendered
+            // from THIS one grid template with `full-bleed` as a plain CLASS
+            // toggle, instead of a separate full-bleed rsx! branch. Dioxus 0.7
+            // diffs by template-pointer identity, so the old branch swap tore
+            // down the `<canvas>` and rebuilt the renderer (last_width:0 → resize
+            // → FPS collapse) on every 2<->1 transition. Keeping one template
+            // lets Dioxus diff the tile in place and REUSE the same `<canvas>`
+            // node. The className is built to be byte-identical to the previous
+            // behaviour: "grid-item" in the normal grid, "grid-item full-bleed"
+            // for the single surviving peer, each gaining " signal-popup-open"
+            // when the signal popup is open.
+            let mut grid_item_class = String::from("grid-item");
+            if full_bleed {
+                grid_item_class.push_str(" full-bleed");
+            }
+            if show_signal_popup {
+                grid_item_class.push_str(" signal-popup-open");
+            }
             // HCL follow-up 957 (@token-exempt): anchor the popup on
             // the tile's signal-quality button (id below) so the popup
             // overlays the button's top-left corner on first open.
@@ -1231,6 +1054,18 @@ pub fn generate_for_peer(
                 "Video paused"
             } else {
                 "Video Disabled"
+            };
+            // issue 508: the full-bleed single peer used to read "Camera Off"
+            // in its now-deleted separate template. Preserve that exact visible
+            // text here, WITHIN this one template, for the plain camera-off arm
+            // only. A full-bleed tile has force_avatar == false, so
+            // paused_by_device is always false for it and it always lands in the
+            // plain `else` arm below — the paused arm keeps using
+            // `placeholder_label` and is unreachable for full-bleed tiles.
+            let camera_off_label = if full_bleed {
+                "Camera Off"
+            } else {
+                placeholder_label
             };
             // Tooltip / screen-reader text for the device-paused case. Empty for a
             // normal camera-off tile so nothing extra is announced there.
@@ -1284,7 +1119,7 @@ pub fn generate_for_peer(
                         } else {
                             div { class: "placeholder-content",
                                 PeerIcon {}
-                                span { class: "placeholder-text", "{placeholder_label}" }
+                                span { class: "placeholder-text", "{camera_off_label}" }
                             }
                         }
                         h4 {

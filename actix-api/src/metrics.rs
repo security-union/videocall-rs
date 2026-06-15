@@ -790,6 +790,28 @@ lazy_static! {
     )
     .expect("Failed to create videocall_client_reelection_total metric");
 
+    /// Cumulative encoder auto-restart cycles reported by the client (#527),
+    /// partitioned by encoder `kind` (camera|screen) and `reason`
+    /// (closed_codec|memory|configure|other).
+    ///
+    /// TYPE DECISION — GaugeVec, NOT CounterVec: identical reasoning to
+    /// CLIENT_REELECTION_TOTAL above. The client reports a CUMULATIVE per-reason
+    /// total in every health packet; the expander `.set()`s this gauge to that
+    /// value. `.inc()`-ing a CounterVec per packet would multiply-count the same
+    /// cumulative value once per second. The client value is monotonic within a
+    /// page session, so Grafana charts restart RATE with `rate()`/`increase()`
+    /// exactly as for the sibling `*_total` gauges; a page reload that resets the
+    /// client statics shows as a gauge drop (the same accepted caveat).
+    ///
+    /// CARDINALITY: `meeting_id` × `session_id` × 2 `kind` × 4 `reason` (bounded).
+    /// Per-session series are GC'd by the metrics-server's stale-session cleanup.
+    pub static ref ENCODER_RESTART_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_restart_total",
+        "Cumulative encoder auto-restart cycles reported by the client, by encoder kind (camera|screen) and reason (closed_codec|memory|configure|other). GaugeVec set() to the client's cumulative value; chart with rate()/increase() (#527)",
+        &["meeting_id", "session_id", "kind", "reason"]
+    )
+    .expect("Failed to create videocall_encoder_restart_total metric");
+
     // ===== ENCODER & SCREEN SHARE METRICS (sender-side, P0/P1) =====
     // NOTE(#1184): videocall_encoder_fps_ratio / videocall_encoder_bitrate_ratio
     // removed — dead telemetry whose source proto fields no longer exist.

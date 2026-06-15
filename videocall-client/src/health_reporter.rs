@@ -26,9 +26,13 @@ use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::encode::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
-    camera_encoder_frames_submitted_ok, screen_encoder_errors_closed_codec,
+    camera_encoder_frames_submitted_ok, camera_encoder_restarts_closed_codec,
+    camera_encoder_restarts_configure, camera_encoder_restarts_memory,
+    camera_encoder_restarts_other, screen_encoder_errors_closed_codec,
     screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
     screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
+    screen_encoder_restarts_closed_codec, screen_encoder_restarts_configure,
+    screen_encoder_restarts_memory, screen_encoder_restarts_other,
 };
 use log::{debug, trace, warn};
 use protobuf::Message;
@@ -1507,6 +1511,44 @@ impl HealthReporter {
         }
         if scr_frames > 0 {
             pb.screen_encoder_frames_submitted_ok = Some(scr_frames);
+        }
+
+        // Encoder auto-restart counters (#527), partitioned by reason. Same
+        // zero-cost-static + non-zero-only convention as the error counters
+        // above. The relay's metrics_server folds these into the single labeled
+        // counter videocall_encoder_restart_total{kind, reason}.
+        let cam_restart_closed = camera_encoder_restarts_closed_codec();
+        let cam_restart_mem = camera_encoder_restarts_memory();
+        let cam_restart_cfg = camera_encoder_restarts_configure();
+        let cam_restart_other = camera_encoder_restarts_other();
+        let scr_restart_closed = screen_encoder_restarts_closed_codec();
+        let scr_restart_mem = screen_encoder_restarts_memory();
+        let scr_restart_cfg = screen_encoder_restarts_configure();
+        let scr_restart_other = screen_encoder_restarts_other();
+
+        if cam_restart_closed > 0 {
+            pb.camera_encoder_restarts_closed_codec = Some(cam_restart_closed);
+        }
+        if cam_restart_mem > 0 {
+            pb.camera_encoder_restarts_memory = Some(cam_restart_mem);
+        }
+        if cam_restart_cfg > 0 {
+            pb.camera_encoder_restarts_configure = Some(cam_restart_cfg);
+        }
+        if cam_restart_other > 0 {
+            pb.camera_encoder_restarts_other = Some(cam_restart_other);
+        }
+        if scr_restart_closed > 0 {
+            pb.screen_encoder_restarts_closed_codec = Some(scr_restart_closed);
+        }
+        if scr_restart_mem > 0 {
+            pb.screen_encoder_restarts_memory = Some(scr_restart_mem);
+        }
+        if scr_restart_cfg > 0 {
+            pb.screen_encoder_restarts_configure = Some(scr_restart_cfg);
+        }
+        if scr_restart_other > 0 {
+            pb.screen_encoder_restarts_other = Some(scr_restart_other);
         }
 
         // Connection-loss reason counters

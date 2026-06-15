@@ -447,6 +447,25 @@ struct Inner {
     /// self-targeted CONGESTION sets BOTH so both publishers step down. Like the
     /// split `force_camera_keyframe` / `force_screen_keyframe` flags above.
     screen_congestion_step_down_requested: Arc<AtomicBool>,
+    /// CONGESTION-driven AUDIO simulcast layer-ceiling (issue #621). Unlike the
+    /// camera/screen `AtomicBool` step-down FLAGS above — which are consumed
+    /// (`swap(false)`) by an encoder AQ loop — this is a layer-COUNT atom shared
+    /// with the microphone encoder (`u32::MAX` = fail-open / no congestion cap).
+    /// On a self-targeted CONGESTION the dispatch stores `1` (base-only),
+    /// dropping every upper audio simulcast layer on the next frame — the audio
+    /// analogue of the camera's aggressive `force_congestion_cut`, but via the
+    /// layer-ceiling lever because the Opus AudioWorklet cannot reconfigure
+    /// bitrate live.
+    ///
+    /// A direct atomic store (NOT a consume-once flag) because the mic encoder has
+    /// NO AQ loop of its own — audio tier decisions are normally driven by the
+    /// CAMERA's AQ loop, which is NOT running when the publisher is audio-only.
+    /// Driving the ceiling directly here means the cut works regardless of camera
+    /// state. The mic encoder owns a self-contained recovery timer that climbs
+    /// this back up after a cooldown. Reset to `u32::MAX` on reconnect (see the
+    /// `Connected` handler) so a stale cut from the old session does not suppress
+    /// audio on a fresh one.
+    audio_congestion_layer_ceiling: Arc<AtomicU32>,
     /// Signal set by `ConnectionManager` when a re-election completes. The
     /// camera encoder reads and clears this to suppress crash ceiling arming.
     reelection_completed_signal: Rc<AtomicBool>,
@@ -464,19 +483,6 @@ struct Inner {
     /// Mirror of `camera_union_requested_layer` for the SCREEN media-kind — a
     /// clone of `ScreenEncoder::shared_union_requested_layer`. `None` until wired.
     screen_union_requested_layer: Option<Rc<AtomicU32>>,
-    /// Forced-keyframe cooldown reset for the CAMERA encoder (issue #1311). A
-    /// clone of `CameraEncoder::keyframe_cooldown_reset`, wired in by the host
-    /// after the encoder is built. SET to `true` on each `Connected` lifecycle
-    /// event (every reconnect) so the camera encode loop clears its
-    /// `last_keyframe_emit_ms` cooldown clock and the first post-reconnect PLI is
-    /// not coalesced away. `None` when no camera encoder is attached (observer
-    /// mode / native lib callers), in which case the reset is a no-op. The
-    /// RE-ELECTION path arms the same encoder-owned atom directly from the camera
-    /// quality task — only the RECONNECT path needs this client-side wiring,
-    /// because a full reconnect runs `reset_and_start_election` (clearing
-    /// `old_active_connection`) and so never drives `reelection_completed_signal`.
-    /// Screen has no equivalent yet (deferred #1311 follow-up, gated on #1322/#1344).
-    camera_keyframe_cooldown_reset: Option<Rc<AtomicBool>>,
     /// Long Tasks API observer that emits `client_longtask_duration_ms` /
     /// `client_longtask_count` to the diagnostic bus whenever the main
     /// thread blocks for more than 50 ms. Held for its drop side-effect:
@@ -520,6 +526,15 @@ pub struct VideoCallClient {
     /// `viewport_debounce_timer`. Dropping the `VideoCallClient` drops this slot,
     /// which drops the `Interval`, which cancels the underlying browser timer.
     early_seed_timer: Rc<RefCell<Option<Interval>>>,
+    /// Forced-keyframe cooldown reset for the CAMERA encoder (issue #1311,
+    /// hardened in #1352). A clone of `CameraEncoder::keyframe_cooldown_reset`,
+    /// wired in by the host after the encoder is built.
+    camera_keyframe_cooldown_reset: Rc<RefCell<Option<Rc<AtomicBool>>>>,
+    /// Forced-keyframe cooldown reset for the SCREEN encoder (issue #1311 screen
+    /// half), held outside `Inner` for the same borrow-safety reason as the camera
+    /// slot: a reconnect must be able to arm the encoder-owned atom even if the
+    /// `Inner` mutable borrow used for layer-preference / union-cap reset is busy.
+    screen_keyframe_cooldown_reset: Rc<RefCell<Option<Rc<AtomicBool>>>>,
 }
 
 // `Timeout` (gloo) is not `Debug`; derive a manual impl that elides the
@@ -669,6 +684,114 @@ fn send_layer_preference_via(
         },
         Err(_) => warn!("connection_controller busy; dropping LAYER_PREFERENCE packet"),
     }
+}
+
+/// Arm the CAMERA forced-keyframe cooldown reset on a (re)connect (issue #1311,
+/// hardened in #1352).
+///
+/// Reads the dedicated cooldown-reset slot (held OUTSIDE `Inner`), clones the
+/// encoder-owned `Rc<AtomicBool>` out, and stores `true` on it so the camera
+/// encode loop clears its `last_keyframe_emit_ms` cooldown clock on its next
+/// frame — letting the first post-reconnect PLI emit immediately instead of
+/// being coalesced away by a stale pre-transition keyframe timestamp.
+///
+/// The key invariant (issue #1352): the `store(true, Release)` MUST be
+/// independent of any `Inner` borrow. A full reconnect (not a re-election)
+/// relies solely on this client-side store — the encoder's re-election re-arm
+/// never fires on a plain reconnect (`reset_and_start_election` clears
+/// `old_active_connection`). The previous code nested the store inside the same
+/// `Inner` `try_borrow_mut()` that runs the layer-preference / union-cap resets,
+/// so a transient borrow conflict at reconnect time silently dropped the reset.
+/// Holding the atom in its own slot and cloning the `Rc` out under a short
+/// `try_borrow` removes that coupling. If the wiring slot itself is somehow
+/// borrowed (it never is in practice — the only writer is the synchronous
+/// `set_camera_keyframe_cooldown_reset`), the reset is skipped for that
+/// transition, which is the same fail-open behavior as `None` (not yet wired).
+///
+/// Idempotent and side-effect-bounded: arming a no-op (cold-start) reset is
+/// harmless (no PLI pending, clock already `None`), and a duplicate vs the
+/// quality task's re-election arm is collapsed by the `.swap(false)` consume on
+/// the encode-loop side.
+fn arm_keyframe_cooldown_reset_slot(slot: &Rc<RefCell<Option<Rc<AtomicBool>>>>) -> bool {
+    let atom = slot.try_borrow().ok().and_then(|slot| slot.clone());
+    if let Some(atom) = atom {
+        atom.store(true, Ordering::Release);
+        true
+    } else {
+        false
+    }
+}
+
+fn arm_camera_keyframe_cooldown_reset(slot: &Rc<RefCell<Option<Rc<AtomicBool>>>>) {
+    let _ = arm_keyframe_cooldown_reset_slot(slot);
+}
+
+fn handle_connected_reconnect_resets(
+    inner: &Weak<RefCell<Inner>>,
+    early_seed_timer: &Rc<RefCell<Option<Interval>>>,
+    camera_keyframe_cooldown_reset: &Rc<RefCell<Option<Rc<AtomicBool>>>>,
+    screen_keyframe_cooldown_reset: &Rc<RefCell<Option<Rc<AtomicBool>>>>,
+) {
+    // On (re)connect the relay also allocated a fresh empty layer-preference map
+    // for the new session_id (fail-open -> every layer forwarded). Clear the
+    // sender's last-sent memory so the NEXT peer-monitor tick re-sends the
+    // current per-peer desired layers unconditionally and downlink-aware
+    // filtering resumes (issue #989, Phase 2). We reset here rather than
+    // re-send inline because the desired map is recomputed from live per-peer
+    // health on the tick.
+    // Issue #1179, Part B: drop any armed early-seed timer so the next inbound
+    // packet re-arms a fresh 30s window against the new session. Dropping the
+    // Interval cancels the underlying browser timer.
+    if let Ok(mut slot) = early_seed_timer.try_borrow_mut() {
+        *slot = None;
+    }
+
+    if let Some(inner) = Weak::upgrade(inner) {
+        if let Ok(mut inner) = inner.try_borrow_mut() {
+            inner.layer_preference_sender.reset_for_reconnect();
+
+            // Relay layer-union cap reset (issue #1108, Stage 3). The NEW
+            // relay/session starts with an empty receiver set -> no union yet ->
+            // it would publish nothing (fail-open). Until its first LAYER_HINT
+            // lands, a cap left over from the OLD relay must not keep suppressing
+            // our ladder against a fresh session, so reset both kinds to the
+            // u32::MAX fail-open sentinel. The next LAYER_HINT (if any)
+            // re-establishes the cap. Same precedent as the layer_preference_sender
+            // reset above.
+            if let Some(atom) = &inner.camera_union_requested_layer {
+                atom.store(u32::MAX, Ordering::Relaxed);
+            }
+            if let Some(atom) = &inner.screen_union_requested_layer {
+                atom.store(u32::MAX, Ordering::Relaxed);
+            }
+            // CONGESTION-driven audio layer-ceiling reset (issue #621). A cut left
+            // over from the OLD relay/session must not keep the audio ladder pinned
+            // to base-only against a FRESH session, so reset it to the fail-open
+            // sentinel. The next self-targeted CONGESTION (if any) re-cuts it. Same
+            // reconnect-reset precedent as the union caps above. (The mic encoder's
+            // recovery timer would also climb it back, but resetting here means a
+            // fresh session starts at the full ladder immediately rather than
+            // waiting out a cooldown carried over from the old session.)
+            inner
+                .audio_congestion_layer_ceiling
+                .store(u32::MAX, Ordering::Relaxed);
+        } else {
+            warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
+        }
+    }
+
+    // Forced-keyframe cooldown reset (issue #1311, hardened in #1352). Run
+    // OUTSIDE the `Inner` `try_borrow_mut()` block above on purpose: a full
+    // reconnect relies SOLELY on this client-side arm (the encoder's
+    // re-election re-arm does not fire on a plain reconnect), and nesting it
+    // inside the `Inner` borrow meant a transient conflict at reconnect time
+    // silently dropped the reset. The helper clones the encoder-owned atom out
+    // of its own slot and stores `true` independently of any `Inner` borrow.
+    // This arm covers BOTH a full reconnect and a re-election (both re-emit
+    // `Connected` here); a cold-start no-op and a duplicate vs the quality task's
+    // arm are both harmless.
+    arm_camera_keyframe_cooldown_reset(camera_keyframe_cooldown_reset);
+    let _ = arm_keyframe_cooldown_reset_slot(screen_keyframe_cooldown_reset);
 }
 
 /// Arm the issue-#1179 early-seed sampler if it is not already armed.
@@ -893,6 +1016,9 @@ impl VideoCallClient {
         let force_screen_keyframe = Arc::new(AtomicBool::new(false));
         let congestion_step_down_requested = Arc::new(AtomicBool::new(false));
         let screen_congestion_step_down_requested = Arc::new(AtomicBool::new(false));
+        // CONGESTION-driven audio layer-ceiling (issue #621). Fail-open
+        // (u32::MAX = no congestion cap) until a self-targeted CONGESTION cuts it.
+        let audio_congestion_layer_ceiling = Arc::new(AtomicU32::new(u32::MAX));
         let reelection_completed_signal = Rc::new(AtomicBool::new(false));
 
         // Phase 8a / TELEM-1: register a Long Tasks API observer once per
@@ -967,16 +1093,13 @@ impl VideoCallClient {
                 congestion_step_down_requested: congestion_step_down_requested.clone(),
                 screen_congestion_step_down_requested: screen_congestion_step_down_requested
                     .clone(),
+                audio_congestion_layer_ceiling: audio_congestion_layer_ceiling.clone(),
                 reelection_completed_signal: reelection_completed_signal.clone(),
                 // Relay layer-union hint atoms (issue #1108, Stage 3). None until
                 // the host wires in the camera/screen encoder accessors; the
                 // LAYER_HINT dispatch arm no-ops while None (fail-open).
                 camera_union_requested_layer: None,
                 screen_union_requested_layer: None,
-                // Issue #1311: None until the host wires in
-                // `CameraEncoder::keyframe_cooldown_reset`; the reconnect reset
-                // no-ops while None.
-                camera_keyframe_cooldown_reset: None,
                 _long_task_observer: long_task_observer,
                 _render_fps_observer: render_fps_observer,
             })),
@@ -986,6 +1109,12 @@ impl VideoCallClient {
             viewport_sender: Rc::new(RefCell::new(ViewportSender::new())),
             viewport_debounce_timer: Rc::new(RefCell::new(None)),
             early_seed_timer: Rc::new(RefCell::new(None)),
+            // Issue #1311 / #1352: None until the host wires in
+            // `CameraEncoder::keyframe_cooldown_reset`; the reconnect reset
+            // no-ops while None. Held outside `Inner` so the `Connected` arm can
+            // arm it independently of the `Inner` borrow (see field doc).
+            camera_keyframe_cooldown_reset: Rc::new(RefCell::new(None)),
+            screen_keyframe_cooldown_reset: Rc::new(RefCell::new(None)),
         };
 
         // Wire up the send-packet callback on PeerDecodeManager so it can
@@ -1132,6 +1261,13 @@ impl VideoCallClient {
                 // against the new session (mirrors the layer_preference_sender
                 // reset below). Dropping the stored Interval cancels the old one.
                 let early_seed_timer = self.early_seed_timer.clone();
+                // Issue #1352: capture the forced-keyframe cooldown-reset slot
+                // directly (NOT via `Inner`) so the `Connected` arm can arm the
+                // encoder-owned atom even when the `Inner` borrow below is
+                // contended. Cloning the `Rc` is the whole point — the
+                // `store(true)` must not depend on `inner.try_borrow_mut()`.
+                let camera_keyframe_cooldown_reset = self.camera_keyframe_cooldown_reset.clone();
+                let screen_keyframe_cooldown_reset = self.screen_keyframe_cooldown_reset.clone();
                 Callback::from(move |state: ConnectionState| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
@@ -1151,71 +1287,12 @@ impl VideoCallClient {
                         ConnectionState::Connected { .. } => {
                             on_connected.emit(());
 
-                            // On (re)connect the relay also allocated a fresh
-                            // empty layer-preference map for the new session_id
-                            // (fail-open → every layer forwarded). Clear the
-                            // sender's last-sent memory so the NEXT peer-monitor
-                            // tick re-sends the current per-peer desired layers
-                            // unconditionally and downlink-aware filtering
-                            // resumes (issue #989, Phase 2). We reset here rather
-                            // than re-send inline because the desired map is
-                            // recomputed from live per-peer health on the tick.
-                            // Issue #1179, Part B: drop any armed early-seed
-                            // timer so the next inbound packet re-arms a fresh
-                            // 30s window against the new session. Dropping the
-                            // Interval cancels the underlying browser timer.
-                            if let Ok(mut slot) = early_seed_timer.try_borrow_mut() {
-                                *slot = None;
-                            }
-
-                            if let Some(inner) = Weak::upgrade(&inner) {
-                                if let Ok(mut inner) = inner.try_borrow_mut() {
-                                    inner.layer_preference_sender.reset_for_reconnect();
-
-                                    // Relay layer-union cap reset (issue #1108,
-                                    // Stage 3). The NEW relay/session starts with
-                                    // an empty receiver set → no union yet → it
-                                    // would publish nothing (fail-open). Until its
-                                    // first LAYER_HINT lands, a cap left over from
-                                    // the OLD relay must not keep suppressing our
-                                    // ladder against a fresh session, so reset both
-                                    // kinds to the u32::MAX fail-open sentinel. The
-                                    // next LAYER_HINT (if any) re-establishes the
-                                    // cap. Same precedent as the
-                                    // layer_preference_sender reset above.
-                                    if let Some(atom) = &inner.camera_union_requested_layer {
-                                        atom.store(u32::MAX, Ordering::Relaxed);
-                                    }
-                                    if let Some(atom) = &inner.screen_union_requested_layer {
-                                        atom.store(u32::MAX, Ordering::Relaxed);
-                                    }
-
-                                    // Forced-keyframe cooldown reset (issue #1311).
-                                    // The camera encode loop persists across a full
-                                    // reconnect AND a re-election (the connection is
-                                    // rebuilt / the active server is swapped, but the
-                                    // encoder is never restarted), so its
-                                    // `last_keyframe_emit_ms` carries a stale
-                                    // pre-transition timestamp that could suppress the
-                                    // first recovery PLI for up to one cooldown window
-                                    // (250ms). ARM the encoder-owned reset atom so the
-                                    // encode loop clears that clock on its next frame.
-                                    // This `Connected` arm covers BOTH transitions:
-                                    // a full reconnect and a re-election both end in an
-                                    // election that re-emits `Connected` here (a full
-                                    // reconnect does NOT drive `reelection_completed_signal`,
-                                    // so the camera quality task's re-election arm alone
-                                    // would miss it). A reset on the cold-start connect
-                                    // is a harmless no-op (no PLI pending, clock already
-                                    // `None`); a duplicate vs the quality task's arm is
-                                    // idempotent (`.swap(false)` on the consume side).
-                                    if let Some(atom) = &inner.camera_keyframe_cooldown_reset {
-                                        atom.store(true, Ordering::Release);
-                                    }
-                                } else {
-                                    warn!("LAYER_PREFERENCE reconnect reset: inner busy, skipping");
-                                }
-                            }
+                            handle_connected_reconnect_resets(
+                                &inner,
+                                &early_seed_timer,
+                                &camera_keyframe_cooldown_reset,
+                                &screen_keyframe_cooldown_reset,
+                            );
 
                             // On (re)connect the session_id changed and the
                             // relay allocated a fresh empty viewport (fail-open
@@ -1915,6 +1992,20 @@ impl VideoCallClient {
             .clone()
     }
 
+    /// Returns a shared reference to the CONGESTION-driven AUDIO layer-ceiling
+    /// atom (issue #621).
+    ///
+    /// Pass this to `MicrophoneEncoder::set_congestion_layer_ceiling` so a
+    /// self-targeted CONGESTION signal cuts the audio simulcast ladder to
+    /// base-only and the mic encoder's recovery timer can climb it back. This is
+    /// a layer-COUNT atom (`u32::MAX` = fail-open), NOT a consume-once flag like
+    /// [`congestion_step_down_flag`](Self::congestion_step_down_flag): the mic
+    /// encoder has no AQ loop of its own, so the dispatch drives this directly and
+    /// the cut works even when the camera is off (audio-only).
+    pub fn audio_congestion_layer_ceiling(&self) -> Arc<AtomicU32> {
+        self.inner.borrow().audio_congestion_layer_ceiling.clone()
+    }
+
     /// Returns a shared reference to the re-election completed signal.
     ///
     /// Pass this to `CameraEncoder` so that re-election events reach the
@@ -1939,7 +2030,8 @@ impl VideoCallClient {
         }
     }
 
-    /// Wire the CAMERA forced-keyframe cooldown reset atom (issue #1311).
+    /// Wire the CAMERA forced-keyframe cooldown reset atom (issue #1311,
+    /// hardened in #1352).
     ///
     /// The host calls this with
     /// [`CameraEncoder::keyframe_cooldown_reset`](crate::CameraEncoder::keyframe_cooldown_reset)
@@ -1950,11 +2042,39 @@ impl VideoCallClient {
     /// [`set_camera_union_requested_layer`](Self::set_camera_union_requested_layer)
     /// (atom OWNED by the encoder). The re-election path arms the same atom from
     /// the camera quality task with no client involvement.
+    ///
+    /// Stores into the dedicated `camera_keyframe_cooldown_reset` slot (held
+    /// outside `Inner`) rather than into `Inner` itself (issue #1352), so the
+    /// `Connected` arm's `store(true)` cannot be lost to a transient `Inner`
+    /// borrow conflict at reconnect time. This is a synchronous wiring call made
+    /// once during host setup, never from a connection callback, so its
+    /// `try_borrow_mut` of the slot does not contend with the `Connected` arm's
+    /// read of the same slot.
     pub fn set_camera_keyframe_cooldown_reset(&self, atom: Rc<AtomicBool>) {
-        if let Ok(mut inner) = self.inner.try_borrow_mut() {
-            inner.camera_keyframe_cooldown_reset = Some(atom);
+        if let Ok(mut slot) = self.camera_keyframe_cooldown_reset.try_borrow_mut() {
+            *slot = Some(atom);
         } else {
-            warn!("set_camera_keyframe_cooldown_reset: inner busy, skipping wiring");
+            warn!("set_camera_keyframe_cooldown_reset: slot busy, skipping wiring");
+        }
+    }
+
+    /// Wire the SCREEN forced-keyframe cooldown reset atom (issue #1311, screen half).
+    ///
+    /// Mirror of
+    /// [`set_camera_keyframe_cooldown_reset`](Self::set_camera_keyframe_cooldown_reset)
+    /// for the SCREEN media-kind; pass
+    /// [`ScreenEncoder::keyframe_cooldown_reset`](crate::ScreenEncoder::keyframe_cooldown_reset).
+    /// The `Connected` lifecycle callback ARMS this on the SAME transition as the
+    /// camera reset, so both encoders clear their forced-keyframe cooldown clock
+    /// together on every reconnect and the first post-reconnect screen PLI is not
+    /// coalesced away. Until wired the reconnect reset is a no-op (`None`); the
+    /// re-election path arms the same atom from the screen quality task with no client
+    /// involvement.
+    pub fn set_screen_keyframe_cooldown_reset(&self, atom: Rc<AtomicBool>) {
+        if let Ok(mut slot) = self.screen_keyframe_cooldown_reset.try_borrow_mut() {
+            *slot = Some(atom);
+        } else {
+            warn!("set_screen_keyframe_cooldown_reset: slot busy, skipping wiring");
         }
     }
 
@@ -2553,6 +2673,43 @@ impl Inner {
         }
 
         true
+    }
+
+    /// Apply every publisher-side quality cut triggered by a SELF-TARGETED server
+    /// CONGESTION signal.
+    ///
+    /// The CONGESTION signal targets a SESSION, not a media-kind — the relay is
+    /// dropping our outbound packets regardless of which stream they belong to —
+    /// so EVERY live publisher must back off:
+    ///   * VIDEO + SCREEN (issue #1199): set each encoder's own step-down FLAG.
+    ///     Separate flags (not one shared atom) so each encoder's AQ loop consumes
+    ///     its own with `swap(false)` and they never race; the AQ loop turns the
+    ///     edge into an aggressive multi-tier `force_congestion_cut`.
+    ///   * AUDIO (issue #621): drive the audio congestion layer-ceiling DIRECTLY
+    ///     to base-only (count `1`). Unlike video/screen this is NOT a consume-once
+    ///     flag, because the mic encoder has no AQ loop of its own (audio tier
+    ///     decisions are normally driven by the CAMERA's AQ loop, which is not
+    ///     running when the publisher is audio-only). A direct store makes the
+    ///     audio cut take effect on the next frame regardless of camera state; the
+    ///     mic encoder's self-contained recovery timer climbs the ceiling back up
+    ///     after a cooldown.
+    ///
+    /// Extracted as a `&self` helper so the dispatch arm and the host-side unit
+    /// test exercise the EXACT same coordinated side-effects.
+    fn apply_self_congestion_cut(&self) {
+        self.congestion_step_down_requested
+            .store(true, Ordering::Release);
+        self.screen_congestion_step_down_requested
+            .store(true, Ordering::Release);
+        // `Relaxed` (not `Release` like the two flags above) is deliberate and
+        // consistent with every other access to this atom: it is a plain shared
+        // level read live by the mic publish gate + recovery timer, with no
+        // cross-thread handoff to order against (single-threaded wasm). The
+        // video/screen flags use `Release` only to pair with the `swap(false)`
+        // `AcqRel` consume in their AQ loops; the audio ceiling has no such
+        // consume, so do not "upgrade" this to `Release`.
+        self.audio_congestion_layer_ceiling
+            .store(1, Ordering::Relaxed);
     }
 
     /// Returns the [`PeerStatus`] of the (possibly newly-created) peer so the
@@ -3206,17 +3363,7 @@ impl Inner {
                         "Received CONGESTION signal targeting us (session: {}), requesting quality step-down",
                         response.session_id,
                     );
-                    // Set BOTH the camera and screen step-down flags (issue
-                    // #1199). The CONGESTION signal targets a SESSION, not a
-                    // media-kind — the relay is dropping our outbound packets
-                    // regardless of which stream they belong to — so every live
-                    // publisher must back off. Separate flags (not one shared
-                    // atom) so each encoder's AQ loop consumes its own with
-                    // `swap(false)` and they never race.
-                    self.congestion_step_down_requested
-                        .store(true, Ordering::Release);
-                    self.screen_congestion_step_down_requested
-                        .store(true, Ordering::Release);
+                    self.apply_self_congestion_cut();
                 } else {
                     debug!(
                         "Ignoring cross-session CONGESTION signal for session {} (our session: {:?})",
@@ -3944,6 +4091,302 @@ mod dedup_tests {
              to the renaming tab only — sibling tabs of the same authed \
              user must NOT overwrite their own display name signal. \
              Regression guard for HCL #828."
+        );
+    }
+}
+
+/// Host-target regression tests for the issue-#1352 hardening of the
+/// reconnect forced-keyframe cooldown reset.
+///
+/// These are plain `#[test]`s (NOT `#[wasm_bindgen_test]`) on purpose: per the
+/// project's CI notes, `#[wasm_bindgen_test]` can silently no-op on some runners,
+/// so a wasm-only assertion would be a false green. They drive the REAL source
+/// helpers the `Connected` lifecycle arm calls against the SAME slot type the
+/// live code holds (`Rc<RefCell<Option<Rc<AtomicBool>>>>`). The reset path
+/// touches no browser API, so it runs unchanged on the host target.
+#[cfg(test)]
+mod cooldown_reset_hardening_tests {
+    use super::arm_camera_keyframe_cooldown_reset;
+    use super::arm_keyframe_cooldown_reset_slot;
+    use super::handle_connected_reconnect_resets;
+    use super::VideoCallClient;
+    use super::VideoCallClientOptions;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use videocall_types::Callback;
+
+    fn build_test_client() -> VideoCallClient {
+        VideoCallClient::new(VideoCallClientOptions {
+            enable_e2ee: false,
+            enable_webtransport: false,
+            on_peer_added: Callback::noop(),
+            on_peer_first_frame: Callback::noop(),
+            on_peer_removed: None,
+            on_peers_removed_batch: None,
+            refresh_room_token_callback: None,
+            get_peer_video_canvas_id: Callback::from(|id| id),
+            get_peer_screen_canvas_id: Callback::from(|id| id),
+            user_id: "test-user".to_string(),
+            display_name: "test".to_string(),
+            meeting_id: "test-meeting".to_string(),
+            websocket_urls: Vec::new(),
+            webtransport_urls: Vec::new(),
+            on_connected: Callback::noop(),
+            on_connection_lost: Callback::noop(),
+            enable_diagnostics: false,
+            diagnostics_update_interval_ms: None,
+            enable_health_reporting: false,
+            health_reporting_interval_ms: None,
+            on_encoder_settings_update: None,
+            rtt_testing_period_ms: 2000,
+            rtt_probe_interval_ms: None,
+            on_meeting_info: None,
+            on_meeting_ended: None,
+            on_speaking_changed: None,
+            on_audio_level_changed: None,
+            vad_threshold: None,
+            on_meeting_activated: None,
+            on_participant_admitted: None,
+            on_participant_rejected: None,
+            on_waiting_room_updated: None,
+            on_meeting_settings_updated: None,
+            on_peer_left: None,
+            on_peer_joined: None,
+            on_display_name_changed: None,
+            on_host_mute: None,
+            on_host_disable_video: None,
+            on_participant_kicked: None,
+            on_peer_event: None,
+            decode_media: true,
+            is_guest: false,
+            allow_post_rebase_retry: true,
+        })
+    }
+
+    #[test]
+    fn connected_reset_helper_arms_real_slot_while_real_inner_is_borrowed() {
+        let client = build_test_client();
+        let camera = Rc::new(AtomicBool::new(false));
+        let screen = Rc::new(AtomicBool::new(false));
+        client.set_camera_keyframe_cooldown_reset(camera.clone());
+        client.set_screen_keyframe_cooldown_reset(screen.clone());
+
+        let inner_guard = client.inner.borrow_mut();
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+        );
+
+        assert!(
+            camera.load(Ordering::Acquire),
+            "the real Connected reset helper must arm the camera cooldown atom even \
+             while the real Inner is mutably borrowed"
+        );
+        assert!(
+            screen.load(Ordering::Acquire),
+            "the real Connected reset helper must arm the screen cooldown atom even \
+             while the real Inner is mutably borrowed"
+        );
+        drop(inner_guard);
+    }
+
+    /// The whole point of #1352: the reset must fire on a reconnect even when
+    /// `Inner` is borrowed at that instant. Because the atom now lives in its
+    /// OWN slot (not inside `Inner`), an outstanding `Inner` borrow is irrelevant.
+    /// We model the contended reconnect by holding a borrow of a stand-in `Inner`
+    /// across the arm call and asserting the atom was still set.
+    #[test]
+    fn reset_fires_even_while_inner_is_borrowed() {
+        // Stand-in for the `Rc<RefCell<Inner>>` the `Connected` arm also touches.
+        let inner_like: Rc<RefCell<u32>> = Rc::new(RefCell::new(0));
+        // Encoder-owned reset atom, wired into the dedicated slot.
+        let atom = Rc::new(AtomicBool::new(false));
+        let slot: Rc<RefCell<Option<Rc<AtomicBool>>>> = Rc::new(RefCell::new(Some(atom.clone())));
+
+        // Simulate the transient borrow conflict that, pre-#1352, dropped the
+        // reset: `Inner` is mutably borrowed for the duration of the arm call.
+        let inner_guard = inner_like.borrow_mut();
+        arm_camera_keyframe_cooldown_reset(&slot);
+        // The atom must be armed regardless of the held `Inner` borrow. If the
+        // store were ever moved back inside an `Inner` borrow (the #1352
+        // regression), this would NOT be reachable under contention.
+        assert!(
+            atom.load(Ordering::Acquire),
+            "cooldown reset must fire while Inner is borrowed (issue #1352): the \
+             store must not depend on an Inner borrow"
+        );
+        drop(inner_guard);
+
+        // The encode loop consumes the edge exactly once (`.swap(false)`), the
+        // same one-shot contract the camera encoder relies on.
+        assert!(
+            atom.swap(false, Ordering::AcqRel),
+            "the armed reset edge must be observable exactly once"
+        );
+        assert!(
+            !atom.load(Ordering::Acquire),
+            "the reset edge is one-shot; it must not stick set after consume"
+        );
+    }
+
+    /// CONTROL: pins that the helper's effect is real and not vacuous. If the
+    /// store inside `arm_camera_keyframe_cooldown_reset` were removed (the
+    /// mutation this suite guards), the atom would stay `false` and this fails.
+    #[test]
+    fn helper_actually_sets_the_atom() {
+        let atom = Rc::new(AtomicBool::new(false));
+        let slot: Rc<RefCell<Option<Rc<AtomicBool>>>> = Rc::new(RefCell::new(Some(atom.clone())));
+        assert!(
+            !atom.load(Ordering::Acquire),
+            "precondition: atom starts unarmed"
+        );
+        arm_camera_keyframe_cooldown_reset(&slot);
+        assert!(
+            atom.load(Ordering::Acquire),
+            "arm_camera_keyframe_cooldown_reset must store(true) on the wired atom"
+        );
+    }
+
+    /// Fail-open: before the host wires the encoder atom (slot is `None`, e.g.
+    /// observer mode), arming is a safe no-op and must not panic.
+    #[test]
+    fn unwired_slot_is_a_safe_no_op() {
+        let slot: Rc<RefCell<Option<Rc<AtomicBool>>>> = Rc::new(RefCell::new(None));
+        // Must not panic and must do nothing observable.
+        arm_camera_keyframe_cooldown_reset(&slot);
+    }
+
+    /// The arm call must NOT hold the slot borrow across the `store` — otherwise a
+    /// re-entrant arm (or the synchronous wiring setter) could deadlock/conflict.
+    /// We prove the borrow is released by mutably borrowing the slot immediately
+    /// after the arm returns; a leaked borrow would panic here.
+    #[test]
+    fn arm_releases_slot_borrow_before_returning() {
+        let atom = Rc::new(AtomicBool::new(false));
+        let slot: Rc<RefCell<Option<Rc<AtomicBool>>>> = Rc::new(RefCell::new(Some(atom.clone())));
+        arm_camera_keyframe_cooldown_reset(&slot);
+        // If the helper held the borrow past its return, this would panic
+        // ("already borrowed"). It must succeed.
+        let mut guard = slot.borrow_mut();
+        *guard = None;
+        assert!(
+            atom.load(Ordering::Acquire),
+            "atom was still armed by the call"
+        );
+    }
+
+    #[test]
+    fn slot_helper_reports_whether_it_armed_an_atom() {
+        let atom = Rc::new(AtomicBool::new(false));
+        let wired: Rc<RefCell<Option<Rc<AtomicBool>>>> = Rc::new(RefCell::new(Some(atom.clone())));
+        let unwired: Rc<RefCell<Option<Rc<AtomicBool>>>> = Rc::new(RefCell::new(None));
+
+        assert!(arm_keyframe_cooldown_reset_slot(&wired));
+        assert!(atom.load(Ordering::Acquire));
+        assert!(!arm_keyframe_cooldown_reset_slot(&unwired));
+    }
+
+    /// Issue #621 acceptance: a self-targeted CONGESTION cut must fire the VIDEO
+    /// step-down flag AND cut the AUDIO congestion layer-ceiling to base-only — in
+    /// one coordinated action (the screen flag too, #1199). Drives the exact
+    /// `apply_self_congestion_cut` path the CONGESTION dispatch arm calls, on a
+    /// real host-built `Inner`.
+    #[test]
+    fn self_congestion_cut_fires_both_video_and_audio() {
+        let client = build_test_client();
+
+        let inner = client.inner.borrow();
+        // Preconditions: video/screen flags clear, audio ceiling fail-open.
+        assert!(
+            !inner.congestion_step_down_requested.load(Ordering::Acquire),
+            "precondition: camera flag starts clear"
+        );
+        assert!(
+            !inner
+                .screen_congestion_step_down_requested
+                .load(Ordering::Acquire),
+            "precondition: screen flag starts clear"
+        );
+        assert_eq!(
+            inner.audio_congestion_layer_ceiling.load(Ordering::Relaxed),
+            u32::MAX,
+            "precondition: audio congestion ceiling starts fail-open"
+        );
+
+        inner.apply_self_congestion_cut();
+
+        // BOTH the video step-down (force_video_step_down's edge, via the flag the
+        // camera AQ loop turns into force_congestion_cut) AND the audio cut fire.
+        assert!(
+            inner.congestion_step_down_requested.load(Ordering::Acquire),
+            "self-targeted CONGESTION must set the camera step-down flag"
+        );
+        assert!(
+            inner
+                .screen_congestion_step_down_requested
+                .load(Ordering::Acquire),
+            "self-targeted CONGESTION must set the screen step-down flag (#1199)"
+        );
+        assert_eq!(
+            inner.audio_congestion_layer_ceiling.load(Ordering::Relaxed),
+            1,
+            "self-targeted CONGESTION must cut the AUDIO ceiling to base-only (#621)"
+        );
+    }
+
+    /// Issue #621: the audio congestion cut must be observable through the public
+    /// `audio_congestion_layer_ceiling()` accessor the host wires into the mic
+    /// encoder — proving the SAME atom the mic reads is the one the dispatch cuts.
+    #[test]
+    fn self_congestion_cut_visible_via_public_accessor() {
+        let client = build_test_client();
+        let shared = client.audio_congestion_layer_ceiling();
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            u32::MAX,
+            "shared atom starts fail-open"
+        );
+        client.inner.borrow().apply_self_congestion_cut();
+        assert_eq!(
+            shared.load(Ordering::Relaxed),
+            1,
+            "the cut is visible on the atom shared with the mic encoder"
+        );
+    }
+
+    /// Issue #621: a reconnect must reset the audio congestion ceiling back to
+    /// fail-open so a stale cut from the OLD session does not pin the audio ladder
+    /// to base-only against a FRESH session.
+    #[test]
+    fn reconnect_resets_audio_congestion_ceiling() {
+        let client = build_test_client();
+        // Simulate an active cut left over from the previous session.
+        client.inner.borrow().apply_self_congestion_cut();
+        assert_eq!(
+            client
+                .audio_congestion_layer_ceiling()
+                .load(Ordering::Relaxed),
+            1,
+            "precondition: a cut is active"
+        );
+
+        // The real Connected/reconnect reset path.
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+        );
+
+        assert_eq!(
+            client
+                .audio_congestion_layer_ceiling()
+                .load(Ordering::Relaxed),
+            u32::MAX,
+            "reconnect must reset the audio congestion ceiling to fail-open"
         );
     }
 }

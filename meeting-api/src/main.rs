@@ -65,7 +65,10 @@ async fn main() {
             }
         },
         None => {
-            tracing::info!("NATS_URL not set — meeting event push notifications disabled");
+            tracing::warn!(
+                "NATS_URL not set — meeting event push notifications disabled \
+                 (mute, rename, waiting-room admit/reject, host-leave broadcast)"
+            );
             None
         }
     };

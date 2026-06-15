@@ -346,8 +346,9 @@ pub fn generate_for_peer(
     // to save CPU. The tile renders the avatar/initials placeholder instead of a
     // live `<canvas>` (so no decode pipeline is bound) and tags the grid item
     // with `off-budget-tile` for styling / E2E. Audio is unaffected: the peer is
-    // simply not in `active_decode_set`. Always `false` on the screen-share /
-    // full-bleed paths (the avatar tier only appears in the multi-tile grid).
+    // simply not in `active_decode_set`. Always `false` on the full-bleed
+    // screen-share path. In the split-layout right panel, off-budget SS tiles
+    // pass `true` just as the normal grid does.
     force_avatar: bool,
 ) -> Element {
     let cropped_tiles: Option<Signal<HashMap<String, bool>>> =
@@ -398,8 +399,8 @@ pub fn generate_for_peer(
     // has excluded it from `active_decode_set` (no frames are being decoded for
     // it). `show_canvas` therefore requires BOTH the peer's camera to be on AND
     // the tile not to be forced into avatar mode. When `force_avatar` is false
-    // (the no-cap default and every screen-share / full-bleed call) this is
-    // exactly `is_video_enabled_for_peer`, so behaviour is unchanged.
+    // (the no-cap default) this is exactly `is_video_enabled_for_peer`, so
+    // behaviour is unchanged.
     let show_canvas = is_video_enabled_for_peer && !force_avatar;
 
     let is_pinned = pinned_peer_id
@@ -603,8 +604,31 @@ pub fn generate_for_peer(
                             toggle_pinned_div(&div_id_mobile);
                         }
                     },
-                    if is_video_enabled_for_peer {
+                    if show_canvas {
                         UserVideo { id: key_clone.clone(), hidden: false }
+                    } else if force_avatar && is_video_enabled_for_peer {
+                        // Device-paused avatar: peer's camera is on but our
+                        // decode budget excluded this tile. Mirror the grid
+                        // path's paused placeholder (pause badge + tooltip).
+                        div {
+                            class: "placeholder-content placeholder-content--paused",
+                            title: "Paused by your device to keep the call smooth. Audio is still on.",
+                            "aria-label": "Paused by your device to keep the call smooth. Audio is still on.",
+                            role: "img",
+                            span { class: "decode-paused-badge", aria_hidden: "true",
+                                svg {
+                                    width: "14",
+                                    height: "14",
+                                    view_box: "0 0 24 24",
+                                    fill: "currentColor",
+                                    stroke: "none",
+                                    rect { x: "6", y: "5", width: "4", height: "14", rx: "1" }
+                                    rect { x: "14", y: "5", width: "4", height: "14", rx: "1" }
+                                }
+                            }
+                            PeerIcon {}
+                            span { class: "placeholder-text", "Video paused" }
+                        }
                     } else {
                         div {
                             class: "placeholder-content",

@@ -286,6 +286,23 @@ message HealthPacket {
   // so this can be < effective_video_layers. The gap is the shed depth.
   optional uint32 active_video_layers = 76;
 
+  // Encoder auto-RESTART counters (#527), cumulative since page load,
+  // partitioned by reason. Distinct from the *_errors_* counters above: those
+  // count fault OCCURRENCES; these count restart CYCLES (the encode loop
+  // re-entering its 'restart loop). The relay's metrics_server expands these
+  // into a single labeled counter
+  // videocall_encoder_restart_total{kind=camera|screen, reason=closed_codec|memory|configure|other}.
+  // Only attached when non-zero (healthy sessions never restart), mirroring the
+  // encoder-error fields. Cold start and user-initiated stop do NOT bump these.
+  optional uint64 camera_encoder_restarts_closed_codec = 77;
+  optional uint64 camera_encoder_restarts_memory = 78;
+  optional uint64 camera_encoder_restarts_configure = 79;
+  optional uint64 camera_encoder_restarts_other = 80;
+  optional uint64 screen_encoder_restarts_closed_codec = 81;
+  optional uint64 screen_encoder_restarts_memory = 82;
+  optional uint64 screen_encoder_restarts_configure = 83;
+  optional uint64 screen_encoder_restarts_other = 84;
+
   // RTT-probe resilience signals (#522). Surface the client-side RTT-probe
   // backpressure/staleness the merged #522 core already tracks so operators can
   // see probe-pipeline health across the fleet server-side. Both are cumulative
@@ -296,12 +313,12 @@ message HealthPacket {
   //
   // rtt_probe_dropped_total = cumulative count of RTT probes dropped because the
   // in-flight probe queue was at MAX_INFLIGHT_PROBES (queue-cap backpressure).
-  optional uint64 rtt_probe_dropped_total = 77; // (#522)
+  optional uint64 rtt_probe_dropped_total = 85; // (#522)
   // rtt_probe_stale_suppressions_total = cumulative count of 1 Hz diagnostics
   // ticks on which the active link's RTT-probe pipeline was stale and so
   // active_server_rtt was suppressed (observability-only; does NOT change the
   // suppression/re-election behavior, only counts it).
-  optional uint64 rtt_probe_stale_suppressions_total = 78; // (#522)
+  optional uint64 rtt_probe_stale_suppressions_total = 86; // (#522)
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

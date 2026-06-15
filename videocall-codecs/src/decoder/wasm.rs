@@ -393,12 +393,46 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
     }
 
     // freshness_skip (issue #1045): the #1020 freshness-deadline outcome, forwarded
-    // from the worker so it lands in uploaded field logs. Re-broadcast as a
-    // DiagEvent with the worker's peer context, mirroring the video_stats path.
+    // from the worker so it lands in uploaded field logs.
+    //
+    // Delivery (issue #1045 follow-up): the upload pipeline captures the main thread's
+    // `console.*` (see `console-log-collector.js`), so the load-bearing delivery is the
+    // re-emitted `console` line below — NOT the DiagEvent. The DiagEvent broadcast goes only
+    // to the in-process diagnostics bus, which has no console bridge: its `"video"` subsystem
+    // is consumed by `health_reporter` (folded into the Prometheus health packet, where every
+    // freshness field hits a catch-all and is dropped) and the diagnostics drawer (rendered to
+    // the DOM, never uploaded) — so on its own it would NOT reach the field logs the issue
+    // targets. This was the same gap fixed for `worker_log` in #1356/#1372; the skip path was
+    // missed there and is corrected here. The DiagEvent is kept for any future structured
+    // consumer, mirroring the other worker->main diagnostics. The `[JITTER_BUFFER]` prefix
+    // matches the grep the field investigation already uses for this signal.
     if let Ok(skip_msg) = serde_wasm_bindgen::from_value::<FreshnessSkipMessage>(js_val.clone()) {
         if skip_msg.kind == FRESHNESS_SKIP_KIND {
             #[cfg(feature = "wasm")]
             {
+                let from = skip_msg.from_peer.clone().unwrap_or_default();
+                let to = skip_msg.to_peer.clone().unwrap_or_default();
+                // `None` keyframe_seq is the keyframe-less held (last-good) case; otherwise the
+                // sequence we skipped forward to.
+                let keyframe = skip_msg
+                    .keyframe_seq
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| "none (held last-good)".into());
+                // A skip means the head-of-line frame aged past the playout deadline and stale
+                // frames were evicted to recover — a real degradation signal, surfaced at WARN so
+                // it stands out in field logs. This cannot amplify per tick: the worker only
+                // surfaces a skip for forwarding at most ~once/sec/stream (the rate-limit +
+                // coalescing in `JitterBuffer::record_freshness_skip`, gated on
+                // `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS`), so one console line maps to one
+                // forwarded event, not one per eviction.
+                console::warn_1(
+                    &format!(
+                        "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms dropped={} keyframe_seq={keyframe}",
+                        skip_msg.head_age_ms, skip_msg.dropped
+                    )
+                    .into(),
+                );
+
                 let evt = DiagEvent {
                     subsystem: "video",
                     stream_id: None,

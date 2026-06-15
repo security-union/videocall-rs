@@ -3341,44 +3341,19 @@ pub fn AttendantsComponent(
     let has_screen_share = active_screen_sharer.is_some();
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
-    // The right panel uses a 2-column grid of compact tiles. We compute how
-    // many fit based on the available height, then run speaker promotion
-    // independently of the normal grid's visible_tile_count.
     //
-    // Layout constants must stay in sync with container_style below:
-    //   - SS_FLEX_RATIO: right panel gets 1/(2+1) of the container width
-    //   - SS_OUTER_PAD: padding: 16px 16px 80px 16px → left + right = 32px
-    //   - SS_GAP: gap between left/right panels = 10px (container gap)
-    //   - SS_GRID_GAP: gap between tiles in the 2-col grid = 8px
-    //   - SS_GRID_PAD: padding inside the right panel div = 6px each side
-    //   - SS_BOTTOM_PAD: padding-bottom (80px) from container_style
-    //   - SS_TOP_PAD: padding-top (16px) + right panel padding (6px*2)
+    // Screen-share right panel: compact tiles via CSS flex-wrap layout.
+    // All visual sizing is handled purely by CSS (.ss-peer-panel).
     //
-    // Tile sizing: height is fixed to fit 4 tiles per column regardless of panel width.
-    // Column count collapses to 1 when right_ratio <= 0.25 or panel is too narrow.
-    // Actual tile width is controlled by the CSS grid (1fr columns), not computed here.
-    const SS_GRID_GAP: f64 = 8.0;
-    const SS_BOTTOM_PAD: f64 = 80.0;
-    const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
-    let right_ratio = 1.0 - screen_share_ratio();
-    let ss_panel_width = (right_ratio * (vw - 42.0) - 12.0).max(100.0); // ≈ right_ratio * (vw - outer_pad - gap) - grid_pad
-    let ss_cols = if right_ratio <= 0.25 || ss_panel_width < 180.0 {
-        1.0_f64 // single column
-    } else {
-        2.0_f64 // two columns
-    };
-    let ss_avail_h = vh - SS_BOTTOM_PAD - SS_VERT_PAD;
-    // Tile height: always sized to fit exactly 4 tiles per column (independent of panel width resize).
-    let ss_tile_h = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0);
-    // Natural tile width at 16:9: ss_tile_h * 16.0 / 9.0 (actual width follows grid columns).
-    // Max rows is always 4 (height is sized for exactly 4 tiles per column).
-    let ss_max_rows = 4_usize;
-    let ss_max_tiles = ss_max_rows * ss_cols as usize;
+    // ALL participants are rendered in the DOM (vertical scroll handles
+    // overflow), but only the first `ss_decoded_limit` get live video
+    // decode. The rest render as avatar-tier tiles (`force_avatar: true`)
+    // — same pattern as the normal grid's decode-budget (issue #987).
+    // This prevents a 30-person meeting from spinning up 30 decoders
+    // during screen share on constrained hardware.
 
     // Build a separate tile list for the screen-share right panel.
-    // The grid's promotion used visible_tile_count which differs from the
-    // screen-share panel's capacity, so we rebuild from scratch and re-promote.
-    let (ss_tiles, ss_overflow_count) = if has_screen_share {
+    let (ss_decoded_tiles, ss_avatar_tiles) = if has_screen_share {
         let mut ss_all: Vec<String> = Vec::with_capacity(total_tiles);
         for peer_id in display_peers.iter().take(capped_real) {
             ss_all.push(peer_id.clone());
@@ -3393,19 +3368,14 @@ pub fn AttendantsComponent(
             });
         }
 
-        let (ss_vis_count, ss_ovf) = if ss_all.len() > ss_max_tiles {
-            let vis = ss_max_tiles.saturating_sub(1).max(1); // reserve 1 slot for badge
-            (vis, ss_all.len() - vis)
-        } else {
-            (ss_all.len(), 0)
-        };
-
+        // Promote active speakers into the decoded budget window.
+        let ss_budget = budget_cap.max(MIN_CAP).min(ss_all.len());
         {
             let speech_map = peer_speech_priority.read();
             let join_map = peer_join_time.read();
             promote_speakers(
                 &mut ss_all,
-                ss_vis_count,
+                ss_budget,
                 &speech_map,
                 &join_map,
                 now_ms,
@@ -3413,10 +3383,32 @@ pub fn AttendantsComponent(
             );
         }
 
-        let tiles: Vec<String> = ss_all.into_iter().take(ss_vis_count).collect();
-        (tiles, ss_ovf)
+        // --- SS pin-swap (mirrors the normal grid's pin-swap at lines above) ---
+        // If the pinned peer is ranked beyond `ss_budget`, swap it into the
+        // last decoded slot so it renders with live video instead of avatar.
+        // Without this, a pinned off-budget SS peer gets force-added to
+        // `active_decode_set` (phase 3) which silently exceeds budget_cap,
+        // AND renders as avatar despite being decoded (wasted decode +
+        // misleading UI).
+        if ss_budget > 0 && ss_budget < ss_all.len() {
+            if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
+                let pinned_idx = ss_all.iter().position(|tile_id| {
+                    client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
+                });
+                if let Some(idx) = pinned_idx {
+                    if idx >= ss_budget {
+                        ss_all.swap(ss_budget - 1, idx);
+                    }
+                }
+            }
+        }
+
+        // Split: first ss_budget tiles get video decode, rest get avatars.
+        let decoded: Vec<String> = ss_all.iter().take(ss_budget).cloned().collect();
+        let avatars: Vec<String> = ss_all.iter().skip(ss_budget).cloned().collect();
+        (decoded, avatars)
     } else {
-        (Vec::new(), 0)
+        (Vec::new(), Vec::new())
     };
 
     // ORDERING INVARIANT: the active decode set is built in 3 phases:
@@ -3426,8 +3418,9 @@ pub fn AttendantsComponent(
     // The dedup check against previous_active_decode_set must run AFTER all
     // three phases. Moving any insertion after the dedup will silently desync.
     let mut active_decode_set: HashSet<u64> = if has_screen_share {
-        // In screen share mode, decode only the tiles visible in the right panel.
-        ss_tiles
+        // In screen share mode, decode only the budget-capped tiles.
+        // Avatar-tier tiles are rendered but not decoded.
+        ss_decoded_tiles
             .iter()
             .filter_map(|pid| pid.parse::<u64>().ok())
             .collect()
@@ -4105,36 +4098,12 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — 1 or 2-column grid of compact peer tiles.
-                                //
-                                // HCL issues #3 + #4: columns are sized to the tile's natural
-                                // 3:2 width (`ss_tile_h * 1.5`), NOT `1fr`. `1fr` columns made
-                                // the grid stretch each cell to fill `right_pct%`, leaving the
-                                // 3:2-capped `.split-peer-tile` centered with surplus on both
-                                // sides — visually "centered with too-large column gaps" on a
-                                // wide right panel. Pairing fixed `var(--ss-tile-w)` cells
-                                // with `justify-content: start` packs the tiles to the left
-                                // edge and keeps the inter-tile gap exactly `8px`, matching
-                                // the non-share grid feel. Tiles still hold their 3:2 cap
-                                // (enforced by `.split-peer-tile { aspect-ratio: 3 / 2 }`),
-                                // so wide-screen viewports leave empty space on the right
-                                // edge of the panel instead of stretching the tiles.
+                                // Right panel — CSS flex-wrap panel.
                                 div {
-                                    style: {
-                                        let ss_tile_w = (ss_tile_h * TILE_AR).round();
-                                        let grid_cols = if ss_cols > 1.0 {
-                                            format!("repeat(2, {ss_tile_w:.0}px)")
-                                        } else {
-                                            format!("{ss_tile_w:.0}px")
-                                        };
-                                        format!("width: {right_pct:.2}%; min-width: 0; height: 100%; \
-                                                display: grid; grid-template-columns: {grid_cols}; \
-                                                grid-auto-rows: {ss_tile_h:.0}px; \
-                                                gap: 8px; padding: 6px; \
-                                                justify-content: start; align-content: start; \
-                                                overflow: visible;")
-                                    },
-                                    for tile_id in ss_tiles.iter() {
+                                    class: "ss-peer-panel",
+                                    style: "width: {right_pct:.2}%;",
+                                    // Decoded tiles — live video canvas
+                                    for tile_id in ss_decoded_tiles.iter() {
                                         {
                                             let is_mock = tile_id.starts_with("mock-");
                                             if is_mock {
@@ -4167,11 +4136,41 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
-
-                                    if ss_overflow_count > 0 {
-                                        div { class: "grid-overflow-badge",
-                                            "+{ss_overflow_count}"
-                                            span { "more in meeting" }
+                                    // Off-budget avatar tiles — rendered in DOM
+                                    // but no video decode (force_avatar: true).
+                                    for tile_id in ss_avatar_tiles.iter() {
+                                        {
+                                            let is_mock = tile_id.starts_with("mock-");
+                                            if is_mock {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        force_avatar: true,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_session_id: my_session_id.clone(),
+                                                        on_toggle_pin: move |_: String| {},
+                                                    }
+                                                }
+                                            } else {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        force_avatar: true,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_session_id: my_session_id.clone(),
+                                                        pinned_peer_id: current_pinned.clone(),
+                                                        on_toggle_pin: toggle_pin.clone(),
+                                                        room_id: Some(id.clone()),
+                                                        is_current_user_host: is_owner,
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

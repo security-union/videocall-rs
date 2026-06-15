@@ -1380,6 +1380,51 @@ pub const CONGESTION_CUT_TIERS: usize = 2;
 /// that recovery is not penalized for long.
 pub const CONGESTION_HOLD_MS: f64 = 2500.0;
 
+/// Cooldown (milliseconds) the AUDIO simulcast publisher waits — with NO new
+/// self-targeted CONGESTION signal — before climbing its congestion layer
+/// ceiling back up by ONE rung (issue #621).
+///
+/// On a self-targeted CONGESTION the audio publisher cuts its congestion ceiling
+/// straight to base-only (layer 0 / 24 kbps) — the aggressive analogue of the
+/// video [`CONGESTION_CUT_TIERS`] cut, but expressed through the simulcast
+/// layer-ceiling lever (the Opus AudioWorklet cannot reconfigure bitrate live, so
+/// dropping the upper simulcast layers is the only available downshift). Recovery
+/// then climbs ONE rung per cooldown window, so on a 3-rung ladder full restore
+/// after a single congestion event takes `2 × cooldown`.
+///
+/// **Hysteresis interaction with the VIDEO/SCREEN downshift cadence.** Video and
+/// audio share the same self-targeted CONGESTION trigger but recover on
+/// deliberately DIFFERENT timescales:
+///   * VIDEO/SCREEN cut via the PID controller and are pinned for the short
+///     [`CONGESTION_HOLD_MS`] (2.5 s) drain window, then the PID re-ramps
+///     bitrate *within* a tier over seconds — video is the high-bandwidth stream
+///     the relay buffer cares about, so it recovers quickly once the buffer
+///     drains.
+///   * AUDIO is ~1-3% of call bandwidth, so re-adding an audio layer barely moves
+///     the relay buffer; there is no urgency to restore it. We therefore use a
+///     MUCH longer per-rung cooldown so a flapping link cannot thrash the audio
+///     ladder (each re-add/re-cut would briefly perturb every receiver's RED
+///     chain). Picking a window FAR longer than the video drain also guarantees
+///     audio never climbs back *during* an active congestion episode that video
+///     is still fighting.
+///
+/// Set to [`CLIMB_COOLDOWN_BASE_MS`] (2 min) so the audio per-rung recovery
+/// cadence is aligned with the video crash-ceiling decay cadence rather than an
+/// invented magic number; both express "wait a sustained-stable window before
+/// trusting headroom again."
+pub const AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS: f64 = CLIMB_COOLDOWN_BASE_MS;
+
+/// Poll cadence (milliseconds) of the AUDIO congestion-recovery timer (issue
+/// #621). Deliberately COARSE: the CONGESTION cut itself takes effect on the
+/// next audio frame (the publish gate reads the ceiling atom live — the timer is
+/// NOT on the cut path), so this interval governs only how promptly recovery
+/// NOTICES that a cut happened and how granularly it climbs back. With a
+/// [`AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS`] of 2 min, sub-second polling is
+/// pointless; a 1 Hz tick keeps the per-rung climb timing effectively exact while
+/// adding a negligible wakeup load on battery-constrained devices (vs. riding the
+/// 20 Hz VAD interval, which would wake 20× as often for a minutes-long cooldown).
+pub const AUDIO_CONGESTION_RECOVERY_TICK_MS: u32 = 1000;
+
 // ---------------------------------------------------------------------------
 // Client-Side WebSocket Backpressure Self-Detection
 // ---------------------------------------------------------------------------

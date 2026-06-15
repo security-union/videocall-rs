@@ -3566,32 +3566,50 @@ impl Inner {
                 // Field observability: the relay logs the EMIT; the client logs
                 // RECEIPT. Not WT-gated — the relay already decided, on whichever
                 // transport this client elected (WS or WT alike).
-                warn!(
-                    "Received DOWNLINK_CONGESTION signal from relay — downlink saturated; \
-                     stepping down receive layer preferences (#1219 Half 2)"
-                );
-                let now_ms = js_sys::Date::now() as u64;
-                // Copy snapshot of the user's receive bounds to avoid aliasing the
-                // `&mut peer_decode_manager` borrow below.
-                let bounds = self.receive_layer_bounds;
-                // Synthetic forced-congestion step-down: feeds a synthetic congested
-                // sample into each peer's chooser, independent of the real (zero on
-                // lossless transports) `last_video_downlink`. The early-seed primitive
-                // would no-op here because the real sample is not congested.
-                self.peer_decode_manager
-                    .seed_downlink_congestion_for_connected_peers(now_ms, &bounds);
-                // Publish the resulting (possibly held) preference via the existing
-                // change-detected sender, exactly as `set_receive_layer_bounds` does.
-                let desired = self
-                    .peer_decode_manager
-                    .current_desired_preferences(now_ms, &bounds);
-                if let Some(entries) = self
-                    .layer_preference_sender
-                    .take_if_changed(&desired, now_ms)
-                {
-                    let user_id = self.options.user_id.clone();
-                    let cc = self.connection_controller.clone();
-                    send_layer_preference_via(&cc, &user_id, entries);
+                //
+                // Self-target check (defense-in-depth, mirroring CONGESTION and
+                // LAYER_HINT): the relay stamps THIS receiver's session_id and
+                // publishes to our own NATS subject, but the wildcard `room.{room}.*`
+                // fan-out means every session sees every packet, so we must confirm
+                // the embedded session_id is OURS before acting. A cross-session
+                // DOWNLINK_CONGESTION is noise — acting on it would step down our
+                // receive preferences in response to a PEER's congestion.
+                let is_self_targeted = self.own_session_id == Some(response.session_id)
+                    || self.session_id_history.contains(&response.session_id);
+
+                if !is_self_targeted {
+                    debug!(
+                        "Ignoring cross-session DOWNLINK_CONGESTION signal for session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
+                    );
+                } else {
+                    warn!(
+                        "Received DOWNLINK_CONGESTION signal from relay — downlink saturated; \
+                         stepping down receive layer preferences (#1219 Half 2)"
+                    );
+                    let now_ms = js_sys::Date::now() as u64;
+                    // Copy snapshot of the user's receive bounds to avoid aliasing the
+                    // `&mut peer_decode_manager` borrow below.
+                    let bounds = self.receive_layer_bounds;
+                    // Synthetic forced-congestion step-down: feeds a synthetic congested
+                    // sample into each peer's chooser, independent of the real (zero on
+                    // lossless transports) `last_video_downlink`. The early-seed primitive
+                    // would no-op here because the real sample is not congested.
+                    self.peer_decode_manager
+                        .seed_downlink_congestion_for_connected_peers(now_ms, &bounds);
+                    // Publish the resulting (possibly held) preference via the existing
+                    // change-detected sender, exactly as `set_receive_layer_bounds` does.
+                    let desired = self
+                        .peer_decode_manager
+                        .current_desired_preferences(now_ms, &bounds);
+                    if let Some(entries) = self
+                        .layer_preference_sender
+                        .take_if_changed(&desired, now_ms)
+                    {
+                        let user_id = self.options.user_id.clone();
+                        let cc = self.connection_controller.clone();
+                        send_layer_preference_via(&cc, &user_id, entries);
+                    }
                 }
             }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {

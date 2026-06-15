@@ -592,6 +592,14 @@ fn check_jitter_buffer_for_ready_frames() {
                                         FRAMES_PAINTED.with(|c| c.get()),
                                         jb.source_frame_interval_ms(),
                                     );
+                                    // Resync-to-live governor skip count (issue #1252): cumulative
+                                    // counter of governor skips on this stream. Unlike the ms
+                                    // latency/paint-lag values above this is a COUNTER: it rises and
+                                    // is preserved across flush(), but resets to 0 when the pipeline
+                                    // is rebuilt (reset_pipeline() on decoder-error recovery), so
+                                    // consume it via increase()/rate(); a rising value proves the
+                                    // governor fired in the field.
+                                    let playout_skip_to_live_total = jb.governor_skip_count();
 
                                     let evt = DiagEvent {
                                         subsystem: "video",
@@ -607,6 +615,10 @@ fn check_jitter_buffer_for_ready_frames() {
                                                 playout_stage1_span_ms
                                             ),
                                             metric!("playout_paint_lag_ms", playout_paint_lag_ms),
+                                            metric!(
+                                                "playout_skip_to_live_total",
+                                                playout_skip_to_live_total
+                                            ),
                                         ],
                                     };
                                     let _ = global_sender().try_broadcast(evt);
@@ -622,6 +634,7 @@ fn check_jitter_buffer_for_ready_frames() {
                                             playout_latency_ms,
                                             playout_stage1_span_ms,
                                             playout_paint_lag_ms,
+                                            playout_skip_to_live_total,
                                         );
                                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                             let _ = scope.post_message(&val);

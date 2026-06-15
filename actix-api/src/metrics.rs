@@ -639,6 +639,20 @@ lazy_static! {
     )
     .expect("Failed to create video_playout_paint_lag_ms metric");
 
+    /// Per-peer cumulative count of resync-to-live governor skips (#1252): how many times the
+    /// decode-side governor jumped this receiver→source stream forward to live to shed accumulated
+    /// lag. A COUNTER value held in a GaugeVec (set to the current cumulative total) so the per-pair
+    /// `remove_label_values` cleanup GCs it with the sibling playout gauges. It rises within a
+    /// decoder-pipeline lifetime but resets to 0 on the client's `reset_pipeline()` (decoder-error
+    /// recovery), so query with `increase()`/`rate()`, which tolerate the reset. Unlike the ms
+    /// gauges it is reported unconditionally (even at fps 0). A rising value proves the governor fired.
+    pub static ref VIDEO_SKIP_TO_LIVE_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_video_skip_to_live_total",
+        "Cumulative resync-to-live governor skips per receiver→source pair (#1252); a rising value proves the governor fired",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_skip_to_live_total metric");
+
     /// Call quality score (0-100, min of audio and video)
     pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_call_quality_score",

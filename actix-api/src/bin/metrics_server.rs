@@ -65,7 +65,8 @@ use sec_api::metrics::{
     SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
     SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
     VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
-    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC,
+    VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -459,6 +460,7 @@ fn remove_per_peer_metrics(
     let _ = VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
+    let _ = VIDEO_SKIP_TO_LIVE_TOTAL.remove_label_values(&labels);
     let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
@@ -1294,6 +1296,14 @@ fn process_health_packet_to_metrics_pb(
                     VIDEO_PLAYOUT_PAINT_LAG_MS
                         .with_label_values(&peer_labels)
                         .set(video_stats.playout_paint_lag_ms);
+                    // Resync-to-live governor skips (#1252): cumulative COUNTER value held in a
+                    // gauge. Set UNCONDITIONALLY (same recover-to-0 pattern as the gauges above): the
+                    // client folds this field unconditionally, so an absent/idle stream reports its
+                    // last cumulative total (or the proto default 0 if never set) rather than a stale
+                    // latch. A monotonically-rising value proves the governor fired.
+                    VIDEO_SKIP_TO_LIVE_TOTAL
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_skip_to_live_total as f64);
                 }
 
                 // Screen video metrics (separate from camera)

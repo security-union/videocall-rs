@@ -62,10 +62,11 @@ use sec_api::metrics::{
     NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
     NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
     PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED,
-    SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS,
-    VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
-    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    RTT_PROBE_DROPPED_TOTAL, RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_SHARING_ACTIVE,
+    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
+    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
+    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
+    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -274,6 +275,10 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = DATAGRAM_DROPS.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
+    // #522 RTT-probe resilience gauges: same per-reporter GC so the high-cardinality
+    // session_id label leaves no residual series on disconnect.
+    let _ = RTT_PROBE_DROPPED_TOTAL.remove_label_values(&reporter_labels);
+    let _ = RTT_PROBE_STALE_SUPPRESSIONS_TOTAL.remove_label_values(&reporter_labels);
     let _ = ENCODER_QUEUE_DEPTH.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_SCREEN_TIER.remove_label_values(&reporter_labels);
     let _ = SCREEN_SHARING_ACTIVE.remove_label_values(&reporter_labels);
@@ -873,6 +878,22 @@ fn process_health_packet_to_metrics_pb(
             KEYFRAME_REQUESTS_SENT_TOTAL
                 .with_label_values(&reporter_labels)
                 .set(kf_reqs as f64);
+        }
+
+        // RTT-probe resilience signals (#522). Each is a CUMULATIVE total reported by
+        // the client every packet; .set() the gauge to that value keyed by the
+        // reporter labels (NOT .inc(), NOT summed across reporters — that would
+        // multiply/double-count). Absent until the client has seen at least one
+        // event, so the series only appears once there is something to show.
+        if let Some(dropped) = health_packet.rtt_probe_dropped_total {
+            RTT_PROBE_DROPPED_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(dropped as f64);
+        }
+        if let Some(suppressions) = health_packet.rtt_probe_stale_suppressions_total {
+            RTT_PROBE_STALE_SUPPRESSIONS_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(suppressions as f64);
         }
 
         // Encoder decision inputs (P0). NOTE(#1184): encoder_fps_ratio removed
@@ -2013,6 +2034,96 @@ mod tests {
                 ("from_peer", reporting_user_id),
                 ("to_peer", "bob"),
             ],
+        ));
+    }
+
+    #[test]
+    fn test_rtt_probe_resilience_metrics_exported_and_gc() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // Build a packet with the two #522 RTT-probe cumulative totals set to
+        // distinct non-zero values. create_test_health_packet leaves display_name
+        // unset, so the exported series' display_name label falls back to the
+        // reporting_user_id ("probeuser") via reporter_display_name (see the
+        // .unwrap_or(reporting_user_id) fallback in process_health_packet_to_metrics_pb).
+        let peer_stats: std::collections::HashMap<String, PbPeerStats> =
+            std::collections::HashMap::new();
+        let mut packet =
+            create_test_health_packet("session_rtt522", "meeting_rtt522", "probeuser", peer_stats);
+        packet.rtt_probe_dropped_total = Some(7);
+        packet.rtt_probe_stale_suppressions_total = Some(3);
+
+        let result = process_health_packet_to_metrics_pb(
+            &packet,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        // Value-checking helper: mirrors series_exists's label-matching loop but
+        // returns the gauge value of the first fully-matching metric. series_exists
+        // only checks existence, so this is the mutation-stronger value assertion.
+        let gauge_value = |metric_name: &str, expected_labels: &[(&str, &str)]| -> Option<f64> {
+            for family in prometheus::gather() {
+                if family.get_name() == metric_name {
+                    for metric in family.get_metric() {
+                        let all_match = expected_labels.iter().all(|(lname, lval)| {
+                            metric.get_label().iter().any(|label| {
+                                label.get_name() == *lname && label.get_value() == *lval
+                            })
+                        });
+                        if all_match {
+                            return Some(metric.get_gauge().get_value());
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        let dropped_labels = [
+            ("meeting_id", "meeting_rtt522"),
+            ("session_id", "session_rtt522"),
+            ("peer_id", "probeuser"),
+            ("display_name", "probeuser"),
+        ];
+        let suppressions_labels = dropped_labels;
+
+        assert!(series_exists(
+            "videocall_rtt_probe_dropped_total",
+            &dropped_labels
+        ));
+        assert!(series_exists(
+            "videocall_rtt_probe_stale_suppressions_total",
+            &suppressions_labels,
+        ));
+        assert_eq!(
+            gauge_value("videocall_rtt_probe_dropped_total", &dropped_labels),
+            Some(7.0),
+        );
+        assert_eq!(
+            gauge_value(
+                "videocall_rtt_probe_stale_suppressions_total",
+                &suppressions_labels,
+            ),
+            Some(3.0),
+        );
+
+        // GC the session and confirm both series disappear.
+        let session_key = "meeting_rtt522_session_rtt522_probeuser".to_string();
+        let info = {
+            let g = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            g.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(!series_exists(
+            "videocall_rtt_probe_dropped_total",
+            &dropped_labels
+        ));
+        assert!(!series_exists(
+            "videocall_rtt_probe_stale_suppressions_total",
+            &suppressions_labels,
         ));
     }
 

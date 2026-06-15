@@ -567,25 +567,38 @@ pub type MeetingHostCtx = Signal<MeetingHost>;
 
 const STORAGE_KEY: &str = "vc_display_name";
 
+/// Secondary plain-text key that bypasses CBOR+zlib serialization.  On Safari,
+/// ITP can cause `dioxus_sdk_storage::LocalStorage` reads (which deserialize
+/// CBOR+zlib) to silently return `None` during or right after programmatic
+/// navigation.  Storing a plain-text copy under this key gives us a reliable
+/// fallback.
+const RAW_STORAGE_KEY: &str = "vc_display_name_raw";
+
 /// Load the persisted display name from local storage.
 ///
-/// Uses [`dioxus_sdk_storage::LocalStorage`] which maps to the browser's
-/// `localStorage` on web and the file system on native platforms.  Returns
-/// `None` when no name has been saved yet, or when the stored value is empty.
+/// Tries the primary CBOR+zlib key first (via [`dioxus_sdk_storage::LocalStorage`]),
+/// then falls back to the plain-text key which survives Safari ITP
+/// deserialization failures.  Returns `None` when no name has been saved yet,
+/// or when the stored value is empty.
 pub fn load_display_name_from_storage() -> Option<String> {
     LocalStorage::get::<Option<String>>(&STORAGE_KEY.to_string())
         .flatten()
         .filter(|s| !s.is_empty())
+        // Fallback: plain-text key (survives Safari ITP deserialization failures)
+        .or_else(|| read_local_storage(RAW_STORAGE_KEY))
 }
 
 /// Persist the display name to local storage.
 pub fn save_display_name_to_storage(display_name: &str) {
     LocalStorage::set(STORAGE_KEY.to_string(), &Some(display_name.to_string()));
+    // Also persist as plain text for Safari ITP resilience
+    write_local_storage(RAW_STORAGE_KEY, display_name);
 }
 
 /// Remove the display name from local storage entirely (e.g. on logout).
 pub fn clear_display_name_from_storage() {
     LocalStorage::set(STORAGE_KEY.to_string(), &None::<String>);
+    remove_local_storage(RAW_STORAGE_KEY);
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +628,12 @@ fn read_local_storage(key: &str) -> Option<String> {
 fn write_local_storage(key: &str, value: &str) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item(key, value);
+    }
+}
+
+fn remove_local_storage(key: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(key);
     }
 }
 

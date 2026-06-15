@@ -3045,13 +3045,20 @@ impl Handler<JoinRoom> for ChatServer {
         // Joins with no `instance_id` cannot be classified as a reconnection
         // because they have no stable identity that could match a prior
         // session's pending entry — they always fall through as fresh joins.
+        let mut reconnect_display_name: Option<String> = None;
         let is_reconnection = if let Some(ref iid) = instance_id {
             let departure_key = (room.clone(), iid.clone());
             if let Some(pending) = self.pending_departures.remove(&departure_key) {
                 ctx.cancel_future(pending.spawn_handle);
 
-                // Clean up stale room_members entry from the old session
+                // Capture the old session's display_name before cleanup —
+                // it may have been updated by an in-meeting rename and is
+                // more current than the JWT's frozen-at-login display_name.
                 if let Some(members) = self.room_members.get_mut(&room) {
+                    reconnect_display_name = members
+                        .iter()
+                        .find(|m| m.session == pending.old_session)
+                        .map(|m| m.display_name.clone());
                     members.retain(|m| m.session != pending.old_session);
                 }
 
@@ -3080,7 +3087,9 @@ impl Handler<JoinRoom> for ChatServer {
 
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
-        let display_name_clone = display_name.clone();
+        let display_name_clone = reconnect_display_name
+            .clone()
+            .unwrap_or_else(|| display_name.clone());
         let session_id = session;
         let nc = self.nats_connection.clone();
 
@@ -3157,7 +3166,10 @@ impl Handler<JoinRoom> for ChatServer {
                 .push(RoomMemberInfo {
                     session,
                     user_id: user_id.clone(),
-                    display_name: display_name.clone(),
+                    // Prefer the in-meeting display name from the old session
+                    // (which reflects any renames) over the JWT's
+                    // frozen-at-login name.
+                    display_name: reconnect_display_name.unwrap_or_else(|| display_name.clone()),
                     is_host,
                     end_on_host_leave,
                 });

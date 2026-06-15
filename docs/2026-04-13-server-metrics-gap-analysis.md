@@ -99,7 +99,7 @@
 
 | Question | Why We Couldn't Answer It | Now Answered By |
 |----------|--------------------------|-----------------|
-| Why did the encoder degrade to minimal? | No metric for `fps_ratio` or `bitrate_ratio` -- the actual inputs to the tier decision | `videocall_encoder_fps_ratio`, `videocall_encoder_bitrate_ratio` |
+| Why did the encoder degrade to minimal? | No metric for `fps_ratio` or `bitrate_ratio` -- the actual inputs to the tier decision | `videocall_encoder_fps_ratio`, `videocall_encoder_bitrate_ratio` _(removed in #1184 -- see #1228)_ |
 | Which receiver caused the degradation? | No metric for worst-peer identity or worst-peer FPS | `videocall_encoder_worst_peer_fps` |
 | Was screen share degraded? | No screen-specific tier metric. `videocall_adaptive_video_tier` only tracks camera tier. | `videocall_adaptive_screen_tier`, `videocall_screen_video_{fps,bitrate_kbps}` |
 | What was the encoder's actual output FPS? | `videocall_video_fps` is receiver-side. No sender-side encoder output FPS metric. | `videocall_encoder_output_fps` |
@@ -141,8 +141,8 @@ Until this is fixed, any alert or dashboard based on `audio_packet_loss_pct` wil
 **Current**: `videocall_video_quality_score` is a composite score that says "quality is bad" but not why.
 
 **Fix**: Expose the component inputs alongside the composite:
-- `videocall_video_fps_ratio` (new) -- ratio of received FPS to target FPS, the primary degradation trigger
-- `videocall_video_bitrate_ratio` (new) -- ratio of actual to ideal bitrate
+- `videocall_video_fps_ratio` (new) -- ratio of received FPS to target FPS, the primary degradation trigger _(implemented as `videocall_encoder_fps_ratio` in PR #308; removed in #1184 — see #1228)_
+- `videocall_video_bitrate_ratio` (new) -- ratio of actual to ideal bitrate _(implemented as `videocall_encoder_bitrate_ratio` in PR #308; removed in #1184 — see #1228)_
 - Keep the composite score for alerting, but add the components for diagnosis
 
 ### Problem 3: No Screen Share Metrics At All
@@ -160,8 +160,8 @@ Without these, we cannot even tell from Grafana whether screen share is happenin
 **Current**: We can see the output (`videocall_adaptive_video_tier` = 7/minimal) but not the inputs or reasoning.
 
 **Fix**: Add sender-side encoder metrics to HealthPacket:
-- `videocall_encoder_fps_ratio` -- the fps_ratio value the controller is acting on
-- `videocall_encoder_bitrate_ratio` -- the bitrate_ratio value
+- `videocall_encoder_fps_ratio` -- the fps_ratio value the controller is acting on _(removed in #1184 -- see #1228)_
+- `videocall_encoder_bitrate_ratio` -- the bitrate_ratio value _(removed in #1184 -- see #1228)_
 - `videocall_encoder_worst_peer_fps` -- the FPS from the worst-performing receiver
 - `videocall_encoder_output_fps` -- actual frames/sec the encoder is producing (local measurement, not receiver-reported)
 - `videocall_encoder_target_bitrate_kbps` -- what the PID controller told the encoder to target
@@ -217,7 +217,7 @@ This would let us query "how many tier transitions happened during this meeting?
 
 **Proposed**: Add a panel group "Adaptive Quality Debugging" with:
 - **Tier timeline**: `videocall_adaptive_video_tier` and `videocall_adaptive_screen_tier` over time per sender
-- **Decision inputs**: `videocall_encoder_fps_ratio` and `videocall_encoder_bitrate_ratio` overlaid
+- **Decision inputs**: `videocall_encoder_fps_ratio` and `videocall_encoder_bitrate_ratio` overlaid _(both removed in #1184 -- see #1228)_
 - **Worst peer**: `videocall_encoder_worst_peer_fps` identifying the dragging receiver
 - **Decoder health**: `videocall_decoder_errors_total` rate per receiver
 
@@ -229,7 +229,7 @@ This panel group would let us diagnose the exact scenario from 2026-04-13 entire
 
 | Priority | Item | Effort | Impact | Status |
 |----------|------|--------|--------|--------|
-| **P0** | Add `videocall_encoder_fps_ratio` and `videocall_encoder_worst_peer_fps` | Low | Directly exposes the root cause signal that was invisible | **Done** — PR #308 |
+| **P0** | Add `videocall_encoder_fps_ratio` _(removed in #1184 -- see #1228)_ and `videocall_encoder_worst_peer_fps` | Low | Directly exposes the root cause signal that was invisible | **Done** — PR #308 |
 | **P0** | Add `videocall_adaptive_screen_tier` and `videocall_screen_sharing_active` | Low | Screen share is a primary use case with zero observability | **Done** — PR #308 |
 | **P1** | Rename `audio_packet_loss_pct` to `audio_concealment_pct` | Low | Prevents the most common misdiagnosis | **Done** — PR #308 (emitted alongside old metric for backward compat) |
 | **P1** | Add `videocall_encoder_output_fps` and `videocall_encoder_target_bitrate_kbps` | Low | Completes the encoder decision chain | **Done** — PR #308 |
@@ -245,13 +245,13 @@ This panel group would let us diagnose the exact scenario from 2026-04-13 entire
 
 **PR #308** (`fix/metrics-observability-gaps` → `PR-staging`) implemented all items except the join-time network probe:
 
-- **P0/P1 (9 new metrics)**: Encoder decision inputs (`fps_ratio`, `bitrate_ratio`, `worst_peer_fps`, `output_fps`, `target_bitrate_kbps`), screen share state (`screen_sharing_active`, `adaptive_screen_tier`), `decoder_errors_total`, and `audio_concealment_pct` (new name alongside old `audio_packet_loss_pct`).
+- **P0/P1 (9 new metrics)**: Encoder decision inputs (`fps_ratio`, `bitrate_ratio` _(both removed in #1184 -- see #1228)_, `worst_peer_fps`, `output_fps`, `target_bitrate_kbps`), screen share state (`screen_sharing_active`, `adaptive_screen_tier`), `decoder_errors_total`, and `audio_concealment_pct` (new name alongside old `audio_packet_loss_pct`).
 - **P2 tier transitions**: `TierTransitionRecord` captured at all 6 transition points in `AdaptiveQualityManager`, drained through shared buffers to health packet, mapped to `videocall_tier_transition_total` Prometheus CounterVec with direction/stream/from_tier/to_tier/trigger labels.
 - **P2 stream discrimination**: Split `VideoStats` into camera and screen buckets in health_reporter using `media_type` DiagEvent routing. Added `screen_video_stats` protobuf field. Separate `videocall_screen_video_fps` and `videocall_screen_video_bitrate_kbps` metrics (existing camera metrics unchanged — backward compatible).
 - **P3 dashboard**: Collapsed "Adaptive Quality Debugging" row with 4 panels: Tier Timeline, Decision Inputs (with threshold lines), Worst Peer FPS, Decoder Errors.
 
 **Review findings fixed during implementation**:
-- Removed `> 0.0` guards on `encoder_fps_ratio`, `encoder_bitrate_ratio`, `encoder_target_bitrate_kbps` that suppressed the exact zero values needed to diagnose the scrum call scenario.
+- Removed `> 0.0` guards on `encoder_fps_ratio`, `encoder_bitrate_ratio` _(both removed in #1184 -- see #1228)_, `encoder_target_bitrate_kbps` that suppressed the exact zero values needed to diagnose the scrum call scenario.
 - Fixed `AUDIO_CONCEALMENT_PCT` gauge never resetting to zero when concealment clears.
 
 **What remains**:

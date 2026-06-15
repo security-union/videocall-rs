@@ -71,6 +71,34 @@ pub trait Decodable: Send + Sync {
 
     /// Sends a raw frame buffer to the decoder for processing.
     fn decode(&self, frame: FrameBuffer);
+
+    /// Returns the number of chunks currently queued inside the underlying decoder but not yet
+    /// processed (the second buffer stage — e.g. WebCodecs `VideoDecoder.decodeQueueSize`).
+    ///
+    /// The jitter buffer reads this to apply release-side backpressure (issue #1024): it stops
+    /// releasing fresh frames while this depth is at/above a high-water mark, so frames drain at
+    /// display rate instead of being shoveled into an unpaced second-stage queue and painted
+    /// back-to-back. Decoders without an observable internal queue (native/mock) return the default
+    /// `0`, which disables backpressure for them (their pacing is handled elsewhere).
+    fn decode_queue_depth(&self) -> u32 {
+        0
+    }
+
+    /// Hard-resets the decoder pipeline, tearing down the underlying decoder so the next frame
+    /// starts a fresh decode session (and the buffer resumes from a keyframe).
+    ///
+    /// This is the recovery escalation for the wedged-decoder escape hatch (issue #1324): when the
+    /// jitter buffer has held frame release behind the backpressure gate for too long *and* a
+    /// force-release did not unblock the decoder, the buffer calls this to break a hard wedge — a
+    /// `VideoDecoder` whose `decode_queue_depth()` is pinned at/above the high-water mark, never
+    /// draining, yet still reporting `state() == Configured` so neither the `decode()`-error path
+    /// nor the state guard in `worker_decoder.rs` ever fires.
+    ///
+    /// The WebCodecs implementation tears down the decoder and schedules the jitter-buffer reset on
+    /// the next event-loop tick (`setTimeout(0)`), so it is safe to call from within the buffer's
+    /// release loop: the deferred reset runs after the current call stack unwinds. Decoders that
+    /// have no separate pipeline to reset (native/mock) keep the default no-op.
+    fn reset(&self) {}
 }
 
 // Conditionally compile and expose the native implementation

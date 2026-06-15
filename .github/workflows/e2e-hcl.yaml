@@ -20,6 +20,8 @@ permissions:
   pull-requests: write
   issues: write
 
+# workflow_dispatch deliberately groups by github.ref_name (not inputs.branch) so a
+# manual rerun can cancel-in-progress an automated push run on the same branch.
 concurrency:
   group: e2e-hcl-${{ github.event_name == 'issue_comment' && github.event.issue.number || github.ref_name }}
   cancel-in-progress: true
@@ -148,6 +150,34 @@ jobs:
         run: |
           sudo find . -mindepth 1 -delete 2>/dev/null || true
           sudo rm -rf /var/lib/ghrunner/_work/videocall/videocall/* 2>/dev/null || true
+
+      - name: Sweep stale leaked Chromium temp dirs in /tmp
+        # THIS job is the source of the leak: every `chromium.launch()` creates
+        # a `/tmp/org.chromium.Chromium.scoped_dir.*` profile dir that Chromium
+        # only removes on a CLEAN shutdown. When a browser is killed instead
+        # (OOM, test timeout, or the "Target page/context/browser has been
+        # closed" crash this constrained CI stack is prone to), the dir is
+        # orphaned. These leaked ~1,900 dirs / 177G and filled the host to 97%,
+        # ENOSPC-failing the shared backend job. The E2E workflow had no /tmp
+        # cleanup, so nothing ever reclaimed them. Sweep them BEFORE the heavy
+        # `npx playwright install chromium` + test run so space exists when it
+        # is needed (mirrors the backend job's "free disk before heavy build").
+        #
+        # SHARED-HOST SAFETY: 4 hcl-ci runners share this host; a concurrent
+        # E2E/smoke run on another runner has a LIVE scoped_dir for its
+        # in-flight browser. Deleting that would crash that job. We therefore
+        # delete ONLY dirs older than 24h (`-mmin +1440`, matching the
+        # build-logs janitor in daily-build-images-hcl.yaml). The longest full
+        # suite finishes well under an hour, so a live browser's dir is at most
+        # ~1h old and is NEVER in scope. `2>/dev/null || true` keeps a sweep
+        # hiccup non-fatal; `df -h /` brackets show what was reclaimed.
+        run: |
+          echo "=== Disk usage BEFORE /tmp sweep ==="
+          df -h / || true
+          echo "=== Sweeping STALE (>24h) leaked Chromium temp profile dirs ==="
+          sudo find /tmp -maxdepth 1 -name "org.chromium.Chromium.scoped_dir.*" -type d -mmin +1440 -exec rm -rf {} \; 2>/dev/null || true
+          echo "=== Disk usage AFTER /tmp sweep ==="
+          df -h / || true
 
       - uses: actions/checkout@v4.2.0
         with:
@@ -398,9 +428,17 @@ jobs:
 
           MESSAGE="❌ *E2E Tests FAILED* on \`${BRANCH}\` (\`${SHORT_SHA}\`)\n\n📊 Passed: ${PASSED} | Failed: ${FAILED} | Skipped: ${SKIPPED}\n⏱️ Duration: ${DURATION}s${PR_INFO}\n🔗 ${RUN_URL}\n📈 ${DASHBOARD_URL}"
 
+          # JSON-encode the payload with jq so a PR title / branch name containing
+          # ", \, backticks, newlines, or control chars can't produce invalid JSON
+          # (Google Chat rejects malformed payloads with 400, silently dropping the
+          # failure alert — exactly when the team most needs it; see #770).
+          # printf '%b' first expands the \n escapes in MESSAGE to real newlines;
+          # `jq -Rsc` then slurps the whole (multi-line) string and emits a fully
+          # escaped JSON string, preserving the rendered newlines.
+          PAYLOAD=$(printf '%b' "${MESSAGE}" | jq -Rsc '{text: .}')
           curl -X POST "${GCHAT_WEBHOOK_URL}" \
             -H 'Content-Type: application/json' \
-            -d "{\"text\": \"${MESSAGE}\"}" || echo "Google Chat notification failed (non-fatal)"
+            -d "${PAYLOAD}" || echo "Google Chat notification failed (non-fatal)"
 
       - name: Dump docker logs on failure
         if: failure()

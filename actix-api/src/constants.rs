@@ -468,6 +468,38 @@ const _: () = {
     );
 };
 
+/// Minimum interval (in milliseconds) between two KEYFRAME_REQUESTs the
+/// **delivery-aware** relaxation path will admit from a receiver that is STILL
+/// WAITING for a keyframe (issue #1297).
+///
+/// The strict steady-state per-pair budget
+/// ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`], 1/sec) throttles a genuinely
+/// frozen receiver identically to a flooder, and its only relaxation path
+/// ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`]) can NEVER fire on a
+/// lossless WS/TCP path — there is no loss, so the `CongestionTracker` never
+/// marks the receiver congested. On the common deployment (small, all-WS,
+/// capable HW, good network) a frozen receiver's legitimate recovery requests
+/// were therefore dropped, leaving its video stuck frozen.
+///
+/// The fix tracks, per `(target, media_kind)` bucket, whether the relay has
+/// observed a qualifying keyframe-bearing frame DELIVERED since the receiver's
+/// last request. While the receiver is still waiting (no delivery seen), the
+/// limiter admits a retry even when the strict per-pair budget is exhausted —
+/// but no faster than this interval, so a receiver hammering faster than it is
+/// still throttled. Once a frame is delivered the waiting flag clears and the
+/// strict budget re-engages, so a receiver that keeps requesting AFTER recovery
+/// is throttled again (a spammer-after-delivery cannot reopen the storm).
+///
+/// `200`ms: admits ~5 retries/sec while waiting — comfortably under the
+/// unchanged global per-receiver ceiling ([`KEYFRAME_REQUEST_MAX_PER_SEC`],
+/// 32/sec, which still bounds the still-waiting allow), and matched to
+/// real-world links: on a 200ms+ RTT path (Change Impact Policy) a single
+/// retry's round trip is ~200ms, so retrying faster than this cannot have
+/// observed the previous request's result yet and would only add redundant
+/// PLI pressure. 5 retries/sec recovers a frozen tile within a few hundred ms
+/// even if some keyframe responses are themselves lost.
+pub const KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS: u64 = 200;
+
 /// Maximum number of `session_ids` the relay will accept from a single
 /// VIEWPORT control packet (HCL issue #988).
 ///
@@ -661,6 +693,31 @@ pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
 /// governs whether a LOWER hint is actually emitted, so the two debounces
 /// compose without double-counting.
 pub const LAYER_HINT_RECOMPUTE_COALESCE_MS: u64 = 300;
+
+/// Period of the [`ChatServer`](crate::actors::chat_server) sweep that publishes
+/// the DEMAND-side simulcast gauge `relay_layer_preference_sessions{room, kind,
+/// layer_id}` (#1170 item 2).
+///
+/// ## Why a periodic sweep (not event-driven)
+///
+/// The gauge is a STATE snapshot ("how many sessions currently request each
+/// layer"), not an event rate, so it is naturally a poll: one read-only pass
+/// over the live rooms that re-SETs each `{room, kind, layer_id}` cell. Driving
+/// it off every LAYER_PREFERENCE update / join / leave would couple a metric to
+/// the hot control path and add work to the O(n) reconnection storms the
+/// [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] debounce already exists to absorb. A
+/// gauge that lags real demand by at most one sweep is correct for dashboards.
+///
+/// ## Why 10 s
+///
+/// 10 s is twice the typical Prometheus scrape interval (so every scrape sees a
+/// fresh value with margin) yet an order of magnitude below the ~5 s receiver
+/// chooser / AQ adaptation loop's settling time at the dashboard timescale —
+/// demand shifts are visible within one sweep without the sweep itself being
+/// chatty. Each tick is O(rooms × min(sessions, 256)) of `RwLock::read()`-only
+/// work in the single-threaded actor (no `.write()`, no mailbox blocking), so a
+/// 10 s cadence keeps its amortized cost negligible even with many rooms.
+pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
 #[cfg(test)]
 mod tests {

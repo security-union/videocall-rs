@@ -43,6 +43,23 @@ static CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
+// Encoder auto-RESTART cycles (issue #527), partitioned by reason. Bumped once
+// per `restart_count += 1` (the loop re-enters `'restart`), NOT per error event:
+// distinct from the *_ERRORS_* counters above, which count fault occurrences
+// (one restart may follow several classified errors, and a restart may have no
+// classified error, e.g. a getUserMedia failure). Exported as
+// `videocall_encoder_restart_total{kind="camera", reason}`. Cold start (the
+// first `'restart` iteration with `restart_count == 0`) and user-initiated
+// `stop()`/supersede returns do NOT bump these.
+static CAMERA_ENCODER_RESTARTS_CLOSED_CODEC: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_RESTARTS_MEMORY: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_RESTARTS_CONFIGURE: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_RESTARTS_OTHER: AtomicU64 = AtomicU64::new(0);
+// Cumulative count of upper-rung `VideoEncoder`s torn down after a sustained
+// shed dwell (issue #1230). Bumped once per rung freed in the encode loop; the
+// freed encoder + its ~100KB output buffer are reclaimed and the existing lazy
+// path (`encoders_to_build`) rebuilds the rung if it is ever earned back.
+static CAMERA_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL: AtomicU64 = AtomicU64::new(0);
 
 pub fn camera_encoder_errors_closed_codec() -> u64 {
     CAMERA_ENCODER_ERRORS_CLOSED_CODEC.load(Ordering::Relaxed)
@@ -58,6 +75,55 @@ pub fn camera_encoder_errors_generic() -> u64 {
 }
 pub fn camera_encoder_frames_submitted_ok() -> u64 {
     CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
+}
+
+/// Cumulative camera encoder auto-restart cycles classified as a closed/invalid
+/// codec (issue #527). See [`record_camera_restart`].
+pub fn camera_encoder_restarts_closed_codec() -> u64 {
+    CAMERA_ENCODER_RESTARTS_CLOSED_CODEC.load(Ordering::Relaxed)
+}
+/// Cumulative camera encoder auto-restart cycles classified as a memory fault.
+pub fn camera_encoder_restarts_memory() -> u64 {
+    CAMERA_ENCODER_RESTARTS_MEMORY.load(Ordering::Relaxed)
+}
+/// Cumulative camera encoder auto-restart cycles caused by a fatal `configure()`
+/// or an encoder found already-closed at a reconfigure/guard point.
+pub fn camera_encoder_restarts_configure() -> u64 {
+    CAMERA_ENCODER_RESTARTS_CONFIGURE.load(Ordering::Relaxed)
+}
+/// Cumulative camera encoder auto-restart cycles with no codec/memory/configure
+/// cause (media-acquisition failures and unclassified errors).
+pub fn camera_encoder_restarts_other() -> u64 {
+    CAMERA_ENCODER_RESTARTS_OTHER.load(Ordering::Relaxed)
+}
+
+/// Record one camera encoder auto-restart cycle, partitioned by [`RestartReason`]
+/// (issue #527). Call this at EACH `restart_count += 1` site, with the reason
+/// that triggered the restart. Cold start and user-initiated stop must NOT call
+/// this (they do not bump `restart_count`).
+fn record_camera_restart(reason: RestartReason) {
+    let counter = match reason {
+        RestartReason::ClosedCodec => &CAMERA_ENCODER_RESTARTS_CLOSED_CODEC,
+        RestartReason::Memory => &CAMERA_ENCODER_RESTARTS_MEMORY,
+        RestartReason::Configure => &CAMERA_ENCODER_RESTARTS_CONFIGURE,
+        RestartReason::Other => &CAMERA_ENCODER_RESTARTS_OTHER,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    // `trace!` (off by default) so this adds no production noise; it records the
+    // exact `reason` label the metric uses (RestartReason::as_label) for local
+    // debugging and is NOT a periodic/analyzer-consumed line.
+    log::trace!(
+        "camera encoder restart recorded (reason={})",
+        reason.as_label()
+    );
+}
+/// Cumulative count of upper-rung simulcast `VideoEncoder`s torn down after a
+/// sustained shed dwell (issue #1230). A pure observability hook: it lets
+/// Prometheus/Grafana confirm memory is actually being reclaimed on devices
+/// stuck in distress, and that teardown is NOT thrashing (a rapidly climbing
+/// counter alongside frequent rebuilds would mean the dwell is mistuned).
+pub fn camera_encoder_layers_torn_down() -> u64 {
+    CAMERA_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL.load(Ordering::Relaxed)
 }
 use crate::connection::MediaStreamKey;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
@@ -83,8 +149,10 @@ use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
-use super::classify_encode_error::{classify_encode_error, EncodeErrorBucket};
-use super::encoder_state::EncoderState;
+use super::classify_encode_error::{
+    classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
+};
+use super::encoder_state::{keyframe_tick_decision, EncoderState, KeyframeTickInput};
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
@@ -372,8 +440,11 @@ pub struct CameraEncoder {
     shared_video_tier_index: Rc<AtomicU32>,
     /// Current audio quality tier index (0=high, 3=emergency).
     shared_audio_tier_index: Rc<AtomicU32>,
-    /// Worst peer FPS from the encoder control loop (f32 bits in AtomicU32).
-    shared_encoder_p75_peer_fps: Rc<AtomicU32>,
+    /// The encoder control loop's *reported* queue-depth value (f32 bits in
+    /// AtomicU32) plumbed out to the health reporter for Prometheus telemetry.
+    /// Distinct from the internal `shared_encoder_queue_depth` AQ bridge — this
+    /// atom carries the telemetry copy, not the raw encode-loop→control-loop signal.
+    shared_encoder_queue_depth_report: Rc<AtomicU32>,
     /// PID target bitrate kbps from the encoder control loop (f32 bits in AtomicU32).
     shared_encoder_target_bitrate_kbps: Rc<AtomicU32>,
     /// Tier transition events buffer, drained by health reporter each health packet.
@@ -385,6 +456,38 @@ pub struct CameraEncoder {
     /// Re-election completed signal. Set by ConnectionManager, consumed by the
     /// encoder control loop to call `notify_reelection_completed()`.
     reelection_completed_signal: Rc<AtomicBool>,
+    /// Forced-keyframe cooldown reset (issue #1311). A one-shot edge that tells
+    /// the ENCODE loop to clear its `last_keyframe_emit_ms` cooldown clock so the
+    /// FIRST post-reconnect/post-re-election PLI emits a forced keyframe
+    /// immediately, regardless of how recently a keyframe went out pre-transition.
+    ///
+    /// Why a SEPARATE atom rather than reusing `reelection_completed_signal`: the
+    /// re-election signal is consumed by the QUALITY task (`.swap(false)` at the
+    /// `notify_reelection_completed()` site — and it is SHARED with the screen
+    /// encoder's quality task, which swap-consumes its own copy), while
+    /// `last_keyframe_emit_ms` lives in a DIFFERENT `spawn_local` ENCODE task.
+    /// Having the encode loop ALSO `.swap` that signal would add a third racing
+    /// consumer that loses the edge unpredictably. This dedicated atom is consumed
+    /// only by the encode loop and ARMED from two complementary sources:
+    ///
+    /// * RECONNECT **and** RE-ELECTION (primary, race-free): the client's
+    ///   `Connected` lifecycle callback unconditionally stores `true` via
+    ///   [`Self::keyframe_cooldown_reset`]. Both a full reconnect and a re-election
+    ///   re-emit `ConnectionState::Connected` (both run an election that ends in
+    ///   `report_state()`), so this single client-side arm covers BOTH transitions.
+    ///   A full reconnect does NOT drive `reelection_completed_signal` at all — it
+    ///   runs `reset_and_start_election`, which clears `old_active_connection`, so
+    ///   the post-reconnect election's "Elected" branch skips the re-election store
+    ///   — which is exactly why keying off that signal alone would miss reconnects.
+    /// * RE-ELECTION (secondary, no plumbing): the quality task also arms it where
+    ///   it consumes `reelection_completed_signal`. Redundant with the client arm
+    ///   on a winning swap, and harmless when it loses (the client arm still fires);
+    ///   kept because it is the zero-plumbing in-encoder path and self-documents the
+    ///   coupling at the re-election consume site.
+    ///
+    /// The encode loop `.swap(false)`-consumes this each frame; a duplicate arm is
+    /// idempotent and only matters when a PLI is pending.
+    keyframe_cooldown_reset: Rc<AtomicBool>,
     /// User-configurable adaptive-quality tier bounds (issue #961). Written by
     /// the UI via [`Self::set_quality_tier_bounds`], read by the encoder control
     /// loop (which applies them live to the `EncoderBitrateController`) and on
@@ -498,6 +601,39 @@ pub struct CameraEncoder {
     /// mid-call (it is NOT latched at cold start). In simulcast mode
     /// (`effective_layers > 1`) this stays `false` and the gate is a no-op.
     single_layer_low_pin: Rc<AtomicBool>,
+    /// "Loop already running" canary (issue #1295). Mirrors the mic encoder's
+    /// `codecs[0].is_instantiated()` canary, which the camera lacks. Set
+    /// synchronously in `start()` right before `spawn_local`; cleared by the
+    /// spawned task on EVERY task-exit path. `start()`'s guard reads it to refuse
+    /// a duplicate loop spawn (and to tear down the old loop on a real switch),
+    /// so at most one acquire/`set_src_object` is ever in flight for the selected
+    /// device — closing the intermittent wrong-device race.
+    loop_running: Arc<AtomicBool>,
+    /// Device id the currently-running loop is bound to (issue #1295). Recorded
+    /// synchronously in `start()` alongside `loop_running`, cleared on every
+    /// task-exit path (epoch-guarded). The guard compares it to the freshly-selected
+    /// device: same id => the live loop is already correct (true duplicate, no
+    /// respawn); different id with no `switching` raised (the OFF→switch→ON
+    /// path) => a real device change the `select()`-while-disabled missed, so
+    /// stop() the stale loop and respawn on the new device. `Rc<RefCell<…>>`
+    /// (not an atomic) matches this file's shared-mutable-across-`spawn_local`
+    /// idiom and is safe on the single-threaded wasm executor.
+    loop_device_id: Rc<RefCell<Option<String>>>,
+    /// Loop-generation epoch (issue #1295). `start()` bumps it synchronously
+    /// before spawning and each task captures its own value. On EVERY task-exit
+    /// path a loop clears `loop_running`/`loop_device_id` ONLY if this epoch
+    /// still equals its captured value — i.e. "I am still the latest loop". This
+    /// closes the supersede race: when a different-device start() tears down a
+    /// stale loop and spawns a new one, the new loop has set the canary/bound-id
+    /// synchronously; the stale loop then exits LATER and must NOT clobber them.
+    /// The epoch mismatch makes the stale loop's clear a no-op, so exactly the
+    /// latest loop owns the canary. The acquire-phase and per-frame exit checks
+    /// also read it, so a superseded loop self-terminates before binding / on its
+    /// next frame even if `enabled` was flipped back true for the newer loop.
+    /// Epoch is the authoritative supersede signal — the supersede guards do NOT
+    /// consult `switching`, which only flags that a switch was *requested* (the
+    /// newest loop is that request's response and must not abort on it).
+    loop_epoch: Arc<AtomicU64>,
 }
 
 /// Upper bound on simulcast layers regardless of what the caller requests.
@@ -578,6 +714,68 @@ const fn encoders_to_build(active: usize, ceiling: usize) -> usize {
     }
 }
 
+/// Sustained-shed dwell before an upper-rung `VideoEncoder` is torn down to
+/// reclaim its native VPX/WebCodecs state + ~100KB output buffer (issue #1230).
+///
+/// Why 30s: the AQ controller can shed/restore a layer at most once per
+/// `MIN_TIER_TRANSITION_INTERVAL_MS` = 1500ms (the `can_transition` floor in
+/// `videocall-aq/src/manager.rs`), so 30s is 20× the minimum shed→restore
+/// interval — a transient bounce can never accumulate 30s of CONTINUOUS shed and
+/// so never trips teardown. Teardown is also thrash-free regardless of how soon
+/// an earn-up follows: it requires 30s of UNBROKEN shed, and the per-frame stamp
+/// loop clears a rung's dwell clock the instant it is re-activated, so a
+/// teardown→rebuild→teardown cycle is necessarily ≥30s apart, not a tight loop.
+/// And a re-earned rung is rebuilt by the SAME lazy `encoders_to_build` path a
+/// publisher already runs at every cold start (only the base is built up front
+/// since #1204/#1227) — teardown introduces no new rebuild-stall class, only
+/// defers an already-existing one. (`MIN_TIER_TRANSITION_INTERVAL_MS` lives in
+/// `videocall-aq/src/constants.rs`. NOTE: `CLIMB_COOLDOWN_BASE_MS` is unrelated
+/// here — it governs the crash-CEILING decay axis, not layer earn-up.)
+const SHED_TEARDOWN_DWELL_MS: f64 = 30_000.0;
+
+/// Pure teardown decision (issue #1230, host-testable single source of truth).
+///
+/// Given when a rung first became continuously shed (`shed_since_ms`, `None`
+/// once it is active or already torn down), the current clock (`now_ms`), and
+/// the dwell threshold, return `true` iff the rung has been shed for at least
+/// `dwell_threshold_ms`. `None` ⇒ `false` (not currently shed → never tear
+/// down). The `>=` makes the boundary inclusive: exactly `dwell_threshold_ms`
+/// of dwell tears down.
+///
+/// This is the ONLY place the comparison lives so a host unit test pins it
+/// (mutating `>=`→`>`, inverting the comparison, or dropping the `None` guard
+/// all make the test fail). Both encode loops call it.
+fn should_teardown_shed_layer(
+    shed_since_ms: Option<f64>,
+    now_ms: f64,
+    dwell_threshold_ms: f64,
+) -> bool {
+    match shed_since_ms {
+        Some(since) => now_ms - since >= dwell_threshold_ms,
+        None => false,
+    }
+}
+
+/// Minimum interval between PLI-driven *forced* keyframes a publisher will emit
+/// (issue #1287 emit coalescer). The periodic GOP keyframe is NOT gated by this.
+///
+/// A publisher has one encoder per layer feeding a single outbound stream that is
+/// broadcast to ALL receivers; a forced keyframe is ~5-10x a delta frame, x the
+/// active simulcast layers, and fans out to every receiver's downlink — not just
+/// the requester. With N receivers each allowed ~3 inbound KEYFRAME_REQUESTs/sec
+/// by the relay, an uncoalesced publisher can be driven toward frame-rate forced
+/// keyframes, amplifying egress by xN x layers. Because a single keyframe is
+/// broadcast, ONE emission already satisfies every pending requester, so
+/// collapsing a burst of PLIs into one forced keyframe per window cuts that
+/// worst-case amplification without harming recovery: a request that lands
+/// mid-window is honored the instant the window expires, so added recovery
+/// latency is bounded by this value.
+///
+/// 250ms (at most ~4 forced keyframes/sec at 30fps, vs up to frame-rate before)
+/// is a conservative starting point within the issue's 250-500ms range — longer
+/// coalesces more but adds recovery latency. Tune/validate via performance-reviewer.
+const FORCED_KEYFRAME_COOLDOWN_MS: f64 = 250.0;
+
 /// Decide whether a just-encoded frame counts as "healthy" for the purpose of
 /// resetting the encoder restart counter.
 ///
@@ -596,6 +794,31 @@ const fn encoders_to_build(active: usize, ceiling: usize) -> usize {
 #[inline]
 fn frame_is_healthy(base_ok: bool) -> bool {
     base_ok
+}
+
+/// Whether a spawned encode loop has been superseded and must abandon its work
+/// WITHOUT binding the shared `<video>` element (issue #1295).
+///
+/// A loop is superseded iff it has been disabled (`!enabled`) OR a newer
+/// `start()` bumped the loop epoch past the value this loop captured at spawn
+/// (`loop_epoch != my_epoch`). The epoch is the SOLE supersede authority.
+///
+/// `switching` (the "a switch was requested" flag set by `EncoderState::select()`
+/// while enabled) is deliberately NOT a parameter and NOT consulted: the newest
+/// loop IS that request's response and must OWN the switch, not self-abort on it.
+/// On a real switch, `start()`'s running-guard tears the old loop down and bumps
+/// the epoch, so the stale loop is already caught by `loop_epoch != my_epoch`
+/// here; the newest loop sees its own epoch and proceeds to bind. Reading
+/// `switching` in this predicate was the initial-join dark-square bug — the loop
+/// that should bind killed itself because a post-permission devicechange had
+/// raised `switching`. Taking no `switching` arg makes that regression
+/// impossible to reintroduce without changing this signature.
+///
+/// Pure function so it can be unit-tested without a live camera / encoder; the
+/// acquire-phase and per-frame supersede guards both call it.
+#[inline]
+fn loop_is_superseded(enabled: bool, loop_epoch: u64, my_epoch: u64) -> bool {
+    !enabled || loop_epoch != my_epoch
 }
 
 /// A minimal, decoder-free view of one simulcast layer for formatting the
@@ -809,12 +1032,15 @@ impl CameraEncoder {
             screen_sharing_active: Rc::new(AtomicBool::new(false)),
             shared_video_tier_index: Rc::new(AtomicU32::new(0)),
             shared_audio_tier_index: Rc::new(AtomicU32::new(0)),
-            shared_encoder_p75_peer_fps: Rc::new(AtomicU32::new(0)),
+            shared_encoder_queue_depth_report: Rc::new(AtomicU32::new(0)),
             shared_encoder_target_bitrate_kbps: Rc::new(AtomicU32::new(0)),
             shared_tier_transitions: Rc::new(RefCell::new(Vec::new())),
             shared_climb_limiter_snapshot: Rc::new(RefCell::new(ClimbLimiterSnapshot::default())),
             shared_dwell_samples: Rc::new(RefCell::new(Vec::new())),
             reelection_completed_signal: Rc::new(AtomicBool::new(false)),
+            // Issue #1311: no reset pending at construction; armed by a re-election
+            // (quality task) or a reconnect (client `Connected` callback).
+            keyframe_cooldown_reset: Rc::new(AtomicBool::new(false)),
             quality_bounds: Rc::new(RefCell::new(SharedQualityBounds::default())),
             max_layers,
             // Simulcast ACTIVE-layer state (issue #989 / #1140 / #1141). Cold-start
@@ -857,6 +1083,9 @@ impl CameraEncoder {
             // control loop sets it once it observes single-stream mode + >3
             // peers. No effect in simulcast mode.
             single_layer_low_pin: Rc::new(AtomicBool::new(false)),
+            loop_running: Arc::new(AtomicBool::new(false)),
+            loop_device_id: Rc::new(RefCell::new(None)),
+            loop_epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -892,12 +1121,17 @@ impl CameraEncoder {
         let screen_sharing_active = self.screen_sharing_active.clone();
         let shared_video_tier_idx = self.shared_video_tier_index.clone();
         let shared_audio_tier_idx = self.shared_audio_tier_index.clone();
-        let shared_encoder_p75_peer_fps = self.shared_encoder_p75_peer_fps.clone();
+        let shared_encoder_queue_depth_report = self.shared_encoder_queue_depth_report.clone();
         let shared_encoder_target_bitrate_kbps = self.shared_encoder_target_bitrate_kbps.clone();
         let shared_tier_transitions = self.shared_tier_transitions.clone();
         let shared_climb_limiter_snapshot = self.shared_climb_limiter_snapshot.clone();
         let shared_dwell_samples = self.shared_dwell_samples.clone();
         let reelection_completed_signal = self.reelection_completed_signal.clone();
+        // Issue #1311: the QUALITY task ARMS this when it consumes a re-election
+        // (below, at the `notify_reelection_completed` site); the ENCODE task
+        // CONSUMES it per frame to clear `last_keyframe_emit_ms`. Both spawn_local
+        // tasks share this same `CameraEncoder`-owned atom.
+        let keyframe_cooldown_reset_quality = self.keyframe_cooldown_reset.clone();
         // #961 (send quality bounds) + #1082 (simulcast layers) both feed the
         // encoder control loop — clone both sides' shared state.
         let quality_bounds = self.quality_bounds.clone();
@@ -1271,7 +1505,7 @@ impl CameraEncoder {
                 // shared atomics have been removed; `encoder_queue_depth()`
                 // carries the sender backpressure signal (encoder queue depth)
                 // through the existing host telemetry channel.
-                shared_encoder_p75_peer_fps.store(
+                shared_encoder_queue_depth_report.store(
                     (encoder_control.encoder_queue_depth() as f32).to_bits(),
                     Ordering::Relaxed,
                 );
@@ -1293,6 +1527,19 @@ impl CameraEncoder {
                 if reelection_completed_signal.swap(false, Ordering::AcqRel) {
                     log::info!("CameraEncoder: re-election completed, notifying quality manager");
                     encoder_control.notify_reelection_completed();
+                    // Issue #1311: arm the forced-keyframe cooldown reset so the
+                    // FIRST post-re-election PLI emits immediately. The encode loop
+                    // (a separate spawn_local task) consumes the dedicated atom and
+                    // clears `last_keyframe_emit_ms`. We ARM here, piggybacking on
+                    // the existing re-election consume, rather than having the encode
+                    // loop ALSO `.swap` `reelection_completed_signal`: that atom is
+                    // already swap-consumed in exactly one place per encoder (this
+                    // line) — and is shared with the screen encoder's quality task,
+                    // which swap-consumes its own copy — so adding a THIRD swap
+                    // consumer (the encode loop) would race the existing two and lose
+                    // the edge half the time. Storing into a separate single-consumer
+                    // atom avoids that race entirely.
+                    keyframe_cooldown_reset_quality.store(true, Ordering::Release);
                 }
 
                 // Update climb-rate limiter snapshot for health reporting.
@@ -1529,9 +1776,9 @@ impl CameraEncoder {
         }
     }
 
-    /// Returns the encoder worst peer FPS atomic (f32 bits).
-    pub fn shared_encoder_p75_peer_fps(&self) -> Rc<AtomicU32> {
-        self.shared_encoder_p75_peer_fps.clone()
+    /// Returns the reported encoder-queue-depth telemetry atomic (f32 bits).
+    pub fn shared_encoder_queue_depth_report(&self) -> Rc<AtomicU32> {
+        self.shared_encoder_queue_depth_report.clone()
     }
 
     /// Returns the encoder target bitrate kbps atomic (f32 bits).
@@ -1596,6 +1843,20 @@ impl CameraEncoder {
     /// Replace the internal re-election completed signal with an externally-owned one.
     pub fn set_reelection_completed_signal(&mut self, signal: Rc<AtomicBool>) {
         self.reelection_completed_signal = signal;
+    }
+
+    /// Returns a shared reference to the forced-keyframe cooldown reset (issue #1311).
+    ///
+    /// The atom is OWNED by this `CameraEncoder` (not the client) — same ownership
+    /// direction as [`Self::shared_union_requested_layer`]. The host hands this
+    /// clone to the `VideoCallClient`, which SETS it on each `Connected` lifecycle
+    /// event (i.e. every reconnect) so the encode loop clears its forced-keyframe
+    /// cooldown clock and the first post-reconnect PLI is not coalesced away. The
+    /// re-election path SETS the same atom directly from the quality task (no
+    /// plumbing) at its `reelection_completed_signal` consume site, so the two
+    /// transitions converge on one consumer in the encode loop.
+    pub fn keyframe_cooldown_reset(&self) -> Rc<AtomicBool> {
+        self.keyframe_cooldown_reset.clone()
     }
 
     /// Returns a shared reference to the force-keyframe flag.
@@ -1775,11 +2036,66 @@ impl CameraEncoder {
         // READS it per frame to cap resolution/bitrate to the `low` rung. Always
         // `false` in simulcast mode, so the read is a no-op there.
         let single_layer_low_pin = self.single_layer_low_pin.clone();
+        // Issue #1311: the ENCODE loop CONSUMES this each frame (`.swap(false)`)
+        // and clears `last_keyframe_emit_ms` when set, so the first PLI after a
+        // reconnect/re-election is not coalesced away by a stale pre-transition
+        // cooldown timestamp. ARMED by the quality task (re-election) and the
+        // client's `Connected` callback (reconnect).
+        let keyframe_cooldown_reset = self.keyframe_cooldown_reset.clone();
         let device_id = if let Some(vid) = &self.state.selected {
             vid.to_string()
         } else {
             return;
         };
+
+        // No-op if not enabled (mirrors MicrophoneEncoder::start():396). This is
+        // the documented contract — start() does nothing unless set_enabled(true)
+        // has been called. Placing it BEFORE the running-guard guarantees that by
+        // the time we reach the guard, is_enabled() is true, so a raised
+        // `switching` unambiguously means a device switch.
+        if !self.state.is_enabled() {
+            log::debug!("CameraEncoder::start() called but encoder is not enabled");
+            return;
+        }
+
+        // Single-loop + correct-device guard (issue #1295). `loop_running` is the
+        // "already running" canary (mirrors the mic's `is_instantiated()`);
+        // `loop_device_id` records which device the live loop is bound to. We are
+        // enabled here (checked above), so a loop already being alive means we
+        // must tear it down before spawning the replacement in TWO cases, then
+        // re-enable so the new loop survives its per-frame check:
+        //
+        //   1. Explicit switch: the UI raised `switching` (select() while
+        //      enabled).
+        //   2. Different-device with NO `switching` raised — the OFF→switch→ON
+        //      hole: select() ran while disabled so it never set `switching`, and
+        //      the live loop captured its device_id at spawn and reuses it across
+        //      every `'restart`, so it can never retarget itself.
+        //
+        // In BOTH cases we stop() the stale loop (clearing enabled+switching) and
+        // then set_enabled(true) for the new loop. The stale loop is forced to
+        // exit by the per-frame/acquire epoch check (its captured epoch is now
+        // stale), NOT by the enabled flip — so re-enabling for the new loop does
+        // not keep the old one alive. A true SAME-device duplicate returns early
+        // instead: the early not-enabled guard above already guarantees we are
+        // enabled here, so the early-return only has to test (running, no
+        // switching, bound == selected). Spawning a second loop would race two
+        // getUserMedia/set_src_object acquisitions on the shared <video>.
+        let running = self.loop_running.load(Ordering::Acquire);
+        if running {
+            let switch_requested = switching.load(Ordering::Acquire);
+            let bound = self.loop_device_id.borrow().clone();
+            let same_device = bound.as_deref() == Some(device_id.as_str());
+            if !switch_requested && same_device {
+                // True duplicate on the SAME device: the live loop is already
+                // correct — do nothing.
+                return;
+            }
+            // Explicit switch OR different-device-no-switching: tear down the
+            // stale loop and re-enable for the replacement.
+            self.stop();
+            self.state.set_enabled(true);
+        }
         let on_error = self.on_error.clone();
 
         log::info!(
@@ -1787,6 +2103,38 @@ impl CameraEncoder {
             device_id
         );
 
+        // Commit to running BEFORE spawning (synchronous, no check-then-set race
+        // with the guard reads above). Bump the epoch so this loop has a unique
+        // generation; record the bound device id; set the canary. The spawned
+        // task captures `my_epoch` and clears canary/bound-id on exit ONLY if it
+        // is still the latest generation (epoch unchanged) — a superseded loop's
+        // clear is a no-op, so it can never clobber a newer loop's state. The
+        // per-frame and acquire exit checks also read the epoch, so a superseded
+        // loop self-terminates on its next frame / before binding.
+        //
+        // `fetch_add` returns the PREVIOUS value, so `my_epoch` = previous + 1 =
+        // the value now stored; a later `loop_epoch.load() == my_epoch` is true
+        // iff no newer start() has bumped it.
+        let my_epoch = self
+            .loop_epoch
+            .fetch_add(1, Ordering::AcqRel)
+            .wrapping_add(1);
+        *self.loop_device_id.borrow_mut() = Some(device_id.clone());
+        self.loop_running.store(true, Ordering::Release);
+        // Clear `switching` HERE, at the epoch commit (issue #1295). `switching`
+        // is set by select() to REQUEST a switch; the guard above already
+        // consumed it (read into `switch_requested`) to decide whether to tear
+        // the old loop down. This new loop, with its freshly-bumped epoch, IS the
+        // response to that request, so the request is now satisfied and the flag
+        // must be lowered. The supersede guards (acquire + per-frame) no longer
+        // read `switching` — they rely on the epoch — so this is the single,
+        // authoritative place (besides stop()) that lowers it: select() raises,
+        // commit (here) and stop() clear. Leaving it raised cannot strand a loop
+        // any more, but clearing it keeps the next start()'s guard read honest.
+        self.state.switching.store(false, Ordering::Release);
+        let loop_running = self.loop_running.clone();
+        let loop_device_id = self.loop_device_id.clone();
+        let loop_epoch = self.loop_epoch.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let navigator = window().navigator();
 
@@ -1817,6 +2165,16 @@ impl CameraEncoder {
                     error!("{msg}");
                     if let Some(cb) = &on_error {
                         cb.emit(msg);
+                    }
+                    // Clear only if still the latest loop (issue #1295 epoch
+                    // guard): a superseded loop must not clobber a newer one's
+                    // canary/bound-id. `switching` is NOT touched here: it is
+                    // owned by select() (raise) and start()'s commit / stop()
+                    // (clear), and no supersede guard reads it any more, so a
+                    // task-exit reset would be dead code.
+                    if loop_epoch.load(Ordering::Acquire) == my_epoch {
+                        loop_running.store(false, Ordering::Release);
+                        *loop_device_id.borrow_mut() = None;
                     }
                     return;
                 }
@@ -1851,6 +2209,18 @@ impl CameraEncoder {
             let mut prev_active_layers: usize =
                 shared_active_layer_count.load(Ordering::Relaxed) as usize;
 
+            // Per-rung "continuously shed since" wall-clock (ms, `performance.now()`),
+            // indexed by `layer_id` (issue #1230). `Some(t)` once a rung drops out of
+            // the active set; cleared to `None` when it is active again or after it is
+            // torn down. Declared OUTSIDE `'restart` (like `prev_active_layers`) so a
+            // mid-dwell encoder restart does not reset the clock and re-arm a full 30s
+            // wait. The encode loop STAMPS this every frame from the same
+            // `local_active_layers` it tears down against, so the dwell clock actually
+            // advances (it is not a dead timer). Sized `n_layers`; in single-stream
+            // mode (`n_layers == 1`) it has one slot that is never used (the base layer
+            // is never shed).
+            let mut shed_since_ms: Vec<Option<f64>> = vec![None; n_layers];
+
             'restart: loop {
                 // Backoff + max-restart guard (skip on first iteration).
                 if restart_count > 0 {
@@ -1867,6 +2237,16 @@ impl CameraEncoder {
                         if let Some(cb) = &on_error {
                             cb.emit("Camera encoder failed after repeated restarts".into());
                         }
+                        // Clear only if still the latest loop (issue #1295 epoch
+                        // guard): a superseded loop must not clobber a newer
+                        // one's canary/bound-id. `switching` is NOT touched here:
+                        // it is owned by select() (raise) and start()'s commit /
+                        // stop() (clear), and no supersede guard reads it any
+                        // more, so a task-exit reset would be dead code.
+                        if loop_epoch.load(Ordering::Acquire) == my_epoch {
+                            loop_running.store(false, Ordering::Release);
+                            *loop_device_id.borrow_mut() = None;
+                        }
                         return;
                     }
                 }
@@ -1881,6 +2261,7 @@ impl CameraEncoder {
                         if let Some(cb) = &on_error {
                             cb.emit(msg);
                         }
+                        record_camera_restart(RestartReason::Other);
                         restart_count += 1;
                         continue 'restart;
                     }
@@ -1917,6 +2298,7 @@ impl CameraEncoder {
                             if let Some(cb) = &on_error {
                                 cb.emit(msg);
                             }
+                            record_camera_restart(RestartReason::Other);
                             restart_count += 1;
                             continue 'restart;
                         }
@@ -1930,6 +2312,7 @@ impl CameraEncoder {
                         if let Some(cb) = &on_error {
                             cb.emit(msg);
                         }
+                        record_camera_restart(RestartReason::Other);
                         restart_count += 1;
                         continue 'restart;
                     }
@@ -1940,6 +2323,47 @@ impl CameraEncoder {
                     device.id(),
                     device.get_tracks().length()
                 );
+
+                // Acquire-phase supersede check (issue #1295). getUserMedia is an
+                // await point: while THIS loop was acquiring (cold start OR a
+                // `'restart` re-acquisition), a newer start() may have superseded
+                // us. `set_src_object` below binds the SHARED <video> element, so
+                // a stale loop binding here is the exact wrong-device race. Bail
+                // BEFORE binding: stop the just-acquired tracks so the camera is
+                // released, then return. The epoch-guarded clear is a no-op when
+                // superseded (a newer loop owns the canary), so we never clobber
+                // the latest loop's state.
+                //
+                // Supersede is decided by `epoch` and `enabled` ONLY — NOT by
+                // `switching` — via the shared `loop_is_superseded` predicate (the
+                // same one the per-frame guard uses). `switching` means "a switch
+                // was requested"; the LATEST loop IS the response to that request
+                // and must OWN it, not self-abort on it. A real switch tears the
+                // old loop down and bumps the epoch in start()'s guard/commit, so
+                // the stale loop is already caught by `loop_epoch != my_epoch`
+                // here (and again at the per-frame check); the newest loop — the
+                // one that should bind — sees its own epoch and a `switching`
+                // already cleared by the commit, so it proceeds. Reading
+                // `switching` here would instead kill the very loop that is meant
+                // to bind (the initial-join dark square, issue #1295).
+                if loop_is_superseded(
+                    enabled.load(Ordering::Acquire),
+                    loop_epoch.load(Ordering::Acquire),
+                    my_epoch,
+                ) {
+                    log::info!(
+                        "CameraEncoder: superseded during acquire (epoch/enabled), releasing stream without binding"
+                    );
+                    for track in device.get_tracks().iter() {
+                        track.unchecked_into::<MediaStreamTrack>().stop();
+                    }
+                    if loop_epoch.load(Ordering::Acquire) == my_epoch {
+                        loop_running.store(false, Ordering::Release);
+                        *loop_device_id.borrow_mut() = None;
+                    }
+                    return;
+                }
+
                 // Configure the local preview element
                 // Muted must be set before calling play() to avoid autoplay restrictions
                 video_element.set_muted(true);
@@ -2029,10 +2453,23 @@ impl CameraEncoder {
                 // OUTPUT/EGRESS is unchanged: the encode loop already only encodes
                 // layers with `layer_id < active`, so for any given active-count
                 // sequence the same frames are emitted whether the un-earned
-                // encoders existed or not. Teardown-after-shed is intentionally
-                // NOT implemented (issue #1204 marks it optional and gated on a
-                // rebuild-latency measurement) — a shed encoder is retained so a
-                // later restore reuses it with no rebuild stall.
+                // encoders existed or not.
+                //
+                // TEARDOWN-AFTER-SHED (issue #1230): a shed upper rung is RETAINED
+                // (its encoder + ~100KB output buffer) so a brief shed→restore
+                // bounce reuses it with no rebuild stall. But on a device under
+                // SUSTAINED distress that never earns the rung back, holding that
+                // native VPX/WebCodecs state for the share's lifetime is a leak.
+                // So once a rung has been continuously shed for
+                // `SHED_TEARDOWN_DWELL_MS` (30s — 20× the 1500ms AQ min transition
+                // interval, so a transient bounce never accumulates the dwell) the
+                // encode loop closes+drops its `LayerEncoder` to reclaim the memory; the
+                // SAME lazy path above (`encoders_to_build`) rebuilds it if it is
+                // ever earned back, seeded from its persisted sequence. Teardown
+                // pops ONLY the top built rung(s) to keep `layers` a contiguous
+                // 0..len prefix (shed is strictly top-down) and never frees the
+                // base layer. See `should_teardown_shed_layer` + the per-frame
+                // dwell tracking in the encode loop.
                 //
                 // PR A: n_layers == 1, so only the base layer is ever built —
                 // byte-identical to the legacy single-encoder path.
@@ -2242,6 +2679,9 @@ impl CameraEncoder {
                                 let _ = built.encoder.close();
                             }
                             stop_media_stream_tracks(&device);
+                            // Classify by the create error message BEFORE it is
+                            // moved into the on_error callback (memory vs other).
+                            record_camera_restart(restart_reason_from_message(&msg));
                             if let Some(cb) = &on_error {
                                 cb.emit(msg);
                             }
@@ -2253,6 +2693,7 @@ impl CameraEncoder {
                                 let _ = built.encoder.close();
                             }
                             stop_media_stream_tracks(&device);
+                            record_camera_restart(RestartReason::Configure);
                             restart_count += 1;
                             continue 'restart;
                         }
@@ -2271,6 +2712,24 @@ impl CameraEncoder {
 
                 // Start encoding video and audio.
                 let mut video_frame_counter: u32 = 0;
+
+                // Wall-clock (`performance.now()`, ms) of the last keyframe this
+                // publisher emitted — periodic OR PLI-forced. Drives the forced-
+                // keyframe emit coalescer (issue #1287): PLIs landing within
+                // FORCED_KEYFRAME_COOLDOWN_MS of the last keyframe are held, not
+                // re-emitted. `None` until the first keyframe goes out.
+                //
+                // Declared INSIDE `'restart` (unlike `prev_active_layers` /
+                // `shed_since_ms`, which are declared OUTSIDE so they survive a
+                // restart): the per-`'restart` reset to `None` is INTENTIONAL. A
+                // `'restart` is fatal-encoder-error recovery — the codec was rebuilt
+                // and the receivers need a fresh keyframe immediately, so the
+                // cooldown clock must start clean. `prev_active_layers`/`shed_since_ms`
+                // deliberately persist because they track ladder/dwell state that a
+                // codec restart must NOT reset. A reconnect/re-election does NOT take
+                // this `'restart` path (the encode loop runs uninterrupted), so it
+                // gets its own reset via `keyframe_cooldown_reset` below (issue #1311).
+                let mut last_keyframe_emit_ms: Option<f64> = None;
 
                 // Per-encoder bitrate and dimensions now live in each
                 // `LayerEncoder` (local_bitrate / current_w / current_h) so each
@@ -2303,8 +2762,22 @@ impl CameraEncoder {
                 let mut encoded_ok_this_cycle = false;
 
                 'encode: loop {
-                    if !enabled.load(Ordering::Acquire) || switching.load(Ordering::Acquire) {
-                        switching.store(false, Ordering::Release);
+                    // Exit when disabled OR superseded (issue #1295), via the
+                    // shared `loop_is_superseded` predicate (the same one the
+                    // acquire-phase guard uses): a newer start() bumped
+                    // `loop_epoch` past our captured `my_epoch`, so we are a stale
+                    // loop and must self-terminate even though `enabled` may have
+                    // been set true again for the newer loop. This is what forces
+                    // the OFF→switch→ON stale loop to die — the enabled flip alone
+                    // would not. `switching` is NOT read here: the epoch already
+                    // covers supersede (a real switch bumps it), and the loop that
+                    // owns the current epoch is the switch's intended response,
+                    // which must keep running rather than exit on the request flag.
+                    if loop_is_superseded(
+                        enabled.load(Ordering::Acquire),
+                        loop_epoch.load(Ordering::Acquire),
+                        my_epoch,
+                    ) {
                         let video_track = video_track.clone().unchecked_into::<MediaStreamTrack>();
                         video_track.stop();
                         log::info!("CameraEncoder: stopped");
@@ -2316,6 +2789,13 @@ impl CameraEncoder {
                                     layer.layer_id
                                 );
                             }
+                        }
+                        // Clear only if still the latest loop (issue #1295 epoch
+                        // guard): a superseded loop must not clobber a newer
+                        // one's canary/bound-id.
+                        if loop_epoch.load(Ordering::Acquire) == my_epoch {
+                            loop_running.store(false, Ordering::Release);
+                            *loop_device_id.borrow_mut() = None;
                         }
                         return;
                     }
@@ -2330,6 +2810,7 @@ impl CameraEncoder {
                         .any(|l| l.encoder.state() == CodecState::Closed)
                     {
                         log::warn!("CameraEncoder: an encoder state is Closed, triggering restart");
+                        record_camera_restart(RestartReason::ClosedCodec);
                         restart_count += 1;
                         break 'encode;
                     }
@@ -2364,20 +2845,35 @@ impl CameraEncoder {
                     {
                         let want = encoders_to_build(local_active_layers, n_layers);
                         let already_built = layers.len();
-                        let mut build_failed = false;
+                        // Restart reason captured from the failing build (issue
+                        // #527); `None` while the rung builds succeed.
+                        let mut build_failed: Option<RestartReason> = None;
                         for (offset, &initial_seq) in
                             sequence_numbers[already_built..want].iter().enumerate()
                         {
                             let layer_idx = already_built + offset;
+                            // #1230 rebuild-latency: time the construct+configure
+                            // cost of the (re)build so it is field-measurable on
+                            // real devices/bots. This delta is the build CALL cost;
+                            // the configure→first-emitted-keyframe latency can be
+                            // derived in the field by correlating this log with the
+                            // first chunk emitted for `layer_idx` (the per-chunk
+                            // handler computes `now` already). This is the
+                            // "documented rebuild-latency measurement" that #1204
+                            // gated teardown on — now enabled.
+                            let build_started_ms = window().performance().unwrap().now();
                             match build_layer(layer_idx, initial_seq) {
                                 Ok(le) => {
+                                    let build_ms =
+                                        window().performance().unwrap().now() - build_started_ms;
                                     log::info!(
-                                        "CameraEncoder: lazily constructed simulcast layer {} on first activation (#1204)",
-                                        layer_idx
+                                        "CameraEncoder: lazily (re)built simulcast layer {} on activation in {:.1}ms (#1204/#1230 rebuild-latency)",
+                                        layer_idx,
+                                        build_ms
                                     );
                                     layers.push(le);
                                 }
-                                Err(_) => {
+                                Err(e) => {
                                     // VideoEncoder::new or a fatal configure failed
                                     // for the newly-activated rung. Restart the
                                     // whole encode cycle (the normal 'encode
@@ -2386,14 +2882,103 @@ impl CameraEncoder {
                                         "CameraEncoder: failed to lazily construct simulcast layer {}, restarting",
                                         layer_idx
                                     );
-                                    build_failed = true;
+                                    // #527: classify by the build error variant —
+                                    // a create failure carries a message (memory/
+                                    // other), a fatal configure is structural.
+                                    build_failed = Some(match &e {
+                                        LayerBuildError::CreateFailed(msg) => {
+                                            restart_reason_from_message(msg)
+                                        }
+                                        LayerBuildError::ConfigureFatal => RestartReason::Configure,
+                                    });
                                     break;
                                 }
                             }
                         }
-                        if build_failed {
+                        if let Some(reason) = build_failed {
+                            record_camera_restart(reason);
                             restart_count += 1;
                             break 'encode;
+                        }
+                    }
+
+                    // ── Sustained-shed teardown (issue #1230) ──────────────────
+                    // SIMULCAST-ONLY. In single-stream mode (`n_layers == 1`,
+                    // `simulcast == false`) this entire block is skipped, so the
+                    // legacy path is byte-identical. Runs in the SAME loop that
+                    // reads `local_active_layers` and would rebuild a rung, so a
+                    // layer is freed only while observed inactive by the loop that
+                    // would earn it back — no separate thread, no AQ-loop teardown.
+                    if simulcast {
+                        let now_ms = window().performance().unwrap().now();
+                        // 1) STAMP per-rung shed-since each frame from the active
+                        // count we just read. A rung is "shed" iff its id >=
+                        // active. Stamp the start on the shed edge; clear when it
+                        // is active again. This is what makes the dwell clock
+                        // advance — it is updated every frame, not in a side task.
+                        for layer in layers.iter() {
+                            let id = layer.layer_id as usize;
+                            if id >= local_active_layers {
+                                // Currently shed: arm the clock if not already.
+                                if shed_since_ms[id].is_none() {
+                                    shed_since_ms[id] = Some(now_ms);
+                                }
+                            } else {
+                                // Active: clear any prior shed timer.
+                                shed_since_ms[id] = None;
+                            }
+                        }
+
+                        // 2) TEAR DOWN the top built rung(s) whose shed dwell has
+                        // exceeded the threshold. Pop ONLY from the end so `layers`
+                        // stays a contiguous 0..len prefix (the lazy-build path
+                        // above rebuilds `already_built..want` and assumes
+                        // `layers[i].layer_id == i`). Shed is strictly top-down
+                        // (the AQ controller's `drop_top_layer` decrements the
+                        // active count from the top), so the only shed rungs are at
+                        // the end — popping the tail is exactly the shed set. Floor
+                        // at keeping >= 1 layer: never free the base (id 0). Guard
+                        // `layers.len() > local_active_layers` so we never free an
+                        // ACTIVE rung even if its (stale) timer were armed.
+                        while layers.len() > local_active_layers
+                            && layers.len() > 1
+                            && should_teardown_shed_layer(
+                                shed_since_ms[layers.len() - 1],
+                                now_ms,
+                                SHED_TEARDOWN_DWELL_MS,
+                            )
+                        {
+                            // Pop the top rung. Its `layer_id` equals its index
+                            // (contiguous prefix invariant), so this is the highest
+                            // shed layer.
+                            if let Some(top) = layers.pop() {
+                                let id = top.layer_id as usize;
+                                let dwell_s = shed_since_ms[id]
+                                    .map(|t| (now_ms - t) / 1000.0)
+                                    .unwrap_or(0.0);
+                                // CRITICAL: persist this rung's sequence back into
+                                // `sequence_numbers[id]` BEFORE dropping it, exactly
+                                // like the end-of-loop writeback
+                                // (`sequence_numbers[layer.layer_id] = layer.seq_out.get()`),
+                                // so a future lazy rebuild seeds from the continued
+                                // (non-regressed) sequence and a receiver that
+                                // re-acquires the rung never sees a duplicate seq.
+                                sequence_numbers[id] = top.seq_out.get();
+                                // Close + drop frees the native encoder and the
+                                // ~100KB output buffer owned by the output closure.
+                                let _ = top.encoder.close();
+                                drop(top);
+                                // The rung is gone; clear its timer so a future
+                                // rebuild+shed re-arms a fresh dwell.
+                                shed_since_ms[id] = None;
+                                CAMERA_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL
+                                    .fetch_add(1, Ordering::Relaxed);
+                                log::info!(
+                                    "CameraEncoder: tore down shed simulcast layer {} after {:.1}s sustained shed dwell, reclaiming encoder+buffer (#1230); lazy path rebuilds it if earned back",
+                                    id,
+                                    dwell_s
+                                );
+                            }
                         }
                     }
 
@@ -2446,7 +3031,10 @@ impl CameraEncoder {
                     //    Layers with layer_id >= active count are skipped entirely
                     //    (not reconfigured, not encoded) so a dropped top layer
                     //    costs no encode CPU.
-                    let mut fatal_reconfigure = false;
+                    // Restart reason captured from a fatal reconfigure cause
+                    // (issue #527): a closed-codec guard vs a fatal configure().
+                    // `None` while reconfigure succeeds.
+                    let mut fatal_reconfigure: Option<RestartReason> = None;
                     for layer in layers.iter_mut() {
                         // Simulcast: skip inactive (shed) top layers entirely.
                         if simulcast && (layer.layer_id as usize) >= local_active_layers {
@@ -2467,7 +3055,7 @@ impl CameraEncoder {
                             if new_layer_bitrate > 0 && new_layer_bitrate != layer.local_bitrate {
                                 if layer.encoder.state() == CodecState::Closed {
                                     log::warn!("CameraEncoder: encoder closed before per-layer bitrate reconfigure (layer {})", layer.layer_id);
-                                    fatal_reconfigure = true;
+                                    fatal_reconfigure = Some(RestartReason::ClosedCodec);
                                     break;
                                 }
                                 layer.local_bitrate = new_layer_bitrate;
@@ -2477,7 +3065,7 @@ impl CameraEncoder {
                                         .fetch_add(1, Ordering::Relaxed);
                                     if is_fatal_encoder_error(&e) {
                                         error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                        fatal_reconfigure = true;
+                                        fatal_reconfigure = Some(RestartReason::Configure);
                                         break;
                                     }
                                     error!(
@@ -2494,7 +3082,7 @@ impl CameraEncoder {
                             // Guard: do not configure a closed encoder.
                             if layer.encoder.state() == CodecState::Closed {
                                 log::warn!("CameraEncoder: encoder closed before tier reconfigure (layer {})", layer.layer_id);
-                                fatal_reconfigure = true;
+                                fatal_reconfigure = Some(RestartReason::ClosedCodec);
                                 break;
                             }
 
@@ -2542,7 +3130,7 @@ impl CameraEncoder {
                                     .fetch_add(1, Ordering::Relaxed);
                                 if is_fatal_encoder_error(&e) {
                                     error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                    fatal_reconfigure = true;
+                                    fatal_reconfigure = Some(RestartReason::Configure);
                                     break;
                                 }
                                 error!("Error reconfiguring camera encoder for tier change (layer {}): {e:?}", layer.layer_id);
@@ -2556,7 +3144,7 @@ impl CameraEncoder {
                             // Guard: do not configure a closed encoder.
                             if layer.encoder.state() == CodecState::Closed {
                                 log::warn!("CameraEncoder: encoder closed before bitrate reconfigure (layer {})", layer.layer_id);
-                                fatal_reconfigure = true;
+                                fatal_reconfigure = Some(RestartReason::ClosedCodec);
                                 break;
                             }
                             log::info!(
@@ -2570,7 +3158,7 @@ impl CameraEncoder {
                                     .fetch_add(1, Ordering::Relaxed);
                                 if is_fatal_encoder_error(&e) {
                                     error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                    fatal_reconfigure = true;
+                                    fatal_reconfigure = Some(RestartReason::Configure);
                                     break;
                                 }
                                 error!(
@@ -2583,7 +3171,8 @@ impl CameraEncoder {
                             layer.local_bitrate = new_current_bitrate;
                         }
                     }
-                    if fatal_reconfigure {
+                    if let Some(reason) = fatal_reconfigure {
+                        record_camera_restart(reason);
                         restart_count += 1;
                         break 'encode;
                     }
@@ -2659,12 +3248,23 @@ impl CameraEncoder {
                                 .unwrap()
                                 .unchecked_into::<VideoFrame>();
 
-                            // Read-and-clear the PLI keyframe request ONCE per
-                            // frame and apply the SAME keyframe flag to every
-                            // layer. Reading it per-layer would let only the
-                            // first layer see the request (the swap clears it),
-                            // desynchronizing keyframes across layers.
-                            let pli_requested = force_keyframe.swap(false, Ordering::AcqRel);
+                            // Resolve the PLI keyframe request ONCE per frame and
+                            // apply the SAME keyframe flag to every layer (reading
+                            // it per-layer would let only the first layer see the
+                            // request, desynchronizing keyframes across layers).
+                            //
+                            // Emit-side coalescer (issue #1287): a forced keyframe is
+                            // broadcast to ALL receivers, so ONE emission satisfies
+                            // every pending requester. We therefore PEEK the request
+                            // (`load`, not `swap`) and only honor it outside the
+                            // forced-keyframe cooldown window — collapsing a burst of
+                            // PLIs from many receivers into at most one forced
+                            // keyframe per FORCED_KEYFRAME_COOLDOWN_MS. A request that
+                            // arrives mid-window is left PENDING (flag not cleared)
+                            // and honored the instant the window expires, so it is
+                            // never lost; added recovery latency is bounded by the
+                            // cooldown. The periodic GOP keyframe is never gated.
+                            let now_ms = window().performance().unwrap().now();
                             // Use tier-controlled keyframe interval instead of the
                             // static constant, allowing adaptive quality to adjust it.
                             // Using `%` instead of `.is_multiple_of()` for compatibility
@@ -2672,8 +3272,43 @@ impl CameraEncoder {
                             #[allow(clippy::manual_is_multiple_of)]
                             let is_periodic_keyframe = local_keyframe_interval > 0
                                 && video_frame_counter % local_keyframe_interval == 0;
-                            let want_keyframe = is_periodic_keyframe || pli_requested;
-                            if pli_requested {
+                            // Resolve the keyframe decision via the shared single
+                            // source of truth (issue #1347 item 2: the camera AND
+                            // screen loops call the same pure `keyframe_tick_decision`,
+                            // which the host tests pin). It folds:
+                            //  * #1311 cooldown reset — a reconnect or re-election just
+                            //    happened (the `keyframe_cooldown_reset` one-shot edge,
+                            //    `.swap(false)`-consumed here so a single transition
+                            //    resets exactly once); the decision clears the stale
+                            //    cooldown clock so the FIRST post-transition PLI emits
+                            //    immediately instead of being coalesced away (up to
+                            //    FORCED_KEYFRAME_COOLDOWN_MS = 250ms of suppressed
+                            //    recovery). It only un-gates an ALREADY-pending PLI —
+                            //    never forces an unrequested keyframe.
+                            //  * #1287 PLI coalescer — PEEK the request flag (`load`,
+                            //    not `swap`) so a mid-cooldown PLI stays pending and is
+                            //    honored at window expiry rather than dropped.
+                            //  * periodic GOP — never gated by the cooldown.
+                            let decision = keyframe_tick_decision(KeyframeTickInput {
+                                now_ms,
+                                pli_pending: force_keyframe.load(Ordering::Acquire),
+                                is_periodic: is_periodic_keyframe,
+                                cooldown_reset: keyframe_cooldown_reset
+                                    .swap(false, Ordering::AcqRel),
+                                last_keyframe_emit_ms,
+                                cooldown_ms: FORCED_KEYFRAME_COOLDOWN_MS,
+                            });
+                            let want_keyframe = decision.want_keyframe;
+                            last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
+                            if decision.clear_force_keyframe {
+                                // ANY keyframe (periodic or forced) is broadcast to
+                                // the whole room and satisfies every pending PLI, so
+                                // clear the request flag. Clearing only on an actual
+                                // emit is what lets a mid-cooldown request survive to
+                                // be honored at window expiry.
+                                force_keyframe.store(false, Ordering::Release);
+                            }
+                            if decision.pli_forced {
                                 log::info!(
                                     "CameraEncoder: forcing keyframe at frame {} (PLI)",
                                     video_frame_counter
@@ -2685,7 +3320,10 @@ impl CameraEncoder {
                             let frame_width = video_frame.display_width();
                             let frame_height = video_frame.display_height();
 
-                            let mut fatal_encode = false;
+                            // Restart reason captured from a fatal per-frame
+                            // encode/reconfigure cause (issue #527). `None` while
+                            // the frame encodes cleanly.
+                            let mut fatal_encode: Option<RestartReason> = None;
                             // Health is anchored to the BASE layer (layer_id == 0),
                             // NOT "≥1 layer encoded". Every receiver currently decodes
                             // only layer 0 (receiver default `selected_video_layer = 0`),
@@ -2762,7 +3400,7 @@ impl CameraEncoder {
                                         // Guard: do not configure a closed encoder.
                                         if layer.encoder.state() == CodecState::Closed {
                                             log::warn!("CameraEncoder: encoder closed before per-layer dimension reconfigure (layer {})", layer.layer_id);
-                                            fatal_encode = true;
+                                            fatal_encode = Some(RestartReason::ClosedCodec);
                                             break;
                                         }
 
@@ -2796,7 +3434,7 @@ impl CameraEncoder {
                                                 .fetch_add(1, Ordering::Relaxed);
                                             if is_fatal_encoder_error(&e) {
                                                 error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                                fatal_encode = true;
+                                                fatal_encode = Some(RestartReason::Configure);
                                                 break;
                                             }
                                             error!("Error reconfiguring camera layer for dimension change (layer {}): {e:?}", layer.layer_id);
@@ -2832,7 +3470,7 @@ impl CameraEncoder {
                                         // Guard: do not configure a closed encoder.
                                         if layer.encoder.state() == CodecState::Closed {
                                             log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
-                                            fatal_encode = true;
+                                            fatal_encode = Some(RestartReason::ClosedCodec);
                                             break;
                                         }
 
@@ -2853,7 +3491,7 @@ impl CameraEncoder {
                                                 .fetch_add(1, Ordering::Relaxed);
                                             if is_fatal_encoder_error(&e) {
                                                 error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                                fatal_encode = true;
+                                                fatal_encode = Some(RestartReason::Configure);
                                                 break;
                                             }
                                             error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
@@ -2908,7 +3546,11 @@ impl CameraEncoder {
                                         }
                                         if is_fatal_encoder_error(&e) {
                                             error!("CameraEncoder: fatal encode error (layer {}, restart {restart_count}): {e:?}", layer.layer_id);
-                                            fatal_encode = true;
+                                            // #527: reuse the same message classification
+                                            // as the error counter just bumped above so the
+                                            // restart reason agrees with the error bucket
+                                            // (closed_codec vs memory).
+                                            fatal_encode = Some(restart_reason_from_message(&msg));
                                             break;
                                         }
                                         error!(
@@ -2964,7 +3606,8 @@ impl CameraEncoder {
                                 encoded_ok_this_cycle = true;
                             }
 
-                            if fatal_encode {
+                            if let Some(reason) = fatal_encode {
+                                record_camera_restart(reason);
                                 restart_count += 1;
                                 break 'encode;
                             }
@@ -3005,14 +3648,38 @@ impl CameraEncoder {
 
 #[cfg(test)]
 mod tests {
+    use super::RestartReason;
     use super::{
-        build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
-        frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
-        layer_ceiling_to_count, next_single_layer_pin, shed_reason, should_pin_single_layer_low,
-        LayerView, SimulcastLayerInfo, SIMULCAST_MAX_SUPPORTED_LAYERS,
-        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        build_simulcast_layers, camera_encoder_restarts_closed_codec,
+        camera_encoder_restarts_configure, camera_encoder_restarts_memory,
+        camera_encoder_restarts_other, clamp_layer_count, encoders_to_build,
+        format_layer_transition, frame_is_healthy, initial_active_layer_count,
+        is_fatal_encoder_error_message, keyframe_tick_decision, layer_ceiling_to_count,
+        loop_is_superseded, next_single_layer_pin, record_camera_restart, shed_reason,
+        should_pin_single_layer_low, should_teardown_shed_layer, KeyframeTickInput, LayerView,
+        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
+        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
+        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use videocall_aq::constants::simulcast_layers;
+
+    #[test]
+    fn record_camera_restart_increments_each_reason_counter() {
+        let before_closed = camera_encoder_restarts_closed_codec();
+        let before_memory = camera_encoder_restarts_memory();
+        let before_configure = camera_encoder_restarts_configure();
+        let before_other = camera_encoder_restarts_other();
+
+        record_camera_restart(RestartReason::ClosedCodec);
+        record_camera_restart(RestartReason::Memory);
+        record_camera_restart(RestartReason::Configure);
+        record_camera_restart(RestartReason::Other);
+
+        assert!(camera_encoder_restarts_closed_codec() > before_closed);
+        assert!(camera_encoder_restarts_memory() > before_memory);
+        assert!(camera_encoder_restarts_configure() > before_configure);
+        assert!(camera_encoder_restarts_other() > before_other);
+    }
 
     #[test]
     fn simulcast_layers_emit_shed_rungs_with_zero_bitrate() {
@@ -3112,6 +3779,40 @@ mod tests {
         assert!(!is_fatal_encoder_error_message(
             "EncodingError: dropped one frame"
         ));
+    }
+
+    #[test]
+    fn loop_is_not_superseded_when_only_switching_is_raised() {
+        // Issue #1295 dark-square regression pin. On initial-join-with-camera-ON
+        // a post-permission `devicechange` raises `switching` on the very loop
+        // that should bind the capture stream to `<video id="webcam">`. The fixed
+        // supersede predicate is epoch + enabled ONLY, so a raised `switching`
+        // (with `enabled == true` and a matching epoch) must NOT mark the loop
+        // superseded — otherwise it bails before `set_src_object` and the camera
+        // stays dark until a manual OFF→ON. The pre-fix predicate OR-ed
+        // `switching` in and returned `true` here, producing the dark square.
+        //
+        // `loop_is_superseded` takes NO `switching` argument precisely so the bug
+        // cannot be reintroduced without changing this signature: re-adding a
+        // `switching` term forces a call-site/signature change that breaks this
+        // test. With `enabled == true` and equal epochs the loop is the live,
+        // current generation and must keep going.
+        assert!(
+            !loop_is_superseded(true, 7, 7),
+            "enabled with a matching epoch must NOT be superseded, even though a \
+             switch was requested (the dark-square bug returned true here)"
+        );
+
+        // The real supersede conditions DO trip it, so the assertion above is not
+        // vacuously "always false":
+        assert!(
+            loop_is_superseded(false, 7, 7),
+            "disabled → superseded (the loop must tear down)"
+        );
+        assert!(
+            loop_is_superseded(true, 8, 7),
+            "a newer start() bumped the epoch past ours → superseded"
+        );
     }
 
     #[test]
@@ -3362,6 +4063,198 @@ mod tests {
 
         // Single-stream ceiling (PR-A default): only ever the one base encoder.
         assert_eq!(encoders_to_build(1, 1), 1);
+    }
+
+    #[test]
+    fn sustained_shed_teardown_decision_fires_only_past_dwell() {
+        // Issue #1230: pins the SINGLE SOURCE OF TRUTH for teardown
+        // (`should_teardown_shed_layer`). The encode loop frees a shed upper rung
+        // iff this returns true, so pinning it here pins the whole behavior off-wasm
+        // (the counter is bumped in the live loop and is not host-runnable).
+        //
+        // Mutations these assertions CATCH:
+        //  * dropping the `None` guard (an un-shed rung would tear down) — first case
+        //  * inverting the comparison (`>=`→`<`) — every Some case flips and FAILS
+        //  * swapping `>=`→`>` — the exact-boundary case (29_999 retain, 30_000 tear
+        //    down) flips and FAILS
+        let dwell = SHED_TEARDOWN_DWELL_MS; // 30_000.0
+
+        // Not currently shed (None) → never tear down, no matter how late the clock.
+        assert!(
+            !should_teardown_shed_layer(None, 100_000.0, dwell),
+            "a rung that is not shed (None) must never be torn down"
+        );
+        // Dwelled 29.999s (< 30s) → RETAIN (boundary just under threshold).
+        assert!(
+            !should_teardown_shed_layer(Some(0.0), 29_999.0, dwell),
+            "29.999s < 30s dwell must retain the rung"
+        );
+        // Exactly 30s → TEAR DOWN (pins the inclusive `>=`; a `>` mutation fails).
+        assert!(
+            should_teardown_shed_layer(Some(0.0), 30_000.0, dwell),
+            "exactly 30s dwell must tear down (>= is inclusive)"
+        );
+        // 35s dwell (armed at t=10s, now 45s) → TEAR DOWN.
+        assert!(
+            should_teardown_shed_layer(Some(10_000.0), 45_000.0, dwell),
+            "35s dwell must tear down"
+        );
+        // 10s dwell (armed at t=10s, now 20s) → RETAIN.
+        assert!(
+            !should_teardown_shed_layer(Some(10_000.0), 20_000.0, dwell),
+            "10s dwell must retain"
+        );
+
+        // FREED-COUNT SEMANTICS: drive the REAL decision helper over a per-rung
+        // shed-since array (as the encode loop does) and count the trues. This
+        // pins "freed count == number of rungs whose dwell exceeded N" via the
+        // actual decision path — NOT a literal-against-itself. now = 40_000ms:
+        //   id0 base: never shed (None)            → retain
+        //   id1: armed t=0   (40s dwell >= 30s)     → tear down
+        //   id2: armed t=20s (20s dwell <  30s)     → retain
+        let now_ms = 40_000.0;
+        let shed_since: [Option<f64>; 3] = [None, Some(0.0), Some(20_000.0)];
+        let freed = shed_since
+            .iter()
+            .filter(|s| should_teardown_shed_layer(**s, now_ms, dwell))
+            .count();
+        assert_eq!(
+            freed, 1,
+            "exactly the rungs whose dwell exceeded the threshold are freed"
+        );
+    }
+
+    #[test]
+    fn forced_keyframe_pli_coalesces_within_cooldown_window() {
+        // Issue #1287 / #1347 item 2: drives the REAL per-frame keyframe decision the
+        // camera encode loop calls (`keyframe_tick_decision` — the production loop
+        // calls this exact fn, so a mutation to the real decision logic breaks this
+        // test off-wasm; the live encode loop is not host-runnable).
+        //
+        // ACCEPTANCE (#1287): a frame stream where EVERY frame has a PLI pending
+        // (worst case: N receivers hammering one publisher), replicating the encode
+        // loop's state update by feeding the decision's returned
+        // `last_keyframe_emit_ms` back in each tick. Assert the burst coalesces to
+        // ~one forced keyframe per cooldown. Removing the cooldown gate from the
+        // decision makes `forced` jump to 30 (one per frame), failing `== 4`; the
+        // inclusive-`>=` boundary itself is pinned exactly by
+        // `keyframe_tick_decision_coalesces_and_holds_pli` in `encoder_state`.
+        // 30fps => a frame every ~33.33ms; no periodic GOP in this 1s slice, so all
+        // emits are PLI-forced.
+        let cd = FORCED_KEYFRAME_COOLDOWN_MS; // 250.0
+        let frame_interval_ms = 1000.0 / 30.0;
+        let mut last_keyframe_emit_ms: Option<f64> = None;
+        let mut forced = 0u32;
+        let mut now = 0.0_f64;
+        for _ in 0..30 {
+            // pli_pending is ALWAYS true in this saturated worst case; no reconnect.
+            let decision = keyframe_tick_decision(KeyframeTickInput {
+                now_ms: now,
+                pli_pending: true,
+                is_periodic: false,
+                cooldown_reset: false,
+                last_keyframe_emit_ms,
+                cooldown_ms: cd,
+            });
+            if decision.want_keyframe {
+                assert!(
+                    decision.pli_forced,
+                    "with no periodic GOP, every emit in this slice is PLI-forced"
+                );
+                forced += 1;
+            }
+            // Feed the decision's post-tick clock back, exactly like the loop.
+            last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
+            now += frame_interval_ms;
+        }
+        // 1s of saturated PLI at a 250ms cooldown: the first frame at/after each window
+        // fires, so emissions land at t≈0, 266.7, 533.3, 800ms => exactly 4 (vs up to
+        // 30 = frame-rate with no coalescer).
+        assert_eq!(
+            forced, 4,
+            "saturated PLI for 1s must coalesce to exactly 4 forced keyframes, got {forced}"
+        );
+    }
+
+    #[test]
+    fn keyframe_cooldown_reset_unblocks_first_post_reconnect_pli() {
+        // Issue #1311: after a reconnect/re-election the camera encode loop keeps
+        // running (it is NOT torn down — only the connection is rebuilt / the
+        // re-election atomic flips), so `last_keyframe_emit_ms` carries a STALE
+        // pre-transition timestamp. Without a reset, a recovery PLI on the first
+        // post-transition frame would be coalesced away for up to
+        // FORCED_KEYFRAME_COOLDOWN_MS. The fix arms a one-shot reset
+        // (`keyframe_cooldown_reset`) that the encode loop `.swap(false)`-consumes
+        // each frame and passes into the decision as `cooldown_reset`, which clears
+        // the stale clock so the PLI emits immediately.
+        //
+        // This drives the REAL `keyframe_tick_decision` (the exact fn the camera
+        // production loop calls). It is mutation-proof: the CONTROL arm pins that the
+        // cooldown genuinely WOULD suppress (so the assert is not vacuous), and the
+        // RESET arm fails if the `cooldown_reset` clear is removed from the decision.
+        let cd = FORCED_KEYFRAME_COOLDOWN_MS; // 250.0
+
+        // A keyframe was emitted just before the transition.
+        let pre_reconnect_emit_ms = 1_000.0;
+        // The first post-transition frame arrives only 33ms later — well INSIDE the
+        // 250ms cooldown window, with a PLI pending (a receiver requesting recovery).
+        let first_frame_after_ms = pre_reconnect_emit_ms + 33.0;
+
+        // CONTROL: reset NOT armed. The stale timestamp must SUPPRESS the PLI — this
+        // pins that the window is real, so the reset arm below is a true behavioral
+        // difference, not an always-true assertion.
+        let control = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: first_frame_after_ms,
+            pli_pending: true,
+            is_periodic: false,
+            cooldown_reset: false,
+            last_keyframe_emit_ms: Some(pre_reconnect_emit_ms),
+            cooldown_ms: cd,
+        });
+        assert!(
+            !control.want_keyframe,
+            "control: a PLI {}ms after the last keyframe must be coalesced when no \
+             reconnect reset is armed",
+            first_frame_after_ms - pre_reconnect_emit_ms
+        );
+
+        // RESET ARM: a reconnect/re-election armed the reset (the loop
+        // `.swap(false)`-consumed it → `cooldown_reset: true`). The SAME PLI on the
+        // SAME early frame now EMITS. Removing the `cooldown_reset` clear from the
+        // decision makes `want_keyframe` false and FAILS.
+        let reset = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: first_frame_after_ms,
+            pli_pending: true,
+            is_periodic: false,
+            cooldown_reset: true,
+            last_keyframe_emit_ms: Some(pre_reconnect_emit_ms),
+            cooldown_ms: cd,
+        });
+        assert!(
+            reset.want_keyframe,
+            "after a reconnect/re-election reset, the first PLI must emit a forced \
+             keyframe immediately even {}ms < cooldown ({}ms) since the last keyframe",
+            first_frame_after_ms - pre_reconnect_emit_ms,
+            cd
+        );
+
+        // One-shot: the reset is a per-frame edge (the loop already consumed it via
+        // `.swap`), so a SUBSEQUENT early frame — still inside the cooldown of the
+        // keyframe we just emitted, reset NOT re-armed — is coalesced again. The reset
+        // does not stick and disable the coalescer.
+        let next = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: first_frame_after_ms + 33.0,
+            pli_pending: true,
+            is_periodic: false,
+            cooldown_reset: false,
+            last_keyframe_emit_ms: reset.last_keyframe_emit_ms,
+            cooldown_ms: cd,
+        });
+        assert!(
+            !next.want_keyframe,
+            "after the one-shot reset is consumed, the coalescer must resume \
+             suppressing PLIs inside the cooldown window"
+        );
     }
 
     #[test]

@@ -63,21 +63,35 @@ canvas {
 
 #peer-list-container {
   position: fixed;
-  left: -400px;
+  left: 0;
   top: 0;
   height: 100%;
   width: 400px;
+  /* Slide via transform so any custom (dragged) width still slides fully out of
+     view in the closed state — a fixed negative `left` could not. (issue 1296) */
+  transform: translateX(-100%);
   background-color: var(--color-surface-elevated);
   color: var(--text-primary);
-  transition: left 0.3s ease;
+  transition: transform 0.3s ease;
   z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
 }
 
 #peer-list-container.visible {
-  left: 0;
+  transform: translateX(0);
   visibility: visible;
+  /* Open INSTANTLY (no slide) so the drag-resize handle — an absolutely
+     positioned child that rides the drawer's `transform` — is at its FINAL hit
+     position the moment `.visible` applies, instead of being a moving target
+     during a 0.3s slide-in. Close stays animated: the base rule's
+     `transition: transform 0.3s ease` governs the transition INTO the closed
+     state, and this 0s duration only applies while opening (in the `.visible`
+     state). Without this, a pointer drag that grabs the handle's transient
+     mid-slide position misses the moving handle entirely. The transform VALUE is
+     unchanged, so the closed full-hide at custom widths and the popover
+     containing-block behaviour are preserved. (issue 1296) */
+  transition-duration: 0s;
 }
 
 /* Shared sidebar styles */
@@ -592,7 +606,12 @@ h3 {
     height: 100% !important;
     background-color: var(--surface-elevated) !important;
     transition: transform 0.3s ease !important;
-    z-index: 9300 !important;
+    /* On mobile both drawers are full-width fixed overlays. Now that they can be
+       open at the same time (issue 1296), give diagnostics one layer above
+       peer-list (9300) so the right/diagnostics drawer deterministically sits on
+       top instead of relying on DOM order. Both keep their own close buttons, so
+       each stays independently dismissible. (issue 1296) */
+    z-index: 9301 !important;
     overflow-y: auto !important;
     transform: translateX(100%) !important;
     box-shadow: none !important;
@@ -601,6 +620,12 @@ h3 {
   #diagnostics-sidebar.visible {
     transform: translateX(0) !important;
     visibility: visible !important;
+  }
+
+  /* Hide the resize grip on mobile: drawers are forced full-width (width:100%
+     !important) here, so the handle is a no-op affordance. (issue 1296) */
+  .drawer-resize-handle {
+    display: none !important;
   }
 
   #peer-list-container .sidebar-header,
@@ -641,7 +666,9 @@ h3 {
     padding: 0 15px !important;
   }
   #diagnostics-sidebar .diagnostics-section {
-    margin-bottom: 25px !important;
+    /* Zero the additive margin — `.sidebar-content` flex `gap` spaces sections
+       (Fix A). Padding / background / radius keep the mobile card look. */
+    margin-bottom: 0 !important;
     padding: 15px !important;
     background-color: var(--field-bg) !important;
     border-radius: 8px !important;
@@ -1016,29 +1043,178 @@ select {
 
 #diagnostics-sidebar {
   position: fixed;
-  right: -650px;
+  /* Widened 650 → 720 so the two-column per-kind perf cards stay 2-col at this
+     width (card container ~662px → ~315px/col). The closed state slides off-screen
+     via transform: translateX(100%) below, not a negative offset. (issue 1131 unify) */
+  right: 0;
   top: 0;
   height: 100%;
-  width: 650px;
+  width: 720px;
+  /* Slide via transform so any custom (dragged) width still slides fully out of
+     view in the closed state — a fixed negative `right` could not. (issue 1296) */
+  transform: translateX(100%);
   background-color: var(--surface-elevated);
-  color: white;
-  transition: right 0.3s ease;
+  /* Use the theme text token (not hard-coded white) so the migrated perf text +
+     the drawer body read correctly in BOTH themes. Dark theme additionally
+     remaps --text-* to the settings-modal tokens below. (#1131 §5) */
+  color: var(--text-primary);
+  transition: transform 0.3s ease;
   z-index: 9300;
   overflow-y: auto;
   box-shadow: var(--shadow-sm);
 }
 
+/* Theme compliance (#1131 §5): the `.perf-*` text uses --text-primary/-secondary/
+   -tertiary. Inside the settings modal those are remapped to the white
+   settings-modal tokens for dark theme; mirror that remap for the drawer so the
+   migrated controls read identically. Light theme defines no settings-modal text
+   tokens (the light modal uses the default light --text-* tokens), so the drawer
+   inherits the correct light tokens via `color: var(--text-primary)` above — no
+   light remap needed (a remap to the undefined dark tokens would break it). */
+html[data-theme="dark"] #diagnostics-sidebar {
+  --text-primary: var(--settings-modal-text-primary);
+  --text-secondary: var(--settings-modal-text-secondary);
+  --text-tertiary: var(--settings-modal-text-tertiary);
+}
+
+/* Lightweight, non-interactive group dividers between the three IA groups
+   (Quality controls / Live stream state / Connection & system). NOT headings —
+   the per-section <h3>s are the real headings. (#1131 §5) */
+.diag-group-label {
+  margin: 20px 0 8px;
+  padding-top: 16px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+/* The first group needs no top border/extra top padding (it leads the body). */
+.diag-group-label--first {
+  margin-top: 4px;
+  padding-top: 0;
+  border-top: none;
+}
+
+/* Section header row that carries an inline "?" help popover next to its <h3>
+   (e.g. "Current Status", "NetEQ charts"). The popover itself is `position: fixed`
+   and positioned by `use_help_popover_anchor` (see `.perf-help-popover`), so this
+   row only needs to lay out the <h3> + button. (#1131) */
+.diag-section-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.diag-section-head h3 {
+  margin: 0;
+}
+
+/* Native `<details>` disclosure for the collapsed "Raw stats" and "Build info"
+   sections (iteration 3). The summary reads like a section heading; the marker
+   gives the open/closed affordance for free. (#1223) */
+.diag-disclosure > .diag-disclosure-summary {
+  cursor: pointer;
+  /* Hide the default disclosure marker — we render an explicit chevron SVG
+     (`.diag-disclosure-chev`) inside the summary so the open/closed affordance
+     is consistent across browsers (Fix B), mirroring `.perf-peers__summary`. */
+  list-style: none;
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  padding: 4px 0;
+  /* ≥44px keyboard/touch target for the summary row. */
+  min-height: 44px;
+  display: flex;
+  align-items: center;
+}
+/* WebKit/Blink draw their own marker even with `list-style:none`; remove it. */
+.diag-disclosure-summary::-webkit-details-marker {
+  display: none;
+}
+/* Subtle hover affordance on the clickable summary row. */
+.diag-disclosure-summary:hover {
+  background: var(--glass-bg-hover);
+  border-radius: 6px;
+}
+/* The explicit chevron points right when closed, rotates to point down when the
+   `<details>` is open. Mirrors the `.perf-peers__chev` pattern. */
+.diag-disclosure-chev {
+  flex: 0 0 auto;
+  width: 12px;
+  height: 12px;
+  margin-right: 6px;
+  transition: transform 0.15s ease;
+}
+details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
+  transform: rotate(90deg);
+}
+@media (prefers-reduced-motion: reduce) {
+  .diag-disclosure-chev {
+    transition: none;
+  }
+}
+.diag-disclosure[open] > .diag-disclosure-summary {
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--glass-bg-hover);
+  padding-bottom: 8px;
+}
+/* "Select a specific peer…" placeholder shown for the NetEq section when the
+   "All Peers" aggregate is selected (S2). */
+.diag-neteq-placeholder {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: 14px;
+}
+/* Each folded raw-stats block (Reception / Sending / Encoder / Media Status)
+   keeps its own sub-heading inside the one disclosure. */
+.diag-raw-block + .diag-raw-block {
+  margin-top: 12px;
+}
+.diag-raw-block h4 {
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* Honour reduced-motion for the drawer slide on BOTH the desktop `right`
+   transition (this rule, non-`!important`, wins by source order) AND the mobile
+   `transform 0.3s ease !important` transition at the ≤639px breakpoint (style.css
+   mobile block) — which is itself `!important`, so this override MUST also be
+   `!important` to beat it. (#1131 §5, review REQUIRED 2) */
+@media (prefers-reduced-motion: reduce) {
+  #diagnostics-sidebar {
+    transition: none !important;
+  }
+}
+
 #diagnostics-sidebar.visible {
-  right: 0;
+  transform: translateX(0);
   visibility: visible;
+  /* Open INSTANTLY (no slide) so the drag-resize handle is at its FINAL hit
+     position the moment `.visible` applies — same rationale as
+     `#peer-list-container.visible`. The right drawer happens to pass the resize
+     e2e today only because its heavier component mounts slowly enough that the
+     handle's box is read post-settle; that is timing-luck, so it gets the same
+     deterministic fix for symmetry. Close stays animated via the base
+     `transition: transform 0.3s ease`; the transform VALUE is unchanged so the
+     fixed help-popover's containing block is unaffected. (issue 1296) */
+  transition-duration: 0s;
 }
 
 #diagnostics-sidebar .diagnostics-data {
   padding: 10px;
 }
 
+/* Drawer sections no longer carry a bottom margin — `.sidebar-content` now
+   spaces them with a single flex `gap` (iteration 3 polish). Flex gap + child
+   margins are additive, so the global `.diagnostics-section { margin-bottom }`
+   leaks an extra gap inside the drawer; zero it here (the global rule body is
+   unchanged so non-drawer sections keep their margin). */
 #diagnostics-sidebar .diagnostics-section {
-  margin-bottom: 20px;
+  margin-bottom: 0;
 }
 
 #diagnostics-sidebar .diagnostics-section h3 {
@@ -1049,17 +1225,16 @@ select {
   border-bottom: 1px solid var(--glass-bg-hover);
 }
 
+/* Raw-stats monospace dumps use the build-info mono treatment (the theme mono
+   token on the surface) instead of the old #00ff00-on-black debug look
+   (iteration 3 polish). */
 #diagnostics-sidebar .diagnostics-data pre {
   font-family: monospace;
-  font-size: 14px;
+  font-size: 13px;
   white-space: pre-wrap;
-  color: #00ff00; /* @token-exempt: debug indicator, not a design token */
-  background-color: rgba(
-    0,
-    0,
-    0,
-    0.3
-  ); /* @token-exempt: dark translucent bg, no matching token */
+  color: var(--diag-mono-text);
+  background-color: var(--surface);
+  border: 1px solid var(--border);
   padding: 10px;
   border-radius: 5px;
   max-height: 40vh;
@@ -1083,6 +1258,12 @@ select {
   padding: 15px;
   background-color: var(--surface);
   border-bottom: 1px solid var(--glass-bg-hover);
+  /* Sticky so the title + close stay reachable while the single scroll surface
+     scrolls. The opaque --surface background lets content scroll cleanly beneath
+     it. (#1131 §2) */
+  position: sticky;
+  top: 0;
+  z-index: 2;
 }
 
 #diagnostics-sidebar .sidebar-header h2 {
@@ -1106,6 +1287,13 @@ select {
 
 #diagnostics-sidebar .sidebar-content {
   padding: 15px;
+  /* Single spacing rhythm: one flex `gap` between the group labels, sections,
+     panels and disclosures, instead of per-child bottom margins (iteration 3
+     polish). The removed margins are: `.diagnostics-section`, the drawer
+     `.perf-simulcast-strip` / `.perf-kind-card`. */
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
 }
 
 .diagnostics-sidebar {
@@ -1172,8 +1360,9 @@ select {
 .diagnostics-section h3 {
   margin: 0 0 10px 0;
   font-size: 1.2em;
-  color: var(--success);
-  border-bottom: 1px solid var(--success);
+  /* Drawer headings read as plain section titles (matching the perf-card
+     titles), not the old green-on-underline debug look (iteration 3 polish). */
+  color: var(--text-primary);
   padding-bottom: 5px;
 }
 
@@ -1278,79 +1467,185 @@ select {
   padding: 20px;
 }
 
-.neteq-advanced-chart svg {
+/* The advanced charts are now a fixed-Y-axis + growing-width scrollable form
+   (`.neteq-chart-*` below), so the chart SVG width is DYNAMIC. Only style the
+   chart card chrome here — no fixed/max width, which would clip the timeline. */
+.neteq-advanced-chart {
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: 4px;
-  width: 100%;
-  height: auto;
-  max-width: 280px;
-  min-height: 220px;
-  display: block;
-  margin: 0 auto;
+  padding: 10px;
 }
 
+.neteq-advanced-chart .chart-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  margin-bottom: 6px;
+}
+
+/* Current Status — two-tier compact layout (iteration 4). Replaces the 9 uniform
+   110px tiles. Quality classes (.is-good/.is-warn/.is-poor) tint the VALUE only;
+   each colored state also carries a text reason (.status-stat__reason or title)
+   so meaning never depends on color alone (WCAG 1.4.1). Uses var(--text-*): the
+   drawer is bi-theme — under dark theme --text-* resolves to the settings-modal
+   dark tokens remapped inside #diagnostics-sidebar, and under light theme it
+   inherits the default light --text-* (the light drawer is intentionally NOT
+   remapped). No .settings-modal ancestor dependency either way. */
 .neteq-status {
   background: var(--surface-elevated);
-  padding: 15px;
+  padding: 16px;
   border-radius: 8px;
-  margin-bottom: 20px;
   box-shadow: var(--shadow-sm);
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
 }
 
-.status-grid {
+/* Tier 1 — primary stats (Buffer | Target) */
+.neteq-status .status-primary {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
-  gap: 10px;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
 }
-
-.status-item {
-  text-align: center;
-  padding: 10px;
+.neteq-status .status-stat {
   background: var(--border);
-  border-radius: 4px;
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
 }
-
-.status-value {
-  font-size: 18px;
-  font-weight: bold;
+.neteq-status .status-stat__value {
+  font-size: 22px;
+  font-weight: 600;
+  line-height: 1.1;
   color: var(--text-primary);
-  margin-bottom: 5px;
+  font-variant-numeric: tabular-nums;
 }
-
-.status-value.warning {
-  color: var(--error-text);
+.neteq-status .status-stat__label {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-secondary);
 }
-
-.status-value.good {
-  color: var(--success);
-}
-
-.status-label {
+.neteq-status .status-stat__unit {
   font-size: 11px;
+  color: var(--text-tertiary);
+}
+.neteq-status .status-stat__reason {
+  font-size: 11px;
+  line-height: 1.3;
+  margin-top: 2px;
+  color: var(--text-secondary);
+}
+
+/* Tier 2 — flow group, label-left / value-right rows */
+.neteq-status .status-secondary {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px 16px;
+}
+.neteq-status .status-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+  border-bottom: 1px solid var(--border);
+}
+.neteq-status .status-row__label {
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.neteq-status .status-row__value {
+  font-size: 16px;
+  font-weight: 600;
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Tier 3 — reordering, demoted muted micro-row */
+.neteq-status .status-reorder {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+  padding-top: 4px;
+  font-size: 12px;
+  color: var(--text-tertiary);
+}
+.neteq-status .status-reorder__head {
+  font-weight: 600;
   color: var(--text-secondary);
   text-transform: uppercase;
-  letter-spacing: 0.5px;
+  letter-spacing: 0.4px;
+  font-size: 11px;
+}
+
+/* Quality tinting — VALUE color only; canonical tokens (Directive 5) */
+.neteq-status .is-good   .status-stat__value,
+.neteq-status .is-good   .status-row__value,
+.neteq-status .status-reorder__item.is-good  { color: var(--diag-q-good); }
+.neteq-status .is-warn   .status-stat__value,
+.neteq-status .is-warn   .status-row__value,
+.neteq-status .status-reorder__item.is-warn  { color: var(--diag-q-warn); }
+.neteq-status .is-poor   .status-stat__value,
+.neteq-status .is-poor   .status-row__value,
+.neteq-status .status-reorder__item.is-poor  { color: var(--diag-q-poor); }
+.neteq-status .is-warn   .status-stat__reason { color: var(--diag-q-warn); }
+.neteq-status .is-poor   .status-stat__reason { color: var(--diag-q-poor); }
+
+/* Mobile: primary stacks, secondary single column */
+@media (max-width: 639px) {
+  .neteq-status .status-primary,
+  .neteq-status .status-secondary { grid-template-columns: 1fr; }
 }
 
 .diagnostics-charts {
-  margin: 20px 0;
+  margin: 0;
 }
 
+/* NetEq charts are now 1-up, full drawer width, stacked vertically (iteration 3).
+   The four scrollable charts share one timeline and each fills the column. */
+.neteq-charts-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.neteq-charts-stack .chart-container {
+  min-height: 0;
+  width: 100%;
+}
+
+/* Per-chart heading row (title + ⓘ) for the four NetEq charts (iteration 4).
+   Replaces the single section-level charts help popover; each chart now carries
+   its own explanation where the user is looking. */
+.neteq-charts-stack .diag-chart-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.neteq-charts-stack .diag-chart-head__title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* `.charts-grid` is no longer used for the NetEq charts (they stack 1-up). Kept
+   as an auto-fit grid in case any other surface references it. (iteration 3) */
 .charts-grid {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
   gap: 20px;
-  margin-bottom: 20px;
   padding: 0 10px;
 }
 
 .chart-container {
   background: var(--surface-elevated);
   border-radius: 8px;
-  overflow: hidden;
   box-shadow: var(--shadow-sm);
-  min-height: 300px;
   padding: 10px;
 }
 
@@ -1363,6 +1658,9 @@ select {
   color: var(--text-primary);
   font-size: 14px;
   margin: 8px 0;
+  /* ≥44px tap target for the Peer Selection AND Transport Preference selects
+     (both use this class) on touch devices (iteration 3 polish). */
+  min-height: 44px;
 }
 
 .peer-selector:focus {
@@ -1406,24 +1704,22 @@ select {
   font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
 }
 
+/* Per-peer Buffer/Jitter value color-coding (iteration 4, Directive 5). Tints
+   the value span only; the `title` attribute carries the text reason so meaning
+   never depends on color alone (WCAG 1.4.1). */
+.peer-summary .peer-stat.is-good { color: var(--diag-q-good); }
+.peer-summary .peer-stat.is-warn { color: var(--diag-q-warn); }
+.peer-summary .peer-stat.is-poor { color: var(--diag-q-poor); }
+
 @media (max-width: 37.5em) {
   .charts-grid {
     grid-template-columns: 1fr;
     gap: 10px;
   }
-  .status-grid {
-    grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
-    gap: 5px;
-  }
-  .status-item {
-    padding: 8px;
-  }
-  .status-value {
-    font-size: 14px;
-  }
-  .status-label {
-    font-size: 9px;
-  }
+  /* The old `.neteq-status .status-grid/item/value/label` mobile overrides were
+     removed with the two-tier Current Status redesign (iteration 4); the new
+     `.status-primary` / `.status-secondary` mobile collapse lives in its own
+     `@media (max-width: 639px)` block above. */
   .neteq-advanced-chart {
     padding: 10px;
   }
@@ -1586,6 +1882,66 @@ select {
 
 .menu-button:active {
   transform: scale(0.95);
+}
+
+/* Drawer resize grip (issue 1296). One per drawer, positioned on the drawer's inner
+   edge. Drag is driven by pointer listeners on each drawer's
+   .drawer-resize-handle, using pointer capture (attendants.rs / diagnostics.rs).
+   The #grid-container handlers only drive the screen-share split, not resize.
+
+   The handle div is the FULL-HEIGHT pointerdown/capture target (cursor ew-resize)
+   but is itself visually transparent; the visible affordance is a short, centered
+   vertical grip rendered via ::before so a bare edge-hover doesn't read as a solid
+   resizable bar. The grip uses var(--border-emphasis) at rest and var(--accent) on
+   hover/focus/active. (issue 1296) */
+.drawer-resize-handle {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  /* Slightly wider hit area than the old 6px so the grip is easy to grab. */
+  width: 10px;
+  cursor: ew-resize;
+  z-index: 9310;
+  background: transparent;
+  transition: background 0.15s ease;
+  /* Suppress browser touch panning and text selection during a capture drag. */
+  touch-action: none;
+  user-select: none;
+}
+
+/* Centered grip: a short rounded vertical bar, vertically centered in the
+   full-height handle. var(--border-emphasis) normally, var(--accent) on interaction. */
+.drawer-resize-handle::before {
+  content: "";
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 3px;
+  height: 32px;
+  border-radius: 2px;
+  background: var(--border-emphasis);
+  transition: background 0.15s ease;
+  pointer-events: none;
+}
+
+.drawer-resize-handle:hover::before,
+.drawer-resize-handle:focus::before,
+.drawer-resize-handle:active::before {
+  background: var(--accent);
+}
+
+.drawer-resize-handle:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+#peer-list-container .drawer-resize-handle {
+  right: 0;
+}
+
+#diagnostics-sidebar .drawer-resize-handle {
+  left: 0;
 }
 
 .context-menu {
@@ -3949,21 +4305,28 @@ select {
 }
 
 /* ── Decode-budget "tiles paused" banner (#1142 Phase 1) ─────────────
-   A slim, dismissible glass bar pinned top-centre of the grid area. It is
+   A slim, dismissible dark bar pinned top-centre of the grid area. It is
    NOT a modal: it overlays the grid (absolute within #grid-container) and
-   does not block interaction with the tiles below. The glass treatment
-   mirrors `.peer-toast` (backdrop blur, near-opaque dark surface) and the
-   accent is the shared amber `--warning` token.
+   does not block interaction with the tiles below. The accent is the shared
+   amber `--warning` token.
 
-   The banner surface is ALWAYS dark (it hardcodes rgba(30,30,30,0.9) in both
+   Per issue 1197, this banner has NO backdrop-filter blur (unlike `.peer-toast`). It
+   only appears under sustained decode-budget pressure — i.e. exactly when the
+   device is already CPU/GPU-bound and shedding video to keep audio alive — so
+   a GPU compositing blur here adds cost precisely when the GPU is the
+   bottleneck. The surface was already 90% opaque, so the blur affected only the
+   ~10% bleed-through and was barely perceptible; bumping the fill to near-opaque
+   removes the GPU cost with negligible visual change.
+
+   The banner surface is ALWAYS dark (a flat near-opaque dark fill in both
    themes), so its foreground colours MUST be literal light-on-dark — NOT the
    `--text-on-glass-strong` token, which flips to near-black under
    html[data-theme="light"] and would render the text + ✕ invisible on the dark
    surface. We therefore use literal rgba(255,255,255,0.95) for body text and the
    dismiss glyph, matching how the amber accent is already a literal. Contrast on
-   the composited dark surface: white text ≈ 11–16:1, amber #ff9f0a ≈ 6–8:1
-   (range = page background showing through the ~0.9-opacity surface) — both well
-   past 4.5:1, in BOTH themes. */
+   the near-opaque dark surface: white text ≈ 15–16:1, amber accent ≈ 7–8:1
+   (the more-opaque fill only RAISES contrast vs the prior ~0.9 surface, since
+   less page background bleeds through) — both well past 4.5:1, in BOTH themes. */
 .decode-budget-banner {
   position: absolute;
   top: 12px;
@@ -3975,10 +4338,12 @@ select {
   gap: 10px;
   max-width: min(560px, calc(100% - 24px));
   padding: 8px 10px 8px 14px;
-  background: rgba(30, 30, 30, 0.9)
-    /* @token-exempt: dark near-opaque banner surface, matches .peer-toast */;
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  background: rgba(30, 30, 30, 0.97)
+    /* @token-exempt: flat near-opaque dark banner surface. No backdrop-filter
+       blur (#1197): the banner only renders under decode-budget pressure, when
+       the GPU is already the bottleneck, so a compositing blur would add cost
+       exactly when it hurts most. The fill is near-opaque (was 0.9 + blur), so
+       dropping the blur is visually ~indistinguishable. */;
   border: 1px solid var(--btn-warning-border);
   border-radius: var(--radius-lg, 14px);
   box-shadow: 0 8px 32px var(--shadow-card-deep);
@@ -4136,7 +4501,14 @@ select {
   border: 1px solid var(--glass-bg-hover);
   border-radius: var(--radius-lg);
   padding: 10px 16px;
-  color: var(--text-primary);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes (rgba(30,30,30,0.88) above), so the theme-flipping --text-primary
+     token must NOT be used here — it goes near-black under
+     html[data-theme="light"] and would render the toast text invisible on the
+     dark surface. This literal equals --text-primary's dark value (opaque white)
+     so dark mode is byte-identical; white on rgb(30,30,30) ≈ 16:1, well past
+     4.5:1. */
+  color: #ffffff;
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
@@ -4174,7 +4546,13 @@ select {
 }
 
 .peer-toast.toast-left .toast-icon svg {
-  color: var(--toast-action-neutral);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes, so --toast-action-neutral must NOT be used — it flips near-black
+     (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this icon glyph
+     invisible on the dark chip. Literal equals the token's dark value so dark mode
+     is unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
+     ≈ 6-7:1, past 4.5:1. */
+  color: rgba(255, 255, 255, 0.5);
 }
 
 .peer-toast .toast-text {
@@ -4184,7 +4562,13 @@ select {
 
 .peer-toast .toast-name {
   font-weight: 600;
-  color: var(--text-on-glass-strong);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes, so --text-on-glass-strong must NOT be used — it flips near-black
+     (rgba(0,0,0,0.92)) under html[data-theme="light"], rendering the participant
+     name invisible on the dark surface (the reported issue 1189 bug). Literal
+     equals the token's dark value so dark mode is unchanged; white 0.95 on
+     rgb(30,30,30) ≈ 14.5:1, well past 4.5:1. */
+  color: rgba(255, 255, 255, 0.95);
 }
 
 .peer-toast.toast-joined .toast-action {
@@ -4193,7 +4577,13 @@ select {
 }
 
 .peer-toast.toast-left .toast-action {
-  color: var(--text-on-glass-faint);
+  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+     both themes, so --text-on-glass-faint must NOT be used — it flips near-black
+     (rgba(0,0,0,0.44)) under html[data-theme="light"], rendering this faint
+     secondary text invisible on the dark surface. Literal equals the token's dark
+     value so dark mode is unchanged; preserves the dimmer secondary weight. White
+     0.5 on rgb(30,30,30) ≈ 6-7:1, still past 4.5:1. */
+  color: rgba(255, 255, 255, 0.5);
   font-weight: 400;
 }
 
@@ -4215,7 +4605,13 @@ select {
 }
 
 .peer-toast.toast-loading .toast-icon svg {
-    color: var(--toast-action-neutral);
+    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+       both themes, so --toast-action-neutral must NOT be used — it flips near-black
+       (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this loading
+       glyph invisible on the dark chip. Literal equals the token's dark value so
+       dark mode is unchanged; preserves the dim neutral weight. White 0.5 on
+       rgb(30,30,30) ≈ 6-7:1, past 4.5:1. */
+    color: rgba(255, 255, 255, 0.5);
     animation: screen-share-spin 1s linear infinite;
 }
 
@@ -4232,7 +4628,14 @@ select {
 }
 
 .peer-toast.toast-error .toast-icon svg {
-    color: var(--danger, var(--toast-action-neutral));
+    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
+       both themes. --danger is UNDEFINED in this codebase, so this fell through to
+       --toast-action-neutral, which flips near-black (rgba(0,0,0,0.45)) under
+       html[data-theme="light"], rendering the error glyph invisible on the dark
+       chip. Literal equals the (fallen-through) token's dark value so dark mode is
+       unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
+       ≈ 6-7:1, past 4.5:1. */
+    color: rgba(255, 255, 255, 0.5);
 }
 
 @keyframes screen-share-spin {
@@ -4509,14 +4912,10 @@ select {
   padding-top: 6px;
 }
 
-/* Performance tab only: tighter inter-element spacing so the three per-kind
-   cards + header + intro + strip fit the modal body without scrolling (#1095
-   no-scroll requirement). Scoped via :has(.perf-header-row) so other tabs keep
-   the roomier default. */
-.settings-section:has(.perf-header-row) {
-  gap: 10px;
-  padding-top: 0;
-}
+/* (The Performance tab's no-scroll `:has(.perf-header-row)` override was removed
+   in #1131: the panel moved into the Diagnostics drawer, which is a single
+   scrolling surface by design — the no-scroll budget no longer applies, and the
+   `.perf-header-row` it keyed off was deleted.) */
 
 .appearance-section-title,
 .settings-section-title,
@@ -6619,6 +7018,54 @@ html[data-theme="light"]
 .signal-chart-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-active);
 }
+
+/* ============================================================
+   NetEq scrollable charts (iteration 3) — mirrors `.signal-chart-*`.
+   Fixed external Y-axis SVG outside the scroll box + a growing inner SVG
+   inside `.neteq-chart-scroll`. The scrollbar IS the interaction (no drag-pan);
+   `onscroll` keeps the four stacked charts in lockstep on one timeline.
+   ============================================================ */
+.neteq-chart-wrapper {
+  display: flex;
+  align-items: flex-start;
+  position: relative;
+}
+.neteq-chart-y-axis {
+  flex-shrink: 0;
+}
+.neteq-chart-scroll {
+  position: relative;
+  overflow-x: auto;
+  overflow-y: hidden;
+  flex: 1;
+  min-width: 0;
+  scrollbar-width: auto;
+  scrollbar-color: rgba(255, 255, 255, 0.35) rgba(255, 255, 255, 0.08); /* @token-exempt: scrollbar custom rendering */
+}
+/* Always-visible classic (non-overlay) scrollbar when content overflows — same
+   rationale as `.signal-chart-scroll` above. */
+.neteq-chart-scroll::-webkit-scrollbar {
+  height: 10px;
+}
+.neteq-chart-scroll::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+  border-radius: 5px;
+}
+.neteq-chart-scroll::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb-strong);
+  border-radius: 5px;
+}
+.neteq-chart-scroll::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-active);
+}
+/* The 2-hour retention caption, shown only when a peer's deque is at cap. */
+.neteq-chart-cap-note {
+  margin-top: 6px;
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-tertiary);
+}
+
 .signal-chart-legend {
   display: flex;
   flex-wrap: wrap;
@@ -7491,58 +7938,10 @@ html[data-theme="light"] .settings-divider {
    Auto toggle + "?" help. All colors are design tokens (see global.css).
    ────────────────────────────────────────────────────────────────── */
 
-/* ── Panel header row: "Performance" title left, Diagnostics cross-nav button
-   right (#1095 §4a). The Receive | Send direction toggle was removed — both
-   directions now render side-by-side in each per-kind card. ── */
-.perf-header-row {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-/* Shared ghost button for both cross-nav buttons (Perf→Diag here, Diag→Perf in
-   the diagnostics sidebar header). 16–18px icon, 8px gap, >=44px hit area. */
-.perf-nav-button,
-.sidebar-header-action {
-  display: inline-flex;
-  align-items: center;
-  gap: 8px;
-  min-height: 44px;
-  padding: 6px 12px;
-  font-size: 13px;
-  font-weight: 600;
-  color: var(--text-secondary);
-  background: transparent;
-  border: 1px solid var(--border-emphasis);
-  border-radius: var(--radius-pill);
-  cursor: pointer;
-}
-
-.perf-nav-button:hover,
-.sidebar-header-action:hover {
-  color: var(--text-primary);
-  background: var(--field-bg-hover);
-}
-
-.perf-nav-button:focus-visible,
-.sidebar-header-action:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-}
-
-.perf-nav-button__icon {
-  flex: 0 0 auto;
-}
-
-/* Below ~480px the cross-nav buttons go icon-only (aria-label still conveys the
-   action; the visible text label is hidden). */
-@media (max-width: 480px) {
-  .perf-nav-button__label,
-  .sidebar-header-action__label {
-    display: none;
-  }
-}
+/* (The transitional "Performance moved to Diagnostics" settings-sidebar row and
+   its `.settings-perf-moved*` rules were removed in the #1131 iteration: the
+   redirect link is no longer offered. The "performance" deep link is still
+   intercepted in attendants and routed to the Diagnostics drawer.) */
 
 /* Inline "your upload" / "from N peers" consequence beside each side title, so
    the meaning is legible without opening the "?" popover. */
@@ -7573,30 +7972,19 @@ html[data-theme="light"] .settings-divider {
   border-bottom: 1px solid var(--border);
 }
 
-.perf-simulcast-strip__info {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 16px;
-  height: 16px;
-  font-size: 12px;
-  line-height: 1;
-  color: var(--text-secondary);
-  cursor: help;
-}
-
-.perf-simulcast-strip__info:focus-visible {
-  outline: 2px solid var(--focus-ring);
-  outline-offset: 2px;
-  border-radius: var(--radius-pill);
-}
+/* (`.perf-simulcast-strip__info` — the decorative `ⓘ` glyph — was removed in
+   #1131 review F2: it duplicated the strip's `(i)` HelpPopover. The simulcast
+   framing it held now rides the strip text span's title/aria; the full per-layer
+   detail lives in the "Simulcast layers" section.) */
 
 /* ── Per-kind cards (Video / Audio / Content), each split Send | Receive
    (#1095 redesign). A card is a glass surface; its two columns share the
    `.perf-card-cols` grid that collapses to one column on narrow widths. ── */
 .perf-kind-card {
-  /* No vertical margin: the parent `.settings-section` flex `gap` already spaces
-     the cards; a margin here would double-space (#2a). */
+  /* Base: no vertical margin. The drawer adds explicit inter-card spacing via the
+     `#diagnostics-sidebar` rule below (the `.sidebar-content` is a plain padded
+     block, NOT a flex container with a `gap`, so the cards would otherwise render
+     flush — #1131 review F4). */
   padding: 10px 14px;
   background: var(--surface-elevated);
   border: 1px solid var(--border);
@@ -7606,6 +7994,11 @@ html[data-theme="light"] .settings-divider {
   container-type: inline-size;
 }
 
+/* Drawer-scoped spacing for the migrated Performance controls: the strip + the
+   three per-kind cards are now spaced by `.sidebar-content`'s flex `gap`
+   (iteration 3 polish), so their explicit drawer bottom-margins were removed
+   here — flex gap + child margins are additive. */
+
 .perf-kind-card__title {
   font-size: 14px;
   font-weight: 600;
@@ -7614,8 +8007,11 @@ html[data-theme="light"] .settings-divider {
 }
 
 /* Two side-by-side columns (Send | Receive). Collapses to one column below the
-   card-width threshold (Send on top). `@container` first, with an `@media`
-   fallback for engines without container-query support. */
+   card-width threshold (Send on top), driven PURELY by the card's own width via
+   the `@container` query — the redundant viewport `@media (max-width: 639px)`
+   collapse was dropped in issue 1131 so the columns track the card (now in the wider
+   720px drawer), not the viewport. `.perf-kind-card` sets `container-type:
+   inline-size`, so this resolves correctly. */
 .perf-card-cols {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -7623,12 +8019,6 @@ html[data-theme="light"] .settings-divider {
 }
 
 @container (max-width: 560px) {
-  .perf-card-cols {
-    grid-template-columns: 1fr;
-  }
-}
-
-@media (max-width: 639px) {
   .perf-card-cols {
     grid-template-columns: 1fr;
   }
@@ -7987,28 +8377,36 @@ details.perf-peers[open] .perf-peers__chev {
   background: transparent;
 }
 
+/* `position: fixed` so the popover escapes the Diagnostics drawer's scroll-clip
+   on EVERY edge: `#diagnostics-sidebar { overflow-y: auto }` makes the box clip
+   both axes (CSS overflow propagation), and an `absolute` popover anchored to a
+   wrapper INSIDE that scroll box was clipped at the right border (horizontal) and
+   the bottom fold (vertical). IMPORTANT: the OPEN drawer carries a non-`none`
+   `transform` (`#diagnostics-sidebar.visible { transform: translateX(0) }`), which
+   makes the DRAWER — not the viewport — the containing block for this fixed
+   popover, AND scrolls it with the drawer. So the popover's inline `left/top` are
+   in the drawer's coordinate space, NOT viewport space. `use_help_popover_anchor`
+   computes the desired VIEWPORT position (clamp + flip ABOVE the button when there
+   isn't room below) and `reposition_help_popover` then maps it into this containing
+   block (subtract the offsetParent rect, add back its scrollTop) before writing
+   `left/top`, each open + on scroll(capture)/resize. The inline `left/top`
+   overrides the safe defaults below (off-screen-left until the first reposition
+   tick, so no flash at 0,0). `max-height` + `overflow:auto` keep a tall popover
+   usable on short viewports. (issue 1131 scroll-clip fix; containing-block mapping) */
 .perf-help-popover {
-  position: absolute;
+  position: fixed;
   z-index: 1001;
-  top: calc(100% + 8px);
-  left: 0;
+  left: -9999px;
+  top: 0;
   width: 260px;
-  /* Cap to the card's own width so the popover can't overhang the card / modal
-     edge (#8). `cqw` resolves against `.perf-kind-card` (container-type set). */
-  max-width: min(260px, 90cqw);
+  max-width: calc(100vw - 16px);
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
   padding: 12px 14px;
   background: var(--surface-overlay);
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-md);
-}
-
-/* Receive column is the RIGHT column: anchor its popover to the right edge so it
-   opens leftward into the card instead of overhanging the modal's right side
-   (#8). */
-.perf-side--recv .perf-help-popover {
-  left: auto;
-  right: 0;
 }
 
 .perf-help-popover-text {

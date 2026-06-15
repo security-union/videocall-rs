@@ -1,0 +1,79 @@
+name: CI Host Janitor (HCL)
+
+# Scheduled disk janitor for the self-hosted `hcl-ci` host (videocallci.fnxlabs.com).
+# Durable follow-up to the acute per-job /tmp sweep in PR #1250 and the one-time
+# manual reclaim on 2026-06-11 (issue #1251).
+#
+# Why this exists: the host hit 97% disk (483G/500G) and `cargo tests` began failing
+# with ENOSPC masquerading as a `linking with cc failed` error. The dominant hog was
+# /tmp = 178G, almost entirely ~1,941 leaked `org.chromium.Chromium.scoped_dir.*`
+# browser-profile temp dirs from Playwright/Chromium e2e jobs whose browser was killed
+# (OOM / timeout / "Target ... closed" crash) before Chromium could clean its scratch
+# profile. A per-job sweep (PR #1250) only fires when a PR runs; this scheduled janitor
+# bounds the leak independent of PR cadence.
+#
+# Safety: every reclaim has an age floor (>=24h) so it can NEVER touch a concurrent
+# runner's live browser profile (the longest e2e suite finishes well under an hour).
+# It does API-level docker pruning only and NEVER removes /var/lib/docker,
+# /var/lib/containerd (the live image store under the containerd snapshotter), or the
+# warm /var/lib/ci cargo target cache (deleting that just makes the next build slow).
+
+on:
+  schedule:
+    - cron: '0 9 * * *'  # Daily at 09:00 UTC (off-peak, after the 05:00 daily build)
+  workflow_dispatch:      # Allow manual trigger
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-host-janitor-hcl
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  janitor:
+    name: Reclaim /tmp + docker caches on hcl-ci host
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    steps:
+      - name: Disk usage before
+        run: |
+          echo "=== df -h / ==="
+          df -h / || true
+          echo "=== /tmp size ==="
+          du -sh /tmp 2>/dev/null || true
+          echo "=== leaked Chromium scoped dirs in /tmp ==="
+          find /tmp -maxdepth 1 -name 'org.chromium.Chromium.scoped_dir.*' -type d 2>/dev/null | wc -l
+
+      - name: Sweep leaked Chromium scoped dirs (>=24h old)
+        # The runner's own browser processes own these dirs, so no sudo is needed
+        # (sudo here would risk the silent password-prompt failure tracked in #1247).
+        # -mmin +1440 = older than 24h: never touches a live or recently-finished run.
+        run: |
+          find /tmp -maxdepth 1 -name 'org.chromium.Chromium.scoped_dir.*' -type d -mmin +1440 \
+            -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Sweep stale generic temp dirs (>=48h old)
+        run: |
+          find /tmp -maxdepth 1 -name '.tmp*' -mmin +2880 -exec rm -rf {} + 2>/dev/null || true
+
+      - name: Prune dangling docker images + build cache (API-level only)
+        # API-level prune ONLY. Do NOT rm /var/lib/docker or /var/lib/containerd — under
+        # the containerd snapshotter those are the live image store. Try without sudo
+        # first (runner is typically in the docker group); fall back to sudo, then no-op.
+        run: |
+          (docker image prune -f && docker builder prune -f) \
+            || (sudo docker image prune -f && sudo docker builder prune -f) \
+            || echo "docker prune unavailable (non-fatal)"
+
+      - name: Disk usage after
+        run: |
+          echo "=== df -h / ==="
+          df -h / || true
+          echo "=== /tmp size ==="
+          du -sh /tmp 2>/dev/null || true
+          echo "=== remaining Chromium scoped dirs in /tmp ==="
+          find /tmp -maxdepth 1 -name 'org.chromium.Chromium.scoped_dir.*' -type d 2>/dev/null | wc -l

@@ -65,15 +65,29 @@ async function gotoPreJoin(page: Page, meetingId: string) {
 }
 
 /**
- * Grant media access from the pre-join prompt. With
- * `--use-fake-ui-for-media-stream` the click auto-grants getUserMedia, the
- * permission prompt disappears, and the device selects populate. Returns once
- * the granted state is reflected in the DOM.
+ * Reach the granted state on the pre-join screen and return once it is
+ * reflected in the DOM.
+ *
+ * Since issue 1134 the pre-join screen AUTO-requests getUserMedia once on mount,
+ * and with `--use-fake-ui-for-media-stream` that request auto-grants — so the
+ * granted state (toggles + selects) typically appears WITHOUT any click and the
+ * permission prompt / Allow button clear on their own. This helper is therefore
+ * written to be path-agnostic: if the manual "Allow camera & mic" fallback
+ * button is still on screen (the auto-request hasn't resolved yet, or the
+ * browser blocked it), we click it; otherwise we just wait for the granted
+ * state the auto-request produced. Either way it returns once the toggles render.
  */
 async function grantMediaAccess(page: Page) {
   const allow = page.locator(PERMISSION_ALLOW);
-  await expect(allow).toBeVisible();
-  await allow.click();
+  // Click the manual fallback only if it is actually still present — the 1134
+  // auto-request may have already granted and removed it. A short visibility
+  // probe avoids racing the auto-grant: we don't hard-require the button.
+  if (await allow.isVisible().catch(() => false)) {
+    await allow.click().catch(() => {
+      // The auto-grant may have detached the button between the probe and the
+      // click; that is fine — the granted-state wait below is the real gate.
+    });
+  }
   // Prompt goes away once getUserMedia resolves and labels are populated.
   await expect(page.locator(PERMISSION_PROMPT)).toBeHidden({ timeout: 15_000 });
   // Toggles only render in the granted state.
@@ -118,14 +132,15 @@ test.describe("Pre-join device preview (#959)", () => {
     });
   });
 
-  test("permission prompt shows before grant and clears after granting", async ({ page }) => {
+  test("granted state renders with prompt cleared and selects labeled", async ({ page }) => {
     await gotoPreJoin(page, `e2e_prejoin_perm_${Date.now()}`);
 
-    // Before granting: prompt is visible, toggles/selects are not rendered yet.
-    await expect(page.locator(PERMISSION_PROMPT)).toBeVisible();
-    await expect(page.locator(CAMERA_TOGGLE)).toHaveCount(0);
-    await expect(page.locator(CAMERA_SELECT)).toHaveCount(0);
-
+    // NOTE: since issue 1134 the pre-join screen auto-requests getUserMedia on
+    // mount and the fake-UI Chromium auto-grants, so we deliberately do NOT
+    // assert the transient pre-grant prompt here — it can clear before the
+    // assertion runs and would flake. The dedicated auto-show / no-auto-join
+    // coverage lives in prejoin-auto-show-devices.spec.ts (issue 1134); this
+    // test just confirms the granted-state UI is correct once reached.
     await grantMediaAccess(page);
 
     // After granting: prompt gone, selects present and labeled.

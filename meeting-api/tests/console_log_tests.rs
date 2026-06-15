@@ -22,13 +22,16 @@
 mod test_helpers;
 
 use axum::body::Body;
-use axum::http::header::{ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, ORIGIN};
+use axum::http::header::{
+    ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, AUTHORIZATION, ORIGIN,
+};
 use axum::http::Method;
 use axum::http::StatusCode;
+use meeting_api::token::{generate_observer_token, generate_room_token};
 use serial_test::serial;
 use test_helpers::*;
 use tower::ServiceExt;
-use videocall_meeting_types::{responses::APIResponse, APIError};
+use videocall_meeting_types::{responses::APIResponse, APIError, GUEST_USER_ID_PREFIX};
 
 use meeting_api::routes::console_logs::MAX_BODY_SIZE;
 
@@ -40,6 +43,7 @@ const OUTSIDER_EMAIL: &str = "outsider@example.com";
 const QUOTA_GUEST_EMAIL: &str = "guest-quota@videocall.rs";
 const SESSION_TS: &str = "1700000000000";
 const LOG_BODY: &str = r#"{"ts":"2025-01-01T00:00:00Z","level":"log","msg":"test entry"}"#;
+const ROOM_TOKEN_TTL_SECS: i64 = 600;
 
 /// Set up env vars for the console log feature and create a temp directory for log storage.
 /// Returns the path to the temp directory.
@@ -131,81 +135,98 @@ fn console_log_request_with_seq(
     user_email: &str,
     chunk_seq: &str,
 ) -> axum::http::request::Builder {
-    request_with_cookie(
-        "POST",
-        &format!("/api/v1/meetings/{room_id}/console-logs"),
-        user_email,
-    )
-    .header("Content-Type", "text/plain")
-    .header("X-User-Id", user_email)
-    .header("X-Session-Timestamp", SESSION_TS)
-    .header("X-Chunk-Seq", chunk_seq)
+    let token = room_token(room_id, user_email);
+    console_log_request_with_token_and_seq(room_id, &token, chunk_seq)
 }
 
-// ── Test: admitted guest can upload console logs ────────────────────────────
+/// Build a console log upload request with a caller-supplied bearer token.
+fn console_log_request_with_token(room_id: &str, token: &str) -> axum::http::request::Builder {
+    console_log_request_with_token_and_seq(room_id, token, "1")
+}
+
+/// Build a console log upload request with a caller-supplied bearer token and chunk sequence.
+fn console_log_request_with_token_and_seq(
+    room_id: &str,
+    token: &str,
+    chunk_seq: &str,
+) -> axum::http::request::Builder {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/meetings/{room_id}/console-logs"))
+        .header("Content-Type", "text/plain")
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header("X-Session-Timestamp", SESSION_TS)
+        .header("X-Chunk-Seq", chunk_seq)
+}
+
+fn room_token(room_id: &str, user_email: &str) -> String {
+    generate_room_token(
+        TEST_JWT_SECRET,
+        ROOM_TOKEN_TTL_SECS,
+        user_email,
+        room_id,
+        false,
+        user_email,
+        true,
+        false,
+    )
+    .expect("room token should sign")
+}
+
+fn guest_room_token(room_id: &str, guest_id: &str) -> String {
+    generate_room_token(
+        TEST_JWT_SECRET,
+        ROOM_TOKEN_TTL_SECS,
+        guest_id,
+        room_id,
+        false,
+        "Guest User",
+        true,
+        true,
+    )
+    .expect("guest room token should sign")
+}
+
+fn observer_token(room_id: &str, user_email: &str) -> String {
+    generate_observer_token(TEST_JWT_SECRET, user_email, room_id, user_email, false)
+        .expect("observer token should sign")
+}
+
+fn console_log_request_with_non_numeric_session_ts(
+    room_id: &str,
+    token: &str,
+) -> axum::http::request::Builder {
+    axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/v1/meetings/{room_id}/console-logs"))
+        .header("Content-Type", "text/plain")
+        .header(AUTHORIZATION, format!("Bearer {token}"))
+        .header("X-Session-Timestamp", "not-a-number")
+}
+
+// ── Test: guest token sub with colon is rejected by path-safety validation ──
 
 #[tokio::test]
 #[serial]
-async fn test_guest_participant_can_upload_console_logs() {
+async fn test_guest_participant_console_log_upload_rejected_by_safe_user_id() {
     let pool = get_test_pool().await;
     let room_id = "test-clog-guest";
     let log_dir = enable_console_logs();
 
     setup_active_meeting(&pool, room_id).await;
-    guest_joins_waiting_room(&pool, room_id, GUEST_EMAIL).await;
-    host_admits_guest(&pool, room_id, GUEST_EMAIL).await;
+    let guest_id = format!("{GUEST_USER_ID_PREFIX}{}", uuid::Uuid::now_v7());
+    let token = guest_room_token(room_id, &guest_id);
 
-    // Upload console logs as admitted guest.
     let app = build_app(pool.clone());
-    let req = console_log_request(room_id, GUEST_EMAIL)
+    let req = console_log_request_with_token(room_id, &token)
         .body(Body::from(LOG_BODY))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "Admitted guest should be able to upload console logs"
-    );
-
-    // Verify a .log.gz file was written under the meeting's directory.
-    let meeting_dir = log_dir.join(room_id);
-    assert!(
-        meeting_dir.exists(),
-        "Meeting log directory should be created at {:?}",
-        meeting_dir
-    );
-
-    let mut found_log = false;
-    for entry in walkdir(&meeting_dir) {
-        let name = entry.file_name().unwrap().to_str().unwrap();
-        if name.ends_with(".log.gz") {
-            let compressed = std::fs::read(&entry).expect("read log file");
-            let mut decoder = flate2::read::GzDecoder::new(&compressed[..]);
-            let mut content = String::new();
-            std::io::Read::read_to_string(&mut decoder, &mut content).expect("decompress log file");
-            assert_eq!(
-                content, LOG_BODY,
-                "Decompressed log file content should match uploaded body"
-            );
-            assert!(
-                name.contains("guest-test@videocall.rs"),
-                "Filename should contain the user_id: {name}"
-            );
-            assert!(
-                name.contains(SESSION_TS),
-                "Filename should contain the session timestamp: {name}"
-            );
-            assert!(
-                name.ends_with("_00001.log.gz"),
-                "Filename should end with zero-padded chunk seq _00001.log.gz: {name}"
-            );
-            found_log = true;
-        }
-    }
-    assert!(
-        found_log,
-        "At least one .log.gz file should exist under the meeting directory"
+        StatusCode::BAD_REQUEST,
+        "Guest room-token subjects include ':' and are rejected by SAFE_USER_ID_RE"
     );
 
     cleanup_test_data(&pool, room_id).await;
@@ -220,11 +241,9 @@ async fn test_out_of_range_chunk_seq_falls_back_to_uuid_suffix() {
     let log_dir = enable_console_logs();
 
     setup_active_meeting(&pool, room_id).await;
-    guest_joins_waiting_room(&pool, room_id, GUEST_EMAIL).await;
-    host_admits_guest(&pool, room_id, GUEST_EMAIL).await;
 
     let app = build_app(pool.clone());
-    let req = console_log_request_with_seq(room_id, GUEST_EMAIL, "100000")
+    let req = console_log_request_with_seq(room_id, HOST_EMAIL, "100000")
         .body(Body::from(LOG_BODY))
         .unwrap();
 
@@ -300,11 +319,11 @@ async fn test_non_participant_rejected_from_console_log_upload() {
     disable_console_logs(&log_dir);
 }
 
-// ── Test: waiting-room participant CAN upload logs ─────────────────────────
+// ── Test: waiting-room observer token cannot upload logs ───────────────────
 
 #[tokio::test]
 #[serial]
-async fn test_waiting_participant_can_upload_console_logs() {
+async fn test_waiting_participant_observer_token_cannot_upload_console_logs() {
     let pool = get_test_pool().await;
     let room_id = "test-clog-waiting";
     let log_dir = enable_console_logs();
@@ -313,24 +332,17 @@ async fn test_waiting_participant_can_upload_console_logs() {
     // Guest joins but is NOT admitted — stays in "waiting" status.
     guest_joins_waiting_room(&pool, room_id, GUEST_EMAIL).await;
 
+    let token = observer_token(room_id, GUEST_EMAIL);
     let app = build_app(pool.clone());
-    let req = console_log_request(room_id, GUEST_EMAIL)
+    let req = console_log_request_with_token(room_id, &token)
         .body(Body::from(LOG_BODY))
         .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
         resp.status(),
-        StatusCode::OK,
-        "Waiting-room participant should be able to upload console logs — \
-         get_status returns any existing row regardless of status"
-    );
-
-    // Verify a log file was written.
-    let meeting_dir = log_dir.join(room_id);
-    assert!(
-        meeting_dir.exists(),
-        "Meeting log directory should be created for waiting participant upload"
+        StatusCode::UNAUTHORIZED,
+        "Observer tokens have room_join=false and cannot upload console logs"
     );
 
     cleanup_test_data(&pool, room_id).await;
@@ -350,11 +362,9 @@ async fn test_console_log_upload_disabled_returns_404() {
     std::env::remove_var("CONSOLE_LOG_DIR");
 
     setup_active_meeting(&pool, room_id).await;
-    guest_joins_waiting_room(&pool, room_id, GUEST_EMAIL).await;
-    host_admits_guest(&pool, room_id, GUEST_EMAIL).await;
 
     let app = build_app(pool.clone());
-    let req = console_log_request(room_id, GUEST_EMAIL)
+    let req = console_log_request(room_id, HOST_EMAIL)
         .body(Body::from(LOG_BODY))
         .unwrap();
 
@@ -385,7 +395,7 @@ async fn test_nonexistent_meeting_returns_404() {
     cleanup_test_data(&pool, room_id).await;
 
     let app = build_app(pool.clone());
-    let req = console_log_request(room_id, GUEST_EMAIL)
+    let req = console_log_request(room_id, HOST_EMAIL)
         .body(Body::from(LOG_BODY))
         .unwrap();
 
@@ -421,19 +431,13 @@ async fn test_jwt_identity_overrides_x_user_id_header() {
     guest_joins_waiting_room(&pool, room_id, GUEST_EMAIL).await;
     host_admits_guest(&pool, room_id, GUEST_EMAIL).await;
 
-    // Outsider is authenticated (JWT sub = OUTSIDER_EMAIL) but claims to be
+    // Outsider has a valid room token (sub = OUTSIDER_EMAIL) but claims to be
     // the guest via X-User-Id header.
     let app = build_app(pool.clone());
-    let req = request_with_cookie(
-        "POST",
-        &format!("/api/v1/meetings/{room_id}/console-logs"),
-        OUTSIDER_EMAIL, // JWT sub = outsider
-    )
-    .header("Content-Type", "text/plain")
-    .header("X-User-Id", GUEST_EMAIL) // claims to be the guest
-    .header("X-Session-Timestamp", SESSION_TS)
-    .body(Body::from(LOG_BODY))
-    .unwrap();
+    let req = console_log_request(room_id, OUTSIDER_EMAIL)
+        .header("X-User-Id", GUEST_EMAIL)
+        .body(Body::from(LOG_BODY))
+        .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
@@ -509,14 +513,12 @@ async fn test_oversized_body_rejected() {
     let log_dir = enable_console_logs();
 
     setup_active_meeting(&pool, room_id).await;
-    guest_joins_waiting_room(&pool, room_id, GUEST_EMAIL).await;
-    host_admits_guest(&pool, room_id, GUEST_EMAIL).await;
 
     // Send a body that exceeds MAX_BODY_SIZE (1 MB). The DefaultBodyLimit
     // layer on the route should reject it before the handler runs.
     let oversized = vec![b'x'; MAX_BODY_SIZE + 1];
     let app = build_app(pool.clone());
-    let req = console_log_request(room_id, GUEST_EMAIL)
+    let req = console_log_request(room_id, HOST_EMAIL)
         .body(Body::from(oversized))
         .unwrap();
 
@@ -541,17 +543,11 @@ async fn test_path_traversal_meeting_id_rejected() {
 
     // meeting_id containing dots is rejected by SAFE_MEETING_ID_RE.
     // No meeting setup needed — validate_id fails before the DB lookup.
+    let token = room_token("room..name", HOST_EMAIL);
     let app = build_app(pool.clone());
-    let req = request_with_cookie(
-        "POST",
-        "/api/v1/meetings/room..name/console-logs",
-        GUEST_EMAIL,
-    )
-    .header("Content-Type", "text/plain")
-    .header("X-User-Id", GUEST_EMAIL)
-    .header("X-Session-Timestamp", SESSION_TS)
-    .body(Body::from(LOG_BODY))
-    .unwrap();
+    let req = console_log_request_with_token("room..name", &token)
+        .body(Body::from(LOG_BODY))
+        .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
@@ -575,17 +571,11 @@ async fn test_non_numeric_session_timestamp_rejected() {
     let log_dir = enable_console_logs();
 
     // A non-numeric session timestamp is rejected before the DB lookup.
+    let token = room_token("valid-room", HOST_EMAIL);
     let app = build_app(pool.clone());
-    let req = request_with_cookie(
-        "POST",
-        "/api/v1/meetings/valid-room/console-logs",
-        GUEST_EMAIL,
-    )
-    .header("Content-Type", "text/plain")
-    .header("X-User-Id", GUEST_EMAIL)
-    .header("X-Session-Timestamp", "not-a-number")
-    .body(Body::from(LOG_BODY))
-    .unwrap();
+    let req = console_log_request_with_non_numeric_session_ts("valid-room", &token)
+        .body(Body::from(LOG_BODY))
+        .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(
@@ -614,7 +604,7 @@ async fn test_console_log_cors_preflight_allows_custom_headers() {
         .header("Access-Control-Request-Method", "POST")
         .header(
             ACCESS_CONTROL_REQUEST_HEADERS,
-            "x-user-id, x-session-timestamp, x-chunk-seq, content-type",
+            "authorization, x-session-timestamp, x-chunk-seq, content-type",
         )
         .body(Body::empty())
         .unwrap();
@@ -631,7 +621,7 @@ async fn test_console_log_cors_preflight_allows_custom_headers() {
         .to_lowercase();
 
     for expected in [
-        "x-user-id",
+        "authorization",
         "x-session-timestamp",
         "x-chunk-seq",
         "content-type",

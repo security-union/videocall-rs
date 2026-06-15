@@ -24,7 +24,8 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::{
-    classify_packet, KeyframeRequestLimiter, KeyframeTarget, PacketKind,
+    classify_packet, outbound_keyframe_observation, KeyframeRequestLimiter, KeyframeTarget,
+    PacketKind,
 };
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
@@ -39,14 +40,11 @@ use crate::server_diagnostics::{
 };
 use crate::session_manager::SessionManager;
 use actix::Addr;
-use protobuf::Message as ProtobufMessage;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
-use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
-use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub type SessionId = u64;
 pub type RoomId = String;
@@ -84,31 +82,49 @@ struct SenderDropState {
     drop_count: u32,
     /// Start of the current counting window.
     window_start: Instant,
-    /// Last time a CONGESTION notification was sent for this sender.
+    /// Last time this sender crossed the drop threshold (i.e. `record_drop`
+    /// returned `Some`). Used only to rate-limit threshold crossings; since
+    /// #1219 no CONGESTION notification is emitted on a crossing.
     last_notify: Option<Instant>,
 }
 
-/// Tracks outbound packet drops per sender and generates CONGESTION feedback
-/// when the drop rate exceeds the configured threshold.
+/// Tracks outbound packet drops per sender for this receiver's downlink.
 ///
 /// Each receiver session has its own `CongestionTracker`. When the receiver's
 /// outbound channel is full, the transport layer calls
-/// [`CongestionTracker::record_drop`] with the sender's session ID. If enough
-/// drops accumulate within the configured window, a CONGESTION `PacketWrapper`
-/// is generated for publication to NATS so the sender can step down its
-/// quality tier.
+/// [`CongestionTracker::record_drop`] with the sender's session ID. When enough
+/// drops accumulate within the configured window the tracker records that this
+/// receiver is *actively congested* (see `last_congestion` /
+/// [`CongestionTracker::is_actively_congested`]), which relaxes the
+/// KEYFRAME_REQUEST rate limiter so a frozen receiver can recover (#979).
+///
+/// As of #1219 (Half 1) crossing the threshold no longer authors a sender-keyed
+/// CONGESTION `PacketWrapper`: a single slow receiver's full downlink is a
+/// per-receiver problem and must not collapse the publisher's encode for the
+/// whole room. The publisher's own uplink distress is detected client-side
+/// instead (see [`SessionLogic::on_outbound_drop`]).
 pub struct CongestionTracker {
     /// Drop state keyed by sender session ID.
     senders: HashMap<u64, SenderDropState>,
     /// Total drops since the last stale-entry cleanup. Cleanup runs every
     /// [`CLEANUP_INTERVAL`] drops to amortize the cost of `retain()`.
     total_drops: u32,
+    /// Value of [`total_drops`](Self::total_drops) the last time the #1320
+    /// cap-pressure forced sweep ran. Gates that sweep to the same amortized
+    /// [`CLEANUP_INTERVAL`] cadence as the unconditional cleanup so that under a
+    /// sustained flood of distinct new `sender_session_id`s on an already-full
+    /// receiver we do NOT run an O(n) `retain()` on every dropped packet (#1349).
+    last_forced_sweep_drops: u32,
     /// Most recent instant at which this receiver crossed the drop threshold
-    /// for *any* sender (i.e. a CONGESTION notification was emitted). Used by
-    /// [`CongestionTracker::is_actively_congested`] to relax the
-    /// KEYFRAME_REQUEST rate limiter so a frozen receiver can recover
-    /// (issue #979).
+    /// for *any* sender. Used by [`CongestionTracker::is_actively_congested`]
+    /// to relax the KEYFRAME_REQUEST rate limiter so a frozen receiver can
+    /// recover (issue #979).
     last_congestion: Option<Instant>,
+    /// Test-only count of how many times the #1320 cap-pressure forced sweep was
+    /// actually invoked. Lets the #1349 gating test assert the sweep does NOT run
+    /// on every at-cap drop without depending on internal eviction side effects.
+    #[cfg(test)]
+    forced_sweep_count: u32,
 }
 
 impl Default for CongestionTracker {
@@ -121,35 +137,114 @@ impl Default for CongestionTracker {
 /// O(n) `retain()` cost so it does not run on every single drop.
 const CLEANUP_INTERVAL: u32 = 100;
 
+/// Hard upper bound on the number of distinct senders tracked per receiver
+/// (issue #1320). The amortized time-based cleanup runs only every
+/// [`CLEANUP_INTERVAL`] drops, so between passes the map could accumulate one
+/// entry per distinct `sender_session_id` seen — a memory-amplification vector
+/// in the SAME client-forgeable trust class as #1303. The key is the outer
+/// `PacketWrapper.session_id` of the forwarded media packet (see
+/// `on_outbound_drop`); ingress only stamps it when the client sends 0
+/// (`chat_server::handle_msg`), so a non-zero value is publisher-controlled and
+/// fanned out unchanged — a malicious publisher can stamp a distinct id on each
+/// of its own packets and mint a fresh entry per dropped packet on any
+/// saturated receiver (no join/leave churn needed). This cap makes key fidelity
+/// irrelevant: it is ~5–10× the largest realistic room (≈13× a 20-user room),
+/// so it never constrains legitimate traffic and only backstops the abuse case.
+/// At ~40 bytes per [`SenderDropState`], 256 entries is ~10 KB per receiver.
+const MAX_TRACKED_SENDERS: usize = 256;
+
 impl CongestionTracker {
     pub fn new() -> Self {
         Self {
             senders: HashMap::new(),
             total_drops: 0,
+            last_forced_sweep_drops: 0,
             last_congestion: None,
+            #[cfg(test)]
+            forced_sweep_count: 0,
         }
+    }
+
+    /// Remove sender entries idle longer than `CONGESTION_WINDOW * 10` (10s of
+    /// no recorded drops). Shared by the amortized cleanup and the #1320
+    /// cap-pressure sweep.
+    fn evict_stale_senders(&mut self, now: Instant) {
+        let stale_threshold = CONGESTION_WINDOW * 10;
+        self.senders
+            .retain(|_, state| now.duration_since(state.window_start) <= stale_threshold);
     }
 
     /// Record a dropped outbound packet from the given sender.
     ///
-    /// Returns `Some(sender_session_id)` when the drop threshold has been
-    /// exceeded and a CONGESTION notification should be sent. Returns `None`
-    /// if the threshold has not been met or the notification is rate-limited.
+    /// Returns `Some(sender_session_id)` when the drop threshold has just been
+    /// crossed (rate-limited per sender), otherwise `None`. Since #1219 the
+    /// `Some` arm no longer drives a CONGESTION emit; crossing the threshold
+    /// updates `last_congestion` so [`CongestionTracker::is_actively_congested`]
+    /// can relax the KEYFRAME_REQUEST limiter (#979).
     ///
     /// Performs amortized cleanup of stale entries every [`CLEANUP_INTERVAL`]
     /// drops: any sender whose `window_start` is older than
     /// `CONGESTION_WINDOW * 10` (10 seconds of inactivity) is removed. This
     /// prevents unbounded growth when transient participants leave while
-    /// avoiding an O(n) `retain()` on every single drop.
+    /// avoiding an O(n) `retain()` on every single drop. As a defense-in-depth
+    /// backstop the map is ALSO hard-capped at [`MAX_TRACKED_SENDERS`] (#1320):
+    /// at the cap a NEW sender is refused so the map cannot grow unbounded
+    /// between amortized passes. The cap-pressure reclaim sweep is itself gated
+    /// to the [`CLEANUP_INTERVAL`] cadence (#1349) so a flood of distinct new
+    /// senders against a saturated receiver stays O(1) per drop rather than
+    /// triggering a full `retain()` on each packet.
     pub fn record_drop(&mut self, sender_session_id: u64) -> Option<u64> {
         let now = Instant::now();
 
         // Amortized cleanup of stale sender entries.
         self.total_drops = self.total_drops.wrapping_add(1);
         if self.total_drops.is_multiple_of(CLEANUP_INTERVAL) {
-            let stale_threshold = CONGESTION_WINDOW * 10;
-            self.senders
-                .retain(|_, state| now.duration_since(state.window_start) <= stale_threshold);
+            self.evict_stale_senders(now);
+        }
+
+        // #1320: hard entry-count bound as defense-in-depth on top of the
+        // amortized time-based cleanup above. If we are at the cap and this is a
+        // NEW sender, try once to reclaim space, then either admit (if room was
+        // freed) or skip tracking this drop rather than grow the map unbounded.
+        // An ALREADY-tracked sender is never refused (its window/notify state and
+        // the #979 keyframe-relax path it feeds are untouched). Refusing a brand
+        // new sender only when the cap is genuinely full is harmless: at that
+        // point this receiver is already tracking MAX_TRACKED_SENDERS congested
+        // sources, `last_congestion` is already being driven, and
+        // `is_actively_congested()` already returns true — so the dropped
+        // tracking for one more sender costs nothing the relax path needs.
+        //
+        // #1349: the reclaim sweep is GATED to the same amortized CLEANUP_INTERVAL
+        // cadence as the unconditional cleanup above, keyed off `total_drops`.
+        // `sender_session_id` is the publisher-controlled outer
+        // `PacketWrapper.session_id` (see the MAX_TRACKED_SENDERS doc), so a
+        // malicious publisher can present a distinct NEW id on every dropped
+        // packet to a saturated receiver. Without the gate that adversarial path
+        // would run a full O(<=MAX_TRACKED_SENDERS) `retain()` PER PACKET — a
+        // self-inflicted O(n)-per-drop on exactly the case the cap backstops.
+        // Gating makes the steady-state at-cap drop O(1): the sweep runs at most
+        // once per CLEANUP_INTERVAL drops, and between sweeps an over-cap new
+        // sender is simply refused. The memory bound is unaffected — the map only
+        // ever grows when a sweep has actually freed a slot, never on the
+        // gated-off path.
+        if self.senders.len() >= MAX_TRACKED_SENDERS
+            && !self.senders.contains_key(&sender_session_id)
+        {
+            let due_for_sweep =
+                self.total_drops.wrapping_sub(self.last_forced_sweep_drops) >= CLEANUP_INTERVAL;
+            if due_for_sweep {
+                self.last_forced_sweep_drops = self.total_drops;
+                #[cfg(test)]
+                {
+                    self.forced_sweep_count += 1;
+                }
+                self.evict_stale_senders(now);
+            }
+            if self.senders.len() >= MAX_TRACKED_SENDERS
+                && !self.senders.contains_key(&sender_session_id)
+            {
+                return None;
+            }
         }
 
         let state = self
@@ -234,7 +329,8 @@ pub struct SessionLogic {
     pub is_host: bool,
     /// Whether the meeting should end when the host leaves.
     pub end_on_host_leave: bool,
-    /// Tracks outbound packet drops per sender to generate CONGESTION feedback.
+    /// Tracks this receiver's outbound packet drops per sender; feeds the
+    /// #979 keyframe-relax path (no longer a CONGESTION emit, see #1219).
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
     pub keyframe_limiter: KeyframeRequestLimiter,
@@ -411,24 +507,16 @@ impl SessionLogic {
         // `(room, transport, session_id, kind)` tuple the moment this session
         // disconnects keeps the live series count bounded to active sessions.
         //
-        // LEAK-PROOF (issue #1090): we iterate the FULL fixed `kind` taxonomy
-        // [`crate::metrics::RELAY_DROP_KINDS`] UNCONDITIONALLY rather than a
-        // per-session "kinds I emitted" tracking set. `remove_label_values` on a
-        // `(…, kind)` tuple that was never created returns a benign `Err`, so
-        // the discarded result is intentional. This removes the dependency on
-        // tracking-set completeness: even if a future drop site introduces a new
-        // `kind`, adding it to `RELAY_DROP_KINDS` (the single source of truth the
-        // emit sites are documented against) keeps cleanup exhaustive — there is
-        // no second bookkeeping structure that could silently fall out of sync.
+        // LEAK-PROOF (issue #1090): `forget_session_drops` iterates the FULL fixed
+        // `kind` taxonomy [`crate::metrics::RELAY_DROP_KINDS`] UNCONDITIONALLY
+        // rather than a per-session "kinds I emitted" tracking set, so a session
+        // that only ever incremented a subset of kinds is still fully cleaned.
+        // The sweep lives in `metrics` as the single source of truth so the #1090
+        // GC test pins this exact code path rather than an inline copy of it
+        // (issue #1186): reverting this to a per-session subset would fail that
+        // test.
         let session_id = self.id.to_string();
-        for kind in crate::metrics::RELAY_DROP_KINDS {
-            let _ = crate::metrics::RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
-                &self.room,
-                &self.transport,
-                &session_id,
-                kind,
-            ]);
-        }
+        crate::metrics::forget_session_drops(&self.room, &self.transport, &session_id);
         send_connection_ended(&self.tracker_sender, self.id);
         self.addr.do_send(Disconnect {
             session: self.id,
@@ -494,6 +582,7 @@ impl SessionLogic {
                 target_user_id,
                 target_session_id,
                 layer,
+                kind,
             } => {
                 if self.observer {
                     return InboundAction::Processed;
@@ -521,9 +610,18 @@ impl SessionLogic {
                 // one identity), else fall back to the target user_id (older
                 // clients). `KeyframeTarget::from_request` encodes that choice.
                 let target = KeyframeTarget::from_request(&target_user_id, target_session_id);
+                // #1297: `kind` (derived from the inner request bytes in
+                // `classify_packet`) splits VIDEO and SCREEN into separate
+                // rate-limit buckets so SCREEN recovery is not starved by VIDEO
+                // requests in the same second. The delivery-aware relaxation
+                // inside `allow_with_congestion` lets a still-frozen receiver on
+                // a lossless WS path re-request even when the strict budget is
+                // exhausted (the `congested` path cannot fire on a lossless
+                // link); `handle_outbound` clears that waiting flag when the
+                // matching media is actually delivered.
                 if !self
                     .keyframe_limiter
-                    .allow_with_congestion(target, layer, congested)
+                    .allow_with_congestion(target, kind, layer, congested)
                 {
                     warn!(
                         "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting user {} session {}",
@@ -554,12 +652,49 @@ impl SessionLogic {
     /// Handle an outbound message from ChatServer (to be sent to client).
     ///
     /// Returns the bytes to send and tracks metrics.
-    pub fn handle_outbound(&self, msg: &Message) -> Vec<u8> {
+    ///
+    /// #1297: this is also the DELIVERY-OBSERVATION point for the keyframe
+    /// limiter. Every forwarded frame this receiver is about to be sent is the
+    /// delivery side of the keyframe-request/keyframe-delivery loop. When the
+    /// frame is a MEDIA VIDEO/SCREEN packet, we clear THIS receiver's
+    /// still-waiting flag for that `(publisher, kind)` bucket so the strict
+    /// per-pair budget re-engages on its next request (a receiver that keeps
+    /// requesting after recovery is throttled again). This runs for BOTH
+    /// transports because both `WsChatSession` and `WtChatSession` route every
+    /// outbound frame through here. It is `&mut self` purely so the observation
+    /// can mutate `self.keyframe_limiter` — the SAME limiter instance the
+    /// inbound KEYFRAME_REQUEST arm reads, so request-set and delivery-clear act
+    /// on one map.
+    ///
+    /// DELIVERY semantics (honest contract): like the `RELAY_ROOM_BYTES_TOTAL`
+    /// "outbound" accounting above, this hook runs when a frame is HANDED to the
+    /// transport — BEFORE the per-transport priority-drop / channel-full check
+    /// (both callers invoke `handle_outbound` first). So a keyframe that is
+    /// subsequently priority-dropped under outbound-channel saturation still
+    /// clears the wait. That imprecision is benign: a drop here means the
+    /// receiver's outbound channel is SATURATED, which fires `on_outbound_drop`
+    /// → the receiver is then flagged congested, so the #979 congested
+    /// relaxation (not the delivery-aware path) covers its next recovery
+    /// request. On the healthy, unsaturated path #1297 targets — the common
+    /// all-WS deployment — the frame IS delivered and clearing the wait is
+    /// correct.
+    pub fn handle_outbound(&mut self, msg: &Message) -> Vec<u8> {
         RELAY_ROOM_BYTES_TOTAL
             .with_label_values(&[&self.room, "outbound"])
             .inc_by(msg.msg.len() as f64);
         let data_tracker = DataTracker::new(self.tracker_sender.clone());
         data_tracker.track_sent(self.id, msg.msg.len() as u64);
+
+        // #1297 delivery observation: cheap partial decode (no `data` copy —
+        // see `outbound_keyframe_observation`). Only MEDIA VIDEO/SCREEN frames
+        // return Some; everything else (the bulk of traffic) is a no-op here.
+        // Observers never request keyframes, so skip the work for them.
+        if !self.observer {
+            if let Some((target, kind)) = outbound_keyframe_observation(&msg.msg) {
+                self.keyframe_limiter.observe_delivery(target, kind);
+            }
+        }
+
         // `msg.msg` is a shared `bytes::Bytes` (#1063): the single NATS payload
         // allocation is refcounted across all fan-out receivers. The
         // per-transport outbound channel (`Sender<Vec<u8>>` for WS, or
@@ -574,48 +709,71 @@ impl SessionLogic {
     // =========================================================================
 
     /// Record that an outbound packet from `sender_session_id` was dropped
-    /// because the outbound channel to this receiver was full.
+    /// because the outbound channel to THIS receiver was full.
     ///
-    /// If the drop threshold is exceeded, a CONGESTION `PacketWrapper` is
-    /// published to NATS so the sender's client can step down its quality
-    /// tier. The notification is rate-limited per sender session.
+    /// ## #1219 (Half 1) — this no longer emits a sender-keyed CONGESTION signal
+    ///
+    /// This callback fires ONLY on receiver-DOWNLINK overflow: every caller
+    /// (`ws_chat_session.rs` and `wt_chat_session.rs`, both the priority-drop
+    /// preempt and the real channel-full branch) invokes it when the bounded
+    /// outbound channel to this ONE receiver is saturated. There is NO
+    /// server-side caller that fires for a publisher's OWN uplink distress.
+    ///
+    /// Historically this published a CONGESTION `PacketWrapper` keyed to the
+    /// SENDER's session (subject `room.{room}.{sender_sid}`), which drove the
+    /// publisher's client-side `force_congestion_cut` — the HARD 2-tier global
+    /// encoder collapse (#702) for the WHOLE room. For a broadcast relay (NOT
+    /// an SFU) that is the wrong response: a single slow receiver's full
+    /// downlink channel is a per-RECEIVER problem and must never collapse the
+    /// stream that every OTHER receiver is happily getting. Field evidence
+    /// (#1217) showed 338–510 cuts/publisher, pinning publishers at 400kbps
+    /// 166–273×, caused by exactly this path.
+    ///
+    /// The publisher's OWN uplink distress is instead detected entirely
+    /// CLIENT-SIDE, by THREE complementary compensating signals in the
+    /// encoders (`camera_encoder.rs` / `screen_encoder.rs`), each feeding the
+    /// gentle single-rung `force_video_step_down` via
+    /// `videocall_aq::constants::evaluate_self_congestion`:
+    ///   1. WS: browser TCP send-buffer (`bufferedAmount`) drops via
+    ///      `websocket::websocket_drop_count()` (#1178).
+    ///   2. WT teardown: `webtransport::unistream_drop_count()` — increments
+    ///      only on stream/connection TEARDOWN (STOP_SENDING / RESET_STREAM /
+    ///      close), so it stays FLAT on a slow-but-alive uplink cliff (#1178).
+    ///   3. WT saturation: `webtransport::unistream_ready_stall_count()` —
+    ///      increments when `writer.ready().await` blocks past
+    ///      `READY_STALL_THRESHOLD_MS` (250ms), gated by the videocall-aq
+    ///      `WT_SATURATION_STALL_THRESHOLD` / `WT_SATURATION_WINDOW_MS`
+    ///      constants. This is the ACTUAL WT bandwidth-cliff detector (#1219
+    ///      prerequisite): signal #2 alone could never self-shed a saturated
+    ///      WT uplink. This relay path is deliberately SUBTRACTED in favour of
+    ///      those three.
+    ///
+    /// HALF-1 SCOPE / KNOWN GAP: this is the subtraction only. The
+    /// receiver-scoped downlink-relief signal (the replacement that lets a
+    /// slow receiver shed to a lower simulcast layer for ITSELF without
+    /// touching the publisher's encode) is "Half 2", deferred — its consumer
+    /// is the already-merged #1179 client chooser. Until Half 2 lands, a slow
+    /// receiver's tile may freeze or degrade. That is ACCEPTABLE and strictly
+    /// better than a room-wide collapse: only the congested receiver is
+    /// affected, not every participant.
+    ///
+    /// We STILL call [`CongestionTracker::record_drop`] (and ignore its return
+    /// value) because that is what updates `last_congestion`, which
+    /// [`CongestionTracker::is_actively_congested`] reads to RELAX the
+    /// KEYFRAME_REQUEST rate limiter (#979) so a congested receiver can recover
+    /// its own frozen video faster. That is a per-receiver downlink response
+    /// and is correct to keep; only the sender-keyed CONGESTION emit is removed.
     pub fn on_outbound_drop(&mut self, sender_session_id: u64, sender_user_id: &[u8]) {
         if let Some(sender_sid) = self.congestion_tracker.record_drop(sender_session_id) {
+            // #1219 (Half 1): intentionally do NOT publish a sender-keyed
+            // CONGESTION signal here. See the doc comment above. `record_drop`
+            // still ran (updating `last_congestion` for the #979 keyframe-relax
+            // path); we only log for observability and drop the signal.
             warn!(
-                "Congestion: session {} dropping packets from sender {} (user: {}), sending CONGESTION signal",
+                "Receiver-downlink overflow: session {} dropping packets from sender {} (user: {}); \
+                 CONGESTION cut SUPPRESSED (#1219 Half 1 — per-receiver downlink, not publisher uplink)",
                 self.id, sender_sid, String::from_utf8_lossy(sender_user_id),
             );
-
-            // Build a CONGESTION PacketWrapper targeted at the sender.
-            // `user_id`: receiver's identity (for sender-side logging).
-            // `data`: sender's user_id (for observability on client side).
-            // `session_id`: sender's session_id — the client matches this
-            //               against its session_id history (all IDs from the
-            //               current page load) to survive reconnects while
-            //               correctly scoping to a single tab/instance.
-            let congestion_packet = PacketWrapper {
-                packet_type: PacketType::CONGESTION.into(),
-                user_id: self.user_id.as_bytes().to_vec(),
-                data: sender_user_id.to_vec(),
-                session_id: sender_sid,
-                ..Default::default()
-            };
-
-            match congestion_packet.write_to_bytes() {
-                Ok(bytes) => {
-                    let subject = format!("room.{}.{}", self.room.replace(' ', "_"), sender_sid);
-                    let nc = self.nats_client.clone();
-                    let bytes = bytes::Bytes::from(bytes);
-                    tokio::spawn(async move {
-                        if let Err(e) = nc.publish(subject, bytes).await {
-                            error!("Failed to publish CONGESTION signal: {}", e);
-                        }
-                    });
-                }
-                Err(e) => {
-                    error!("Failed to serialize CONGESTION packet: {}", e);
-                }
-            }
         }
     }
 }
@@ -695,6 +853,122 @@ mod tests {
         assert!(tracker.senders.contains_key(&200));
     }
 
+    /// #1320: the senders map must be hard-bounded at MAX_TRACKED_SENDERS. A NEW
+    /// sender beyond the cap (with no stale entries to evict) is refused so the
+    /// map cannot grow unbounded; an ALREADY-tracked sender is never refused.
+    ///
+    /// Mutation coverage: removing the cap gate inserts `over_cap_sender`, growing
+    /// the map to MAX+1 and failing the size/containment asserts. Dropping the
+    /// `!contains_key` term (refusing existing senders too) makes the established
+    /// sender's threshold-crossing return `None`, failing the final assert.
+    #[test]
+    fn test_congestion_tracker_bounds_senders_map_at_cap() {
+        let mut tracker = CongestionTracker::new();
+        let now = Instant::now();
+
+        // Fill to the cap with FRESH (non-stale) entries so the stale sweep
+        // cannot make room.
+        for id in 0..MAX_TRACKED_SENDERS as u64 {
+            tracker.senders.insert(
+                id,
+                SenderDropState {
+                    drop_count: 0,
+                    window_start: now,
+                    last_notify: None,
+                },
+            );
+        }
+        assert_eq!(tracker.senders.len(), MAX_TRACKED_SENDERS);
+
+        // A NEW sender beyond the cap must be REFUSED: no growth, returns None.
+        let over_cap_sender = MAX_TRACKED_SENDERS as u64 + 1;
+        assert_eq!(
+            tracker.record_drop(over_cap_sender),
+            None,
+            "a new sender at the cap must not be admitted"
+        );
+        assert!(
+            !tracker.senders.contains_key(&over_cap_sender),
+            "the over-cap sender must not be inserted"
+        );
+        assert_eq!(
+            tracker.senders.len(),
+            MAX_TRACKED_SENDERS,
+            "the map must not grow past MAX_TRACKED_SENDERS"
+        );
+
+        // An ALREADY-tracked sender is still recorded at the cap (never refused):
+        // prove the drop lands by crossing the congestion threshold.
+        let established = 0u64;
+        tracker.senders.get_mut(&established).unwrap().drop_count = CONGESTION_DROP_THRESHOLD - 1;
+        assert_eq!(
+            tracker.record_drop(established),
+            Some(established),
+            "an already-tracked sender must keep being recorded at the cap"
+        );
+        assert_eq!(tracker.senders.len(), MAX_TRACKED_SENDERS);
+    }
+
+    /// #1349: the cap-pressure forced sweep must NOT run on every at-cap drop.
+    /// Under a flood of distinct NEW (publisher-forgeable) `sender_session_id`s
+    /// against an already-full receiver, the forced `retain()` is gated to the
+    /// amortized `CLEANUP_INTERVAL` cadence so the steady-state at-cap drop is
+    /// O(1) — never an O(n) sweep per packet.
+    ///
+    /// Mutation coverage: if the `due_for_sweep` gate is removed (sweep runs
+    /// unconditionally, the pre-#1349 behavior), `forced_sweep_count` would equal
+    /// the number of at-cap new-sender drops and the `<= 1` assert below fails.
+    /// The map-bound asserts also pin the #1320 invariant the gate must preserve.
+    #[test]
+    fn test_congestion_tracker_forced_sweep_gated_at_cap() {
+        let mut tracker = CongestionTracker::new();
+        let now = Instant::now();
+
+        // Fill to the cap with FRESH (non-stale) entries so the stale sweep can
+        // never reclaim a slot: every new sender below is genuinely refused.
+        for id in 0..MAX_TRACKED_SENDERS as u64 {
+            tracker.senders.insert(
+                id,
+                SenderDropState {
+                    drop_count: 0,
+                    window_start: now,
+                    last_notify: None,
+                },
+            );
+        }
+        assert_eq!(tracker.senders.len(), MAX_TRACKED_SENDERS);
+        assert_eq!(tracker.forced_sweep_count, 0);
+
+        // Flood the saturated receiver with a burst of DISTINCT new senders that
+        // stays strictly below CLEANUP_INTERVAL. With the #1349 gate the forced
+        // sweep fires at most once across the whole burst; without it (sweep per
+        // packet) it would fire `burst` times.
+        let burst = CLEANUP_INTERVAL - 1;
+        let base = MAX_TRACKED_SENDERS as u64;
+        for i in 0..burst as u64 {
+            assert_eq!(
+                tracker.record_drop(base + i),
+                None,
+                "an over-cap new sender must always be refused"
+            );
+        }
+
+        assert!(
+            tracker.forced_sweep_count <= 1,
+            "forced sweep ran {} times over {} at-cap drops; it must be gated to \
+             the CLEANUP_INTERVAL cadence (<= 1), not run per packet",
+            tracker.forced_sweep_count,
+            burst
+        );
+        // The bound the gate must preserve: the map never grew past the cap and
+        // no over-cap sender was admitted.
+        assert_eq!(
+            tracker.senders.len(),
+            MAX_TRACKED_SENDERS,
+            "the map must remain bounded at MAX_TRACKED_SENDERS under flood"
+        );
+    }
+
     // =====================================================================
     // Active-congestion flag for relaxed keyframe budget (issue #979)
     // =====================================================================
@@ -719,12 +993,13 @@ mod tests {
     #[test]
     fn test_is_actively_congested_true_after_threshold_cross() {
         let mut tracker = CongestionTracker::new();
-        // Cross the threshold so a CONGESTION notification fires.
-        let mut notified = false;
+        // Cross the threshold so `record_drop` returns `Some` (threshold
+        // crossing). Since #1219 this no longer emits a notification.
+        let mut crossed = false;
         for _ in 0..CONGESTION_DROP_THRESHOLD {
-            notified |= tracker.record_drop(1).is_some();
+            crossed |= tracker.record_drop(1).is_some();
         }
-        assert!(notified, "threshold cross must emit a notification");
+        assert!(crossed, "threshold cross must return Some");
         assert!(
             tracker.is_actively_congested(),
             "tracker must report active congestion right after a threshold cross"
@@ -1050,5 +1325,121 @@ mod tests {
         assert!(SessionLogic::should_activate_on_action(
             &InboundAction::KeepAlive
         ));
+    }
+
+    // =====================================================================
+    // #1219 — receiver-downlink overflow must NOT emit sender-keyed CONGESTION
+    // =====================================================================
+    //
+    // These tests need NATS (they subscribe to the sender's self-subject to
+    // prove no CONGESTION is published). They are `#[serial]` + `#[actix_rt::test]`
+    // to match the other NATS-backed tests in this crate.
+
+    /// Build a `SessionLogic` for a receiver in `room` over `nats_client`.
+    /// (Test helper — mirrors the construction in `chat_server.rs` tests but
+    /// needs no DB pool.)
+    #[cfg(test)]
+    async fn build_test_receiver_logic(
+        nats_client: async_nats::client::Client,
+        room: &str,
+    ) -> SessionLogic {
+        use crate::actors::chat_server::ChatServer;
+        use crate::server_diagnostics::{TrackerMessage, TrackerSender};
+        use actix::Actor;
+        use tokio::sync::mpsc;
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let (tx, _rx) = mpsc::unbounded_channel::<TrackerMessage>();
+        let tracker_sender: TrackerSender = tx;
+        SessionLogic::new(
+            chat_server,
+            room.to_string(),
+            "receiver-user".to_string(),
+            "receiver-user".to_string(),
+            false,
+            nats_client,
+            tracker_sender,
+            SessionManager::new(),
+            false,
+            None,
+            "websocket",
+            false,
+            false,
+        )
+    }
+
+    /// #1219 (Half 1): when the relay drops outbound packets to ONE receiver
+    /// (receiver-downlink overflow) past the congestion threshold,
+    /// `on_outbound_drop` must NOT publish a sender-keyed CONGESTION packet to
+    /// the sender's self-subject. (Before #1219 it did — driving the publisher's
+    /// whole-room `force_congestion_cut`.) We subscribe to the sender's subject
+    /// and assert SILENCE.
+    ///
+    /// MUTATION PROOF: reverting #1219 (restoring the `nc.publish(subject, ..)`
+    /// of the CONGESTION packet in `on_outbound_drop`) makes a CONGESTION arrive
+    /// on the subscription, so `received` becomes 1 and the `== 0` assert FAILS.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn test_on_outbound_drop_does_not_emit_sender_keyed_congestion() {
+        use futures::StreamExt;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
+
+        let room = "congestion_1219_room";
+        let sender_sid: u64 = 424242;
+        // The relay publishes CONGESTION on `room.{room}.{sender_sid}`.
+        let subject = format!("room.{room}.{sender_sid}");
+        let mut sub = nats_client
+            .subscribe(subject.clone())
+            .await
+            .expect("subscribe should succeed");
+        // Ensure the subscription is registered server-side before we drive drops.
+        nats_client.flush().await.expect("flush should succeed");
+
+        let mut logic = build_test_receiver_logic(nats_client.clone(), room).await;
+
+        // Drive enough drops to cross the threshold MULTIPLE times (and past the
+        // rate-limit interval would still only ever publish, never not-publish).
+        // record_drop returns Some at the threshold; on_outbound_drop used to
+        // publish on that. We call well past threshold to be unambiguous.
+        let sender_user_id = b"sender-user";
+        for _ in 0..(CONGESTION_DROP_THRESHOLD * 3) {
+            logic.on_outbound_drop(sender_sid, sender_user_id);
+        }
+
+        // The surviving #979 behavior: the receiver IS now actively congested
+        // (record_drop still ran and crossed the threshold). This proves we did
+        // not gut record_drop — only the emit.
+        assert!(
+            logic.congestion_tracker.is_actively_congested(),
+            "#979 keyframe-relax path must survive: record_drop still flags active congestion"
+        );
+
+        // Allow any (erroneously) spawned publish task to land on the wire.
+        let mut received = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match tokio::time::timeout(remaining, sub.next()).await {
+                Ok(Some(_msg)) => received += 1,
+                _ => break,
+            }
+        }
+
+        assert_eq!(
+            received, 0,
+            "#1219 Half 1: receiver-downlink overflow must NOT publish a \
+             sender-keyed CONGESTION packet (got {received} on {subject})"
+        );
     }
 }

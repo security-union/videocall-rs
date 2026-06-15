@@ -2,18 +2,10 @@
  * Copyright 2025 Security Union LLC
  * Licensed under MIT OR Apache-2.0
  */
-use crate::components::performance_settings::{
-    DiagnosticsReader, KindReceivePref, PerformancePreference, PerformanceSettingsPanel,
-    ReceivePreference, ReceivedReader, ScreenSnapshotReader, SnapshotReader,
-};
-use crate::context::{
-    clear_transport_sticky_and_pref, load_transport_sticky, save_transport_preference,
-    save_transport_preference_session, save_transport_sticky, TransportPreference,
-};
+use crate::context::{apply_transport_decision, load_transport_sticky, TransportPreference};
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
 use videocall_client::utils::is_ios;
-use videocall_client::PrefMediaKind;
 use wasm_bindgen::JsCast;
 use web_sys::MediaDeviceInfo;
 
@@ -220,11 +212,14 @@ fn SettingsGlassSelect(
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+// The `Performance` tab was removed in #1131: the Performance controls moved
+// into the Diagnostics drawer. The tablist is now four tabs. (The transitional
+// "moved to Diagnostics" redirect row was also removed; users find Performance
+// in the drawer, and the "performance" deep link routes there via attendants.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum SettingsSection {
     Audio,
     Video,
-    Performance,
     Network,
     Appearance,
 }
@@ -234,7 +229,6 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "Audio",
             SettingsSection::Video => "Video",
-            SettingsSection::Performance => "Performance",
             SettingsSection::Network => "Network",
             SettingsSection::Appearance => "Appearance",
         }
@@ -244,7 +238,6 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-tab-audio",
             SettingsSection::Video => "settings-tab-video",
-            SettingsSection::Performance => "settings-tab-performance",
             SettingsSection::Network => "settings-tab-network",
             SettingsSection::Appearance => "settings-tab-appearance",
         }
@@ -254,7 +247,6 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-panel-audio",
             SettingsSection::Video => "settings-panel-video",
-            SettingsSection::Performance => "settings-panel-performance",
             SettingsSection::Network => "settings-panel-network",
             SettingsSection::Appearance => "settings-panel-appearance",
         }
@@ -264,17 +256,15 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => "settings-nav-audio",
             SettingsSection::Video => "settings-nav-video",
-            SettingsSection::Performance => "settings-nav-performance",
             SettingsSection::Network => "settings-nav-network",
             SettingsSection::Appearance => "settings-nav-appearance",
         }
     }
 
-    fn all() -> [SettingsSection; 5] {
+    fn all() -> [SettingsSection; 4] {
         [
             SettingsSection::Audio,
             SettingsSection::Video,
-            SettingsSection::Performance,
             SettingsSection::Network,
             SettingsSection::Appearance,
         ]
@@ -283,8 +273,7 @@ impl SettingsSection {
     fn next(self) -> Self {
         match self {
             SettingsSection::Audio => SettingsSection::Video,
-            SettingsSection::Video => SettingsSection::Performance,
-            SettingsSection::Performance => SettingsSection::Network,
+            SettingsSection::Video => SettingsSection::Network,
             SettingsSection::Network => SettingsSection::Appearance,
             SettingsSection::Appearance => SettingsSection::Audio,
         }
@@ -294,8 +283,7 @@ impl SettingsSection {
         match self {
             SettingsSection::Audio => SettingsSection::Appearance,
             SettingsSection::Video => SettingsSection::Audio,
-            SettingsSection::Performance => SettingsSection::Video,
-            SettingsSection::Network => SettingsSection::Performance,
+            SettingsSection::Network => SettingsSection::Video,
             SettingsSection::Appearance => SettingsSection::Network,
         }
     }
@@ -316,69 +304,16 @@ pub fn DeviceSettingsModal(
     on_close: EventHandler<()>,
     #[props(default)] transport_preference: TransportPreference,
     #[props(default)] initial_section: Option<String>,
-    // ── SEND side (#961): quality-bound preference, change callback, live needles.
-    /// Current persisted performance (send quality-bounds) preference. (#961)
-    #[props(default)]
-    performance_preference: PerformancePreference,
-    /// Called when the user changes any SEND quality bound. The parent persists
-    /// the new preference and pushes it to the encoders via
-    /// `CameraEncoder` / `ScreenEncoder::set_quality_tier_bounds`. (#961)
-    #[props(default)]
-    on_performance_change: EventHandler<PerformancePreference>,
-    /// Reads the encoder's live quality snapshot for the "Sending" needles.
-    /// Defaults to a reader that always yields `None` (encoder unavailable). (#961)
-    #[props(default = SnapshotReader::none())]
-    read_quality_snapshot: SnapshotReader,
-    /// Reads the screen encoder's live snapshot for the screen "Sending" needle.
-    /// Defaults to `None` (not sharing). (#961)
-    #[props(default = ScreenSnapshotReader::none())]
-    read_screen_snapshot: ScreenSnapshotReader,
-    // ── RECEIVE side (#989 simulcast): layer-bound preference, change callback, needles.
-    /// Current persisted RECEIVE-side layer-bounds preference (simulcast P4). (#989)
-    #[props(default)]
-    receive_preference: ReceivePreference,
-    /// Called when the user changes a kind's receive bounds. The parent persists
-    /// the new preference and pushes it to the client via
-    /// `set_receive_layer_bounds`. (#989)
-    #[props(default)]
-    on_receive_change: EventHandler<(PrefMediaKind, KindReceivePref)>,
-    /// Reads the client's per-kind received-layer snapshot for the "Receiving"
-    /// needles. Defaults to `None` (nothing received). (#989)
-    #[props(default = ReceivedReader::none())]
-    received_reader: ReceivedReader,
-    /// Live simulcast/AQ diagnostics for the Performance panel's summary lines.
-    /// Defaults to an inert reader. (#1095)
-    #[props(default = DiagnosticsReader::none())]
-    diagnostics_reader: DiagnosticsReader,
-    /// Cross-nav: open the Call Diagnostics panel from the Performance tab.
-    /// Defaults to a no-op so call sites that don't wire it still compile. (#1095 §4a)
-    #[props(default)]
-    on_open_diagnostics: EventHandler<()>,
-    /// Effective simulcast layer ceilings for the SEND "layers published"
-    /// controls, sourced from `host.rs` (`effective_max_layers`). Drives the
-    /// layer slider's tick count + full/default ceiling. Default 1 (single-stream)
-    /// so call sites that don't wire them render a 1-rung (no-op) control.
-    #[props(default = 1)]
-    video_layer_max: usize,
-    #[props(default = 1)] screen_layer_max: usize,
-    /// Audio's effective ladder depth — NOT CPU-clamped (audio encode is cheap),
-    /// so typically the full audio ladder even on weak runners.
-    #[props(default = 1)]
-    audio_layer_max: usize,
-    /// Whether the mic is currently capturing — drives the audio SEND caption's
-    /// "Sending …" vs. "Will send … when the mic is on" form (audio has no SEND
-    /// snapshot to infer it from, unlike video/screen). From `host.rs`'s
-    /// `mic_enabled`. Default `false` so call sites that don't wire it read the
-    /// off-state copy.
-    #[props(default)]
-    audio_source_active: bool,
 ) -> Element {
     let is_ios_safari = is_ios();
-    // Map the parent's requested section string to the enum.
+    // Map the parent's requested section string to the enum. The "performance"
+    // section no longer exists here (it moved to the Diagnostics drawer, #1131);
+    // the parent (attendants) intercepts "performance" BEFORE opening this modal
+    // and routes it to the drawer, so reaching here with "performance" should not
+    // happen — fall back to the default Audio tab defensively rather than panic.
     let requested = match initial_section.as_deref() {
         Some("appearance") => SettingsSection::Appearance,
         Some("network") => SettingsSection::Network,
-        Some("performance") => SettingsSection::Performance,
         Some("video") => SettingsSection::Video,
         _ => SettingsSection::Audio,
     };
@@ -497,6 +432,11 @@ pub fn DeviceSettingsModal(
                                 },
                             }
                         }
+                        // The transitional "Performance moved to Diagnostics" row
+                        // was removed (#1131 iteration): the Performance controls
+                        // live in the Diagnostics drawer now, and the redirect link
+                        // is no longer offered. The "performance" deep link is still
+                        // intercepted in attendants and routed to the drawer.
                     }
 
                     div { class: "settings-panel",
@@ -606,40 +546,6 @@ pub fn DeviceSettingsModal(
                                     }
                                 }
                             },
-                            SettingsSection::Performance => rsx! {
-                                div {
-                                    id: SettingsSection::Performance.panel_id(),
-                                    class: "settings-section",
-                                    role: "tabpanel",
-                                    "aria-labelledby": SettingsSection::Performance.tab_id(),
-
-                                    PerformanceSettingsPanel {
-                                        // SEND (#961).
-                                        pref: performance_preference,
-                                        on_change: move |p: PerformancePreference| {
-                                            on_performance_change.call(p);
-                                        },
-                                        read_snapshot: read_quality_snapshot.clone(),
-                                        read_screen_snapshot: read_screen_snapshot.clone(),
-                                        // RECEIVE (#989 simulcast).
-                                        receive_pref: receive_preference,
-                                        on_receive_change: move |(kind, sub): (PrefMediaKind, KindReceivePref)| {
-                                            on_receive_change.call((kind, sub));
-                                        },
-                                        received_reader: received_reader.clone(),
-                                        // Live diagnostics (#1095).
-                                        diagnostics_reader: diagnostics_reader.clone(),
-                                        // Cross-nav to the Diagnostics panel (#1095 §4a).
-                                        on_open_diagnostics: move |_| on_open_diagnostics.call(()),
-                                        // SEND layer-count ceilings (real ladder depth from host).
-                                        video_layer_max,
-                                        screen_layer_max,
-                                        audio_layer_max,
-                                        // Mic capture state for the audio SEND caption.
-                                        audio_source_active,
-                                    }
-                                }
-                            },
                             SettingsSection::Network => rsx! {
                                 div {
                                     id: SettingsSection::Network.panel_id(),
@@ -681,6 +587,24 @@ pub fn DeviceSettingsModal(
                                                             "data-testid": test_id,
                                                             class: if is_selected { "transport-segmented-option selected" } else { "transport-segmented-option" },
                                                             onclick: move |_| {
+                                                                // Picking a DIFFERENT protocol is a fresh, uncommitted
+                                                                // choice, so un-check "Remember" in the UI — otherwise a
+                                                                // stale pin from the previously selected protocol (e.g.
+                                                                // an old WebSocket pin) would keep the toggle stuck ON
+                                                                // and the user could never clear it (issue #1291).
+                                                                // `use_signal` only runs its init once per mount; after that
+                                                                // `sticky_transport` is reconciled here (radio reset) and by
+                                                                // the "Remember" checkbox — never by storage. This is an IN-MEMORY reset
+                                                                // only: storage is intentionally NOT touched here, because
+                                                                // the modal is a staging surface and persistence happens
+                                                                // solely on "Apply" via `apply_transport_decision` (which
+                                                                // clears any stale pin in its `(true,false)` and
+                                                                // `(false,false)` arms). Mutating storage on an
+                                                                // uncommitted radio click would wipe a confirmed pin even
+                                                                // if the user abandons the modal without applying.
+                                                                if pending_protocol() != value {
+                                                                    sticky_transport.set(false);
+                                                                }
                                                                 pending_protocol.set(value);
                                                             },
                                                             "{label}"
@@ -691,45 +615,48 @@ pub fn DeviceSettingsModal(
                                         }
                                     }
 
-                                    // Hidden for the default (WebTransport) since pinning the
-                                    // implicit default is a no-op.
-                                    if pending_protocol() != TransportPreference::default() {
-                                        div { class: "device-setting-group sticky-protocol-row",
-                                            div { class: "sticky-protocol-row-inner",
-                                                div { class: "sticky-protocol-text",
-                                                    label {
-                                                        r#for: "sticky-transport-checkbox",
-                                                        class: "sticky-protocol-label",
-                                                        "Remember protocol choice"
-                                                    }
-                                                    p { class: "sticky-protocol-hint", "Pin this protocol across browser sessions." }
-                                                }
+                                    // Shown for BOTH protocols (#1291): hiding the toggle for the
+                                    // default left a stale WebSocket pin un-clearable when the user
+                                    // switched the radio back to WebTransport. Pinning the default
+                                    // is itself harmless — `apply_transport_decision` writes
+                                    // `vc_transport_preference=webtransport` + `vc_transport_sticky=true`,
+                                    // which `load_transport_preference` resolves to WebTransport anyway.
+                                    div { class: "device-setting-group sticky-protocol-row",
+                                        div { class: "sticky-protocol-row-inner",
+                                            div { class: "sticky-protocol-text",
                                                 label {
-                                                    class: "glow-switch",
-                                                    "aria-label": "Remember protocol choice across browser sessions",
-                                                    input {
-                                                        id: "sticky-transport-checkbox",
-                                                        r#type: "checkbox",
-                                                        checked: sticky_transport(),
-                                                        onchange: move |evt: Event<FormData>| {
-                                                            // Persist immediately so the choice survives an unexpected tab close.
-                                                            let checked = evt.checked();
-                                                            sticky_transport.set(checked);
-                                                            if checked {
-                                                                save_transport_preference(pending_protocol());
-                                                                save_transport_sticky(true);
-                                                            } else {
-                                                                clear_transport_sticky_and_pref();
-                                                            }
-                                                        },
-                                                    }
-                                                    span { class: "glow-switch-track" }
+                                                    r#for: "sticky-transport-checkbox",
+                                                    class: "sticky-protocol-label",
+                                                    "Remember protocol choice"
                                                 }
+                                                p { class: "sticky-protocol-hint", "Pin this protocol across browser sessions." }
+                                            }
+                                            label {
+                                                class: "glow-switch",
+                                                "aria-label": "Remember protocol choice across browser sessions",
+                                                input {
+                                                    id: "sticky-transport-checkbox",
+                                                    r#type: "checkbox",
+                                                    checked: sticky_transport(),
+                                                    onchange: move |evt: Event<FormData>| {
+                                                        // Stage the choice in memory only; persistence happens
+                                                        // solely on "Apply" via `apply_transport_decision`,
+                                                        // mirroring the radio's in-memory-only reset. Writing
+                                                        // storage on an uncommitted toggle would pin (or wipe) a
+                                                        // protocol even if the user abandons the modal.
+                                                        sticky_transport.set(evt.checked());
+                                                    },
+                                                }
+                                                span { class: "glow-switch-track" }
                                             }
                                         }
                                     }
 
-                                    // Default+sticky is a silent no-op, so suppress the advisory there.
+                                    // Advisory shown only for a NON-default (WebSocket) pin. The
+                                    // "switch back to WebTransport to clear" wording is only true
+                                    // when the pinned protocol is WebSocket, so it stays suppressed
+                                    // for a WebTransport+remember selection (which is itself
+                                    // harmless — load resolves it to the default regardless).
                                     if sticky_transport() && pending_protocol() != TransportPreference::default() {
                                         div {
                                             class: "settings-info-panel",
@@ -765,14 +692,14 @@ pub fn DeviceSettingsModal(
                                             div { class: "settings-info-panel-body",
                                                 p { class: "settings-info-panel-title", "Protocol pinned" }
                                                 p { class: "settings-info-panel-text",
-                                                    "This protocol will be used on every future page load. To clear it, switch back to WebTransport. Picking a different protocol replaces the saved choice."
+                                                    "This protocol will be used on every future page load. Turn off \"Remember protocol choice\" (or switch back to WebTransport) to clear it."
                                                 }
                                             }
                                         }
                                     }
 
-                                    // Only shown when the pending selection diverges from the active one.
-                                    if pending_protocol() != transport_preference {
+                                    // Shown when the staged selection (protocol or sticky flag) diverges from the stored state.
+                                    if pending_protocol() != transport_preference || sticky_transport() != load_transport_sticky() {
                                         div { class: "transport-apply-row",
                                             p { class: "transport-preference-note", "Changing protocol will reload the page." }
                                             button {
@@ -780,23 +707,12 @@ pub fn DeviceSettingsModal(
                                                 class: "transport-apply-button",
                                                 "data-testid": "transport-apply-button",
                                                 onclick: move |_| {
-                                                    let pref = pending_protocol();
-                                                    let is_default = pref == TransportPreference::default();
-                                                    match (is_default, sticky_transport()) {
-                                                        // Default + not sticky: clear all storage so the
-                                                        // implicit default takes over on reload.
-                                                        (true, false) => {
-                                                            clear_transport_sticky_and_pref();
-                                                        }
-                                                        (_, true) => {
-                                                            save_transport_preference(pref);
-                                                            save_transport_sticky(true);
-                                                        }
-                                                        (false, false) => {
-                                                            // Session-scoped: survives the reload only.
-                                                            save_transport_preference_session(pref);
-                                                        }
-                                                    }
+                                                    // Single source of truth for the persistence decision,
+                                                    // shared with `confirm_transport_change` so the two
+                                                    // callers cannot drift. For a non-default + not-sticky
+                                                    // choice this also clears any prior sticky pin so a
+                                                    // session-scoped choice wins on the next load (#1291).
+                                                    apply_transport_decision(pending_protocol(), sticky_transport());
                                                     if let Some(w) = web_sys::window() {
                                                         let _ = w.location().reload();
                                                     }
@@ -898,24 +814,6 @@ fn render_nav_icon(section: SettingsSection) -> Element {
                 path { d: "M16 10l5-3v10l-5-3z" }
             }
         },
-        SettingsSection::Performance => rsx! {
-            svg {
-                class: "settings-nav-icon",
-                view_box: "0 0 24 24",
-                width: "18",
-                height: "18",
-                "aria-hidden": "true",
-                fill: "none",
-                stroke: "currentColor",
-                stroke_width: "1.6",
-                stroke_linecap: "round",
-                stroke_linejoin: "round",
-                // Gauge: an arc with a needle, echoing the VU meters.
-                path { d: "M4 16a8 8 0 0 1 16 0" }
-                path { d: "M12 16l4-4" }
-                circle { cx: "12", cy: "16", r: "1.2", fill: "currentColor", stroke: "none" }
-            }
-        },
         SettingsSection::Network => rsx! {
             svg {
                 class: "settings-nav-icon",
@@ -960,4 +858,44 @@ fn find_device_by_id(devices: &[MediaDeviceInfo], device_id: &str) -> Option<Dev
         .iter()
         .find(|device| device.device_id() == device_id)
         .map(DeviceInfo::from_media_device_info)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tablist is now FOUR tabs — Performance was removed (#1131). If a
+    /// Performance variant is reintroduced into `all()` this length flips,
+    /// catching an accidental revert.
+    #[test]
+    fn tablist_has_four_sections_without_performance() {
+        let all = SettingsSection::all();
+        assert_eq!(all.len(), 4, "tablist must have exactly 4 tabs");
+        let titles: Vec<&str> = all.iter().map(|s| s.title()).collect();
+        assert_eq!(titles, ["Audio", "Video", "Network", "Appearance"]);
+        assert!(
+            !titles.contains(&"Performance"),
+            "Performance tab must not be in the tablist (it moved to Diagnostics)"
+        );
+    }
+
+    /// `next()` cycles through exactly the four sections and wraps. Audio→Video
+    /// is the post-removal edge (it used to be Video→Performance); this fails if
+    /// the cycle is wired back through a Performance variant.
+    #[test]
+    fn next_cycles_four_sections_and_wraps() {
+        assert_eq!(SettingsSection::Audio.next(), SettingsSection::Video);
+        assert_eq!(SettingsSection::Video.next(), SettingsSection::Network);
+        assert_eq!(SettingsSection::Network.next(), SettingsSection::Appearance);
+        assert_eq!(SettingsSection::Appearance.next(), SettingsSection::Audio);
+    }
+
+    /// `prev()` is the exact inverse of `next()` over the four-section ring.
+    #[test]
+    fn prev_is_inverse_of_next() {
+        for s in SettingsSection::all() {
+            assert_eq!(s.next().prev(), s, "prev(next({s:?})) must round-trip");
+            assert_eq!(s.prev().next(), s, "next(prev({s:?})) must round-trip");
+        }
+    }
 }

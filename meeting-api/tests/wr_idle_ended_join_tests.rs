@@ -34,8 +34,10 @@
 //! 5. **No authorization bypass** — with WR on and meeting idle, a non-host
 //!    cannot activate the meeting; it remains `idle`.
 //!
-//! 6. Non-host joins **ended** meeting with WR **off** but `end_on_host_leave = true`  
-//!    → participant gets `waiting_for_meeting`; meeting stays `ended`.
+//! 6. Non-host joins **ended** meeting with WR **off** but `end_on_host_leave = true`
+//!    → join is rejected with HTTP 400 `MEETING_NOT_ACTIVE` (issue #742);
+//!    meeting stays `ended`. (Was previously `waiting_for_meeting`, which
+//!    stranded the joiner in a phantom waiting room for a server-ended meeting.)
 //!
 //! 7. Authenticated non-host joins **active** meeting with WR **off** (host still present)  
 //!    → participant is auto-admitted immediately with a room_token.
@@ -63,6 +65,7 @@ use tower::ServiceExt;
 use videocall_meeting_types::responses::{
     APIResponse, MeetingInfoResponse, ParticipantStatusResponse,
 };
+use videocall_meeting_types::APIError;
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -276,15 +279,19 @@ async fn test_non_host_joins_ended_wr_off_eohl_false_reactivates_and_admits() {
     cleanup_test_data(&pool, room_id).await;
 }
 
-// ── Scenario 6: ended meeting + WR off + end_on_host_leave=true → waiting_for_meeting ─
+// ── Scenario 6: ended meeting + WR off + end_on_host_leave=true → MEETING_NOT_ACTIVE ─
 
 /// Non-host joins an `ended` meeting with WR off but `end_on_host_leave = true`.
 /// The host configured the meeting to end when they leave, so we must NOT
-/// allow a non-host to re-activate it.
-/// Expected: status is `waiting_for_meeting`, no room_token, meeting stays `ended`.
+/// allow a non-host to re-activate it — and we must NOT strand them in a
+/// phantom `waiting_for_meeting` waiting room for a meeting that has terminated
+/// (issue #742). The join path now rejects this case with the same
+/// `MEETING_NOT_ACTIVE` error the status-polling endpoints already return for an
+/// ended meeting, so join and status agree on the wire.
+/// Expected: HTTP 400 `MEETING_NOT_ACTIVE`; meeting stays `ended`.
 #[tokio::test]
 #[serial]
-async fn test_non_host_joins_ended_wr_off_eohl_true_waiting_for_meeting() {
+async fn test_non_host_joins_ended_wr_off_eohl_true_rejected_not_active() {
     let pool = get_test_pool().await;
     let room_id = "wr-ended-off-eohl-true-wait";
     cleanup_test_data(&pool, room_id).await;
@@ -355,21 +362,20 @@ async fn test_non_host_joins_ended_wr_off_eohl_true_waiting_for_meeting() {
     .unwrap();
 
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body: APIResponse<ParticipantStatusResponse> = response_json(resp).await;
-    assert!(body.success, "join call must succeed");
+    // The join must be rejected — an ended meeting with end_on_host_leave=true
+    // is terminal for non-hosts. Returning `waiting_for_meeting` here (the old
+    // behaviour, issue #742) stranded the joiner in a phantom waiting room.
     assert_eq!(
-        body.result.status, "waiting_for_meeting",
-        "non-host must NOT re-activate an ended meeting when end_on_host_leave=true"
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "join into an ended end_on_host_leave=true meeting must be rejected, not waiting_for_meeting"
     );
-    assert!(
-        body.result.room_token.is_none(),
-        "waiting_for_meeting must NOT include a room_token"
-    );
-    assert!(
-        body.result.observer_token.is_some(),
-        "waiting_for_meeting must include an observer_token"
+
+    let body: APIResponse<APIError> = response_json(resp).await;
+    assert!(!body.success, "rejected join must report success=false");
+    assert_eq!(
+        body.result.code, "MEETING_NOT_ACTIVE",
+        "join path must reject an ended meeting with the same code the status endpoints use"
     );
 
     // Meeting must remain ended.

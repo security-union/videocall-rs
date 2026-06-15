@@ -29,8 +29,9 @@ import { chromium } from "@playwright/test";
  * the SAME per-peer simulcast RECEIVE breakdown the Performance dialog's
  * per-peer receive rows expose (issue: tile signal-meter popup ↔ perf dialog
  * layer parity). It reuses the perf-dialog markup verbatim — `.perf-peer-row`,
- * `.perf-q-dot--{optimal|medium|low}`, `.perf-peer-row__metric` ("L i / n",
- * 1-based), and the optional `.perf-reason-chip--{network|setting|sender}`. We
+ * `.perf-q-dot--{optimal|medium|low}`, `.perf-peer-row__metric` ("{Q} · {i}/{n}",
+ * #1222 quality-letter + 1-based position/total), and the optional
+ * `.perf-reason-chip--{network|setting|sender}`. We
  * assert the video layer row appears for the receiving host, carries a shared
  * quality-dot modifier class, and shows the 1-based "L i / n" metric.
  */
@@ -289,10 +290,13 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
         const dotClass = (await videoDot.getAttribute("class")) || "";
         expect(dotClass).toMatch(/\bperf-q-dot--(optimal|medium|low)\b/);
 
-        // Metric text is 1-based "L i / n" (e.g. "540p · ~600k · L2/3"), the
-        // exact shape `peer_row_metric` produces for the perf dialog.
+        // Metric text is the quality LETTER + 1-based position/total (#1222
+        // Directive 4: e.g. "540p · ~600k · M · 2/3"), the exact shape
+        // `peer_row_metric` produces for the perf dialog (the old "L2/3" numeric
+        // chip is gone). Match the "{Q} · {i}/{n}" tail — a quality letter
+        // (L/M/H, or "1" single-layer) followed by " · " and the position/total.
         const videoMetric = videoRow.locator(".perf-peer-row__metric");
-        await expect(videoMetric).toHaveText(/L\d+\/\d+/, { timeout: 30_000 });
+        await expect(videoMetric).toHaveText(/\S+ · \d+\/\d+/, { timeout: 30_000 });
 
         // When the row is below the full-ladder top a tinted reason chip appears,
         // again reusing the perf-dialog chip classes. The chip is optional (an

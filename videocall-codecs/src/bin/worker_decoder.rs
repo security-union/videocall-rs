@@ -38,8 +38,11 @@
 use std::cell::{Cell, RefCell};
 use videocall_codecs::decoder::{Decodable, DecodedFrame, VideoCodec};
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, VideoFrame};
-use videocall_codecs::jitter_buffer::JitterBuffer;
-use videocall_codecs::messages::{VideoStatsMessage, WorkerMessage};
+use videocall_codecs::jitter_buffer::{paint_lag_ms, FreshnessSkip, JitterBuffer};
+use videocall_codecs::messages::{
+    FreshnessSkipMessage, RequestKeyframeMessage, VideoStatsMessage, WorkerLogMessage,
+    WorkerMessage,
+};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{
@@ -124,6 +127,10 @@ impl WebDecoder {
                         &format!("[WORKER] Error posting decoded frame: {e:?}").into(),
                     );
                 }
+                // Stage-3 paint lag (issue #1252): count every decoded frame handed off to the
+                // worker->main postMessage queue. The main thread ACKs how many it has drained
+                // (WorkerMessage::PaintProgress); the 1Hz tick computes emitted - painted.
+                FRAMES_EMITTED.with(|c| c.set(c.get().wrapping_add(1)));
                 video_frame.close();
             }) as Box<dyn FnMut(_)>)
         };
@@ -271,22 +278,15 @@ impl Decodable for WebDecoder {
 
             // Second buffer stage observability (issue #1020). Frames handed to
             // `VideoDecoder.decode()` sit in WebCodecs' own internal queue, which is unpaced: even
-            // with the jitter-buffer freshness deadline in place, a burst of frames can still pile
-            // up here and be painted back-to-back, partially defeating the buffer-side fix. We read
-            // the decoder's queue depth so the backlog is at least visible.
+            // with the jitter-buffer freshness deadline in place, a burst of frames could pile up
+            // here and be painted back-to-back, partially defeating the buffer-side fix.
             //
-            // TODO(#1020): turn this read into real backpressure. The correct fix is to consult
-            // `decode_queue_size()` *before the jitter buffer releases a frame* (i.e. in
-            // `JitterBuffer::find_and_move_continuous_frames`) and stop pulling new frames while the
-            // WebCodecs queue is above a small high-water mark (e.g. > 2-3 frames), letting the
-            // decoder drain at display rate instead of as fast as it can. That requires threading
-            // the live queue depth from this worker back into the jitter buffer (e.g. a
-            // `decode_queue_depth: Rc<Cell<u32>>` shared handle, or a `can_accept()` callback
-            // injected at `JitterBuffer::new`). Dropping a frame *here* is not an option: the frame
-            // has already been removed from the jitter buffer, so skipping it would create a
-            // reference gap and force a `DataError: A key frame is required` reset. Deferred to keep
-            // this pass confined to the (already substantial) jitter-buffer deadline; admission
-            // gating must live on the release side, not the post-release side.
+            // Release-side backpressure (issue #1024) now caps this: the jitter buffer reads the
+            // live depth via `Decodable::decode_queue_depth()` (implemented below) *before*
+            // releasing a frame and holds new frames while the queue is at/above its high-water
+            // mark, so under healthy pacing this depth stays around that mark and the debug log
+            // below should rarely fire. If it still fires, the decoder genuinely can't keep up and
+            // the freshness deadline will skip to live. This log is kept purely for observability.
             let decode_queue_size = decoder.decode_queue_size();
             if decode_queue_size > WEBCODECS_QUEUE_WARN_DEPTH {
                 log::debug!(
@@ -343,6 +343,30 @@ impl Decodable for WebDecoder {
             }
         }
     }
+
+    /// Live depth of the WebCodecs `VideoDecoder` internal queue, used by the jitter buffer for
+    /// release-side backpressure (issue #1024). Returns `0` when no decoder is configured yet, so
+    /// the buffer is free to release the first frame(s) and let the decoder come up.
+    fn decode_queue_depth(&self) -> u32 {
+        self.decoder
+            .borrow()
+            .as_ref()
+            .map(|d| d.decode_queue_size())
+            .unwrap_or(0)
+    }
+
+    /// Wedged-decoder recovery escalation (issue #1324). Tears down the current `VideoDecoder` and
+    /// schedules the jitter-buffer reset on the next event-loop tick. Called by the jitter buffer's
+    /// escape hatch when backpressure has held release past `MAX_BACKPRESSURE_HOLD_MS` and a
+    /// force-release did not break the wedge. `reset_pipeline()` defers the buffer reset via
+    /// `setTimeout(0)`, so calling it from inside the release loop is safe — the deferred
+    /// `reset_jitter_buffer()` runs after the current call stack unwinds.
+    fn reset(&self) {
+        console::warn_1(
+            &"[WORKER] Backpressure escape hatch: resetting decoder pipeline (wedged decoder, issue #1324)".into(),
+        );
+        self.reset_pipeline();
+    }
 }
 
 // Thread-local storage for the jitter buffer and related state
@@ -352,21 +376,56 @@ thread_local! {
     static CONTEXT_FROM: RefCell<Option<String>> = const { RefCell::new(None) };
     static CONTEXT_TO: RefCell<Option<String>> = const { RefCell::new(None) };
     static LAST_DIAGNOSTIC_EMIT_MS: RefCell<f64> = const { RefCell::new(0.0) };
+    /// Cumulative count of decoded frames this worker has `post_message`'d to the main thread
+    /// (issue #1252, stage-3 paint lag). Incremented in the WebCodecs `on_output` closure.
+    static FRAMES_EMITTED: Cell<u64> = const { Cell::new(0) };
+    /// Latest cumulative count of frames the main thread reports it has drained from the
+    /// worker->main `postMessage` queue, ACK'd back via `WorkerMessage::PaintProgress`
+    /// (issue #1252, stage-3 paint lag). The difference `emitted - painted` is the
+    /// decoded-but-unpainted backlog `decode_queue_size()` cannot see.
+    static FRAMES_PAINTED: Cell<u64> = const { Cell::new(0) };
+    /// Timestamp (ms, `Date::now()`) of the last worker `log::` record forwarded to the main
+    /// thread (issue #1356). Drives the forwarder's min-interval rate limit so a chatty
+    /// `log::warn!` loop cannot turn into per-record `postMessage` network amplification.
+    static WORKER_LOG_LAST_EMIT_MS: Cell<f64> = const { Cell::new(0.0) };
+    /// Count of worker `log::` records suppressed by the rate limit since the last forwarded
+    /// line (issue #1356). Folded into the next forwarded `WorkerLogMessage` as `suppressed`
+    /// so a coalesced burst reports its volume without sending one message per record.
+    static WORKER_LOG_SUPPRESSED: Cell<u64> = const { Cell::new(0) };
+    /// Re-entrancy guard for the `log::Log` impl (issue #1356). The forwarder must never
+    /// emit a `log::` record from inside its own `log()` (that would recurse), so it uses
+    /// `console::*` for internal errors — this flag is belt-and-suspenders against any
+    /// future change that introduces a nested record.
+    static WORKER_LOG_IN_LOG: Cell<bool> = const { Cell::new(false) };
 }
 
 const JITTER_BUFFER_CHECK_INTERVAL_MS: i32 = 10; // Check every 10ms for frames ready to decode
-/// Depth of the WebCodecs `VideoDecoder` internal queue above which we log a backlog warning.
-/// At ~30fps a healthy queue stays at 0-1; sustained depth here means frames are being shoveled
-/// faster than the decoder paints them (issue #1020, second buffer stage).
-const WEBCODECS_QUEUE_WARN_DEPTH: u32 = 3;
+/// Depth of the WebCodecs `VideoDecoder` internal queue above which we log a backlog (debug) line.
+/// Derived from the release-side gate's high-water mark (the single source of truth) so the two
+/// can't silently desync. The gate (`jitter_buffer.rs`) HOLDS release at
+/// `>= DECODE_QUEUE_HIGH_WATER_MARK`, so under healthy pacing the depth sits right at the mark;
+/// this observability log intentionally uses a strict `>` (below) so it fires only when the depth
+/// climbs ABOVE the mark — i.e. the decoder accepted more than the gate would normally let
+/// accumulate, the genuine "can't keep up" signal (issue #1020, second buffer stage). At ~30fps a
+/// healthy queue stays at 0-1. The `>` vs gate `>=` operator difference is intentional, not an
+/// off-by-one.
+const WEBCODECS_QUEUE_WARN_DEPTH: u32 =
+    videocall_codecs::jitter_buffer::DECODE_QUEUE_HIGH_WATER_MARK;
 const DIAGNOSTIC_EMIT_INTERVAL_MS: f64 = 1000.0; // Emit diagnostics at 1 Hz (once per second)
 
 #[wasm_bindgen(start)]
 pub fn main() {
     // Set up panic hook to get Rust panics in the console
     console_error_panic_hook::set_once();
-    // Initialize Rust log to console logging
-    log::set_max_level(log::LevelFilter::Debug);
+    // Install the worker->main `log::` forwarder FIRST, before any code path that could
+    // emit a record we want captured (issue #1356). It is the worker's ONLY `log::Log`
+    // facade: until now no logger was installed here, so every `log::` line emitted inside
+    // the worker was silently dropped (the `log` crate discards all records when no logger
+    // is set). Installing it before the rest of `main()` runs — and before the message and
+    // interval handlers are wired up — guarantees later records are not lost to a
+    // too-late install. `install_worker_logger` also sets the global `max_level`; without
+    // that the facade filters everything out regardless of the logger.
+    install_worker_logger();
     log::info!("Starting worker decoder with jitter buffer and message handling");
 
     let self_scope = js_sys::global()
@@ -406,6 +465,13 @@ fn handle_worker_message(message: WorkerMessage) {
             CONTEXT_FROM.with(|f| *f.borrow_mut() = Some(from_peer));
             CONTEXT_TO.with(|t| *t.borrow_mut() = Some(to_peer));
             console::log_1(&"[WORKER] Set diagnostics context (from_peer,to_peer)".into());
+        }
+        WorkerMessage::PaintProgress { painted } => {
+            // Stage-3 paint lag (issue #1252): cumulative frames the main thread has drained from
+            // the worker->main postMessage queue. Store the latest; the 1Hz tick computes
+            // emitted - painted. This ACK is itself delayed by the same FIFO backlog, which only
+            // makes the computed lag read slightly LARGER (conservative) — fine for a gross signal.
+            FRAMES_PAINTED.with(|c| c.set(painted));
         }
     }
 }
@@ -478,6 +544,16 @@ fn check_jitter_buffer_for_ready_frames() {
             let current_time_ms = js_sys::Date::now() as u128;
             jb.find_and_move_continuous_frames(current_time_ms);
 
+            // Forward any freshness-deadline skip to the main thread for field-log
+            // visibility (issue #1045). The deadline runs here in the worker, whose
+            // logs the main-thread capture pipeline never sees; this is the only way
+            // to confirm #1020 (and future decode-side fixes) actually fire in the
+            // field. Event-driven (only on an actual skip), so unlike the 1Hz stats
+            // below it is not rate-limited.
+            if let Some(skip) = jb.take_freshness_skip() {
+                post_freshness_skip_to_main(&skip);
+            }
+
             // Publish buffered frames metric periodically under subsystem "video" with stream_id unset.
             // Rate limited to 1 Hz to avoid flooding diagnostics.
             // The client layer will attach original ids later in the pipeline.
@@ -499,6 +575,24 @@ fn check_jitter_buffer_for_ready_frames() {
                                 if now - last_emit >= DIAGNOSTIC_EMIT_INTERVAL_MS {
                                     *last_emit_cell.borrow_mut() = now;
 
+                                    // Buffered video playout latency (issue #1252): how far behind
+                                    // live this peer's video is. Compute only on the 1 Hz emit path.
+                                    // Total spans both receive stages (jitter-buffer backlog +
+                                    // decoder queue); stage-1 is emitted separately for attribution.
+                                    let (playout_latency_ms, playout_stage1_span_ms) =
+                                        jb.playout_latency_parts_ms(current_time_ms);
+                                    // Stage-3 paint lag (issue #1252): decoded-but-unpainted frames
+                                    // still sitting in the worker->main postMessage queue +
+                                    // main-thread paint task queue — a region decode_queue_size()
+                                    // (stage 2) cannot observe. Compute on the same 1 Hz emit path
+                                    // so the metric reflects the same sampling cadence as the rest
+                                    // of the video diagnostic packet.
+                                    let playout_paint_lag_ms = paint_lag_ms(
+                                        FRAMES_EMITTED.with(|c| c.get()),
+                                        FRAMES_PAINTED.with(|c| c.get()),
+                                        jb.source_frame_interval_ms(),
+                                    );
+
                                     let evt = DiagEvent {
                                         subsystem: "video",
                                         stream_id: None,
@@ -507,6 +601,12 @@ fn check_jitter_buffer_for_ready_frames() {
                                             metric!("from_peer", from_peer.clone()),
                                             metric!("to_peer", to_peer.clone()),
                                             metric!("frames_buffered", buffered),
+                                            metric!("playout_latency_ms", playout_latency_ms),
+                                            metric!(
+                                                "playout_stage1_span_ms",
+                                                playout_stage1_span_ms
+                                            ),
+                                            metric!("playout_paint_lag_ms", playout_paint_lag_ms),
                                         ],
                                     };
                                     let _ = global_sender().try_broadcast(evt);
@@ -515,8 +615,14 @@ fn check_jitter_buffer_for_ready_frames() {
                                     if let Ok(scope) =
                                         js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>()
                                     {
-                                        let msg =
-                                            VideoStatsMessage::new(from_peer, to_peer, buffered);
+                                        let msg = VideoStatsMessage::new(
+                                            from_peer,
+                                            to_peer,
+                                            buffered,
+                                            playout_latency_ms,
+                                            playout_stage1_span_ms,
+                                            playout_paint_lag_ms,
+                                        );
                                         if let Ok(val) = serde_wasm_bindgen::to_value(&msg) {
                                             let _ = scope.post_message(&val);
                                         }
@@ -540,7 +646,180 @@ fn initialize_jitter_buffer() -> Result<JitterBuffer<DecodedFrame>, String> {
     let boxed_decoder = Box::new(web_decoder);
 
     console::log_1(&"[WORKER] Initializing jitter buffer with WebCodecs decoder".into());
-    Ok(JitterBuffer::new(boxed_decoder))
+    // Issue #1025: inject the proactive keyframe-request hook. The jitter buffer fires this
+    // (via `with_keyframe_request`) the instant the freshness deadline evicts a stale
+    // keyframe-less backlog — at which point playout is frozen on the last-good frame with
+    // no buffered keyframe to resume from. We post a `RequestKeyframeMessage` to the main
+    // thread, which owns the transport (WebTransport OR WebSocket) and the PeerDecodeManager,
+    // so it can send a real KEYFRAME_REQUEST for this decoder's peer/stream. The diagnostics
+    // context (CONTEXT_FROM/CONTEXT_TO) is read at FIRE time (not captured at init) because
+    // `SetContext` can arrive after the buffer is constructed; it is carried for log symmetry
+    // only — the main-side callback is per-decoder and needs no identity from the wire.
+    Ok(JitterBuffer::with_keyframe_request(
+        boxed_decoder,
+        Box::new(post_request_keyframe_to_main),
+    ))
+}
+
+/// Worker-side keyframe-request hook (issue #1025): post a [`RequestKeyframeMessage`] to the
+/// main thread. Invoked by the jitter buffer on a keyframe-less stale-backlog eviction. Reading
+/// the diagnostics context here (rather than capturing it at init) keeps the message tagged
+/// correctly even when `SetContext` lands after `initialize_jitter_buffer`.
+fn post_request_keyframe_to_main() {
+    let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
+        console::warn_1(&"[WORKER] request_keyframe: no worker scope; dropping".into());
+        return;
+    };
+    let from_peer = CONTEXT_FROM.with(|f| f.borrow().clone());
+    let to_peer = CONTEXT_TO.with(|t| t.borrow().clone());
+    let msg = RequestKeyframeMessage::new(from_peer, to_peer);
+    match serde_wasm_bindgen::to_value(&msg) {
+        Ok(val) => {
+            let _ = scope.post_message(&val);
+        }
+        Err(e) => {
+            console::warn_1(&format!("[WORKER] request_keyframe: serialize failed: {e:?}").into());
+        }
+    }
+}
+
+/// Post a freshness-deadline skip (issue #1045) to the main thread so it lands in
+/// uploaded field logs. Mirrors `post_request_keyframe_to_main`; context
+/// (CONTEXT_FROM/CONTEXT_TO) is read at emit time.
+fn post_freshness_skip_to_main(skip: &FreshnessSkip) {
+    let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
+        console::warn_1(&"[WORKER] freshness_skip: no worker scope; dropping".into());
+        return;
+    };
+    let from_peer = CONTEXT_FROM.with(|f| f.borrow().clone());
+    let to_peer = CONTEXT_TO.with(|t| t.borrow().clone());
+    let msg = FreshnessSkipMessage::new(
+        from_peer,
+        to_peer,
+        skip.head_age_ms,
+        skip.keyframe_seq,
+        skip.dropped,
+    );
+    match serde_wasm_bindgen::to_value(&msg) {
+        Ok(val) => {
+            let _ = scope.post_message(&val);
+        }
+        Err(e) => {
+            console::warn_1(&format!("[WORKER] freshness_skip: serialize failed: {e:?}").into());
+        }
+    }
+}
+
+/// Minimum interval (ms) between worker `log::` records forwarded to the main thread (issue
+/// #1356). Records arriving inside this window are coalesced: they are counted (not sent) and
+/// the count rides the next forwarded line as `suppressed`. At 250ms the worker forwards at most
+/// ~4 log lines/sec per worker no matter how chatty the source loop is, which is the throttle the
+/// issue requires ("no per-record network amplification"). WARN/ERROR are inherently low-volume,
+/// so in normal operation almost nothing is suppressed; the gate exists to cap a pathological
+/// hot-loop, not to throttle steady-state logging.
+const WORKER_LOG_MIN_INTERVAL_MS: f64 = 250.0;
+
+/// Maximum `log` level forwarded from the worker to the main-thread upload pipeline (issue #1356).
+///
+/// Default is `Warn`: `warn!`/`error!` are forwarded; `info!`/`debug!`/`trace!` are filtered at
+/// the facade and never even reach the rate limiter or the wire. This is the issue's "safe
+/// default" — the worker's `log::debug!` lines (e.g. the per-frame WebCodecs queue-depth trace)
+/// fire often enough that forwarding them by default would amplify field-log volume. To capture
+/// `debug!` from the worker during a field investigation, raise this single constant to
+/// `LevelFilter::Debug` and rebuild; the rate limiter still caps the volume.
+const WORKER_LOG_FORWARD_LEVEL: log::LevelFilter = log::LevelFilter::Warn;
+
+/// `log::Log` facade that forwards worker-side records to the main thread (issue #1356).
+///
+/// The decoder Web Worker has no console-log capture of its own — the main-thread pipeline that
+/// uploads field logs only sees the main thread. Before this, no logger was installed in the
+/// worker at all, so every `log::` line here was discarded by the `log` crate. This forwarder is
+/// installed first in `main()` (see `install_worker_logger`) and posts a `WorkerLogMessage` for
+/// each enabled, non-rate-limited record; `wasm.rs::handle_worker_diag_message` re-broadcasts it
+/// as a `DiagEvent` so it flows into the upload buffer exactly like the freshness-skip diagnostic.
+struct WorkerLogForwarder;
+
+impl log::Log for WorkerLogForwarder {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        // `max_level()` is also enforced by the `log!` macros before `log()` is called, but the
+        // crate contract requires `enabled()` to honor the level too (e.g. `log_enabled!`).
+        metadata.level() <= WORKER_LOG_FORWARD_LEVEL
+    }
+
+    fn log(&self, record: &log::Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+        // Re-entrancy guard: never let a record emitted from within `log()` recurse. We only use
+        // `console::*` (not `log::`) for internal errors below, so this can't trip today, but it
+        // keeps the invariant explicit and cheap.
+        if WORKER_LOG_IN_LOG.with(|g| g.replace(true)) {
+            return;
+        }
+        // Rate-limit / coalesce (issue #1356): forward at most one line per
+        // WORKER_LOG_MIN_INTERVAL_MS; otherwise count it and fold the count into the next line.
+        let now = js_sys::Date::now();
+        let last = WORKER_LOG_LAST_EMIT_MS.with(|c| c.get());
+        if last != 0.0 && now - last < WORKER_LOG_MIN_INTERVAL_MS {
+            WORKER_LOG_SUPPRESSED.with(|c| c.set(c.get().saturating_add(1)));
+            WORKER_LOG_IN_LOG.with(|g| g.set(false));
+            return;
+        }
+        WORKER_LOG_LAST_EMIT_MS.with(|c| c.set(now));
+        let suppressed = WORKER_LOG_SUPPRESSED.with(|c| c.replace(0));
+
+        let level = record.level().as_str().to_string();
+        let target = record.target().to_string();
+        let message = format!("{}", record.args());
+        post_worker_log_to_main(level, target, message, suppressed);
+
+        WORKER_LOG_IN_LOG.with(|g| g.set(false));
+    }
+
+    fn flush(&self) {}
+}
+
+static WORKER_LOG_FORWARDER: WorkerLogForwarder = WorkerLogForwarder;
+
+/// Install the worker->main `log::` forwarder and set the global max level (issue #1356).
+///
+/// Must run before any code path that emits a record we want to capture. `set_logger` returns
+/// `Err` if a logger is already installed (it can only be set once per process); the worker has
+/// none, so this succeeds — and if some future change installs one earlier, we surface it via
+/// `console` rather than panicking. Setting `max_level` is REQUIRED: the `log!` macros short-circuit
+/// on the global max level before consulting the logger, so without this every record would be
+/// filtered out regardless of the forwarder.
+fn install_worker_logger() {
+    match log::set_logger(&WORKER_LOG_FORWARDER) {
+        Ok(()) => log::set_max_level(WORKER_LOG_FORWARD_LEVEL),
+        Err(e) => {
+            console::warn_1(
+                &format!("[WORKER] worker_log: logger already set, not forwarding: {e:?}").into(),
+            );
+        }
+    }
+}
+
+/// Post a worker-side `log::` record to the main thread as a [`WorkerLogMessage`] (issue #1356).
+/// Mirrors `post_freshness_skip_to_main`: gets the worker scope, reads the diagnostics context
+/// (`CONTEXT_FROM`/`CONTEXT_TO`) at emit time so the line is attributed to the right peer, and
+/// posts. Uses only `console::*` for failures so it can never recurse into the `log` facade.
+fn post_worker_log_to_main(level: String, target: String, message: String, suppressed: u64) {
+    let Ok(scope) = js_sys::global().dyn_into::<DedicatedWorkerGlobalScope>() else {
+        // No worker scope (e.g. unit test / non-worker context): drop rather than panic.
+        return;
+    };
+    let from_peer = CONTEXT_FROM.with(|f| f.borrow().clone());
+    let to_peer = CONTEXT_TO.with(|t| t.borrow().clone());
+    let msg = WorkerLogMessage::new(level, target, message, from_peer, to_peer, suppressed);
+    match serde_wasm_bindgen::to_value(&msg) {
+        Ok(val) => {
+            let _ = scope.post_message(&val);
+        }
+        Err(e) => {
+            console::warn_1(&format!("[WORKER] worker_log: serialize failed: {e:?}").into());
+        }
+    }
 }
 
 fn flush_jitter_buffer() {
@@ -559,5 +838,16 @@ fn reset_jitter_buffer() {
     JITTER_BUFFER.with(|jb_cell| {
         *jb_cell.borrow_mut() = None;
     });
+    // Stage-3 paint lag (issue #1252): the FRAMES_EMITTED / FRAMES_PAINTED counters are
+    // deliberately NOT reset here. They are lifetime-cumulative per worker, and the main thread's
+    // painted counter (in the wasm.rs onmessage closure) is likewise monotonic and survives an
+    // in-place reset — that closure is not recreated when the worker tears down its decoder. They
+    // stay coherent across a reset on their own: frames dropped by `destroy_decoder()` were never
+    // emitted (`on_output` never fired, so they were never counted), while frames already
+    // `post_message`'d before the reset still drain on the main thread and are still counted. So
+    // `emitted - painted` remains the true in-flight backlog. Zeroing only the worker side here
+    // would desync it from the still-monotonic main-thread ACK (the next ACK would set
+    // FRAMES_PAINTED far above a freshly-zeroed FRAMES_EMITTED), flooring paint lag to a false 0
+    // for minutes — hiding exactly the lag this metric exists to surface.
     console::log_1(&"[WORKER] Jitter buffer reset to initial state".into());
 }

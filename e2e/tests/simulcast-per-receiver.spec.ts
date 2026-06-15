@@ -104,7 +104,8 @@
  *       5. Performance panel renders ALL THREE received-quality controls
  *          (video + audio + content) — #1082 structural assertion.
  *       6. AUDIO layering active under the flag (#1082-B: 2 → 3 layers). The
- *          audio needle readout's `L{i}/{N} · {kbps} kbps` reports the live
+ *          audio needle readout's `{Q} · {i}/{N} · {kbps} kbps` (#1222
+ *          quality-letter format) reports the live
  *          per-snapshot `layer_count` (the only DOM signal of audio simulcast);
  *          the ladder-length and bitrate invariants are asserted unconditionally
  *          and the >1-layer assertion is capability-gated like VIDEO send.
@@ -167,14 +168,15 @@
  * the RECEIVE side only; since the unified send+receive panel landed (#1078) the
  * receive controls/needles live under the `perf-recv-*` / `perf-vu-recv-*`
  * namespace (the bare `perf-*` / `perf-vu-*` ids are now the SEND side):
- *   - `[data-testid="open-settings"]`               toolbar gear (settings modal)
- *   - `.device-settings-modal`                      the settings modal root
- *   - `role="tab" name="Performance"`               Performance nav tab
- *   - `#settings-panel-performance`                 the perf tabpanel
+ *   - toolbar "Open Diagnostics" button             opens the Diagnostics drawer
+ *       (#1131: the perf controls MOVED here from the Settings → Performance tab;
+ *        the tab + the `perf-open-diagnostics` cross-nav button are gone)
+ *   - `#diagnostics-sidebar`                        the drawer root scoping perf-*
  *   - `#perf-vu-recv-video-readout`                 video received-quality readout
- *       text format: `L{idx+1}/{count} · {w}x{h}` or "Not receiving"
+ *       text format: `{Q} · {idx+1}/{count} · {w}x{h}` or "Not receiving"
+ *       (#1222: `{Q}` is the quality letter L/M/H, or "1" single-layer)
  *   - `#perf-vu-recv-audio-readout`                 audio received-quality readout
- *       text format: `L{idx+1}/{count} · {kbps} kbps` or "Not receiving"
+ *       text format: `{Q} · {idx+1}/{count} · {kbps} kbps` or "Not receiving"
  *   - `[data-testid="perf-recv-video-range-max"]`   video max-layer range thumb
  *   - `[data-testid="perf-recv-video-auto"]`        video "Reset" button (#1131 §D
  *       REPURPOSED this testid off the former Auto TOGGLE; it is now a plain
@@ -500,37 +502,58 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
 }
 
 /**
- * Open Settings → Performance and return the visible perf tabpanel locator.
+ * Open the in-meeting Diagnostics drawer (the new home of the Performance
+ * controls, #1131) and return the drawer locator that scopes the perf controls.
  *
- * The #1095 redesign REMOVED the old `Receive | Send` direction toggle: every
- * per-kind card now renders both a Sending and a Receiving column at once, so the
- * receive controls/meters (`perf-recv-*` / `perf-vu-recv-*`) are always mounted
- * once the Performance tab is open. We assert the receive video meter is visible
- * as a readiness guard (this whole spec reads RECEIVE needles/controls).
+ * #1131 RELOCATION: the Performance panel MOVED out of the Settings → Performance
+ * modal tab into the right-side Diagnostics drawer (`#diagnostics-sidebar`),
+ * mounted as the "Quality controls" group. The receive controls/meters
+ * (`perf-recv-*` / `perf-vu-recv-*`) now render directly inside the drawer's
+ * `.sidebar-content` (no `#settings-panel-performance` tabpanel any more). The
+ * `perf-*` COMPONENTS are unchanged — only the mount moved — so this spec's
+ * RECEIVE assertions are untouched; only the opening flow swapped from "Settings
+ * → Performance tab" to "Open Diagnostics".
+ *
+ * The #1095 redesign already removed the `Receive | Send` direction toggle: every
+ * per-kind card renders both a Sending and a Receiving column at once, so the
+ * receive controls/meters are always mounted once the drawer is open. We assert
+ * the receive video meter is visible INSIDE the drawer as a readiness +
+ * relocation guard (this whole spec reads RECEIVE needles/controls).
  */
 async function openPerformancePanel(page: Page) {
-  await page.locator('[data-testid="open-settings"]').click();
-  await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
-  await page.getByRole("tab", { name: "Performance" }).click();
-  const panel = page.locator("#settings-panel-performance");
-  await expect(panel).toBeVisible({ timeout: 10_000 });
-  // The #1095 redesign removed the Receive | Send direction toggle: both
-  // directions render together, so the receive-side meter is always present.
-  // Assert it as a readiness guard (was: click the receive toggle segment).
-  await expect(page.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible({ timeout: 5_000 });
-  return panel;
+  // The diagnostics button carries no data-testid; locate it via its tooltip
+  // text (mirrors protocol-selection.spec.ts::openDiagnosticsPanel).
+  const diagButton = page.locator("button", {
+    has: page.locator("span.tooltip", { hasText: "Open Diagnostics" }),
+  });
+  await diagButton.click();
+  const drawer = page.locator("#diagnostics-sidebar");
+  await expect(drawer).toBeVisible({ timeout: 10_000 });
+  // Readiness + relocation proof: the migrated receive video meter is present
+  // INSIDE the drawer (not anywhere else on the page).
+  await expect(drawer.locator('[data-testid="perf-vu-recv-video"]')).toBeVisible({
+    timeout: 10_000,
+  });
+  return drawer;
 }
 
 /**
  * Parse the video received-quality readout `#perf-vu-recv-video-readout`.
  * Returns null while the readout reads "Not receiving" (nothing decoded yet),
- * otherwise `{ layerIndex, layerCount }` (1-based "L{idx+1}/{count}" → 0-based).
+ * otherwise `{ layerIndex, layerCount }`.
+ *
+ * #1222 Directive 4 — the readout format changed from `"L{idx+1}/{count} · …"`
+ * to `"{Q} · {idx+1}/{count} · …"` where `{Q}` is the quality letter
+ * (L/M/H, or "1" for a degenerate single-layer ladder). We parse the
+ * `{position}/{count}` numbers AFTER the leading quality letter + " · "; the
+ * letter itself is not load-bearing for these tests (the position/count is the
+ * 0-based index basis every assertion uses), so we skip past it permissively.
  */
 async function readVideoLayer(
   page: Page,
 ): Promise<{ layerIndex: number; layerCount: number } | null> {
   const text = (await page.locator("#perf-vu-recv-video-readout").textContent())?.trim() ?? "";
-  const m = text.match(/^L(\d+)\/(\d+)/);
+  const m = text.match(/^\S+\s+·\s+(\d+)\/(\d+)/);
   if (!m) return null;
   return { layerIndex: Number(m[1]) - 1, layerCount: Number(m[2]) };
 }
@@ -540,8 +563,9 @@ async function readVideoLayer(
  *
  * The audio readout format (see `format_readout` in
  * `dioxus-ui/src/components/performance_settings.rs`) is
- * `"L{idx+1}/{count} · {kbps} kbps"` while receiving, or "Not receiving" before
- * the first audio frame is decoded.
+ * `"{Q} · {idx+1}/{count} · {kbps} kbps"` while receiving (#1222 Directive 4:
+ * `{Q}` is the quality letter L/M/H, or "1" single-layer), or "Not receiving"
+ * before the first audio frame is decoded.
  *
  * `count` is the LIVE per-snapshot `layer_count` reported by the publisher's
  * audio ladder — this is the only DOM-observable signal of #1082-B (AUDIO went
@@ -551,13 +575,14 @@ async function readVideoLayer(
  * we assert here.
  *
  * Returns null while the readout reads "Not receiving"; otherwise
- * `{ layerIndex (0-based), layerCount, kbps }`.
+ * `{ layerIndex (0-based), layerCount, kbps }`. We skip the leading quality
+ * letter + " · " and parse the `{position}/{count} · {kbps} kbps` tail.
  */
 async function readAudioLayer(
   page: Page,
 ): Promise<{ layerIndex: number; layerCount: number; kbps: number } | null> {
   const text = (await page.locator("#perf-vu-recv-audio-readout").textContent())?.trim() ?? "";
-  const m = text.match(/^L(\d+)\/(\d+)\s+·\s+(\d+)\s+kbps/);
+  const m = text.match(/^\S+\s+·\s+(\d+)\/(\d+)\s+·\s+(\d+)\s+kbps/);
   if (!m) return null;
   return {
     layerIndex: Number(m[1]) - 1,
@@ -916,8 +941,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       await expect(maxThumb).toHaveValue(String(topValue));
 
       // The needle gauge is present and the readout reflects auto-selection
-      // (either actively decoding "L../.." or "Not receiving" before first
-      // frame). It must NOT be artificially clamped — full range is in effect.
+      // (either actively decoding "{Q} · {i}/{n} · …" — #1222 quality-letter
+      // format — or "Not receiving" before the first frame). It must NOT be
+      // artificially clamped — full range is in effect.
       await expect(panel.locator("#perf-vu-recv-video-readout")).toBeVisible();
       await expect
         .poll(
@@ -927,7 +953,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
             intervals: [500, 1000, 2000],
           },
         )
-        .toMatch(/^(L\d+\/\d+|Not receiving)/);
+        .toMatch(/^(\S+ · \d+\/\d+|Not receiving)/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -1030,9 +1056,9 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       }
 
       // The audio readout must be present and reflect a valid state: either
-      // actively decoding ("L../.. kbps") or the "Not receiving" placeholder
-      // before the first audio frame. (Layer-count content is asserted in the
-      // dedicated audio-layering test below.)
+      // actively decoding ("{Q} · {i}/{n} · {kbps} kbps" — #1222 quality-letter
+      // format) or the "Not receiving" placeholder before the first audio frame.
+      // (Layer-count content is asserted in the dedicated audio-layering test below.)
       await expect(panel.locator("#perf-vu-recv-audio-readout")).toBeVisible();
       await expect
         .poll(
@@ -1042,7 +1068,7 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
             intervals: [500, 1000, 2000],
           },
         )
-        .toMatch(/^(L\d+\/\d+ · \d+ kbps|Not receiving)/);
+        .toMatch(/^(\S+ · \d+\/\d+ · \d+ kbps|Not receiving)/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -1052,7 +1078,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // -------------------------------------------------------------------------
   // 6. AUDIO layering is active under the flag (#1082-B: audio 2 → 3 layers).
   //    The only DOM-observable signal of audio simulcast is the audio needle
-  //    readout's reported `layer_count` (`L{i}/{N} · {kbps} kbps`). With the
+  //    readout's reported `layer_count` (`{Q} · {i}/{N} · {kbps} kbps`, #1222
+  //    quality-letter format). With the
   //    flag on and a capable runner, the publisher emits up to 3 audio layers,
   //    so the receiver's readout `N` rises above 1. As with VIDEO send, a weak
   //    CI runner's capability ceiling can clamp audio to a single layer — in
@@ -1149,18 +1176,19 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   //
   // FIXME(#1093): multi-PEER (>= 2 publishers + 1 receiver, i.e. 3 contexts) —
   // needs a renderer-crash-resilient runner + a capability-override hook. After
-  // the #1095 redesign the per-peer receive breakdown lives in the Diagnostics
-  // sidebar (reached via the `diag-open-performance` ⇄ `perf-open-diagnostics`
-  // cross-nav), one block per kind, only rendered when >= 1 peer is decoding that
-  // kind:
+  // the #1131 unification the per-peer receive breakdown lives in the Diagnostics
+  // drawer's "Simulcast layers" section (Group B of the same open drawer), one
+  // block per kind, only rendered when >= 1 peer is decoding that kind:
   //   * 0 peers → the kind block is absent (single-context receive coverage —
   //     the "Not receiving" readout placeholder — is green in
   //     performance-settings.spec.ts → receive-needle/readout tests),
   //   * >= 1 peer → `[data-testid="diag-simulcast-recv-{kind}"]` with a head
-  //     "{kind} · {n} peer(s) · {spread}", the top-3 peers as
+  //     "{kind} · {n} peer(s) · {spread}" where {spread} is the quality-letter
+  //     range (#1222: e.g. "L–H", or a single letter "H" when all peers share a
+  //     layer), the top-3 peers as
   //     `[data-testid="diag-simulcast-recv-peer-{sessionId}"]` rows, plus, when
   //     n > 3, a `[data-testid="diag-simulcast-recv-more-{kind}"]` tail
-  //     ("+{n-3} more peer(s) at L{lo}").
+  //     ("+{n-3} more peer(s) on {Quality}" — the full quality word, e.g. "Low").
   //
   // Exercising the per-peer rows + the "+N more" tail therefore requires a real
   // multi-peer simulcast meeting (>= 2 senders so the receiver has >= 2 peers for
@@ -1173,10 +1201,12 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // INTENDED assertions once #1093 unblocks this (sketch — left unimplemented on
   // purpose so it is a documented stub, not a runnable test):
   //   1. Join >= 2 publishers (cameras ON, flag ON) + 1 receiver into one room.
-  //   2. openPerformancePanel(rxPage), then click `perf-open-diagnostics` to land
-  //      in the Diagnostics sidebar's "Simulcast layers" section.
+  //   2. openPerformancePanel(rxPage) — one open drawer surfaces BOTH the perf
+  //      controls (Group A) and the "Simulcast layers" section (Group B); no
+  //      cross-nav click needed any more (#1131).
   //   3. expect.poll `[data-testid="diag-simulcast-recv-video"]` head to read
-  //      /\d+ peer\(s\) · L/.
+  //      /\d+ peer\(s\) · [LMH]/ (#1222: the spread starts with a quality letter
+  //      L/M/H, not the old "L{n}" number).
   //   4. Assert a `[data-testid="diag-simulcast-recv-peer-{sessionId}"]` row
   //      exists for each visible peer (top-3), and with >= 4 publishers assert
   //      `[data-testid="diag-simulcast-recv-more-video"]` reads /\+\d+ more/.
@@ -1188,7 +1218,8 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   // multi-peer harness will additionally exercise, in the perf panel:
   //   * `[data-testid="perf-recv-{kind}-peers"]` — a native <details> (collapsed
   //     by default) whose `[data-testid="perf-recv-{kind}-peers-summary"]` shows
-  //     "{n} peers · L{lo}–L{hi}". After expanding it:
+  //     "{n} peers · {Qlo}–{Qhi}" (#1222: quality-letter spread, e.g. "L–H").
+  //     After expanding it:
   //   * one `[data-testid="perf-recv-{kind}-peer-{sessionId}"]` row per peer, each
   //     carrying a quality dot `…-peer-{sessionId}-q` (class
   //     `perf-q-dot--{optimal|medium|low}`) and — only when the peer is below the
@@ -1722,7 +1753,9 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 
       // Wait until the receiver is decoding the publisher's VIDEO, then assert
       // the ladder is a SINGLE layer (count == 1). With the flag off the encoder
-      // produces exactly one layer, so the readout must report `L1/1`.
+      // produces exactly one layer, so the readout reports position/count "1/1"
+      // (#1222: the single-layer quality letter is "1", so the readout reads
+      // "1 · 1/1 · …"; `readVideoLayer` parses the position/count tail).
       let video: { layerIndex: number; layerCount: number } | null = null;
       await expect
         .poll(
@@ -1794,12 +1827,14 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 //
 // NOTE — publisher-side DOM observability is NO LONGER a blocker. It WAS (the
 // old design exposed nothing), but the #1095 redesign on THIS branch surfaces the
-// publisher's per-rung send ladder in the Diagnostics sidebar's "Simulcast
+// publisher's per-rung send ladder in the Diagnostics drawer's "Simulcast
 // layers" section: one chip per layer, testid `diag-simulcast-rung-{layer_id}`,
 // with the shed state conveyed by an `is-shed` CSS class (active rungs carry
-// `is-active`). The body below is written against THOSE selectors (reached via
-// the `perf-open-diagnostics` cross-nav on the publisher), so it goes green the
-// moment the #1093 multi-party harness lands — no further UI work is needed.
+// `is-active`). The body below is written against THOSE selectors (reached by
+// simply opening the unified drawer on the publisher — #1131 removed the
+// cross-nav button; the ladder shares the drawer with the perf controls), so it
+// goes green the moment the #1093 multi-party harness lands — no further UI work
+// is needed.
 // (The earlier `perf-video-diag-rung-*` / `data-shed` / `data-bitrate-kbps`
 // contract from the never-merged `feat/perf-panel-simulcast-diagnostics` branch
 // does NOT exist; do not reintroduce it.)
@@ -1903,24 +1938,17 @@ test.describe("Publish-side layer suppression (#1108 Stage 3)", () => {
           timeout: 30_000,
         });
 
-        // Open the receive Performance panels (where the max-layer sliders live)
-        // on both receivers, and the Diagnostics sidebar on the publisher (where
-        // the per-rung SEND ladder now lives after the #1095 redesign — it MOVED
-        // out of the Performance panel into the "Simulcast layers" section). Reach
-        // it via the in-panel "Diagnostics" cross-nav button so this also exercises
-        // the Perf→Diagnostics nav.
+        // Open the unified Diagnostics drawer (#1131) on all three contexts. ONE
+        // surface now hosts BOTH the receive max-layer sliders (Group A — the
+        // migrated Performance panel) AND the publisher's per-rung SEND ladder
+        // (Group B — the "Simulcast layers" section). So the same
+        // `openPerformancePanel` opener gives the receivers their sliders and the
+        // publisher its ladder — no Settings tab, no cross-nav button (both were
+        // removed when the surfaces merged in #1131).
         await openPerformancePanel(rxAPage);
         await openPerformancePanel(rxBPage);
-        await pubPage.locator('[data-testid="open-settings"]').click();
-        await expect(pubPage.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
-        await pubPage.getByRole("tab", { name: "Performance" }).click();
-        await expect(pubPage.locator("#settings-panel-performance")).toBeVisible({
-          timeout: 10_000,
-        });
-        // The publisher's per-rung send ladder is in the Diagnostics sidebar now,
-        // not behind a SEND-direction segment (the Receive | Send toggle was
-        // removed in #1095). Cross-nav to it.
-        await pubPage.locator('[data-testid="perf-open-diagnostics"]').click();
+        await openPerformancePanel(pubPage);
+        // The publisher's per-rung send ladder lives in the SAME open drawer.
         await expect(pubPage.locator("#diagnostics-sidebar.visible")).toBeVisible({
           timeout: 5_000,
         });

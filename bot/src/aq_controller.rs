@@ -42,7 +42,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use videocall_aq::constants::{
     AUDIO_QUALITY_TIERS, DEFAULT_VIDEO_TIER_INDEX, ENCODER_QUEUE_BACKPRESSURE_HIGH,
     SIMULCAST_MAX_LAYERS, VIDEO_QUALITY_TIERS,
@@ -183,10 +183,6 @@ pub struct BotAq {
     last_target_bitrate_kbps_bits: AtomicU32,
     /// Last p75 received FPS as observed by the PID, f32 bits.
     last_p75_peer_fps_bits: AtomicU32,
-    /// fps_ratio = received / target, f32 bits.
-    last_fps_ratio_bits: AtomicU32,
-    /// bitrate_ratio = pid_clamped / tier_ideal, f32 bits.
-    last_bitrate_ratio_bits: AtomicU32,
 
     /// Optional Prometheus metrics handle + pre-built label pair.
     ///
@@ -259,8 +255,6 @@ impl BotAq {
                 (initial_video.ideal_bitrate_kbps as f32).to_bits(),
             ),
             last_p75_peer_fps_bits: AtomicU32::new(0),
-            last_fps_ratio_bits: AtomicU32::new(0),
-            last_bitrate_ratio_bits: AtomicU32::new(0),
             #[cfg(feature = "metrics")]
             metrics: Mutex::new(None),
         };
@@ -321,6 +315,18 @@ impl BotAq {
     /// never probes layers UP. After enabling, the snapshot is republished so the
     /// producers pick up the active count + per-layer targets on their next poll.
     pub fn set_simulcast_layers(&self, n: usize) {
+        // INIT-INVARIANT for `is_simulcast` (issue #1226): this is the SOLE
+        // enabler of simulcast. `is_simulcast` mirrors `simulcast_layer_count >
+        // 1` (the inner controller's `is_simulcast()`), and that topology count
+        // is written ONLY by this init-time configurator — never by any
+        // tick/congestion/shed/restore path (those move `active_layer_count`,
+        // not `simulcast_layer_count`). So once init is done the value is fixed
+        // for the process's life. `publish_simulcast_snapshot_locked` re-stores
+        // `is_simulcast` every tick, but always with this same configured value,
+        // which is what makes the producer's Relaxed read safe (see both store
+        // and load sites). The safety does NOT rest on spawn ordering — every
+        // store writes the identical bit, so a Relaxed reader can never observe a
+        // value that disagrees with the configured topology.
         if n < 2 {
             return; // single-stream: leave the controller (and snapshot) untouched.
         }
@@ -450,32 +456,23 @@ impl BotAq {
         self.publish_simulcast_snapshot_locked(&ctrl);
 
         // Always publish the latest telemetry — useful for health reporting even
-        // when the tier has not changed. NOTE(#1184): the fps_ratio /
-        // bitrate_ratio AQ accessors and their dead proto fields were removed
-        // (receiver FPS no longer feeds the sender AQ); they are sourced as NaN
-        // here so the bot-local atomics/gauges stay wired without a larger
-        // refactor. `encoder_queue_depth` carries the sender backpressure signal
-        // formerly exposed via the misnamed `last_p75_peer_fps`.
+        // when the tier has not changed. NOTE(#1184, see #1228): the
+        // receiver-FPS -> sender-AQ ratio signals (fps_ratio / bitrate_ratio)
+        // were removed — receiver FPS no longer feeds the sender AQ.
+        // `encoder_queue_depth` carries the sender backpressure signal formerly
+        // exposed via the misnamed `last_p75_peer_fps`.
         let target_bitrate = ctrl.last_target_bitrate_kbps() as f32;
         let p75_peer_fps = ctrl.encoder_queue_depth() as f32;
-        let fps_ratio = f32::NAN;
-        let bitrate_ratio = f32::NAN;
         self.last_target_bitrate_kbps_bits
             .store(target_bitrate.to_bits(), Ordering::Relaxed);
         self.last_p75_peer_fps_bits
             .store(p75_peer_fps.to_bits(), Ordering::Relaxed);
-        self.last_fps_ratio_bits
-            .store(fps_ratio.to_bits(), Ordering::Relaxed);
-        self.last_bitrate_ratio_bits
-            .store(bitrate_ratio.to_bits(), Ordering::Relaxed);
 
         // Refresh per-scrape Prometheus gauges every tick.
         #[cfg(feature = "metrics")]
         self.publish_live_metrics(
             target_bitrate,
             p75_peer_fps,
-            fps_ratio,
-            bitrate_ratio,
             ctrl.video_tier_index() as i64,
             ctrl.audio_tier_index() as i64,
         );
@@ -518,7 +515,15 @@ impl BotAq {
             // reader that subsequently does an Acquire load on `tier_epoch`.
             self.tier_epoch.fetch_add(1, Ordering::Release);
 
-            info!(
+            // #654: per-transition log is DEBUG, not INFO. Under a network flap a
+            // large bot fleet flips tiers repeatedly; at INFO each bot emitted one
+            // line per transition, producing a log-storm with no upside —
+            // observability is already covered by the `HealthPacket.tier_transitions`
+            // field (drained in `drain_tier_transitions`, populated by the bot
+            // health reporter) which drives the Prometheus counter
+            // `videocall_tier_transition_total` in the metrics server, independent
+            // of this log level. Keep the line at DEBUG for opt-in local tracing.
+            debug!(
                 "BotAq: tier change -> video='{}' ({}kbps, {}x{}@{}fps, kf={}), audio='{}' ({}kbps, fec={}, dtx={})",
                 video.label,
                 video.ideal_bitrate_kbps,
@@ -562,8 +567,6 @@ impl BotAq {
         &self,
         target_bitrate_kbps: f32,
         p75_peer_fps: f32,
-        fps_ratio: f32,
-        bitrate_ratio: f32,
         video_tier_index: i64,
         audio_tier_index: i64,
     ) {
@@ -584,16 +587,6 @@ impl BotAq {
             .aq_p75_peer_fps
             .with_label_values(&labels)
             .set(p75_peer_fps as f64);
-        binding
-            .metrics
-            .aq_fps_ratio
-            .with_label_values(&labels)
-            .set(fps_ratio as f64);
-        binding
-            .metrics
-            .aq_bitrate_ratio
-            .with_label_values(&labels)
-            .set(bitrate_ratio as f64);
         binding
             .metrics
             .aq_video_tier_index
@@ -630,9 +623,40 @@ impl BotAq {
     ///
     /// Producers compare [`Self::simulcast_epoch`] against a local value each
     /// loop iteration and only call this when it changed. The `Acquire` load of
-    /// the epoch (in `simulcast_epoch()`) synchronizes-with the writer's
-    /// `Release` fetch-add, so the `Relaxed` loads of the count/bitrate fields
-    /// here observe every field written before that epoch bump.
+    /// the epoch (in `simulcast_epoch()`) synchronizes-with the writer's last
+    /// *completed* `Release` fetch-add, so the `Relaxed` loads of the
+    /// count/bitrate fields here observe every field written before that epoch
+    /// bump.
+    ///
+    /// TOLERATED-TEAR INVARIANT (issue #1226). This is deliberately NOT a
+    /// seqlock: the writer ([`Self::publish_simulcast_snapshot_locked`]) bumps
+    /// the epoch exactly ONCE, AFTER its field stores — a single-bump version
+    /// counter, not the even/odd seqlock that would let a reader detect a
+    /// writer mid-flight. So if the writer is between its field stores and its
+    /// (not-yet-issued) epoch bump when this reader runs, the reader can observe
+    /// a TORN snapshot (e.g. a new `active_layer_count` with the previous tick's
+    /// per-layer bitrates). A reader-only retry loop would NOT close that window
+    /// — it would see the unchanged pre-bump epoch on both sides and wrongly
+    /// conclude the read was clean. We accept the tear rather than pay the
+    /// writer-side seqlock complexity (odd-before/even-after Release stores +
+    /// reader spin) because for a load-test bot it is provably harmless:
+    ///
+    /// 1. Every field is BOUNDED — `layer_count`/`active` are small usizes and
+    ///    the bitrates are kbps targets; there is no pointer/length pairing that
+    ///    a tear could make unsound (the slice length below is taken from the
+    ///    single `layer_count` read, then clamped to `SIMULCAST_MAX_LAYERS`, so
+    ///    the iteration can never read out of bounds even on a torn value).
+    /// 2. The CONSUMER clamps anyway — `simulcast_layer_directives` does
+    ///    `active.clamp(1, n_layers)` and only reads `layer_bitrates_kbps[id]`
+    ///    for `id < active`, so a torn `active` cannot silence the base layer or
+    ///    index past the published bitrates.
+    /// 3. It SELF-CORRECTS within one tick — the writer's eventual epoch bump
+    ///    makes the producer re-read on its very next iteration, so a torn value
+    ///    survives at most one render frame and is never latched.
+    ///
+    /// A future change that makes any field a pointer/length pair, removes the
+    /// consumer clamp, or makes a single stale frame load-bearing would break
+    /// this invariant and require promoting the read to a real seqlock.
     pub fn simulcast_snapshot(&self) -> SimulcastSnapshot {
         let layer_count = self.simulcast_layer_count.load(Ordering::Relaxed);
         let active = self.active_layer_count.load(Ordering::Relaxed);
@@ -642,6 +666,14 @@ impl BotAq {
             .map(|a| a.load(Ordering::Relaxed))
             .collect();
         SimulcastSnapshot {
+            // Relaxed is safe here because `is_simulcast` is an INIT-INVARIANT:
+            // it equals `simulcast_layer_count > 1`, and that topology count is
+            // written only by `set_simulcast_layers` at init — no tick/shed/
+            // restore path mutates it. `publish_simulcast_snapshot_locked`
+            // re-stores it every tick, but always with the SAME configured value,
+            // concurrent with this read. Because every store writes the identical
+            // bit, there is no transition for a Relaxed reader to miss or tear —
+            // the observed value can never disagree with the configured topology.
             is_simulcast: self.is_simulcast.load(Ordering::Relaxed),
             layer_count,
             active,
@@ -674,6 +706,17 @@ impl BotAq {
     /// rescale (the cluster validation run reads these) — issue #1083 V21.
     fn publish_simulcast_snapshot_locked(&self, ctrl: &EncoderBitrateController) {
         let is_simulcast = ctrl.is_simulcast();
+        // Relaxed store: `is_simulcast` is an INIT-INVARIANT. `ctrl.is_simulcast()`
+        // is `simulcast_layer_count > 1`, and that topology count is set only by
+        // `set_simulcast_layers` at init — never mutated by tick/shed/restore
+        // (those move `active_layer_count`). So although this store runs on EVERY
+        // tick, it always writes the SAME value the init configurator
+        // established, concurrent with the producer's Relaxed read in
+        // `simulcast_snapshot`. Writing the identical bit repeatedly cannot create
+        // a transition for a Relaxed reader to miss or tear, so no Release/Acquire
+        // pairing is needed. (Only a refactor that let some runtime path change
+        // the layer COUNT — not just the active count — would break this and
+        // require promoting both ends.)
         self.is_simulcast.store(is_simulcast, Ordering::Relaxed);
         if !is_simulcast {
             // Single-stream: keep the snapshot at the inert 1-layer default and
@@ -778,16 +821,6 @@ impl BotAq {
     /// Last observed p75 received FPS as seen by the PID (for health reporting).
     pub fn last_p75_peer_fps(&self) -> f32 {
         f32::from_bits(self.last_p75_peer_fps_bits.load(Ordering::Relaxed))
-    }
-
-    /// Last fps_ratio (received / target) for health reporting.
-    pub fn last_fps_ratio(&self) -> f32 {
-        f32::from_bits(self.last_fps_ratio_bits.load(Ordering::Relaxed))
-    }
-
-    /// Last bitrate_ratio (pid_clamped / tier_ideal) for health reporting.
-    pub fn last_bitrate_ratio(&self) -> f32 {
-        f32::from_bits(self.last_bitrate_ratio_bits.load(Ordering::Relaxed))
     }
 
     /// Snapshot the climb-rate limiter state for health reporting.

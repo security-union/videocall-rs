@@ -446,6 +446,7 @@ jobs:
             --set fullnameOverride=videocall-dioxus-ui \
             --set "runtimeConfig.apiBaseUrl=https://api.videocall.conceptcar7.com" \
             --set "runtimeConfig.meetingApiBaseUrl=https://api.videocall.conceptcar7.com" \
+            --set "runtimeConfig.jmapBaseUrl=https://smatter.conceptcar7.com" \
             --set "runtimeConfig.wsUrl=wss://websocket.videocall.conceptcar7.com" \
             --set "runtimeConfig.webTransportHost=https://webtransport.videocall.conceptcar7.com:30056" \
             --set-string "runtimeConfig.webTransportEnabled=true" \

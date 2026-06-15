@@ -54,6 +54,104 @@ pub fn keyframe_requests_sent_count() -> u64 {
     KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed)
 }
 
+/// Build and emit a single `KEYFRAME_REQUEST` `PacketWrapper` for `peer_user_id`'s
+/// `requested_media_type` stream, keyed to `target_session_id` for the relay's per-session
+/// rate limiter (#1124).
+///
+/// Extracted as a free helper (issue #1025) so BOTH the manager's gap-/visibility-driven
+/// `send_keyframe_request(&self, ...)` AND the worker's proactive eviction route can produce
+/// the **identical** packet without either holding `&PeerDecodeManager`. The proactive route
+/// (`VideoPeerDecoder::set_keyframe_request_route`) captures a cheap clone of the `send_packet`
+/// `Callback` plus the owned `local_user_id` / peer id / session id and calls this directly.
+///
+/// Coalescing (#979 / #1011): this helper does NOT rate-limit. The CLIENT-side per-stream
+/// backoff lives in `SequenceTracker::should_request_keyframe` and gates only the gap-driven
+/// path; the visibility-driven proactive path (and now the eviction-driven one) intentionally
+/// bypass it, exactly as the existing visibility PLIs do. The authoritative coalescer is the
+/// RELAY's per-`(receiver, target_session)` `KEYFRAME_REQUEST` limiter — every request, from
+/// every client subsystem, lands on it as the same `target_session_id`-keyed packet, so a burst
+/// of evictions cannot storm the publisher regardless of how many subsystems ask.
+///
+/// Uses `send_packet` (reliable stream), NOT datagrams: a `KEYFRAME_REQUEST` is a control
+/// message that must be delivered reliably. Sent unencrypted (raw `MediaPacket`) because the
+/// relay must read the target `user_id` / `target_session_id` to route and rate-limit it.
+fn emit_keyframe_request(
+    send_packet: &Callback<PacketWrapper>,
+    local_user_id: &str,
+    peer_user_id: &str,
+    target_session_id: u64,
+    requested_media_type: MediaType,
+) {
+    let media_type_byte = match requested_media_type {
+        MediaType::VIDEO => b"VIDEO".to_vec(),
+        MediaType::SCREEN => b"SCREEN".to_vec(),
+        _ => return,
+    };
+
+    let media_packet = MediaPacket {
+        media_type: MediaType::KEYFRAME_REQUEST.into(),
+        user_id: peer_user_id.as_bytes().to_vec(),
+        target_session_id,
+        data: media_type_byte,
+        ..Default::default()
+    };
+
+    let media_data = match media_packet.write_to_bytes() {
+        Ok(data) => data,
+        Err(e) => {
+            log::warn!("Failed to serialize keyframe request: {}", e);
+            return;
+        }
+    };
+
+    let wrapper = PacketWrapper {
+        packet_type: PacketType::MEDIA.into(),
+        user_id: local_user_id.as_bytes().to_vec(),
+        data: media_data,
+        ..Default::default()
+    };
+
+    KEYFRAME_REQUESTS_SENT.fetch_add(1, Ordering::Relaxed);
+    log::info!(
+        "Sending KEYFRAME_REQUEST to {} (session {}) for {:?}",
+        peer_user_id,
+        target_session_id,
+        requested_media_type
+    );
+    send_packet.emit(wrapper);
+}
+
+/// Install the proactive keyframe-request route (issue #1025) on a peer's VIDEO and SCREEN
+/// decoders. Each route captures a cheap clone of the transport `send_packet` callback plus the
+/// owned local user id, the peer's user id, and the peer's relay `session_id` (the per-session
+/// limiter key, #1124), so it can call [`emit_keyframe_request`] for the right peer + stream
+/// without holding `&PeerDecodeManager`. The worker fires the route when its jitter buffer
+/// evicts a stale keyframe-less backlog for that stream.
+fn install_keyframe_request_routes(
+    peer: &Peer,
+    send_packet: &Callback<PacketWrapper>,
+    local_user_id: &str,
+) {
+    for (decoder, media_type) in [
+        (&peer.video, MediaType::VIDEO),
+        (&peer.screen, MediaType::SCREEN),
+    ] {
+        let send_packet = send_packet.clone();
+        let local_user_id = local_user_id.to_owned();
+        let peer_user_id = peer.user_id.clone();
+        let session_id = peer.session_id;
+        decoder.set_keyframe_request_route(Box::new(move || {
+            emit_keyframe_request(
+                &send_packet,
+                &local_user_id,
+                &peer_user_id,
+                session_id,
+                media_type,
+            );
+        }));
+    }
+}
+
 #[derive(Debug)]
 pub enum PeerDecodeError {
     AesDecryptError,
@@ -2001,8 +2099,23 @@ impl PeerDecodeManager {
     /// `Rc` cycle that otherwise keeps `Inner` alive after the UI scope
     /// holding the client has unmounted (issue: cc7tp meeting incident
     /// 2026-05-01, github01.hclpnp.com/labs-projects/videocall/discussions/502).
+    ///
+    /// Also drops every peer decoder's proactive keyframe-request route (#1025):
+    /// each route closure captured a CLONE of this same `send_packet` `Callback`
+    /// (a strong `Rc` reaching `Inner`) and is stored in a per-decoder slot that
+    /// nulling `self.send_packet` alone does NOT reach — so without this it would
+    /// be a second leg of the same `Rc` cycle, re-leaking `Inner` past teardown.
     pub fn clear_send_packet_callback(&mut self) {
         self.send_packet = None;
+        // Drop each peer decoder's route (interior-mutable slot, so `&Peer` is
+        // enough). `ordered_keys().clone()` + `get` mirrors the established
+        // iteration pattern for this ordered map (it has no `values()`).
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get(&session_id) {
+                peer.video.clear_keyframe_request_route();
+                peer.screen.clear_keyframe_request_route();
+            }
+        }
     }
 
     /// Test/observability helper: report whether the PLI send-packet
@@ -2249,25 +2362,27 @@ impl PeerDecodeManager {
         desired
     }
 
-    /// Early-seed congestion across every peer showing an early-congested sample
-    /// (issue #1179, Part B).
+    /// Early-seed congestion across every connected peer showing an
+    /// early-congested sample (issue #1179, Part B).
     ///
     /// Drives [`Peer::seed_early_congestion`] for each connected peer; the
     /// primitive is itself a no-op on a clean sample, so a peer healthy at join
     /// is seeded nothing. The early-seed primitive's `observe_early_congestion`
-    /// congestion gate is the only thing deciding whether a given peer flips to
-    /// constrained.
+    /// congestion gate is the ONLY thing deciding whether a given peer flips to
+    /// constrained — this method applies NO transport filtering of its own.
     ///
-    /// NOTE — the WebTransport gate is NOT here. #1179's root cause is THIS
-    /// client's own downlink being WebTransport (reliable-unistream flow-control
-    /// pinning), which is a single client-wide boolean — NOT a per-peer property.
-    /// A peer's announced `transport_type` describes that *remote sender's*
-    /// uplink and is the wrong signal for a downlink-pinning bug. The local-WT
-    /// decision is therefore made ONCE by the caller
-    /// ([`crate::client::video_call_client`]'s early-seed timer tick) on the
+    /// NOTE — there is NO transport gate in this method (neither client-wide nor
+    /// per-peer). The WebTransport decision was already made by the caller. #1179's
+    /// root cause is THIS client's own downlink being WebTransport
+    /// (reliable-unistream flow-control pinning), which is a single client-wide
+    /// boolean — NOT a per-peer property. A peer's announced `transport_type`
+    /// describes that *remote sender's* uplink and is the wrong signal for a
+    /// downlink-pinning bug. The local-WT decision is therefore made ONCE by the
+    /// caller ([`crate::client::video_call_client`]'s early-seed timer tick) on the
     /// client's active connection transport, and this loop is only ever reached
-    /// when that gate has passed. Keeping the gate at the call site makes the
-    /// WT-only semantics explicit and removes any per-peer transport read here.
+    /// when that gate has passed. Keeping the gate at the call site removes any
+    /// per-peer transport read here, so this method simply seeds every connected
+    /// peer whose congestion gate trips.
     ///
     /// Returns `true` if any peer was actually seeded (a congested early sample
     /// flipped it to constrained). The caller still emits the resulting
@@ -2278,7 +2393,7 @@ impl PeerDecodeManager {
     /// [`Peer::seed_early_congestion`] so the seeded decode layer is clamped to
     /// the user's per-kind `max`/`min` exactly as the 5s tick clamps its output
     /// (PR #1192 review). Open (default) bounds are an identity clamp.
-    pub fn seed_early_congestion_for_wt_peers(
+    pub fn seed_early_congestion_for_connected_peers(
         &mut self,
         now_ms: u64,
         bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
@@ -2529,6 +2644,14 @@ impl PeerDecodeManager {
         // `userid` is the local (reporting) user — captured before the mutable
         // borrow of `connected_peers` so `Peer::decode` can stamp it as the
         // `from_peer` on its windowed loss/keyframe bus events (#1013).
+        //
+        // Issue #1025: also clone the transport send-packet callback + local user id BEFORE the
+        // mutable borrow of `connected_peers`, so the per-decoder proactive keyframe-request
+        // routes installed in the `!context_initialized` block can capture them without
+        // double-borrowing `self`. `Callback` is a cheap `Rc`-clone. `None` means the transport
+        // isn't wired (e.g. pre-connect / post-disconnect) — the proactive route stays unset.
+        let send_packet_for_route = self.send_packet.clone();
+        let local_user_id_for_route = self.local_user_id.clone();
         if let Some(peer) = self.connected_peers.get_mut(&peer_session_id) {
             let was_screen_enabled = peer.screen_enabled;
             if !peer.context_initialized {
@@ -2536,6 +2659,18 @@ impl PeerDecodeManager {
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
                 peer.screen
                     .set_stream_context(userid.to_string(), peer.sid_str.clone());
+                // Issue #1025: install the proactive keyframe-request route on each video
+                // decoder. The worker fires this (via the jitter buffer) the instant it evicts a
+                // stale keyframe-less backlog for this stream, so we request a fresh keyframe for
+                // THIS peer + media type immediately. Each route is bound to one (peer,
+                // media_type) and emits the identical `KEYFRAME_REQUEST` that the gap-/
+                // visibility-driven paths do, so it flows through the same relay limiter (#979 /
+                // #1011) and cannot storm. Installed only when the transport is wired
+                // (`send_packet` set); `session_id` (not `sid_str`) is the per-session limiter
+                // key (#1124).
+                if let Some(send_packet) = &send_packet_for_route {
+                    install_keyframe_request_routes(peer, send_packet, &local_user_id_for_route);
+                }
                 peer.context_initialized = true;
             }
             match peer.decode(&packet, userid) {
@@ -2651,44 +2786,13 @@ impl PeerDecodeManager {
             debug!("Cannot send KEYFRAME_REQUEST: no send_packet callback");
             return;
         };
-
-        let media_type_byte = match requested_media_type {
-            MediaType::VIDEO => b"VIDEO".to_vec(),
-            MediaType::SCREEN => b"SCREEN".to_vec(),
-            _ => return,
-        };
-
-        let media_packet = MediaPacket {
-            media_type: MediaType::KEYFRAME_REQUEST.into(),
-            user_id: peer_user_id.as_bytes().to_vec(),
-            target_session_id,
-            data: media_type_byte,
-            ..Default::default()
-        };
-
-        let media_data = match media_packet.write_to_bytes() {
-            Ok(data) => data,
-            Err(e) => {
-                log::warn!("Failed to serialize keyframe request: {}", e);
-                return;
-            }
-        };
-
-        let wrapper = PacketWrapper {
-            packet_type: PacketType::MEDIA.into(),
-            user_id: self.local_user_id.as_bytes().to_vec(),
-            data: media_data,
-            ..Default::default()
-        };
-
-        KEYFRAME_REQUESTS_SENT.fetch_add(1, Ordering::Relaxed);
-        log::info!(
-            "Sending KEYFRAME_REQUEST to {} (session {}) for {:?}",
+        emit_keyframe_request(
+            send_packet,
+            &self.local_user_id,
             peer_user_id,
             target_session_id,
-            requested_media_type
+            requested_media_type,
         );
-        send_packet.emit(wrapper);
     }
 
     /// Send a `PEER_EVENT(screen_decode_started)` to the publisher whose
@@ -3315,6 +3419,38 @@ mod tests {
             last_audio_frame_ms: 0,
         };
         (peer, muted_handle)
+    }
+
+    /// #1025 leak guard: `clear_send_packet_callback` (disconnect teardown) must
+    /// drop every peer decoder's keyframe-request route. Each route closure
+    /// captured a clone of `send_packet` (a strong `Rc` reaching `Inner`) and
+    /// lives in a per-decoder slot that nulling `self.send_packet` alone does NOT
+    /// reach — a second leg of the cc7tp/#502 `Rc` cycle.
+    ///
+    /// Mutation coverage: removing the route-clearing loop from
+    /// `clear_send_packet_callback` leaves the routes installed → both asserts fail.
+    #[test]
+    fn clear_send_packet_callback_drops_keyframe_request_routes() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(42);
+        // Simulate a connected, context-initialized peer with routes installed.
+        peer.video.set_keyframe_request_route(Box::new(|| {}));
+        peer.screen.set_keyframe_request_route(Box::new(|| {}));
+        assert!(peer.video.has_keyframe_request_route());
+        assert!(peer.screen.has_keyframe_request_route());
+        manager.connected_peers.insert(42, peer);
+
+        manager.clear_send_packet_callback();
+
+        let peer = manager.connected_peers.get(&42).expect("peer present");
+        assert!(
+            !peer.video.has_keyframe_request_route(),
+            "video keyframe-request route must be cleared on teardown (#1025 leak guard)"
+        );
+        assert!(
+            !peer.screen.has_keyframe_request_route(),
+            "screen keyframe-request route must be cleared on teardown (#1025 leak guard)"
+        );
     }
 
     #[wasm_bindgen_test]
@@ -5435,8 +5571,10 @@ mod tests {
     // Issue #1179, Part B: early-seed wiring (manager level)
     //
     // These exercise the two glue methods the early-seed timer drives:
-    //   * seed_early_congestion_for_wt_peers — WT-ONLY, and a no-op on a
-    //     clean WT join (M2 preserved);
+    //   * seed_early_congestion_for_connected_peers — seeds purely on each
+    //     peer's congestion gate (no transport filtering of its own; the WT
+    //     decision lives at the call site) and is a no-op on a clean join
+    //     (M2 preserved);
     //   * current_desired_preferences — READ-ONLY (advances no hysteresis).
     // -----------------------------------------------------------------
 
@@ -5469,8 +5607,8 @@ mod tests {
     /// UNKNOWN-announcing peer must be seeded exactly like a WT-announcing one.
     ///
     /// MUTATION CHECK: fails if a per-peer `transport_type` gate is (re)introduced
-    /// into `seed_early_congestion_for_wt_peers` — then the WS/UNKNOWN peers would
-    /// NOT be seeded and their desired entries would be missing.
+    /// into `seed_early_congestion_for_connected_peers` — then the WS/UNKNOWN peers
+    /// would NOT be seeded and their desired entries would be missing.
     #[wasm_bindgen_test]
     fn early_seed_constrains_congested_peers_regardless_of_peer_transport() {
         use crate::decode::layer_chooser::PrefMediaKind;
@@ -5491,7 +5629,7 @@ mod tests {
         // Open (default) bounds — these tests cover the unbounded user; the bounds
         // clamp is exercised separately in `early_seed_respects_user_receive_max`.
         let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
-        let seeded = manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        let seeded = manager.seed_early_congestion_for_connected_peers(2000, &bounds);
         assert!(seeded, "the congested peers' samples must seed a constrain");
 
         let desired = manager.current_desired_preferences(2000, &bounds);
@@ -5530,7 +5668,7 @@ mod tests {
         manager.connected_peers.insert(101, peer);
 
         let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
-        let seeded = manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        let seeded = manager.seed_early_congestion_for_connected_peers(2000, &bounds);
         assert!(!seeded, "a clean WT join must seed nothing (M2)");
         let desired = manager.current_desired_preferences(2000, &bounds);
         assert!(
@@ -5571,7 +5709,7 @@ mod tests {
         // `early_seed_respects_user_receive_max`.
         let bounds = crate::decode::layer_chooser::ReceiveLayerBounds::default();
         // Seed: constrains video 2 -> 1 (and audio, video-proxied).
-        assert!(mgr.seed_early_congestion_for_wt_peers(2000, &bounds));
+        assert!(mgr.seed_early_congestion_for_connected_peers(2000, &bounds));
 
         // Load a CLEAN downlink so that IF the accessor (incorrectly) advanced the
         // chooser, the clean-window streak would build and eventually climb.
@@ -5681,7 +5819,7 @@ mod tests {
         let mut bounds = ReceiveLayerBounds::default();
         bounds.set_kind(PrefMediaKind::Video, None, Some(0));
 
-        let seeded = manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        let seeded = manager.seed_early_congestion_for_connected_peers(2000, &bounds);
         assert!(
             seeded,
             "the congested sample must still seed a constrain (clamp is a pure \
@@ -5737,7 +5875,7 @@ mod tests {
         manager.connected_peers.insert(950, peer);
 
         let bounds = ReceiveLayerBounds::default();
-        manager.seed_early_congestion_for_wt_peers(2000, &bounds);
+        manager.seed_early_congestion_for_connected_peers(2000, &bounds);
 
         let desired = manager.current_desired_preferences(2000, &bounds);
         assert_eq!(
@@ -7526,6 +7664,106 @@ mod tests {
         assert!(
             alice.audio_enabled && alice.video_enabled,
             "force-off with no flags set must not change any peer"
+        );
+    }
+
+    /// Issue #1025: the free `emit_keyframe_request` helper — shared by the manager's
+    /// `send_keyframe_request` and the worker-driven proactive route — must build the same
+    /// `KEYFRAME_REQUEST` packet shape the legacy method built and bump the global counter.
+    ///
+    /// This is a NATIVE `#[test]` (not `#[wasm_bindgen_test]`) so it actually runs in CI on a
+    /// box whose browser harness silently no-ops wasm tests. It exercises the exact code the
+    /// proactive eviction route invokes, since that route calls this helper directly.
+    ///
+    /// Mutation coverage: flipping the VIDEO/SCREEN byte, the `KEYFRAME_REQUEST` media_type, the
+    /// `target_session_id`, the inner/outer `user_id`, or removing the counter increment all
+    /// break a concrete assert below.
+    #[test]
+    fn emit_keyframe_request_builds_expected_packet_and_counts() {
+        use std::rc::Rc;
+
+        let captured: Rc<RefCell<Option<PacketWrapper>>> = Rc::new(RefCell::new(None));
+        let sink = captured.clone();
+        let send_packet: Callback<PacketWrapper> = Callback::from(move |p: PacketWrapper| {
+            *sink.borrow_mut() = Some(p);
+        });
+
+        let before = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
+        emit_keyframe_request(
+            &send_packet,
+            "me@example.com",
+            "peer@example.com",
+            4242,
+            MediaType::SCREEN,
+        );
+        // `>` not `==`: KEYFRAME_REQUESTS_SENT is a process-global counter shared
+        // across native tests that cargo runs in parallel threads, so an interleaved
+        // bump from another test could break an exact `before + 1`. The emitted
+        // packet's contents (asserted below) are the real coverage.
+        assert!(
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed) > before,
+            "emit_keyframe_request must bump the sent counter"
+        );
+
+        let wrapper = captured.borrow().clone().expect("packet must be emitted");
+        assert_eq!(wrapper.packet_type, PacketType::MEDIA.into());
+        assert_eq!(
+            wrapper.user_id,
+            b"me@example.com".to_vec(),
+            "outer wrapper user_id is the LOCAL (sending) user"
+        );
+
+        let inner = MediaPacket::parse_from_bytes(&wrapper.data).expect("inner MediaPacket");
+        assert_eq!(inner.media_type, MediaType::KEYFRAME_REQUEST.into());
+        assert_eq!(
+            inner.user_id,
+            b"peer@example.com".to_vec(),
+            "inner user_id is the TARGET peer the relay routes to"
+        );
+        assert_eq!(
+            inner.target_session_id, 4242,
+            "session id is the per-session relay limiter key (#1124)"
+        );
+        assert_eq!(
+            inner.data,
+            b"SCREEN".to_vec(),
+            "SCREEN request must carry the SCREEN stream selector"
+        );
+
+        // VIDEO selector is distinct.
+        captured.borrow_mut().take();
+        emit_keyframe_request(
+            &send_packet,
+            "me@example.com",
+            "peer@example.com",
+            1,
+            MediaType::VIDEO,
+        );
+        let wrapper = captured
+            .borrow()
+            .clone()
+            .expect("video packet must be emitted");
+        let inner = MediaPacket::parse_from_bytes(&wrapper.data).expect("inner MediaPacket");
+        assert_eq!(inner.data, b"VIDEO".to_vec());
+
+        // A non-VIDEO/SCREEN media type is rejected (no emit, no count bump).
+        let before = KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed);
+        captured.borrow_mut().take();
+        emit_keyframe_request(
+            &send_packet,
+            "me@example.com",
+            "peer@example.com",
+            1,
+            MediaType::AUDIO,
+        );
+        assert!(
+            captured.borrow().is_none(),
+            "AUDIO is not a keyframe-bearing stream; emit must be a no-op"
+        );
+        assert_eq!(
+            KEYFRAME_REQUESTS_SENT.load(Ordering::Relaxed),
+            before,
+            "rejected media type must not bump the counter"
         );
     }
 }

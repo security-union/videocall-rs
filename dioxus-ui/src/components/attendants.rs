@@ -17,7 +17,8 @@
  */
 
 use crate::components::decode_budget::{
-    decide_step, effective_cap, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
+    decide_step, effective_cap, ios_decode_tile_ceiling, BudgetSample, BudgetState, BudgetStep,
+    MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
@@ -32,7 +33,7 @@ use crate::components::{
     meeting_ended_overlay::MeetingEndedOverlay,
     peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
-    performance_settings::DiagnosticsReader,
+    performance_settings::{DiagnosticsReader, PerfControlsHandle},
     pre_join_settings_card::PreJoinSettingsCard,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
@@ -40,7 +41,9 @@ use crate::components::{
         MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
     },
 };
-use crate::console_log_collector::{flush_console_logs, set_console_log_context};
+use crate::console_log_collector::{
+    flush_console_logs, set_console_log_auth_token, set_console_log_context,
+};
 use crate::constants::actix_websocket_base;
 use crate::constants::{
     mock_peers_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
@@ -59,6 +62,7 @@ use crate::context::{
     LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap,
     SignalPopupStateMap, TransportPreference, TransportPreferenceCtx,
 };
+use crate::local_storage::{load_f64, save_f64};
 use crate::types::DeviceInfo;
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -82,6 +86,27 @@ use videocall_client::{RefreshRoomTokenCallback, RefreshedTokens};
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
+
+/// Minimum width (px) a drawer can be dragged to. Below this the panel chrome
+/// (headers, controls) stops being usable.
+const DRAWER_MIN_WIDTH: f64 = 240.0;
+/// Absolute maximum drawer width (px). The per-side cap is the smaller of this
+/// and 50% of the viewport (see `max_for_side` in the render body).
+const DRAWER_MAX_ABS: f64 = 720.0;
+
+/// Which drawer (if any) is currently being resized by a pointer drag. Tracked
+/// at the meeting-view level because the width signals live here; the pointer
+/// listeners (onpointerdown/move/up) live on each drawer's own
+/// `.drawer-resize-handle` and use pointer capture (`set_pointer_capture`) so
+/// pointermove/up route to the handle even when the cursor is over the drawer
+/// body or the video tiles. The `#grid-container` onmousemove/up/leave handlers
+/// only drive the screen-share split (`ss_resizing`), NOT drawer resize.
+#[derive(Clone, Copy, PartialEq)]
+enum ResizingDrawer {
+    None,
+    Left,
+    Right,
+}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum ScreenShareState {
@@ -329,6 +354,9 @@ fn schedule_reconnect(
             match crate::meeting_api::refresh_room_token(&meeting_id).await {
                 Ok(new_token) => {
                     log::info!("Room token refreshed, reconnecting with new token");
+                    // Keep console-log uploads authenticated after a reconnect
+                    // (the token rotated). O(1); token value is never logged.
+                    set_console_log_auth_token(&new_token);
                     let latest_display_name = current_display_name();
 
                     // Re-evaluate `webtransport_enabled()` at reconnect time —
@@ -460,6 +488,29 @@ fn show_host_change_toast(
     )));
 }
 
+/// Where a settings deep link should land. The Performance controls moved out of
+/// the Settings modal into the Diagnostics drawer (#1131 unify), so an incoming
+/// `"performance"` section opens the DRAWER, not the modal; every other section
+/// (or none) opens the modal as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SettingsDeepLink {
+    /// Open the right-side Diagnostics drawer (the new home of the Performance
+    /// controls). Do NOT open the Settings modal.
+    Drawer,
+    /// Open the Settings modal (optionally on a requested tab).
+    Modal,
+}
+
+/// Classify a requested settings-section string into where it should open. Pure
+/// so the routing contract is host-testable. The match is case-sensitive,
+/// mirroring `DeviceSettingsModal`'s own `initial_section` mapping.
+pub(crate) fn classify_settings_deep_link(section: Option<&str>) -> SettingsDeepLink {
+    match section {
+        Some("performance") => SettingsDeepLink::Drawer,
+        _ => SettingsDeepLink::Modal,
+    }
+}
+
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
@@ -493,6 +544,54 @@ pub fn AttendantsComponent(
     let mut video_enabled = use_signal(|| false);
     let mut peer_list_open = use_signal(|| false);
     let mut diagnostics_open = use_signal(|| false);
+    // Latch: set true the first time the Diagnostics drawer is opened, never
+    // reset. Once the drawer has been opened at least once, CLOSING it keeps a
+    // lightweight `#diagnostics-sidebar` placeholder in the DOM (without the
+    // `visible` class) instead of unmounting the element entirely — symmetric with
+    // `#peer-list-container`, whose outer div always renders. This is what lets the
+    // both-open close flow observe the drawer LOSE `visible` rather than vanish
+    // (a `:not(.visible)` assertion can't match an element that no longer exists).
+    // Gating the placeholder on "ever opened" preserves the never-opened contract
+    // (the element must NOT exist until the drawer is first opened). The heavy
+    // `Diagnostics` component is still only mounted while actually open, so no
+    // diagnostics work runs for the closed placeholder. (issue 1296 both-open close)
+    let mut diagnostics_was_opened = use_signal(|| false);
+    // Drawer width state. Both drawers are overlay-only: they float over the
+    // tiles and never reflow the grid. Their widths are drag-resizable and
+    // persisted to localStorage. Widths are clamped on load in case a value
+    // persisted by an older/incompatible release no longer satisfies the current
+    // min/max.
+    let mut left_width = use_signal(|| {
+        load_f64("vc_drawer_left_width", 320.0).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS)
+    });
+    let mut right_width = use_signal(|| {
+        load_f64("vc_drawer_right_width", 560.0).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS)
+    });
+    let mut resizing_drawer = use_signal(|| ResizingDrawer::None);
+    // Viewport width snapshotted at drag-start so the move handler does NOT
+    // re-read `window().inner_width()` on every mousemove. (#1296)
+    let mut drag_start_vw = use_signal(|| 0.0f64);
+    // Non-reactive rAF coalescing stash for drawer resize (#1296 perf).
+    // Holds the latest pointer client_x and a "rAF scheduled" flag so a fast
+    // drag writes the width signal at most ONCE per painted frame instead of
+    // once per coalesced pointermove (each width write re-runs the whole
+    // meeting-view body + every keyed PeerTile, stealing the wasm main thread
+    // from live video decode). use_hook => one stable instance across renders;
+    // a signal here would defeat the throttle by triggering a re-render itself.
+    let left_raf_x: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
+    let left_raf_pending: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
+    let right_raf_x: Rc<Cell<f64>> = use_hook(|| Rc::new(Cell::new(0.0)));
+    let right_raf_pending: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
+    // Per-drawer "a real move happened this drag" flag. Reset to false on
+    // pointerdown / on_resize_start; set true the first time a pointermove
+    // arrives. The pointerup / on_resize_end flush is GATED on this so a
+    // no-move interaction (accidental click or focus tap on the handle) does
+    // NOT overwrite the current width with the default stash value (0.0 → min
+    // on the left, vw*0.5 on the right) and does NOT persist that bogus value.
+    // Resetting on drag-start also stops a PRIOR drag's stash from leaking into
+    // a later no-move click. (#1296 regression fix)
+    let left_raf_valid: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
+    let right_raf_valid: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     let mut mock_peers_open = use_signal(|| false);
     let mut controls_visible = use_signal(|| true);
     let mut controls_expanded = use_signal(|| true);
@@ -572,6 +671,22 @@ pub fn AttendantsComponent(
     // it with the live `total_tiles` on the first frame, after which the loop
     // seeds/tracks the cap up to it.
     let mut decode_budget_natural = use_signal(|| MIN_CAP);
+    // Device-class decode-tile ceiling (issue #1286 / #1289). Computed ONCE per
+    // mount (it depends only on the platform + core count, neither of which
+    // changes within a session) and reused by BOTH `effective_cap` call sites
+    // (render + telemetry) and the control loop's growth clamp. `Some(n)` on
+    // iOS (mobile WebKit) where the absence of any valid main-thread-saturation
+    // signal means an unbounded cap can collapse the device; `None` elsewhere
+    // (no extra ceiling). Gated on `is_ios()` specifically, NOT all WebKit:
+    // desktop Safari on capable hardware should not be clamped to a phone-class
+    // budget, and Part A's longtask-blind conservatism already prevents the
+    // unjustified growth there.
+    let device_decode_ceiling: Option<usize> = use_hook(|| {
+        ios_decode_tile_ceiling(
+            is_ios(),
+            videocall_client::utils::hardware_concurrency_cores(),
+        )
+    });
     // Last decode-budget snapshot published to the diagnostics bus (for the
     // HEALTH packet, #987 P3): (effective_cap, natural_capped, pressured,
     // is_fixed, fixed_n). Tracked so the publisher effect only emits a bus
@@ -749,6 +864,39 @@ pub fn AttendantsComponent(
     // Diagnostics sidebar (a sibling of Host that can't reach the encoders) can
     // render the "Simulcast layers" section from the live SEND snapshots. (#1095)
     let diagnostics_reader_sink: Signal<Option<DiagnosticsReader>> = use_signal(|| None);
+    // Host also publishes its Performance controls handle here, so the Diagnostics
+    // drawer can mount the `PerformanceSettingsPanel` (sliders/Auto/meters) — the
+    // panel moved out of the Settings modal into the drawer (#1131 unify).
+    let perf_controls_sink: Signal<Option<PerfControlsHandle>> = use_signal(|| None);
+
+    // Deep-link interception (#1131 unify): a requested `"performance"` section no
+    // longer has a Settings tab — the Performance controls live in the Diagnostics
+    // drawer now. Catch it BEFORE the modal opens: route to the drawer and clear
+    // the requested section so the (closed) modal doesn't keep a dangling
+    // "performance" target. Other sections fall through untouched. The classifier
+    // is the pure `classify_settings_deep_link` (host-tested); this effect only
+    // applies its verdict to the open-state signals.
+    use_effect(move || {
+        if classify_settings_deep_link(device_settings_initial_section().as_deref())
+            == SettingsDeepLink::Drawer
+        {
+            device_settings_open.set(false);
+            device_settings_initial_section.set(None);
+            diagnostics_open.set(true);
+        }
+    });
+
+    // Latch `diagnostics_was_opened` the first time the drawer opens, via ANY path
+    // (toolbar button, deep-link redirect above, etc.). Reading `diagnostics_open`
+    // here subscribes this effect to it; the write is guarded so it only fires once
+    // (and never resets), so it cannot loop. After this latches, closing the drawer
+    // renders the persistent placeholder instead of unmounting. (issue 1296)
+    use_effect(move || {
+        if diagnostics_open() && !diagnostics_was_opened() {
+            diagnostics_was_opened.set(true);
+        }
+    });
+
     let mut connection_error = use_signal(|| None::<String>);
     let mut user_error = use_signal(|| None::<String>);
     let mut display_name_modal_open = use_signal(|| false);
@@ -1015,6 +1163,13 @@ pub fn AttendantsComponent(
             enable_webtransport: effective_wt_enabled,
             on_connected: {
                 let meeting_id_for_log = id.clone();
+                // Initial room_token for console-log upload auth. The collector
+                // re-receives a fresh token on every refresh via
+                // refresh_room_token_callback below, so this only needs to seed
+                // the value at connect time. Empty only in non-JWT dev builds:
+                // the collector treats "" as no token, so the upload is then
+                // unauthenticated — the server has no cookie fallback.
+                let room_token_for_logs = room_token.clone();
                 // Slugify the fallback display name so it passes SAFE_USER_ID_RE
                 // on the server (spaces and other chars would cause a 400).
                 let user_id_for_log = user_id.clone().unwrap_or_else(|| {
@@ -1060,9 +1215,14 @@ pub fn AttendantsComponent(
                         // the genuine per-packet spam now lives at trace!, off by
                         // default even when collecting.
                         let effective_level = crate::constants::log_level_explicit()
-                            .unwrap_or(log::LevelFilter::Debug);
+                            .unwrap_or(crate::constants::COLLECTION_LOG_LEVEL_FALLBACK);
                         log::set_max_level(effective_level);
                         let dn = current_display_name();
+                        // Hand the collector the room_token BEFORE setContext:
+                        // setContext starts the upload timer, so the token must
+                        // already be in place for the very first upload to carry
+                        // `Authorization: Bearer`. Never log the token value.
+                        set_console_log_auth_token(&room_token_for_logs);
                         set_console_log_context(&meeting_id_for_log, &user_id_for_log, &dn);
                     }
                 })
@@ -1680,6 +1840,10 @@ pub fn AttendantsComponent(
                     async move {
                         match crate::meeting_api::refresh_room_token(&meeting_id).await {
                             Ok(new_token) => {
+                                // Keep console-log uploads authenticated across
+                                // token refreshes on long calls. O(1), and the
+                                // token value is never logged.
+                                set_console_log_auth_token(&new_token);
                                 let dn = display_name_signal();
                                 let (ws, wt) = build_lobby_urls(&new_token, &dn, &meeting_id);
                                 // Apply the user's transport preference so
@@ -2016,6 +2180,59 @@ pub fn AttendantsComponent(
         });
     }
 
+    // ── Auto-request media permission for pre-join preview (issue 1134) ──────
+    //
+    // So the camera/mic device selectors appear automatically when the user
+    // lands on the pre-join screen, fire a single permission request on mount.
+    // This fires ONLY on the manual pre-join path (`auto_join == false`); on the
+    // auto-join path (waiting-room admission / direct-URL) the auto-join effect
+    // already owns the single permission request that proceeds to connect, so
+    // this effect early-returns there to avoid a redundant getUserMedia.
+    // This is PREVIEW-ONLY and never auto-joins: it does NOT set
+    // `join_requested`, so `on_result` takes the `else if !join_requested()`
+    // branch (logs the preview message, does not connect), preserving the
+    // issue 933 no-auto-start invariant.
+    //
+    // `request()` is async (spawn_local in media_device_access.rs), so when it
+    // resolves `on_result` sets `media_access_granted = true`. That write
+    // invalidates this effect's subscription and re-runs it once; the
+    // `Rc<Cell<bool>>` one-shot guard — set BEFORE calling `request()` — makes
+    // that re-run a no-op, so the request fires exactly once. (This effect does
+    // NOT re-run on window `focus`: it reads none of the signals a focus event
+    // touches — the separate focus listener, which early-returns while
+    // `meeting_joined` is false, is what keeps focus from acting in pre-join.)
+    // The request is also gated on the live signals so it never fires while in
+    // a meeting, while connecting, or once access is already granted.
+    let auto_requested = use_hook(|| Rc::new(Cell::new(false)));
+    {
+        let mda = mda.clone();
+        let auto_requested = auto_requested.clone();
+        use_effect(move || {
+            // Manual pre-join path only: on the auto-join path the auto-join
+            // effect already owns the single permission request that proceeds
+            // to connect, so skipping here avoids a redundant getUserMedia.
+            if auto_join {
+                return;
+            }
+            // Subscribe to the reactive triggers by reading them in the closure.
+            let joined = meeting_joined();
+            let granted = media_access_granted();
+            let requested = join_requested();
+            // Fire exactly once on a clean pre-join mount: not in a meeting, not
+            // already granted, no join in flight, and the guard not yet tripped.
+            if joined || granted || requested || auto_requested.get() {
+                return;
+            }
+            // Set the guard BEFORE requesting: once `request()` resolves and
+            // `on_result` flips `media_access_granted`, this effect re-runs —
+            // the guard makes that re-run return early, so request() fires once.
+            auto_requested.set(true);
+            // Preview-only: deliberately do NOT set `join_requested` — keeps
+            // `on_result` on the preview branch (no connect).
+            mda.borrow().request();
+        });
+    }
+
     // Keep each pre-join <select>'s DOM `.value` in sync with the restored
     // selection signal once devices are enumerated. (issue #959 restore bug)
     //
@@ -2298,34 +2515,9 @@ pub fn AttendantsComponent(
     use_effect(move || {
         let task = spawn(async move {
             use crate::components::decode_budget::{
-                median_render_fps, non_distress_growth_qualifying, recovery_qualifying, FPS_SEVERE,
-                LONGTASK_SEVERE_MS_PER_SEC, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
+                median_render_fps, non_distress_growth_qualifying, recovery_qualifying,
+                severe_label, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
             };
-
-            /// Severe-tier label for a multi-tile (`magnitude > 1`) down-step,
-            /// reproducing `decide_step`'s catastrophic-pressure test EXACTLY so
-            /// the log is not misled by a single closing sample. FPS uses the
-            /// window median (`<= FPS_SEVERE`); long-task uses the SUSTAINED
-            /// window check (every one of the last `SUSTAIN_SAMPLES` samples at or
-            /// above `LONGTASK_SEVERE_MS_PER_SEC`) — the same condition
-            /// `decide_step` evaluates. Both may be true at once, hence the
-            /// `fps+longtask_severe` combined label. Observation only.
-            fn severe_label(samples: &[BudgetSample], median: Option<f64>) -> &'static str {
-                let fps_severe = median.map(|m| m <= FPS_SEVERE).unwrap_or(false);
-                let longtask_severe = samples.len() >= SUSTAIN_SAMPLES
-                    && samples[samples.len() - SUSTAIN_SAMPLES..]
-                        .iter()
-                        .all(|s| s.longtask_ms_per_sec >= LONGTASK_SEVERE_MS_PER_SEC);
-                match (fps_severe, longtask_severe) {
-                    (true, true) => "fps+longtask_severe",
-                    (true, false) => "fps_severe",
-                    (false, true) => "longtask_severe",
-                    // Unreachable in practice: decide_step only returns magnitude>1
-                    // when at least one severe condition holds. Logged as `unknown`
-                    // rather than asserting, so logging can never panic.
-                    (false, false) => "unknown_severe",
-                }
-            }
             use videocall_diagnostics::{now_ms, MetricValue};
 
             /// Rolling window length (~5 s at 1 Hz). Must be >= SUSTAIN_SAMPLES so
@@ -2337,6 +2529,28 @@ pub fn AttendantsComponent(
             let mut samples: Vec<BudgetSample> = Vec::with_capacity(WINDOW);
             // Sum of long-task durations observed in the *current* (open) bucket.
             let mut longtask_bucket_ms: f64 = 0.0;
+            // #1286: is the Long Tasks API available on THIS browser at all?
+            // Computed ONCE — it cannot change within a session. On WebKit
+            // (desktop Safari + ALL iOS browsers) the `"longtask"`
+            // PerformanceObserver entry type is unimplemented, so
+            // `long_tasks::LongTaskObserver::start` returns `None` and NO
+            // `client_longtask_duration_ms` events are ever emitted. There the
+            // open bucket stays a perpetual 0.0 — indistinguishable from a
+            // genuinely idle Chromium second. So we use the platform capability
+            // (NOT the bucket value) as the discriminator: when the observer is
+            // unsupported, every sample's `longtask` is `None` ("no telemetry"),
+            // and the gate functions treat that conservatively (never confirm
+            // idle / not-busy → never permit growth) instead of reading the
+            // blind 0.0 as healthy. On a supported browser we emit
+            // `Some(bucket_sum)` for every sample, including a legitimate idle
+            // 0.0.
+            //
+            // TODO(#1024/#1025/#1020): WebKit/iOS has NO main-thread-saturation
+            // signal today; the controller relies on FPS + the device-class
+            // tile ceiling (`ios_decode_tile_ceiling`) there. A real iOS-valid
+            // backpressure signal (decode-queue depth) is tracked by
+            // #1024/#1025/#1020 — wire it in when it lands.
+            let longtask_supported = !videocall_client::utils::is_webkit();
             // Controller-owned budget state. `cap` is seeded from the current
             // actuator value; switching the override Auto -> Fixed -> Auto
             // re-seeds it from whatever the cap is at that moment.
@@ -2378,9 +2592,19 @@ pub fn AttendantsComponent(
                 };
 
                 // Close the 1-second bucket into a sample and reset the bucket.
+                // #1286: emit `None` (signal unavailable) on browsers where the
+                // Long Tasks API is unsupported — NOT a blind `Some(0.0)`. The
+                // discriminator is platform capability (`longtask_supported`,
+                // computed once above), not the bucket value: an idle Chromium
+                // second also produces a 0.0 bucket, so the value cannot tell
+                // "no telemetry" from "idle".
                 let sample = BudgetSample {
                     render_fps: Some(fps),
-                    longtask_ms_per_sec: longtask_bucket_ms,
+                    longtask: if longtask_supported {
+                        Some(longtask_bucket_ms)
+                    } else {
+                        None
+                    },
                 };
                 longtask_bucket_ms = 0.0;
                 samples.push(sample);
@@ -2475,6 +2699,13 @@ pub fn AttendantsComponent(
                     // `direction_hold` book-keeping live so the strict-recovery
                     // gate is warm if we ever do step down then recover.
                     state.cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+                    // #1286 belt-and-suspenders: bind the device-class ceiling
+                    // on the loop-owned state too, so `decode_budget_cap` can
+                    // never internally ratchet above what `effective_cap` would
+                    // display on iOS. Floored at MIN_CAP.
+                    if let Some(ceiling) = device_decode_ceiling {
+                        state.cap = state.cap.min(ceiling.max(MIN_CAP));
+                    }
 
                     let qualifies = recovery_qualifying(&samples, SUSTAIN_SAMPLES);
                     if qualifies {
@@ -2489,10 +2720,17 @@ pub fn AttendantsComponent(
                     // natural (the maximum the loop would ever grow to).
                     if let BudgetStep::Down(magnitude) = decide_step(&samples, &state, natural, now)
                     {
-                        // Closing-sample rationale for the decision logs below.
+                        // Telemetry for the decision logs below. Computed once on
+                        // this one-time pressured-latch edge (NOT per tick), so the
+                        // `median_render_fps` recompute cost is irrelevant here
+                        // (contrast the per-tick Auto path, #1001). #1286: render a
+                        // `None` longtask (signal unavailable on WebKit/iOS) as
+                        // "none", mirroring how `median`/`cur_fps` render their
+                        // missing case, so the log never implies a healthy 0.0
+                        // where there is simply no telemetry.
                         let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
                         let cur_fps = samples.last().and_then(|s| s.render_fps);
-                        let longtask = samples.last().map(|s| s.longtask_ms_per_sec).unwrap_or(0.0);
+                        let longtask = samples.last().and_then(|s| s.longtask);
                         let prev_cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
 
                         decode_budget_pressured.set(true);
@@ -2504,10 +2742,10 @@ pub fn AttendantsComponent(
                         // Pressured-latch edge (false->true): the controller now
                         // owns the cap. Trigger is the first measured down-step.
                         log::info!(
-                            "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={} cap={}",
+                            "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={} natural={} cap={}",
                             median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
                             cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                            longtask,
+                            longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                             natural,
                             state.cap,
                         );
@@ -2518,24 +2756,29 @@ pub fn AttendantsComponent(
                         // signature.
                         if magnitude > 1 {
                             log::info!(
-                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={:.0}",
+                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
                                 magnitude,
                                 severe_label(&samples, median),
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                             );
                         }
                         // First cap transition (un-pressured -> pressured down-step).
-                        log::info!(
-                            "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
-                            prev_cap,
-                            state.cap,
-                            magnitude,
-                            median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                            cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                            longtask,
-                            natural,
-                        );
+                        // #1001: gate on an actual change (mirroring the steady
+                        // Auto arm) so a clamp-collapsed `prev_cap` can never log a
+                        // no-op `cap N->N`; the log always reflects real movement.
+                        if state.cap != prev_cap {
+                            log::info!(
+                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
+                                prev_cap,
+                                state.cap,
+                                magnitude,
+                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                natural,
+                            );
+                        }
                     }
                     continue;
                 }
@@ -2555,22 +2798,28 @@ pub fn AttendantsComponent(
                     state.direction_hold = 0;
                 }
 
-                // Closing-sample rationale shared by every decision log in this
-                // arm. Cheap copies only — the `format!` allocations are inlined
-                // lazily into each `log::info!` so they are skipped both on the
-                // steady-state Hold path (no log fires) AND when the log level is
-                // disabled. `median` is also read by the `magnitude > 1` severe
-                // check. Observation only.
-                let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
-                let cur_fps = samples.last().and_then(|s| s.render_fps);
-                let longtask = samples.last().map(|s| s.longtask_ms_per_sec).unwrap_or(0.0);
-
                 // Apply the step: the controller owns cap + last_step_ms.
+                //
+                // #1001: the decision-log telemetry (`median` / `cur_fps` /
+                // `longtask`) is computed INSIDE the Down / Up / growth branches
+                // that actually emit it — never before this `match`.
+                // `median_render_fps` is a `Vec`-alloc + sort (NOT a cheap copy),
+                // so hoisting it here would re-run it on every steady-state Hold
+                // tick for a value Hold never uses. Each branch computes it only
+                // when it is about to log. (`cur_fps` / `longtask` are cheap
+                // `Option<f64>` reads; they ride along for locality.)
                 match step {
                     BudgetStep::Down(magnitude) => {
                         // Proportional/multi-tile down-step (HCL #987 review
                         // FIX 4): `magnitude` is 1 under mild pressure, larger
                         // under catastrophic pressure. Floor at MIN_CAP.
+                        // #1001: telemetry computed here in the consuming branch.
+                        // A Down only fires when `cap > MIN_CAP` (decide_step
+                        // guard), so it always strictly lowers the cap and the cap
+                        // log below always fires — these are never unused.
+                        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                        let cur_fps = samples.last().and_then(|s| s.render_fps);
+                        let longtask = samples.last().and_then(|s| s.longtask);
                         let prev_cap = state.cap;
                         state.cap = state.cap.saturating_sub(magnitude).max(MIN_CAP);
                         state.last_step_ms = now;
@@ -2588,22 +2837,22 @@ pub fn AttendantsComponent(
                         // change.
                         if magnitude > 1 {
                             log::info!(
-                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={:.0}",
+                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
                                 magnitude,
                                 severe_label(&samples, median),
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                             );
                         }
                         if state.cap != prev_cap {
                             log::info!(
-                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
                                 prev_cap,
                                 state.cap,
                                 magnitude,
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
                                 cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                                 natural,
                             );
                         }
@@ -2611,19 +2860,32 @@ pub fn AttendantsComponent(
                     BudgetStep::Up => {
                         let prev_cap = state.cap;
                         state.cap = (state.cap + 1).min(natural.max(MIN_CAP));
+                        // #1286 belt-and-suspenders: never grow past the
+                        // device-class ceiling. (On iOS the up-step gate
+                        // `recovery_qualifying` already returns false for the
+                        // blind longtask, so this rarely fires — but the clamp
+                        // guarantees the cap can't exceed the ceiling on any path.)
+                        if let Some(ceiling) = device_decode_ceiling {
+                            state.cap = state.cap.min(ceiling.max(MIN_CAP));
+                        }
                         state.last_step_ms = now;
                         // A consumed up-step resets the recovery streak so the
                         // next up-step must re-earn RECOVERY_HOLD samples.
                         state.direction_hold = 0;
                         decode_budget_cap.set(state.cap);
                         if state.cap != prev_cap {
+                            // #1001: telemetry computed only when the up-step
+                            // actually moves the cap (and thus logs).
+                            let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                            let cur_fps = samples.last().and_then(|s| s.render_fps);
+                            let longtask = samples.last().and_then(|s| s.longtask);
                             log::info!(
-                                "DecodeBudget: cap {}->{} dir=up magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                "DecodeBudget: cap {}->{} dir=up magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
                                 prev_cap,
                                 state.cap,
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
                                 cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                                 natural,
                             );
                         }
@@ -2673,7 +2935,16 @@ pub fn AttendantsComponent(
                         // `non_distress_growth_qualifying` is the single source
                         // of truth for the non-distress condition (and returns
                         // false on a short/incomplete window, so no underflow).
-                        let target = natural.max(MIN_CAP);
+                        // #1286 belt-and-suspenders: lower the growth target to
+                        // the device-class ceiling so non-distress growth can
+                        // never push the cap past it. (On iOS the gate
+                        // `non_distress_growth_qualifying` already returns false
+                        // for the blind longtask, so this arm rarely runs there;
+                        // capping the target is the guarantee regardless.)
+                        let target = match device_decode_ceiling {
+                            Some(ceiling) => natural.max(MIN_CAP).min(ceiling.max(MIN_CAP)),
+                            None => natural.max(MIN_CAP),
+                        };
                         let up_cooldown_elapsed = (now - state.last_step_ms) >= STEP_UP_COOLDOWN_MS;
                         let not_distressed =
                             non_distress_growth_qualifying(&samples, SUSTAIN_SAMPLES);
@@ -2682,16 +2953,22 @@ pub fn AttendantsComponent(
                             state.cap += 1;
                             state.last_step_ms = now;
                             decode_budget_cap.set(state.cap);
+                            // #1001: telemetry computed only on an actual growth
+                            // step; a steady-state Hold tick never reaches here, so
+                            // `median_render_fps` does not run when nothing changes.
+                            let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                            let cur_fps = samples.last().and_then(|s| s.render_fps);
+                            let longtask = samples.last().and_then(|s| s.longtask);
                             // Non-distress growth: cap re-grows toward natural while
                             // `decide_step` is Holding. dir=growth distinguishes this
                             // from the strict-recovery dir=up step above.
                             log::info!(
-                                "DecodeBudget: cap {}->{} dir=growth magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={:.0} natural={}",
+                                "DecodeBudget: cap {}->{} dir=growth magnitude=1 pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
                                 prev_cap,
                                 state.cap,
                                 median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
                                 cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask,
+                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
                                 natural,
                             );
                         }
@@ -2858,8 +3135,16 @@ pub fn AttendantsComponent(
         let natural_capped = natural.min(CANVAS_LIMIT);
         // Shared three-mode actuator: identical to the render-side
         // `effective_cap` below, so reported telemetry can never drift from
-        // what is on screen (HCL #987 review FIX).
-        let effective = effective_cap(override_mode, pressured, natural, cap);
+        // what is on screen (HCL #987 review FIX). The SAME device-class
+        // ceiling (#1286) is passed so the reported cap matches the rendered
+        // (ceiling-clamped) one on iOS.
+        let effective = effective_cap(
+            override_mode,
+            pressured,
+            natural,
+            cap,
+            device_decode_ceiling,
+        );
 
         // Compact, comparable snapshot. Only emit on a real change so the
         // diagnostics bus (and the health packet) is not spammed per render.
@@ -2948,6 +3233,15 @@ pub fn AttendantsComponent(
             }
         }
     };
+    // Per-side resize cap reused by the drag handler below. The smaller of the
+    // absolute max and half the viewport. The DRAWER_MIN_WIDTH lower bound here is
+    // inert above the 568px breakpoint (where the CSS hides the resize handle on
+    // mobile, vw >= 568 always yields >= 284), but kept for safety if the
+    // breakpoint ever changes.
+    let max_for_side = (vw * 0.5).clamp(DRAWER_MIN_WIDTH, DRAWER_MAX_ABS);
+    // Both drawers are overlay-only — they float over the tiles and never carve
+    // horizontal space out of the grid, so the available tile width is just the
+    // viewport minus padding.
     let avail_w = (vw - pad_left - pad_right).max(0.0);
     let avail_h = (vh - pad_top - pad_bottom).max(0.0);
 
@@ -3067,6 +3361,10 @@ pub fn AttendantsComponent(
         decode_budget_pressured(),
         total_tiles,
         decode_budget_cap(),
+        // #1286: device-class ceiling binds on every mode, including
+        // un-pressured Auto (which otherwise returns the raw natural). Computed
+        // once at mount above.
+        device_decode_ceiling,
     );
     let budget_cap = effective_cap;
     // Natural layout capacity (already bounded by CANVAS_LIMIT through
@@ -3330,8 +3628,9 @@ pub fn AttendantsComponent(
     let tile_count = displayed_tile_count + if overflow_count > 0 { 1 } else { 0 };
 
     let container_style = if has_screen_share {
-        // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85)
-        "position: absolute; inset: 0; width: 100%; height: 100%; \
+        // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85).
+        // The container is full-bleed; the overlay drawers float over it without reflowing it.
+        "position: absolute; left: 0; right: 0; top: 0; bottom: 0; height: 100%; \
          display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
          padding: 16px 16px 80px 16px; \
          align-items: center; box-sizing: border-box; \
@@ -3374,12 +3673,12 @@ pub fn AttendantsComponent(
         };
         format!(
             "display: grid; \
-             position: absolute; inset: 0; \
+             position: absolute; top: 0; bottom: 0; left: 0; right: 0; \
              gap: {gap:.0}px; \
              padding: {pad_top:.0}px {pad_right:.0}px {pad_bottom:.0}px {pad_left:.0}px; \
              box-sizing: border-box; overflow: hidden; \
              flex-direction: unset; flex-wrap: unset; align-items: unset; \
-             width: 100%; height: 100%; \
+             height: 100%; \
              grid-template-columns: {track_cols}; grid-template-rows: {track_rows}; \
              {pack} \
              --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
@@ -3438,10 +3737,19 @@ pub fn AttendantsComponent(
                             mic_on: prejoin_mic_on,
                             on_request_permission: {
                                 let mda = mda.clone();
+                                let auto_requested = auto_requested.clone();
                                 move |_| {
-                                    // Preview-only permission request: does NOT join
-                                    // (join_requested stays false).
-                                    mda.borrow().request();
+                                    // Preview-only permission request: does NOT
+                                    // join (join_requested stays false). Share the
+                                    // on-mount auto-request's one-shot guard so a
+                                    // manual click while the auto-probe is still
+                                    // in flight doesn't fire a second concurrent
+                                    // getUserMedia; still works if the auto-effect
+                                    // never ran (guard not yet set).
+                                    if !auto_requested.get() {
+                                        auto_requested.set(true);
+                                        mda.borrow().request();
+                                    }
                                 }
                             },
                             on_camera_toggle: {
@@ -4217,6 +4525,10 @@ pub fn AttendantsComponent(
                                         let expanded = if controls_expanded() { " controls-expanded" } else { "" };
                                         format!("video-controls-container {pos}{hidden}{expanded}")
                                     },
+                                    // The action bar uses its plain CSS-defined position for each dock
+                                    // (bottom centered, left/right edge-anchored). Overlay drawers float
+                                    // over the tiles and do not reflow the grid, so the bar needs no
+                                    // inline position override.
                                     // Primary: Mic button - always visible
                                     {
                                         let mda_mic = mda.clone();
@@ -4401,11 +4713,15 @@ pub fn AttendantsComponent(
                                                 let opening = !peer_list_open();
                                                 peer_list_open.set(opening);
                                                 if opening {
-                                                    diagnostics_open.set(false);
+                                                    // #1296: the two drawers are now INDEPENDENT —
+                                                    // opening the peer list no longer closes
+                                                    // diagnostics (both overlay drawers can be open
+                                                    // together, floating over the tiles). Only
+                                                    // popovers / dev overlays are dismissed so they
+                                                    // don't float stale.
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);
-
                                                 }
                                             },
                                         }
@@ -4565,17 +4881,22 @@ pub fn AttendantsComponent(
                                                 let opening = !diagnostics_open();
                                                 diagnostics_open.set(opening);
                                                 if opening {
-                                                    peer_list_open.set(false);
-                                                    // Close Device Settings so its
-                                                    // Performance-tab 4Hz tick can't
-                                                    // run alongside the diagnostics
-                                                    // one (symmetry with the reverse
-                                                    // at DeviceSettingsButton; #6).
+                                                    // #1296: the two drawers are now INDEPENDENT —
+                                                    // opening diagnostics no longer closes the peer
+                                                    // list (both can be open together). Device
+                                                    // Settings (a modal) is still closed below as a
+                                                    // UX choice — don't stack a modal over the
+                                                    // drawer (symmetry with the reverse at
+                                                    // DeviceSettingsButton). The old "two 4Hz loops
+                                                    // can't coexist" rationale is moot since the
+                                                    // Performance panel moved into this drawer
+                                                    // (#1131): there is now ONE surface, with two
+                                                    // tick-scoped child components (the panel +
+                                                    // SimulcastLayers) by design.
                                                     device_settings_open.set(false);
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);
-
                                                 }
                                             },
                                         }
@@ -4749,13 +5070,11 @@ pub fn AttendantsComponent(
                                         }
                                     },
                                     reload_devices_counter: reload_devices_counter(),
-                                    // Cross-nav: Performance tab → Diagnostics panel.
-                                    // Close settings, open the diagnostics sidebar. (#1095 §4a)
-                                    on_open_diagnostics: move |_| {
-                                        device_settings_open.set(false);
-                                        diagnostics_open.set(true);
-                                    },
                                     publish_diagnostics_reader: diagnostics_reader_sink,
+                                    // Host publishes its Performance controls handle
+                                    // here so the Diagnostics drawer can mount the
+                                    // panel (sliders/Auto/meters). (#1131 unify)
+                                    publish_perf_controls: perf_controls_sink,
                                 }
                             }
                             if is_guest {
@@ -4779,6 +5098,8 @@ pub fn AttendantsComponent(
                 div {
                     id: "peer-list-container",
                     class: if peer_list_open() { "visible" } else { "" },
+                    // Overlay drawer: floats over the tiles at its (resizable) width.
+                    style: format!("width: {}px", left_width()),
                     if peer_list_open() {
                         PeerList {
                             peers: peers_for_display.clone(),
@@ -4803,6 +5124,169 @@ pub fn AttendantsComponent(
                             on_edit_self_name: {
                                 move |_| {
                                     display_name_modal_open.set(true);
+                                }
+                            },
+                        }
+                        div {
+                            class: "drawer-resize-handle",
+                            role: "separator",
+                            aria_orientation: "vertical",
+                            aria_label: "Resize panel",
+                            tabindex: "0",
+                            // keyboard resize is a follow-up
+                            // Pointer capture: on pointerdown the handle captures the
+                            // pointer so every subsequent pointermove/up is delivered HERE
+                            // even when the pointer is over the drawer body or a tile — that
+                            // is what makes shrink (drag left, over the drawer) work at all.
+                            onpointerdown: {
+                                let lv = left_raf_valid.clone();
+                                let lp = left_raf_pending.clone();
+                                move |evt: PointerEvent| {
+                                    evt.prevent_default();
+                                    resizing_drawer.set(ResizingDrawer::Left);
+                                    // Start a fresh drag with no valid stash yet: the flush in
+                                    // pointerup is skipped until a real pointermove sets this.
+                                    lv.set(false);
+                                    // Defensive: clear any stale pending flag so a fresh drag can always schedule its first rAF (can't start wedged).
+                                    lp.set(false);
+                                    // No start-vw cache: the left edge sits at viewport x=0, so
+                                    // the move handler reads client_x directly. drag_start_vw is
+                                    // only needed by the right drawer.
+                                    let native = evt.as_web_event();
+                                    if let Some(t) = native.target() {
+                                        use wasm_bindgen::JsCast;
+                                        if let Ok(el) = t.dyn_into::<web_sys::Element>() {
+                                            let _ = el.set_pointer_capture(native.pointer_id());
+                                        }
+                                    }
+                                }
+                            },
+                            // rAF-coalesced move: stash the latest client_x and schedule
+                            // at most ONE animation-frame callback per painted frame. The
+                            // callback does the single width.set() — so a fast drag that
+                            // delivers many coalesced pointermoves still causes only one
+                            // re-render per frame, keeping the wasm main thread available
+                            // for live video decode. localStorage is persisted ONLY on
+                            // pointerup (below) to avoid write churn. (#1296 perf)
+                            //
+                            // Each `move` closure takes ownership of its captured Rcs, so
+                            // we pre-clone a dedicated handle for every handler below.
+                            onpointermove: {
+                                let lx = left_raf_x.clone();
+                                let lp = left_raf_pending.clone();
+                                let lv = left_raf_valid.clone();
+                                move |evt: PointerEvent| {
+                                    if resizing_drawer() == ResizingDrawer::Left {
+                                        let client_x = evt.as_web_event().client_x() as f64;
+                                        lx.set(client_x);
+                                        // A real move occurred: the stash now holds a genuine
+                                        // pointer position, so the pointerup flush may apply it.
+                                        lv.set(true);
+                                        if !lp.get() {
+                                            lp.set(true);
+                                            let x_cell = lx.clone();
+                                            let pending_cell = lp.clone();
+                                            let cb = Closure::once_into_js(move |_ts: f64| {
+                                                // Guard: if drag ended before this frame fires,
+                                                // the resizing-state is already None — skip.
+                                                if resizing_drawer() == ResizingDrawer::Left {
+                                                    let x = x_cell.get();
+                                                    left_width.set(
+                                                        x.clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                    );
+                                                }
+                                                pending_cell.set(false);
+                                            });
+                                            let _ = window().request_animation_frame(
+                                                cb.as_ref().unchecked_ref(),
+                                            );
+                                        }
+                                    }
+                                }
+                            },
+                            onpointerup: {
+                                let lx = left_raf_x.clone();
+                                let lp = left_raf_pending.clone();
+                                let lv = left_raf_valid.clone();
+                                move |evt: PointerEvent| {
+                                    if resizing_drawer() == ResizingDrawer::Left {
+                                        evt.prevent_default();
+                                        // Always clear pending so any in-flight rAF callback is
+                                        // a no-op (the resizing-state guard also protects it).
+                                        lp.set(false);
+                                        // Flush ONLY if a real move happened this drag: apply the
+                                        // last MOVED position so the drawer settles exact (not one
+                                        // frame stale) and persist it. A no-move interaction
+                                        // (click / focus tap on the handle) leaves left_width and
+                                        // the persisted value untouched — the stash still holds
+                                        // its default and must not overwrite the current width.
+                                        if lv.get() {
+                                            left_width.set(
+                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                            );
+                                            // Persist on drag-end only; value is already clamped.
+                                            save_f64("vc_drawer_left_width", left_width());
+                                        }
+                                        resizing_drawer.set(ResizingDrawer::None);
+                                    }
+                                }
+                            },
+                            // Pointer stream cancelled (OS gesture, touch interruption,
+                            // lost capture): always clear the pending flag (so any in-flight
+                            // rAF callback sees ResizingDrawer::None and skips the write —
+                            // belt-and-suspenders over the resizing-state guard) and reset
+                            // drag state so it can't latch. The flush+persist applies ONLY
+                            // the last MOVED position and is skipped entirely when no move
+                            // occurred this drag, so a no-move cancel cannot overwrite the
+                            // current width with the default stash. When a real move did
+                            // happen we persist the (already clamped) cancelled width,
+                            // keeping left/right cancel semantics identical.
+                            onpointercancel: {
+                                let lx = left_raf_x.clone();
+                                let lp = left_raf_pending.clone();
+                                let lv = left_raf_valid.clone();
+                                move |_: PointerEvent| {
+                                    if resizing_drawer() == ResizingDrawer::Left {
+                                        lp.set(false);
+                                        if lv.get() {
+                                            left_width.set(
+                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                            );
+                                            // Persist on cancel; value is already clamped.
+                                            save_f64("vc_drawer_left_width", left_width());
+                                        }
+                                        resizing_drawer.set(ResizingDrawer::None);
+                                    }
+                                }
+                            },
+                            // #1296: lost-capture end-of-drag. onpointerup only fires when the
+                            // pointer is released over the captured element; if capture is lost
+                            // some other way (release off-element after capture was dropped, OS
+                            // interruption, element re-render) the browser fires
+                            // `lostpointercapture` on the SAME element that called
+                            // set_pointer_capture — here the handle div (capture is taken on
+                            // evt.target() in onpointerdown, which IS this div). Without this
+                            // handler resizing_drawer would stay Left and a later plain hover over
+                            // the handle (its move guard only checks `== Left`) would keep
+                            // resizing — the latch the user hit. We MIRROR onpointercancel exactly
+                            // so flush/persist/reset semantics are identical: clear pending, flush
+                            // + persist only if a real move happened, then reset to None.
+                            onlostpointercapture: {
+                                let lx = left_raf_x.clone();
+                                let lp = left_raf_pending.clone();
+                                let lv = left_raf_valid.clone();
+                                move |_: PointerEvent| {
+                                    if resizing_drawer() == ResizingDrawer::Left {
+                                        lp.set(false);
+                                        if lv.get() {
+                                            left_width.set(
+                                                lx.get().clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                            );
+                                            // Persist on lost-capture; value is already clamped.
+                                            save_f64("vc_drawer_left_width", left_width());
+                                        }
+                                        resizing_drawer.set(ResizingDrawer::None);
+                                    }
                                 }
                             },
                         }
@@ -4855,7 +5339,20 @@ pub fn AttendantsComponent(
                     MeetingEndedOverlay { message }
                 }
 
-                // Diagnostics sidebar
+                // Diagnostics sidebar.
+                //
+                // The `#diagnostics-sidebar` ELEMENT must persist in the DOM whether
+                // open or closed — symmetric with `#peer-list-container` above, whose
+                // outer div always renders and only toggles the `visible` class. The
+                // heavy `Diagnostics` component (live NetEq subscriptions, charts,
+                // 4 Hz simulcast interval) is still only MOUNTED while open, so there
+                // is no closed-state work; when closed we render a lightweight empty
+                // placeholder div with the same id but WITHOUT `visible`. Previously
+                // the whole element lived inside `if diagnostics_open()`, so closing
+                // it UNMOUNTED `#diagnostics-sidebar` entirely — which broke the
+                // both-open close flow (a `:not(.visible)` assertion can't match an
+                // element that no longer exists) and was asymmetric with the left
+                // drawer. (issue 1296 both-open close)
                 if diagnostics_open() {
                     Diagnostics {
                         is_open: true,
@@ -4867,14 +5364,122 @@ pub fn AttendantsComponent(
                         // Live SEND simulcast reader (published by Host on mount),
                         // for the "Simulcast layers" section. (#1095 §6)
                         diagnostics_reader: diagnostics_reader_sink(),
-                        // Cross-nav: Diagnostics → Performance settings. Close the
-                        // diagnostics panel, open settings on the Performance tab. (#1095 §4b)
-                        on_open_performance: move |_| {
-                            diagnostics_open.set(false);
-                            device_settings_initial_section.set(Some("performance".into()));
-                            device_settings_generation.set(device_settings_generation() + 1);
-                            device_settings_open.set(true);
+                        // Performance controls handle (published by Host on mount),
+                        // for the migrated Performance panel in the drawer's
+                        // "Quality controls" group. (#1131 unify)
+                        perf_controls: perf_controls_sink(),
+                        // Overlay drawer: floats over the tiles at its (resizable) width.
+                        width: right_width(),
+                        // The right handle lives in diagnostics.rs (no access to the width
+                        // signals), so it forwards pointer events here where the math runs.
+                        on_resize_start: {
+                            let rv = right_raf_valid.clone();
+                            let rp = right_raf_pending.clone();
+                            move |_| {
+                                resizing_drawer.set(ResizingDrawer::Right);
+                                // Cache start-of-drag viewport width (not re-read per move).
+                                drag_start_vw.set(vw);
+                                // Start a fresh drag with no valid stash yet: the flush in
+                                // on_resize_end is skipped until a real on_resize_move sets it.
+                                rv.set(false);
+                                // Defensive: clear any stale pending flag so a fresh drag can always schedule its first rAF (can't start wedged).
+                                rp.set(false);
+                            }
                         },
+                        // rAF-coalesced move: stash the raw client_x and schedule at most
+                        // ONE animation-frame callback per painted frame. The callback
+                        // computes the clamped width from the latest stashed x and the
+                        // drag_start_vw captured at drag start — so a fast drag still
+                        // causes only one re-render per frame. inner_width is NOT re-read
+                        // per move (cached in drag_start_vw at on_resize_start). (#1296 perf)
+                        //
+                        // Each `move` closure takes ownership of its captured Rcs, so we
+                        // pre-clone a dedicated handle for each handler below.
+                        on_resize_move: {
+                            let rx = right_raf_x.clone();
+                            let rp = right_raf_pending.clone();
+                            let rv = right_raf_valid.clone();
+                            move |client_x: f64| {
+                                if resizing_drawer() == ResizingDrawer::Right {
+                                    rx.set(client_x);
+                                    // A real move occurred: the stash now holds a genuine
+                                    // pointer position, so the on_resize_end flush may apply it.
+                                    rv.set(true);
+                                    if !rp.get() {
+                                        rp.set(true);
+                                        let x_cell = rx.clone();
+                                        let pending_cell = rp.clone();
+                                        let start_vw = drag_start_vw;
+                                        let cb = Closure::once_into_js(move |_ts: f64| {
+                                            // Guard: if drag ended before this frame fires,
+                                            // the resizing-state is already None — skip.
+                                            if resizing_drawer() == ResizingDrawer::Right {
+                                                let x = x_cell.get();
+                                                right_width.set(
+                                                    (start_vw() - x)
+                                                        .clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                                );
+                                            }
+                                            pending_cell.set(false);
+                                        });
+                                        let _ = window().request_animation_frame(
+                                            cb.as_ref().unchecked_ref(),
+                                        );
+                                    }
+                                }
+                            }
+                        },
+                        on_resize_end: {
+                            let rx = right_raf_x.clone();
+                            let rp = right_raf_pending.clone();
+                            let rv = right_raf_valid.clone();
+                            move |_| {
+                                if resizing_drawer() == ResizingDrawer::Right {
+                                    // Always clear pending so any in-flight rAF callback is a
+                                    // no-op (the resizing-state guard also protects it).
+                                    rp.set(false);
+                                    // Flush ONLY if a real move happened this drag: apply the
+                                    // last MOVED position so the drawer settles exact (not one
+                                    // frame stale) and persist it. A no-move interaction
+                                    // (click / focus tap on the handle) leaves right_width and
+                                    // the persisted value untouched — the stash still holds its
+                                    // default and must not overwrite the current width.
+                                    // Note: on_resize_end is also called from diagnostics.rs
+                                    // onpointercancel AND onlostpointercapture, so end + cancel
+                                    // + lost-capture all share this flush path. (#1296)
+                                    if rv.get() {
+                                        right_width.set(
+                                            (drag_start_vw() - rx.get())
+                                                .clamp(DRAWER_MIN_WIDTH, max_for_side),
+                                        );
+                                        // Persist on drag-end only; value is already clamped.
+                                        save_f64("vc_drawer_right_width", right_width());
+                                    }
+                                    resizing_drawer.set(ResizingDrawer::None);
+                                }
+                            }
+                        },
+                    }
+                } else if diagnostics_was_opened() {
+                    // Closed AFTER having been opened at least once: keep a
+                    // lightweight `#diagnostics-sidebar` placeholder in the DOM (no
+                    // `visible` class, no children) so the both-open close flow can
+                    // observe it lose `visible` rather than vanish. Before the drawer
+                    // is EVER opened this branch does not render, so the never-opened
+                    // contract (`#diagnostics-sidebar` absent until first open) holds.
+                    // The width inline style mirrors the open drawer so a future
+                    // reopen has no layout pop; no children → no diagnostics work runs
+                    // while closed. (issue 1296 both-open close)
+                    div {
+                        id: "diagnostics-sidebar",
+                        class: "",
+                        style: format!("width: {}px", right_width()),
+                        // No `role`/`aria-label` on the EMPTY closed placeholder: a
+                        // labelled landmark with no content would announce an empty
+                        // region to a screen reader. The open `Diagnostics` root
+                        // carries the `role="region"` + label; the placeholder is a
+                        // pure DOM-presence shim so the both-open close flow can see
+                        // the element lose `visible` rather than vanish. (issue 1296)
                     }
                 }
 
@@ -5061,6 +5666,39 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    // ── Settings deep-link routing (#1131 unify) ──
+    // Plain host `#[test]`s (not browser tests): the classifier is pure.
+
+    /// "performance" must route to the Diagnostics DRAWER (its new home), NOT the
+    /// Settings modal. If this reverts to `Modal`, the migration regresses: the
+    /// old Performance tab no longer exists, so the modal would land on a missing
+    /// section. This is the load-bearing assertion of the deep-link repurpose.
+    #[test]
+    fn deep_link_performance_opens_drawer() {
+        assert_eq!(
+            classify_settings_deep_link(Some("performance")),
+            SettingsDeepLink::Drawer
+        );
+    }
+
+    /// Every other section — and `None` — opens the Settings modal as before.
+    #[test]
+    fn deep_link_other_sections_open_modal() {
+        for s in ["audio", "video", "network", "appearance"] {
+            assert_eq!(
+                classify_settings_deep_link(Some(s)),
+                SettingsDeepLink::Modal,
+                "section {s:?} should open the modal"
+            );
+        }
+        assert_eq!(classify_settings_deep_link(None), SettingsDeepLink::Modal);
+        // An unknown section also falls through to the modal (default tab).
+        assert_eq!(
+            classify_settings_deep_link(Some("bogus")),
+            SettingsDeepLink::Modal
+        );
+    }
 
     /// attempt=0 should return Some(d) where d is in the base range.
     /// base = 1000, jitter in [-25%, +25%), so delay in [750, 1250).

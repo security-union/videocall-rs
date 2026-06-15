@@ -1320,6 +1320,17 @@ html[data-theme="light"] #invite-overlay p {
   --status-warning: var(--warning);
   --status-error: var(--error);
 
+  /* Canonical diagnostics quality triple (issue 1222). One source of truth for
+     ALL color-coded surfaces in the Performance & Diagnostics drawer. Declared in
+     this theme-agnostic :root (NOT the dark-default block) because --perf-q-* is
+     split across the html[data-theme="dark|light"] blocks, not :root — declaring
+     the alias here means it is set under EVERY theme. var(--perf-q-*) is resolved
+     by deferred substitution at USE time, so it picks up the active theme's
+     --perf-q-* value. No dark/light duplicate needed. */
+  --diag-q-good: var(--perf-q-optimal);
+  --diag-q-warn: var(--perf-q-medium);
+  --diag-q-poor: var(--perf-q-low);
+
   --space-1: 0.25rem;
   --space-2: 0.5rem;
   --space-3: 0.75rem;

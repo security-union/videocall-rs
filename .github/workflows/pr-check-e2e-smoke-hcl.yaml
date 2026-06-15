@@ -69,6 +69,26 @@ jobs:
         run: |
           sudo find . -mindepth 1 -delete 2>/dev/null || true
 
+      - name: Sweep stale leaked Chromium temp dirs in /tmp
+        # Defensive janitor mirroring e2e-hcl.yaml. This job runs on the
+        # separate `hcl-ci-bvt` host (not the shared `hcl-ci`/videocallci box
+        # that hit 97% disk), but Chromium leaks the same
+        # `/tmp/org.chromium.Chromium.scoped_dir.*` profile dirs on any killed
+        # browser, so the bvt host can fill over time too. Sweep BEFORE the
+        # heavy `npx playwright install chromium` + test run.
+        #
+        # SHARED-HOST SAFETY: delete ONLY dirs older than 24h (`-mmin +1440`)
+        # so any in-flight browser's LIVE scoped_dir (at most a few minutes old
+        # for the ~40s bvt suite) is NEVER touched. `2>/dev/null || true` keeps
+        # a sweep hiccup non-fatal.
+        run: |
+          echo "=== Disk usage BEFORE /tmp sweep ==="
+          df -h / || true
+          echo "=== Sweeping STALE (>24h) leaked Chromium temp profile dirs ==="
+          sudo find /tmp -maxdepth 1 -name "org.chromium.Chromium.scoped_dir.*" -type d -mmin +1440 -exec rm -rf {} \; 2>/dev/null || true
+          echo "=== Disk usage AFTER /tmp sweep ==="
+          df -h / || true
+
       - uses: actions/checkout@v4.2.0
         with:
           clean: false

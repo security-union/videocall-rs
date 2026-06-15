@@ -118,6 +118,15 @@ services:
       # (`RATE_LIMIT_EXCEEDED`) and the cascade times out downstream
       # `toBeVisible()` assertions. See issue #608.
       - DISPLAY_NAME_RATE_LIMIT_DISABLED=true
+      # Enable the console-log upload endpoint so the e2e suite can exercise its
+      # room_token auth contract (see e2e/tests/console-log-upload-auth.spec.ts).
+      # Without this the endpoint returns 404 for ALL requests, which would make
+      # the positive (200) and cross-meeting (403) assertions pass vacuously.
+      # CONSOLE_LOG_DIR points at a guaranteed-writable path inside the
+      # container (the default /data/console-logs is not provisioned in the e2e
+      # stack; the handler canonicalizes the base dir, so it must be writable).
+      - CONSOLE_LOG_UPLOAD_ENABLED=true
+      - CONSOLE_LOG_DIR=/tmp/console-logs
       - RUST_LOG=info
       - CARGO_TARGET_DIR=/app/meeting-api/target
       - CARGO_INCREMENTAL=1

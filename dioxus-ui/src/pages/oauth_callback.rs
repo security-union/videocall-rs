@@ -51,7 +51,9 @@
 //! `client_secret` even for PKCE (confidential clients) cannot use this
 //! flow; use the backend `/api/v1/oauth/exchange` endpoint instead.
 
-use crate::auth::{clear_pkce_state, load_pkce_state, store_access_token, store_id_token};
+use crate::auth::{
+    clear_pkce_state, load_pkce_state, store_access_token, store_id_token, store_refresh_token,
+};
 use crate::constants::{
     meeting_api_base_url, oauth_client_id, oauth_issuer, oauth_redirect_url, oauth_token_url,
 };
@@ -509,6 +511,11 @@ async fn run_callback(query_params: String) -> Result<(), String> {
     store_id_token(&id_token);
     if let Some(ref at) = access_token {
         store_access_token(at);
+    }
+    // Refresh token (only present when the IdP granted offline_access). This is
+    // the PKCE exchange path, so storing unconditionally here is correct.
+    if let Some(rt) = token_resp.refresh_token.filter(|s| !s.is_empty()) {
+        store_refresh_token(&rt);
     }
 
     // ── 10. Upsert the user record on the backend (graceful) ─────────────

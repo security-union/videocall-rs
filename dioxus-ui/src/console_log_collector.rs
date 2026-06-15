@@ -30,6 +30,14 @@ use wasm_bindgen::prelude::*;
       window.__consoleLogCollector.flush();
     }
   }
+  export function set_console_log_auth_token(token) {
+    // Hand the collector the current room_token so its uploads can carry
+    // `Authorization: Bearer <token>`. Called on join and again on every
+    // token refresh so long calls stay authenticated.
+    if (window.__consoleLogCollector && window.__consoleLogCollector.setAuthToken) {
+      window.__consoleLogCollector.setAuthToken(token);
+    }
+  }
 ")]
 extern "C" {
     fn set_console_log_context_with_capability(
@@ -39,6 +47,10 @@ extern "C" {
         capability_score: u32,
     );
     pub fn flush_console_logs();
+    /// Set (or update) the room_token the collector attaches to uploads as
+    /// `Authorization: Bearer <token>`. The token is a credential — never
+    /// log its value. No-op if the collector is the disabled stub.
+    pub fn set_console_log_auth_token(token: &str);
 }
 
 /// Set the console-log-collector context and write the preamble line.

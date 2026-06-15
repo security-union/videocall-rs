@@ -283,13 +283,17 @@ test.describe("Host-gone join check", () => {
   /**
    * Control scenario B:
    *   admitted_can_admit=OFF + end_on_host_leave=ON
-   *   → the meeting is ended when the host leaves, so any subsequent join
-   *     attempt should get a non-200 response (meeting not active / not found),
-   *     but NOT the JOINING_NOT_ALLOWED error specifically.
+   *   → the meeting is ended when the host leaves (server-side guard), so any
+   *     subsequent non-host join attempt must be rejected with
+   *     MEETING_NOT_ACTIVE — the same code the status-polling endpoints return
+   *     for an ended meeting — and NOT the JOINING_NOT_ALLOWED error (that code
+   *     belongs to the WR-on / host-gone branch, not the ended-meeting branch).
    *
-   * This validates that the correct code path is exercised in each branch.
+   * This validates that the correct code path is exercised in each branch and
+   * guards issue #742: an ended meeting must not strand the joiner in a phantom
+   * `waiting_for_meeting` waiting room.
    */
-  test("join after host leaves with end_on_host_leave=ON does not return JOINING_NOT_ALLOWED", async () => {
+  test("join after host leaves with end_on_host_leave=ON is rejected with MEETING_NOT_ACTIVE", async () => {
     const meetingId = `e2e_hgjc_eohl_${Date.now()}`;
     const hostEmail = "hgjc-eohl-host@videocall.rs";
     const hostName = "HGJCEOHLHost";
@@ -306,14 +310,16 @@ test.describe("Host-gone join check", () => {
     const hostJoinRes = await joinMeetingRaw(hostEmail, hostName, meetingId);
     expect(hostJoinRes.ok, "host join should succeed").toBe(true);
 
-    // Host leaves → meeting should be ended by the server.
+    // Host leaves → meeting is ended by the server (end_on_host_leave=ON).
     await leaveMeeting(hostEmail, hostName, meetingId);
 
-    // The late joiner should not see JOINING_NOT_ALLOWED. With end_on_host_leave=ON,
-    // the meeting is ended; the backend returns 200 "waiting_for_meeting" (not 403).
+    // The late joiner must be rejected for an ended meeting (HTTP 400
+    // MEETING_NOT_ACTIVE), not stranded in waiting_for_meeting, and never
+    // JOINING_NOT_ALLOWED (which is the WR-on host-gone branch).
     const lateJoinRes = await joinMeetingRaw(lateEmail, lateName, meetingId);
+    expect(lateJoinRes.status).toBe(400);
     const body = await lateJoinRes.json();
-    expect(body?.result?.code).not.toBe("JOINING_NOT_ALLOWED");
-    expect(body?.result?.status).toBe("waiting_for_meeting");
+    expect(body?.success).toBe(false);
+    expect(body?.result?.code).toBe("MEETING_NOT_ACTIVE");
   });
 });

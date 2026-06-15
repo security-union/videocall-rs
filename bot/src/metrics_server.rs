@@ -30,7 +30,6 @@
 //!
 //! - `bot_aq_video_tier_index`, `bot_aq_audio_tier_index`
 //! - `bot_aq_target_bitrate_kbps`, `bot_aq_p75_peer_fps`
-//! - `bot_aq_fps_ratio`, `bot_aq_bitrate_ratio`
 //! - `bot_netsim_dropped_total`, `bot_netsim_delay_ms`
 //! - `bot_packets_sent_total`, `bot_packets_received_total`
 //! - `bot_packets_parsed_error_total`
@@ -108,8 +107,6 @@ pub struct BotMetrics {
     pub aq_audio_tier_index: IntGaugeVec,
     pub aq_target_bitrate_kbps: GaugeVec,
     pub aq_p75_peer_fps: GaugeVec,
-    pub aq_fps_ratio: GaugeVec,
-    pub aq_bitrate_ratio: GaugeVec,
 
     // ---------------------------------------------------------------------
     // Network-impairment shim counters + histogram.
@@ -169,20 +166,6 @@ impl BotMetrics {
             registry
         )?;
 
-        let aq_fps_ratio = register_gauge_vec_with_registry!(
-            "bot_aq_fps_ratio",
-            "Bot fps_ratio = received / target (driving AQ step-down)",
-            &["bot", "meeting"],
-            registry
-        )?;
-
-        let aq_bitrate_ratio = register_gauge_vec_with_registry!(
-            "bot_aq_bitrate_ratio",
-            "Bot bitrate_ratio = PID-clamped / tier-ideal (driving AQ step-down)",
-            &["bot", "meeting"],
-            registry
-        )?;
-
         let netsim_dropped_total = register_int_counter_vec_with_registry!(
             "bot_netsim_dropped_total",
             "Total packets dropped by the bot network-impairment shim",
@@ -235,8 +218,6 @@ impl BotMetrics {
             aq_audio_tier_index,
             aq_target_bitrate_kbps,
             aq_p75_peer_fps,
-            aq_fps_ratio,
-            aq_bitrate_ratio,
             netsim_dropped_total,
             netsim_delay_ms,
             packets_sent_total,
@@ -373,14 +354,6 @@ mod tests {
             .aq_p75_peer_fps
             .with_label_values(&["b", "m"])
             .set(25.0);
-        metrics
-            .aq_fps_ratio
-            .with_label_values(&["b", "m"])
-            .set(0.83);
-        metrics
-            .aq_bitrate_ratio
-            .with_label_values(&["b", "m"])
-            .set(0.75);
         metrics
             .netsim_dropped_total
             .with_label_values(&["b", "up", "loss"])

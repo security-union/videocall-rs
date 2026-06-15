@@ -161,13 +161,19 @@ pub fn format_simulcast_summary(s: &SimulcastSummary) -> String {
     )
 }
 
-/// Format one SEND simulcast layer line, e.g. `"L1 640×360 · 400 kbps"`. The
-/// `layer_id` is the internal 0-based id; the DISPLAYED layer number is 1-based
-/// (`layer_id + 1`) to match the receive side's `L1/3` convention — users count
-/// layers from 1, not 0. Pure.
-pub fn format_send_layer(layer_id: u32, width: u32, height: u32, bitrate_kbps: u32) -> String {
-    let layer_num = layer_id + 1;
-    format!("L{layer_num} {width}×{height} · {bitrate_kbps} kbps")
+/// Format one SEND simulcast layer line, e.g. `"Low · 640×360 · 400 kbps"`. The
+/// `layer_id` is the internal 0-based id; `count` is the ladder size. The
+/// DISPLAYED label is the quality name (Low/Medium/High) via
+/// [`layer_quality_label`] — the internal id stays 0-based for e2e/protobuf. Pure.
+pub fn format_send_layer(
+    layer_id: u32,
+    count: u32,
+    width: u32,
+    height: u32,
+    bitrate_kbps: u32,
+) -> String {
+    let name = layer_quality_label(layer_id, count, false);
+    format!("{name} · {width}×{height} · {bitrate_kbps} kbps")
 }
 
 /// Format the SEND simulcast header for a kind, e.g.
@@ -185,22 +191,24 @@ pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
     }
 }
 
-/// Format one RECEIVE per-kind line for a peer, e.g. `"video L2/3 · 1280×720"`
-/// or `"audio L1/3 · 24 kbps"`. Returns `None` when the kind is not flowing.
-/// Pure / host-tested.
+/// Format one RECEIVE per-kind line for a peer, e.g. `"video M · 2/3 · 1280×720"`
+/// or `"audio L · 1/3 · 24 kbps"`. The quality LETTER (Low/Med/High → L/M/H) is
+/// followed by the 1-based position/total. Returns `None` when the kind is not
+/// flowing. Pure / host-tested.
 pub fn format_peer_kind_line(
     kind_label: &str,
     snap: Option<&ReceivedLayerSnapshot>,
 ) -> Option<String> {
     let s = snap?;
-    let layer = s.layer_index + 1;
+    let letter = layer_quality_label(s.layer_index, s.layer_count, true);
     let detail = if matches!(s.kind, PrefMediaKind::Audio) {
         format!("{} kbps", s.kbps)
     } else {
         format!("{}×{}", s.width, s.height)
     };
     Some(format!(
-        "{kind_label} L{layer}/{} · {detail}",
+        "{kind_label} {letter} · {}/{} · {detail}",
+        s.layer_index + 1,
         s.layer_count
     ))
 }
@@ -248,6 +256,73 @@ impl PartialEq for DiagnosticsReader {
             && Rc::ptr_eq(&self.send_video, &other.send_video)
             && Rc::ptr_eq(&self.send_screen, &other.send_screen)
             && Rc::ptr_eq(&self.per_peer_receive, &other.per_peer_receive)
+    }
+}
+
+/// Everything [`PerformanceSettingsPanel`] needs that only `Host` can supply,
+/// bundled so it can travel from `Host` (which owns the encoders + preference
+/// signals) to the Diagnostics drawer, which is a SIBLING of `Host` in the
+/// attendants tree and cannot reach those internals directly (#1131 unify).
+///
+/// Before the merge the panel lived inside `Host → DeviceSettingsModal`, so it
+/// received these as ordinary props. Now the panel mounts inside the Diagnostics
+/// drawer, so `Host` builds ONE handle per mount and publishes it through a sink
+/// signal (mirroring the existing `publish_diagnostics_reader` mechanism); the
+/// attendants forward it into `Diagnostics`, which reads the preference signals
+/// and hands the panel its existing value props.
+///
+/// The two preference fields are `Signal`s (not values): the panel's slider
+/// positions are reactive, and a `Signal` read subscribes whatever component
+/// reads it — even across the component-tree boundary — so the controls stay
+/// live without re-plumbing the panel's value-typed props. Preference edits are
+/// user-driven (not tick-rate), so reading them in the drawer body does not
+/// reintroduce the per-tick re-render the scoped 250 ms ticks avoid (#1128).
+///
+/// `Clone` is cheap (`Copy` signals + `Rc` bumps). `PartialEq` compares the
+/// signals by identity (`Signal: Eq`) and the closures/readers by `Rc` pointer,
+/// so a stable per-`Host`-mount handle never spuriously re-renders the drawer.
+#[derive(Clone)]
+pub struct PerfControlsHandle {
+    /// Persisted SEND quality-bounds preference (drives the send slider thumbs).
+    pub performance_preference: Signal<PerformancePreference>,
+    /// Persisted RECEIVE layer-bounds preference (drives the receive thumbs).
+    pub receive_preference: Signal<ReceivePreference>,
+    /// Apply a changed SEND preference (persist + push to encoders).
+    pub on_change: Rc<dyn Fn(PerformancePreference)>,
+    /// Apply a changed RECEIVE preference for one kind (persist + push to client).
+    pub on_receive_change: Rc<dyn Fn((PrefMediaKind, KindReceivePref))>,
+    /// Live camera SEND quality snapshot reader (for the "Sending" video meter).
+    pub read_snapshot: SnapshotReader,
+    /// Live screen SEND quality snapshot reader (for the "Sending" screen meter).
+    pub read_screen_snapshot: ScreenSnapshotReader,
+    /// Per-kind RECEIVE-layer snapshot reader (for the "Receiving" meters).
+    pub received_reader: ReceivedReader,
+    /// Live simulcast/AQ diagnostics for the per-card summary lines + strip.
+    pub diagnostics_reader: DiagnosticsReader,
+    /// Effective VIDEO ladder depth (`min(flag, CPU capability)`).
+    pub video_layer_max: usize,
+    /// Effective SCREEN ladder depth (shares the video CPU capability ceiling).
+    pub screen_layer_max: usize,
+    /// Effective AUDIO ladder depth (NOT CPU-clamped — audio encode is cheap).
+    pub audio_layer_max: usize,
+}
+
+impl PartialEq for PerfControlsHandle {
+    fn eq(&self, other: &Self) -> bool {
+        // Signals compare by identity (`Signal: Eq`); the closures/readers by
+        // allocation identity (one stable set per Host mount); the layer-max
+        // counts by value (deterministic per session).
+        self.performance_preference == other.performance_preference
+            && self.receive_preference == other.receive_preference
+            && Rc::ptr_eq(&self.on_change, &other.on_change)
+            && Rc::ptr_eq(&self.on_receive_change, &other.on_receive_change)
+            && self.read_snapshot == other.read_snapshot
+            && self.read_screen_snapshot == other.read_screen_snapshot
+            && self.received_reader == other.received_reader
+            && self.diagnostics_reader == other.diagnostics_reader
+            && self.video_layer_max == other.video_layer_max
+            && self.screen_layer_max == other.screen_layer_max
+            && self.audio_layer_max == other.audio_layer_max
     }
 }
 
@@ -313,21 +388,51 @@ pub fn format_kbps_compact(kbps: u32) -> String {
     format!("{s}M")
 }
 
-/// Format the RECEIVE per-kind layer spread across peers, e.g. `"L1–L3"`, or
-/// `"L3"` when every peer is on the same layer. `layers` is the list of
-/// 0-based `layer_index` values; the DISPLAYED numbers are 1-based (via `+1`).
-/// Empty → empty string (caller renders the "not receiving" state).
-/// Pure / host-tested.
-pub fn format_receive_spread(layers: &[u32]) -> String {
+/// Position→quality label for simulcast tiers (#1222). `index` is the 0-based
+/// ladder position; `count` the ladder size; `compact` returns the single letter
+/// for space-constrained chips. Degenerate: count<=1 → "Single" (compact "1").
+/// Top index (`count-1`) is always High; everything between 0 and top is Medium.
+/// Pure / host-testable.
+pub fn layer_quality_label(index: u32, count: u32, compact: bool) -> &'static str {
+    if count <= 1 {
+        return if compact { "1" } else { "Single" };
+    }
+    if count == 2 {
+        return match (index, compact) {
+            (0, false) => "Low",
+            (0, true) => "L",
+            (_, false) => "High",
+            (_, true) => "H",
+        };
+    }
+    let top = count - 1;
+    match (index, compact) {
+        (0, false) => "Low",
+        (0, true) => "L",
+        (i, false) if i >= top => "High",
+        (i, true) if i >= top => "H",
+        (_, false) => "Medium",
+        (_, true) => "M",
+    }
+}
+
+/// Format the RECEIVE per-kind layer spread across peers by quality LETTER, e.g.
+/// `"L–H"`, or a single letter `"H"` when every peer is on the same layer.
+/// `layers` is the list of 0-based `layer_index` values; `count` is the ladder
+/// size for the kind (the basis for the quality letters). Empty → empty string
+/// (caller renders the "not receiving" state). Pure / host-tested.
+pub fn format_receive_spread(layers: &[u32], count: u32) -> String {
     let Some(&first) = layers.first() else {
         return String::new();
     };
-    let lo = layers.iter().copied().min().unwrap_or(first) + 1;
-    let hi = layers.iter().copied().max().unwrap_or(first) + 1;
+    let lo = layers.iter().copied().min().unwrap_or(first);
+    let hi = layers.iter().copied().max().unwrap_or(first);
+    let lo_letter = layer_quality_label(lo, count, true);
+    let hi_letter = layer_quality_label(hi, count, true);
     if lo == hi {
-        format!("L{lo}")
+        hi_letter.to_string()
     } else {
-        format!("L{lo}–L{hi}")
+        format!("{lo_letter}\u{2013}{hi_letter}")
     }
 }
 
@@ -474,16 +579,16 @@ pub fn send_rungs_aria(rungs: &[SendRung]) -> String {
     }
 }
 
-/// VIDEO RECEIVE summary, e.g. `"Pulling up to high quality · L1–L3 across 4
+/// VIDEO RECEIVE summary, e.g. `"Pulling up to high quality · L–H across 4
 /// peers"`. No peers → `"Not receiving video"`. `layers` is the per-peer
-/// `layer_index` list (1-indexed for display via [`format_receive_spread`]).
-/// Pure / host-tested.
-pub fn format_video_receive_summary(layers: &[u32]) -> String {
+/// `layer_index` list; `count` is the video ladder size (the basis for the
+/// quality letters via [`format_receive_spread`]). Pure / host-tested.
+pub fn format_video_receive_summary(layers: &[u32], count: u32) -> String {
     let n = layers.len();
     if n == 0 {
         return "Not receiving video".to_string();
     }
-    let spread = format_receive_spread(layers);
+    let spread = format_receive_spread(layers, count);
     let peers = if n == 1 {
         "1 peer".to_string()
     } else {
@@ -612,17 +717,16 @@ pub fn format_content_send_summary(snap: Option<&SimulcastSendSnapshot>) -> Stri
 }
 
 /// CONTENT (screen) RECEIVE summary. No peer sharing → `"Nobody is sharing"`;
-/// otherwise `"Pulling full quality · L{i} · {w}×{h}"` for the top-layer peer.
+/// otherwise `"Pulling full quality · {letter} · {w}×{h}"` for the top-layer
+/// peer, where the letter is the quality tier (L/M/H) of the received layer.
 /// `top` is the highest-layer peer snapshot currently received. Pure.
 pub fn format_content_receive_summary(top: Option<&ReceivedLayerSnapshot>) -> String {
     match top {
         None => "Nobody is sharing".to_string(),
-        Some(s) => format!(
-            "Pulling full quality · L{} · {}×{}",
-            s.layer_index + 1,
-            s.width,
-            s.height
-        ),
+        Some(s) => {
+            let q = layer_quality_label(s.layer_index, s.layer_count, true);
+            format!("Pulling full quality · {q} · {}×{}", s.width, s.height)
+        }
     }
 }
 
@@ -704,23 +808,36 @@ pub fn reason_aria_clause(r: DegradeReason) -> &'static str {
     }
 }
 
-/// The per-peer row metric text (§3). video/screen `"{res} · ~{kbps} · L{i}/{n}"`;
-/// audio `"{kbps}k · {label} · L{i}/{n}"`. `n` is the FULL-ladder length (so the
-/// "L i / n" denominator matches the color basis). `audio_label` is the receive
-/// audio rung label (e.g. "mid (32k)") supplied by the caller (the receive
-/// submodule owns that mapping). Pure / host-tested.
+/// The per-peer row metric text (§3, Directive 4 SITE 6b). video/screen
+/// `"{res} · ~{kbps} · {Q} · {i}/{n}"`; audio `"{kbps}k · {label} · {Q} · {i}/{n}"`,
+/// where `{Q}` is the quality LETTER (L/M/H via [`layer_quality_label`]) and `n`
+/// is the FULL-ladder length (so the `{i}/{n}` denominator matches the color
+/// basis). `audio_label` is the receive audio rung label (e.g. "mid (32k)")
+/// supplied by the caller (the receive submodule owns that mapping). Pure /
+/// host-tested.
+///
+/// NOTE (#1222): this helper is shared with the signal-quality popup
+/// (`signal_quality.rs`). The drawer layer-name rename (Directive 4) is global,
+/// so the visible `L{i}/{n}` → `{Q} · {i}/{n}` swap propagates to that surface
+/// too; its unit test + doc comment are updated in lockstep (Option A).
 pub fn peer_row_metric(
     snap: &ReceivedLayerSnapshot,
     full_ladder_len: u32,
     audio_label: &str,
 ) -> String {
     let i = snap.layer_index + 1;
+    // Quality LETTER (L/M/H) over the FULL ladder — the internal layer_index
+    // stays 0-based; only the visible chip changes (e2e/protobuf stability).
+    let q = layer_quality_label(snap.layer_index, full_ladder_len, true);
     if matches!(snap.kind, PrefMediaKind::Audio) {
-        format!("{}k · {} · L{i}/{full_ladder_len}", snap.kbps, audio_label)
+        format!(
+            "{}k · {} · {q} · {i}/{full_ladder_len}",
+            snap.kbps, audio_label
+        )
     } else {
         let res = format_send_layer_short(snap.width, snap.height);
         format!(
-            "{res} · ~{} · L{i}/{full_ladder_len}",
+            "{res} · ~{} · {q} · {i}/{full_ladder_len}",
             format_kbps_compact(snap.kbps)
         )
     }
@@ -1955,12 +2072,288 @@ fn DualRangeSlider(
     }
 }
 
-/// A self-contained "?" help popover button (shared by send + receive rows).
+/// A self-contained "?" help popover button (shared by send + receive rows, and
+/// by the Diagnostics drawer's NetEq sections — #1131 cleanup).
 ///
 /// `open_help` is the shared single-open signal keyed by `key_id`. Opening one
-/// closes any other (since they all share the signal).
+/// closes any other (since they all share the signal). Reuses the `.perf-help*`
+/// styles (44×44 hit area, focus ring, aria-expanded, Escape/outside-click close,
+/// focus return) so every caller gets the same a11y treatment for free.
+///
+/// Gap between the "?" button and its popover (matches the legacy `calc(100% +
+/// 8px)` offset). Also used as the viewport edge margin so the popover never sits
+/// flush to a screen edge.
+const HELP_POPOVER_GAP_PX: f64 = 8.0;
+
+/// Pure positioning math for the help popover, in viewport (CSS-pixel) coords.
+///
+/// The popover is rendered `position: fixed` so it escapes the Diagnostics
+/// drawer's scroll-clip (`#diagnostics-sidebar { overflow-y: auto }` clips BOTH
+/// axes per the CSS overflow-propagation rule). This function returns the popover
+/// top-left in VIEWPORT coords computed from the button's rect. NOTE: an OPEN
+/// drawer carries a non-`none` `transform` (`#diagnostics-sidebar.visible {
+/// transform: translateX(0) }`), which makes the drawer the containing block for
+/// the `position: fixed` popover — so these viewport coords cannot be written to
+/// `left/top` directly. `reposition_help_popover` (the only caller) maps them into
+/// that containing block before writing them; this function is purely the viewport
+/// math and is unit-tested in isolation.
+///
+/// Rules:
+///   - Horizontal: align the popover's LEFT to the button's left, then clamp into
+///     `[gap, viewport_w - w - gap]`. A button near the RIGHT drawer border is
+///     pulled left so the popover never overhangs the border (fixes the
+///     right-edge clip); a button near the left can't push it off-screen left.
+///   - Vertical: prefer BELOW the button (`button_bottom + gap`). If that would
+///     overflow the bottom margin AND there is more room ABOVE than below, FLIP to
+///     above (`button_top - gap - h`). Finally clamp into the vertical viewport
+///     so it can never spill past the top/bottom fold (fixes the bottom-fold
+///     clip). The flip is what a pure-CSS `top: calc(100% + 8px)` could not do.
+///
+/// Pure data in → `(left, top)` out, so it is unit-tested without a browser.
+fn compute_help_popover_position(
+    btn_left: f64,
+    btn_top: f64,
+    btn_bottom: f64,
+    popup_w: f64,
+    popup_h: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+) -> (f64, f64) {
+    let gap = HELP_POPOVER_GAP_PX;
+
+    // Horizontal: left-align to the button, clamp into the viewport.
+    let max_left = (viewport_w - popup_w - gap).max(gap);
+    let left = btn_left.clamp(gap, max_left);
+
+    // Vertical: below by default; flip above when below overflows and above has
+    // more room.
+    let space_below = viewport_h - btn_bottom - gap;
+    let space_above = btn_top - gap;
+    let below_top = btn_bottom + gap;
+    let above_top = btn_top - gap - popup_h;
+    let max_top = (viewport_h - popup_h - gap).max(gap);
+    let top = if popup_h <= space_below {
+        // Fits below.
+        below_top
+    } else if space_above > space_below {
+        // Doesn't fit below and there's more room above → flip up, clamp so a
+        // very tall popover can't run off the TOP edge.
+        above_top.clamp(gap, max_top)
+    } else {
+        // More room below (or equal) but still doesn't fully fit → keep below,
+        // clamped (the popover's own max-height + internal scroll keep it usable).
+        below_top.clamp(gap, max_top)
+    };
+
+    (left, top)
+}
+
+/// Position the `position: fixed` help popover under (or above) its button, in
+/// the viewport, and keep it there while open. Reuses the codebase's established
+/// "fixed + clamp + reposition on scroll(capture)/resize + `use_drop` teardown"
+/// pattern (see `signal_quality::install_popup_anchor`) so the popover genuinely
+/// escapes the drawer's scroll-clip on every edge — without portaling the node out
+/// of its `.perf-help` wrapper, so all ids/testids/aria/scrim wiring stay put.
+///
+/// `open` gates installation: listeners + the initial rAF layout are attached only
+/// while the popover is open, and torn down when it closes or the component
+/// unmounts. `btn_id`/`popup_id` are read live each reposition tick so a stale
+/// rect is never used.
+///
+/// `open_help`/`key_id` (not a plain `bool`) are taken so the effect READS the
+/// signal inside its body and therefore re-runs every time the popover opens or
+/// closes WHILE the component stays mounted — the `HelpPopover` button is always
+/// mounted, so a captured `bool` would be read once at mount (`false`) and never
+/// re-fire on open. (Adversarial check 1: the `SimulcastLayersSection` bool-prop
+/// effect only "works" because that whole subtree mounts/unmounts; this one does
+/// not, so it must subscribe to the signal.)
+fn use_help_popover_anchor(
+    open_help: Signal<Option<&'static str>>,
+    key_id: &'static str,
+    btn_id: String,
+    popup_id: String,
+) {
+    use std::cell::RefCell;
+    use wasm_bindgen::closure::Closure;
+
+    struct AnchorState {
+        win: web_sys::Window,
+        resize_cb: Closure<dyn FnMut()>,
+        scroll_cb: Closure<dyn FnMut()>,
+    }
+
+    let state: Rc<RefCell<Option<AnchorState>>> = use_hook(|| Rc::new(RefCell::new(None)));
+
+    {
+        let state = state.clone();
+        use_effect(move || {
+            // Read the signal INSIDE the effect so it re-runs on every open/close.
+            let open = open_help() == Some(key_id);
+
+            // Tear down any previous installation first (open→close, or a
+            // re-run) so listeners never stack.
+            if let Some(prev) = state.borrow_mut().take() {
+                let _ = prev.win.remove_event_listener_with_callback(
+                    "resize",
+                    prev.resize_cb.as_ref().unchecked_ref(),
+                );
+                let _ = prev.win.remove_event_listener_with_callback_and_bool(
+                    "scroll",
+                    prev.scroll_cb.as_ref().unchecked_ref(),
+                    true,
+                );
+            }
+
+            if !open {
+                return;
+            }
+            let Some(win) = web_sys::window() else {
+                return;
+            };
+
+            let reposition = {
+                let btn_id = btn_id.clone();
+                let popup_id = popup_id.clone();
+                move || reposition_help_popover(&btn_id, &popup_id)
+            };
+
+            // First paint can race the popover attaching to the DOM, so lay it
+            // out on the next animation frame (after the layout engine can
+            // measure the popover's natural size).
+            {
+                let rep = reposition.clone();
+                let cb = Closure::once_into_js(move |_ts: f64| rep());
+                let _ = win.request_animation_frame(cb.as_ref().unchecked_ref());
+            }
+
+            let resize_cb: Closure<dyn FnMut()> = Closure::new({
+                let rep = reposition.clone();
+                move || rep()
+            });
+            let _ =
+                win.add_event_listener_with_callback("resize", resize_cb.as_ref().unchecked_ref());
+
+            // Capture-phase scroll so we observe scrolling on the drawer (any
+            // ancestor scroll container), not just the window.
+            let scroll_cb: Closure<dyn FnMut()> = Closure::new({
+                let rep = reposition.clone();
+                move || rep()
+            });
+            let _ = win.add_event_listener_with_callback_and_bool(
+                "scroll",
+                scroll_cb.as_ref().unchecked_ref(),
+                true,
+            );
+
+            *state.borrow_mut() = Some(AnchorState {
+                win,
+                resize_cb,
+                scroll_cb,
+            });
+        });
+    }
+
+    use_drop(move || {
+        if let Some(prev) = state.borrow_mut().take() {
+            let _ = prev.win.remove_event_listener_with_callback(
+                "resize",
+                prev.resize_cb.as_ref().unchecked_ref(),
+            );
+            let _ = prev.win.remove_event_listener_with_callback_and_bool(
+                "scroll",
+                prev.scroll_cb.as_ref().unchecked_ref(),
+                true,
+            );
+        }
+    });
+}
+
+/// Measure the button + popover, compute the popover's target top-left in VIEWPORT
+/// coords, then map those into the popover's actual containing block before writing
+/// `left/top`. The open Diagnostics drawer carries a `transform`, which makes IT
+/// (not the viewport) the containing block for the `position: fixed` popover and
+/// also scrolls it; the mapping below (subtract the offsetParent rect, add back its
+/// scroll) is what makes the popover land at the intended viewport position. No-op
+/// if either element is absent or the window is unavailable.
+fn reposition_help_popover(btn_id: &str, popup_id: &str) {
+    let Some(win) = web_sys::window() else {
+        return;
+    };
+    let Some(doc) = win.document() else {
+        return;
+    };
+    let (Some(btn), Some(popup)) = (
+        doc.get_element_by_id(btn_id),
+        doc.get_element_by_id(popup_id),
+    ) else {
+        return;
+    };
+    let btn_rect = btn.get_bounding_client_rect();
+    let popup_rect = popup.get_bounding_client_rect();
+    let viewport_w = win
+        .inner_width()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+    let viewport_h = win
+        .inner_height()
+        .ok()
+        .and_then(|v| v.as_f64())
+        .unwrap_or(0.0);
+
+    let (left, top) = compute_help_popover_position(
+        btn_rect.left(),
+        btn_rect.top(),
+        btn_rect.bottom(),
+        popup_rect.width(),
+        popup_rect.height(),
+        viewport_w,
+        viewport_h,
+    );
+
+    if let Some(html) = popup.dyn_ref::<web_sys::HtmlElement>() {
+        // (left, top) are VIEWPORT coords. But the popover is `position: fixed`
+        // INSIDE the Diagnostics drawer, and the drawer carries a non-`none`
+        // `transform` while open (`#diagnostics-sidebar.visible { transform:
+        // translateX(0) }`). A transformed ancestor becomes the containing block
+        // for its `position: fixed` descendants, so the popover's inline `left/top`
+        // are interpreted RELATIVE TO THAT ANCESTOR'S box, not the viewport — and
+        // because the drawer is also the scroll container (`overflow-y: auto`), the
+        // fixed popover additionally scrolls with the drawer by `-scrollTop`.
+        // Measured live: rendered_x = inline_left + parent_rect.left, and
+        // rendered_y = inline_top + parent_rect.top - parent.scrollTop. Invert that
+        // mapping so the popover lands at the viewport coords we computed:
+        //   inline_left = left - parent_rect.left
+        //   inline_top  = top  - parent_rect.top + parent.scrollTop
+        // When there is NO transformed ancestor the offsetParent is typically the
+        // body (rect.left/top ≈ 0, scroll ≈ 0) or null, so the mapping degrades to
+        // a no-op and the viewport coords are written unchanged.
+        let (off_left, off_top) = match html.offset_parent() {
+            Some(parent) => {
+                let pr = parent.get_bounding_client_rect();
+                // scroll_* are i32; the drawer (offsetParent) is the scroll box.
+                (
+                    pr.left() - parent.scroll_left() as f64,
+                    pr.top() - parent.scroll_top() as f64,
+                )
+            }
+            None => (0.0, 0.0),
+        };
+        let inline_left = left - off_left;
+        let inline_top = top - off_top;
+        let _ = html
+            .style()
+            .set_property("left", &format!("{inline_left:.1}px"));
+        let _ = html
+            .style()
+            .set_property("top", &format!("{inline_top:.1}px"));
+    }
+}
+
+/// `pub(crate)` so the Diagnostics drawer can mount it directly rather than
+/// duplicating the markup (single source of truth for the help affordance).
 #[component]
-fn HelpPopover(
+pub(crate) fn HelpPopover(
     /// Unique key for this popover within the shared `open_help` signal.
     key_id: &'static str,
     help_testid: &'static str,
@@ -1972,6 +2365,18 @@ fn HelpPopover(
     let help_open = open_help() == Some(key_id);
     let help_popover_id = format!("{key_id}-help-popover");
     let help_btn_id = format!("{key_id}-help-btn");
+
+    // Position the `position: fixed` popover so it escapes the drawer's
+    // scroll-clip on every edge (right border + bottom fold). Installed only
+    // while open; torn down on close/unmount. Takes the signal (not `help_open`)
+    // so the effect re-fires on open/close while the button stays mounted.
+    // (#1131 scroll-clip fix)
+    use_help_popover_anchor(
+        open_help,
+        key_id,
+        help_btn_id.clone(),
+        help_popover_id.clone(),
+    );
 
     rsx! {
         div { class: "perf-help",
@@ -2126,6 +2531,10 @@ fn SendLayerCell(
     // Reset shown IFF not at the full ladder (ceiling below the top). At full the
     // slot is empty so the head reads clean (mirrors SendCell's rule).
     let show_reset = ceiling_pos < last_pos;
+    // Ladder size as a Copy `usize` so the rung tooltips + the `on_change`
+    // closure can use it WITHOUT borrowing `labels` after it is moved into the
+    // closure / cloned into the slider below (Directive 4 SITE 2/3).
+    let ladder_count = labels.len();
 
     rsx! {
         div { class: "perf-side perf-side--send",
@@ -2183,7 +2592,7 @@ fn SendLayerCell(
                 on_change: move |s: RangeSel| {
                     // Only the ceiling (max) thumb is interactive; map its position
                     // to the stored layer-ceiling (None at full = Auto).
-                    on_ceiling_change.call(thumb_pos_to_layer_ceiling(s.max_pos, labels.len()));
+                    on_ceiling_change.call(thumb_pos_to_layer_ceiling(s.max_pos, ladder_count));
                 },
             }
             div {
@@ -2197,9 +2606,16 @@ fn SendLayerCell(
                         class: if rung.active { "perf-rung is-active" } else { "perf-rung is-shed" },
                         "data-testid": "{id_prefix}-send-rung-{rung.layer_id}",
                         title: if rung.active {
-                            format!("Layer {} — publishing {}", rung.layer_id + 1, rung.res_label)
+                            format!(
+                                "{} layer — publishing {}",
+                                layer_quality_label(rung.layer_id, ladder_count as u32, false),
+                                rung.res_label
+                            )
                         } else {
-                            format!("Layer {} — not published (ceiling lowered)", rung.layer_id + 1)
+                            format!(
+                                "{} layer — not published (ceiling lowered)",
+                                layer_quality_label(rung.layer_id, ladder_count as u32, false)
+                            )
                         },
                         span { class: "perf-rung__bar", "aria-hidden": "true" }
                         span { class: "perf-rung__label", "{rung.res_label}" }
@@ -2249,9 +2665,11 @@ const HELP_CONTENT_SEND: &str = "When you share your screen, the base layer is A
 /// The unified Performance settings panel body (#1095 redesign). Three stacked
 /// per-kind cards (Video / Audio / Content), each split into a **Sending** column
 /// and a **Receiving** column, so both directions are visible at once without a
-/// direction tab. A header row carries the "Performance" title and a "Diagnostics"
-/// cross-nav button; a slim simulcast strip (with an `(i)` tooltip) sits under the
-/// intro. Two headless rAF drivers update the Sending and Receiving bar-meters
+/// direction tab. The panel now mounts INSIDE the Diagnostics drawer's "Quality
+/// controls" group (#1131), which supplies the surrounding title + group label, so
+/// the panel has no heading of its own: it leads with a slim simulcast strip whose
+/// single `(i)` HelpPopover (testid `perf-intro-help`) holds the collapsed intro.
+/// Two headless rAF drivers update the Sending and Receiving bar-meters
 /// independently by id.
 ///
 /// `pref` (send) + `receive_pref` are the current persisted preferences
@@ -2261,21 +2679,21 @@ const HELP_CONTENT_SEND: &str = "When you share your screen, the base layer is A
 /// from the open-popover signal and the throttled refresh tick.
 #[component]
 pub fn PerformanceSettingsPanel(
-    // SEND side (#961).
+    // SEND side (#961). The snapshot readers default to inert `none()` readers so
+    // call sites / tests that don't wire live encoders still compile and render
+    // placeholder meters (the live drawer always wires them via the published
+    // `PerfControlsHandle`).
     pref: PerformancePreference,
     on_change: EventHandler<PerformancePreference>,
-    read_snapshot: SnapshotReader,
-    read_screen_snapshot: ScreenSnapshotReader,
+    #[props(default = SnapshotReader::none())] read_snapshot: SnapshotReader,
+    #[props(default = ScreenSnapshotReader::none())] read_screen_snapshot: ScreenSnapshotReader,
     // RECEIVE side (#989 simulcast).
     receive_pref: ReceivePreference,
     on_receive_change: EventHandler<(PrefMediaKind, KindReceivePref)>,
-    received_reader: ReceivedReader,
+    #[props(default = ReceivedReader::none())] received_reader: ReceivedReader,
     // Live simulcast/AQ diagnostics (#1095 observability). Defaults to an inert
     // reader so existing call sites / tests that don't wire it still compile.
     #[props(default = DiagnosticsReader::none())] diagnostics_reader: DiagnosticsReader,
-    // Cross-nav: open the Call Diagnostics panel (closes settings). Defaults to a
-    // no-op so call sites / tests that don't wire it still compile. (#1095 §4a)
-    #[props(default)] on_open_diagnostics: EventHandler<()>,
     // Effective simulcast layer ceilings for the SEND layer-count sliders
     // (sourced from `host.rs` where `effective_max_layers` is computed). These
     // set the slider's tick count AND its full/default ceiling so the control
@@ -2315,8 +2733,11 @@ pub fn PerformanceSettingsPanel(
     // Panel-level 4 Hz refresh tick. The per-card SUMMARY lines are always
     // visible AND live (layer count / total uplink / peer spread change at
     // runtime), so the panel subtree must re-render periodically. This loop is
-    // gated to the panel mount (the panel only mounts on the open Performance
-    // tab), and the summaries are cheap (count / min-max).
+    // gated to the panel mount (the panel only mounts inside the open Diagnostics
+    // drawer's "Quality controls" group; #1131), and the summaries are cheap
+    // (count / min-max). Scoping the tick to this child keeps it off the
+    // top-level `Diagnostics` body, which would otherwise re-run its expensive
+    // NetEq prelude 4×/s (#1128).
     //
     // Driven by a 250 ms `setInterval` (gloo `Interval`): the panel only needs a
     // ~4 Hz re-render, so the timer wakes 4×/s — a battery/CPU win on low-core
@@ -2360,6 +2781,7 @@ pub fn PerformanceSettingsPanel(
             .iter()
             .map(|p| p.snap.layer_index)
             .collect::<Vec<_>>(),
+        videocall_client::max_layers_for_kind(PrefMediaKind::Video),
     );
     // Audio has no per-layer encoder snapshot; derive its send summary from the
     // chosen LAYER CEILING (count-aware) so it tracks the rung strip when the user
@@ -2392,57 +2814,32 @@ pub fn PerformanceSettingsPanel(
     };
 
     rsx! {
-        // Header row: title left, Diagnostics cross-nav button right (§4a).
-        div { class: "perf-header-row",
-            h3 { class: "settings-section-title", "Performance" }
-            // The intro explanation is now COLLAPSED behind this (i) info icon
-            // (reusing the shared HelpPopover: single-open signal, aria-expanded,
-            // Escape/outside-click, focus return) — it used to be an always-visible
-            // paragraph that ate vertical space / the no-scroll budget. The content
-            // is unchanged, just on-demand.
+        // Global effective-setting strip: compact copy + ONE help affordance.
+        // The cross-nav button + "Performance" title row was removed when the panel
+        // moved INTO the Diagnostics drawer (#1131): the drawer supplies the title +
+        // the "Quality controls" group label, so a panel-local heading would double
+        // up. The intro explanation stays, collapsed behind the single `(i)`
+        // HelpPopover (single-open signal, aria-expanded, Escape/outside-click,
+        // focus return). The earlier separate decorative `ⓘ` glyph was REMOVED
+        // (#1131 review F2): two adjacent help affordances on one line duplicated;
+        // the full per-layer simulcast detail it carried lives in Group B's
+        // "Simulcast layers" section (its own source of truth, §3). The simulcast
+        // framing is kept discoverable on the strip via the text span's title/aria.
+        div {
+            class: "perf-simulcast-strip",
+            "data-testid": TESTID_SIMULCAST_STRIP,
+            span {
+                class: "perf-simulcast-strip__text",
+                title: "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
+                "aria-label": "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
+                "{strip_compact}"
+            }
             HelpPopover {
                 key_id: "perf-intro",
                 help_testid: "perf-intro-help",
                 help_label: "About the Performance panel",
                 help_body: HELP_PERF_INTRO,
                 open_help,
-            }
-            button {
-                r#type: "button",
-                class: "perf-nav-button",
-                "data-testid": "perf-open-diagnostics",
-                title: "Open Call Diagnostics (live per-peer and per-layer detail)",
-                "aria-label": "Open Call Diagnostics",
-                onclick: move |_| on_open_diagnostics.call(()),
-                // Lucide panel-right-open (NOT a gear) — conveys "open the side panel".
-                svg {
-                    class: "perf-nav-button__icon",
-                    xmlns: "http://www.w3.org/2000/svg",
-                    width: "18", height: "18", view_box: "0 0 24 24",
-                    fill: "none", stroke: "currentColor", stroke_width: "2",
-                    stroke_linecap: "round", stroke_linejoin: "round",
-                    "aria-hidden": "true",
-                    rect { x: "3", y: "3", width: "18", height: "18", rx: "2" }
-                    path { d: "M15 3v18" }
-                    path { d: "m10 15-3-3 3-3" }
-                }
-                span { class: "perf-nav-button__label", "Diagnostics" }
-            }
-        }
-
-        // Global effective-setting strip with an (i) tooltip. Compact copy; full
-        // flag×cap text in the (i) title/aria.
-        div {
-            class: "perf-simulcast-strip",
-            "data-testid": TESTID_SIMULCAST_STRIP,
-            span { class: "perf-simulcast-strip__text", "{strip_compact}" }
-            span {
-                class: "perf-simulcast-strip__info",
-                role: "img",
-                tabindex: "0",
-                title: "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
-                "aria-label": "Simulcast publishes multiple quality layers so viewers self-select. {strip_full}. Audio has its own ladder.",
-                "ⓘ"
             }
         }
 
@@ -2635,9 +3032,10 @@ pub fn peers_for_kind(peers: &[PeerReceiveDiag], kind: PrefMediaKind) -> Vec<Pee
 // ══════════════════════════════════════════════════════════════════════════
 pub mod receive {
     use super::{
-        format_receive_spread, level_from_fraction, peer_row_aria_label, peer_row_metric,
-        quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
-        reason_chip_title, tick_offsets, write_meter_level, write_readout_text, PeerKindSnap,
+        format_receive_spread, layer_quality_label, level_from_fraction, peer_row_aria_label,
+        peer_row_metric, quality_state_glyph, quality_state_modifier, reason_chip_modifier,
+        reason_chip_text, reason_chip_title, tick_offsets, write_meter_level, write_readout_text,
+        PeerKindSnap,
     };
     use dioxus::prelude::*;
     use std::rc::Rc;
@@ -2928,15 +3326,18 @@ pub mod receive {
     }
 
     /// Format the readout line for a received snapshot. Video/screen show
-    /// `"L{i+1}/{n} · {w}x{h}"`; audio shows `"L{i+1}/{n} · {kbps} kbps"`. Pure.
+    /// `"{Q} · {i+1}/{n} · {w}x{h}"`; audio shows `"{Q} · {i+1}/{n} · {kbps} kbps"`,
+    /// where `{Q}` is the quality letter (L/M/H via [`super::layer_quality_label`]).
+    /// Pure.
     pub fn format_readout(snap: &ReceivedLayerSnapshot) -> String {
         let layer = snap.layer_index + 1;
+        let q = layer_quality_label(snap.layer_index, snap.layer_count, true);
         match snap.kind {
             PrefMediaKind::Audio => {
-                format!("L{layer}/{} · {} kbps", snap.layer_count, snap.kbps)
+                format!("{q} · {layer}/{} · {} kbps", snap.layer_count, snap.kbps)
             }
             _ => format!(
-                "L{layer}/{} · {}x{}",
+                "{q} · {layer}/{} · {}x{}",
                 snap.layer_count, snap.width, snap.height
             ),
         }
@@ -3252,8 +3653,10 @@ pub mod receive {
         // summary reuses `format_receive_spread` over the per-peer layer indices.
         let full_ladder_len = max_layers_for_kind(kind);
         let peer_count = peers.len();
-        let spread =
-            format_receive_spread(&peers.iter().map(|p| p.snap.layer_index).collect::<Vec<_>>());
+        let spread = format_receive_spread(
+            &peers.iter().map(|p| p.snap.layer_index).collect::<Vec<_>>(),
+            full_ladder_len,
+        );
         let agg = if peer_count == 1 {
             format!("1 peer · {spread}")
         } else {
@@ -3704,7 +4107,7 @@ pub mod receive {
                 kbps: 900,
                 reason: None,
             };
-            assert_eq!(format_readout(&v), "L2/3 · 960x540");
+            assert_eq!(format_readout(&v), "M · 2/3 · 960x540");
             let a = ReceivedLayerSnapshot {
                 kind: PrefMediaKind::Audio,
                 layer_index: 0,
@@ -3714,7 +4117,7 @@ pub mod receive {
                 kbps: 24,
                 reason: None,
             };
-            assert_eq!(format_readout(&a), "L1/3 · 24 kbps");
+            assert_eq!(format_readout(&a), "L · 1/3 · 24 kbps");
             let s = ReceivedLayerSnapshot {
                 kind: PrefMediaKind::Screen,
                 layer_index: 2,
@@ -3724,7 +4127,7 @@ pub mod receive {
                 kbps: 2500,
                 reason: None,
             };
-            assert_eq!(format_readout(&s), "L3/3 · 1920x1080");
+            assert_eq!(format_readout(&s), "H · 3/3 · 1920x1080");
         }
 
         #[test]
@@ -3744,7 +4147,7 @@ pub mod receive {
                 st.level,
                 crate::components::performance_settings::MAX_METER_LEVEL
             );
-            assert_eq!(st.text, "L3/3 · 1280x720");
+            assert_eq!(st.text, "H · 3/3 · 1280x720");
             let empty = gauge_state(None);
             assert_eq!(empty.level, EMPTY_METER_LEVEL);
             assert_eq!(empty.level, 0); // no signal → all bars unlit
@@ -3786,6 +4189,61 @@ pub mod receive {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Help popover positioning (drawer scroll-clip fix, #1131) ──────
+    // The popover is `position: fixed`; this math keeps it on-screen on every
+    // edge. All cases use gap = HELP_POPOVER_GAP_PX (8.0).
+
+    /// Roomy case: button mid-viewport → popover sits directly below, left edge
+    /// aligned to the button. (Breaks if the below-default or left-align changes.)
+    #[test]
+    fn help_popover_opens_below_when_room() {
+        // button at (100, 200)-(122, 222), popover 260x120, viewport 720x1000.
+        let (left, top) =
+            compute_help_popover_position(100.0, 200.0, 222.0, 260.0, 120.0, 720.0, 1000.0);
+        assert_eq!(left, 100.0, "left aligns to the button when it fits");
+        assert_eq!(top, 222.0 + 8.0, "opens just below the button");
+    }
+
+    /// Right-edge clip: a button near the RIGHT drawer border must pull the
+    /// popover LEFT so its right edge stays inside `viewport_w - gap`. (This is
+    /// the horizontal half of the reported bug.)
+    #[test]
+    fn help_popover_clamps_off_right_edge() {
+        // viewport 720 wide; button left at 700 would put a 260px popover at
+        // 700..960, 240px off-screen. Expect left clamped to 720-260-8 = 452.
+        let (left, _top) =
+            compute_help_popover_position(700.0, 100.0, 122.0, 260.0, 120.0, 720.0, 1000.0);
+        assert_eq!(
+            left, 452.0,
+            "popover pulled left to stay within the viewport"
+        );
+        assert!(left + 260.0 <= 720.0 - 8.0 + 0.001);
+    }
+
+    /// Bottom-fold clip: a tall popover whose below-placement would overflow the
+    /// bottom, with MORE room above, must FLIP above the button. (The vertical
+    /// half of the bug — a pure-CSS `top: calc(100% + 8px)` could never do this.)
+    #[test]
+    fn help_popover_flips_above_near_bottom() {
+        // viewport 600 tall; button at bottom (560..582), popover 200 tall.
+        // Below would be 590..790 (off-screen). Above-room (560-8=552) >
+        // below-room (600-582-8=10) → flip: top = 560 - 8 - 200 = 352.
+        let (_left, top) =
+            compute_help_popover_position(100.0, 560.0, 582.0, 260.0, 200.0, 720.0, 600.0);
+        assert_eq!(top, 352.0, "flips above the button when below overflows");
+        assert!(top >= 8.0, "stays below the top margin");
+    }
+
+    /// Degenerate: popover taller than EITHER side → kept below but clamped so it
+    /// never spills past the bottom (its max-height + internal scroll do the rest).
+    #[test]
+    fn help_popover_clamps_when_taller_than_viewport() {
+        // popover 900 tall, viewport 600 → max_top = max(600-900-8, 8) = 8.
+        let (_left, top) =
+            compute_help_popover_position(100.0, 100.0, 122.0, 260.0, 900.0, 720.0, 600.0);
+        assert_eq!(top, 8.0, "clamped to the top margin, not off-screen");
+    }
 
     // ── Live diagnostics formatters (issue #1095) ──────────────────────
 
@@ -3829,15 +4287,49 @@ mod tests {
         );
     }
 
+    /// `layer_quality_label` (#1222): position→quality name (full + compact).
+    /// Pins every branch — 3-layer Low/Med/High, 2-layer Low/High, degenerate
+    /// 1-layer "Single"/"1", and the i>=top rule in a 4-layer ladder (index 1 and
+    /// 2 are BOTH Medium; index 3 is High). Mutating `i >= top` to `i > top` would
+    /// make (3,4) report Medium instead of High → fails; mutating the count==2
+    /// branch flips (1,2); the (any,1) cases pin the degenerate guard.
+    #[test]
+    fn layer_quality_label_all_branches() {
+        // 3-layer full + compact.
+        assert_eq!(layer_quality_label(0, 3, false), "Low");
+        assert_eq!(layer_quality_label(1, 3, false), "Medium");
+        assert_eq!(layer_quality_label(2, 3, false), "High");
+        assert_eq!(layer_quality_label(0, 3, true), "L");
+        assert_eq!(layer_quality_label(1, 3, true), "M");
+        assert_eq!(layer_quality_label(2, 3, true), "H");
+        // 2-layer: Low/High only (no Medium).
+        assert_eq!(layer_quality_label(0, 2, false), "Low");
+        assert_eq!(layer_quality_label(1, 2, false), "High");
+        assert_eq!(layer_quality_label(0, 2, true), "L");
+        assert_eq!(layer_quality_label(1, 2, true), "H");
+        // 1-layer degenerate.
+        assert_eq!(layer_quality_label(0, 1, false), "Single");
+        assert_eq!(layer_quality_label(0, 1, true), "1");
+        assert_eq!(layer_quality_label(5, 1, false), "Single");
+        // 4-layer: top = index 3 is High; everything 0<i<top is Medium.
+        assert_eq!(layer_quality_label(0, 4, false), "Low");
+        assert_eq!(layer_quality_label(1, 4, false), "Medium");
+        assert_eq!(layer_quality_label(2, 4, false), "Medium");
+        assert_eq!(layer_quality_label(3, 4, false), "High");
+    }
+
     #[test]
     fn send_layer_and_header_formatting() {
-        // DISPLAY 1-based: internal layer_id 0 (the base) renders "L1"; id 2
-        // renders "L3" — matching the receive side's L{i}/n convention. (The
-        // internal id stays 0-based; only the rendered number is +1.)
-        assert_eq!(format_send_layer(0, 640, 360, 400), "L1 640×360 · 400 kbps");
+        // DISPLAY by quality name: in a 3-layer ladder, internal layer_id 0 (the
+        // base) renders "Low"; id 2 (the top) renders "High". The internal id /
+        // data-testid suffix stays 0-based; only the visible label changes (#1222).
         assert_eq!(
-            format_send_layer(2, 1280, 720, 1500),
-            "L3 1280×720 · 1500 kbps"
+            format_send_layer(0, 3, 640, 360, 400),
+            "Low · 640×360 · 400 kbps"
+        );
+        assert_eq!(
+            format_send_layer(2, 3, 1280, 720, 1500),
+            "High · 1280×720 · 1500 kbps"
         );
         // Header: active/effective vs single-stream.
         let multi = SimulcastSendSnapshot {
@@ -3858,7 +4350,7 @@ mod tests {
 
     #[test]
     fn peer_kind_line_formats_video_audio_and_none() {
-        // Video → resolution; layer is 1-indexed for display.
+        // Video → resolution; quality LETTER + 1-indexed position/total.
         let v = ReceivedLayerSnapshot {
             kind: PrefMediaKind::Video,
             layer_index: 2,
@@ -3870,7 +4362,7 @@ mod tests {
         };
         assert_eq!(
             format_peer_kind_line("video", Some(&v)),
-            Some("video L3/3 · 1280×720".to_string())
+            Some("video H · 3/3 · 1280×720".to_string())
         );
         // Audio → kbps detail.
         let a = ReceivedLayerSnapshot {
@@ -3884,7 +4376,7 @@ mod tests {
         };
         assert_eq!(
             format_peer_kind_line("audio", Some(&a)),
-            Some("audio L1/3 · 24 kbps".to_string())
+            Some("audio L · 1/3 · 24 kbps".to_string())
         );
         // None → no line.
         assert_eq!(format_peer_kind_line("screen", None), None);
@@ -4015,14 +4507,14 @@ mod tests {
 
     #[test]
     fn receive_spread_range_collapse_and_empty() {
-        // Mixed layers → lo–hi (1-indexed).
-        assert_eq!(format_receive_spread(&[0, 1, 2]), "L1–L3");
-        assert_eq!(format_receive_spread(&[2, 0]), "L1–L3");
-        // All same → single label.
-        assert_eq!(format_receive_spread(&[2, 2, 2]), "L3");
-        assert_eq!(format_receive_spread(&[0]), "L1");
+        // Mixed layers in a 3-ladder → lo–hi quality letters (L–H), en-dash.
+        assert_eq!(format_receive_spread(&[0, 1, 2], 3), "L\u{2013}H");
+        assert_eq!(format_receive_spread(&[2, 0], 3), "L\u{2013}H");
+        // All same → single letter (no count; endpoints imply the ladder).
+        assert_eq!(format_receive_spread(&[2, 2, 2], 3), "H");
+        assert_eq!(format_receive_spread(&[0], 3), "L");
         // Empty → empty string.
-        assert_eq!(format_receive_spread(&[]), "");
+        assert_eq!(format_receive_spread(&[], 3), "");
     }
 
     #[test]
@@ -4112,15 +4604,15 @@ mod tests {
 
     #[test]
     fn video_receive_summary_peers_and_spread() {
-        assert_eq!(format_video_receive_summary(&[]), "Not receiving video");
+        assert_eq!(format_video_receive_summary(&[], 3), "Not receiving video");
         assert_eq!(
-            format_video_receive_summary(&[0, 1, 2, 2]),
-            "Pulling up to high quality · L1–L3 across 4 peers"
+            format_video_receive_summary(&[0, 1, 2, 2], 3),
+            "Pulling up to high quality · L\u{2013}H across 4 peers"
         );
-        // Singular peer.
+        // Singular peer: index 1 in a 3-ladder → "M".
         assert_eq!(
-            format_video_receive_summary(&[1]),
-            "Pulling up to high quality · L2 across 1 peer"
+            format_video_receive_summary(&[1], 3),
+            "Pulling up to high quality · M across 1 peer"
         );
     }
 
@@ -4209,7 +4701,17 @@ mod tests {
         };
         assert_eq!(
             format_content_receive_summary(Some(&top)),
-            "Pulling full quality · L3 · 1920×1080"
+            "Pulling full quality · H · 1920×1080"
+        );
+        // 2-layer ladder: index 0 is Low → compact "L".
+        let low = ReceivedLayerSnapshot {
+            layer_index: 0,
+            layer_count: 2,
+            ..top
+        };
+        assert_eq!(
+            format_content_receive_summary(Some(&low)),
+            "Pulling full quality · L · 1920×1080"
         );
     }
 
@@ -5183,15 +5685,18 @@ mod tests {
 
     #[test]
     fn peer_row_metric_video_and_audio_shapes() {
-        // Video/screen: "{res} · ~{kbps} · L{i}/{n}". n is the FULL ladder length
-        // passed in (3), not the snapshot's own layer_count.
+        // Video/screen: "{res} · ~{kbps} · {Q} · {i}/{n}" (Directive 4 SITE 6b).
+        // n is the FULL ladder length passed in (3); index 1 of 3 → letter "M",
+        // 1-based position 2. (peer_row_metric is the real e2e-string site; the
+        // rename propagates to signal_quality.rs too — #1222.) Mutating the
+        // `layer_quality_label` letter or the i/n arithmetic breaks this literal.
         let v = snap(PrefMediaKind::Video, 1, 960, 540, 600, None);
-        assert_eq!(peer_row_metric(&v, 3, "ignored"), "540p · ~600k · L2/3");
-        // Audio: "{kbps}k · {label} · L{i}/{n}".
+        assert_eq!(peer_row_metric(&v, 3, "ignored"), "540p · ~600k · M · 2/3");
+        // Audio: "{kbps}k · {label} · {Q} · {i}/{n}".
         let a = snap(PrefMediaKind::Audio, 1, 0, 0, 32, None);
         assert_eq!(
             peer_row_metric(&a, 3, "mid (32k)"),
-            "32k · mid (32k) · L2/3"
+            "32k · mid (32k) · M · 2/3"
         );
     }
 

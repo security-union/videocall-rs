@@ -70,7 +70,16 @@ pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 /// * `parsed=true && is_media && anything else (HEARTBEAT, KEYFRAME_REQUEST,
 ///   encrypted/unparseable inner)` → `"media"` — the legacy catch-all so
 ///   existing alerts pivoting on `kind="media"` still see a series.
-fn drop_kind_label(parsed: bool, is_media: bool, media_type: Option<MediaType>) -> &'static str {
+// `pub(crate)` so the metric-taxonomy coverage guard
+// (`metrics::tests::relay_drop_kinds_covers_all_emitted_drop_labels`) can
+// enumerate this emit site's output directly instead of against a hand-copied
+// literal list (issue #1186). Kept in lock-step with the `wt_chat_session`
+// copy — that test asserts both copies agree.
+pub(crate) fn drop_kind_label(
+    parsed: bool,
+    is_media: bool,
+    media_type: Option<MediaType>,
+) -> &'static str {
     if !parsed {
         return "unknown";
     }
@@ -101,7 +110,7 @@ pub struct WsChatSession {
 
     /// Bounded outbound channel sender — packets are enqueued here and
     /// drained by a `StreamHandler<Vec<u8>>` registered in `started()`.
-    /// When the channel is full, `on_outbound_drop()` fires CONGESTION.
+    /// When the channel is full, `on_outbound_drop()` records the drop.
     outbound_tx: mpsc::Sender<Vec<u8>>,
 
     /// Receiver half, consumed once by `started()` via `ctx.add_stream()`.
@@ -188,8 +197,8 @@ impl Actor for WsChatSession {
         // 128-slot `outbound_tx`. Under a bursty fan-out storm (keyframe /
         // join / screen-share spikes) the 16-slot mailbox overflows long
         // before `outbound_tx` does — and that mailbox is a *dumb* queue:
-        // it drops indiscriminately (audio, control, video alike) and fires
-        // NO CONGESTION feedback, so the offending sender never throttles.
+        // it drops indiscriminately (audio, control, video alike) and cannot
+        // feed the drop tracker.
         // The observed symptom is room-wide video freezes (276 `mailbox_full`
         // drops in one meeting while `relay_outbound_queue_depth` stayed 0,
         // proving the smart channel never filled).
@@ -197,10 +206,9 @@ impl Actor for WsChatSession {
         // Sizing the mailbox AT the outbound channel capacity (issue #1057)
         // relocates a *steady-state* overflow onto `outbound_tx`, which is
         // policy-aware: it sheds VIDEO/SCREEN first, protects AUDIO to ~95%,
-        // never preempts CONTROL/CONGESTION/MEETING, and fires CONGESTION back
-        // to the sender via `on_outbound_drop`. So a genuine overflow becomes
-        // video-first + audio-protected + sender-throttled instead of a total
-        // stall.
+        // never preempts CONTROL/CONGESTION/MEETING, and records drops via
+        // `on_outbound_drop`. So a genuine overflow becomes video-first +
+        // audio-protected instead of a total stall.
         //
         // BUT a publisher-join fan-out BURST (issue #1144) overflows even a
         // mailbox sized AT the channel: #1144 saw 303 `mailbox_full` drops in
@@ -305,8 +313,8 @@ impl Actor for WsChatSession {
 /// Enqueues serialized bytes into the bounded `outbound_tx` channel instead
 /// of calling `ctx.binary()` directly. The `StreamHandler<Vec<u8>>` drains
 /// the channel on the actor event loop. When the channel is full, the packet
-/// is dropped and `on_outbound_drop()` fires CONGESTION feedback to the
-/// sender via NATS — mirroring the WebTransport relay pattern.
+/// is dropped and `on_outbound_drop()` records the drop — mirroring the
+/// WebTransport relay pattern.
 ///
 /// **Priority-drop policy (discussion #699)**: before `try_send`, the
 /// per-session `actors::priority_drop` evaluator decides whether to
@@ -322,11 +330,8 @@ impl Actor for WsChatSession {
 ///   label when they fail on real channel overflow, so a saturation
 ///   severe enough to drop lifecycle traffic is alertable on its own.
 ///
-/// On any drop (preempted or real overflow), the sender's
-/// `on_outbound_drop` still fires so CONGESTION feedback reaches the
-/// upstream sender that caused the saturation. Without that callback
-/// the offending sender keeps sending at the same rate and the
-/// receiver keeps shedding their traffic.
+/// On any drop (preempted or real overflow), `on_outbound_drop` still records
+/// the drop for metrics and the #979 keyframe-relax path.
 impl Handler<Message> for WsChatSession {
     type Result = ();
 
@@ -339,7 +344,7 @@ impl Handler<Message> for WsChatSession {
         // paid almost every call regardless of the saturation state.
         //
         // We pull out sender_session_id / user_id here so a drop can
-        // still feed `on_outbound_drop` (the CONGESTION trigger).
+        // still feed `on_outbound_drop`.
         let parsed = PacketWrapper::parse_from_bytes(&msg.msg).ok();
         let parse_succeeded = parsed.is_some();
         let sender_session_id = parsed.as_ref().map(|pw| pw.session_id).unwrap_or(0);
@@ -375,8 +380,7 @@ impl Handler<Message> for WsChatSession {
         {
             // Priority-driven preempt: record both the per-room and
             // protocol-wide counters with the policy-specific label,
-            // and fire `on_outbound_drop` so the offending sender
-            // gets CONGESTION feedback.
+            // and feed `on_outbound_drop` so the drop is recorded.
             RELAY_PACKET_DROPS_TOTAL
                 .with_label_values(&[&self.logic.room, "websocket", reason])
                 .inc();
@@ -406,10 +410,10 @@ impl Handler<Message> for WsChatSession {
                     .inc();
                 // Real channel-full drop (priority policy already
                 // admitted this packet — it's Control or Critical,
-                // or the priority bands did not preempt). Fire
-                // CONGESTION feedback for the upstream sender. The
-                // metric `kind` label distinguishes Critical (loud)
-                // from other channel-full drops.
+                // or the priority bands did not preempt). Record the
+                // drop for the upstream sender. The metric `kind`
+                // label distinguishes Critical (loud) from other
+                // channel-full drops.
                 //
                 // 2026-05-08 audio-quality follow-up: when the wrapper says
                 // MEDIA, peek at the inner `MediaPacket.media_type` so we

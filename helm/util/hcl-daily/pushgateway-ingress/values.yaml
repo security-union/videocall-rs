@@ -3,5 +3,8 @@ serviceName: prometheus-prometheus-pushgateway
 servicePort: 9091
 tlsSecretName: pushgateway-tls
 issuer: letsencrypt-prod
+# Modern ingress-class selector (replaces the deprecated
+# kubernetes.io/ingress.class annotation). Matches the cluster IngressClass.
+ingressClassName: nginx
 # CI runner (videocallci.fnxlabs.com) + K3s node (local cluster traffic)
 allowedSourceRange: "10.190.252.135/32,10.190.252.83/32,10.42.0.0/16"

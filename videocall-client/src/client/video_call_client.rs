@@ -3540,6 +3540,20 @@ impl Inner {
                 // VIEWPORT, a client should never receive one; ignore it
                 // defensively if it ever appears.
             }
+            Ok(PacketType::DOWNLINK_CONGESTION) => {
+                // DOWNLINK_CONGESTION is a relay -> receiver ONLY control packet
+                // (#1219 Half 2): the relay emits it when this receiver's
+                // downlink is congested (mailbox drops crossed threshold). The
+                // client should step down its layer preferences to reduce
+                // bandwidth demand.
+                //
+                // TODO(#1219): Wire into LayerChooser to trigger a formal
+                // step-down of layer preferences. For now, log it so we can
+                // verify delivery in field testing.
+                warn!(
+                    "Received DOWNLINK_CONGESTION signal from relay — downlink saturated (#1219)"
+                );
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

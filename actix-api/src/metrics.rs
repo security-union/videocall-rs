@@ -1637,6 +1637,65 @@ lazy_static! {
         &["meeting_id", "session_id", "display_name"]
     )
     .expect("Failed to create videocall_client_render_fps metric");
+
+    // ===== RECEIVER DOWNLINK CONGESTION (#1219 Half 2) =====
+
+    /// Per-receiver downlink congestion shedding episodes (entered shedding mode)
+    /// (#1219 Half 2).
+    ///
+    /// Incremented each time a receiver crosses the
+    /// `DOWNLINK_CONGESTION_DROP_THRESHOLD` consecutive mailbox drops and enters
+    /// shedding mode. This is the receiver-directed complement of the existing
+    /// sender-directed CONGESTION signal: it detects when the relay-to-receiver
+    /// link (not the sender-to-relay link) is saturated and the relay must shed
+    /// non-base layers to create mailbox headroom.
+    ///
+    /// CARDINALITY: bounded — `transport` only (2 values: `websocket`,
+    /// `webtransport`). Safe for indefinite retention.
+    pub static ref RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL: CounterVec = register_counter_vec!(
+        "relay_receiver_downlink_congestion_total",
+        "Receivers entering downlink congestion shedding mode (mailbox drop threshold crossed) (#1219)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_receiver_downlink_congestion_total metric");
+
+    /// Per-receiver downlink congestion recovery (exited shedding mode) (#1219
+    /// Half 2).
+    ///
+    /// Incremented each time a shedding receiver accumulates
+    /// `DOWNLINK_CONGESTION_SUCCESS_WINDOW` consecutive successful `try_send`
+    /// deliveries and exits shedding mode, resuming full-layer forwarding. The
+    /// difference `congestion_total - recovered_total` gives the current count of
+    /// receivers still in shedding mode (useful for alerting).
+    ///
+    /// CARDINALITY: bounded — `transport` only (2 values). Safe for indefinite
+    /// retention.
+    pub static ref RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_receiver_downlink_recovered_total",
+        "Receivers exiting downlink congestion shedding mode (success window cleared) (#1219)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_receiver_downlink_recovered_total metric");
+
+    /// Non-base-layer media packets shed by the downlink congestion pre-filter
+    /// (#1219 Half 2).
+    ///
+    /// Incremented each time a non-base (layer > 0) VIDEO/SCREEN packet is
+    /// discarded for a receiver in shedding mode BEFORE reaching `try_send`. This
+    /// is the volume of proactive shedding the congestion detection performs —
+    /// distinct from the `relay_packet_drops_total{drop_reason=mailbox_full}`
+    /// counter (which counts packets lost at the mailbox itself). Together they
+    /// tell the story: shedding should REDUCE mailbox drops by removing volume
+    /// before it reaches the mailbox.
+    ///
+    /// CARDINALITY: bounded — `transport` only (2 values). Safe for indefinite
+    /// retention.
+    pub static ref RELAY_DOWNLINK_SHED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_shed_total",
+        "Non-base-layer media packets shed before try_send for receivers in downlink congestion (#1219)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_downlink_shed_total metric");
 }
 
 // =============================================================================

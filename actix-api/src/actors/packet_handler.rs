@@ -194,6 +194,15 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
         return PacketKind::Dropped;
     }
 
+    // Drop client-originated DOWNLINK_CONGESTION packets (#1219 Half 2).
+    // DOWNLINK_CONGESTION is relay-authored (emitted by the relay when a
+    // receiver's mailbox drops exceed threshold). A client-sent one is always
+    // forged. Drop it to prevent a client from injecting fake congestion
+    // signals that would trick OTHER receivers into stepping down their layers.
+    if packet_wrapper.packet_type == PacketType::DOWNLINK_CONGESTION.into() {
+        return PacketKind::Dropped;
+    }
+
     // Drop client-originated MEETING packets.
     // MEETING events (HOST_MUTE_PARTICIPANT, MEETING_ENDED, etc.) are
     // server-authoritative: they are published exclusively by meeting-api

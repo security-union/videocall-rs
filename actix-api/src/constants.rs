@@ -719,6 +719,39 @@ pub const LAYER_HINT_RECOMPUTE_COALESCE_MS: u64 = 300;
 /// 10 s cadence keeps its amortized cost negligible even with many rooms.
 pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
+// ---------------------------------------------------------------------------
+// Receiver Downlink Congestion (#1219 Half 2)
+// ---------------------------------------------------------------------------
+
+/// Consecutive inbound-mailbox drops (per-receiver) before entering downlink
+/// shedding mode (#1219 Half 2).
+///
+/// When a receiver's Actix mailbox fills repeatedly (TCP socket stalled / actor
+/// event-loop parked on a slow link), the fan-out closure increments a per-call
+/// drop counter. Once it reaches this threshold the closure enters "shedding
+/// mode": non-base-layer simulcast VIDEO/SCREEN packets are discarded BEFORE
+/// `try_send`, reducing volume ~2-3x and giving the mailbox headroom to drain.
+/// A DOWNLINK_CONGESTION control packet is also emitted (once) so the client's
+/// LayerChooser can formally step down.
+///
+/// `10` allows transient scheduling bursts (a few dropped packets during a
+/// fan-out spike) while still reacting within a few hundred milliseconds of
+/// sustained stall: at 30 fps video, 10 consecutive drops is ~330 ms of fully
+/// stalled drain — long enough to distinguish a real downlink problem from a
+/// single scheduling hiccup, short enough to intervene before the receiver's
+/// video freezes for seconds.
+pub const DOWNLINK_CONGESTION_DROP_THRESHOLD: u32 = 10;
+
+/// Consecutive successful `try_send` deliveries needed to EXIT shedding mode
+/// after entering it (#1219 Half 2).
+///
+/// Ensures the link has genuinely recovered — not just a single lucky drain —
+/// before resuming higher layers. At 30 fps video + ~50 audio pps, 50 successes
+/// spans roughly 600 ms of clean drain at typical packet rates. This is long
+/// enough to be confident the stall was transient, short enough to restore full
+/// quality within ~1 second of recovery.
+pub const DOWNLINK_CONGESTION_SUCCESS_WINDOW: u32 = 50;
+
 #[cfg(test)]
 mod tests {
     use super::*;

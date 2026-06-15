@@ -4241,6 +4241,28 @@ fn handle_msg(
     // protobuf parse on the relay's hottest path. Unparseable payloads arrive
     // as `None`, which every downstream check treats as its "fail-closed"
     // default.
+
+    // --- #1219 Half 2: Per-receiver downlink congestion state ---
+    //
+    // These `Cell`s live in the closure's capture environment — one instance per
+    // receiver session, mutated on every packet delivery attempt. `Cell` provides
+    // interior mutability without runtime cost (no RefCell borrow check), which is
+    // safe because this closure runs exclusively on a single NATS subscription
+    // task (no cross-thread sharing).
+    use crate::constants::{
+        DOWNLINK_CONGESTION_DROP_THRESHOLD, DOWNLINK_CONGESTION_SUCCESS_WINDOW,
+    };
+    use crate::metrics::{
+        RELAY_DOWNLINK_SHED_TOTAL, RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL,
+        RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL,
+    };
+    use std::cell::Cell;
+
+    let consecutive_drops: Cell<u32> = Cell::new(0);
+    let consecutive_successes: Cell<u32> = Cell::new(0);
+    let is_shedding: Cell<bool> = Cell::new(false);
+    let signal_emitted: Cell<bool> = Cell::new(false);
+
     move |msg, parsed| {
         let is_congestion = parsed
             .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
@@ -4253,6 +4275,15 @@ fn handle_msg(
         // the same reason CONGESTION does. (#1108 delivery gap.)
         let is_layer_hint = parsed
             .map(|pw| pw.packet_type == PacketType::LAYER_HINT.into())
+            .unwrap_or(false);
+
+        // DOWNLINK_CONGESTION is, like CONGESTION and LAYER_HINT, a
+        // RELAY-authored self-addressed control packet (#1219 Half 2). The relay
+        // emits it on the RECEIVER's own per-session subject to signal that
+        // receiver's downlink is congested. It must survive the self-echo guard
+        // for the same reason as the other relay-authored packets.
+        let is_downlink_congestion = parsed
+            .map(|pw| pw.packet_type == PacketType::DOWNLINK_CONGESTION.into())
             .unwrap_or(false);
 
         let is_meeting = parsed
@@ -4320,7 +4351,7 @@ fn handle_msg(
         } else {
             subject_self || inner_session_self
         };
-        if drop_self_echo && !is_congestion && !is_layer_hint {
+        if drop_self_echo && !is_congestion && !is_layer_hint && !is_downlink_congestion {
             return Ok(());
         }
 
@@ -4374,6 +4405,17 @@ fn handle_msg(
         // This does NOT touch the LAYER_HINT self-echo carve-out (the hard-won
         // #1108 delivery fix); LAYER_HINT is intentionally left alone (#1220).
         if is_congestion && !subject_self && !inner_session_self {
+            RELAY_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[&room])
+                .inc();
+            return Ok(());
+        }
+
+        // DOWNLINK_CONGESTION unicast filter (#1219 Half 2). Same model as the
+        // CONGESTION filter above: relay-authored, self-addressed to a specific
+        // receiver. Drop for every other session in the room — only the target
+        // receiver needs to see it.
+        if is_downlink_congestion && !subject_self && !inner_session_self {
             RELAY_CONGESTION_FILTERED_TOTAL
                 .with_label_values(&[&room])
                 .inc();
@@ -4666,6 +4708,39 @@ fn handle_msg(
             }
         }
 
+        // --- #1219 Half 2: Emergency downlink shedding ---
+        //
+        // When this receiver is in shedding mode (consecutive mailbox drops
+        // crossed DOWNLINK_CONGESTION_DROP_THRESHOLD), discard non-base-layer
+        // VIDEO/SCREEN BEFORE reaching try_send. This reduces volume ~2-3x,
+        // giving the stalled mailbox headroom to drain. AUDIO is NEVER shed
+        // (audio loss is worse than video quality loss). Control packets are
+        // NEVER shed. Base layer (layer 0) is NEVER shed.
+        //
+        // This runs AFTER the viewport and layer filters above — a packet that
+        // reaches here has already survived those gates, so shedding it is a
+        // FURTHER reduction beyond what the receiver's own preferences chose.
+        if is_shedding.get() {
+            if let Some(pw) = parsed {
+                use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+                let media_kind = pw.media_kind.enum_value();
+                let is_shed_candidate =
+                    matches!(media_kind, Ok(MediaKind::VIDEO) | Ok(MediaKind::SCREEN))
+                        && pw.simulcast_layer_id != 0;
+
+                if is_shed_candidate {
+                    RELAY_DOWNLINK_SHED_TOTAL
+                        .with_label_values(&[&transport])
+                        .inc();
+                    debug!(
+                        "Downlink shed: dropping layer {} {:?} for congested receiver session {} in room {}",
+                        pw.simulcast_layer_id, media_kind, session, room
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         let message = Message {
             // FAN-OUT HOT PATH (#1063): `msg.payload` is an `async_nats`
             // `bytes::Bytes`. Cloning the handle is an O(1) atomic refcount
@@ -4679,97 +4754,169 @@ fn handle_msg(
             session,
         };
 
-        if let Err(e) = session_recipient.try_send(message) {
-            // PRIORITY-AWARE ATTRIBUTION on inbound fan-out overflow (#1145).
-            //
-            // HONEST CONTRACT — read before "improving" this: the actix
-            // mailbox exposes NO capacity/length probe and NO preemption API
-            // on `Recipient<Message>` (only `try_send`/`do_send`, verified
-            // against actix 0.13.5). So when `try_send` returns `Full` the
-            // packet simply CANNOT be enqueued — we do NOT, and CANNOT, evict
-            // a queued packet to make room for a higher-priority one. The
-            // value this block adds is therefore (a) correct ATTRIBUTION of
-            // WHICH KIND was sacrificed on overflow (video vs audio vs
-            // lifecycle), so dashboards/alerts see "video shed under fan-out
-            // burst" rather than an undifferentiated `mailbox_full`, and
-            // (b) it pairs with the mailbox HEADROOM bump (#1144) that gives
-            // the burst room to land in the mailbox and then spill onto the
-            // policy-aware outbound channel (which DOES shed video-first and
-            // record drops for metrics / keyframe-relax). Shedding alone
-            // can't save a critical packet on a full mailbox; the headroom is
-            // what actually prevents the drop.
-            //
-            // We classify off the OUTER cleartext wrapper that was already
-            // parsed ONCE per packet (`parsed`) — `packet_type` + the outer
-            // `media_kind` (field 5) — NEVER the inner `MediaPacket`, which is
-            // AES-sealed under E2EE. This is the SAME data the #988/#989
-            // filters above already read, so the added per-receiver work here
-            // is O(1): two enum reads on already-decoded fields, no parse, no
-            // allocation, no lock. Fail-open: an unparseable wrapper
-            // (`parsed == None`) or UNSPECIFIED/unknown media_kind classifies
-            // as Control and is attributed `mailbox_full` (never preferentially
-            // blamed as a media shed).
-            //
-            // We also distinguish `Full` (transient backpressure — the fan-out
-            // burst case) from `Closed` (the receiver actor is gone). Only
-            // `Full` is a shed scenario; a `Closed` drop keeps the plain
-            // `mailbox_full` label and the warn, exactly as before.
-            let is_full = matches!(e, SendError::Full(_));
-            let priority = match parsed {
-                Some(pw) => OutboundPriority::classify_outer(
-                    true,
-                    pw.packet_type
-                        .enum_value()
-                        .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
-                    pw.media_kind.enum_value().unwrap_or(
-                        videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED,
+        match session_recipient.try_send(message) {
+            Err(e) => {
+                // PRIORITY-AWARE ATTRIBUTION on inbound fan-out overflow (#1145).
+                //
+                // HONEST CONTRACT — read before "improving" this: the actix
+                // mailbox exposes NO capacity/length probe and NO preemption API
+                // on `Recipient<Message>` (only `try_send`/`do_send`, verified
+                // against actix 0.13.5). So when `try_send` returns `Full` the
+                // packet simply CANNOT be enqueued — we do NOT, and CANNOT, evict
+                // a queued packet to make room for a higher-priority one. The
+                // value this block adds is therefore (a) correct ATTRIBUTION of
+                // WHICH KIND was sacrificed on overflow (video vs audio vs
+                // lifecycle), so dashboards/alerts see "video shed under fan-out
+                // burst" rather than an undifferentiated `mailbox_full`, and
+                // (b) it pairs with the mailbox HEADROOM bump (#1144) that gives
+                // the burst room to land in the mailbox and then spill onto the
+                // policy-aware outbound channel (which DOES shed video-first and
+                // record drops for metrics / keyframe-relax). Shedding alone
+                // can't save a critical packet on a full mailbox; the headroom is
+                // what actually prevents the drop.
+                //
+                // We classify off the OUTER cleartext wrapper that was already
+                // parsed ONCE per packet (`parsed`) — `packet_type` + the outer
+                // `media_kind` (field 5) — NEVER the inner `MediaPacket`, which is
+                // AES-sealed under E2EE. This is the SAME data the #988/#989
+                // filters above already read, so the added per-receiver work here
+                // is O(1): two enum reads on already-decoded fields, no parse, no
+                // allocation, no lock. Fail-open: an unparseable wrapper
+                // (`parsed == None`) or UNSPECIFIED/unknown media_kind classifies
+                // as Control and is attributed `mailbox_full` (never preferentially
+                // blamed as a media shed).
+                //
+                // We also distinguish `Full` (transient backpressure — the fan-out
+                // burst case) from `Closed` (the receiver actor is gone). Only
+                // `Full` is a shed scenario; a `Closed` drop keeps the plain
+                // `mailbox_full` label and the warn, exactly as before.
+                let is_full = matches!(e, SendError::Full(_));
+                let priority = match parsed {
+                    Some(pw) => OutboundPriority::classify_outer(
+                        true,
+                        pw.packet_type
+                            .enum_value()
+                            .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
+                        pw.media_kind.enum_value().unwrap_or(
+                            videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED,
+                        ),
                     ),
-                ),
-                // Unparseable outer wrapper → fail-open Control (never a media shed).
-                None => OutboundPriority::Control,
-            };
+                    // Unparseable outer wrapper → fail-open Control (never a media shed).
+                    None => OutboundPriority::Control,
+                };
 
-            // Pick the per-room `drop_reason` label. On a `Full` mailbox a
-            // droppable media kind (VIDEO/SCREEN → `priority_drop_video`,
-            // AUDIO → `priority_drop_audio`) attributes the sacrifice to that
-            // kind; everything else (Critical/Control, or a `Closed` mailbox)
-            // keeps the legacy `mailbox_full` label. The labels mirror the
-            // OUTBOUND taxonomy documented on `OUTBOUND_CHANNEL_DROPS_TOTAL`
-            // (`metrics.rs`), so a single dashboard query spans both hops.
-            let drop_reason = match (is_full, priority.priority_drop_label()) {
-                (true, Some(label)) => label,
-                _ => "mailbox_full",
-            };
+                // Pick the per-room `drop_reason` label. On a `Full` mailbox a
+                // droppable media kind (VIDEO/SCREEN → `priority_drop_video`,
+                // AUDIO → `priority_drop_audio`) attributes the sacrifice to that
+                // kind; everything else (Critical/Control, or a `Closed` mailbox)
+                // keeps the legacy `mailbox_full` label. The labels mirror the
+                // OUTBOUND taxonomy documented on `OUTBOUND_CHANNEL_DROPS_TOTAL`
+                // (`metrics.rs`), so a single dashboard query spans both hops.
+                let drop_reason = match (is_full, priority.priority_drop_label()) {
+                    (true, Some(label)) => label,
+                    _ => "mailbox_full",
+                };
 
-            // Room-tagged forensic series (kept for per-room drill-down). The
-            // `transport="nats_delivery"` here is the publish-side identity, not
-            // the receiver's transport.
-            RELAY_PACKET_DROPS_TOTAL
-                .with_label_values(&[&room, "nats_delivery", drop_reason])
-                .inc();
-            // Low-cardinality fleet-alerting sibling (Tier B #2 / #1057): the
-            // room-wide-freeze signature, labeled by the RECEIVER's transport so
-            // an SRE can rate() it without scraping per-room series and can tell
-            // which transport's mailbox is overflowing. This counts EVERY
-            // inbound-mailbox drop regardless of attributed kind, so the #1057
-            // freeze signature (sum over transport) is unchanged by the new
-            // per-room `drop_reason` split.
-            RELAY_INBOUND_MAILBOX_DROPS_TOTAL
-                .with_label_values(&[&transport])
-                .inc();
-            // The `Dropping inbound message for session <id> ... (mailbox full)`
-            // line is a STABLE CONTRACT consumed by
-            // `scripts/parse_meeting_console_logs.sh` (`--relay-ws`), which
-            // greps it per session to reconstruct mailbox-drop counts. It is
-            // kept VERBATIM (same text + WARN level) for every drop so the
-            // analyzer is not silently corrupted — the priority attribution
-            // added by this change lives entirely on the `drop_reason` metric
-            // label above, not in the log line. Do NOT edge-trigger or demote
-            // this line without updating the parse script in lock-step.
-            warn!(
-                "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
-                session, e
-            );
+                // Room-tagged forensic series (kept for per-room drill-down). The
+                // `transport="nats_delivery"` here is the publish-side identity, not
+                // the receiver's transport.
+                RELAY_PACKET_DROPS_TOTAL
+                    .with_label_values(&[&room, "nats_delivery", drop_reason])
+                    .inc();
+                // Low-cardinality fleet-alerting sibling (Tier B #2 / #1057): the
+                // room-wide-freeze signature, labeled by the RECEIVER's transport so
+                // an SRE can rate() it without scraping per-room series and can tell
+                // which transport's mailbox is overflowing. This counts EVERY
+                // inbound-mailbox drop regardless of attributed kind, so the #1057
+                // freeze signature (sum over transport) is unchanged by the new
+                // per-room `drop_reason` split.
+                RELAY_INBOUND_MAILBOX_DROPS_TOTAL
+                    .with_label_values(&[&transport])
+                    .inc();
+                // The `Dropping inbound message for session <id> ... (mailbox full)`
+                // line is a STABLE CONTRACT consumed by
+                // `scripts/parse_meeting_console_logs.sh` (`--relay-ws`), which
+                // greps it per session to reconstruct mailbox-drop counts. It is
+                // kept VERBATIM (same text + WARN level) for every drop so the
+                // analyzer is not silently corrupted — the priority attribution
+                // added by this change lives entirely on the `drop_reason` metric
+                // label above, not in the log line. Do NOT edge-trigger or demote
+                // this line without updating the parse script in lock-step.
+                warn!(
+                    "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
+                    session, e
+                );
+
+                // --- #1219 Half 2: Track consecutive drops for downlink detection ---
+                //
+                // Only count Full errors (transient backpressure). A Closed error
+                // means the actor is gone and we should not be tracking congestion
+                // for a dead session.
+                if is_full {
+                    consecutive_drops.set(consecutive_drops.get() + 1);
+                    consecutive_successes.set(0);
+
+                    // Cross threshold? Enter shedding mode.
+                    if !is_shedding.get()
+                        && consecutive_drops.get() >= DOWNLINK_CONGESTION_DROP_THRESHOLD
+                    {
+                        is_shedding.set(true);
+
+                        RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL
+                            .with_label_values(&[&transport])
+                            .inc();
+
+                        warn!(
+                            "Receiver session {} entered downlink congestion shedding mode \
+                             after {} consecutive drops (room: {}, transport: {}) (#1219)",
+                            session, DOWNLINK_CONGESTION_DROP_THRESHOLD, room, transport
+                        );
+
+                        // Emit DOWNLINK_CONGESTION signal (once per stall episode).
+                        // The signal is published to the receiver's own NATS subject
+                        // so it arrives via the normal subscription loop and passes
+                        // through the self-echo carve-out above.
+                        if !signal_emitted.get() {
+                            signal_emitted.set(true);
+                            info!(
+                                "DOWNLINK_CONGESTION signal armed for session {} (room: {}) — \
+                                 client-side consumption is a separate PR (#1219)",
+                                session, room
+                            );
+                            // NOTE: Actual NATS publish of the DOWNLINK_CONGESTION
+                            // packet is deferred to a follow-up PR that wires the
+                            // NATS client handle into this closure (requires passing
+                            // nc.clone() into handle_msg). The shedding logic above
+                            // is the critical path and is active NOW.
+                        }
+                    }
+                }
+            }
+            Ok(()) => {
+                // --- #1219 Half 2: Track consecutive successes for recovery ---
+                consecutive_drops.set(0);
+
+                if is_shedding.get() {
+                    consecutive_successes.set(consecutive_successes.get() + 1);
+
+                    // Exit shedding mode after sustained recovery.
+                    if consecutive_successes.get() >= DOWNLINK_CONGESTION_SUCCESS_WINDOW {
+                        is_shedding.set(false);
+                        signal_emitted.set(false); // Reset for next episode
+                        consecutive_successes.set(0);
+
+                        RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL
+                            .with_label_values(&[&transport])
+                            .inc();
+
+                        info!(
+                            "Receiver session {} exited downlink congestion shedding mode \
+                             after {} consecutive successes (room: {}, transport: {}) (#1219)",
+                            session, DOWNLINK_CONGESTION_SUCCESS_WINDOW, room, transport
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }

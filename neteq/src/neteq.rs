@@ -50,6 +50,25 @@ const K_DECELERATION_TARGET_LEVEL_OFFSET_MS: u32 = 85;
 /// Hardcoded minimum delay.
 const K_BASE_MIN_DELAY_MS: u32 = 20;
 
+/// Default playout-latency ceiling for the resync-to-live governor (issue #1299).
+///
+/// When the FILTERED playout buffer level ([`NetEq::filtered_buffer_level_ms`]) — i.e. how far
+/// behind live the audio playout sits — exceeds this many milliseconds, the governor performs a
+/// one-time controlled flush-to-live (see [`NetEq::maybe_resync_to_live`]). 1000ms is chosen so
+/// the governor fires ONLY on genuine multi-second lag (the #1299 standing-wave case) and never
+/// during normal jitter buffering: it sits well above `max_delay_ms` (the adaptive-target cap,
+/// see [`DEFAULT_RESYNC_MAX_DELAY_MS`]) so ordinary Accelerate/Normal operation is untouched.
+/// Field-tunable via [`NetEqConfig::resync_ceiling_ms`].
+const DEFAULT_RESYNC_CEILING_MS: u32 = 1000;
+
+/// Default minimum wall-clock interval between governor flushes (issue #1299).
+///
+/// Hysteresis/cooldown: after a resync flush, the governor will not fire again for at least this
+/// long. This prevents thrashing if the filtered level briefly re-crosses the ceiling while the
+/// buffer-level filter is still settling toward the post-flush level. Field-tunable via
+/// [`NetEqConfig::resync_cooldown_ms`].
+const DEFAULT_RESYNC_COOLDOWN_MS: u64 = 5000;
+
 /// NetEQ configuration
 #[derive(Debug, Clone)]
 pub struct NetEqConfig {
@@ -73,6 +92,18 @@ pub struct NetEqConfig {
     pub delay_config: DelayConfig,
     /// Smart flushing configuration
     pub smart_flush_config: SmartFlushConfig,
+    /// Resync-to-live governor: playout-latency ceiling in milliseconds (issue #1299).
+    ///
+    /// When the filtered playout buffer level exceeds this, the governor flushes the stale
+    /// backlog and resyncs to live (keeping ~`target_delay_ms` of the freshest audio, with
+    /// concealment over the seam). `0` disables the governor entirely. Must be set well above
+    /// `max_delay_ms` so it only fires on genuine multi-second lag, never on normal jitter.
+    /// Defaults to [`DEFAULT_RESYNC_CEILING_MS`].
+    pub resync_ceiling_ms: u32,
+    /// Resync-to-live governor: minimum wall-clock interval between flushes, in milliseconds
+    /// (issue #1299). Cooldown/hysteresis to prevent thrashing. Defaults to
+    /// [`DEFAULT_RESYNC_COOLDOWN_MS`].
+    pub resync_cooldown_ms: u64,
 }
 
 impl Default for NetEqConfig {
@@ -88,6 +119,8 @@ impl Default for NetEqConfig {
             bypass_mode: false,
             delay_config: DelayConfig::default(),
             smart_flush_config: SmartFlushConfig::default(),
+            resync_ceiling_ms: DEFAULT_RESYNC_CEILING_MS,
+            resync_cooldown_ms: DEFAULT_RESYNC_COOLDOWN_MS,
         }
     }
 }
@@ -229,6 +262,9 @@ pub struct NetEq {
     /// Number of samples added by time-stretching operations (matches WebRTC sample_memory_,
     /// but with clearer meaning for positive/negative values).
     timestretch_added_samples: i32,
+    /// Resync-to-live governor (issue #1299): wall-clock anchor of the last flush, for the
+    /// cooldown/hysteresis. `None` means no flush has occurred this stream. Reset in [`reset`].
+    last_resync: Option<Instant>,
 }
 
 impl NetEq {
@@ -298,6 +334,7 @@ impl NetEq {
             packets_per_sec_snapshot: 0,
             leftover_time_stretched_samples: Vec::new(),
             timestretch_added_samples: 0,
+            last_resync: None,
         })
     }
 
@@ -524,6 +561,10 @@ impl NetEq {
         self.last_packets_second_instant = Instant::now();
         self.leftover_time_stretched_samples.clear();
         self.timestretch_added_samples = 0;
+        // Resync-to-live governor (issue #1299): clear the cooldown anchor so a stale lag episode
+        // (e.g. a full flush or a prolonged disconnect/safety-valve reset) cannot mis-gate a
+        // freshly recalibrating stream.
+        self.last_resync = None;
     }
 
     fn get_decision(&mut self) -> Result<Operation> {
@@ -540,6 +581,17 @@ impl NetEq {
 
         // Reset for next frame (matches WebRTC decision_logic.cc:245-246)
         self.timestretch_added_samples = 0;
+
+        // Resync-to-live governor (issue #1299). Evaluated per decode tick, AFTER the buffer-level
+        // filter has been updated for this tick (so `filtered_buffer_level_ms()` reflects the live
+        // level) and BEFORE any normal decision. When the playout buffer is genuinely seconds
+        // behind live it drops the stale backlog, keeps ~`target_delay_ms` of the freshest audio,
+        // and returns `ExpandStart` so this very tick conceals the seam via the existing
+        // expand/crossfade path (NOT a raw splice). Below the ceiling this is a no-op and the
+        // decision flow below is byte-identical to pre-#1299 behavior.
+        if let Some(op) = self.maybe_resync_to_live(target_delay_ms) {
+            return Ok(op);
+        }
 
         // Use WebRTC-style threshold calculations
         let samples_per_ms = self.config.sample_rate / 1000;
@@ -609,6 +661,122 @@ impl NetEq {
 
         // Normal operation
         Ok(Operation::Normal)
+    }
+
+    /// Resync-to-live governor (issue #1299): the real fix for unbounded audio playout latency.
+    ///
+    /// A NetEQ receiver can fall multiple seconds behind live, play at normal 1× cadence, and stay
+    /// there forever: the consumer is real-time-paced so a backlog is a standing wave it never
+    /// drains, and Accelerate's catch-up gates off because the adaptive target ratchets toward the
+    /// 3s cap and re-labels the lag as the "correct" depth. Bounding the target (see
+    /// `NetEqConfig::max_delay_ms`, set to ~300ms on the wasm path) keeps Accelerate's setpoint low
+    /// but cannot claw back seconds already buffered. This governor handles that episodic case
+    /// directly.
+    ///
+    /// Fires ONLY when the FILTERED playout buffer level (how far behind live we are) exceeds
+    /// `resync_ceiling_ms` AND the cooldown has elapsed. When it fires it performs a one-time
+    /// controlled flush-to-live: it drops the stale backlog, keeps ~`target_delay_ms` of the
+    /// freshest buffered audio, resets the buffer-level filter to that reduced level, and returns
+    /// [`Operation::ExpandStart`]. Returning `ExpandStart` makes the very next decode this tick run
+    /// the existing expand/crossfade concealment path (`decode_expand`) across the discontinuity —
+    /// the SAME machinery a packet-gap underrun uses — rather than a raw, audible splice. The
+    /// natural decision flow then produces `Expand`/`ExpandEnd` as the kept buffer is consumed,
+    /// completing the conceal→resume arc.
+    ///
+    /// Returns `Some(ExpandStart)` when it fires, otherwise `None` (caller proceeds with the normal
+    /// decision flow, which is byte-identical to pre-#1299 behavior below the ceiling).
+    ///
+    /// `target_delay_ms` is passed in (rather than re-read) so it matches exactly the value
+    /// `get_decision` already computed for this tick.
+    fn maybe_resync_to_live(&mut self, target_delay_ms: u32) -> Option<Operation> {
+        // Disabled when ceiling is 0.
+        if self.config.resync_ceiling_ms == 0 {
+            return None;
+        }
+
+        // Trigger signal: the live, decision-grade playout latency. Only fire on genuine lag above
+        // the ceiling — below it, behavior is unchanged.
+        let playout_latency_ms = self.filtered_buffer_level_ms();
+        if playout_latency_ms <= self.config.resync_ceiling_ms {
+            return None;
+        }
+
+        // Hysteresis/cooldown: do not fire again until `resync_cooldown_ms` has elapsed since the
+        // last flush, so the governor cannot thrash while the filter settles to the new level.
+        let now = Instant::now();
+        if let Some(last) = self.last_resync {
+            if now.duration_since(last) < Duration::from_millis(self.config.resync_cooldown_ms) {
+                return None;
+            }
+        }
+
+        // Decide how much of the freshest audio to keep. We want ~`target_delay_ms` (the live
+        // jitter setpoint) — BUT in the broken/cold regime the adaptive target has itself ratcheted
+        // toward seconds (the very #1299 mechanism), so keeping the raw target would keep the whole
+        // backlog and the flush would be a no-op. Clamp the kept depth to half the ceiling so the
+        // flush ALWAYS lands well below the trigger and genuinely drops the backlog, regardless of
+        // whether part 2's `max_delay_ms` bound is active. With the bound active (wasm path,
+        // target≈300, ceiling 1000) this is min(300, 500)=300 — exactly the issue's "~target ms".
+        let keep_ms = target_delay_ms.min(self.config.resync_ceiling_ms / 2);
+
+        // Perform the controlled flush-to-live: keep ~keep_ms of the freshest packets, drop the
+        // older backlog. This is the audio analog of #1252's video skip-to-live.
+        self.flush_to_live(keep_ms);
+
+        // Anchor the cooldown.
+        self.last_resync = Some(now);
+
+        log::info!(
+            "Resync-to-live governor fired (#1299): playout latency was {playout_latency_ms}ms (> ceiling {}ms); flushed backlog, kept ~{keep_ms}ms, concealing seam",
+            self.config.resync_ceiling_ms
+        );
+
+        // Enter the same concealment-then-resume state a real underrun would, so the seam is
+        // crossfaded rather than spliced. consecutive_expands == 1 matches get_decision's own
+        // ExpandStart branch (which increments from 0 to 1).
+        self.consecutive_expands = 1;
+        Some(Operation::ExpandStart)
+    }
+
+    /// Drop the stale backlog and keep ~`keep_ms` of the freshest buffered audio (issue #1299).
+    ///
+    /// Steps:
+    /// 1. Remove older packets from the packet buffer (via `PacketBuffer::partial_flush`, the same
+    ///    span-keeping primitive smart-flush uses), keeping ~`keep_ms` of the freshest content.
+    /// 2. Clear the post-NetEQ leftover residue (`leftover_samples` /
+    ///    `leftover_time_stretched_samples`), since that residue is also stale playout content
+    ///    contributing to the lag; `decode_normal` will pull fresh packets for the concealment.
+    /// 3. Reset the delay manager. This is essential: the adaptive target (and thus `low_limit` /
+    ///    `high_limit` in `get_decision`) may have ratcheted toward seconds — the #1299 mechanism.
+    ///    If we kept that stale target, the post-flush buffer (~`keep_ms`) would sit BELOW
+    ///    `low_limit` and `get_decision` would conceal (Expand) forever, playing noise over real
+    ///    audio. Resetting recalibrates the target to the start delay (still bounded by any
+    ///    `max_delay_ms`), so the kept buffer is correctly seen as healthy and playback resumes.
+    /// 4. Resync the buffer-level filter to the new (reduced) buffer level so the next decision sees
+    ///    the post-flush latency, not the stale one.
+    ///
+    /// The seam left behind is concealed by the `ExpandStart` returned from the caller.
+    fn flush_to_live(&mut self, keep_ms: u32) {
+        // 1. Keep ~keep_ms of the freshest packets; drop the older backlog.
+        let _ = self.packet_buffer.partial_flush(
+            keep_ms,
+            self.config.sample_rate,
+            &mut self.statistics,
+        );
+
+        // 2. Drop stale post-NetEQ residue (these count toward current_buffer_size_samples and thus
+        // toward the lag).
+        self.leftover_samples.clear();
+        self.leftover_time_stretched_samples.clear();
+
+        // 3. Recalibrate the adaptive target away from any ratcheted (stale) value so the post-flush
+        // buffer is judged against a live setpoint, not the seconds-deep one that caused the lag.
+        self.delay_manager.reset();
+
+        // 4. Resync the buffer-level filter to the reduced level so subsequent decisions (and the
+        // governor's own ceiling check) see live latency, not the pre-flush backlog.
+        self.buffer_level_filter
+            .set_filtered_buffer_level(self.current_buffer_size_samples());
     }
 
     fn decode_normal(&mut self, frame: &mut AudioFrame) -> Result<()> {
@@ -1802,5 +1970,220 @@ mod tests {
             "playout_latency_ms should be > 0 after buffering 200ms of audio and decoding, got {}",
             stats.playout_latency_ms
         );
+    }
+
+    /// ACCEPTANCE TEST for the resync-to-live governor (issue #1299).
+    ///
+    /// Reproduces the confirmed multi-second-lag failure faithfully in the HARDEST regime: the
+    /// adaptive target is UNBOUNDED (`max_delay_ms = 0`, part 2 OFF) so it ratchets toward seconds —
+    /// exactly the #1299 mechanism that gates Accelerate off and would, without care, also gate the
+    /// post-flush resume off. Time-stretching is disabled (`for_test_no_time_stretching`) to model
+    /// Accelerate's catch-up being too weak / gated off, so the standing wave is GENUINELY
+    /// non-draining and the governor is the sole catch-up path. Running with part 2 off makes this a
+    /// HARD pin on the governor's internals (the keep-amount clamp, the delay-manager recalibration,
+    /// and the histogram reset) — not just on its trigger.
+    ///
+    /// The backlog is built as a genuine ~1.5s of buffered packets (under the 200-packet cap and
+    /// under the smart-flush span threshold) — i.e. real audio is actually behind live, not just a
+    /// primed filter — then sustained 1× arrival is driven (insert 10ms, pull 10ms; net delta 0).
+    ///
+    /// Asserts: (a) latency converges below the ceiling within a bounded number of frames; (b) the
+    /// governor actually fired (cooldown anchor `last_resync` set); (c) the seam is concealed via the
+    /// existing expand/crossfade path (`ExpandStart` then `ExpandEnd`), NOT a raw splice; (d) playback
+    /// RESUMES — after the conceal→resume arc the decision is no longer an Expand-family op, so the
+    /// listener hears real audio again, not endless concealment noise; (e) latency STAYS bounded.
+    ///
+    /// What PINS the governor (i.e. what fails if it is removed): (b) `last_resync.is_some()` and
+    /// (c) the `ExpandStart`/`ExpandEnd` seam — only the governor sets the cooldown anchor and
+    /// returns `ExpandStart` here. The convergence assertion (a) is corroborating, NOT solely
+    /// governor-attributable: this synthetic harness has near-zero inter-arrival jitter, so the
+    /// adaptive target never ratchets the way the FIELD case does, and an incidental Accelerate/
+    /// drain can also reduce the level. The governor's *necessity* under a true production standing
+    /// wave (target ratcheted → Accelerate gated off → no drain) rests on the issue's code-confirmed
+    /// mechanism, which is jitter-history-dependent and not reproducible in a unit test. So this test
+    /// proves the governor FIRES, CONCEALS, CONVERGES, and RESUMES — not that drain is impossible
+    /// without it.
+    #[test]
+    fn resync_governor_converges_below_ceiling_under_standing_wave() {
+        let config = NetEqConfig {
+            // Unbounded target (part 2 OFF) is the hardest case: it pins the governor's flush
+            // internals (keep-amount clamp + delay/histogram recalibration), which a bounded target
+            // would mask. Time-stretch off models Accelerate being unable to drain.
+            for_test_no_time_stretching: true,
+            ..Default::default()
+        };
+        // Sanity on the config the test depends on.
+        assert_eq!(config.resync_ceiling_ms, 1000);
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut insert_audio = make_insert_audio!();
+        let reset_filtered_level = make_reset_filtered_level!();
+
+        // Build a GENUINE ~1.5s raw backlog (150 packets, under the 200-packet cap) in 100ms chunks
+        // so neither the overflow full-flush nor the span-based smart-flush trims it. Then prime the
+        // filter to match — exactly how the field multi-second-lag case presents: real audio behind
+        // live, the buffer-level filter tracking it.
+        for _ in 0..15 {
+            insert_audio(&mut neteq, 100);
+        }
+        reset_filtered_level(&mut neteq);
+        assert!(
+            neteq.filtered_buffer_level_ms() >= 1400,
+            "precondition: ~1.5s genuine backlog, got {}ms",
+            neteq.filtered_buffer_level_ms()
+        );
+
+        // Drive sustained 1× arrival: each iteration adds 10ms and pulls one 10ms frame. Do NOT
+        // re-prime the filter inside the loop — the governor (and only the governor) must bring the
+        // filtered level down. Bound the run to 300 frames (3s of playout).
+        let mut converged_at: Option<usize> = None;
+        let mut saw_expand_start = false;
+        let mut saw_expand_end = false;
+        for frame_idx in 0..300 {
+            insert_audio(&mut neteq, 10);
+            let _ = neteq.get_audio().unwrap();
+            match neteq.last_operation {
+                Operation::ExpandStart => saw_expand_start = true,
+                Operation::ExpandEnd => saw_expand_end = true,
+                _ => {}
+            }
+            if neteq.filtered_buffer_level_ms() <= neteq.config.resync_ceiling_ms {
+                converged_at = Some(frame_idx);
+                break;
+            }
+        }
+
+        let converged_at = converged_at.unwrap_or_else(|| {
+            panic!(
+                "resync governor never brought playout latency below the {}ms ceiling within 300 frames (still {}ms) — the multi-second lag persisted",
+                neteq.config.resync_ceiling_ms,
+                neteq.filtered_buffer_level_ms()
+            )
+        });
+
+        // (b) The governor actually fired (one-shot flush), not some incidental drain: the cooldown
+        // anchor is the unambiguous source-of-truth signal that maybe_resync_to_live ran its body.
+        assert!(
+            neteq.last_resync.is_some(),
+            "expected the resync governor to have fired (cooldown anchor set)"
+        );
+
+        // (a) Bounded convergence: the governor fires on the first eligible tick, so this is fast.
+        assert!(
+            converged_at < 5,
+            "expected convergence within a few frames of the one-shot flush, took {converged_at}"
+        );
+
+        // (c)+(d) Observe the rest of the conceal→resume arc and the resume to real audio. The
+        // convergence loop above breaks on the very tick the governor fires (filtered level already
+        // ≤ ceiling), which is the ExpandStart tick — so ExpandEnd and the resume happen here. The
+        // seam is concealed via the existing crossfade path: ExpandStart (fade the last real audio
+        // out into concealment) THEN ExpandEnd (fade concealment back into the new live audio) —
+        // the exact gap-concealment arc, not a raw, audible splice. Playback must then RESUME to a
+        // non-Expand op (real audio), not get stuck playing concealment noise over a buffer that
+        // actually holds live audio. (e) latency must stay bounded throughout.
+        let mut resumed_to_real_audio = false;
+        for _ in 0..50 {
+            insert_audio(&mut neteq, 10);
+            let _ = neteq.get_audio().unwrap();
+            match neteq.last_operation {
+                Operation::ExpandStart => saw_expand_start = true,
+                Operation::ExpandEnd => saw_expand_end = true,
+                Operation::Expand => {}
+                _ => resumed_to_real_audio = true,
+            }
+            assert!(
+                neteq.filtered_buffer_level_ms() <= neteq.config.resync_ceiling_ms,
+                "post-resync latency re-exceeded ceiling under steady 1× arrival: {}ms",
+                neteq.filtered_buffer_level_ms()
+            );
+        }
+
+        assert!(
+            saw_expand_start,
+            "expected ExpandStart at the resync seam (concealment onset), saw none"
+        );
+        assert!(
+            saw_expand_end,
+            "expected ExpandEnd after the resync seam (concealment resolves back to real audio)"
+        );
+        assert!(
+            resumed_to_real_audio,
+            "after the resync conceal arc, playback never resumed to a non-Expand op (stuck in concealment)"
+        );
+    }
+
+    /// Part 2 (issue #1299): the bounded `max_delay_ms` caps `target_delay_ms`, so the adaptive
+    /// target can never ratchet to the 3000ms regime that gates Accelerate off.
+    ///
+    /// Drives a pathological all-identical-timestamp burst (the same pattern that
+    /// `test_buffer_duration_calculation_with_identical_timestamps` shows pushes the delay manager
+    /// to high targets) and asserts the target stays at/below the configured cap. FAILS if the
+    /// `max_delay_ms` plumbing (NetEqConfig field → set_maximum_delay) is removed: the default
+    /// derived cap is 3000ms (200 packets × 20 × 3/4), so without the bound the target can climb far
+    /// past 300ms.
+    #[test]
+    fn bounded_target_cannot_reach_3s() {
+        const CAP_MS: u32 = 300;
+        let config = NetEqConfig {
+            max_delay_ms: CAP_MS,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Hammer the delay manager toward its maximum: many packets with the SAME timestamp drive
+        // the inter-arrival/quantile estimate high (cf. the identical-timestamp test above).
+        for i in 0..400u32 {
+            let header = RtpHeader::new(i as u16, 1000, 12345, 96, false);
+            let mut payload = Vec::new();
+            for s in 0..160 {
+                payload.extend_from_slice(&((s as f32).sin() * 0.1).to_le_bytes());
+            }
+            let packet = AudioPacket::new(header, payload, 16000, 1, 20);
+            neteq.insert_packet(packet).unwrap();
+        }
+
+        let target = neteq.target_delay_ms();
+        assert!(
+            target <= CAP_MS,
+            "target_delay_ms must be capped at {CAP_MS}ms by max_delay_ms, got {target}ms (would ratchet toward the 3000ms cap unbounded)"
+        );
+    }
+
+    /// Below the ceiling, the resync governor must NOT fire — behavior is unchanged (issue #1299).
+    ///
+    /// Drives a normal, low-latency stream (target-sized buffer, steady 1× arrival) and asserts no
+    /// flush ever occurs (cooldown anchor stays `None`) and every operation is one of the ordinary
+    /// decisions. FAILS if the governor fires on a normal stream (e.g. ceiling set too low or the
+    /// trigger inverted).
+    #[test]
+    fn resync_governor_does_not_fire_below_ceiling() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut insert_audio = make_insert_audio!();
+        let reset_filtered_level = make_reset_filtered_level!();
+
+        // Establish a normal ~80ms buffer (well below the 1000ms ceiling) and run a steady stream.
+        insert_audio(&mut neteq, 80);
+        reset_filtered_level(&mut neteq);
+
+        for _ in 0..200 {
+            insert_audio(&mut neteq, 10);
+            let _ = neteq.get_audio().unwrap();
+
+            // The governor never fired: no cooldown anchor was set.
+            assert!(
+                neteq.last_resync.is_none(),
+                "resync governor fired on a normal below-ceiling stream (latency {}ms)",
+                neteq.filtered_buffer_level_ms()
+            );
+            // Latency stays low; it must never approach the ceiling on a healthy stream.
+            assert!(
+                neteq.filtered_buffer_level_ms() < neteq.config.resync_ceiling_ms,
+                "below-ceiling stream unexpectedly reached {}ms",
+                neteq.filtered_buffer_level_ms()
+            );
+        }
     }
 }

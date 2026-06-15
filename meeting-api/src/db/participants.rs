@@ -346,10 +346,19 @@ pub async fn admit_creator_preserve_host(
 /// Atomically transfer host from `from_user_id` to `to_user_id` (single-host
 /// model: host is handed off, not shared).
 ///
-/// Promotes the target (requiring `admitted`) and demotes the caller in a
-/// single transaction. If the target is not an admitted participant the
-/// transaction is rolled back and `None` is returned, so the caller is never
-/// demoted without a valid successor. Returns `Some(target_row)` on success.
+/// Demotes the caller and promotes the target in a single transaction, holding
+/// a row lock on the meeting so concurrent transfers can't produce two hosts.
+///
+/// Returns:
+/// - `Ok(Some(target_row))` on success;
+/// - `Ok(None)` when the caller is no longer the host (lost a concurrent race —
+///   the row lock + `is_host` guard make the loser a clean no-op) OR the target
+///   is not an admitted participant. In both cases nothing is committed, so the
+///   caller is never demoted without a valid successor and a second host can
+///   never be created.
+///
+/// Ordering: the caller is demoted BEFORE the target is promoted, so there is
+/// at most one `is_host` row at any instant.
 pub async fn transfer_host(
     pool: &PgPool,
     meeting_id: i32,
@@ -358,6 +367,35 @@ pub async fn transfer_host(
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
+    // Serialize against concurrent transfers (and `join_attendee`, which locks
+    // the same row): two near-simultaneous transfers from the same host would
+    // otherwise both pass the pre-BEGIN `require_host` check and each promote a
+    // different target — split-brain with two hosts. The lock forces them to
+    // run one-at-a-time so the second sees the post-first state.
+    sqlx::query("SELECT id FROM meetings WHERE id = $1 FOR UPDATE")
+        .bind(meeting_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+    // Demote the caller, but ONLY if they are still the host. A transfer that
+    // lost the race finds the caller already demoted (`is_host = FALSE`) → zero
+    // rows → abort with `None`, so it never goes on to create a second host.
+    let demoted = sqlx::query(
+        "UPDATE meeting_participants SET is_host = FALSE, updated_at = NOW() \
+         WHERE meeting_id = $1 AND user_id = $2 AND is_host = TRUE",
+    )
+    .bind(meeting_id)
+    .bind(from_user_id)
+    .execute(&mut *tx)
+    .await?;
+    if demoted.rows_affected() == 0 {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+
+    // Promote the target (must be an admitted participant). If it matches no
+    // row, roll back — which also undoes the demote above, so the caller keeps
+    // host and the meeting is never left without one.
     let promote_query = format!(
         r#"
         UPDATE meeting_participants
@@ -373,20 +411,9 @@ pub async fn transfer_host(
         .await?;
 
     let Some(target_row) = promoted else {
-        // Target is not an admitted participant — abort without demoting the
-        // caller so we never leave the meeting with no successor.
         tx.rollback().await?;
         return Ok(None);
     };
-
-    sqlx::query(
-        "UPDATE meeting_participants SET is_host = FALSE, updated_at = NOW() \
-         WHERE meeting_id = $1 AND user_id = $2",
-    )
-    .bind(meeting_id)
-    .bind(from_user_id)
-    .execute(&mut *tx)
-    .await?;
 
     tx.commit().await?;
     Ok(Some(target_row))

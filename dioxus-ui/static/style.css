@@ -5767,19 +5767,12 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .color-swatches {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   width: var(--speaker-control-width);
-  gap: 10px;
-  flex-wrap: nowrap;
-  overflow: visible;
+  gap: 8px;
+  flex-wrap: wrap;
+  overflow: hidden;
   padding: 2px 0;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-
-
-.color-swatches::-webkit-scrollbar {
-  display: none; /* WebKit/Blink */
 }
 
 .color-swatch {

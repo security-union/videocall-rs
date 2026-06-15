@@ -1576,9 +1576,25 @@ pub fn AttendantsComponent(
                 },
             )),
             on_peer_left: {
+                let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
                     move |(display_name, user_id, _session_id): (String, String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
+
+                        // Suppress replayed "left" events during a transport reconnect.
+                        // The server replays the member list on reconnect (see issue 244),
+                        // which would otherwise fire a spurious leave toast + sound that
+                        // a following replayed "joined" cancels - ~30 toasts in a 15-person
+                        // meeting after a network blip. Mirrors the on_peer_joined guard.
+                        if let Some(ref client) = *client_cell.borrow() {
+                            if client.is_reconnecting() {
+                                log::debug!(
+                                    "Suppressing leave toast for {} (reconnecting)",
+                                    display_name
+                                );
+                                return;
+                            }
+                        }
 
                         let settings = appearance_settings.peek();
                         let show_toast = settings.show_join_leave_notifications;

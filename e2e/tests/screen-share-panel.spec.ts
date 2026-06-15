@@ -435,38 +435,40 @@ test.describe("Screen share right panel layout", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 3. Off-budget tiles render as avatars, not blank canvases
+  // 3. Off-budget camera-on peers render as paused avatars, not blank canvases
   //
   // The decode-budget system limits live video decoding to the first N
   // tiles in the screen-share right panel. Tiles beyond the budget must
   // render with `force_avatar: true`, producing a
   // `.placeholder-content--paused` element instead of a `<canvas>`.
   //
-  // This test forces a low decode budget via localStorage
-  // (`vc_decode_budget_override = "3"` → Fixed(3)), adds 8 mock peers
-  // (total ~10 tiles), starts screen share, and asserts that exactly 3
-  // tiles have live canvases while the rest render as paused avatars.
-  // This deterministically exercises the off-budget path regardless of
-  // device capability, ensuring the test fails if `force_avatar` regresses
-  // to a no-op in the VideoOnly render path.
+  // IMPORTANT: mock peers are video-OFF (is_video_enabled_for_peer returns
+  // false for "mock-N" IDs) and render plain `.placeholder-content`
+  // ("Video Disabled"), NOT `.placeholder-content--paused`. The --paused
+  // placeholder only renders for camera-ON peers excluded by the budget
+  // (force_avatar && is_video_enabled_for_peer). Therefore this test uses
+  // 4 real browsers (host + 3 guests, all with fake camera) and forces
+  // Fixed(2) so at least 1 real camera-on peer lands in the avatar tier.
   //
-  // Requires `mockPeersEnabled: "true"` in config.js.
+  // Host sees 3 remote peers in the SS right panel. With ss_budget = 2,
+  // peers are sorted by join time: guests 1-2 (earliest) get decoded,
+  // guest 3 (latest) gets force_avatar: true → .placeholder-content--paused.
   // ──────────────────────────────────────────────────────────────────────
-  test("off-budget tiles render as avatar placeholders during screen share", async ({
+  test("off-budget camera-on peers render as paused avatars during screen share", async ({
     baseURL,
   }) => {
-    test.setTimeout(120_000);
+    test.setTimeout(150_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_ss_panel_avatar_budget_${Date.now()}`;
 
-    // Force a low decode budget BEFORE page navigation so the initial
-    // `load_decode_budget_override()` picks up Fixed(3) from localStorage.
-    // With 8 mock + ~2 real peers = ~10 tiles, ss_budget clamps to 3,
-    // producing ~7 deterministic avatar-tier tiles.
-    const FORCED_BUDGET = 3;
+    // Fixed(2): with 3 remote camera-on peers, ss_budget = 2 → 1 peer
+    // is off-budget and must render as .placeholder-content--paused.
+    const FORCED_BUDGET = 2;
 
     const browser1 = await chromium.launch({ args: BROWSER_ARGS });
     const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser3 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser4 = await chromium.launch({ args: BROWSER_ARGS });
 
     const hostCtx = await createAuthenticatedContext(
       browser1,
@@ -474,95 +476,103 @@ test.describe("Screen share right panel layout", () => {
       "SSBudgetHost",
       uiURL,
     );
-    const guestCtx = await createAuthenticatedContext(
-      browser2,
-      "ssbudgetguest@videocall.rs",
-      "SSBudgetGuest",
-      uiURL,
-    );
-
-    // Inject the Fixed(N) budget override and mock getDisplayMedia on both
-    // contexts BEFORE creating pages (addInitScript runs before every nav).
+    // Inject Fixed(N) budget override on host BEFORE page navigation.
     await hostCtx.addInitScript(`
       localStorage.setItem("vc_decode_budget_override", "${FORCED_BUDGET}");
     `);
     await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
-    await guestCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+
+    const guest1Ctx = await createAuthenticatedContext(
+      browser2,
+      "ssbudgetguest1@videocall.rs",
+      "SSBudgetGuest1",
+      uiURL,
+    );
+    await guest1Ctx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+
+    const guest2Ctx = await createAuthenticatedContext(
+      browser3,
+      "ssbudgetguest2@videocall.rs",
+      "SSBudgetGuest2",
+      uiURL,
+    );
+
+    const guest3Ctx = await createAuthenticatedContext(
+      browser4,
+      "ssbudgetguest3@videocall.rs",
+      "SSBudgetGuest3",
+      uiURL,
+    );
 
     const hostPage = await hostCtx.newPage();
-    const guestPage = await guestCtx.newPage();
+    const guest1Page = await guest1Ctx.newPage();
+    const guest2Page = await guest2Ctx.newPage();
+    const guest3Page = await guest3Ctx.newPage();
 
     try {
-      // Join the meeting with both users (mirrors setupTwoUserMeeting).
+      // Host joins first.
       await navigateToMeeting(hostPage, meetingId, "SSBudgetHost");
       const hostResult = await joinMeetingFromPage(hostPage);
       expect(hostResult).toBe("in-meeting");
 
-      await navigateToMeeting(guestPage, meetingId, "SSBudgetGuest");
-      const guestResult = await joinMeetingFromPage(guestPage);
-      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+      // Guests join sequentially (join order determines budget ranking).
+      await navigateToMeeting(guest1Page, meetingId, "SSBudgetGuest1");
+      const g1Result = await joinMeetingFromPage(guest1Page);
+      await admitGuestIfNeeded(hostPage, guest1Page, g1Result);
 
-      // Wait for peer tile to appear on the host side.
-      const peerTile = hostPage.locator("#grid-container .grid-item");
-      await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
-      await hostPage.waitForTimeout(3000);
+      await navigateToMeeting(guest2Page, meetingId, "SSBudgetGuest2");
+      const g2Result = await joinMeetingFromPage(guest2Page);
+      await admitGuestIfNeeded(hostPage, guest2Page, g2Result);
 
-      // Check that mock peers are available.
-      const mockButton = hostPage.locator("button.video-control-button", {
-        has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
-      });
-      const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
-      if (!mockPeersAvailable) {
-        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
-        return;
-      }
+      await navigateToMeeting(guest3Page, meetingId, "SSBudgetGuest3");
+      const g3Result = await joinMeetingFromPage(guest3Page);
+      await admitGuestIfNeeded(hostPage, guest3Page, g3Result);
 
-      // Add 8 mock peers so total tiles (~10) exceed the forced budget (3).
-      await addMockPeers(hostPage, 8);
-      await hostPage.waitForTimeout(2000);
+      // Wait for all 3 remote peer tiles to appear on the host.
+      const gridTiles = hostPage.locator("#grid-container .grid-item");
+      await expect(gridTiles.nth(2)).toBeVisible({ timeout: 30_000 });
 
-      // Guest starts screen sharing.
-      const shareActivated = await startScreenShare(guestPage, hostPage);
+      // Guest 1 starts screen sharing → host sees SS split layout.
+      const shareActivated = await startScreenShare(guest1Page, hostPage);
       if (!shareActivated) {
         test.skip(true, "Screen share could not be auto-accepted.");
         return;
       }
 
       // Let the split layout settle and the decode budget take effect.
-      await hostPage.waitForTimeout(4000);
+      await hostPage.waitForTimeout(5000);
 
-      // ---- ASSERT: all tiles are rendered in the DOM ----
+      // ---- ASSERT: peer tiles are rendered in the SS right panel ----
       const peerTiles = hostPage.locator(".split-peer-tile");
       const tileCount = await peerTiles.count();
-      // 8 mock + 2 real (host + guest) = 10, but self-tile may vary;
-      // assert at least 8 to confirm tiles are present.
-      expect(tileCount).toBeGreaterThanOrEqual(8);
+      // Host sees 3 remote peers (guests 1-3) in the right panel.
+      expect(tileCount).toBeGreaterThanOrEqual(3);
 
-      // ---- ASSERT: off-budget tiles are avatar-tier (not blank canvases) ----
-      const avatarTiles = hostPage.locator(".split-peer-tile .placeholder-content--paused");
+      // ---- ASSERT: at least 1 off-budget camera-on peer is --paused ----
+      const pausedTiles = hostPage.locator(".split-peer-tile .placeholder-content--paused");
       const canvasTiles = hostPage.locator(".split-peer-tile canvas");
 
-      const avatarCount = await avatarTiles.count();
+      const pausedCount = await pausedTiles.count();
       const canvasCount = await canvasTiles.count();
 
-      // With Fixed(3) and ~10 tiles, we MUST have avatar tiles. If not,
-      // the budget override didn't take effect — that's a test failure,
-      // not a skip.
-      expect(avatarCount).toBeGreaterThan(0);
+      // With Fixed(2) and 3 real camera-on peers, we MUST have at least 1
+      // paused avatar tile. This fails (not skips) if force_avatar regresses.
+      expect(pausedCount).toBeGreaterThan(0);
       expect(canvasCount).toBeGreaterThan(0);
       expect(canvasCount).toBeLessThanOrEqual(FORCED_BUDGET);
-      expect(canvasCount).toBeLessThan(tileCount);
 
       // Verify the paused placeholder has the expected accessibility
       // attributes (role="img" + non-empty aria-label).
-      const firstAvatar = avatarTiles.first();
-      await expect(firstAvatar).toBeVisible({ timeout: 5_000 });
-      await expect(firstAvatar).toHaveAttribute("role", "img");
-      const ariaLabel = await firstAvatar.getAttribute("aria-label");
+      const firstPaused = pausedTiles.first();
+      await expect(firstPaused).toBeVisible({ timeout: 5_000 });
+      await expect(firstPaused).toHaveAttribute("role", "img");
+      const ariaLabel = await firstPaused.getAttribute("aria-label");
       expect(ariaLabel).toBeTruthy();
     } finally {
       await browser1.close();
       await browser2.close();
+      await browser3.close();
+      await browser4.close();
     }
   });
 

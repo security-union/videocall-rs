@@ -413,6 +413,24 @@ impl ConnectionController {
         }
     }
 
+    /// Forwards to [`ConnectionManager::rtt_probe_dropped_total`] (#522).
+    pub fn rtt_probe_dropped_total(&self) -> u64 {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.rtt_probe_dropped_total()
+        } else {
+            0
+        }
+    }
+
+    /// Forwards to [`ConnectionManager::rtt_probe_stale_suppressions_total`] (#522).
+    pub fn rtt_probe_stale_suppressions_total(&self) -> u64 {
+        if let Ok(mgr) = self.manager.try_borrow() {
+            mgr.rtt_probe_stale_suppressions_total()
+        } else {
+            0
+        }
+    }
+
     /// Returns the shared re-election completed signal.
     ///
     /// Forwards to [`ConnectionManager::reelection_completed_signal`].

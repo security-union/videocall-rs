@@ -983,6 +983,65 @@ fn next_single_layer_pin(
     }
 }
 
+/// One AQ tick of the camera's WebTransport uplink-DROP self-congestion axis
+/// (#1104). Given the cumulative `unistream_drop_count()` reading, the window
+/// snapshot, and how long the window has been open, return the
+/// [`SelfCongestionDecision`] — applying the WebTransport DROP window/threshold
+/// (`WT_SELF_CONGESTION_WINDOW_MS` / `WT_SELF_CONGESTION_DROP_THRESHOLD`), NOT
+/// the WebSocket or saturation constants.
+///
+/// Extracted from the wasm-only AQ loop so the encoder's CHOICE OF SIGNAL — the
+/// drop counter wired through `evaluate_self_congestion` with the WT-drop
+/// constants — is pinned by a NATIVE `#[test]` (the loop itself depends on
+/// `js_sys::Date::now()` and cannot run on host). A mutation that fed the WS
+/// constants, the saturation constants, or inverted the comparison changes the
+/// returned decision and fails the test. The wasm loop calls this with
+/// `videocall_transport::webtransport::unistream_drop_count()` as `current`, so
+/// the counter the test reasons about is the one the encoder consults.
+#[inline]
+fn wt_drop_step_down_decision(
+    current_drops: u64,
+    snapshot_drops: u64,
+    elapsed_ms: f64,
+) -> videocall_aq::constants::SelfCongestionDecision {
+    use crate::adaptive_quality_constants::{
+        evaluate_self_congestion, WT_SELF_CONGESTION_DROP_THRESHOLD, WT_SELF_CONGESTION_WINDOW_MS,
+    };
+    evaluate_self_congestion(
+        current_drops,
+        snapshot_drops,
+        elapsed_ms,
+        WT_SELF_CONGESTION_WINDOW_MS,
+        WT_SELF_CONGESTION_DROP_THRESHOLD,
+    )
+}
+
+/// One AQ tick of the camera's WebTransport uplink-SATURATION self-congestion
+/// axis (#1219 prerequisite). Mirrors [`wt_drop_step_down_decision`] but applies
+/// the SATURATION window/threshold (`WT_SATURATION_WINDOW_MS` /
+/// `WT_SATURATION_STALL_THRESHOLD`) over the slow-`ready()` counter. The wasm
+/// loop calls this with
+/// `videocall_transport::webtransport::unistream_ready_stall_count()` as
+/// `current`, so a mutation that fed the drop counter / drop constants here is
+/// caught by the native test (the saturation boundary differs).
+#[inline]
+fn wt_saturation_step_down_decision(
+    current_stalls: u64,
+    snapshot_stalls: u64,
+    elapsed_ms: f64,
+) -> videocall_aq::constants::SelfCongestionDecision {
+    use crate::adaptive_quality_constants::{
+        evaluate_self_congestion, WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS,
+    };
+    evaluate_self_congestion(
+        current_stalls,
+        snapshot_stalls,
+        elapsed_ms,
+        WT_SATURATION_WINDOW_MS,
+        WT_SATURATION_STALL_THRESHOLD,
+    )
+}
+
 impl CameraEncoder {
     /// Construct a camera encoder, with arguments:
     ///
@@ -1387,19 +1446,16 @@ impl CameraEncoder {
                 // into a runaway double step-down. For WebSocket users this
                 // counter stays flat at 0, so the block is a true no-op.
                 {
-                    use crate::adaptive_quality_constants::{
-                        evaluate_self_congestion, WT_SELF_CONGESTION_DROP_THRESHOLD,
-                        WT_SELF_CONGESTION_WINDOW_MS,
-                    };
                     let current_wt_drops =
                         videocall_transport::webtransport::unistream_drop_count();
                     let elapsed_ms = now - wt_drop_window_start_ms;
-                    let decision = evaluate_self_congestion(
+                    // Decision + WT-drop constants live in the host-testable
+                    // `wt_drop_step_down_decision` helper so a mutation to the
+                    // signal/constants is caught by a native test (#509 item #2).
+                    let decision = wt_drop_step_down_decision(
                         current_wt_drops,
                         last_wt_drop_snapshot,
                         elapsed_ms,
-                        WT_SELF_CONGESTION_WINDOW_MS,
-                        WT_SELF_CONGESTION_DROP_THRESHOLD,
                     );
                     if decision.step_down {
                         log::warn!(
@@ -1443,19 +1499,15 @@ impl CameraEncoder {
                 // be removed: a WT publisher now sees its own uplink saturation
                 // directly.
                 {
-                    use crate::adaptive_quality_constants::{
-                        evaluate_self_congestion, WT_SATURATION_STALL_THRESHOLD,
-                        WT_SATURATION_WINDOW_MS,
-                    };
                     let current_wt_stalls =
                         videocall_transport::webtransport::unistream_ready_stall_count();
                     let elapsed_ms = now - wt_stall_window_start_ms;
-                    let decision = evaluate_self_congestion(
+                    // Decision + WT-saturation constants live in the host-testable
+                    // `wt_saturation_step_down_decision` helper (#509 item #2).
+                    let decision = wt_saturation_step_down_decision(
                         current_wt_stalls,
                         last_wt_stall_snapshot,
                         elapsed_ms,
-                        WT_SATURATION_WINDOW_MS,
-                        WT_SATURATION_STALL_THRESHOLD,
                     );
                     if decision.step_down {
                         log::warn!(
@@ -3656,10 +3708,15 @@ mod tests {
         format_layer_transition, frame_is_healthy, initial_active_layer_count,
         is_fatal_encoder_error_message, keyframe_tick_decision, layer_ceiling_to_count,
         loop_is_superseded, next_single_layer_pin, record_camera_restart, shed_reason,
-        should_pin_single_layer_low, should_teardown_shed_layer, KeyframeTickInput, LayerView,
-        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
-        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
-        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        should_pin_single_layer_low, should_teardown_shed_layer, wt_drop_step_down_decision,
+        wt_saturation_step_down_decision, KeyframeTickInput, LayerView, SimulcastLayerInfo,
+        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+    };
+    use crate::adaptive_quality_constants::{
+        WS_SELF_CONGESTION_DROP_THRESHOLD, WS_SELF_CONGESTION_WINDOW_MS,
+        WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS, WT_SELF_CONGESTION_DROP_THRESHOLD,
+        WT_SELF_CONGESTION_WINDOW_MS,
     };
     use videocall_aq::constants::simulcast_layers;
 
@@ -4434,6 +4491,110 @@ mod tests {
         assert!(
             !next_single_layer_pin(2, Some(50), true),
             "simulcast publisher: a real reading releases the pin"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WebTransport backpressure wiring (#509 parity audit, item #2).
+    //
+    // These pin that the camera AQ loop consults the WT *drop* and *saturation*
+    // counters through the WT constants — the client-side congestion signal WT
+    // would otherwise lack (WS-only, per PR #339). The wasm loop itself depends
+    // on `js_sys::Date::now()` and cannot run on host, so the per-axis decision
+    // (counter → `evaluate_self_congestion` → WT window/threshold) is extracted
+    // into `wt_drop_step_down_decision` / `wt_saturation_step_down_decision`,
+    // which the loop calls with the live transport counters. A mutation that
+    // pointed an axis at the WRONG constants (e.g. the WS or the sibling WT
+    // axis) shifts the firing boundary and is caught below; the transport-side
+    // increment of those counters is pinned separately by the
+    // `record_unistream_drop` / `record_ready_stall` tests in
+    // `videocall-transport`.
+    // -----------------------------------------------------------------------
+
+    /// A sustained WT unistream-drop cluster at/above the WT-drop threshold,
+    /// observed over a fully-elapsed WT-drop window, MUST request a step-down.
+    #[test]
+    fn camera_wt_drop_axis_fires_on_sustained_drops() {
+        let current = WT_SELF_CONGESTION_DROP_THRESHOLD; // exactly at threshold
+        let decision = wt_drop_step_down_decision(
+            current,
+            0, // snapshot
+            WT_SELF_CONGESTION_WINDOW_MS,
+        );
+        assert!(
+            decision.step_down,
+            "a WT-drop delta == WT threshold over a closed WT window must step down"
+        );
+    }
+
+    /// A drop count BELOW the WT-drop threshold must NOT fire — a transient
+    /// stream reset on a lossy link cannot shed a layer.
+    #[test]
+    fn camera_wt_drop_axis_does_not_fire_below_threshold() {
+        let current = WT_SELF_CONGESTION_DROP_THRESHOLD - 1;
+        let decision = wt_drop_step_down_decision(current, 0, WT_SELF_CONGESTION_WINDOW_MS);
+        assert!(
+            !decision.step_down,
+            "a WT-drop delta below the WT threshold must NOT step down"
+        );
+    }
+
+    /// The drop axis must use the WT-drop constants, NOT the WS constants. This
+    /// is the anti-misweave pin: at an elapsed past the (narrower) WS window but
+    /// before the WT window closes, the WT axis must still treat the window as
+    /// OPEN. If the helper were mutated to the WS window the same elapsed would
+    /// CLOSE the window and roll/fire. The test is meaningful only because the
+    /// two windows genuinely differ — that premise is pinned at COMPILE TIME by
+    /// `WT_WINDOW_WIDER_THAN_WS` below (a const assert, so it cannot be a
+    /// runtime `assert!` on constants — clippy `assertions_on_constants`).
+    #[test]
+    fn camera_wt_drop_axis_uses_wt_constants_not_ws() {
+        // Compile-time premise: the WT drop window is strictly wider than the
+        // WS window, so an elapsed between them is "open" under WT but "closed"
+        // under WS. If a future tuning made them equal, this fails the BUILD,
+        // flagging that the anti-misweave test below no longer discriminates.
+        const _: () = assert!(
+            WT_SELF_CONGESTION_WINDOW_MS > WS_SELF_CONGESTION_WINDOW_MS,
+            "test premise: WT drop window must be wider than WS window"
+        );
+        // Elapsed sits past the WS window but before the WT window closes.
+        let elapsed = WS_SELF_CONGESTION_WINDOW_MS + 1.0;
+        // A delta at/above BOTH thresholds, evaluated over a still-OPEN WT
+        // window, must not fire or roll.
+        let delta = WS_SELF_CONGESTION_DROP_THRESHOLD.max(WT_SELF_CONGESTION_DROP_THRESHOLD);
+        let decision = wt_drop_step_down_decision(delta, 0, elapsed);
+        assert!(
+            !decision.step_down,
+            "the WT-drop axis must treat the WT window as still open at WS-window elapsed \
+             (proves WT constants, not WS, are used)"
+        );
+        assert!(
+            !decision.roll_window,
+            "an open WT window must not roll (would roll early under WS window)"
+        );
+    }
+
+    /// A sustained slow-`ready()` cluster at/above the WT-saturation threshold
+    /// over a fully-elapsed saturation window MUST request a step-down — the
+    /// slow-but-alive uplink case the drop axis structurally cannot see.
+    #[test]
+    fn camera_wt_saturation_axis_fires_on_sustained_stalls() {
+        let current = WT_SATURATION_STALL_THRESHOLD;
+        let decision = wt_saturation_step_down_decision(current, 0, WT_SATURATION_WINDOW_MS);
+        assert!(
+            decision.step_down,
+            "a saturation delta == saturation threshold over a closed window must step down"
+        );
+    }
+
+    /// A flat saturation counter (a WS user, or a healthy WT uplink that never
+    /// crosses the producer-side ready-stall threshold) must NEVER fire.
+    #[test]
+    fn camera_wt_saturation_axis_never_fires_when_flat() {
+        let decision = wt_saturation_step_down_decision(0, 0, WT_SATURATION_WINDOW_MS);
+        assert!(
+            !decision.step_down,
+            "a flat-at-0 saturation counter must never step down (WS users / healthy WT)"
         );
     }
 }

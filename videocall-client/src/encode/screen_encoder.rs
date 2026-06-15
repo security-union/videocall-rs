@@ -296,6 +296,60 @@ fn set_vbr_mode(config: &VideoEncoderConfig) {
     );
 }
 
+/// One AQ tick of the screen share's WebTransport uplink-DROP self-congestion
+/// axis (#1199). Given the cumulative `unistream_drop_count()` reading, the
+/// window snapshot, and elapsed window time, return the
+/// [`SelfCongestionDecision`] under the WebTransport DROP window/threshold
+/// (`WT_SELF_CONGESTION_WINDOW_MS` / `WT_SELF_CONGESTION_DROP_THRESHOLD`).
+///
+/// Extracted from the wasm-only AQ loop (which depends on `js_sys::Date::now()`)
+/// so the encoder's choice of signal + constants is pinned by a NATIVE
+/// `#[test]`, mirroring the camera encoder. The screen share is frequently the
+/// heaviest egress in a call, so this axis matters at least as much here. The
+/// loop calls this with
+/// `videocall_transport::webtransport::unistream_drop_count()` as `current`.
+#[inline]
+fn wt_drop_step_down_decision(
+    current_drops: u64,
+    snapshot_drops: u64,
+    elapsed_ms: f64,
+) -> videocall_aq::constants::SelfCongestionDecision {
+    use crate::adaptive_quality_constants::{
+        evaluate_self_congestion, WT_SELF_CONGESTION_DROP_THRESHOLD, WT_SELF_CONGESTION_WINDOW_MS,
+    };
+    evaluate_self_congestion(
+        current_drops,
+        snapshot_drops,
+        elapsed_ms,
+        WT_SELF_CONGESTION_WINDOW_MS,
+        WT_SELF_CONGESTION_DROP_THRESHOLD,
+    )
+}
+
+/// One AQ tick of the screen share's WebTransport uplink-SATURATION axis (#1219
+/// prerequisite). Mirrors [`wt_drop_step_down_decision`] but applies the
+/// SATURATION window/threshold (`WT_SATURATION_WINDOW_MS` /
+/// `WT_SATURATION_STALL_THRESHOLD`) over the slow-`ready()` counter. The loop
+/// calls this with
+/// `videocall_transport::webtransport::unistream_ready_stall_count()`.
+#[inline]
+fn wt_saturation_step_down_decision(
+    current_stalls: u64,
+    snapshot_stalls: u64,
+    elapsed_ms: f64,
+) -> videocall_aq::constants::SelfCongestionDecision {
+    use crate::adaptive_quality_constants::{
+        evaluate_self_congestion, WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS,
+    };
+    evaluate_self_congestion(
+        current_stalls,
+        snapshot_stalls,
+        elapsed_ms,
+        WT_SATURATION_WINDOW_MS,
+        WT_SATURATION_STALL_THRESHOLD,
+    )
+}
+
 /// User-configurable adaptive-quality tier bounds for SCREEN SHARE (issue #961
 /// follow-up), shared from the UI into the running screen encoder control loop.
 ///
@@ -1148,19 +1202,16 @@ impl ScreenEncoder {
                 // severe distress is acceptable; this matches the camera loop.)
                 // For WebSocket users this counter stays flat at 0 (no-op).
                 {
-                    use crate::adaptive_quality_constants::{
-                        evaluate_self_congestion, WT_SELF_CONGESTION_DROP_THRESHOLD,
-                        WT_SELF_CONGESTION_WINDOW_MS,
-                    };
                     let current_wt_drops =
                         videocall_transport::webtransport::unistream_drop_count();
                     let elapsed_ms = now - wt_drop_window_start_ms;
-                    let decision = evaluate_self_congestion(
+                    // Decision + WT-drop constants live in the host-testable
+                    // `wt_drop_step_down_decision` helper so a mutation to the
+                    // signal/constants is caught by a native test (#509 item #2).
+                    let decision = wt_drop_step_down_decision(
                         current_wt_drops,
                         last_wt_drop_snapshot,
                         elapsed_ms,
-                        WT_SELF_CONGESTION_WINDOW_MS,
-                        WT_SELF_CONGESTION_DROP_THRESHOLD,
                     );
                     // Issue #1229: roll the window/snapshot ALWAYS (baseline not
                     // stale across an idle gap), but only act while sharing.
@@ -1197,19 +1248,15 @@ impl ScreenEncoder {
                 // egress, so detecting its own uplink saturation here is at least
                 // as important as on the camera.
                 {
-                    use crate::adaptive_quality_constants::{
-                        evaluate_self_congestion, WT_SATURATION_STALL_THRESHOLD,
-                        WT_SATURATION_WINDOW_MS,
-                    };
                     let current_wt_stalls =
                         videocall_transport::webtransport::unistream_ready_stall_count();
                     let elapsed_ms = now - wt_stall_window_start_ms;
-                    let decision = evaluate_self_congestion(
+                    // Decision + WT-saturation constants live in the host-testable
+                    // `wt_saturation_step_down_decision` helper (#509 item #2).
+                    let decision = wt_saturation_step_down_decision(
                         current_wt_stalls,
                         last_wt_stall_snapshot,
                         elapsed_ms,
-                        WT_SATURATION_WINDOW_MS,
-                        WT_SATURATION_STALL_THRESHOLD,
                     );
                     // Issue #1229: roll the window/snapshot ALWAYS (baseline not
                     // stale across an idle gap), but only act while sharing.
@@ -3452,11 +3499,17 @@ mod tests {
     use super::screen_encoder_restarts_other;
     use super::should_reacquire_screen_capture;
     use super::should_teardown_shed_layer;
+    use super::wt_drop_step_down_decision;
+    use super::wt_saturation_step_down_decision;
     use super::KeyframeTickInput;
     use super::RestartReason;
     use super::ScreenEncoder;
     use super::SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS;
     use super::SHED_TEARDOWN_DWELL_MS;
+    use crate::adaptive_quality_constants::{
+        WS_SELF_CONGESTION_WINDOW_MS, WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS,
+        WT_SELF_CONGESTION_DROP_THRESHOLD, WT_SELF_CONGESTION_WINDOW_MS,
+    };
     use crate::{Callback, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
 
     #[test]
@@ -3518,6 +3571,8 @@ mod tests {
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_host_granted: None,
+            on_host_revoked: None,
             on_peer_event: None,
             decode_media: true,
             is_guest: false,
@@ -3996,6 +4051,88 @@ mod tests {
             forced, 3,
             "a saturated PLI burst at a 2000ms cooldown must coalesce to 3 forced keyframes, \
              not one per frame"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WebTransport backpressure wiring (#509 parity audit, item #2).
+    //
+    // Mirror of the camera-encoder pins: the screen AQ loop is wasm-only, so the
+    // per-axis decision (counter → `evaluate_self_congestion` → WT constants) is
+    // extracted into `wt_drop_step_down_decision` /
+    // `wt_saturation_step_down_decision`, which the loop calls with the live WT
+    // counters. Screen is frequently the heaviest egress, so its WT self-shed
+    // matters at least as much as the camera's. A mutation pointing an axis at
+    // the wrong constants is caught here; the transport-side increment is pinned
+    // by the `videocall-transport` `record_*` tests.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn screen_wt_drop_axis_fires_on_sustained_drops() {
+        let decision = wt_drop_step_down_decision(
+            WT_SELF_CONGESTION_DROP_THRESHOLD,
+            0,
+            WT_SELF_CONGESTION_WINDOW_MS,
+        );
+        assert!(
+            decision.step_down,
+            "a WT-drop delta == WT threshold over a closed WT window must step down"
+        );
+    }
+
+    #[test]
+    fn screen_wt_drop_axis_does_not_fire_below_threshold() {
+        let decision = wt_drop_step_down_decision(
+            WT_SELF_CONGESTION_DROP_THRESHOLD - 1,
+            0,
+            WT_SELF_CONGESTION_WINDOW_MS,
+        );
+        assert!(
+            !decision.step_down,
+            "a WT-drop delta below the WT threshold must NOT step down"
+        );
+    }
+
+    /// Anti-misweave pin: the drop axis must use the WT window, not the WS
+    /// window. At an elapsed past the (narrower) WS window but before the WT
+    /// window closes, the WT axis must still treat the window as OPEN. The
+    /// premise (WT window wider than WS) is pinned at COMPILE TIME below so it
+    /// is not a runtime `assert!` on constants (clippy `assertions_on_constants`).
+    #[test]
+    fn screen_wt_drop_axis_uses_wt_window_not_ws() {
+        const _: () = assert!(
+            WT_SELF_CONGESTION_WINDOW_MS > WS_SELF_CONGESTION_WINDOW_MS,
+            "test premise: WT drop window must be wider than WS window"
+        );
+        let elapsed = WS_SELF_CONGESTION_WINDOW_MS + 1.0;
+        let decision = wt_drop_step_down_decision(WT_SELF_CONGESTION_DROP_THRESHOLD, 0, elapsed);
+        assert!(
+            !decision.step_down,
+            "WT-drop axis must treat the WT window as open at WS-window elapsed (proves WT \
+             constants, not WS)"
+        );
+        assert!(!decision.roll_window, "an open WT window must not roll");
+    }
+
+    #[test]
+    fn screen_wt_saturation_axis_fires_on_sustained_stalls() {
+        let decision = wt_saturation_step_down_decision(
+            WT_SATURATION_STALL_THRESHOLD,
+            0,
+            WT_SATURATION_WINDOW_MS,
+        );
+        assert!(
+            decision.step_down,
+            "a saturation delta == saturation threshold over a closed window must step down"
+        );
+    }
+
+    #[test]
+    fn screen_wt_saturation_axis_never_fires_when_flat() {
+        let decision = wt_saturation_step_down_decision(0, 0, WT_SATURATION_WINDOW_MS);
+        assert!(
+            !decision.step_down,
+            "a flat-at-0 saturation counter must never step down (WS users / healthy WT)"
         );
     }
 

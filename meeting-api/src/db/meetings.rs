@@ -468,7 +468,8 @@ pub async fn activate(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error>
     Ok(())
 }
 
-/// End a meeting (set state to 'ended', set ended_at if not already set).
+/// End a meeting (set state to 'ended', set ended_at if not already set) and
+/// reset host to the creator for the next activation.
 ///
 /// Idempotent at the SQL level: `state <> 'ended'` short-circuits zero-row
 /// UPDATEs on re-fire, and `COALESCE(ended_at, NOW())` preserves the original
@@ -476,6 +477,13 @@ pub async fn activate(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error>
 /// duplicate triggers (e.g. NATS re-subscribe after disconnect, or multi-replica
 /// fan-out without a queue group). Callers do not inspect rows-affected, so the
 /// no-op second call is intentionally indistinguishable from a fresh end.
+///
+/// In the single-host model the creator is the default host; a transfer-host
+/// may have moved host to another participant during the session.
+/// [`crate::db::participants::clear_non_creator_hosts`] demotes any such
+/// transfer target on end so the next activation starts with the creator as the
+/// sole host. Both statements are independently idempotent, so a re-fire (NATS
+/// re-subscribe, multi-replica) reconciles any state left by a partial run.
 pub async fn end_meeting(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
     sqlx::query(
         "UPDATE meetings \
@@ -485,6 +493,8 @@ pub async fn end_meeting(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Err
     .bind(meeting_id)
     .execute(pool)
     .await?;
+
+    crate::db::participants::clear_non_creator_hosts(pool, meeting_id).await?;
     Ok(())
 }
 

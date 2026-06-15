@@ -290,6 +290,11 @@ pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
     }
 }
 
+pub async fn transfer_host(meeting_id: &str, user_id: &str) -> Result<(), JoinError> {
+    log::info!("Transferring host via API: {meeting_id} -> {user_id}");
+    client()?.transfer_host(meeting_id, user_id).await
+}
+
 pub async fn update_display_name(
     meeting_id: &str,
     display_name: &str,

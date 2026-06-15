@@ -58,9 +58,9 @@ use crate::context::{
     save_dock_autohide, save_dock_position, save_preferred_camera_id, save_preferred_camera_on,
     save_preferred_mic_id, save_preferred_mic_on, save_preferred_speaker_id, validate_display_name,
     AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride,
-    DensityModeCtx, DisplayNameCtx, DockPosition, DockPositionCtx, LocalAudioLevelCtx, MeetingTime,
-    PeerMediaState, PeerSignalHistoryMap, PeerStatusMap, SignalPopupStateMap, TransportPreference,
-    TransportPreferenceCtx,
+    DensityModeCtx, DisplayNameCtx, DockPosition, DockPositionCtx, HostRefreshNonceCtx, HostSetCtx,
+    LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap,
+    SignalPopupStateMap, TransportPreference, TransportPreferenceCtx,
 };
 use crate::local_storage::{load_f64, save_f64};
 use crate::types::DeviceInfo;
@@ -460,6 +460,33 @@ use super::attendants_layout::{
     compute_effective_density, compute_layout, promote_speakers, TILE_AR,
 };
 use super::density::{DensityMode, DENSITY_MODES};
+
+/// Bump the host-event counter from the HOST_GRANTED/HOST_REVOKED handlers, so
+/// the roster seed can tell a host event landed during its in-flight fetch and
+/// skip a stale overwrite. NATS-handler safe (uses `peek`, no reactive read).
+fn bump_host_event_seq(mut seq: Signal<u64>) {
+    let next = seq.peek().wrapping_add(1);
+    seq.set(next);
+}
+
+/// Show the one-shot host-change toast and dismiss it ~6s later. NATS-handler
+/// safe; a host change re-renders in place (no remount), so the toast is driven
+/// directly via these signals.
+fn show_host_change_toast(
+    message: &str,
+    mut toast: Signal<Option<String>>,
+    mut timer: Signal<Option<gloo_timers::callback::Timeout>>,
+) {
+    toast.set(Some(message.to_string()));
+    timer.set(None);
+    timer.set(Some(gloo_timers::callback::Timeout::new(
+        6_000,
+        move || {
+            toast.set(None);
+            timer.set(None);
+        },
+    )));
+}
 
 /// Where a settings deep link should land. The Performance controls moved out of
 /// the Settings modal into the Diagnostics drawer (#1131 unify), so an incoming
@@ -964,6 +991,86 @@ pub fn AttendantsComponent(
     let video_off_toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
     let peer_display_name_version = use_signal(|| 0u32);
 
+    // Host set: the `user_id`(s) currently holding host (single-host, so ≤1).
+    // Seeded ONLY from `is_owner` (our own /status flag), NOT from `host_user_id`
+    // — that's the meeting CREATOR and goes stale once host is transferred away
+    // (seeding it would paint a wrong crown on the creator). Other peers' current
+    // host is filled in by the `/participants` roster seed below and kept live by
+    // HOST_GRANTED/HOST_REVOKED. Consumed by `peer_list` / `canvas_generator`.
+    let host_set_signal: Signal<std::collections::HashSet<String>> = {
+        let user_id = user_id.clone();
+        use_signal(move || {
+            let mut set = std::collections::HashSet::new();
+            if is_owner {
+                if let Some(uid) = user_id.clone() {
+                    set.insert(uid);
+                }
+            }
+            set
+        })
+    };
+    // Provided by `MeetingPage`. Bumping this nonce re-fetches our participant
+    // status and remounts this component, so a freshly granted/revoked host gets
+    // a rebuilt media client with the correct `is_owner` and a fresh room token.
+    // `None` when rendered without the provider (e.g. isolated component tests).
+    let host_refresh_nonce = try_use_context::<HostRefreshNonceCtx>();
+
+    // Monotonic counter bumped on every HOST_GRANTED/HOST_REVOKED. The roster
+    // seed below snapshots it before its async fetch and skips the overwrite if a
+    // host event landed meanwhile (live events are fresher) — keeping the replace
+    // race-free.
+    let host_event_seq: Signal<u64> = use_signal(|| 0u64);
+
+    // Seed the host set from the `/participants` roster so the current host shows
+    // a "(Host)" for everyone, including late joiners and rejoins after a
+    // transfer — live events only cover changes seen while connected, so the
+    // roster is the source of truth at (re)connect time. Replaces the set
+    // wholesale (self-correcting), but skips the replace when a host event arrived
+    // during the fetch (see `host_event_seq`). Re-runs when `host_refresh_nonce`
+    // bumps (after our own host change).
+    {
+        let meeting_id = id.clone();
+        use_effect(move || {
+            // Track the nonce so a self host-change re-seeds from the roster.
+            let _ = host_refresh_nonce.map(|c| c.0());
+            if is_guest {
+                return;
+            }
+            let seq_at_start = *host_event_seq.peek();
+            let meeting_id = meeting_id.clone();
+            let mut host_set_signal = host_set_signal;
+            let host_event_seq = host_event_seq;
+            wasm_bindgen_futures::spawn_local(async move {
+                match crate::constants::meeting_api_client() {
+                    Ok(client) => match client.list_participants(&meeting_id).await {
+                        Ok(parts) => {
+                            // A live host event during the fetch already updated
+                            // the set with fresher data — don't clobber it.
+                            if *host_event_seq.peek() != seq_at_start {
+                                return;
+                            }
+                            let hosts: std::collections::HashSet<String> = parts
+                                .into_iter()
+                                .filter(|p| p.is_host)
+                                .map(|p| p.user_id)
+                                .collect();
+                            host_set_signal.set(hosts);
+                        }
+                        Err(e) => log::debug!("host-set roster seed failed: {e}"),
+                    },
+                    Err(e) => log::debug!("meeting_api_client error during host-set seed: {e}"),
+                }
+            });
+        });
+    }
+
+    // One-shot toast shown to the local user on grant, driven directly via
+    // these signals from the HOST_GRANTED/HOST_REVOKED handler.
+    // See `show_host_change_toast`.
+    let host_change_toast: Signal<Option<String>> = use_signal(|| None);
+    let host_change_toast_timer: Signal<Option<gloo_timers::callback::Timeout>> =
+        use_signal(|| None);
+
     // Create the peer status map signal early so it can be captured by the
     // on_peer_removed callback inside use_hook below.
     let mut peer_status_map: PeerStatusMap = use_signal(HashMap::new);
@@ -1037,6 +1144,11 @@ pub fn AttendantsComponent(
         let client_for_kick = client_for_reconnect.clone();
 
         let user_id_for_display_name_changed = user_id.clone();
+        // The local user's authoritative id (resolved like `opts.user_id` below),
+        // so HOST_GRANTED/HOST_REVOKED can tell a self-change from an observer one.
+        let user_id_for_host_events = user_id
+            .clone()
+            .unwrap_or_else(|| initial_display_name.clone());
 
         let opts = VideoCallClientOptions {
             user_id: user_id
@@ -1305,12 +1417,13 @@ pub fn AttendantsComponent(
                     }
                 });
             })),
-            // The host's own client must NOT mute itself on mute-all — guard here
-            // by skipping the callback entirely when is_owner is true.
-            on_host_mute: if is_owner {
-                None
-            } else {
-                Some(VcCallback::from(move |_: ()| {
+            on_host_mute: Some(VcCallback::from({
+                let self_uid = user_id_for_host_events.clone();
+                move |_: ()| {
+                    if host_set_signal.peek().contains(&self_uid) {
+                        log::info!("HOST_MUTE: ignored — local user is currently a host");
+                        return;
+                    }
                     log::info!("HOST_MUTE: muting local microphone on host request");
                     let mut mic_enabled = mic_enabled;
                     let mut show_muted_toast = show_muted_toast;
@@ -1325,21 +1438,21 @@ pub fn AttendantsComponent(
                         show_muted_toast.set(false);
                         toast_timer.set(None);
                     })));
-                }))
-            },
-            // Host's own client must NOT disable its own camera on disable-video-all —
-            // skip the callback entirely when is_owner is true (client-side guard).
-            //
-            // Self-protection model:
-            //   • disable-video-all  → client-side only: is_owner check here prevents the
-            //     host from receiving the broadcast as a target of its own "disable video for all" action.
-            //   • disable-video (single-target) → server-side: routes/host.rs rejects any
-            //     request where body.user_id == the authenticated caller's user_id.
-            //
-            on_host_disable_video: if is_owner {
-                None
-            } else {
-                Some(VcCallback::from(move |_: ()| {
+                }
+            })),
+            // Host's own client must NOT disable its own camera on
+            // disable-video-all. Self-protection:
+            //   • disable-video-all → client-side: this check stops a host
+            //     disabling its own camera on its own broadcast.
+            //   • disable-video (single-target) → server-side: routes/host.rs
+            //     rejects a request where body.user_id == the caller's user_id.
+            on_host_disable_video: Some(VcCallback::from({
+                let self_uid = user_id_for_host_events.clone();
+                move |_: ()| {
+                    if host_set_signal.peek().contains(&self_uid) {
+                        log::info!("HOST_DISABLE_VIDEO: ignored — local user is currently a host");
+                        return;
+                    }
                     log::info!("HOST_DISABLE_VIDEO: disabling local camera on host request");
                     let mut video_enabled = video_enabled;
                     let mut show_video_off_toast = show_video_off_toast;
@@ -1353,12 +1466,17 @@ pub fn AttendantsComponent(
                         show_video_off_toast.set(false);
                         video_off_toast_timer.set(None);
                     })));
-                }))
-            },
-            on_participant_kicked: if is_owner {
-                None
-            } else {
-                Some(VcCallback::from(move |_: ()| {
+                }
+            })),
+            on_participant_kicked: Some(VcCallback::from({
+                let self_uid = user_id_for_host_events.clone();
+                move |_: ()| {
+                    if host_set_signal.peek().contains(&self_uid) {
+                        log::warn!(
+                            "PARTICIPANT_KICKED: ignored — local user is currently the host"
+                        );
+                        return;
+                    }
                     let mut meeting_ended_message = meeting_ended_message;
                     let mut mic_enabled = mic_enabled;
                     let mut video_enabled = video_enabled;
@@ -1379,8 +1497,57 @@ pub fn AttendantsComponent(
                             log::warn!("PARTICIPANT_KICKED: disconnect failed: {e}");
                         }
                     }
-                }))
-            },
+                }
+            })),
+            // Broadcast to the whole room. Always update the live host set so the
+            // promoted peer's "(Host)" indicator updates on every client
+            // (including their own self row) without a reload. For self user_id:
+            // also show a toast and bump the refresh nonce so `MeetingPage`
+            // re-fetches our status and flips `is_owner`.
+            on_host_granted: Some(VcCallback::from({
+                let local_uid = user_id_for_host_events.clone();
+                move |target: String| {
+                    log::info!("HOST_GRANTED received for target=\"{target}\"");
+                    {
+                        let mut host_set_signal = host_set_signal;
+                        host_set_signal.write().insert(target.clone());
+                    }
+                    bump_host_event_seq(host_event_seq);
+                    if target == local_uid {
+                        show_host_change_toast(
+                            "You are now a host",
+                            host_change_toast,
+                            host_change_toast_timer,
+                        );
+                        if let Some(ctx) = host_refresh_nonce {
+                            let mut n = ctx.0;
+                            n.set(n() + 1);
+                        }
+                    }
+                }
+            })),
+            on_host_revoked: Some(VcCallback::from({
+                let local_uid = user_id_for_host_events.clone();
+                move |target: String| {
+                    log::info!("HOST_REVOKED received for target=\"{target}\"");
+                    {
+                        let mut host_set_signal = host_set_signal;
+                        host_set_signal.write().remove(&target);
+                    }
+                    bump_host_event_seq(host_event_seq);
+                    if target == local_uid {
+                        show_host_change_toast(
+                            "You are no longer a host",
+                            host_change_toast,
+                            host_change_toast_timer,
+                        );
+                        if let Some(ctx) = host_refresh_nonce {
+                            let mut n = ctx.0;
+                            n.set(n() + 1);
+                        }
+                    }
+                }
+            })),
             on_peer_event: Some(VcCallback::from(
                 move |(source_user_id, event_type, _stream_id): (String, String, String)| {
                     if event_type != videocall_client::PEER_EVENT_SCREEN_DECODE_STARTED {
@@ -2144,6 +2311,9 @@ pub fn AttendantsComponent(
 
     // Provide contexts for child components
     use_context_provider(|| client.clone());
+    // Provide the host set so peer-list rows and video tiles render a host
+    // indicator for the current host.
+    use_context_provider(|| HostSetCtx(host_set_signal));
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
     let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
@@ -2822,6 +2992,13 @@ pub fn AttendantsComponent(
     // in production where that runtime-config flag is false.
     use_hook(crate::components::decode_budget_inject::register_decode_budget_inject_hooks);
 
+    // Register `window.__videocall_inject_stale_video_backlog` /
+    // `window.__videocall_freshness_skips` so an E2E spec can deterministically
+    // trip the #1020 jitter-buffer freshness deadline (which runs in the decoder
+    // worker) and observe the resulting `freshness_skip` event (#1022). Also gated
+    // on `MOCK_PEERS_ENABLED`, so a no-op in production.
+    use_hook(crate::components::freshness_inject::register_freshness_inject_hooks);
+
     // Host self-view speaking glow — update DOM directly to avoid re-rendering
     // the entire meeting view on every audio-level tick.
     // Note: host glow is intentionally not suppressed by pin state so the local
@@ -3341,44 +3518,19 @@ pub fn AttendantsComponent(
     let has_screen_share = active_screen_sharer.is_some();
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
-    // The right panel uses a 2-column grid of compact tiles. We compute how
-    // many fit based on the available height, then run speaker promotion
-    // independently of the normal grid's visible_tile_count.
     //
-    // Layout constants must stay in sync with container_style below:
-    //   - SS_FLEX_RATIO: right panel gets 1/(2+1) of the container width
-    //   - SS_OUTER_PAD: padding: 16px 16px 80px 16px → left + right = 32px
-    //   - SS_GAP: gap between left/right panels = 10px (container gap)
-    //   - SS_GRID_GAP: gap between tiles in the 2-col grid = 8px
-    //   - SS_GRID_PAD: padding inside the right panel div = 6px each side
-    //   - SS_BOTTOM_PAD: padding-bottom (80px) from container_style
-    //   - SS_TOP_PAD: padding-top (16px) + right panel padding (6px*2)
+    // Screen-share right panel: compact tiles via CSS flex-wrap layout.
+    // All visual sizing is handled purely by CSS (.ss-peer-panel).
     //
-    // Tile sizing: height is fixed to fit 4 tiles per column regardless of panel width.
-    // Column count collapses to 1 when right_ratio <= 0.25 or panel is too narrow.
-    // Actual tile width is controlled by the CSS grid (1fr columns), not computed here.
-    const SS_GRID_GAP: f64 = 8.0;
-    const SS_BOTTOM_PAD: f64 = 80.0;
-    const SS_VERT_PAD: f64 = 28.0; // top padding (16) + panel padding (6*2)
-    let right_ratio = 1.0 - screen_share_ratio();
-    let ss_panel_width = (right_ratio * (vw - 42.0) - 12.0).max(100.0); // ≈ right_ratio * (vw - outer_pad - gap) - grid_pad
-    let ss_cols = if right_ratio <= 0.25 || ss_panel_width < 180.0 {
-        1.0_f64 // single column
-    } else {
-        2.0_f64 // two columns
-    };
-    let ss_avail_h = vh - SS_BOTTOM_PAD - SS_VERT_PAD;
-    // Tile height: always sized to fit exactly 4 tiles per column (independent of panel width resize).
-    let ss_tile_h = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0);
-    // Natural tile width at 16:9: ss_tile_h * 16.0 / 9.0 (actual width follows grid columns).
-    // Max rows is always 4 (height is sized for exactly 4 tiles per column).
-    let ss_max_rows = 4_usize;
-    let ss_max_tiles = ss_max_rows * ss_cols as usize;
+    // ALL participants are rendered in the DOM (vertical scroll handles
+    // overflow), but only the first `ss_decoded_limit` get live video
+    // decode. The rest render as avatar-tier tiles (`force_avatar: true`)
+    // — same pattern as the normal grid's decode-budget (issue #987).
+    // This prevents a 30-person meeting from spinning up 30 decoders
+    // during screen share on constrained hardware.
 
     // Build a separate tile list for the screen-share right panel.
-    // The grid's promotion used visible_tile_count which differs from the
-    // screen-share panel's capacity, so we rebuild from scratch and re-promote.
-    let (ss_tiles, ss_overflow_count) = if has_screen_share {
+    let (ss_decoded_tiles, ss_avatar_tiles) = if has_screen_share {
         let mut ss_all: Vec<String> = Vec::with_capacity(total_tiles);
         for peer_id in display_peers.iter().take(capped_real) {
             ss_all.push(peer_id.clone());
@@ -3393,19 +3545,14 @@ pub fn AttendantsComponent(
             });
         }
 
-        let (ss_vis_count, ss_ovf) = if ss_all.len() > ss_max_tiles {
-            let vis = ss_max_tiles.saturating_sub(1).max(1); // reserve 1 slot for badge
-            (vis, ss_all.len() - vis)
-        } else {
-            (ss_all.len(), 0)
-        };
-
+        // Promote active speakers into the decoded budget window.
+        let ss_budget = budget_cap.max(MIN_CAP).min(ss_all.len());
         {
             let speech_map = peer_speech_priority.read();
             let join_map = peer_join_time.read();
             promote_speakers(
                 &mut ss_all,
-                ss_vis_count,
+                ss_budget,
                 &speech_map,
                 &join_map,
                 now_ms,
@@ -3413,10 +3560,32 @@ pub fn AttendantsComponent(
             );
         }
 
-        let tiles: Vec<String> = ss_all.into_iter().take(ss_vis_count).collect();
-        (tiles, ss_ovf)
+        // --- SS pin-swap (mirrors the normal grid's pin-swap at lines above) ---
+        // If the pinned peer is ranked beyond `ss_budget`, swap it into the
+        // last decoded slot so it renders with live video instead of avatar.
+        // Without this, a pinned off-budget SS peer gets force-added to
+        // `active_decode_set` (phase 3) which silently exceeds budget_cap,
+        // AND renders as avatar despite being decoded (wasted decode +
+        // misleading UI).
+        if ss_budget > 0 && ss_budget < ss_all.len() {
+            if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
+                let pinned_idx = ss_all.iter().position(|tile_id| {
+                    client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
+                });
+                if let Some(idx) = pinned_idx {
+                    if idx >= ss_budget {
+                        ss_all.swap(ss_budget - 1, idx);
+                    }
+                }
+            }
+        }
+
+        // Split: first ss_budget tiles get video decode, rest get avatars.
+        let decoded: Vec<String> = ss_all.iter().take(ss_budget).cloned().collect();
+        let avatars: Vec<String> = ss_all.iter().skip(ss_budget).cloned().collect();
+        (decoded, avatars)
     } else {
-        (Vec::new(), 0)
+        (Vec::new(), Vec::new())
     };
 
     // ORDERING INVARIANT: the active decode set is built in 3 phases:
@@ -3426,8 +3595,9 @@ pub fn AttendantsComponent(
     // The dedup check against previous_active_decode_set must run AFTER all
     // three phases. Moving any insertion after the dedup will silently desync.
     let mut active_decode_set: HashSet<u64> = if has_screen_share {
-        // In screen share mode, decode only the tiles visible in the right panel.
-        ss_tiles
+        // In screen share mode, decode only the budget-capped tiles.
+        // Avatar-tier tiles are rendered but not decoded.
+        ss_decoded_tiles
             .iter()
             .filter_map(|pid| pid.parse::<u64>().ok())
             .collect()
@@ -3786,6 +3956,7 @@ pub fn AttendantsComponent(
                 if !peer_toasts().is_empty()
                     || show_muted_toast()
                     || show_video_off_toast()
+                    || host_change_toast().is_some()
                     || screen_share_toast_state().is_some()
                 {
                     div { class: "peer-toasts",
@@ -3949,6 +4120,26 @@ pub fn AttendantsComponent(
                                 }
                             }
                         }
+                        if let Some(host_msg) = host_change_toast() {
+                            div { class: "peer-toast toast-joined",
+                                span { class: "toast-icon",
+                                    svg {
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        path { d: "M2 18h20l-2-9-4 4-4-7-4 7-4-4-2 9Z" }
+                                    }
+                                }
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "{host_msg}" }
+                                }
+                            }
+                        }
                         for (id, display_name, _, is_joined) in peer_toasts().iter().cloned() {
                             {
                                 let variant_class = if is_joined {
@@ -4105,36 +4296,12 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — 1 or 2-column grid of compact peer tiles.
-                                //
-                                // HCL issues #3 + #4: columns are sized to the tile's natural
-                                // 3:2 width (`ss_tile_h * 1.5`), NOT `1fr`. `1fr` columns made
-                                // the grid stretch each cell to fill `right_pct%`, leaving the
-                                // 3:2-capped `.split-peer-tile` centered with surplus on both
-                                // sides — visually "centered with too-large column gaps" on a
-                                // wide right panel. Pairing fixed `var(--ss-tile-w)` cells
-                                // with `justify-content: start` packs the tiles to the left
-                                // edge and keeps the inter-tile gap exactly `8px`, matching
-                                // the non-share grid feel. Tiles still hold their 3:2 cap
-                                // (enforced by `.split-peer-tile { aspect-ratio: 3 / 2 }`),
-                                // so wide-screen viewports leave empty space on the right
-                                // edge of the panel instead of stretching the tiles.
+                                // Right panel — CSS flex-wrap panel.
                                 div {
-                                    style: {
-                                        let ss_tile_w = (ss_tile_h * TILE_AR).round();
-                                        let grid_cols = if ss_cols > 1.0 {
-                                            format!("repeat(2, {ss_tile_w:.0}px)")
-                                        } else {
-                                            format!("{ss_tile_w:.0}px")
-                                        };
-                                        format!("width: {right_pct:.2}%; min-width: 0; height: 100%; \
-                                                display: grid; grid-template-columns: {grid_cols}; \
-                                                grid-auto-rows: {ss_tile_h:.0}px; \
-                                                gap: 8px; padding: 6px; \
-                                                justify-content: start; align-content: start; \
-                                                overflow: visible;")
-                                    },
-                                    for tile_id in ss_tiles.iter() {
+                                    class: "ss-peer-panel",
+                                    style: "width: {right_pct:.2}%;",
+                                    // Decoded tiles — live video canvas
+                                    for tile_id in ss_decoded_tiles.iter() {
                                         {
                                             let is_mock = tile_id.starts_with("mock-");
                                             if is_mock {
@@ -4167,11 +4334,41 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
-
-                                    if ss_overflow_count > 0 {
-                                        div { class: "grid-overflow-badge",
-                                            "+{ss_overflow_count}"
-                                            span { "more in meeting" }
+                                    // Off-budget avatar tiles — rendered in DOM
+                                    // but no video decode (force_avatar: true).
+                                    for tile_id in ss_avatar_tiles.iter() {
+                                        {
+                                            let is_mock = tile_id.starts_with("mock-");
+                                            if is_mock {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        force_avatar: true,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_session_id: my_session_id.clone(),
+                                                        on_toggle_pin: move |_: String| {},
+                                                    }
+                                                }
+                                            } else {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        force_avatar: true,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_session_id: my_session_id.clone(),
+                                                        pinned_peer_id: current_pinned.clone(),
+                                                        on_toggle_pin: toggle_pin.clone(),
+                                                        room_id: Some(id.clone()),
+                                                        is_current_user_host: is_owner,
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 }

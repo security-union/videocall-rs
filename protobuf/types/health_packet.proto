@@ -311,6 +311,23 @@ message HealthPacket {
   optional uint64 screen_encoder_restarts_memory = 82;
   optional uint64 screen_encoder_restarts_configure = 83;
   optional uint64 screen_encoder_restarts_other = 84;
+
+  // RTT-probe resilience signals (#522). Surface the client-side RTT-probe
+  // backpressure/staleness the merged #522 core already tracks so operators can
+  // see probe-pipeline health across the fleet server-side. Both are cumulative
+  // since the ConnectionManager was created and re-sent every health packet
+  // (same convention as the connection-loss counters in fields 54-55); the
+  // relay's metrics_server `.set()`s each onto a per-reporter GaugeVec so Grafana
+  // charts rate()/increase() exactly as for the sibling *_total gauges.
+  //
+  // rtt_probe_dropped_total = cumulative count of RTT probes dropped because the
+  // in-flight probe queue was at MAX_INFLIGHT_PROBES (queue-cap backpressure).
+  optional uint64 rtt_probe_dropped_total = 85; // (#522)
+  // rtt_probe_stale_suppressions_total = cumulative count of 1 Hz diagnostics
+  // ticks on which the active link's RTT-probe pipeline was stale and so
+  // active_server_rtt was suppressed (observability-only; does NOT change the
+  // suppression/re-election behavior, only counts it).
+  optional uint64 rtt_probe_stale_suppressions_total = 86; // (#522)
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

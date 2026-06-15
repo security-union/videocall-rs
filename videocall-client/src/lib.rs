@@ -82,6 +82,8 @@
 //!     on_host_mute: None,
 //!     on_host_disable_video: None,
 //!     on_participant_kicked: None,
+//!     on_host_granted: None,
+//!     on_host_revoked: None,
 //!     on_peer_event: None,
 //!     decode_media: true,
 //!     is_guest: false,
@@ -125,6 +127,8 @@
 //! #     on_host_mute: None,
 //! #     on_host_disable_video: None,
 //! #     on_participant_kicked: None,
+//! #     on_host_granted: None,
+//! #     on_host_revoked: None,
 //! #     on_peer_event: None,
 //! #     decode_media: true,
 //! #     is_guest: false,
@@ -233,6 +237,7 @@ pub mod crypto;
 pub mod decode;
 pub mod diagnostics;
 pub mod encode;
+pub mod freshness_inject;
 pub mod health_reporter;
 pub mod long_tasks;
 mod media_devices;

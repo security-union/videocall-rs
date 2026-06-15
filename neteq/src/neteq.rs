@@ -50,6 +50,25 @@ const K_DECELERATION_TARGET_LEVEL_OFFSET_MS: u32 = 85;
 /// Hardcoded minimum delay.
 const K_BASE_MIN_DELAY_MS: u32 = 20;
 
+/// Default playout-latency ceiling for the resync-to-live governor (issue #1299).
+///
+/// When the FILTERED playout buffer level ([`NetEq::filtered_buffer_level_ms`]) — i.e. how far
+/// behind live the audio playout sits — exceeds this many milliseconds, the governor performs a
+/// one-time controlled flush-to-live (see [`NetEq::maybe_resync_to_live`]). 1000ms is chosen so
+/// the governor fires ONLY on genuine multi-second lag (the #1299 standing-wave case) and never
+/// during normal jitter buffering: it sits well above `max_delay_ms` (the adaptive-target cap,
+/// see [`DEFAULT_RESYNC_MAX_DELAY_MS`]) so ordinary Accelerate/Normal operation is untouched.
+/// Field-tunable via [`NetEqConfig::resync_ceiling_ms`].
+const DEFAULT_RESYNC_CEILING_MS: u32 = 1000;
+
+/// Default minimum wall-clock interval between governor flushes (issue #1299).
+///
+/// Hysteresis/cooldown: after a resync flush, the governor will not fire again for at least this
+/// long. This prevents thrashing if the filtered level briefly re-crosses the ceiling while the
+/// buffer-level filter is still settling toward the post-flush level. Field-tunable via
+/// [`NetEqConfig::resync_cooldown_ms`].
+const DEFAULT_RESYNC_COOLDOWN_MS: u64 = 5000;
+
 /// NetEQ configuration
 #[derive(Debug, Clone)]
 pub struct NetEqConfig {
@@ -67,12 +86,31 @@ pub struct NetEqConfig {
     pub additional_delay_ms: u32,
     /// Disable time stretching (for testing)
     pub for_test_no_time_stretching: bool,
+    /// Skip delay-manager updates on insert (for testing only).
+    ///
+    /// When `true`, `insert_packet` skips the `delay_manager.update()` call and the
+    /// subsequent `statistics.update_buffer_size()` call. This eliminates the per-insert
+    /// O(n log n) sort inside `RelativeArrivalDelayTracker::calculate_relative_packet_arrival_delay`
+    /// that becomes quadratic under test-speed insertion. Production code must never set this.
+    pub for_test_skip_delay_manager: bool,
     /// Bypass NetEQ processing and decode packets directly (for A/B testing)
     pub bypass_mode: bool,
     /// Delay manager configuration
     pub delay_config: DelayConfig,
     /// Smart flushing configuration
     pub smart_flush_config: SmartFlushConfig,
+    /// Resync-to-live governor: playout-latency ceiling in milliseconds (issue #1299).
+    ///
+    /// When the filtered playout buffer level exceeds this, the governor flushes the stale
+    /// backlog and resyncs to live (keeping ~`target_delay_ms` of the freshest audio, with
+    /// concealment over the seam). `0` disables the governor entirely. Must be set well above
+    /// `max_delay_ms` so it only fires on genuine multi-second lag, never on normal jitter.
+    /// Defaults to [`DEFAULT_RESYNC_CEILING_MS`].
+    pub resync_ceiling_ms: u32,
+    /// Resync-to-live governor: minimum wall-clock interval between flushes, in milliseconds
+    /// (issue #1299). Cooldown/hysteresis to prevent thrashing. Defaults to
+    /// [`DEFAULT_RESYNC_COOLDOWN_MS`].
+    pub resync_cooldown_ms: u64,
 }
 
 impl Default for NetEqConfig {
@@ -85,9 +123,12 @@ impl Default for NetEqConfig {
             min_delay_ms: 0,
             additional_delay_ms: 0,
             for_test_no_time_stretching: false,
+            for_test_skip_delay_manager: false,
             bypass_mode: false,
             delay_config: DelayConfig::default(),
             smart_flush_config: SmartFlushConfig::default(),
+            resync_ceiling_ms: DEFAULT_RESYNC_CEILING_MS,
+            resync_cooldown_ms: DEFAULT_RESYNC_COOLDOWN_MS,
         }
     }
 }
@@ -229,6 +270,9 @@ pub struct NetEq {
     /// Number of samples added by time-stretching operations (matches WebRTC sample_memory_,
     /// but with clearer meaning for positive/negative values).
     timestretch_added_samples: i32,
+    /// Resync-to-live governor (issue #1299): wall-clock anchor of the last flush, for the
+    /// cooldown/hysteresis. `None` means no flush has occurred this stream. Reset in [`reset`].
+    last_resync: Option<Instant>,
 }
 
 impl NetEq {
@@ -298,6 +342,7 @@ impl NetEq {
             packets_per_sec_snapshot: 0,
             leftover_time_stretched_samples: Vec::new(),
             timestretch_added_samples: 0,
+            last_resync: None,
         })
     }
 
@@ -330,9 +375,11 @@ impl NetEq {
         }
 
         // Normal NetEQ processing
-        // Update delay manager
-        self.delay_manager
-            .update(packet.header.timestamp, packet.sample_rate, false)?;
+        // Update delay manager (skip when for_test_skip_delay_manager is set — see config doc).
+        if !self.config.for_test_skip_delay_manager {
+            self.delay_manager
+                .update(packet.header.timestamp, packet.sample_rate, false)?;
+        }
 
         // Insert packet into buffer
         let target_delay = self.delay_manager.target_delay_ms();
@@ -340,9 +387,11 @@ impl NetEq {
             self.packet_buffer
                 .insert_packet(packet, &mut self.statistics, target_delay)?;
 
-        // Update statistics
-        self.statistics
-            .update_buffer_size(self.current_buffer_size_ms() as u16, target_delay as u16);
+        // Update statistics (skip alongside delay manager to keep stats consistent).
+        if !self.config.for_test_skip_delay_manager {
+            self.statistics
+                .update_buffer_size(self.current_buffer_size_ms() as u16, target_delay as u16);
+        }
 
         match result {
             BufferReturnCode::Flushed => {
@@ -524,6 +573,10 @@ impl NetEq {
         self.last_packets_second_instant = Instant::now();
         self.leftover_time_stretched_samples.clear();
         self.timestretch_added_samples = 0;
+        // Resync-to-live governor (issue #1299): clear the cooldown anchor so a stale lag episode
+        // (e.g. a full flush or a prolonged disconnect/safety-valve reset) cannot mis-gate a
+        // freshly recalibrating stream.
+        self.last_resync = None;
     }
 
     fn get_decision(&mut self) -> Result<Operation> {
@@ -540,6 +593,17 @@ impl NetEq {
 
         // Reset for next frame (matches WebRTC decision_logic.cc:245-246)
         self.timestretch_added_samples = 0;
+
+        // Resync-to-live governor (issue #1299). Evaluated per decode tick, AFTER the buffer-level
+        // filter has been updated for this tick (so `filtered_buffer_level_ms()` reflects the live
+        // level) and BEFORE any normal decision. When the playout buffer is genuinely seconds
+        // behind live it drops the stale backlog, keeps ~`target_delay_ms` of the freshest audio,
+        // and returns `ExpandStart` so this very tick conceals the seam via the existing
+        // expand/crossfade path (NOT a raw splice). Below the ceiling this is a no-op and the
+        // decision flow below is byte-identical to pre-#1299 behavior.
+        if let Some(op) = self.maybe_resync_to_live(target_delay_ms) {
+            return Ok(op);
+        }
 
         // Use WebRTC-style threshold calculations
         let samples_per_ms = self.config.sample_rate / 1000;
@@ -609,6 +673,122 @@ impl NetEq {
 
         // Normal operation
         Ok(Operation::Normal)
+    }
+
+    /// Resync-to-live governor (issue #1299): the real fix for unbounded audio playout latency.
+    ///
+    /// A NetEQ receiver can fall multiple seconds behind live, play at normal 1× cadence, and stay
+    /// there forever: the consumer is real-time-paced so a backlog is a standing wave it never
+    /// drains, and Accelerate's catch-up gates off because the adaptive target ratchets toward the
+    /// 3s cap and re-labels the lag as the "correct" depth. Bounding the target (see
+    /// `NetEqConfig::max_delay_ms`, set to ~300ms on the wasm path) keeps Accelerate's setpoint low
+    /// but cannot claw back seconds already buffered. This governor handles that episodic case
+    /// directly.
+    ///
+    /// Fires ONLY when the FILTERED playout buffer level (how far behind live we are) exceeds
+    /// `resync_ceiling_ms` AND the cooldown has elapsed. When it fires it performs a one-time
+    /// controlled flush-to-live: it drops the stale backlog, keeps ~`target_delay_ms` of the
+    /// freshest buffered audio, resets the buffer-level filter to that reduced level, and returns
+    /// [`Operation::ExpandStart`]. Returning `ExpandStart` makes the very next decode this tick run
+    /// the existing expand/crossfade concealment path (`decode_expand`) across the discontinuity —
+    /// the SAME machinery a packet-gap underrun uses — rather than a raw, audible splice. The
+    /// natural decision flow then produces `Expand`/`ExpandEnd` as the kept buffer is consumed,
+    /// completing the conceal→resume arc.
+    ///
+    /// Returns `Some(ExpandStart)` when it fires, otherwise `None` (caller proceeds with the normal
+    /// decision flow, which is byte-identical to pre-#1299 behavior below the ceiling).
+    ///
+    /// `target_delay_ms` is passed in (rather than re-read) so it matches exactly the value
+    /// `get_decision` already computed for this tick.
+    fn maybe_resync_to_live(&mut self, target_delay_ms: u32) -> Option<Operation> {
+        // Disabled when ceiling is 0.
+        if self.config.resync_ceiling_ms == 0 {
+            return None;
+        }
+
+        // Trigger signal: the live, decision-grade playout latency. Only fire on genuine lag above
+        // the ceiling — below it, behavior is unchanged.
+        let playout_latency_ms = self.filtered_buffer_level_ms();
+        if playout_latency_ms <= self.config.resync_ceiling_ms {
+            return None;
+        }
+
+        // Hysteresis/cooldown: do not fire again until `resync_cooldown_ms` has elapsed since the
+        // last flush, so the governor cannot thrash while the filter settles to the new level.
+        let now = Instant::now();
+        if let Some(last) = self.last_resync {
+            if now.duration_since(last) < Duration::from_millis(self.config.resync_cooldown_ms) {
+                return None;
+            }
+        }
+
+        // Decide how much of the freshest audio to keep. We want ~`target_delay_ms` (the live
+        // jitter setpoint) — BUT in the broken/cold regime the adaptive target has itself ratcheted
+        // toward seconds (the very #1299 mechanism), so keeping the raw target would keep the whole
+        // backlog and the flush would be a no-op. Clamp the kept depth to half the ceiling so the
+        // flush ALWAYS lands well below the trigger and genuinely drops the backlog, regardless of
+        // whether part 2's `max_delay_ms` bound is active. With the bound active (wasm path,
+        // target≈300, ceiling 1000) this is min(300, 500)=300 — exactly the issue's "~target ms".
+        let keep_ms = target_delay_ms.min(self.config.resync_ceiling_ms / 2);
+
+        // Perform the controlled flush-to-live: keep ~keep_ms of the freshest packets, drop the
+        // older backlog. This is the audio analog of #1252's video skip-to-live.
+        self.flush_to_live(keep_ms);
+
+        // Anchor the cooldown.
+        self.last_resync = Some(now);
+
+        log::info!(
+            "Resync-to-live governor fired (#1299): playout latency was {playout_latency_ms}ms (> ceiling {}ms); flushed backlog, kept ~{keep_ms}ms, concealing seam",
+            self.config.resync_ceiling_ms
+        );
+
+        // Enter the same concealment-then-resume state a real underrun would, so the seam is
+        // crossfaded rather than spliced. consecutive_expands == 1 matches get_decision's own
+        // ExpandStart branch (which increments from 0 to 1).
+        self.consecutive_expands = 1;
+        Some(Operation::ExpandStart)
+    }
+
+    /// Drop the stale backlog and keep ~`keep_ms` of the freshest buffered audio (issue #1299).
+    ///
+    /// Steps:
+    /// 1. Remove older packets from the packet buffer (via `PacketBuffer::partial_flush`, the same
+    ///    span-keeping primitive smart-flush uses), keeping ~`keep_ms` of the freshest content.
+    /// 2. Clear the post-NetEQ leftover residue (`leftover_samples` /
+    ///    `leftover_time_stretched_samples`), since that residue is also stale playout content
+    ///    contributing to the lag; `decode_normal` will pull fresh packets for the concealment.
+    /// 3. Reset the delay manager. This is essential: the adaptive target (and thus `low_limit` /
+    ///    `high_limit` in `get_decision`) may have ratcheted toward seconds — the #1299 mechanism.
+    ///    If we kept that stale target, the post-flush buffer (~`keep_ms`) would sit BELOW
+    ///    `low_limit` and `get_decision` would conceal (Expand) forever, playing noise over real
+    ///    audio. Resetting recalibrates the target to the start delay (still bounded by any
+    ///    `max_delay_ms`), so the kept buffer is correctly seen as healthy and playback resumes.
+    /// 4. Resync the buffer-level filter to the new (reduced) buffer level so the next decision sees
+    ///    the post-flush latency, not the stale one.
+    ///
+    /// The seam left behind is concealed by the `ExpandStart` returned from the caller.
+    fn flush_to_live(&mut self, keep_ms: u32) {
+        // 1. Keep ~keep_ms of the freshest packets; drop the older backlog.
+        let _ = self.packet_buffer.partial_flush(
+            keep_ms,
+            self.config.sample_rate,
+            &mut self.statistics,
+        );
+
+        // 2. Drop stale post-NetEQ residue (these count toward current_buffer_size_samples and thus
+        // toward the lag).
+        self.leftover_samples.clear();
+        self.leftover_time_stretched_samples.clear();
+
+        // 3. Recalibrate the adaptive target away from any ratcheted (stale) value so the post-flush
+        // buffer is judged against a live setpoint, not the seconds-deep one that caused the lag.
+        self.delay_manager.reset();
+
+        // 4. Resync the buffer-level filter to the reduced level so subsequent decisions (and the
+        // governor's own ceiling check) see live latency, not the pre-flush backlog.
+        self.buffer_level_filter
+            .set_filtered_buffer_level(self.current_buffer_size_samples());
     }
 
     fn decode_normal(&mut self, frame: &mut AudioFrame) -> Result<()> {
@@ -982,6 +1162,126 @@ mod tests {
             payload.extend_from_slice(&sample.to_le_bytes());
         }
         AudioPacket::new(header, payload, 16000, 1, duration_ms)
+    }
+
+    /// Build a self-consistent 48kHz / 1ch / 20ms audio packet whose payload sample
+    /// count (960 f32 samples), `sample_rate` (48000), `channels` (1) and `duration_ms`
+    /// (20) all agree. Mirrors the production decoder frame (48kHz, 20ms = 960 samples)
+    /// rather than reusing the 16kHz/160-sample `create_test_packet` helper.
+    fn create_48k_20ms_packet(seq: u16, ts: u32) -> AudioPacket {
+        let header = RtpHeader::new(seq, ts, 12345, 96, false);
+        // 960 samples * 4 bytes = 3840 bytes of raw little-endian f32 PCM (20ms @ 48kHz).
+        let mut payload = Vec::with_capacity(960 * 4);
+        for i in 0..960 {
+            let sample = (i as f32 / 960.0 * 2.0 * std::f32::consts::PI * 440.0).sin() * 0.1;
+            payload.extend_from_slice(&sample.to_le_bytes());
+        }
+        AudioPacket::new(header, payload, 48000, 1, 20)
+    }
+
+    /// Regression guard for issue #624: NetEQ's `delay_manager` treats the per-packet
+    /// RTP `timestamp` as a SAMPLE COUNTER. The videocall-client decoder was fixed to
+    /// advance consecutive 20ms frames by +960 SAMPLES at 48kHz (sample-domain) instead
+    /// of +20 (ms-domain). This test proves that sample-domain stepping keeps NetEQ's
+    /// target delay and expansion near zero for a steady, on-time stream.
+    ///
+    /// Mechanism (see `delay_manager.rs::RelativeArrivalDelayTracker::update`):
+    /// `expected_iat_ms = (timestamp - last_timestamp) * 1000 / sample_rate`, compared
+    /// against the real wall-clock inter-arrival gap. With +960 sample steps at 48kHz,
+    /// `expected_iat_ms = 960 * 1000 / 48000 = 20ms`, which matches the real ~20ms frame
+    /// cadence, so the measured jitter is ~0 and `target_delay_ms` stays at one bucket
+    /// (20ms). If the decoder regressed to ms-domain (+20), `expected_iat_ms` would
+    /// truncate to `20 * 1000 / 48000 = 0ms`, the on-time arrivals would register as
+    /// +20ms of positive jitter, and `target_delay_ms` would climb to 40ms — tripping
+    /// the `<= 30` bound below. Observed steady-state values during development:
+    /// sample-domain (+960) -> target_delay_ms = 20; ms-domain (+20) -> 40.
+    ///
+    /// `resample_interval_ms` is set to `None` so each packet's relative delay is fed to
+    /// the histogram immediately (the default 500ms resampler never fires inside a short
+    /// test, leaving the histogram empty and pegging target at its 2000ms ceiling). A real
+    /// ~20ms per-iteration sleep is required so the wall-clock inter-arrival gap is
+    /// realistic; `insert_packet` derives arrival time from `Instant::now()` internally
+    /// and exposes no injectable clock.
+    #[test]
+    fn test_sample_domain_timestamps_keep_expand_near_zero() {
+        // 20ms @ 48kHz = 960 samples. Sample-domain step the decoder fix produces.
+        const SAMPLE_RATE: u32 = 48000;
+        const FRAME_DURATION_MS: u32 = 20;
+        // Sample-domain RTP-timestamp step for a 20ms frame at 48kHz = 960 samples.
+        const SAMPLE_DOMAIN_STEP: u32 = SAMPLE_RATE / 1000 * FRAME_DURATION_MS;
+        // Bound sits halfway between the sample-domain steady value (20ms, one bucket)
+        // and the ms-domain regression value (40ms); robust to one 20ms bucket of jitter.
+        const TARGET_DELAY_BOUND_MS: u32 = 30;
+        const WARMUP_PACKETS: u32 = 8;
+        const STEADY_ITERS: u32 = 60;
+        const MEASURE_AFTER: u32 = 10;
+
+        let config = NetEqConfig {
+            sample_rate: SAMPLE_RATE,
+            // Feed every packet's relative delay to the histogram immediately; the default
+            // 500ms resampler would never fire within this short test, leaving target pegged.
+            delay_config: DelayConfig {
+                resample_interval_ms: None,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut seq: u16 = 0;
+        let mut timestamp: u32 = 0;
+
+        // Warm-up: prime the jitter buffer with on-time packets so it never starves
+        // during measurement. No frames pulled here so a small cushion accumulates.
+        for _ in 0..WARMUP_PACKETS {
+            let packet = create_48k_20ms_packet(seq, timestamp);
+            neteq.insert_packet(packet).unwrap();
+            seq += 1;
+            timestamp += SAMPLE_DOMAIN_STEP;
+            sleep(Duration::from_millis(FRAME_DURATION_MS as u64));
+        }
+
+        let mut expand_frames = 0u32;
+        let mut max_steady_target_ms = 0u32;
+        let mut max_steady_expand_rate = 0u16;
+
+        // Steady state: insert one packet, pull one frame, sleep ~20ms, in lockstep.
+        for i in 0..STEADY_ITERS {
+            let packet = create_48k_20ms_packet(seq, timestamp);
+            neteq.insert_packet(packet).unwrap();
+
+            let frame = neteq.get_audio().unwrap();
+            if frame.speech_type == SpeechType::Expand {
+                expand_frames += 1;
+            }
+
+            let stats = neteq.get_statistics();
+            if i >= MEASURE_AFTER {
+                max_steady_target_ms = max_steady_target_ms.max(stats.target_delay_ms);
+                max_steady_expand_rate = max_steady_expand_rate.max(stats.network.expand_rate);
+            }
+
+            seq += 1;
+            timestamp += SAMPLE_DOMAIN_STEP;
+            sleep(Duration::from_millis(FRAME_DURATION_MS as u64));
+        }
+
+        // Sample-domain stepping keeps the target delay at one bucket (~20ms). If the
+        // decoder regressed to ms-domain (+20), this would be 40ms and fail.
+        assert!(
+            max_steady_target_ms <= TARGET_DELAY_BOUND_MS,
+            "sample-domain (+{SAMPLE_DOMAIN_STEP}) target_delay_ms should stay <= {TARGET_DELAY_BOUND_MS}ms, got {max_steady_target_ms}ms (ms-domain regression pushes this to ~40ms)"
+        );
+
+        // A steady on-time stream must not trigger any expansion/concealment.
+        assert_eq!(
+            max_steady_expand_rate, 0,
+            "steady on-time stream should produce zero expand_rate (Q14), got {max_steady_expand_rate}"
+        );
+        assert_eq!(
+            expand_frames, 0,
+            "steady on-time stream should produce zero Expand frames, got {expand_frames}"
+        );
     }
 
     #[test]
@@ -1802,5 +2102,498 @@ mod tests {
             "playout_latency_ms should be > 0 after buffering 200ms of audio and decoding, got {}",
             stats.playout_latency_ms
         );
+    }
+
+    /// Regression guard for issue #623: u16 sequence-number wrap must not flush the buffer
+    /// or disrupt audio decoding at ~21.8 minutes (65536-packet boundary).
+    ///
+    /// Design rationale (see `packet.rs::RtpHeader::sequence_number` doc comment):
+    /// - `sequence_number` is u16 BY DESIGN (RFC 3550 wire format).
+    /// - `is_sequence_newer` uses wrapping_sub with a 0x8000 half-window → wrap-safe.
+    /// - Buffer ordering and flush decisions are driven solely by sample-domain `timestamp`
+    ///   (set per issue #624 as `frame_index * 960` at 48 kHz), never by `sequence_number`.
+    /// - `sequence_number` participates only in the `(timestamp, seq, ssrc)` dedup tuple
+    ///   in `buffer.rs::is_duplicate`; the timestamp dimension prevents false dedup at wrap.
+    ///
+    /// Strategy (lean variant): push 70,010 packets so seq wraps past 65535 → 0 at least once.
+    /// Two costs dominate the naive per-insert-per-get_audio loop:
+    ///   (a) Per-insert: `delay_manager.update()` internally sorts a growing `delay_history`
+    ///       on every call (O(n log n)). Under test-speed insertion (no real inter-arrival
+    ///       gaps), the history fills to thousands of entries and becomes quadratic. Eliminated
+    ///       via `for_test_skip_delay_manager = true` (see config doc and the gate in
+    ///       `insert_packet`). This flag does NOT affect buffer-flush behavior; flush decisions
+    ///       live entirely in `packet_buffer.insert_packet`.
+    ///   (b) Per-insert: payload construction calls 960 `sin()` × 70,010 = ~67M sin() calls.
+    ///       Eliminated by pre-computing a single shared payload before the loop.
+    ///
+    /// `get_audio()` is called only in two phases:
+    ///   1. A batch-drain at i=65490 that empties whatever has accumulated in the buffer,
+    ///      ensuring the buffer is nearly empty before the measurement window opens.
+    ///   2. A dense drain (one call per insert) over the measurement window i=65490..65560,
+    ///      which spans both measurement points (65524 and 65546) and the wrap itself (65536).
+    ///
+    /// During the pre-window stretch (i=0..65489), inserts accumulate freely; the buffer
+    /// auto-partial-flushes on overflow every ~200 packets. Those overflow flushes increment
+    /// `buffer_flushes`, but that is intentional: `flushes_pre_wrap` (read at i=65524) absorbs
+    /// ALL pre-window overflow counts as the baseline. The assertion checks only the DELTA
+    /// between i=65524 and i=65546 — a 22-packet window safely inside the 200-packet overflow
+    /// threshold — so no spurious overflow flush can fire in the measurement interval.
+    ///
+    /// Mutation sensitivity: the wrap-value assertion (at i=65536) checks that a packet
+    /// with `sequence_number == 0` and `timestamp == 65536 * 960 == 62_914_560` is present
+    /// in the buffer immediately after insertion. If `seq` is capped below 65536 (e.g.
+    /// `i % 65535 as u16`), then at i=65536 the seq would be 1, not 0, so the assertion
+    /// `wrap_pkt.sequence_number == 0` fails — the test correctly rejects the mutation.
+    /// The flush-counter and continuity assertions cover orthogonal properties (no spurious
+    /// flush, no decoder stall); together all three assertions are necessary and sufficient.
+    #[test]
+    fn test_seq_wrap_no_buffer_flush() {
+        const TOTAL_FRAMES: u32 = 70_010;
+        const SAMPLE_RATE: u32 = 48_000;
+        const SAMPLES_PER_FRAME: u32 = 960; // 20ms at 48kHz
+
+        // The measurement window straddles the wrap (65535→0 at i=65536).
+        // We open it early enough to drain the backlog before the first measurement point.
+        const DRAIN_WINDOW_START: u32 = 65_490;
+        const DRAIN_WINDOW_END: u32 = 65_560;
+
+        let config = NetEqConfig {
+            sample_rate: SAMPLE_RATE,
+            // Disable time stretching so all decode decisions are Normal; this avoids
+            // incidental buffer drain races that could mask or produce spurious flushes.
+            for_test_no_time_stretching: true,
+            // Skip per-insert delay-manager updates. The delay_manager internally sorts a
+            // growing delay_history on every insert; under test-speed insertion (no real
+            // inter-arrival gaps) the history fills to ~max_history_ms worth of entries and
+            // the sort becomes the dominant O(n log n)-per-insert cost, making the full
+            // 70,010-insert loop take ~22s of CPU time. Skipping the delay-manager does not
+            // affect the seq-wrap correctness property under test: buffer-flush decisions are
+            // driven by `packet_buffer.insert_packet` (smart-flush / overflow logic), not by
+            // the delay manager. The target_delay used as the smart-flush threshold defaults
+            // to K_START_DELAY_MS (80ms) and is frozen at that value throughout the test,
+            // which is conservative and still lets the smart-flush path trigger normally if
+            // the buffer ever exceeds its threshold.
+            for_test_skip_delay_manager: true,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Pre-compute the payload once — 960 sin() calls × 70,010 iterations = another
+        // significant cost. Re-using the same bytes is safe: the wrap test cares about RTP
+        // header fields (seq, timestamp, ssrc), not PCM content.
+        let shared_payload: Vec<u8> = {
+            let mut p = Vec::with_capacity(960 * 4);
+            for i in 0..960usize {
+                let sample = (i as f32 / 960.0 * 2.0 * std::f32::consts::PI * 440.0).sin() * 0.1;
+                p.extend_from_slice(&sample.to_le_bytes());
+            }
+            p
+        };
+
+        let mut normal_frames_after_wrap = 0u32;
+        // Flush count immediately before the wrap boundary (frame 65524, seq=65524).
+        let mut flushes_pre_wrap: u64 = 0;
+        // Flush count immediately after the wrap boundary (frame 65546, seq=10).
+        let mut flushes_post_wrap: Option<u64> = None;
+
+        for i in 0u32..TOTAL_FRAMES {
+            let seq = i as u16; // natural truncation — wraps 65535 → 0 at i=65536
+            let timestamp = i * SAMPLES_PER_FRAME; // monotonic u32, never wraps for 70010 frames
+
+            // Reuse the pre-computed payload; clone is a cheap memcpy vs 960 sin() calls.
+            let header = RtpHeader::new(seq, timestamp, 12345, 96, false);
+            let packet = AudioPacket::new(header, shared_payload.clone(), 48000, 1, 20);
+            neteq.insert_packet(packet).unwrap();
+
+            if i == DRAIN_WINDOW_START {
+                // Batch-drain all accumulated frames before opening the measurement window.
+                // This prevents any in-flight overflow flush from firing inside the window.
+                // The buffer holds at most max_packets_in_buffer (default 200) at this point;
+                // draining 400 frames (200 packets × 2 × 10ms frames each) is a safe upper bound.
+                for _ in 0..400 {
+                    let _ = neteq.get_audio().unwrap();
+                }
+            }
+
+            // WRAP-VALUE ASSERTION: immediately after inserting the wrap-point packet
+            // (i=65536, seq=0 as u16, timestamp=65536*960=62_914_560), confirm it landed
+            // in the buffer with the correct seq and timestamp BEFORE get_audio drains it.
+            //
+            // This assertion is structurally impossible to pass unless seq genuinely wraps
+            // to 0 at i=65536. If seq were capped (e.g. `i % 65535 as u16`), then at
+            // i=65536 the seq would be 1, not 0, so no packet with (seq==0, ts==62_914_560)
+            // would ever exist — peek_next_packet_from_timestamp would either return None or
+            // a packet with a different seq, and the assertion would fail. This pins the
+            // mutation that the flush-counter and continuity assertions alone do not catch.
+            if i == 65536 {
+                const WRAP_TS: u32 = 65536 * SAMPLES_PER_FRAME;
+                let wrap_pkt = neteq.packet_buffer.peek_next_packet_from_timestamp(WRAP_TS);
+                assert!(
+                    wrap_pkt.is_some(),
+                    "post-wrap packet (i=65536, ts={WRAP_TS}) not found in buffer immediately \
+                     after insert — seq wrap caused the packet to be lost or rejected"
+                );
+                let wrap_pkt = wrap_pkt.unwrap();
+                assert_eq!(
+                    wrap_pkt.header.sequence_number, 0u16,
+                    "post-wrap packet at ts={WRAP_TS} has seq={} instead of 0 — \
+                     seq was not allowed to wrap to 0",
+                    wrap_pkt.header.sequence_number
+                );
+                assert_eq!(
+                    wrap_pkt.header.timestamp, WRAP_TS,
+                    "post-wrap packet seq_number=0 has unexpected timestamp {} (expected {WRAP_TS})",
+                    wrap_pkt.header.timestamp
+                );
+            }
+
+            // Dense drain only inside the measurement window so the buffer stays bounded
+            // and we capture Normal frames produced after the wrap.
+            if (DRAIN_WINDOW_START..=DRAIN_WINDOW_END).contains(&i) {
+                let frame = neteq.get_audio().unwrap();
+
+                // Count Normal frames after the wrap point (seq has wrapped past 0).
+                if i > 65536 && frame.speech_type == SpeechType::Normal {
+                    normal_frames_after_wrap += 1;
+                }
+            }
+            // Outside the window: skip get_audio(). The buffer accumulates and auto-flushes
+            // on overflow; those counts are absorbed into flushes_pre_wrap as the baseline.
+
+            // Capture flush count just before the wrap window.
+            if i == 65524 {
+                flushes_pre_wrap = neteq.get_statistics().lifetime.buffer_flushes;
+            }
+
+            // Capture flush count just after the wrap window.
+            if i == 65546 {
+                flushes_post_wrap = Some(neteq.get_statistics().lifetime.buffer_flushes);
+            }
+        }
+
+        // PRIMARY ASSERTION: the buffer-flush counter must not increase across the
+        // u16 seq wrap boundary (65535 → 0). Any flush increment here would indicate
+        // that sequence-number logic (not buffer overflow) triggered the flush.
+        let flushes_post = flushes_post_wrap
+            .expect("post-wrap measurement point must be reached within 70010 frames");
+        assert_eq!(
+            flushes_post, flushes_pre_wrap,
+            "buffer_flushes jumped from {flushes_pre_wrap} to {flushes_post} across the \
+             u16 seq wrap boundary (frames 65524-65546) — seq wrap must not trigger a flush"
+        );
+
+        // CONTINUITY ASSERTION: audio must continue decoding (Normal frames) after the wrap.
+        // Fails if the wrap caused the decoder to stall, reset, or enter permanent expansion.
+        assert!(
+            normal_frames_after_wrap > 0,
+            "zero Normal frames decoded after the seq wrap point — wrap disrupted audio continuity"
+        );
+    }
+
+    /// Adversarial dedup-at-wrap regression for issue #623.
+    ///
+    /// At the u16 sequence-number rollover, two packets that are 65536 apart in the logical
+    /// stream share the same truncated u16 sequence number. With #624's monotonic
+    /// sample-domain timestamps they carry DIFFERENT `header.timestamp` values, so they
+    /// represent genuinely different audio frames and must NOT be treated as duplicates.
+    ///
+    /// Per `buffer.rs::is_duplicate`, dedup is keyed on the TUPLE
+    /// `(timestamp, sequence_number, ssrc)`. Because `timestamp` differs, the wrap-twin
+    /// must NOT be treated as a duplicate of the original — both must be accepted.
+    ///
+    /// Critical mutation check: if `is_duplicate` were changed to compare ONLY
+    /// `sequence_number` (dropping the `timestamp` and `ssrc` guards), the wrap-twin
+    /// (same u16 seq=5, different timestamp) would be falsely deduped and silently discarded,
+    /// and the post-wrap-twin packet count assertion below would fail. That is the exact
+    /// residual risk a u16 seq collision could cause, and this test pins it.
+    ///
+    /// We also verify the TRUE-duplicate path (same seq, same ts, same ssrc) IS deduped,
+    /// proving the dedup check is live and not vacuously skipped.
+    ///
+    /// Timestamp design: we use consecutive sample-domain timestamps (ts=4800 and ts=5760,
+    /// i.e. frames 5 and 6 at 48kHz/960-samples-per-frame). This keeps the inter-arrival
+    /// delta small (960 samples = 20ms at 48kHz), which avoids the u32 overflow in the
+    /// delay manager's `timestamp_delta * 1000 / sample_rate` path that would occur if we
+    /// jumped directly to the literal logical-index timestamp (65541 * 960 = 62,919,360).
+    /// The u16 collision is equally real: seq=5 (u16) == `65541u32 as u16` == 5.
+    #[test]
+    fn test_seq_collision_at_wrap_not_deduped() {
+        let config = NetEqConfig {
+            sample_rate: 48_000,
+            for_test_no_time_stretching: true,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // ── Part 1: TRUE DUPLICATE — same (ts, seq, ssrc) must be deduped ──────────────
+        // Original packet: seq=5, ts=4800 (frame index 5 at 48kHz/960-samp steps).
+        let original_seq: u16 = 5;
+        let original_ts: u32 = 5 * 960; // 4800
+        let original = create_48k_20ms_packet(original_seq, original_ts);
+        neteq.insert_packet(original).unwrap();
+        let count_after_original = neteq.packet_buffer.len();
+
+        // Exact duplicate: same (seq, ts, ssrc). Must be rejected.
+        let true_dup = create_48k_20ms_packet(original_seq, original_ts);
+        neteq.insert_packet(true_dup).unwrap();
+        let count_after_true_dup = neteq.packet_buffer.len();
+
+        assert_eq!(
+            count_after_true_dup, count_after_original,
+            "true duplicate (same seq={original_seq}, ts={original_ts}) must be deduped; \
+             buffer grew from {count_after_original} to {count_after_true_dup}"
+        );
+
+        // ── Part 2: WRAP TWIN — same u16 seq but different timestamp, must NOT be deduped ──
+        //
+        // The wrap-twin carries seq=5 (u16) — the same value as the original — because at
+        // the 65535→0 rollover, logical-index 65541 truncates to u16 value 5.  But its
+        // sample-domain timestamp is 5760 (= 6 * 960), one frame after the original at 4800.
+        // Because timestamp differs, `is_duplicate`'s tuple check must NOT fire: these are
+        // distinct frames.
+        //
+        // Adjacent timestamp (4800 vs 5760) keeps the inter-arrival delta at 960 samples
+        // (20ms at 48kHz), safely below the u32 overflow threshold in the delay manager.
+        //
+        // If is_duplicate keyed on seq alone, these two same-u16-seq packets would collide
+        // and the second would be silently discarded; the timestamp dimension of the dedup
+        // tuple is what saves us at the wrap.
+        //
+        // Dedup-window geometry: the wrap-twin's timestamp (5760) > original's (4800), so
+        // binary search places the twin AFTER the original in the buffer. `is_duplicate`
+        // checks positions [insert_pos-1, insert_pos, insert_pos+1]; insert_pos-1 IS the
+        // original, so the comparison fires and must correctly observe ts mismatch.
+        let wrap_twin_seq: u16 = 5; // same u16 as original_seq — this IS the collision
+        let wrap_twin_ts: u32 = 6 * 960; // 5760, one frame after original — different ts
+        let count_before_twin = neteq.packet_buffer.len();
+        let wrap_twin = create_48k_20ms_packet(wrap_twin_seq, wrap_twin_ts);
+        neteq.insert_packet(wrap_twin).unwrap();
+        let count_after_twin = neteq.packet_buffer.len();
+
+        assert_eq!(
+            count_after_twin,
+            count_before_twin + 1,
+            "wrap-twin (u16 seq={wrap_twin_seq} == original seq={original_seq}, but ts={wrap_twin_ts} \
+             != original ts={original_ts}) must NOT be deduped — buffer should have grown by 1, \
+             went from {count_before_twin} to {count_after_twin}. \
+             MUTATION CHECK: changing is_duplicate in buffer.rs to compare only sequence_number \
+             (dropping the timestamp guard) would make this assertion fail, because the wrap-twin \
+             and original share the same u16 seq value and would be falsely treated as duplicates."
+        );
+    }
+
+    /// ACCEPTANCE TEST for the resync-to-live governor (issue #1299).
+    ///
+    /// Reproduces the confirmed multi-second-lag failure faithfully in the HARDEST regime: the
+    /// adaptive target is UNBOUNDED (`max_delay_ms = 0`, part 2 OFF) so it ratchets toward seconds —
+    /// exactly the #1299 mechanism that gates Accelerate off and would, without care, also gate the
+    /// post-flush resume off. Time-stretching is disabled (`for_test_no_time_stretching`) to model
+    /// Accelerate's catch-up being too weak / gated off, so the standing wave is GENUINELY
+    /// non-draining and the governor is the sole catch-up path. Running with part 2 off makes this a
+    /// HARD pin on the governor's internals (the keep-amount clamp, the delay-manager recalibration,
+    /// and the histogram reset) — not just on its trigger.
+    ///
+    /// The backlog is built as a genuine ~1.5s of buffered packets (under the 200-packet cap and
+    /// under the smart-flush span threshold) — i.e. real audio is actually behind live, not just a
+    /// primed filter — then sustained 1× arrival is driven (insert 10ms, pull 10ms; net delta 0).
+    ///
+    /// Asserts: (a) latency converges below the ceiling within a bounded number of frames; (b) the
+    /// governor actually fired (cooldown anchor `last_resync` set); (c) the seam is concealed via the
+    /// existing expand/crossfade path (`ExpandStart` then `ExpandEnd`), NOT a raw splice; (d) playback
+    /// RESUMES — after the conceal→resume arc the decision is no longer an Expand-family op, so the
+    /// listener hears real audio again, not endless concealment noise; (e) latency STAYS bounded.
+    ///
+    /// What PINS the governor (i.e. what fails if it is removed): (b) `last_resync.is_some()` and
+    /// (c) the `ExpandStart`/`ExpandEnd` seam — only the governor sets the cooldown anchor and
+    /// returns `ExpandStart` here. The convergence assertion (a) is corroborating, NOT solely
+    /// governor-attributable: this synthetic harness has near-zero inter-arrival jitter, so the
+    /// adaptive target never ratchets the way the FIELD case does, and an incidental Accelerate/
+    /// drain can also reduce the level. The governor's *necessity* under a true production standing
+    /// wave (target ratcheted → Accelerate gated off → no drain) rests on the issue's code-confirmed
+    /// mechanism, which is jitter-history-dependent and not reproducible in a unit test. So this test
+    /// proves the governor FIRES, CONCEALS, CONVERGES, and RESUMES — not that drain is impossible
+    /// without it.
+    #[test]
+    fn resync_governor_converges_below_ceiling_under_standing_wave() {
+        let config = NetEqConfig {
+            // Unbounded target (part 2 OFF) is the hardest case: it pins the governor's flush
+            // internals (keep-amount clamp + delay/histogram recalibration), which a bounded target
+            // would mask. Time-stretch off models Accelerate being unable to drain.
+            for_test_no_time_stretching: true,
+            ..Default::default()
+        };
+        // Sanity on the config the test depends on.
+        assert_eq!(config.resync_ceiling_ms, 1000);
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut insert_audio = make_insert_audio!();
+        let reset_filtered_level = make_reset_filtered_level!();
+
+        // Build a GENUINE ~1.5s raw backlog (150 packets, under the 200-packet cap) in 100ms chunks
+        // so neither the overflow full-flush nor the span-based smart-flush trims it. Then prime the
+        // filter to match — exactly how the field multi-second-lag case presents: real audio behind
+        // live, the buffer-level filter tracking it.
+        for _ in 0..15 {
+            insert_audio(&mut neteq, 100);
+        }
+        reset_filtered_level(&mut neteq);
+        assert!(
+            neteq.filtered_buffer_level_ms() >= 1400,
+            "precondition: ~1.5s genuine backlog, got {}ms",
+            neteq.filtered_buffer_level_ms()
+        );
+
+        // Drive sustained 1× arrival: each iteration adds 10ms and pulls one 10ms frame. Do NOT
+        // re-prime the filter inside the loop — the governor (and only the governor) must bring the
+        // filtered level down. Bound the run to 300 frames (3s of playout).
+        let mut converged_at: Option<usize> = None;
+        let mut saw_expand_start = false;
+        let mut saw_expand_end = false;
+        for frame_idx in 0..300 {
+            insert_audio(&mut neteq, 10);
+            let _ = neteq.get_audio().unwrap();
+            match neteq.last_operation {
+                Operation::ExpandStart => saw_expand_start = true,
+                Operation::ExpandEnd => saw_expand_end = true,
+                _ => {}
+            }
+            if neteq.filtered_buffer_level_ms() <= neteq.config.resync_ceiling_ms {
+                converged_at = Some(frame_idx);
+                break;
+            }
+        }
+
+        let converged_at = converged_at.unwrap_or_else(|| {
+            panic!(
+                "resync governor never brought playout latency below the {}ms ceiling within 300 frames (still {}ms) — the multi-second lag persisted",
+                neteq.config.resync_ceiling_ms,
+                neteq.filtered_buffer_level_ms()
+            )
+        });
+
+        // (b) The governor actually fired (one-shot flush), not some incidental drain: the cooldown
+        // anchor is the unambiguous source-of-truth signal that maybe_resync_to_live ran its body.
+        assert!(
+            neteq.last_resync.is_some(),
+            "expected the resync governor to have fired (cooldown anchor set)"
+        );
+
+        // (a) Bounded convergence: the governor fires on the first eligible tick, so this is fast.
+        assert!(
+            converged_at < 5,
+            "expected convergence within a few frames of the one-shot flush, took {converged_at}"
+        );
+
+        // (c)+(d) Observe the rest of the conceal→resume arc and the resume to real audio. The
+        // convergence loop above breaks on the very tick the governor fires (filtered level already
+        // ≤ ceiling), which is the ExpandStart tick — so ExpandEnd and the resume happen here. The
+        // seam is concealed via the existing crossfade path: ExpandStart (fade the last real audio
+        // out into concealment) THEN ExpandEnd (fade concealment back into the new live audio) —
+        // the exact gap-concealment arc, not a raw, audible splice. Playback must then RESUME to a
+        // non-Expand op (real audio), not get stuck playing concealment noise over a buffer that
+        // actually holds live audio. (e) latency must stay bounded throughout.
+        let mut resumed_to_real_audio = false;
+        for _ in 0..50 {
+            insert_audio(&mut neteq, 10);
+            let _ = neteq.get_audio().unwrap();
+            match neteq.last_operation {
+                Operation::ExpandStart => saw_expand_start = true,
+                Operation::ExpandEnd => saw_expand_end = true,
+                Operation::Expand => {}
+                _ => resumed_to_real_audio = true,
+            }
+            assert!(
+                neteq.filtered_buffer_level_ms() <= neteq.config.resync_ceiling_ms,
+                "post-resync latency re-exceeded ceiling under steady 1× arrival: {}ms",
+                neteq.filtered_buffer_level_ms()
+            );
+        }
+
+        assert!(
+            saw_expand_start,
+            "expected ExpandStart at the resync seam (concealment onset), saw none"
+        );
+        assert!(
+            saw_expand_end,
+            "expected ExpandEnd after the resync seam (concealment resolves back to real audio)"
+        );
+        assert!(
+            resumed_to_real_audio,
+            "after the resync conceal arc, playback never resumed to a non-Expand op (stuck in concealment)"
+        );
+    }
+
+    /// Part 2 (issue #1299): the bounded `max_delay_ms` caps `target_delay_ms`, so the adaptive
+    /// target can never ratchet to the 3000ms regime that gates Accelerate off.
+    ///
+    /// Drives a pathological all-identical-timestamp burst (the same pattern that
+    /// `test_buffer_duration_calculation_with_identical_timestamps` shows pushes the delay manager
+    /// to high targets) and asserts the target stays at/below the configured cap. FAILS if the
+    /// `max_delay_ms` plumbing (NetEqConfig field → set_maximum_delay) is removed: the default
+    /// derived cap is 3000ms (200 packets × 20 × 3/4), so without the bound the target can climb far
+    /// past 300ms.
+    #[test]
+    fn bounded_target_cannot_reach_3s() {
+        const CAP_MS: u32 = 300;
+        let config = NetEqConfig {
+            max_delay_ms: CAP_MS,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Hammer the delay manager toward its maximum: many packets with the SAME timestamp drive
+        // the inter-arrival/quantile estimate high (cf. the identical-timestamp test above).
+        for i in 0..400u32 {
+            let header = RtpHeader::new(i as u16, 1000, 12345, 96, false);
+            let mut payload = Vec::new();
+            for s in 0..160 {
+                payload.extend_from_slice(&((s as f32).sin() * 0.1).to_le_bytes());
+            }
+            let packet = AudioPacket::new(header, payload, 16000, 1, 20);
+            neteq.insert_packet(packet).unwrap();
+        }
+
+        let target = neteq.target_delay_ms();
+        assert!(
+            target <= CAP_MS,
+            "target_delay_ms must be capped at {CAP_MS}ms by max_delay_ms, got {target}ms (would ratchet toward the 3000ms cap unbounded)"
+        );
+    }
+
+    /// Below the ceiling, the resync governor must NOT fire — behavior is unchanged (issue #1299).
+    ///
+    /// Drives a normal, low-latency stream (target-sized buffer, steady 1× arrival) and asserts no
+    /// flush ever occurs (cooldown anchor stays `None`) and every operation is one of the ordinary
+    /// decisions. FAILS if the governor fires on a normal stream (e.g. ceiling set too low or the
+    /// trigger inverted).
+    #[test]
+    fn resync_governor_does_not_fire_below_ceiling() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        let mut insert_audio = make_insert_audio!();
+        let reset_filtered_level = make_reset_filtered_level!();
+
+        // Establish a normal ~80ms buffer (well below the 1000ms ceiling) and run a steady stream.
+        insert_audio(&mut neteq, 80);
+        reset_filtered_level(&mut neteq);
+
+        for _ in 0..200 {
+            insert_audio(&mut neteq, 10);
+            let _ = neteq.get_audio().unwrap();
+
+            // The governor never fired: no cooldown anchor was set.
+            assert!(
+                neteq.last_resync.is_none(),
+                "resync governor fired on a normal below-ceiling stream (latency {}ms)",
+                neteq.filtered_buffer_level_ms()
+            );
+            // Latency stays low; it must never approach the ceiling on a healthy stream.
+            assert!(
+                neteq.filtered_buffer_level_ms() < neteq.config.resync_ceiling_ms,
+                "below-ceiling stream unexpectedly reached {}ms",
+                neteq.filtered_buffer_level_ms()
+            );
+        }
     }
 }

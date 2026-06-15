@@ -7,10 +7,11 @@ import { waitForServices } from "../helpers/wait-for-services";
  *
  * When a participant shares their screen the meeting switches to a split
  * layout: the shared screen fills the left 2/3 of #grid-container while
- * peer video tiles are arranged in a 2-column grid on the right 1/3.
- *
- * If the number of peers exceeds the right panel's capacity a
- * `.grid-overflow-badge` element is rendered showing "+N more in meeting".
+ * peer video tiles are arranged in a flex-wrap panel (.ss-peer-panel)
+ * on the right 1/3. All participants are rendered (no cap); the panel
+ * scrolls vertically when tiles overflow. Off-budget peers render as
+ * avatar-tier tiles (no video decode) per the decode-budget system
+ * (issue #987).
  *
  * LIMITATION: `getDisplayMedia()` opens a system-level picker that
  * Playwright cannot drive in all environments.  We use Chromium's
@@ -19,9 +20,9 @@ import { waitForServices } from "../helpers/wait-for-services";
  * share button click will not produce a stream and the split layout will
  * not activate — the tests document this and skip gracefully.
  *
- * Mock peers are used to fill the right panel beyond its capacity so that
- * the overflow badge can be verified.  Mock peers require the Dioxus UI
- * to be built with `mockPeersEnabled: "true"` in config.js.
+ * Mock peers are used to verify many-participant rendering and scroll
+ * behavior.  Mock peers require the Dioxus UI to be built with
+ * `mockPeersEnabled: "true"` in config.js.
  */
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
@@ -336,27 +337,17 @@ test.describe("Screen share right panel layout", () => {
       // Verify the screen share tile is visible on the left
       await expect(hostPage.locator(".split-screen-tile")).toBeVisible({ timeout: 10_000 });
 
-      // Verify the right panel has grid-template-columns with fixed-width
-      // tile-sized columns (HCL #3/#4 fix in PR #940). The right panel is
-      // the 3rd child: left + resize-handle + right.
-      //
-      // Pre-#940 form: `grid-template-columns: 1fr 1fr` (or `1fr` when
-      // narrow). That regex still appears in this codebase only as a
-      // negative assertion — the post-fix form is
-      // `repeat(2, <ss_tile_w>px)` (or `<ss_tile_w>px` when narrow) paired
-      // with `justify-content: start` so tiles pack to the left edge.
+      // Verify the right panel uses the .ss-peer-panel CSS class with
+      // flexbox layout. The right panel is the 3rd child: left +
+      // resize-handle + right.
       const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
-      const rightPanelStyle = await rightPanel.getAttribute("style");
-      expect(rightPanelStyle).toBeTruthy();
-      // 2-column (>=2 peers) or 1-column (1 peer) variant, both with
-      // fixed-width tile-sized tracks.
-      expect(rightPanelStyle).toMatch(/grid-template-columns:\s*(repeat\(2,\s*\d+px\)|\d+px)/);
-      // Bug #3: tiles must pack to the left edge (not stretch / center).
-      expect(rightPanelStyle).toContain("justify-content: start");
-      // Stale "1fr" tracks must never reappear (regression guard).
-      expect(rightPanelStyle).not.toMatch(/grid-template-columns:\s*1fr( 1fr)?[;\s]/);
+      // Layout is now CSS-class-driven (.ss-peer-panel) using flexbox.
+      // Verify the panel has the expected class and computed layout.
+      await expect(rightPanel).toHaveClass(/ss-peer-panel/);
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("flex");
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).flexWrap)).toBe("wrap");
 
       // Verify peer tiles (.split-peer-tile) are rendered in the right panel
       const peerTiles = hostPage.locator(".split-peer-tile");
@@ -376,90 +367,67 @@ test.describe("Screen share right panel layout", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 2. Overflow badge shows when peers exceed right panel capacity
+  // 2. All participants rendered with scrollable panel (no cap/badge)
   //
-  // When the number of peers exceeds the right panel's 2-column grid
-  // capacity, a `.grid-overflow-badge` element should appear showing
-  // "+N" and "more in meeting".
+  // When many peers are present during screen share, all participants
+  // are rendered as .split-peer-tile elements (no artificial cap, no
+  // overflow badge). The panel scrolls vertically when tiles overflow.
   //
-  // This test uses mock peers to fill the panel beyond capacity.
   // Requires `mockPeersEnabled: "true"` in config.js.
   // ──────────────────────────────────────────────────────────────────────
-  test("overflow badge shows when peers exceed right panel capacity", async ({ baseURL }) => {
+  test("all participants rendered with scrollable panel during screen share", async ({
+    baseURL,
+  }) => {
     test.setTimeout(120_000);
     const uiURL = baseURL || "http://localhost:80";
-    const meetingId = `e2e_ss_panel_overflow_${Date.now()}`;
+    const meetingId = `e2e_ss_panel_scroll_${Date.now()}`;
 
     const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
       uiURL,
       meetingId,
-      "SSOverHost",
-      "SSOverGuest",
+      "SSScrollHost",
+      "SSScrollGuest",
     );
 
     try {
-      // Give time for WebSocket/WebTransport peer discovery
       await hostPage.waitForTimeout(3000);
 
-      // Check if mock peers feature is available by looking for the button
       const mockButton = hostPage.locator("button.video-control-button", {
         has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
       });
-
       const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
-
       if (!mockPeersAvailable) {
-        test.skip(
-          true,
-          "Mock peers feature is not enabled. " +
-            'Set mockPeersEnabled: "true" in config.js to enable this test.',
-        );
+        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
         return;
       }
 
-      // Add enough mock peers to exceed the right panel capacity.
-      // The right panel uses a 2-column grid. At typical viewport sizes,
-      // only 4-8 tiles fit (2-4 rows * 2 cols). Adding 20 mock peers
-      // ensures overflow regardless of viewport height.
+      // Add 20 mock peers — enough to overflow the panel at any viewport.
       await addMockPeers(hostPage, 20);
-
-      // Wait for mock peer tiles to render in the normal grid
       await hostPage.waitForTimeout(2000);
 
-      // Guest starts screen sharing to trigger the split layout
       const shareActivated = await startScreenShare(guestPage, hostPage);
-
       if (!shareActivated) {
-        test.skip(
-          true,
-          "Screen share could not be auto-accepted. " +
-            "The --auto-select-desktop-capture-source flag may not be supported " +
-            "in this Chromium build or display environment.",
-        );
+        test.skip(true, "Screen share could not be auto-accepted.");
         return;
       }
-
-      // Wait for the split layout to stabilize with mock peers
       await hostPage.waitForTimeout(3000);
 
-      // ---- ASSERT: overflow badge is visible ----
-      const overflowBadge = hostPage.locator(".grid-overflow-badge");
-      await expect(overflowBadge).toBeVisible({ timeout: 10_000 });
-
-      // Verify the badge contains "+N" text (where N > 0)
-      const badgeText = await overflowBadge.textContent();
-      expect(badgeText).toBeTruthy();
-      expect(badgeText).toMatch(/\+\d+/);
-
-      // Verify the badge contains "more in meeting"
-      const moreSpan = overflowBadge.locator("span");
-      await expect(moreSpan).toContainText("more in meeting");
-
-      // Verify some split-peer-tile elements are also visible
-      // (the badge coexists with visible tiles)
+      // All participants should be rendered (no truncation/badge).
       const peerTiles = hostPage.locator(".split-peer-tile");
-      const visibleTileCount = await peerTiles.count();
-      expect(visibleTileCount).toBeGreaterThan(0);
+      const tileCount = await peerTiles.count();
+      // 20 mock + 2 real users (host + guest) = 22, but self-tile may
+      // or may not appear; assert at least 20 to confirm no cap.
+      expect(tileCount).toBeGreaterThanOrEqual(20);
+
+      // No overflow badge should be present.
+      const overflowBadge = hostPage.locator(".grid-overflow-badge");
+      await expect(overflowBadge).toHaveCount(0);
+
+      // Panel should be scrollable (scrollHeight > clientHeight).
+      const panel = hostPage.locator(".ss-peer-panel");
+      await expect(panel).toBeVisible({ timeout: 5_000 });
+      const scrollable = await panel.evaluate((el) => el.scrollHeight > el.clientHeight);
+      expect(scrollable).toBe(true);
     } finally {
       await browser1.close();
       await browser2.close();
@@ -467,7 +435,165 @@ test.describe("Screen share right panel layout", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 3. Normal grid has no split-layout artifacts
+  // 3. Off-budget camera-on peers render as paused avatars, not blank canvases
+  //
+  // The decode-budget system limits live video decoding to the first N
+  // tiles in the screen-share right panel. Tiles beyond the budget must
+  // render with `force_avatar: true`, producing a
+  // `.placeholder-content--paused` element instead of a `<canvas>`.
+  //
+  // IMPORTANT: mock peers are video-OFF (is_video_enabled_for_peer returns
+  // false for "mock-N" IDs) and render plain `.placeholder-content`
+  // ("Video Disabled"), NOT `.placeholder-content--paused`. The --paused
+  // placeholder only renders for camera-ON peers excluded by the budget
+  // (force_avatar && is_video_enabled_for_peer). Therefore this test uses
+  // 4 real browsers (host + 3 guests, all with fake camera) and forces
+  // Fixed(2) so at least 1 real camera-on peer lands in the avatar tier.
+  //
+  // Host sees 3 remote peers in the SS right panel. With ss_budget = 2,
+  // peers are sorted by join time: guests 1-2 (earliest) get decoded,
+  // guest 3 (latest) gets force_avatar: true → .placeholder-content--paused.
+  // ──────────────────────────────────────────────────────────────────────
+  test("off-budget camera-on peers render as paused avatars during screen share", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(150_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_avatar_budget_${Date.now()}`;
+
+    // Fixed(2): with 3 remote camera-on peers, ss_budget = 2 → 1 peer
+    // is off-budget and must render as .placeholder-content--paused.
+    const FORCED_BUDGET = 2;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser3 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser4 = await chromium.launch({ args: BROWSER_ARGS });
+
+    const hostCtx = await createAuthenticatedContext(
+      browser1,
+      "ssbudgethost@videocall.rs",
+      "SSBudgetHost",
+      uiURL,
+    );
+    // Inject Fixed(N) budget override on host BEFORE page navigation.
+    await hostCtx.addInitScript(`
+      localStorage.setItem("vc_decode_budget_override", "${FORCED_BUDGET}");
+    `);
+    await hostCtx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+
+    const guest1Ctx = await createAuthenticatedContext(
+      browser2,
+      "ssbudgetguest1@videocall.rs",
+      "SSBudgetGuest1",
+      uiURL,
+    );
+    await guest1Ctx.addInitScript(MOCK_GET_DISPLAY_MEDIA_SCRIPT);
+    // Enable camera on all guests so they publish real video. The prejoin
+    // camera defaults to OFF; without this the peers join camera-off and
+    // is_video_enabled_for_peer returns false → plain "Video Disabled"
+    // placeholder instead of the --paused avatar we're testing.
+    // (Pattern: simulcast-per-receiver.spec.ts:343, signal-quality-peer-transport.spec.ts:58)
+    await guest1Ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+
+    const guest2Ctx = await createAuthenticatedContext(
+      browser3,
+      "ssbudgetguest2@videocall.rs",
+      "SSBudgetGuest2",
+      uiURL,
+    );
+    await guest2Ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+
+    const guest3Ctx = await createAuthenticatedContext(
+      browser4,
+      "ssbudgetguest3@videocall.rs",
+      "SSBudgetGuest3",
+      uiURL,
+    );
+    await guest3Ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+
+    const hostPage = await hostCtx.newPage();
+    const guest1Page = await guest1Ctx.newPage();
+    const guest2Page = await guest2Ctx.newPage();
+    const guest3Page = await guest3Ctx.newPage();
+
+    try {
+      // Host joins first.
+      await navigateToMeeting(hostPage, meetingId, "SSBudgetHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+
+      // Guests join sequentially (join order determines budget ranking).
+      await navigateToMeeting(guest1Page, meetingId, "SSBudgetGuest1");
+      const g1Result = await joinMeetingFromPage(guest1Page);
+      await admitGuestIfNeeded(hostPage, guest1Page, g1Result);
+
+      await navigateToMeeting(guest2Page, meetingId, "SSBudgetGuest2");
+      const g2Result = await joinMeetingFromPage(guest2Page);
+      await admitGuestIfNeeded(hostPage, guest2Page, g2Result);
+
+      await navigateToMeeting(guest3Page, meetingId, "SSBudgetGuest3");
+      const g3Result = await joinMeetingFromPage(guest3Page);
+      await admitGuestIfNeeded(hostPage, guest3Page, g3Result);
+
+      // Wait for all 3 remote peer tiles to appear on the host.
+      const gridTiles = hostPage.locator("#grid-container .grid-item");
+      await expect(gridTiles.nth(2)).toBeVisible({ timeout: 30_000 });
+
+      // Precondition: verify the host sees live peer video (canvases) before
+      // entering screen share. If cameras didn't publish, canvasCount = 0
+      // and the paused-avatar assertion below would fail for the wrong reason.
+      const liveCanvases = hostPage.locator(".grid-item canvas");
+      await expect(liveCanvases.first()).toBeVisible({ timeout: 15_000 });
+      const preSSCanvasCount = await liveCanvases.count();
+      expect(preSSCanvasCount).toBeGreaterThanOrEqual(2);
+
+      // Guest 1 starts screen sharing → host sees SS split layout.
+      const shareActivated = await startScreenShare(guest1Page, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+
+      // Let the split layout settle and the decode budget take effect.
+      await hostPage.waitForTimeout(5000);
+
+      // ---- ASSERT: peer tiles are rendered in the SS right panel ----
+      const peerTiles = hostPage.locator(".split-peer-tile");
+      const tileCount = await peerTiles.count();
+      // Host sees 3 remote peers (guests 1-3) in the right panel.
+      expect(tileCount).toBeGreaterThanOrEqual(3);
+
+      // ---- ASSERT: at least 1 off-budget camera-on peer is --paused ----
+      const pausedTiles = hostPage.locator(".split-peer-tile .placeholder-content--paused");
+      const canvasTiles = hostPage.locator(".split-peer-tile canvas");
+
+      const pausedCount = await pausedTiles.count();
+      const canvasCount = await canvasTiles.count();
+
+      // With Fixed(2) and 3 real camera-on peers, we MUST have at least 1
+      // paused avatar tile. This fails (not skips) if force_avatar regresses.
+      expect(pausedCount).toBeGreaterThan(0);
+      expect(canvasCount).toBeGreaterThan(0);
+      expect(canvasCount).toBeLessThanOrEqual(FORCED_BUDGET);
+
+      // Verify the paused placeholder has the expected accessibility
+      // attributes (role="img" + non-empty aria-label).
+      const firstPaused = pausedTiles.first();
+      await expect(firstPaused).toBeVisible({ timeout: 5_000 });
+      await expect(firstPaused).toHaveAttribute("role", "img");
+      const ariaLabel = await firstPaused.getAttribute("aria-label");
+      expect(ariaLabel).toBeTruthy();
+    } finally {
+      await browser1.close();
+      await browser2.close();
+      await browser3.close();
+      await browser4.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 4. Normal grid has no split-layout artifacts
   //
   // Structural safety check: when nobody is screen sharing, the meeting
   // should use the normal grid layout with NO .split-screen-tile,
@@ -514,27 +640,12 @@ test.describe("Screen share right panel layout", () => {
   // 4. HCL bugs #3 + #4: side-strip tiles left-justify and hold 3:2 cap
   //    on a wide viewport.
   //
-  // Bug #3 (left-justification): pre-fix the right panel used `1fr 1fr`
-  // tracks with `place-self: center`, which centered each 3:2-capped
-  // `.split-peer-tile` in a viewport-wide cell → large left/right gaps,
-  // tiles visually "floating in the middle of the side-strip". Post-fix
-  // the panel uses fixed-width `(ss_tile_h * 1.5)px` tracks plus
-  // `justify-content: start` so tiles pack to the LEFT edge of the
-  // panel. Verifiable by computing the gap between the panel's left
-  // edge and each tile's left edge: it must be `padding-left` (~6px),
-  // NOT half the cell surplus.
+  // Bug #3+#4: the right panel now uses CSS class `.ss-peer-panel`
+  // with flexbox layout. Tiles pack to the left edge via flex-start
+  // alignment, and each tile preserves its 3:2 aspect ratio.
   //
-  // Bug #4 (3:2 cap on wide screens): same root cause as #3 — the
-  // stretched 1fr cell let `.split-peer-tile` honour its 3:2 cap, but
-  // the cell footprint itself wasn't 3:2, so the surrounding chrome
-  // looked stretched. Post-fix each cell IS exactly the 3:2 tile
-  // footprint (column width is `ss_tile_h * 1.5`), and the tile
-  // stretches to fill the cell. The resulting `.split-peer-tile`
-  // bounding-box aspect must be ~1.5 (3:2) even on a wide viewport.
-  //
-  // The test runs on a deliberately WIDE viewport (1600x900) so the
-  // pre-fix code path would distribute surplus into both cells —
-  // exactly the regression scenario the user reported.
+  // The test runs on a deliberately WIDE viewport (1600x900) to verify
+  // tiles stay left-justified and maintain proper aspect ratio.
   // ──────────────────────────────────────────────────────────────────────
   test("right panel left-justifies tiles with 3:2 footprint on wide viewport (HCL #3+#4) @bvt1", async ({
     baseURL,
@@ -568,13 +679,11 @@ test.describe("Screen share right panel layout", () => {
       const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
-      // ── Bug #3 STRUCTURAL: justify-content: start packs tiles left.
-      const rightPanelStyle = (await rightPanel.getAttribute("style")) || "";
-      expect(rightPanelStyle).toContain("justify-content: start");
-      // ── Bug #3 STRUCTURAL: fixed-width pixel tracks (NOT `1fr`).
-      expect(rightPanelStyle).toMatch(/grid-template-columns:\s*(repeat\(2,\s*\d+px\)|\d+px)/);
-      // ── Bug #3 REGRESSION GUARD: `1fr` tracks must not reappear.
-      expect(rightPanelStyle).not.toMatch(/grid-template-columns:\s*1fr( 1fr)?[;\s]/);
+      // ── Layout is CSS-class-driven (.ss-peer-panel) using flexbox.
+      // Verify the panel has the right class and computed flex layout.
+      await expect(rightPanel).toHaveClass(/ss-peer-panel/);
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("flex");
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).flexWrap)).toBe("wrap");
 
       // ── Bug #3 GEOMETRIC: the first tile's LEFT edge must sit at the
       // panel's left edge plus its padding (~6px), not centered.

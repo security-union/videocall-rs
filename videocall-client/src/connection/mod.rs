@@ -50,10 +50,20 @@ pub use connection_controller::ConnectionController;
 pub use connection_lost_reason::ConnectionLostReason;
 #[allow(unused_imports)]
 pub use connection_manager::ReconnectionPhase;
+// The per-transport connection-loss readers (#509 item #4) are a public
+// observability surface (perf panel / the documented telemetry follow-up). No
+// in-crate consumer reads them yet — they are split client-side for local
+// debuggability without a protobuf change — so the re-export is intentionally
+// allowed to be unused, matching the `ReconnectionPhase` re-export above.
 pub use connection_manager::{
     connection_handshake_failures, connection_session_drops, reelection_aborted_total,
     reelection_failed_total, reelection_preserved_total, reelection_proceeded_total,
     ConnectionManagerOptions, ConnectionState,
+};
+#[allow(unused_imports)]
+pub use connection_manager::{
+    connection_handshake_failures_ws, connection_handshake_failures_wt,
+    connection_session_drops_ws, connection_session_drops_wt,
 };
 pub use webmedia::{ConnectOptions, MediaStreamKey};
 

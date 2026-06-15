@@ -1543,6 +1543,24 @@ pub struct HealthPacket {
     pub screen_encoder_restarts_configure: ::std::option::Option<u64>,
     // @@protoc_insertion_point(field:health_packet.HealthPacket.screen_encoder_restarts_other)
     pub screen_encoder_restarts_other: ::std::option::Option<u64>,
+    ///  RTT-probe resilience signals (#522). Surface the client-side RTT-probe
+    ///  backpressure/staleness the merged #522 core already tracks so operators can
+    ///  see probe-pipeline health across the fleet server-side. Both are cumulative
+    ///  since the ConnectionManager was created and re-sent every health packet
+    ///  (same convention as the connection-loss counters in fields 54-55); the
+    ///  relay's metrics_server `.set()`s each onto a per-reporter GaugeVec so Grafana
+    ///  charts rate()/increase() exactly as for the sibling *_total gauges.
+    ///
+    ///  rtt_probe_dropped_total = cumulative count of RTT probes dropped because the
+    ///  in-flight probe queue was at MAX_INFLIGHT_PROBES (queue-cap backpressure).
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.rtt_probe_dropped_total)
+    pub rtt_probe_dropped_total: ::std::option::Option<u64>,
+    ///  rtt_probe_stale_suppressions_total = cumulative count of 1 Hz diagnostics
+    ///  ticks on which the active link's RTT-probe pipeline was stale and so
+    ///  active_server_rtt was suppressed (observability-only; does NOT change the
+    ///  suppression/re-election behavior, only counts it).
+    // @@protoc_insertion_point(field:health_packet.HealthPacket.rtt_probe_stale_suppressions_total)
+    pub rtt_probe_stale_suppressions_total: ::std::option::Option<u64>,
     // special fields
     // @@protoc_insertion_point(special_field:health_packet.HealthPacket.special_fields)
     pub special_fields: ::protobuf::SpecialFields,
@@ -1560,7 +1578,7 @@ impl HealthPacket {
     }
 
     fn generated_message_descriptor_data() -> ::protobuf::reflect::GeneratedMessageDescriptorData {
-        let mut fields = ::std::vec::Vec::with_capacity(77);
+        let mut fields = ::std::vec::Vec::with_capacity(79);
         let mut oneofs = ::std::vec::Vec::with_capacity(0);
         fields.push(::protobuf::reflect::rt::v2::make_simpler_field_accessor::<_, _>(
             "session_id",
@@ -1947,6 +1965,16 @@ impl HealthPacket {
             |m: &HealthPacket| { &m.screen_encoder_restarts_other },
             |m: &mut HealthPacket| { &mut m.screen_encoder_restarts_other },
         ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "rtt_probe_dropped_total",
+            |m: &HealthPacket| { &m.rtt_probe_dropped_total },
+            |m: &mut HealthPacket| { &mut m.rtt_probe_dropped_total },
+        ));
+        fields.push(::protobuf::reflect::rt::v2::make_option_accessor::<_, _>(
+            "rtt_probe_stale_suppressions_total",
+            |m: &HealthPacket| { &m.rtt_probe_stale_suppressions_total },
+            |m: &mut HealthPacket| { &mut m.rtt_probe_stale_suppressions_total },
+        ));
         ::protobuf::reflect::GeneratedMessageDescriptorData::new_2::<HealthPacket>(
             "HealthPacket",
             fields,
@@ -2211,6 +2239,12 @@ impl ::protobuf::Message for HealthPacket {
                 672 => {
                     self.screen_encoder_restarts_other = ::std::option::Option::Some(is.read_uint64()?);
                 },
+                680 => {
+                    self.rtt_probe_dropped_total = ::std::option::Option::Some(is.read_uint64()?);
+                },
+                688 => {
+                    self.rtt_probe_stale_suppressions_total = ::std::option::Option::Some(is.read_uint64()?);
+                },
                 tag => {
                     ::protobuf::rt::read_unknown_or_skip_group(tag, is, self.special_fields.mut_unknown_fields())?;
                 },
@@ -2459,6 +2493,12 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.screen_encoder_restarts_other {
             my_size += ::protobuf::rt::uint64_size(84, v);
         }
+        if let Some(v) = self.rtt_probe_dropped_total {
+            my_size += ::protobuf::rt::uint64_size(85, v);
+        }
+        if let Some(v) = self.rtt_probe_stale_suppressions_total {
+            my_size += ::protobuf::rt::uint64_size(86, v);
+        }
         my_size += ::protobuf::rt::unknown_fields_size(self.special_fields.unknown_fields());
         self.special_fields.cached_size().set(my_size as u32);
         my_size
@@ -2701,6 +2741,12 @@ impl ::protobuf::Message for HealthPacket {
         if let Some(v) = self.screen_encoder_restarts_other {
             os.write_uint64(84, v)?;
         }
+        if let Some(v) = self.rtt_probe_dropped_total {
+            os.write_uint64(85, v)?;
+        }
+        if let Some(v) = self.rtt_probe_stale_suppressions_total {
+            os.write_uint64(86, v)?;
+        }
         os.write_unknown_fields(self.special_fields.unknown_fields())?;
         ::std::result::Result::Ok(())
     }
@@ -2795,6 +2841,8 @@ impl ::protobuf::Message for HealthPacket {
         self.screen_encoder_restarts_memory = ::std::option::Option::None;
         self.screen_encoder_restarts_configure = ::std::option::Option::None;
         self.screen_encoder_restarts_other = ::std::option::Option::None;
+        self.rtt_probe_dropped_total = ::std::option::Option::None;
+        self.rtt_probe_stale_suppressions_total = ::std::option::Option::None;
         self.special_fields.clear();
     }
 
@@ -3498,7 +3546,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x18\n\x16_avg_decode_latency_msB\x16\n\x14_audio_quality_scoreB\x16\n\
     \x14_video_quality_scoreB\x15\n\x13_call_quality_scoreB\x17\n\x15_decode\
     r_errors_totalB\x19\n\x17_video_seq_loss_per_secB\x1c\n\x1a_keyframe_req\
-    uests_per_sec\"\x9c5\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\
+    uests_per_sec\"\xec6\n\x0cHealthPacket\x12\x1d\n\nsession_id\x18\x01\x20\
     \x01(\tR\tsessionId\x12\x1d\n\nmeeting_id\x18\x02\x20\x01(\tR\tmeetingId\
     \x12*\n\x11reporting_user_id\x18\x03\x20\x01(\x0cR\x0freportingUserId\
     \x12!\n\x0ctimestamp_ms\x18\x04\x20\x01(\x04R\x0btimestampMs\x126\n\x17r\
@@ -3597,39 +3645,43 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     EncoderRestartsMemory\x88\x01\x01\x12N\n!screen_encoder_restarts_configu\
     re\x18S\x20\x01(\x04H<R\x1escreenEncoderRestartsConfigure\x88\x01\x01\
     \x12F\n\x1dscreen_encoder_restarts_other\x18T\x20\x01(\x04H=R\x1ascreenE\
-    ncoderRestartsOther\x88\x01\x01\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03ke\
-    y\x18\x01\x20\x01(\tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.h\
-    ealth_packet.PeerStatsR\x05value:\x028\x01B\x14\n\x12_memory_used_bytesB\
-    \x15\n\x13_memory_total_bytesB\x18\n\x16_avg_encode_latency_msB\x13\n\
-    \x11_send_queue_bytesB\x1b\n\x19_packets_received_per_secB\x17\n\x15_pac\
-    kets_sent_per_secB\x0f\n\r_display_nameB\x16\n\x14_adaptive_video_tierB\
-    \x16\n\x14_adaptive_audio_tierB\x17\n\x15_datagram_drops_totalB\x1f\n\
-    \x1d_keyframe_requests_sent_totalB\x18\n\x16_websocket_drops_totalB\x17\
-    \n\x15_adaptive_screen_tierB\x18\n\x16_screen_sharing_activeB\x15\n\x13_\
-    encoder_output_fpsB\x1e\n\x1c_encoder_target_bitrate_kbpsB\x17\n\x15_cra\
-    sh_ceiling_activeB\x1b\n\x19_crash_ceiling_tier_indexB\x19\n\x17_crash_c\
-    eiling_decay_msB\x1a\n\x18_step_up_blocked_ceilingB\x1b\n\x19_step_up_bl\
-    ocked_slowdownB\x1f\n\x1d_step_up_blocked_screen_shareB%\n#_camera_encod\
-    er_errors_closed_codecB&\n$_camera_encoder_errors_vpx_mem_allocB(\n&_cam\
-    era_encoder_errors_configure_fatalB\x20\n\x1e_camera_encoder_errors_gene\
-    ricB%\n#_camera_encoder_frames_submitted_okB%\n#_screen_encoder_errors_c\
-    losed_codecB&\n$_screen_encoder_errors_vpx_mem_allocB(\n&_screen_encoder\
-    _errors_configure_fatalB\x20\n\x1e_screen_encoder_errors_genericB%\n#_sc\
-    reen_encoder_frames_submitted_okB&\n$_connection_handshake_failures_tota\
-    lB!\n\x1f_connection_session_drops_totalB\x0f\n\r_client_coresB\x16\n\
-    \x14_client_architectureB\x14\n\x12_client_gpu_familyB\x20\n\x1e_client_\
-    network_effective_typeB\x1a\n\x18_client_network_downlinkB\x15\n\x13_cli\
-    ent_network_rttB\x1a\n\x18_client_battery_chargingB\x17\n\x15_client_bat\
-    tery_levelB\x1a\n\x18_client_capability_scoreB\r\n\x0b_render_fpsB\x17\n\
-    \x15_encoder_p75_peer_fpsB\x10\n\x0e_decode_budgetB\x14\n\x12_wasm_memor\
-    y_bytesB\x15\n\x13_agent_memory_bytesB\x1d\n\x1b_reelection_proceeded_to\
-    talB\x1b\n\x19_reelection_aborted_totalB\x1d\n\x1b_reelection_preserved_\
-    totalB\x1a\n\x18_reelection_failed_totalB\x19\n\x17_effective_video_laye\
-    rsB\x16\n\x14_active_video_layersB'\n%_camera_encoder_restarts_closed_co\
-    decB!\n\x1f_camera_encoder_restarts_memoryB$\n\"_camera_encoder_restarts\
-    _configureB\x20\n\x1e_camera_encoder_restarts_otherB'\n%_screen_encoder_\
-    restarts_closed_codecB!\n\x1f_screen_encoder_restarts_memoryB$\n\"_scree\
-    n_encoder_restarts_configureB\x20\n\x1e_screen_encoder_restarts_otherJ\
+    ncoderRestartsOther\x88\x01\x01\x12:\n\x17rtt_probe_dropped_total\x18U\
+    \x20\x01(\x04H>R\x14rttProbeDroppedTotal\x88\x01\x01\x12O\n\"rtt_probe_s\
+    tale_suppressions_total\x18V\x20\x01(\x04H?R\x1erttProbeStaleSuppression\
+    sTotal\x88\x01\x01\x1aV\n\x0ePeerStatsEntry\x12\x10\n\x03key\x18\x01\x20\
+    \x01(\tR\x03key\x12.\n\x05value\x18\x02\x20\x01(\x0b2\x18.health_packet.\
+    PeerStatsR\x05value:\x028\x01B\x14\n\x12_memory_used_bytesB\x15\n\x13_me\
+    mory_total_bytesB\x18\n\x16_avg_encode_latency_msB\x13\n\x11_send_queue_\
+    bytesB\x1b\n\x19_packets_received_per_secB\x17\n\x15_packets_sent_per_se\
+    cB\x0f\n\r_display_nameB\x16\n\x14_adaptive_video_tierB\x16\n\x14_adapti\
+    ve_audio_tierB\x17\n\x15_datagram_drops_totalB\x1f\n\x1d_keyframe_reques\
+    ts_sent_totalB\x18\n\x16_websocket_drops_totalB\x17\n\x15_adaptive_scree\
+    n_tierB\x18\n\x16_screen_sharing_activeB\x15\n\x13_encoder_output_fpsB\
+    \x1e\n\x1c_encoder_target_bitrate_kbpsB\x17\n\x15_crash_ceiling_activeB\
+    \x1b\n\x19_crash_ceiling_tier_indexB\x19\n\x17_crash_ceiling_decay_msB\
+    \x1a\n\x18_step_up_blocked_ceilingB\x1b\n\x19_step_up_blocked_slowdownB\
+    \x1f\n\x1d_step_up_blocked_screen_shareB%\n#_camera_encoder_errors_close\
+    d_codecB&\n$_camera_encoder_errors_vpx_mem_allocB(\n&_camera_encoder_err\
+    ors_configure_fatalB\x20\n\x1e_camera_encoder_errors_genericB%\n#_camera\
+    _encoder_frames_submitted_okB%\n#_screen_encoder_errors_closed_codecB&\n\
+    $_screen_encoder_errors_vpx_mem_allocB(\n&_screen_encoder_errors_configu\
+    re_fatalB\x20\n\x1e_screen_encoder_errors_genericB%\n#_screen_encoder_fr\
+    ames_submitted_okB&\n$_connection_handshake_failures_totalB!\n\x1f_conne\
+    ction_session_drops_totalB\x0f\n\r_client_coresB\x16\n\x14_client_archit\
+    ectureB\x14\n\x12_client_gpu_familyB\x20\n\x1e_client_network_effective_\
+    typeB\x1a\n\x18_client_network_downlinkB\x15\n\x13_client_network_rttB\
+    \x1a\n\x18_client_battery_chargingB\x17\n\x15_client_battery_levelB\x1a\
+    \n\x18_client_capability_scoreB\r\n\x0b_render_fpsB\x17\n\x15_encoder_p7\
+    5_peer_fpsB\x10\n\x0e_decode_budgetB\x14\n\x12_wasm_memory_bytesB\x15\n\
+    \x13_agent_memory_bytesB\x1d\n\x1b_reelection_proceeded_totalB\x1b\n\x19\
+    _reelection_aborted_totalB\x1d\n\x1b_reelection_preserved_totalB\x1a\n\
+    \x18_reelection_failed_totalB\x19\n\x17_effective_video_layersB\x16\n\
+    \x14_active_video_layersB'\n%_camera_encoder_restarts_closed_codecB!\n\
+    \x1f_camera_encoder_restarts_memoryB$\n\"_camera_encoder_restarts_config\
+    ureB\x20\n\x1e_camera_encoder_restarts_otherB'\n%_screen_encoder_restart\
+    s_closed_codecB!\n\x1f_screen_encoder_restarts_memoryB$\n\"_screen_encod\
+    er_restarts_configureB\x20\n\x1e_screen_encoder_restarts_otherB\x1a\n\
+    \x18_rtt_probe_dropped_totalB%\n#_rtt_probe_stale_suppressions_totalJ\
     \x04\x08\x19\x10\x1aJ\x04\x08\x1a\x10\x1bJ\x04\x08\x1f\x10\x20J\x04\x08!\
     \x10\"J\x04\x08\"\x10#J\x04\x08#\x10$J\x04\x08$\x10%R\x11encoder_fps_rat\
     ioR\x16encoder_worst_peer_fpsR\x15encoder_bitrate_ratioR\x13join_bandwid\
@@ -3647,7 +3699,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x03\x20\x01(\tR\x08fromTier\x12\x17\n\x07to_tier\x18\x04\x20\x01(\tR\
     \x06toTier\x12\x18\n\x07trigger\x18\x05\x20\x01(\tR\x07trigger\":\n\tTie\
     rDwell\x12\x12\n\x04tier\x18\x01\x20\x01(\tR\x04tier\x12\x19\n\x08dwell_\
-    ms\x18\x02\x20\x01(\x01R\x07dwellMsJ\xf1\xad\x01\n\x07\x12\x05\0\0\xe2\
+    ms\x18\x02\x20\x01(\x01R\x07dwellMsJ\xd3\xb6\x01\n\x07\x12\x05\0\0\xf3\
     \x02\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\n\x08\n\x01\x02\x12\x03\x02\0\
     \x16\n\n\n\x02\x04\0\x12\x04\x04\0\x0e\x01\n\n\n\x03\x04\0\x01\x12\x03\
     \x04\x08\x1e\n\x0b\n\x04\x04\0\x02\0\x12\x03\x05\x02\x1c\n\x0c\n\x05\x04\
@@ -3859,7 +3911,7 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x20read\x20100/100\n\x20during\x20a\x20keyframe\x20storm.\n\n\x0c\n\x05\
     \x04\x04\x02\x0f\x04\x12\x03|\x02\n\n\x0c\n\x05\x04\x04\x02\x0f\x05\x12\
     \x03|\x0b\x11\n\x0c\n\x05\x04\x04\x02\x0f\x01\x12\x03|\x12+\n\x0c\n\x05\
-    \x04\x04\x02\x0f\x03\x12\x03|.0\n\x0b\n\x02\x04\x05\x12\x05\x7f\0\xb9\
+    \x04\x04\x02\x0f\x03\x12\x03|.0\n\x0b\n\x02\x04\x05\x12\x05\x7f\0\xca\
     \x02\x01\n\n\n\x03\x04\x05\x01\x12\x03\x7f\x08\x14\n\x0c\n\x04\x04\x05\
     \x02\0\x12\x04\x80\x01\x02\x18\n\r\n\x05\x04\x05\x02\0\x05\x12\x04\x80\
     \x01\x02\x08\n\r\n\x05\x04\x05\x02\0\x01\x12\x04\x80\x01\t\x13\n\r\n\x05\
@@ -4287,85 +4339,112 @@ static file_descriptor_proto_data: &'static [u8] = b"\
     \x0c\n\x04\x04\x05\x02L\x12\x04\xb8\x02\x025\n\r\n\x05\x04\x05\x02L\x04\
     \x12\x04\xb8\x02\x02\n\n\r\n\x05\x04\x05\x02L\x05\x12\x04\xb8\x02\x0b\
     \x11\n\r\n\x05\x04\x05\x02L\x01\x12\x04\xb8\x02\x12/\n\r\n\x05\x04\x05\
-    \x02L\x03\x12\x04\xb8\x0224\n\xf0\x01\n\x02\x04\x06\x12\x06\xbf\x02\0\
-    \xd5\x02\x01\x1a\xe1\x01\x20Receiver-side\x20adaptive\x20decode-budget\
-    \x20state\x20(#987).\x20Mirrors\x20the\n\x20AdaptiveQuality\x20tier\x20f\
-    ields\x20on\x20HealthPacket:\x20a\x20periodic\x20snapshot\x20of\x20the\n\
-    \x20current\x20decision\x20the\x20local\x20controller\x20has\x20reached\
-    \x20for\x20how\x20many\x20video\x20tiles\n\x20to\x20decode.\n\n\x0b\n\
-    \x03\x04\x06\x01\x12\x04\xbf\x02\x08\x14\nE\n\x04\x04\x06\x02\0\x12\x04\
-    \xc0\x02\x02\x1b\"7\x20Current\x20effective\x20cap\x20on\x20simultaneous\
-    ly\x20decoded\x20tiles\n\n\r\n\x05\x04\x06\x02\0\x05\x12\x04\xc0\x02\x02\
-    \x08\n\r\n\x05\x04\x06\x02\0\x01\x12\x04\xc0\x02\t\x16\n\r\n\x05\x04\x06\
-    \x02\0\x03\x12\x04\xc0\x02\x19\x1a\nF\n\x04\x04\x06\x02\x01\x12\x04\xc1\
-    \x02\x02\x15\"8\x20Natural/unconstrained\x20tile\x20count\x20the\x20layo\
-    ut\x20would\x20show\n\n\r\n\x05\x04\x06\x02\x01\x05\x12\x04\xc1\x02\x02\
-    \x08\n\r\n\x05\x04\x06\x02\x01\x01\x12\x04\xc1\x02\t\x10\n\r\n\x05\x04\
-    \x06\x02\x01\x03\x12\x04\xc1\x02\x13\x14\n;\n\x04\x04\x06\x02\x02\x12\
-    \x04\xc2\x02\x02\x15\"-\x20Pressured\x20latch\x20engaged\x20(loop\x20own\
-    s\x20the\x20cap)\n\n\r\n\x05\x04\x06\x02\x02\x05\x12\x04\xc2\x02\x02\x06\
-    \n\r\n\x05\x04\x06\x02\x02\x01\x12\x04\xc2\x02\x07\x10\n\r\n\x05\x04\x06\
-    \x02\x02\x03\x12\x04\xc2\x02\x13\x14\n\x1d\n\x04\x04\x06\x02\x03\x12\x04\
-    \xc3\x02\x02!\"\x0f\x20Auto\x20vs\x20Fixed\n\n\r\n\x05\x04\x06\x02\x03\
-    \x06\x12\x04\xc3\x02\x02\x0e\n\r\n\x05\x04\x06\x02\x03\x01\x12\x04\xc3\
-    \x02\x0f\x1c\n\r\n\x05\x04\x06\x02\x03\x03\x12\x04\xc3\x02\x1f\x20\n]\n\
-    \x04\x04\x06\x02\x04\x12\x04\xc5\x02\x02\x1e\x1aO\x20Set\x20only\x20when\
-    \x20override_mode\x20==\x20OVERRIDE_MODE_FIXED:\x20the\x20user's\x20hard\
-    \x20tile\x20cap.\n\n\r\n\x05\x04\x06\x02\x04\x05\x12\x04\xc5\x02\x02\x08\
-    \n\r\n\x05\x04\x06\x02\x04\x01\x12\x04\xc5\x02\t\x19\n\r\n\x05\x04\x06\
-    \x02\x04\x03\x12\x04\xc5\x02\x1c\x1d\n\xa4\x03\n\x04\x04\x06\x02\x05\x12\
-    \x04\xcd\x02\x02\x18\x1a\x95\x03\x20Tiles\x20actually\x20being\x20decode\
-    d\x20right\x20now\x20=\x20min(effective_cap,\x20natural)\n\x20(#1143).\
-    \x20`effective_cap`\x20is\x20the\x20BUDGET\x20ceiling\x20and\x20`natural\
-    `\x20is\x20what\x20the\n\x20layout\x20WOULD\x20show\x20unconstrained;\
-    \x20neither\x20alone\x20answers\x20\"how\x20many\x20videos\x20is\n\x20th\
-    is\x20client\x20actually\x20decoding?\"\x20when\x20the\x20layout\x20has\
-    \x20fewer\x20tiles\x20than\x20the\n\x20cap\x20allows.\x20This\x20is\x20t\
-    hat\x20number\x20\xe2\x80\x94\x20the\x20per-client\x20\"videos\x20showin\
-    g\"\x20signal\x20the\n\x20observability\x20issue\x20asks\x20for.\n\n\r\n\
-    \x05\x04\x06\x02\x05\x05\x12\x04\xcd\x02\x02\x08\n\r\n\x05\x04\x06\x02\
-    \x05\x01\x12\x04\xcd\x02\t\x13\n\r\n\x05\x04\x06\x02\x05\x03\x12\x04\xcd\
-    \x02\x16\x17\n:\n\x04\x04\x06\x04\0\x12\x06\xd0\x02\x02\xd4\x02\x03\x1a*\
-    \x20Manual\x20override\x20mode\x20for\x20the\x20controller.\n\n\r\n\x05\
-    \x04\x06\x04\0\x01\x12\x04\xd0\x02\x07\x13\n,\n\x06\x04\x06\x04\0\x02\0\
-    \x12\x04\xd1\x02\x04\"\"\x1c\x20Treated\x20as\x20Auto\x20by\x20readers\n\
-    \n\x0f\n\x07\x04\x06\x04\0\x02\0\x01\x12\x04\xd1\x02\x04\x1d\n\x0f\n\x07\
-    \x04\x06\x04\0\x02\0\x02\x12\x04\xd1\x02\x20!\n/\n\x06\x04\x06\x04\0\x02\
-    \x01\x12\x04\xd2\x02\x04\x1b\"\x1f\x20Adaptive\x20loop\x20decides\x20the\
-    \x20cap\n\n\x0f\n\x07\x04\x06\x04\0\x02\x01\x01\x12\x04\xd2\x02\x04\x16\
-    \n\x0f\n\x07\x04\x06\x04\0\x02\x01\x02\x12\x04\xd2\x02\x19\x1a\nA\n\x06\
-    \x04\x06\x04\0\x02\x02\x12\x04\xd3\x02\x04\x1c\"1\x20User\x20hard-pinned\
-    \x20the\x20cap\x20(see\x20override_fixed_n)\n\n\x0f\n\x07\x04\x06\x04\0\
-    \x02\x02\x01\x12\x04\xd3\x02\x04\x17\n\x0f\n\x07\x04\x06\x04\0\x02\x02\
-    \x02\x12\x04\xd3\x02\x1a\x1b\n\x0c\n\x02\x04\x07\x12\x06\xd7\x02\0\xdd\
-    \x02\x01\n\x0b\n\x03\x04\x07\x01\x12\x04\xd7\x02\x08\x16\n\x1e\n\x04\x04\
-    \x07\x02\0\x12\x04\xd8\x02\x02\x17\"\x10\x20\"up\"\x20or\x20\"down\"\n\n\
-    \r\n\x05\x04\x07\x02\0\x05\x12\x04\xd8\x02\x02\x08\n\r\n\x05\x04\x07\x02\
-    \0\x01\x12\x04\xd8\x02\t\x12\n\r\n\x05\x04\x07\x02\0\x03\x12\x04\xd8\x02\
-    \x15\x16\n*\n\x04\x04\x07\x02\x01\x12\x04\xd9\x02\x02\x14\"\x1c\x20\"vid\
-    eo\",\x20\"audio\",\x20\"screen\"\n\n\r\n\x05\x04\x07\x02\x01\x05\x12\
-    \x04\xd9\x02\x02\x08\n\r\n\x05\x04\x07\x02\x01\x01\x12\x04\xd9\x02\t\x0f\
-    \n\r\n\x05\x04\x07\x02\x01\x03\x12\x04\xd9\x02\x12\x13\n9\n\x04\x04\x07\
-    \x02\x02\x12\x04\xda\x02\x02\x17\"+\x20tier\x20label\x20e.g.\x20\"hd_108\
-    0p\",\x20\"medium_480p\"\n\n\r\n\x05\x04\x07\x02\x02\x05\x12\x04\xda\x02\
-    \x02\x08\n\r\n\x05\x04\x07\x02\x02\x01\x12\x04\xda\x02\t\x12\n\r\n\x05\
-    \x04\x07\x02\x02\x03\x12\x04\xda\x02\x15\x16\n\x1a\n\x04\x04\x07\x02\x03\
-    \x12\x04\xdb\x02\x02\x15\"\x0c\x20tier\x20label\n\n\r\n\x05\x04\x07\x02\
-    \x03\x05\x12\x04\xdb\x02\x02\x08\n\r\n\x05\x04\x07\x02\x03\x01\x12\x04\
-    \xdb\x02\t\x10\n\r\n\x05\x04\x07\x02\x03\x03\x12\x04\xdb\x02\x13\x14\n>\
-    \n\x04\x04\x07\x02\x04\x12\x04\xdc\x02\x02\x15\"0\x20\"fps\",\x20\"bitra\
-    te\",\x20\"congestion\",\x20\"coordination\"\n\n\r\n\x05\x04\x07\x02\x04\
-    \x05\x12\x04\xdc\x02\x02\x08\n\r\n\x05\x04\x07\x02\x04\x01\x12\x04\xdc\
-    \x02\t\x10\n\r\n\x05\x04\x07\x02\x04\x03\x12\x04\xdc\x02\x13\x14\n\x0c\n\
-    \x02\x04\x08\x12\x06\xdf\x02\0\xe2\x02\x01\n\x0b\n\x03\x04\x08\x01\x12\
-    \x04\xdf\x02\x08\x11\n,\n\x04\x04\x08\x02\0\x12\x04\xe0\x02\x02\x12\"\
-    \x1e\x20Tier\x20label\x20(e.g.\x20\"hd_1080p\")\n\n\r\n\x05\x04\x08\x02\
-    \0\x05\x12\x04\xe0\x02\x02\x08\n\r\n\x05\x04\x08\x02\0\x01\x12\x04\xe0\
-    \x02\t\r\n\r\n\x05\x04\x08\x02\0\x03\x12\x04\xe0\x02\x10\x11\n<\n\x04\
-    \x04\x08\x02\x01\x12\x04\xe1\x02\x02\x16\".\x20Time\x20spent\x20in\x20th\
-    is\x20tier\x20before\x20transitioning\n\n\r\n\x05\x04\x08\x02\x01\x05\
-    \x12\x04\xe1\x02\x02\x08\n\r\n\x05\x04\x08\x02\x01\x01\x12\x04\xe1\x02\t\
-    \x11\n\r\n\x05\x04\x08\x02\x01\x03\x12\x04\xe1\x02\x14\x15b\x06proto3\
+    \x02L\x03\x12\x04\xb8\x0224\n\xbb\x05\n\x04\x04\x05\x02M\x12\x04\xc4\x02\
+    \x02/\x1a\xa2\x05\x20RTT-probe\x20resilience\x20signals\x20(#522).\x20Su\
+    rface\x20the\x20client-side\x20RTT-probe\n\x20backpressure/staleness\x20\
+    the\x20merged\x20#522\x20core\x20already\x20tracks\x20so\x20operators\
+    \x20can\n\x20see\x20probe-pipeline\x20health\x20across\x20the\x20fleet\
+    \x20server-side.\x20Both\x20are\x20cumulative\n\x20since\x20the\x20Conne\
+    ctionManager\x20was\x20created\x20and\x20re-sent\x20every\x20health\x20p\
+    acket\n\x20(same\x20convention\x20as\x20the\x20connection-loss\x20counte\
+    rs\x20in\x20fields\x2054-55);\x20the\n\x20relay's\x20metrics_server\x20`\
+    .set()`s\x20each\x20onto\x20a\x20per-reporter\x20GaugeVec\x20so\x20Grafa\
+    na\n\x20charts\x20rate()/increase()\x20exactly\x20as\x20for\x20the\x20si\
+    bling\x20*_total\x20gauges.\n\n\x20rtt_probe_dropped_total\x20=\x20cumul\
+    ative\x20count\x20of\x20RTT\x20probes\x20dropped\x20because\x20the\n\x20\
+    in-flight\x20probe\x20queue\x20was\x20at\x20MAX_INFLIGHT_PROBES\x20(queu\
+    e-cap\x20backpressure).\n\"\x08\x20(#522)\n\n\r\n\x05\x04\x05\x02M\x04\
+    \x12\x04\xc4\x02\x02\n\n\r\n\x05\x04\x05\x02M\x05\x12\x04\xc4\x02\x0b\
+    \x11\n\r\n\x05\x04\x05\x02M\x01\x12\x04\xc4\x02\x12)\n\r\n\x05\x04\x05\
+    \x02M\x03\x12\x04\xc4\x02,.\n\xa9\x02\n\x04\x04\x05\x02N\x12\x04\xc9\x02\
+    \x02:\x1a\x90\x02\x20rtt_probe_stale_suppressions_total\x20=\x20cumulati\
+    ve\x20count\x20of\x201\x20Hz\x20diagnostics\n\x20ticks\x20on\x20which\
+    \x20the\x20active\x20link's\x20RTT-probe\x20pipeline\x20was\x20stale\x20\
+    and\x20so\n\x20active_server_rtt\x20was\x20suppressed\x20(observability-\
+    only;\x20does\x20NOT\x20change\x20the\n\x20suppression/re-election\x20be\
+    havior,\x20only\x20counts\x20it).\n\"\x08\x20(#522)\n\n\r\n\x05\x04\x05\
+    \x02N\x04\x12\x04\xc9\x02\x02\n\n\r\n\x05\x04\x05\x02N\x05\x12\x04\xc9\
+    \x02\x0b\x11\n\r\n\x05\x04\x05\x02N\x01\x12\x04\xc9\x02\x124\n\r\n\x05\
+    \x04\x05\x02N\x03\x12\x04\xc9\x0279\n\xf0\x01\n\x02\x04\x06\x12\x06\xd0\
+    \x02\0\xe6\x02\x01\x1a\xe1\x01\x20Receiver-side\x20adaptive\x20decode-bu\
+    dget\x20state\x20(#987).\x20Mirrors\x20the\n\x20AdaptiveQuality\x20tier\
+    \x20fields\x20on\x20HealthPacket:\x20a\x20periodic\x20snapshot\x20of\x20\
+    the\n\x20current\x20decision\x20the\x20local\x20controller\x20has\x20rea\
+    ched\x20for\x20how\x20many\x20video\x20tiles\n\x20to\x20decode.\n\n\x0b\
+    \n\x03\x04\x06\x01\x12\x04\xd0\x02\x08\x14\nE\n\x04\x04\x06\x02\0\x12\
+    \x04\xd1\x02\x02\x1b\"7\x20Current\x20effective\x20cap\x20on\x20simultan\
+    eously\x20decoded\x20tiles\n\n\r\n\x05\x04\x06\x02\0\x05\x12\x04\xd1\x02\
+    \x02\x08\n\r\n\x05\x04\x06\x02\0\x01\x12\x04\xd1\x02\t\x16\n\r\n\x05\x04\
+    \x06\x02\0\x03\x12\x04\xd1\x02\x19\x1a\nF\n\x04\x04\x06\x02\x01\x12\x04\
+    \xd2\x02\x02\x15\"8\x20Natural/unconstrained\x20tile\x20count\x20the\x20\
+    layout\x20would\x20show\n\n\r\n\x05\x04\x06\x02\x01\x05\x12\x04\xd2\x02\
+    \x02\x08\n\r\n\x05\x04\x06\x02\x01\x01\x12\x04\xd2\x02\t\x10\n\r\n\x05\
+    \x04\x06\x02\x01\x03\x12\x04\xd2\x02\x13\x14\n;\n\x04\x04\x06\x02\x02\
+    \x12\x04\xd3\x02\x02\x15\"-\x20Pressured\x20latch\x20engaged\x20(loop\
+    \x20owns\x20the\x20cap)\n\n\r\n\x05\x04\x06\x02\x02\x05\x12\x04\xd3\x02\
+    \x02\x06\n\r\n\x05\x04\x06\x02\x02\x01\x12\x04\xd3\x02\x07\x10\n\r\n\x05\
+    \x04\x06\x02\x02\x03\x12\x04\xd3\x02\x13\x14\n\x1d\n\x04\x04\x06\x02\x03\
+    \x12\x04\xd4\x02\x02!\"\x0f\x20Auto\x20vs\x20Fixed\n\n\r\n\x05\x04\x06\
+    \x02\x03\x06\x12\x04\xd4\x02\x02\x0e\n\r\n\x05\x04\x06\x02\x03\x01\x12\
+    \x04\xd4\x02\x0f\x1c\n\r\n\x05\x04\x06\x02\x03\x03\x12\x04\xd4\x02\x1f\
+    \x20\n]\n\x04\x04\x06\x02\x04\x12\x04\xd6\x02\x02\x1e\x1aO\x20Set\x20onl\
+    y\x20when\x20override_mode\x20==\x20OVERRIDE_MODE_FIXED:\x20the\x20user'\
+    s\x20hard\x20tile\x20cap.\n\n\r\n\x05\x04\x06\x02\x04\x05\x12\x04\xd6\
+    \x02\x02\x08\n\r\n\x05\x04\x06\x02\x04\x01\x12\x04\xd6\x02\t\x19\n\r\n\
+    \x05\x04\x06\x02\x04\x03\x12\x04\xd6\x02\x1c\x1d\n\xa4\x03\n\x04\x04\x06\
+    \x02\x05\x12\x04\xde\x02\x02\x18\x1a\x95\x03\x20Tiles\x20actually\x20bei\
+    ng\x20decoded\x20right\x20now\x20=\x20min(effective_cap,\x20natural)\n\
+    \x20(#1143).\x20`effective_cap`\x20is\x20the\x20BUDGET\x20ceiling\x20and\
+    \x20`natural`\x20is\x20what\x20the\n\x20layout\x20WOULD\x20show\x20uncon\
+    strained;\x20neither\x20alone\x20answers\x20\"how\x20many\x20videos\x20i\
+    s\n\x20this\x20client\x20actually\x20decoding?\"\x20when\x20the\x20layou\
+    t\x20has\x20fewer\x20tiles\x20than\x20the\n\x20cap\x20allows.\x20This\
+    \x20is\x20that\x20number\x20\xe2\x80\x94\x20the\x20per-client\x20\"video\
+    s\x20showing\"\x20signal\x20the\n\x20observability\x20issue\x20asks\x20f\
+    or.\n\n\r\n\x05\x04\x06\x02\x05\x05\x12\x04\xde\x02\x02\x08\n\r\n\x05\
+    \x04\x06\x02\x05\x01\x12\x04\xde\x02\t\x13\n\r\n\x05\x04\x06\x02\x05\x03\
+    \x12\x04\xde\x02\x16\x17\n:\n\x04\x04\x06\x04\0\x12\x06\xe1\x02\x02\xe5\
+    \x02\x03\x1a*\x20Manual\x20override\x20mode\x20for\x20the\x20controller.\
+    \n\n\r\n\x05\x04\x06\x04\0\x01\x12\x04\xe1\x02\x07\x13\n,\n\x06\x04\x06\
+    \x04\0\x02\0\x12\x04\xe2\x02\x04\"\"\x1c\x20Treated\x20as\x20Auto\x20by\
+    \x20readers\n\n\x0f\n\x07\x04\x06\x04\0\x02\0\x01\x12\x04\xe2\x02\x04\
+    \x1d\n\x0f\n\x07\x04\x06\x04\0\x02\0\x02\x12\x04\xe2\x02\x20!\n/\n\x06\
+    \x04\x06\x04\0\x02\x01\x12\x04\xe3\x02\x04\x1b\"\x1f\x20Adaptive\x20loop\
+    \x20decides\x20the\x20cap\n\n\x0f\n\x07\x04\x06\x04\0\x02\x01\x01\x12\
+    \x04\xe3\x02\x04\x16\n\x0f\n\x07\x04\x06\x04\0\x02\x01\x02\x12\x04\xe3\
+    \x02\x19\x1a\nA\n\x06\x04\x06\x04\0\x02\x02\x12\x04\xe4\x02\x04\x1c\"1\
+    \x20User\x20hard-pinned\x20the\x20cap\x20(see\x20override_fixed_n)\n\n\
+    \x0f\n\x07\x04\x06\x04\0\x02\x02\x01\x12\x04\xe4\x02\x04\x17\n\x0f\n\x07\
+    \x04\x06\x04\0\x02\x02\x02\x12\x04\xe4\x02\x1a\x1b\n\x0c\n\x02\x04\x07\
+    \x12\x06\xe8\x02\0\xee\x02\x01\n\x0b\n\x03\x04\x07\x01\x12\x04\xe8\x02\
+    \x08\x16\n\x1e\n\x04\x04\x07\x02\0\x12\x04\xe9\x02\x02\x17\"\x10\x20\"up\
+    \"\x20or\x20\"down\"\n\n\r\n\x05\x04\x07\x02\0\x05\x12\x04\xe9\x02\x02\
+    \x08\n\r\n\x05\x04\x07\x02\0\x01\x12\x04\xe9\x02\t\x12\n\r\n\x05\x04\x07\
+    \x02\0\x03\x12\x04\xe9\x02\x15\x16\n*\n\x04\x04\x07\x02\x01\x12\x04\xea\
+    \x02\x02\x14\"\x1c\x20\"video\",\x20\"audio\",\x20\"screen\"\n\n\r\n\x05\
+    \x04\x07\x02\x01\x05\x12\x04\xea\x02\x02\x08\n\r\n\x05\x04\x07\x02\x01\
+    \x01\x12\x04\xea\x02\t\x0f\n\r\n\x05\x04\x07\x02\x01\x03\x12\x04\xea\x02\
+    \x12\x13\n9\n\x04\x04\x07\x02\x02\x12\x04\xeb\x02\x02\x17\"+\x20tier\x20\
+    label\x20e.g.\x20\"hd_1080p\",\x20\"medium_480p\"\n\n\r\n\x05\x04\x07\
+    \x02\x02\x05\x12\x04\xeb\x02\x02\x08\n\r\n\x05\x04\x07\x02\x02\x01\x12\
+    \x04\xeb\x02\t\x12\n\r\n\x05\x04\x07\x02\x02\x03\x12\x04\xeb\x02\x15\x16\
+    \n\x1a\n\x04\x04\x07\x02\x03\x12\x04\xec\x02\x02\x15\"\x0c\x20tier\x20la\
+    bel\n\n\r\n\x05\x04\x07\x02\x03\x05\x12\x04\xec\x02\x02\x08\n\r\n\x05\
+    \x04\x07\x02\x03\x01\x12\x04\xec\x02\t\x10\n\r\n\x05\x04\x07\x02\x03\x03\
+    \x12\x04\xec\x02\x13\x14\n>\n\x04\x04\x07\x02\x04\x12\x04\xed\x02\x02\
+    \x15\"0\x20\"fps\",\x20\"bitrate\",\x20\"congestion\",\x20\"coordination\
+    \"\n\n\r\n\x05\x04\x07\x02\x04\x05\x12\x04\xed\x02\x02\x08\n\r\n\x05\x04\
+    \x07\x02\x04\x01\x12\x04\xed\x02\t\x10\n\r\n\x05\x04\x07\x02\x04\x03\x12\
+    \x04\xed\x02\x13\x14\n\x0c\n\x02\x04\x08\x12\x06\xf0\x02\0\xf3\x02\x01\n\
+    \x0b\n\x03\x04\x08\x01\x12\x04\xf0\x02\x08\x11\n,\n\x04\x04\x08\x02\0\
+    \x12\x04\xf1\x02\x02\x12\"\x1e\x20Tier\x20label\x20(e.g.\x20\"hd_1080p\"\
+    )\n\n\r\n\x05\x04\x08\x02\0\x05\x12\x04\xf1\x02\x02\x08\n\r\n\x05\x04\
+    \x08\x02\0\x01\x12\x04\xf1\x02\t\r\n\r\n\x05\x04\x08\x02\0\x03\x12\x04\
+    \xf1\x02\x10\x11\n<\n\x04\x04\x08\x02\x01\x12\x04\xf2\x02\x02\x16\".\x20\
+    Time\x20spent\x20in\x20this\x20tier\x20before\x20transitioning\n\n\r\n\
+    \x05\x04\x08\x02\x01\x05\x12\x04\xf2\x02\x02\x08\n\r\n\x05\x04\x08\x02\
+    \x01\x01\x12\x04\xf2\x02\t\x11\n\r\n\x05\x04\x08\x02\x01\x03\x12\x04\xf2\
+    \x02\x14\x15b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

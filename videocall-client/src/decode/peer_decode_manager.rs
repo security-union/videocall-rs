@@ -1165,6 +1165,117 @@ impl Peer {
         seeded
     }
 
+    /// Step this peer's RECEIVER-side choosers down ONE rung in response to a
+    /// relay-authored `DOWNLINK_CONGESTION` control packet (issue #1219 Half 2).
+    ///
+    /// This is the SYNTHETIC-sample twin of [`Self::seed_early_congestion`]. The
+    /// two are byte-identical EXCEPT for the `DownlinkSample` fed into each
+    /// `observe_early_congestion` call:
+    ///
+    ///   * `seed_early_congestion` feeds the peer's REAL most-recent windowed
+    ///     downlink sample (`last_video_downlink` / `last_screen_downlink`). On
+    ///     WebSocket (TCP) and WebTransport video (reliable QUIC unistreams) there
+    ///     is NO packet loss, so that real sample is `{loss: 0, kf: 0}` and
+    ///     [`DownlinkSample::is_congested`] is `false` → the early seed is a no-op.
+    ///     That zero-loss blindness is exactly the #1219 condition the relay sees
+    ///     (it drops frames at its outbound mailbox) but the per-peer receive
+    ///     telemetry cannot.
+    ///   * This method instead feeds a SYNTHETIC congested sample
+    ///     (`{loss_per_sec: LOSS_STEP_DOWN_PER_SEC, kf_per_sec: 0.0}`, which makes
+    ///     `is_congested()` true) so the chooser steps down even though the real
+    ///     telemetry shows zero loss. DOWNLINK_CONGESTION is the relay ASSERTING
+    ///     congestion the per-peer loss sample cannot observe; the client honors
+    ///     that assertion by treating this window as congested for the chooser's
+    ///     purposes ONLY.
+    ///
+    /// Everything else is identical to `seed_early_congestion`: the clamp to the
+    /// user's per-kind receive bounds, the `selected_*_layer` decode-guard write,
+    /// the sequence-tracker reanchor on an actual layer switch, and AUDIO being
+    /// proxied by the VIDEO downlink. The real `last_video_downlink` /
+    /// `last_screen_downlink` telemetry is deliberately LEFT UNTOUCHED — the
+    /// synthetic value is local to this call and never written back, so the next
+    /// real-sample tick (`choose`) and the early-seed path keep observing genuine
+    /// link health.
+    ///
+    /// Because it reuses `observe_early_congestion`, a chooser already constrained
+    /// (by a prior real step-down or a prior DOWNLINK_CONGESTION) returns `false`
+    /// and is NOT re-stepped — that is correct and idempotent: the held layer is
+    /// still re-advertised to the relay via
+    /// [`PeerDecodeManager::current_desired_preferences`] on the caller's publish.
+    ///
+    /// RECEIVER-ONLY: this mutates only this peer's own LayerChoosers (the layers
+    /// THIS client REQUESTS from the relay for THIS peer's stream). It does not
+    /// touch — and must never touch — the local publisher's encoder; collapsing
+    /// the publisher would re-collapse this client's outbound stream for the whole
+    /// room, the exact bug #1219 Half 1 fixed.
+    ///
+    /// Returns `true` if ANY kind was stepped down (so the caller can log it); the
+    /// caller still emits the resulting preference via the normal sender path.
+    pub fn seed_downlink_congestion(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> bool {
+        use crate::decode::layer_chooser::{PrefMediaKind, LOSS_STEP_DOWN_PER_SEC};
+        let mut seeded = false;
+
+        // Relay-authored congestion: synthesize a congested window so the chooser
+        // steps down even on lossless transports where the real sample reads
+        // `{0, 0}` (#1219 Half 2). `loss_per_sec == LOSS_STEP_DOWN_PER_SEC` makes
+        // `DownlinkSample::is_congested()` true (`>=` threshold).
+        let synthetic = DownlinkSample {
+            loss_per_sec: LOSS_STEP_DOWN_PER_SEC,
+            kf_per_sec: 0.0,
+        };
+
+        // VIDEO — same inputs/clamp as `seed_early_congestion`, synthetic sample.
+        let vh = self.video_layer_availability.highest_available(now_ms);
+        if self
+            .video_layer_chooser
+            .observe_early_congestion(synthetic, vh, now_ms)
+        {
+            let layer = bounds
+                .for_kind(PrefMediaKind::Video)
+                .clamp(self.video_layer_chooser.current());
+            if layer != self.selected_video_layer {
+                self.video_seq_tracker.reanchor_for_layer_switch();
+            }
+            self.selected_video_layer = layer;
+            seeded = true;
+        }
+
+        // SCREEN — same inputs/clamp as `seed_early_congestion`, synthetic sample.
+        let sh = self.screen_layer_availability.highest_available(now_ms);
+        if self
+            .screen_layer_chooser
+            .observe_early_congestion(synthetic, sh, now_ms)
+        {
+            let layer = bounds
+                .for_kind(PrefMediaKind::Screen)
+                .clamp(self.screen_layer_chooser.current());
+            if layer != self.selected_screen_layer {
+                self.screen_seq_tracker.reanchor_for_layer_switch();
+            }
+            self.selected_screen_layer = layer;
+            seeded = true;
+        }
+
+        // AUDIO — proxied by the VIDEO downlink in `seed_early_congestion`; here
+        // the synthetic sample stands in for it so audio steps down in lockstep.
+        let ah = self.audio_layer_availability.highest_available(now_ms);
+        if self
+            .audio_layer_chooser
+            .observe_early_congestion(synthetic, ah, now_ms)
+        {
+            self.selected_audio_layer = bounds
+                .for_kind(PrefMediaKind::Audio)
+                .clamp(self.audio_layer_chooser.current());
+            seeded = true;
+        }
+
+        seeded
+    }
+
     /// Snapshot of the layer this peer would advertise for each kind RIGHT NOW,
     /// without advancing any chooser hysteresis (issue #1179, Part B; clamp/gate
     /// added in PR #1192 review).
@@ -2427,6 +2538,47 @@ impl PeerDecodeManager {
         for session_id in self.connected_peers.ordered_keys().clone() {
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
                 if peer.seed_early_congestion(now_ms, bounds) {
+                    seeded = true;
+                }
+            }
+        }
+        seeded
+    }
+
+    /// Step EVERY connected peer's RECEIVER-side choosers down one rung in
+    /// response to a relay-authored `DOWNLINK_CONGESTION` control packet (issue
+    /// #1219 Half 2). The synthetic-sample twin of
+    /// [`Self::seed_early_congestion_for_connected_peers`].
+    ///
+    /// Like the early-seed method, there is NO transport gate here: the early-seed
+    /// timer's WT gate exists to bound a SPECULATIVE cold-start optimization to the
+    /// transport where #1179's join spike occurs. DOWNLINK_CONGESTION is not
+    /// speculative — the relay has ALREADY measured this receiver's downlink and
+    /// decided it is saturated, on whatever transport this client elected (WS or
+    /// WT alike). The gate (if any) lives at the relay, which only emits the
+    /// packet when its outbound mailbox crossed the drop threshold. So this method
+    /// unconditionally steps down every connected peer whose chooser is not already
+    /// constrained.
+    ///
+    /// Returns `true` if any peer was actually stepped down. The caller still
+    /// emits the resulting preference through the normal [`LayerPreferenceSender`]
+    /// path via [`Self::current_desired_preferences`] — including for peers whose
+    /// already-constrained choosers returned `false` here, so the held layer is
+    /// re-advertised to the relay.
+    ///
+    /// `bounds` is the user's GLOBAL receive-layer bounds, threaded through to
+    /// [`Peer::seed_downlink_congestion`] so the stepped-down decode layer is
+    /// clamped to the user's per-kind `max`/`min`. Open (default) bounds are an
+    /// identity clamp.
+    pub fn seed_downlink_congestion_for_connected_peers(
+        &mut self,
+        now_ms: u64,
+        bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+    ) -> bool {
+        let mut seeded = false;
+        for session_id in self.connected_peers.ordered_keys().clone() {
+            if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                if peer.seed_downlink_congestion(now_ms, bounds) {
                     seeded = true;
                 }
             }
@@ -5972,6 +6124,253 @@ mod tests {
             "early-seed must advertise the clamped layer 0 (≤ user max), never \
              {advertised:?} above the user's cap"
         );
+    }
+
+    /// Build a connected peer with a learned 3-layer ladder (highest_available
+    /// == 2) and a ZERO-LOSS real downlink sample (`{0.0, 0.0}`) — the WebSocket /
+    /// reliable-WT case where the per-peer telemetry can never see congestion.
+    /// This is the #1219 Half 2 precondition: unlike `make_congested_top_peer`,
+    /// the real sample is NOT congested, so the early-seed path is a no-op here and
+    /// only the synthetic DOWNLINK_CONGESTION seed can step the chooser down.
+    fn make_zero_loss_top_peer(session_id: u64) -> Peer {
+        let (mut peer, _muted) = make_test_peer(session_id);
+        // Learn layers 0,1,2 so highest_available == 2 (room to drop to 1).
+        for layer in 0..3u32 {
+            peer.video_layer_availability.observe(layer, 1000);
+            peer.screen_layer_availability.observe(layer, 1000);
+            peer.audio_layer_availability.observe(layer, 1000);
+        }
+        // Zero-loss real telemetry — the lossless-transport blindness (#1219).
+        peer.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
+        };
+        peer.last_screen_downlink = crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
+        };
+        peer
+    }
+
+    /// CORE REGRESSION (#1219 Half 2): a relay-authored DOWNLINK_CONGESTION must
+    /// step a peer's RECEIVER-side chooser down EVEN WHEN the per-peer real
+    /// downlink sample shows ZERO loss (the WebSocket / reliable-WT case). This is
+    /// the exact blindness the early-seed path cannot cover, because
+    /// `DownlinkSample::is_congested()` is false on `{0, 0}`.
+    ///
+    /// HOST `#[test]` (NOT `#[wasm_bindgen_test]`): the wasm harness on this box
+    /// silently no-ops, so the regression is pinned with a native test that
+    /// actually executes under `cargo test -p videocall-client --lib`.
+    ///
+    /// MUTATION CHECK: if the DOWNLINK_CONGESTION arm's seed call is removed, or
+    /// reverts to `seed_early_congestion_for_connected_peers` (which reads the
+    /// zero-loss REAL sample → `is_congested()` false → no-op), then
+    /// `seed_downlink_congestion_for_connected_peers` returns false and
+    /// `current_desired_preferences` yields an EMPTY map — this test fails.
+    /// Confirmed by hand-swapping the synthetic seed for the early seed: the peer
+    /// stays at layer 2 and advertises nothing.
+    #[test]
+    fn downlink_congestion_steps_down_with_zero_loss() {
+        use crate::decode::layer_chooser::{DownlinkSample, PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(700, make_zero_loss_top_peer(700));
+
+        let open = ReceiveLayerBounds::default();
+
+        // Precondition (assert explicitly): the real sample is ZERO-loss, so the
+        // existing early-seed path could NOT step this peer down.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .last_video_downlink,
+            DownlinkSample {
+                loss_per_sec: 0.0,
+                kf_per_sec: 0.0
+            },
+            "precondition: real downlink sample is zero-loss (lossless transport)"
+        );
+
+        // Bring the unconstrained chooser to the TOP (current == 2) via one CLEAN
+        // unconstrained tick — exactly as `early_seed_respects_user_receive_max`
+        // does — so the synthetic seed steps DOWN from 2 to 1.
+        assert_eq!(
+            manager
+                .tick_layer_choosers(1500, &open)
+                .get(&(700, PrefMediaKind::Video)),
+            None,
+            "clean unconstrained tick tracks the top and advertises nothing"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "chooser climbed to the top before the DOWNLINK_CONGESTION seed"
+        );
+
+        // Sanity: the EARLY seed (real zero-loss sample) is a no-op here — this is
+        // precisely why a synthetic-sample primitive was needed.
+        assert!(
+            !manager.seed_early_congestion_for_connected_peers(1800, &open),
+            "early-seed must NO-OP on the zero-loss sample (the #1219 blindness)"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "early-seed left the peer at the top (no real congestion to react to)"
+        );
+
+        // The relay-authored signal: synthetic congestion steps the chooser down.
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open);
+        assert!(
+            seeded,
+            "DOWNLINK_CONGESTION must step the chooser down despite zero real loss"
+        );
+
+        // Decode guard stepped down 2 -> 1.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&700)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "synthetic seed steps the decode guard down from the top (2) to 1"
+        );
+
+        // The published preference map is NON-EMPTY with video at layer 1.
+        let desired = manager.current_desired_preferences(2000, &open);
+        assert_eq!(
+            desired.get(&(700, PrefMediaKind::Video)).copied(),
+            Some(1),
+            "DOWNLINK_CONGESTION must advertise video stepped down to layer 1"
+        );
+    }
+
+    /// BOUNDS CLAMP (#1219 Half 2): the synthetic DOWNLINK_CONGESTION seed must
+    /// still respect the user's RECEIVE bounds — it shares
+    /// `seed_early_congestion`'s clamp-to-bounds post-process, so a user `max`
+    /// below `highest-1` clamps the stepped-down layer down to the cap.
+    ///
+    /// Mirrors `early_seed_respects_user_receive_max` but with a zero-loss real
+    /// sample (proving the clamp holds on the synthetic path too).
+    ///
+    /// MUTATION CHECK: delete the `bounds.for_kind(...).clamp(...)` in
+    /// `Peer::seed_downlink_congestion` (VIDEO decode guard) and this test fails —
+    /// `selected_video_layer` becomes 1 (> max 0).
+    #[test]
+    fn downlink_congestion_seed_does_not_constrain_below_user_max() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(701, make_zero_loss_top_peer(701));
+
+        let open = ReceiveLayerBounds::default();
+        // Climb to the top first (current == 2).
+        let _ = manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&701)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "chooser climbed to the top before the DOWNLINK_CONGESTION seed"
+        );
+
+        // User caps received VIDEO at layer 0 — BELOW highest-1 (==1).
+        let mut bounds = ReceiveLayerBounds::default();
+        bounds.set_kind(PrefMediaKind::Video, None, Some(0));
+
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &bounds);
+        assert!(
+            seeded,
+            "the synthetic congested sample must still step a constrain (clamp is a \
+             pure post-process, it does not gate the seed)"
+        );
+
+        // Decode guard must NOT exceed the user's max (0). Unclamped this is 1.
+        let selected = manager
+            .connected_peers
+            .get(&701)
+            .unwrap()
+            .selected_video_layer();
+        assert_eq!(
+            selected, 0,
+            "DOWNLINK_CONGESTION decode guard must be clamped to user video max 0 \
+             (unclamped it would be highest-1 == 1)"
+        );
+
+        // Advertised preference must NOT exceed the user's max (0).
+        let desired = manager.current_desired_preferences(2000, &bounds);
+        assert_eq!(
+            desired.get(&(701, PrefMediaKind::Video)).copied(),
+            Some(0),
+            "DOWNLINK_CONGESTION must advertise the clamped layer 0 (≤ user max)"
+        );
+    }
+
+    /// ENCODER-SCOPE GUARD (#1219 Half 2): the synthetic DOWNLINK_CONGESTION seed
+    /// is RECEIVER-ONLY. The publisher encoder (`congestion_step_down_flag`,
+    /// `CameraEncoder`, `EncoderBitrateController`, `audio_congestion_layer_ceiling`,
+    /// `apply_self_congestion_cut`) lives OUTSIDE `PeerDecodeManager` entirely, so a
+    /// `PeerDecodeManager`-level test cannot even name those symbols. This test
+    /// documents that structural separation and asserts the only state the seed
+    /// mutates is the per-peer receiver-side chooser / decode guard.
+    ///
+    /// The wiring-site scope (the DOWNLINK_CONGESTION arm references ONLY
+    /// `peer_decode_manager`, `layer_preference_sender`, and
+    /// `connection_controller`) is additionally verified by the grep recorded in
+    /// the PR description — none of the encoder symbols appear in that arm or in
+    /// the two new seed primitives.
+    #[test]
+    fn downlink_congestion_seed_is_receiver_only() {
+        use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds};
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(702, make_zero_loss_top_peer(702));
+        let open = ReceiveLayerBounds::default();
+        let _ = manager.tick_layer_choosers(1500, &open);
+
+        // Capture the only peer-observable receiver-side state the seed may change.
+        let before = manager
+            .connected_peers
+            .get(&702)
+            .unwrap()
+            .selected_video_layer();
+        assert_eq!(before, 2, "peer at top before seed");
+
+        // Seed steps the RECEIVER chooser down. There is no publisher-encoder field
+        // reachable from here to inspect — the manager owns only receive-side state.
+        assert!(manager.seed_downlink_congestion_for_connected_peers(2000, &open));
+        let after = manager
+            .connected_peers
+            .get(&702)
+            .unwrap()
+            .selected_video_layer();
+        assert_eq!(
+            after, 1,
+            "seed mutated ONLY the receiver-side decode guard (2 -> 1)"
+        );
+
+        // And it advertises a receive-layer request, never an encoder action.
+        let desired = manager.current_desired_preferences(2000, &open);
+        assert_eq!(desired.get(&(702, PrefMediaKind::Video)).copied(), Some(1));
     }
 
     /// NIT 1 (PR #1192 review): a source whose ONLY learned layer is the base

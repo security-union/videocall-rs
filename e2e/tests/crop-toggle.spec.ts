@@ -142,9 +142,12 @@ async function admitGuestIfNeeded(
 
 /**
  * Set up a two-user meeting with real camera-on peers. Both browsers use
- * `--use-fake-device-for-media-stream` so each participant's camera produces
- * a real video stream → the remote peer tile renders a `<canvas>` with a
- * `.crop-icon` control.
+ * `--use-fake-device-for-media-stream` for a synthetic camera device, and
+ * `vc_prejoin_camera_on` is seeded to `"true"` via `addInitScript` so each
+ * participant joins with camera enabled. Without this seed the prejoin
+ * camera toggle defaults to OFF (context.rs:724-728) and the peer tile
+ * renders no `<canvas>` or `.crop-icon`.
+ * (Pattern: simulcast-per-receiver.spec.ts:343)
  */
 async function setupTwoUserMeeting(
   uiURL: string,
@@ -167,6 +170,11 @@ async function setupTwoUserMeeting(
     guestName,
     uiURL,
   );
+
+  // Seed camera-on preference BEFORE page creation so the initial
+  // load_preferred_camera_on() reads true from localStorage.
+  await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+  await guestCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
 
   const hostPage = await hostCtx.newPage();
   const guestPage = await guestCtx.newPage();
@@ -196,8 +204,19 @@ async function getPeerTileWithCrop(viewerPage: Page): Promise<{
   cropBtn: ReturnType<Page["locator"]>;
   canvas: ReturnType<Page["locator"]>;
 }> {
-  const tile = viewerPage.locator(".grid-item:has(canvas)").first();
-  await expect(tile).toBeVisible({ timeout: 15_000 });
+  // Fail-loud precondition: at least one peer tile must have a live canvas.
+  // If this fails, the most likely cause is that the peer's camera never
+  // published (vc_prejoin_camera_on not seeded, or fake device not granted).
+  const canvasTiles = viewerPage.locator(".grid-item:has(canvas)");
+  await expect(canvasTiles.first()).toBeVisible({ timeout: 15_000 });
+  const count = await canvasTiles.count();
+  expect(
+    count,
+    `Precondition failed: expected ≥1 peer tile with <canvas>, found ${count}. ` +
+      "Peer cameras likely did not publish — check vc_prejoin_camera_on seed.",
+  ).toBeGreaterThanOrEqual(1);
+
+  const tile = canvasTiles.first();
 
   const canvas = tile.locator("canvas").first();
   await expect(canvas).toBeVisible({ timeout: 10_000 });
@@ -390,6 +409,11 @@ test.describe("Crop toggle", () => {
       uiURL,
     );
 
+    // Seed camera-on on all contexts so peers publish video.
+    await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+    await guest1Ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+    await guest2Ctx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+
     const hostPage = await hostCtx.newPage();
     const guest1Page = await guest1Ctx.newPage();
     const guest2Page = await guest2Ctx.newPage();
@@ -485,6 +509,10 @@ test.describe("Crop toggle", () => {
       "CropGuest5",
       uiURL,
     );
+
+    // Seed camera-on so peers publish video.
+    await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+    await guestCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
 
     // Inject getDisplayMedia mock so screen share works in headless.
     const mockDisplayMediaScript = `

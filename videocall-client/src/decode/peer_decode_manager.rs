@@ -1151,6 +1151,11 @@ impl Peer {
         }
 
         // AUDIO — proxied by the VIDEO downlink, same as `tick_audio_layer_chooser`.
+        // NOTE (#1219 Half 2): the sibling `seed_downlink_congestion` deliberately
+        // does NOT seed audio (audio is priority-protected on the relay-asserted
+        // congestion path). That divergence is intentional — do NOT "re-align" the
+        // two methods by deleting the audio branch here; this #1179 early-seed path
+        // legitimately proxies audio off the real video downlink sample.
         let ah = self.audio_layer_availability.highest_available(now_ms);
         if self
             .audio_layer_chooser
@@ -1168,9 +1173,11 @@ impl Peer {
     /// Step this peer's RECEIVER-side choosers down ONE rung in response to a
     /// relay-authored `DOWNLINK_CONGESTION` control packet (issue #1219 Half 2).
     ///
-    /// This is the SYNTHETIC-sample twin of [`Self::seed_early_congestion`]. The
-    /// two are byte-identical EXCEPT for the `DownlinkSample` fed into each
-    /// `observe_early_congestion` call:
+    /// This is the SYNTHETIC-sample sibling of [`Self::seed_early_congestion`].
+    /// For VIDEO and SCREEN the two differ ONLY in the `DownlinkSample` fed into
+    /// each `observe_early_congestion` call (see below); for AUDIO they diverge
+    /// further — this method does NOT seed audio at all (see the AUDIO note). The
+    /// `DownlinkSample` difference:
     ///
     ///   * `seed_early_congestion` feeds the peer's REAL most-recent windowed
     ///     downlink sample (`last_video_downlink` / `last_screen_downlink`). On

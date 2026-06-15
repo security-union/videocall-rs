@@ -282,6 +282,54 @@ async fn transfer_rejects_non_admitted_target_keeps_caller_host() {
     cleanup_test_data(&pool, room_id).await;
 }
 
+/// On the un-fixed code (promote-first + unconditional demote, no row lock /
+/// no `is_host` guard) this same setup would promote the admitted target `A`
+/// and return `Some`, producing a second host — both assertions below fail.
+#[tokio::test]
+#[serial]
+async fn transfer_from_already_demoted_caller_is_noop() {
+    let pool = get_test_pool().await;
+    let room_id = "test-transfer-already-demoted-caller-noop";
+    setup_with_admitted_participant(&pool, room_id).await;
+
+    let meeting = db_meetings::get_by_room_id(&pool, room_id)
+        .await
+        .expect("get_by_room_id")
+        .expect("meeting exists");
+
+    // Simulate the race-loser state: a concurrent transfer already demoted H.
+    sqlx::query(
+        "UPDATE meeting_participants SET is_host = FALSE WHERE meeting_id = $1 AND user_id = $2",
+    )
+    .bind(meeting.id)
+    .bind(HOST)
+    .execute(&pool)
+    .await
+    .expect("out-of-band demote of host");
+
+    // The race loser: H is no longer host, so the guarded demote affects 0 rows
+    // and the whole transfer rolls back to a no-op.
+    let result = db_participants::transfer_host(&pool, meeting.id, HOST, PARTICIPANT)
+        .await
+        .expect("transfer_host must not error");
+    assert!(
+        result.is_none(),
+        "a transfer from an already-demoted caller must be a no-op (Ok(None))"
+    );
+
+    // No second host was created: the target was never promoted.
+    assert!(
+        !fetch_is_host(&pool, room_id, PARTICIPANT).await,
+        "the target must NOT be promoted when the caller was no longer host"
+    );
+    assert!(
+        !fetch_is_host(&pool, room_id, HOST).await,
+        "the (already-demoted) caller must remain non-host"
+    );
+
+    cleanup_test_data(&pool, room_id).await;
+}
+
 /// After a transfer the target's `/status` returns is_host=true with a
 /// room_token that decodes to is_host=true.
 #[tokio::test]

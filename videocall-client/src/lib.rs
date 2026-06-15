@@ -233,6 +233,7 @@ pub mod crypto;
 pub mod decode;
 pub mod diagnostics;
 pub mod encode;
+pub mod freshness_inject;
 pub mod health_reporter;
 pub mod long_tasks;
 mod media_devices;

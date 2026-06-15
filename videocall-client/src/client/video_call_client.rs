@@ -269,6 +269,12 @@ pub struct VideoCallClientOptions {
     /// Callback triggered when the host removes this client from the meeting.
     pub on_participant_kicked: Option<Callback<()>>,
 
+    /// Callback triggered when a participant is granted host.
+    pub on_host_granted: Option<Callback<String>>,
+
+    /// Callback triggered when a participant's host is revoked.
+    pub on_host_revoked: Option<Callback<String>>,
+
     /// Callback triggered when a peer publishes a `PEER_EVENT` that targets
     /// this client. Emits `(source_user_id, event_type, stream_id)`.
     ///
@@ -371,6 +377,8 @@ struct InnerOptions {
     on_host_mute: Option<Callback<()>>,
     on_host_disable_video: Option<Callback<()>>,
     on_participant_kicked: Option<Callback<()>>,
+    on_host_granted: Option<Callback<String>>,
+    on_host_revoked: Option<Callback<String>>,
     on_peer_event: Option<Callback<(String, String, String)>>,
     on_peer_left: Option<Callback<(String, String, String)>>,
     on_peer_joined: Option<Callback<(String, String, String)>>,
@@ -1062,6 +1070,8 @@ impl VideoCallClient {
                     on_host_mute: options.on_host_mute.clone(),
                     on_host_disable_video: options.on_host_disable_video.clone(),
                     on_participant_kicked: options.on_participant_kicked.clone(),
+                    on_host_granted: options.on_host_granted.clone(),
+                    on_host_revoked: options.on_host_revoked.clone(),
                     on_peer_event: options.on_peer_event.clone(),
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
@@ -3278,6 +3288,48 @@ impl Inner {
                                 }
                             }
                         }
+                        Ok(MeetingEventType::HOST_GRANTED) => {
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            info!(
+                                "Received HOST_GRANTED: room={}, target=\"{}\"",
+                                meeting_packet.room_id, target_str
+                            );
+                            // Dedup across dual-transport overlap (WebTransport +
+                            // WebSocket both deliver the same packet during failover),
+                            // matching the other host-action events. Without this the
+                            // UI fires the host-change toast twice.
+                            if !self.is_duplicate_host_action("host_granted", &target_str) {
+                                if let Some(cb) = &self.options.on_host_granted {
+                                    cb.emit(target_str);
+                                }
+                            } else {
+                                debug!(
+                                    "Suppressed duplicate HOST_GRANTED for target=\"{}\"",
+                                    target_str
+                                );
+                            }
+                        }
+                        Ok(MeetingEventType::HOST_REVOKED) => {
+                            let target_str =
+                                String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
+                            info!(
+                                "Received HOST_REVOKED: room={}, target=\"{}\"",
+                                meeting_packet.room_id, target_str
+                            );
+                            // Dedup across dual-transport overlap, matching HOST_GRANTED
+                            // and the other host-action events.
+                            if !self.is_duplicate_host_action("host_revoked", &target_str) {
+                                if let Some(cb) = &self.options.on_host_revoked {
+                                    cb.emit(target_str);
+                                }
+                            } else {
+                                debug!(
+                                    "Suppressed duplicate HOST_REVOKED for target=\"{}\"",
+                                    target_str
+                                );
+                            }
+                        }
                         Ok(MeetingEventType::PARTICIPANT_DISPLAY_NAME_CHANGED) => {
                             let target_str =
                                 String::from_utf8_lossy(&meeting_packet.target_user_id).to_string();
@@ -3644,6 +3696,8 @@ mod disconnect_tests {
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_host_granted: None,
+            on_host_revoked: None,
             on_peer_event: None,
             decode_media: true,
             allow_post_rebase_retry: true,
@@ -3809,6 +3863,8 @@ mod dedup_tests {
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_host_granted: None,
+            on_host_revoked: None,
             on_peer_event: None,
             decode_media: true,
             allow_post_rebase_retry: true,
@@ -4157,6 +4213,8 @@ mod cooldown_reset_hardening_tests {
             on_host_mute: None,
             on_host_disable_video: None,
             on_participant_kicked: None,
+            on_host_granted: None,
+            on_host_revoked: None,
             on_peer_event: None,
             decode_media: true,
             is_guest: false,

@@ -214,3 +214,13 @@ pub struct KickParticipantRequest {
     /// User ID of the participant to remove from the meeting.
     pub user_id: String,
 }
+
+/// Request body for `POST /api/v1/meetings/{meeting_id}/transfer-host`.
+///
+/// Atomically promotes the target to host and demotes the issuing host in a
+/// single transaction.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct TransferHostRequest {
+    /// User ID of the admitted participant to transfer host to.
+    pub user_id: String,
+}

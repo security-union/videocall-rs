@@ -561,6 +561,37 @@ impl MeetingHost {
 #[allow(dead_code)]
 pub type MeetingHostCtx = Signal<MeetingHost>;
 
+/// Reactive set of the `user_id`(s) currently holding host in the meeting.
+///
+/// Single-host model, so this holds at most one entry — but a `HashSet` keeps
+/// the update path trivial and order-free. Transfer-host moves host between
+/// participants, and `host_user_id` (= the meeting CREATOR) is stale once host
+/// has been transferred away, so the crown / "(Host)" indicator is driven by
+/// this set instead. Seeded authoritatively from the `/participants` roster and
+/// updated live on `HOST_GRANTED` / `HOST_REVOKED` broadcasts, so every client
+/// paints the crown on the current host without a reload.
+#[derive(Clone, Copy)]
+pub struct HostSetCtx(pub Signal<std::collections::HashSet<String>>);
+
+/// Nonce bumped by `AttendantsComponent` when the LOCAL user is granted or has
+/// their host revoked. `MeetingPage` watches it, re-fetches the participant
+/// status (which re-signs the room token from the live DB `is_host`), and
+/// updates its `MeetingStatus::Admitted`. That flips the `is_owner` prop and
+/// re-renders `AttendantsComponent` IN PLACE — deliberately WITHOUT a `key`, so
+/// the media client is NOT torn down and the user is not bounced back to the
+/// join screen. Host REST actions authorize on the session + DB `is_host`, and
+/// the media server learns the new host via the `meeting_host_changed` NATS
+/// fanout, so no reconnect is required.
+#[derive(Clone, Copy)]
+pub struct HostRefreshNonceCtx(pub Signal<u64>);
+
+impl HostSetCtx {
+    /// Whether `user_id` is currently a host.
+    pub fn is_host(&self, user_id: &str) -> bool {
+        self.0.read().contains(user_id)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Local-storage helpers
 // ---------------------------------------------------------------------------

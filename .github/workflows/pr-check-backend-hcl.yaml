@@ -35,7 +35,18 @@ jobs:
   test:
     name: cargo tests
     runs-on: [self-hosted, linux, x64, hcl-ci]
-    timeout-minutes: 20
+    # 35, not 20 (#1247): on a cold-cargo-cache runner this job legitimately
+    # exceeds 20 min even though every test PASSES. Verified on PR #1400's red
+    # check (run 189279, videocallci-3): the on-path `docker system prune -af`
+    # cost ~3 min (02:07:54->02:10:45, reclaimed 10.57 GB — it did NOT fail, and
+    # the disk was healthy at 203 GB free) and the workspace then cold-compiled
+    # (`hkdf` rebuilt 4x under CARGO_INCREMENTAL=0); at the 20-min cap the suite
+    # was still mid-run with 0 failures. So 20 min was producing FALSE reds on a
+    # green suite. 35 covers the cold-cache + on-path-prune worst case with
+    # headroom; warm-cache runs finish well under it. Tunable back down once the
+    # heavier fixes land (move the prune to the scheduled ci-host-janitor so it's
+    # off the test critical path, and/or sccache) — tracked in #1247.
+    timeout-minutes: 35
     concurrency:
       group: hcl-ci-backend
       cancel-in-progress: false

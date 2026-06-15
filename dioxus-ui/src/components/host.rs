@@ -199,7 +199,7 @@ pub fn Host(
         });
         // Microphone encoder is created after camera so it can share the
         // camera's audio tier atomics (avoiding a duplicate quality manager).
-        let microphone = create_microphone_encoder(
+        let mut microphone = create_microphone_encoder(
             client.clone(),
             audio_bitrate,
             mic_settings_cb,
@@ -258,6 +258,13 @@ pub fn Host(
         // client sets both flags on a self-targeted CONGESTION; each AQ loop
         // consumes its own (separate atoms avoid a swap race).
         screen.set_congestion_step_down_flag(client.screen_congestion_step_down_flag());
+        // Issue #621: give the microphone encoder the CONGESTION-driven audio
+        // layer-ceiling atom so a self-targeted CONGESTION cuts the audio simulcast
+        // ladder to base-only. Unlike the camera/screen step-down flags (consumed
+        // by an AQ loop), this is a layer-count atom the client drives directly —
+        // the mic has no AQ loop of its own, so the cut + recovery work even when
+        // the camera is off (audio-only).
+        microphone.set_congestion_layer_ceiling(client.audio_congestion_layer_ceiling());
 
         // Wire the relay layer-union hint atoms (issue #1108, Stage 3). Each
         // encoder OWNS its `shared_union_requested_layer` atom (initialized to the

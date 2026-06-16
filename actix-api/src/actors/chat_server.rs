@@ -8147,7 +8147,7 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client).await.start();
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
 
         struct DummySession;
         impl Actor for DummySession {
@@ -8163,6 +8163,17 @@ mod tests {
         let instance_id = "inst-alice-1".to_string();
         let session_a: SessionId = 5001;
         let session_b: SessionId = 5002;
+
+        // Subscribe to the room system subject BEFORE either activation so that
+        // session A's PARTICIPANT_JOINED (a real, non-suppressed broadcast) is
+        // buffered alongside whatever B's activation does. Capturing A's join is
+        // the control: it proves the subscription is live, so the *absence* of
+        // B's join later is genuine suppression rather than a dead subscriber.
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
 
         // Session A joins with instance_id
         let dummy_a = DummySession.start();
@@ -8181,6 +8192,7 @@ mod tests {
 
         // Activate session A so it is registered in instance_index. Eviction
         // during B's ActivateConnection needs the forward mapping to find A.
+        // This also publishes A's (legitimate) PARTICIPANT_JOINED.
         chat_server
             .send(ActivateConnection { session: session_a })
             .await
@@ -8256,8 +8268,31 @@ mod tests {
             "Session A should have no active NATS subscription"
         );
 
-        // PARTICIPANT_JOINED suppression is consumed inside ActivateConnection
-        // (the flag is removed when the broadcast is correctly skipped).
+        // Observable suppression outcome: drain the room system subject and
+        // collect the session_id of every PARTICIPANT_JOINED broadcast. A's
+        // activation has had time to spawn its publish; the full-deadline drain
+        // also gives a (wrongly) un-suppressed B join time to land.
+        let joined =
+            collect_joined_sessions(&mut system_sub, std::time::Duration::from_millis(1500)).await;
+
+        // Control: A's join MUST be observed. If it is absent the subscription
+        // never saw any broadcast, so the session_b assertion below would be a
+        // false green — fail loudly instead.
+        assert!(
+            joined.contains(&session_a),
+            "Expected PARTICIPANT_JOINED for the surviving predecessor (session A) \
+             on the room system subject, but captured joins were: {joined:?}"
+        );
+
+        // Core assertion: the re-elected session B evicted A, so its
+        // PARTICIPANT_JOINED must be suppressed and never reach the subject.
+        // This fails if `suppress_join_broadcast.insert(session)` is removed
+        // from the eviction path in ActivateConnection.
+        assert!(
+            !joined.contains(&session_b),
+            "Re-elected session B (same-instance eviction) must NOT broadcast \
+             PARTICIPANT_JOINED, but captured joins were: {joined:?}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -9111,6 +9146,46 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Drain `sub` for the full `deadline`, returning the `session_id` carried by
+    /// every PARTICIPANT_JOINED packet observed on the room system subject.
+    ///
+    /// The eviction tests use this to prove the *observable* outcome of
+    /// `suppress_join_broadcast`: after a same-instance eviction-reconnect, the
+    /// re-elected session's join must NOT be published, while the surviving
+    /// predecessor's join IS — so a non-empty result that omits the evicting
+    /// session distinguishes "suppression worked" from "subscription was dead".
+    async fn collect_joined_sessions(
+        sub: &mut async_nats::Subscriber,
+        deadline: tokio::time::Duration,
+    ) -> Vec<u64> {
+        use std::time::Instant;
+        use tokio::time::timeout;
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let start = Instant::now();
+        let mut joined = Vec::new();
+        while start.elapsed() < deadline {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match timeout(remaining, sub.next()).await {
+                Ok(Some(msg)) => {
+                    if let Ok(wrapper) =
+                        <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                    {
+                        if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                            if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                                joined.push(inner.session_id);
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        joined
     }
 
     // ──────────────────────────────────────────────────────────────────────
@@ -10358,13 +10433,22 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client).await.start();
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
         let dummy = EohlDummySession.start();
         let session_a: SessionId = 9_720;
         let session_b: SessionId = 9_721;
         let room = "issue-502-iid-path";
         let user = "dave@example.com";
         let iid = "inst-stable".to_string();
+
+        // Subscribe to the room system subject BEFORE either activation. A's
+        // PARTICIPANT_JOINED is the control (proves the subscription is live);
+        // B's must be absent because the eviction-reconnect suppresses it.
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
 
         // Session A with instance_id.
         chat_server
@@ -10443,8 +10527,28 @@ mod tests {
             "In-tab reconnect (same instance_id) must still leave one member"
         );
         assert_eq!(members[0].session, session_b);
-        // PARTICIPANT_JOINED suppression is consumed inside ActivateConnection
-        // (the flag is removed when the broadcast is correctly skipped).
+
+        // Observable suppression outcome: drain the room system subject and
+        // collect the session_id of every PARTICIPANT_JOINED broadcast.
+        let joined = collect_joined_sessions(&mut system_sub, Duration::from_millis(1500)).await;
+
+        // Control: A's join MUST be observed, otherwise the subscription saw
+        // nothing and the session_b check would be a false green.
+        assert!(
+            joined.contains(&session_a),
+            "Expected PARTICIPANT_JOINED for the surviving predecessor (session A), \
+             but captured joins were: {joined:?}"
+        );
+
+        // Core assertion: the in-tab reconnect (same instance_id) evicted A, so
+        // session B's PARTICIPANT_JOINED must be suppressed. Fails if
+        // `suppress_join_broadcast.insert(session)` is removed from the eviction
+        // path in ActivateConnection.
+        assert!(
+            !joined.contains(&session_b),
+            "Re-elected session B (same-instance reconnect) must NOT broadcast \
+             PARTICIPANT_JOINED, but captured joins were: {joined:?}"
+        );
     }
 
     // ------------------------------------------------------------------

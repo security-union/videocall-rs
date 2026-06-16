@@ -10495,6 +10495,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10558,6 +10559,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10610,6 +10612,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")

@@ -817,4 +817,79 @@ test.describe("Display name live update", () => {
     const blockedRes = await updateDisplayNameRaw(email, name, meetingId, "BlockedName");
     expect(blockedRes.status).toBe(429);
   });
+
+  /**
+   * Verify that the display name persists after leaving a meeting and
+   * returning to the home page. This tests the plain-text localStorage
+   * fallback (`vc_display_name_raw`) that was added to work around Safari
+   * ITP clearing the CBOR+zlib key (`vc_display_name`). The test also
+   * verifies that the raw fallback survives corruption of the CBOR key.
+   */
+  test("display name persists after leaving meeting and returning to home page", async ({
+    baseURL,
+  }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not support display name persistence",
+    );
+
+    test.setTimeout(90_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_persist_${Date.now()}`;
+    const displayName = "PersistTestUser";
+
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "persist-test@videocall.rs",
+        displayName,
+        uiURL,
+      );
+      const page = await ctx.newPage();
+
+      // Join a meeting with a known display name
+      await navigateToMeeting(page, meetingId, displayName);
+      const result = await joinMeetingFromPage(page);
+      expect(result).toBe("in-meeting");
+      await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Verify the display name is in localStorage (plain-text fallback key)
+      const storedName = await page.evaluate(() => {
+        return localStorage.getItem("vc_display_name_raw");
+      });
+      expect(storedName).toBe(displayName);
+
+      // Leave the meeting by navigating to home
+      await page.goto("/");
+      await page.waitForTimeout(2000);
+
+      // Verify display name field is pre-populated on the home page
+      const usernameInput = page.locator("#username");
+      await expect(usernameInput).toBeVisible({ timeout: 10_000 });
+      await expect(usernameInput).toHaveValue(displayName, { timeout: 5_000 });
+
+      // --- Test the fallback path ---
+      // Corrupt the CBOR key to simulate Safari ITP failure, keep the raw key
+      await page.evaluate(() => {
+        // The CBOR key stores data in a format that won't deserialize as a
+        // simple string — corrupting it simulates what Safari ITP does
+        localStorage.setItem("vc_display_name", "CORRUPTED_CBOR_DATA");
+      });
+
+      // Navigate away and back to force a fresh load
+      await page.goto("/");
+      await page.waitForTimeout(2000);
+
+      // The username should still be pre-populated via the raw fallback.
+      // This assertion is the load-bearing check: it fails on un-fixed code
+      // (corrupted CBOR + no fallback → empty field) and passes only when
+      // load_display_name_from_storage falls through to vc_display_name_raw.
+      await expect(usernameInput).toBeVisible({ timeout: 10_000 });
+      await expect(usernameInput).toHaveValue(displayName, { timeout: 5_000 });
+    } finally {
+      await browser.close();
+    }
+  });
 });

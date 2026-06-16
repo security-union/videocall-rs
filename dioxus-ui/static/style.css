@@ -1802,8 +1802,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   position: fixed;
   inset: 0;
   background: var(--device-settings-overlay-bg-image);
-  backdrop-filter: blur(6px) saturate(100%);
-  -webkit-backdrop-filter: blur(6px) saturate(100%);
+  backdrop-filter: blur(3px) saturate(100%);
+  -webkit-backdrop-filter: blur(3px) saturate(100%);
   z-index: 9500;
 
   display: flex;
@@ -6586,8 +6586,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 html[data-theme="light"] .device-settings-modal-overlay {
   background: var(--device-settings-overlay-bg-image);
-  backdrop-filter: blur(6px) saturate(100%);
-  -webkit-backdrop-filter: blur(6px) saturate(100%);
+  backdrop-filter: blur(3px) saturate(100%);
+  -webkit-backdrop-filter: blur(3px) saturate(100%);
 }
 
 
@@ -7780,18 +7780,18 @@ html[data-theme="dark"] .settings-modal {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.045) 0% /* @token-exempt: theme variant */,
-    rgba(255, 255, 255, 0.028) 100% /* @token-exempt: theme variant */
+    rgba(28, 26, 24, 0.92) 0% /* @token-exempt: theme variant */,
+    rgba(22, 21, 19, 0.88) 100% /* @token-exempt: theme variant */
   );
 
-  border: 1px solid rgba(255, 255, 255, 0.085); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.10); /* @token-exempt: theme variant */
 
   box-shadow:
     0 42px 120px rgba(0, 0, 0, 0.58) /* @token-exempt: theme variant */,
     0 18px 48px rgba(0, 0, 0, 0.34); /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(26px) saturate(145%) contrast(104%);
-  -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
+  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
 }
 
 .settings-sidebar-title-icon {
@@ -7816,15 +7816,15 @@ html[data-theme="dark"] .settings-panel {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.055) 0% /* @token-exempt: theme variant */,
-    rgba(255, 255, 255, 0.035) 100% /* @token-exempt: theme variant */
+    rgba(255, 255, 255, 0.08) 0% /* @token-exempt: theme variant */,
+    rgba(255, 255, 255, 0.055) 100% /* @token-exempt: theme variant */
   );
 
   box-shadow:
-    inset 1px 0 0 rgba(255, 255, 255, 0.045) /* @token-exempt: theme variant */,
-    inset 0 1px 0 rgba(255, 255, 255, 0.035); /* @token-exempt: theme variant */
+    inset 1px 0 0 rgba(255, 255, 255, 0.06) /* @token-exempt: theme variant */,
+    inset 0 1px 0 rgba(255, 255, 255, 0.05); /* @token-exempt: theme variant */
 
-  border: 1px solid rgba(255, 255, 255, 0.055); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.08); /* @token-exempt: theme variant */
 }
 
 html:not([data-theme]) .settings-panel::before,
@@ -7865,7 +7865,7 @@ html[data-theme="dark"] .settings-nav-button.active {
 
   margin: 8px 0 0;
 
-  background: rgba(255, 255, 255, 0.038); /* @token-exempt: theme variant */
+  background: rgba(255, 255, 255, 0.07); /* @token-exempt: theme variant */
 }
 
 /* INPUTS */
@@ -7899,8 +7899,8 @@ html[data-theme="dark"] .settings-input {
 html[data-theme="light"] .settings-modal {
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.52) 0% /* @token-exempt: theme variant */,
-    rgba(238, 242, 248, 0.38) 100% /* @token-exempt: theme variant */
+    rgba(255, 255, 255, 0.78) 0% /* @token-exempt: theme variant */,
+    rgba(238, 242, 248, 0.72) 100% /* @token-exempt: theme variant */
   );
 
   border: 1px solid rgba(255, 255, 255, 0.7); /* @token-exempt: theme variant */
@@ -7909,8 +7909,8 @@ html[data-theme="light"] .settings-modal {
     0 42px 120px rgba(90, 105, 130, 0.22) /* @token-exempt: theme variant */,
     0 18px 48px rgba(90, 105, 130, 0.14); /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(26px) saturate(145%) contrast(104%);
-  -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
+  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
 }
 
 html[data-theme="light"] .settings-layout {
@@ -7928,12 +7928,12 @@ html[data-theme="light"] .settings-panel {
 
   background: linear-gradient(
     180deg,
-    rgba(244, 243, 248, 0.94) 0% /* @token-exempt: theme variant */,
-    rgba(232, 233, 240, 0.92) 100% /* @token-exempt: theme variant */
+    rgba(244, 243, 248, 0.97) 0% /* @token-exempt: theme variant */,
+    rgba(232, 233, 240, 0.95) 100% /* @token-exempt: theme variant */
   );
 
-  backdrop-filter: blur(30px) saturate(130%);
-  -webkit-backdrop-filter: blur(30px) saturate(130%);
+  backdrop-filter: blur(16px) saturate(120%);
+  -webkit-backdrop-filter: blur(16px) saturate(120%);
 }
 
 html[data-theme="light"] .settings-panel::before,

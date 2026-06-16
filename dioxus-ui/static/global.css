@@ -936,18 +936,18 @@ html[data-theme="dark"] {
   /* Modal structure — simple frosted glass */
   --settings-modal-bg: linear-gradient(
     180deg,
-    rgba(32, 30, 26, 0.72) 0%,
-    rgba(25, 24, 21, 0.68) 55%,
-    rgba(18, 18, 16, 0.72) 100%
+    rgba(28, 26, 24, 0.92) 0%,
+    rgba(22, 21, 19, 0.88) 55%,
+    rgba(18, 18, 16, 0.92) 100%
   );
 
-  --settings-modal-border: rgba(255, 255, 255, 0.075);
+  --settings-modal-border: rgba(255, 255, 255, 0.10);
 
   --settings-modal-shadow:
     0 36px 90px rgba(0, 0, 0, 0.48), 0 10px 28px rgba(0, 0, 0, 0.24);
 
-  --settings-backdrop-blur: 26px;
-  --settings-backdrop-saturation: 145%;
+  --settings-backdrop-blur: 16px;
+  --settings-backdrop-saturation: 130%;
   --settings-backdrop-contrast: 102%;
 
   /* Rim layer (::before) — very subtle glass edge */
@@ -1006,10 +1006,10 @@ html[data-theme="dark"] {
 
   /* Settings panel — solid grouped panel (dark): a hint lighter than the
      modal background so it reads as a layered card without feeling heavy. */
-  --settings-panel-bg: rgba(255, 255, 255, 0.012);
-  --settings-panel-border: rgba(255, 255, 255, 0.04);
-  --settings-panel-divider: rgba(255, 255, 255, 0.045);
-  --settings-panel-shadow: 0 1px 1px rgba(0, 0, 0, 0.1);
+  --settings-panel-bg: rgba(255, 255, 255, 0.04);
+  --settings-panel-border: rgba(255, 255, 255, 0.09);
+  --settings-panel-divider: rgba(255, 255, 255, 0.07);
+  --settings-panel-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 
   /* Settings shell — filled button (dark) */
   --settings-button-bg: rgba(255, 255, 255, 0.1);
@@ -1026,10 +1026,10 @@ html[data-theme="dark"] {
   --device-settings-overlay-bg-image:
     radial-gradient(
       80% 80% at 50% 20%,
-      rgba(115, 170, 185, 0.16),
+      rgba(115, 170, 185, 0.10),
       transparent 58%
     ),
-    rgba(0, 0, 0, 0.34);
+    rgba(0, 0, 0, 0.62);
 
   /* Glass-select trigger open/active border (dark) */
   --glass-select-trigger-open-border: rgba(95, 130, 180, 0.3);
@@ -1103,8 +1103,8 @@ html[data-theme="light"] {
   /* Modal structure — simple frosted glass */
   --settings-modal-bg: linear-gradient(
     180deg,
-    rgba(244, 246, 250, 0.88) 0%,
-    rgba(228, 232, 238, 0.82) 100%
+    rgba(244, 246, 250, 0.95) 0%,
+    rgba(228, 232, 238, 0.92) 100%
   );
 
   --settings-modal-border: rgba(255, 255, 255, 0.72);
@@ -1114,14 +1114,14 @@ html[data-theme="light"] {
 
   /* --settings-modal-top-highlight: rgba(255, 255, 255, 0.92); */
 
-  --settings-backdrop-blur: 24px;
+  --settings-backdrop-blur: 16px;
   --settings-backdrop-saturation: 140%;
   --settings-backdrop-contrast: 102%;
 
   --device-settings-overlay-bg-image: linear-gradient(
     180deg,
-    rgba(232, 234, 239, 0.52) 0%,
-    rgba(214, 218, 225, 0.46) 100%
+    rgba(232, 234, 239, 0.72) 0%,
+    rgba(214, 218, 225, 0.66) 100%
   );
 
   --settings-rim-opacity: 0;
@@ -1180,10 +1180,10 @@ html[data-theme="light"] {
 
   /* Settings panel — solid grouped panel (light): a hint darker than the
      modal background so it reads as a layered card without feeling heavy. */
-  --settings-panel-bg: rgba(0, 0, 0, 0.025);
-  --settings-panel-border: rgba(0, 0, 0, 0.06);
-  --settings-panel-divider: rgba(0, 0, 0, 0.05);
-  --settings-panel-shadow: 0 1px 1px rgba(0, 0, 0, 0.025);
+  --settings-panel-bg: rgba(0, 0, 0, 0.05);
+  --settings-panel-border: rgba(0, 0, 0, 0.10);
+  --settings-panel-divider: rgba(0, 0, 0, 0.08);
+  --settings-panel-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
 
   /* Settings shell — filled button (light) */
   --settings-button-bg: rgba(0, 0, 0, 0.06);

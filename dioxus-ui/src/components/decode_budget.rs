@@ -581,6 +581,64 @@ pub fn effective_cap(
     }
 }
 
+/// Camera-on vs camera-off partition for the decode-budget tile list
+/// (issue #1465).
+///
+/// A camera-OFF peer produces zero video to decode, so it must NOT consume a
+/// decode-budget slot and must NOT be rendered with the dashed off-budget
+/// outline (it would look "paused"/sheddable when there is nothing to shed).
+/// This pure helper is the single source of truth for that split: callers pass
+/// the candidate peers as `(tile_id, camera_on)` pairs (already in their final
+/// display order), and it returns `(camera_on_real, camera_off_real)`.
+///
+/// Only peers in `camera_on_real` (plus any mock placeholders the caller
+/// appends separately) feed the decode-budget split; `camera_off_real` peers
+/// render as plain avatars outside the budget. Order within each output is the
+/// input order (stable), so the caller controls deterministic rendering.
+///
+/// Kept pure / DOM-free / signal-free so it is host-unit-testable: the caller
+/// resolves each peer's live `camera_on` (via `is_video_enabled_for_peer`)
+/// before calling.
+pub fn partition_camera_tiles(peers: &[(String, bool)]) -> (Vec<String>, Vec<String>) {
+    let mut camera_on_real = Vec::with_capacity(peers.len());
+    let mut camera_off_real = Vec::with_capacity(peers.len());
+    for (tile_id, camera_on) in peers {
+        if *camera_on {
+            camera_on_real.push(tile_id.clone());
+        } else {
+            camera_off_real.push(tile_id.clone());
+        }
+    }
+    (camera_on_real, camera_off_real)
+}
+
+/// True when exactly ONE real-peer tile is displayed across ALL THREE render
+/// groups combined: decoded video tiles (`visible`), off-budget avatar tiles
+/// (`avatar`), and camera-off avatar tiles (`camera_off`) (issues #1465, #508).
+///
+/// ## Why a cross-group sum and not `visible == 1`
+///
+/// Before the #1465 partition, the only way to have one on-screen tile was
+/// `visible_tiles.len() == 1`, so the lone-peer full-bleed presentation (the
+/// #508 single-peer view: one remote peer filling the tile) keyed off that.
+/// The #1465 partition split camera-OFF real peers OUT of `visible`/`avatar`
+/// into their own `camera_off` group, so `visible == 1` no longer implies the
+/// peer is alone on screen — a camera-on peer and a camera-off peer can render
+/// side by side (`visible == 1`, `camera_off == 1`). Both the visible-tiles
+/// full-bleed rule and the camera-off-tiles full-bleed rule must therefore key
+/// off the TOTAL displayed real-peer tiles, which is exactly this sum.
+///
+/// ## #1465 no-cap byte-identity invariant
+///
+/// With exactly one camera-ON peer and zero camera-off peers, the budget cap is
+/// inactive: `visible == 1`, `avatar == 0`, `camera_off == 0`, so the sum is 1
+/// and this returns `true` — the lone peer is full-bleed exactly as before the
+/// partition. (`avatar` is empty unless a budget cap is active; `camera_off` is
+/// empty when every peer is camera-on — see `partition_camera_tiles`.)
+pub fn is_sole_real_tile(visible: usize, avatar: usize, camera_off: usize) -> bool {
+    visible + avatar + camera_off == 1
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1492,5 +1550,87 @@ mod tests {
             effective_cap(DecodeBudgetOverride::Auto, false, 12, 99, None),
             12
         );
+    }
+
+    // ── issue #1465: camera-off peers are excluded from the decode-budget set ──
+
+    /// Camera-OFF peers must be split out of the budget population (they have no
+    /// video to decode), while camera-ON peers stay in — preserving input order
+    /// in each bucket.
+    ///
+    /// MUTATION SENSITIVITY: this is the load-bearing #1465 assertion. If
+    /// `partition_camera_tiles` is reverted to "include camera-off peers in the
+    /// budget" — e.g. by pushing every peer into `camera_on_real` (dropping the
+    /// `if *camera_on` branch), or by flipping the branch — then `b` ("bob",
+    /// camera off) lands in `camera_on_real` and/or `camera_off_real` is empty,
+    /// and BOTH asserts below fail. There are no `X == X` tautologies here: the
+    /// expected vectors are independent literals, not derived from the output.
+    #[test]
+    fn partition_excludes_camera_off_from_budget() {
+        let peers = vec![
+            ("alice".to_string(), true),
+            ("bob".to_string(), false),
+            ("carol".to_string(), true),
+            ("dave".to_string(), false),
+        ];
+        let (on, off) = partition_camera_tiles(&peers);
+        assert_eq!(
+            on,
+            vec!["alice".to_string(), "carol".to_string()],
+            "only camera-ON peers feed the decode budget"
+        );
+        assert_eq!(
+            off,
+            vec!["bob".to_string(), "dave".to_string()],
+            "camera-OFF peers are partitioned out of the budget population"
+        );
+    }
+
+    /// When every peer is camera-ON, the camera-off bucket is empty and the
+    /// budget population is unchanged (the #1465 no-cap byte-identity invariant:
+    /// nothing is diverted away from `all_tiles`).
+    #[test]
+    fn partition_all_camera_on_leaves_budget_intact() {
+        let peers = vec![("alice".to_string(), true), ("bob".to_string(), true)];
+        let (on, off) = partition_camera_tiles(&peers);
+        assert_eq!(on, vec!["alice".to_string(), "bob".to_string()]);
+        assert!(
+            off.is_empty(),
+            "no camera-off peers ⇒ empty group ⇒ budget population identical to pre-#1465"
+        );
+    }
+
+    /// `is_sole_real_tile` is the shared full-bleed predicate for the normal
+    /// grid (issues #1465, #508): a peer renders full-bleed IFF it is the only
+    /// real-peer tile across ALL THREE groups. The lone peer can live in ANY
+    /// single group (a camera-on decoded tile, an off-budget avatar tile, or a
+    /// camera-off avatar tile), so all three single-group cases must be true and
+    /// every multi-tile / empty combination must be false.
+    ///
+    /// MUTATION SENSITIVITY: the expected booleans are independent literals, not
+    /// derived from the function. Weakening `== 1` to `<= 1` flips `(0,0,0)`
+    /// from false → true; dropping any term from the sum (e.g. ignoring
+    /// `camera_off`) flips `(0,0,1)` from true → false or `(1,0,1)` from false →
+    /// true. Each such mutation breaks at least one assertion below.
+    #[test]
+    fn is_sole_real_tile_only_when_total_is_one() {
+        // Exactly one tile in any single group → sole.
+        assert!(is_sole_real_tile(1, 0, 0), "lone camera-on decoded tile");
+        assert!(is_sole_real_tile(0, 1, 0), "lone off-budget avatar tile");
+        assert!(is_sole_real_tile(0, 0, 1), "lone camera-off avatar tile");
+
+        // Two or more across any groups → not sole.
+        assert!(!is_sole_real_tile(2, 0, 0), "two decoded tiles");
+        assert!(
+            !is_sole_real_tile(1, 1, 0),
+            "one decoded + one avatar = two tiles"
+        );
+        assert!(
+            !is_sole_real_tile(1, 0, 1),
+            "one camera-on + one camera-off = two tiles (the #1465 mixed case)"
+        );
+
+        // Zero tiles → not sole.
+        assert!(!is_sole_real_tile(0, 0, 0), "no tiles is not a sole tile");
     }
 }

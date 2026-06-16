@@ -17,8 +17,8 @@
  */
 
 use crate::components::decode_budget::{
-    decide_step, effective_cap, ios_decode_tile_ceiling, BudgetSample, BudgetState, BudgetStep,
-    MIN_CAP,
+    decide_step, effective_cap, ios_decode_tile_ceiling, is_sole_real_tile, partition_camera_tiles,
+    BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
@@ -2465,10 +2465,72 @@ pub fn AttendantsComponent(
                                 let next = *screen_share_version.peek() + 1;
                                 screen_share_version.set(next);
                             }
+                            // #1465 reactivity gap fix: when an EXISTING peer's
+                            // `video_enabled` flips, the parent MUST re-render so
+                            // the DecodeBudget partition (which runs in the
+                            // `AttendantsComponent` render body and classifies each
+                            // peer via the NON-reactive `is_video_enabled_for_peer`)
+                            // re-runs and re-derives the `active_decode_set`.
+                            //
+                            // #1465 excluded camera-OFF peers from the budget, so a
+                            // camera-OFF peer is NOT in `active_decode_set` and never
+                            // gets `peer.visible = true`. The video decode path then
+                            // SKIPs its frames (`peer_decode_manager.rs`, `if
+                            // !self.visible { return SKIPPED }`). The MAJORITY case is
+                            // a peer joining camera-OFF (the default,
+                            // `load_preferred_camera_on()` == false) and turning the
+                            // camera ON mid-call: without this bump the parent never
+                            // re-renders, `active_decode_set` stays stale, `visible`
+                            // stays false, and the tile shows a blank/frozen canvas
+                            // until some UNRELATED re-render happens to fire. The
+                            // per-peer PeerTile self-heals its own canvas subscription,
+                            // but the active_decode_set is owned by the parent.
+                            //
+                            // Use the THROTTLED `peer_list_version` bump (mirroring the
+                            // speaker-activity path above), NOT a direct set: during a
+                            // reconnection wave many peers' media flags settle at once,
+                            // and a direct set per peer would drive a re-render storm.
+                            // 50 ms coalescing collapses that into one re-render.
+                            //
+                            // NOTE: audio_enabled deliberately does NOT trigger a bump.
+                            // Audio is independent of the decode-set/`visible`
+                            // partition (it plays through NetEQ, not gated by
+                            // `visible`), so bumping on audio toggles would add
+                            // re-renders for no rendering benefit.
+                            if sig.peek().video_enabled != state.video_enabled {
+                                let v = peer_list_version;
+                                schedule_throttled_bump(
+                                    bump_pending.clone(),
+                                    PEER_LIST_VERSION_THROTTLE_MS,
+                                    Rc::new(move || {
+                                        let mut v = v;
+                                        let next = *v.peek() + 1;
+                                        v.set(next);
+                                    }),
+                                );
+                            }
                             sig.set(state);
                         }
                     } else {
                         // First event for this peer — create a new signal.
+                        //
+                        // #1465: no `peer_list_version` bump is needed here even when
+                        // this first event carries `video_enabled = true`. A brand-new
+                        // peer is created by `ensure_peer()` in
+                        // `video_call_client::on_inbound_media`, which returns
+                        // `PeerStatus::Added` and (at the END of the same
+                        // synchronous call) emits `on_peer_added`, whose callback
+                        // (~attendants.rs:1275) bumps `peer_list_version` directly.
+                        // That bump fires AFTER the decode step that may have flipped
+                        // `video_enabled` true, and `is_video_enabled_for_peer` reads
+                        // the live `peer_decode_manager` state, so the parent
+                        // re-render the `on_peer_added` bump triggers already sees the
+                        // correct video state and partitions the new peer correctly.
+                        // This `peer_status` event is delivered asynchronously
+                        // (`global_sender().try_broadcast` -> `rx.recv().await`)
+                        // strictly AFTER that bump, so it is redundant for the
+                        // partition. Adding a second bump here would only add an
+                        // extra re-render on every join.
                         let screen_enabled = state.screen_enabled;
                         let sig = Signal::new(state);
                         if screen_enabled {
@@ -3423,10 +3485,48 @@ pub fn AttendantsComponent(
     // Pre-build mock IDs once to avoid repeated format!() in the hot path.
     let mock_ids: Vec<String> = (0..mock_count).map(|i| format!("mock-{i}")).collect();
 
-    let mut all_tiles: Vec<String> = Vec::with_capacity(total_tiles);
-    for peer_id in display_peers.iter().take(capped_real) {
-        all_tiles.push(peer_id.clone());
+    // --- Camera-on / camera-off partition (issue #1465) ---
+    // A camera-OFF peer produces zero video to decode, so it must NOT consume a
+    // decode-budget slot and must NOT land in the dashed off-budget avatar
+    // bucket (it would look "paused" / sheddable when there is nothing to shed).
+    // Partition the capped real peers up front: camera-ON real peers feed the
+    // decode-budget split (alongside mocks); camera-OFF real peers render in a
+    // separate plain-avatar group (no `force_avatar`, no dash).
+    //
+    // Camera-on predicate (applied uniformly here and in canvas_generator.rs):
+    //   mock peer                     → treated camera-ON (it is a layout-only
+    //                                   placeholder that exercises the decode path)
+    //   real peer, video_enabled true → camera-ON
+    //   real peer, video_enabled false→ camera-OFF
+    // `is_video_enabled_for_peer` returns false for any non-numeric key (incl.
+    // mock-N), which is why mocks are handled by the `take(capped_real)` slice
+    // here (they are not in `display_peers`) and need no explicit OR.
+    let camera_candidates: Vec<(String, bool)> = display_peers
+        .iter()
+        .take(capped_real)
+        .map(|peer_id| (peer_id.clone(), client.is_video_enabled_for_peer(peer_id)))
+        .collect();
+    let (camera_on_real, mut camera_off_real) = partition_camera_tiles(&camera_candidates);
+    // Stable join-order sort for the camera-off group so its render order is
+    // deterministic and matches the rest of the grid's earliest-first ordering.
+    {
+        let join_map = peer_join_time.read();
+        camera_off_real.sort_by(|a, b| {
+            let jt_a = join_map.get(a).copied().unwrap_or(0.0);
+            let jt_b = join_map.get(b).copied().unwrap_or(0.0);
+            jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
+
+    // `all_tiles` now holds ONLY the peers with video to decode: camera-ON real
+    // peers + mock placeholders. The decode-budget split (visible/avatar) below
+    // operates on this shrunken population. Layout counters (`total_tiles`,
+    // `displayed_tile_count`, `overflow_count`, `visible_tile_count`,
+    // `avatar_tile_count`, `tile_count`) are UNCHANGED — they still size over the
+    // FULL population so the grid geometry and the +N badge are identical; only
+    // which peers feed the decode split changes (issue #1465).
+    let mut all_tiles: Vec<String> = Vec::with_capacity(camera_on_real.len() + mock_count);
+    all_tiles.extend_from_slice(&camera_on_real);
     all_tiles.extend_from_slice(&mock_ids);
     // Stable sort by join time (earliest first).
     {
@@ -3493,6 +3593,67 @@ pub fn AttendantsComponent(
         .cloned()
         .collect();
 
+    // --- Camera-off group displayed window (issue #1465) ---
+    // The layout reserves `displayed_tile_count` real grid cells (the rest fold
+    // into the +N badge). Camera-ON + mock tiles fill the first
+    // `visible_tiles.len() + avatar_tiles.len()` of those cells; camera-OFF peers
+    // fill the REMAINING displayed cells (camera-on peers get priority for the
+    // displayed window since they carry video). Any camera-off peers past that
+    // belong to the overflow region and must NOT render as tiles — they are
+    // already accounted for in `overflow_count` / the +N badge.
+    //
+    // Arithmetic proof that rendered-tile-count == `tile_count` (the value that
+    // drives `participants-N` + `compute_layout`):
+    //   rendered_on   = visible_tiles.len() + avatar_tiles.len()
+    //                 = min(all_tiles.len(), displayed_tile_count)   [take/skip]
+    //   off_to_render = displayed_tile_count - rendered_on           [below]
+    //   rendered      = rendered_on + off_to_render + (overflow ? 1 : 0)
+    //                 = displayed_tile_count + (overflow ? 1 : 0)
+    //                 = tile_count                                    ∎
+    // No-cap byte-identity (issue #1465 invariant 1): when EVERY peer is
+    // camera-on, `camera_off_real` is empty, `all_tiles` equals the pre-#1465
+    // list, `rendered_on == displayed_tile_count`, so `off_to_render == 0` and
+    // `camera_off_tiles` is empty — output is byte-identical to before.
+    let rendered_on = visible_tiles.len() + avatar_tiles.len();
+    let off_to_render = displayed_tile_count.saturating_sub(rendered_on);
+    let camera_off_tiles: Vec<String> = camera_off_real
+        .iter()
+        .take(off_to_render)
+        .cloned()
+        .collect();
+
+    // --- Lone-peer full-bleed predicate (issues #1465, #508) ---
+    // The #508 single-peer presentation renders the SOLE remote peer full-bleed
+    // (its content — live video, or the "Camera Off" placeholder — filling the
+    // tile). Before #1465 that was keyed off `visible_tile_count == 1`, because
+    // a single on-screen tile could only ever be a decoded video tile.
+    //
+    // The #1465 partition broke that assumption: camera-OFF real peers are no
+    // longer in `visible_tiles`/`avatar_tiles` — they render from the separate
+    // `camera_off_tiles` group. So `visible_tile_count == 1` no longer means the
+    // peer is alone on screen: a camera-on peer (visible) can render ALONGSIDE a
+    // camera-off peer (camera_off), giving `visible == 1` while two tiles are
+    // actually shown. Keying full-bleed off `visible_tile_count` would then make
+    // BOTH the lone-camera-on rule and the camera-off rule believe they are
+    // alone, full-bleeding two tiles at once.
+    //
+    // The correct key is the TOTAL displayed real-peer tiles across all three
+    // render groups. `is_sole_real_tile` computes exactly that sum; the
+    // visible_tiles loop and the camera_off_tiles loop below both gate full-bleed
+    // on this single shared value, so at most one tile can ever be full-bleed.
+    //
+    // No-cap byte-identity invariant (#1465): with exactly one camera-ON peer and
+    // zero camera-off peers the cap is inactive, so `visible_tiles.len() == 1`
+    // while `avatar_tiles` and `camera_off_tiles` are empty. The sum is 1 →
+    // `sole_real_tile` is true → that lone peer is full-bleed, exactly as before
+    // the partition. (Mocks are excluded from full-bleed separately via the
+    // `!is_mock` guard on the visible_tiles rule.)
+    let sole_real_tile = is_sole_real_tile(
+        visible_tiles.len(),
+        avatar_tiles.len(),
+        camera_off_tiles.len(),
+    );
+
     // Build the peer-list sidebar entries keyed by `session_id` so each open
     // browser tab is its own row. `user_id` is carried alongside only for
     // host-action callbacks (mute / disable video), which remain per-user.
@@ -3546,11 +3707,15 @@ pub fn AttendantsComponent(
     // during screen share on constrained hardware.
 
     // Build a separate tile list for the screen-share right panel.
-    let (ss_decoded_tiles, ss_avatar_tiles) = if has_screen_share {
-        let mut ss_all: Vec<String> = Vec::with_capacity(total_tiles);
-        for peer_id in display_peers.iter().take(capped_real) {
-            ss_all.push(peer_id.clone());
-        }
+    // (issue #1465) Same partition as the normal grid: only camera-ON real peers
+    // + mocks consume the SS decode budget; camera-OFF peers render in a separate
+    // plain-avatar group (`ss_camera_off_tiles`), never dashed, never budgeted.
+    // The SS panel renders ALL tiles in the DOM (vertical scroll, no +N badge),
+    // so the camera-off group is the WHOLE `camera_off_real` set here — there is
+    // no displayed-window cap to apply.
+    let (ss_decoded_tiles, ss_avatar_tiles, ss_camera_off_tiles) = if has_screen_share {
+        let mut ss_all: Vec<String> = Vec::with_capacity(camera_on_real.len() + mock_count);
+        ss_all.extend_from_slice(&camera_on_real);
         ss_all.extend_from_slice(&mock_ids);
         {
             let join_map = peer_join_time.read();
@@ -3599,9 +3764,10 @@ pub fn AttendantsComponent(
         // Split: first ss_budget tiles get video decode, rest get avatars.
         let decoded: Vec<String> = ss_all.iter().take(ss_budget).cloned().collect();
         let avatars: Vec<String> = ss_all.iter().skip(ss_budget).cloned().collect();
-        (decoded, avatars)
+        // Camera-off peers (issue #1465): plain avatars, never dashed/budgeted.
+        (decoded, avatars, camera_off_real.clone())
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new())
     };
 
     // ORDERING INVARIANT: the active decode set is built in 3 phases:
@@ -4387,6 +4553,25 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+                                    // Camera-off peers (issue #1465): real peers
+                                    // with no video to decode. Rendered as PLAIN
+                                    // avatars (no `force_avatar` → no dashed
+                                    // off-budget outline). Always the real-peer
+                                    // arm — these are never mocks.
+                                    for tile_id in ss_camera_off_tiles.iter() {
+                                        PeerTile {
+                                            key: "tile-{tile_id}",
+                                            peer_id: tile_id.clone(),
+                                            full_bleed: false,
+                                            host_user_id: host_user_id.clone(),
+                                            render_mode: TileMode::VideoOnly,
+                                            my_session_id: my_session_id.clone(),
+                                            pinned_peer_id: current_pinned.clone(),
+                                            on_toggle_pin: toggle_pin.clone(),
+                                            room_id: Some(id.clone()),
+                                            is_current_user_host: is_owner,
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -4395,8 +4580,13 @@ pub fn AttendantsComponent(
                         for tile_id in visible_tiles.iter() {
                             {
                                 let is_mock = tile_id.starts_with("mock-");
+                                // Full-bleed only when this is the single tile on
+                                // screen across ALL render groups (issues #1465,
+                                // #508) — see `sole_real_tile` above. Was keyed
+                                // off `visible_tile_count == 1`, which the #1465
+                                // camera-off split made unsafe.
                                 let full_bleed = !is_mock
-                                    && visible_tile_count == 1
+                                    && sole_real_tile
                                     && !client.is_screen_share_enabled_for_peer(tile_id);
                                 if is_mock {
                                     rsx! {
@@ -4471,6 +4661,48 @@ pub fn AttendantsComponent(
                             }
                         }
 
+                        // ---- Camera-off peers (issue #1465) ----
+                        // Real peers with no video to decode. They occupy the
+                        // remaining displayed grid cells (after camera-on +
+                        // avatar tiles) and render as PLAIN avatars — NO
+                        // `force_avatar`, so NO dashed off-budget outline (the
+                        // #1465 fix: a cameraless peer is not "paused", it has
+                        // nothing to shed). Capped to `off_to_render` so any
+                        // camera-off peers in the overflow region stay folded
+                        // into the +N badge and the rendered tile count still
+                        // equals `tile_count` (see proof above). Always the
+                        // real-peer arm — these are never mocks.
+                        //
+                        // Full-bleed (issues #1465, #508): a lone camera-off
+                        // remote peer renders full-bleed — the "Camera Off"
+                        // placeholder fills the tile, matching the pre-#1465
+                        // single-peer presentation (canvas_generator renders this
+                        // correctly with no change). `sole_real_tile` guarantees
+                        // there is no other decoded / avatar / camera-off tile, so
+                        // this rule and the visible_tiles rule can never both
+                        // believe their tile is alone. These entries are never
+                        // mocks, so the `!is_mock` guard the visible rule carries
+                        // is unconditionally true here and omitted.
+                        for tile_id in camera_off_tiles.iter() {
+                            {
+                                let full_bleed = sole_real_tile
+                                    && !client.is_screen_share_enabled_for_peer(tile_id);
+                                rsx! {
+                                    PeerTile {
+                                        key: "tile-{tile_id}",
+                                        peer_id: tile_id.clone(),
+                                        full_bleed,
+                                        host_user_id: host_user_id.clone(),
+                                        my_session_id: my_session_id.clone(),
+                                        pinned_peer_id: current_pinned.clone(),
+                                        on_toggle_pin: toggle_pin.clone(),
+                                        room_id: Some(id.clone()),
+                                        is_current_user_host: is_owner,
+                                    }
+                                }
+                            }
+                        }
+
                         if overflow_count > 0 {
                             div { class: "grid-overflow-badge",
                                 "+{overflow_count}"
@@ -4478,8 +4710,16 @@ pub fn AttendantsComponent(
                             }
                         }
 
-                        // Invitation overlay when no peers
-                        if visible_tiles.is_empty() {
+                        // Invitation overlay when no peers (issue #1465).
+                        // Previously gated on `visible_tiles.is_empty()`, but a
+                        // call where every remote peer is camera-off now has an
+                        // empty `visible_tiles` while those peers still render in
+                        // `camera_off_tiles` — showing "Your meeting is ready!"
+                        // over a populated grid would be wrong. Gate instead on
+                        // there being NO peers at all: `all_tiles` (camera-ON real
+                        // peers + mock placeholders) AND `camera_off_real` (real
+                        // camera-off peers) must both be empty.
+                        if all_tiles.is_empty() && camera_off_real.is_empty() {
                             div {
                                 id: "invite-overlay",
                                 class: "invite-glass-card",

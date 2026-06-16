@@ -1007,11 +1007,6 @@ pub fn generate_for_peer(
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
             let grid_speaking = speaking_class;
-            // Issue #987, task 1a.4: tag off-budget tiles with `off-budget-tile`
-            // so CSS can style them and E2E can query them
-            // (`.grid-item.off-budget-tile`). Empty string in the no-cap path,
-            // so the rendered class list is unchanged when no budget is active.
-            let off_budget_class = if force_avatar { " off-budget-tile" } else { "" };
             // issue 508: the surviving single peer (full_bleed) is now rendered
             // from THIS one grid template with `full-bleed` as a plain CLASS
             // toggle, instead of a separate full-bleed rsx! branch. Dioxus 0.7
@@ -1050,6 +1045,27 @@ pub fn generate_for_peer(
             // not to decode their live video. That case gets a distinct pause
             // glyph + tooltip; a genuine camera-off tile keeps the plain wording.
             let paused_by_device = force_avatar && is_video_enabled_for_peer;
+            // Issue #1465: only DASH a tile (`.off-budget-tile`) when it is a
+            // budget-SHED tile that actually has video to decode — i.e. the
+            // local decode budget chose not to decode a live stream. A genuine
+            // camera-off real peer (force_avatar but camera off) must render a
+            // PLAIN avatar with no dash: there is nothing being shed, so the
+            // "paused/sheddable" outline is misleading (the field complaint).
+            //   real camera-OFF  → is_video_enabled_for_peer false, is_mock false
+            //                      → no dash (the #1465 fix)
+            //   real camera-ON, budget-shed → is_video_enabled_for_peer true → dash
+            //   mock, budget-shed → is_video_enabled_for_peer is FALSE for mocks
+            //                      (non-numeric key), so the `is_mock` OR is what
+            //                      keeps the mock's dash for local layout testing.
+            // Tag with `off-budget-tile` so CSS can style it and E2E can query
+            // `.grid-item.off-budget-tile`. Empty string in the no-cap path
+            // (force_avatar false), so the class list is unchanged with no budget.
+            let is_mock = key.starts_with("mock-");
+            let off_budget_class = if force_avatar && (is_mock || is_video_enabled_for_peer) {
+                " off-budget-tile"
+            } else {
+                ""
+            };
             let placeholder_label = if paused_by_device {
                 "Video paused"
             } else {

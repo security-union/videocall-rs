@@ -3,6 +3,7 @@
 pub mod aes_packet;
 pub mod connection_packet;
 pub mod diagnostics_packet;
+pub mod downlink_congestion_packet;
 pub mod health_packet;
 pub mod layer_hint_packet;
 pub mod layer_preference_packet;

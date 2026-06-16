@@ -1,0 +1,30 @@
+syntax = "proto3";
+
+// Relay -> receiver control payload (#1219 Half 2; receiver downlink congestion
+// signal).
+//
+// Carried inside a PacketWrapper whose `packet_type` is DOWNLINK_CONGESTION.
+// The relay emits this (once per episode) when a receiver's REAL downlink
+// backpressure surface — its bounded per-session outbound channel overflowing on
+// a slow socket — drives the windowed CongestionTracker across its drop
+// threshold (the same signal the #979 keyframe-relax path uses), staying armed
+// for RECEIVER_DOWNLINK_RELIEF_WINDOW. The receiver should reduce its layer
+// preferences to adapt to available downlink bandwidth.
+//
+// SCOPE: there is intentionally NO source/session id in this message. The
+// packet is delivered on the RECEIVER's OWN per-session subject
+// (room.{room}.{receiver_session}), so the delivery subject alone scopes the
+// signal to exactly one receiver — there is nothing to address.
+//
+// SECURITY / TRUST BOUNDARY: this packet is RELAY-AUTHORED and consumed by the
+// RECEIVER only. It travels relay -> receiver, never client -> relay. The relay
+// NEVER parses an inbound DOWNLINK_CONGESTION: there is no interceptor and no
+// handler that records or acts on one arriving on any session subject, so a
+// client cannot forge one to influence another receiver. The signal is purely
+// ADVISORY — a missing or delayed signal simply means the receiver does not
+// step down proactively (fail-open to today's behaviour); it cannot cause data
+// loss or privilege escalation.
+message DownlinkCongestionPacket {
+  // Currently empty — the presence of the packet IS the signal. Reserved for
+  // future use (e.g. severity level, suggested target layer, per-source hints).
+}

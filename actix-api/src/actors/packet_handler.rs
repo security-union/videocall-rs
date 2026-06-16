@@ -194,6 +194,16 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
         return PacketKind::Dropped;
     }
 
+    // Drop client-originated DOWNLINK_CONGESTION packets (#1219 Half 2).
+    // DOWNLINK_CONGESTION is relay-authored (emitted by the relay when a
+    // receiver's outbound channel overflows, as observed by the windowed
+    // CongestionTracker via on_outbound_drop). A client-sent one is always
+    // forged. Drop it to prevent a client from injecting fake congestion
+    // signals that would trick OTHER receivers into stepping down their layers.
+    if packet_wrapper.packet_type == PacketType::DOWNLINK_CONGESTION.into() {
+        return PacketKind::Dropped;
+    }
+
     // Drop client-originated MEETING packets.
     // MEETING events (HOST_MUTE_PARTICIPANT, MEETING_ENDED, etc.) are
     // server-authoritative: they are published exclusively by meeting-api
@@ -1010,6 +1020,26 @@ mod tests {
         // the room — symmetric with the CONGESTION drop above.
         let wrapper = PacketWrapper {
             packet_type: PacketType::LAYER_HINT.into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+    }
+
+    #[test]
+    fn test_classify_downlink_congestion_packet_as_dropped() {
+        // #1219 Half 2: DOWNLINK_CONGESTION is relay-authored-only (the relay
+        // emits it on a receiver's own subject when that receiver's outbound
+        // channel overflows, as observed by the windowed CongestionTracker).
+        // A client-sent one is always forged and is
+        // the PRIMARY trust boundary for the signal: if accepted and reflected,
+        // a malicious client could trick OTHER receivers into stepping their
+        // video layers down (denial-of-quality). It must be dropped at ingest —
+        // symmetric with the CONGESTION and LAYER_HINT drops above. This test
+        // pins that drop: deleting the guard in `classify_packet` must fail here.
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::DOWNLINK_CONGESTION.into(),
             data: vec![1, 2, 3],
             ..Default::default()
         };

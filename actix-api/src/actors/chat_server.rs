@@ -53,13 +53,15 @@ use tracing::{debug, error, info, trace, warn};
 
 use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
-    RELAY_CONGESTION_FILTERED_TOTAL, RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
+    RELAY_CONGESTION_FILTERED_TOTAL, RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL,
+    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
     RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
     RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
     RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE,
     RELAY_VIEWPORT_UPDATES_TOTAL,
 };
+use videocall_types::protos::downlink_congestion_packet::DownlinkCongestionPacket;
 use videocall_types::protos::layer_hint_packet::layer_hint_packet::Entry as LayerHintEntry;
 use videocall_types::protos::layer_hint_packet::LayerHintPacket;
 use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
@@ -3121,6 +3123,7 @@ impl Handler<JoinRoom> for ChatServer {
             is_host,
             end_on_host_leave,
             transport,
+            downlink_congested_epoch,
         }: JoinRoom,
         ctx: &mut Self::Context,
     ) -> Self::Result {
@@ -3386,6 +3389,10 @@ impl Handler<JoinRoom> for ChatServer {
         // inbound actor-mailbox overflow can be attributed to the right
         // transport on `relay_inbound_mailbox_drops_total` (Tier B #2 / #1057).
         let transport_for_loop = transport.clone();
+        // #1219 Half 2: the shared receiver-downlink-congestion signal the
+        // transport actor writes from `on_outbound_drop`; `handle_msg` reads it
+        // to drive emergency layer shedding.
+        let downlink_epoch_for_loop = downlink_congested_epoch;
 
         let handle = tokio::spawn(async move {
             // start_session is called by the transport actors (ws_chat_session /
@@ -3483,7 +3490,14 @@ impl Handler<JoinRoom> for ChatServer {
                     // Build the forwarding closure once; it is cheap to call
                     // per packet and avoids re-cloning the config on every
                     // message.
-                    let forward = handle_msg(
+                    // `emit_downlink_congestion` is a shared flag the (synchronous)
+                    // forwarding closure raises when this receiver crosses into
+                    // downlink-shedding mode. The closure cannot publish itself
+                    // (it is on the hot path and cannot `.await`), so the async loop
+                    // below reads-and-clears the flag after each `forward(...)` call
+                    // and performs the actual NATS publish off the hot path (#1219
+                    // Half 2).
+                    let (forward, emit_downlink_congestion) = handle_msg(
                         session_recipient.clone(),
                         room_clone.clone(),
                         session_clone,
@@ -3492,6 +3506,7 @@ impl Handler<JoinRoom> for ChatServer {
                         desired_streams_for_loop.clone(),
                         layer_prefs_for_loop.clone(),
                         transport_for_loop.clone(),
+                        downlink_epoch_for_loop.clone(),
                     );
                     let self_subject =
                         format!("room.{room_clone}.{session_clone}").replace(' ', "_");
@@ -3592,6 +3607,72 @@ impl Handler<JoinRoom> for ChatServer {
                         if let Err(e) = forward(msg, parsed.as_ref()) {
                             error!("Error handling message: {}", e);
                             break;
+                        }
+
+                        // --- #1219 Half 2: publish the DOWNLINK_CONGESTION signal ---
+                        //
+                        // The synchronous `forward` closure raised this flag on the
+                        // rising edge of a congestion episode (and only then — the
+                        // `DownlinkRelayState` edge detector debounces it to once per
+                        // episode). The `swap(false, ..)` below runs on EVERY packet
+                        // (a cheap uncontended Relaxed atomic on this receiver's own
+                        // task), reads-and-clears the flag in one step, and performs
+                        // the NATS publish only on the iteration that observed it set.
+                        // We publish to the receiver's OWN per-session subject
+                        // (`self_subject` == `room.{room}.{session}`) with the
+                        // receiver's `session_id` stamped, so the closure's
+                        // `is_downlink_congestion` self-echo carve-out and the unicast
+                        // filter deliver it back to exactly this receiver's client.
+                        if emit_downlink_congestion
+                            .swap(false, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            // The message is intentionally empty: the packet TYPE is
+                            // the signal (see downlink_congestion_packet.proto).
+                            let inner = DownlinkCongestionPacket::new();
+
+                            match inner.write_to_bytes() {
+                                Ok(data) => {
+                                    let mut wrapper = PacketWrapper::new();
+                                    wrapper.packet_type = PacketType::DOWNLINK_CONGESTION.into();
+                                    // Stamp the RECEIVER's session so the self-echo
+                                    // carve-out (`is_downlink_congestion`) and unicast
+                                    // filter route it to exactly this receiver.
+                                    wrapper.session_id = session_clone;
+                                    wrapper.user_id = user_id_clone.clone().into_bytes();
+                                    wrapper.data = data;
+
+                                    match wrapper.write_to_bytes() {
+                                        Ok(bytes) => {
+                                            if let Err(e) = nc2
+                                                .publish(self_subject.clone(), bytes.into())
+                                                .await
+                                            {
+                                                warn!(
+                                                    "Failed to publish DOWNLINK_CONGESTION for \
+                                                     session {} in room {}: {}",
+                                                    session_clone, room_clone, e
+                                                );
+                                            } else {
+                                                info!(
+                                                    "Published DOWNLINK_CONGESTION to session {} \
+                                                     (room: {}) (#1219)",
+                                                    session_clone, room_clone
+                                                );
+                                            }
+                                        }
+                                        Err(e) => warn!(
+                                            "Failed to serialize DOWNLINK_CONGESTION \
+                                             PacketWrapper for session {} in room {}: {}",
+                                            session_clone, room_clone, e
+                                        ),
+                                    }
+                                }
+                                Err(e) => warn!(
+                                    "Failed to serialize DownlinkCongestionPacket for session \
+                                     {} in room {}: {}",
+                                    session_clone, room_clone, e
+                                ),
+                            }
                         }
                     }
                 }
@@ -4212,6 +4293,75 @@ fn try_intercept_display_name_change(
     true
 }
 
+/// Pure per-receiver downlink-relief edge detector (#1219 Half 2).
+///
+/// This holds ONLY the EPISODE bookkeeping for the receiver-downlink relief
+/// mechanism — no protobuf, metrics, NATS, or actix coupling — so it is
+/// deterministic and unit-testable in isolation. The actual congestion SIGNAL
+/// is NOT computed here: it is the windowed, time-decaying
+/// [`CongestionTracker`](crate::actors::session_logic::CongestionTracker) the
+/// transport actor maintains and publishes into a shared
+/// `Arc<AtomicU64>` epoch (see [`SessionLogic::on_outbound_drop`]). The fan-out
+/// closure reads that epoch with
+/// [`downlink_epoch_is_active`](crate::actors::session_logic::downlink_epoch_is_active)
+/// on every packet and passes the resulting boolean to [`Self::observe`].
+///
+/// Keeping the SIGNAL in the windowed tracker and only the EDGE bookkeeping here
+/// fixes both #1219 Half-2 review blockers:
+///
+/// * **B1** — the trigger now keys off the REAL per-receiver downlink overflow
+///   (`outbound_tx` channel-full → `on_outbound_drop` → `CongestionTracker`),
+///   not the relay-side actor-mailbox `Full` (room-wide fan-out burst).
+/// * **B2** — shed-exit is the windowed signal going inactive (the relief
+///   window elapsing with no fresh crossing), NOT a count of strictly
+///   consecutive successes that a single stray drop could reset and wedge a
+///   healthy link in base-layer-only mode.
+///
+/// [`SessionLogic::on_outbound_drop`]: crate::actors::session_logic::SessionLogic::on_outbound_drop
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct DownlinkRelayState {
+    /// Whether the receiver was congested on the previous observation. Used to
+    /// detect the healthy→congested rising edge (emit the one-shot signal +
+    /// count an episode) and the congested→healthy falling edge (count a
+    /// recovery). Initialized `false` (a fresh receiver is healthy).
+    was_congested: bool,
+}
+
+/// Outcome of feeding the current windowed congestion level to
+/// [`DownlinkRelayState::observe`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+struct RelayTransition {
+    /// The receiver just crossed healthy → congested. Emit the one-shot
+    /// DOWNLINK_CONGESTION signal and count a new shedding episode.
+    entered_congestion: bool,
+    /// The receiver just crossed congested → healthy (the relief window
+    /// elapsed). Count a recovery.
+    recovered: bool,
+}
+
+impl DownlinkRelayState {
+    const fn new() -> Self {
+        Self {
+            was_congested: false,
+        }
+    }
+
+    /// Feed the current windowed congestion level (computed by the closure from
+    /// the shared epoch). Returns the edge transition, if any. The level is the
+    /// single source of truth for shedding; this only debounces the episode
+    /// metrics + the one-shot emit so each is reported exactly once per episode.
+    fn observe(&mut self, congested_now: bool) -> RelayTransition {
+        let mut transition = RelayTransition::default();
+        match (self.was_congested, congested_now) {
+            (false, true) => transition.entered_congestion = true,
+            (true, false) => transition.recovered = true,
+            _ => {}
+        }
+        self.was_congested = congested_now;
+        transition
+    }
+}
+
 /// Server-authoritative packet filter for observer (waiting-room) sessions.
 ///
 /// # Enforcement Model
@@ -4234,9 +4384,22 @@ fn try_intercept_display_name_change(
 /// MEDIA packets to observer sessions in the first place.
 // The per-session forwarding closure legitimately needs all of these inputs
 // (recipient, room, session id, observer flag, user id, viewport set, layer
-// prefs, and now the receiver transport for mailbox-drop attribution). Grouping
-// them into a struct would not improve clarity for a single internal builder.
-#[allow(clippy::too_many_arguments)]
+// prefs, the receiver transport for mailbox-drop attribution, and the shared
+// receiver-downlink-congestion epoch for #1219 Half 2 relief). Grouping them
+// into a struct would not improve clarity for a single internal builder.
+// Returns a `(closure, emit_flag)` pair. The closure is the per-packet forwarder
+// (its return type stays `Result<(), io::Error>` so every existing call site is
+// unchanged); the `Arc<AtomicBool>` is the out-of-band DOWNLINK_CONGESTION emit
+// signal the SYNC closure raises and the ASYNC NATS loop drains+publishes (#1219
+// Half 2). `type_complexity` is allowed because the `impl Fn` half cannot be
+// hoisted into a `type` alias, and the two-element tuple is self-documenting.
+//
+// `downlink_congested_epoch` is the INBOUND half of the #1219 Half-2 wiring: the
+// transport actor writes the windowed `CongestionTracker` crossing epoch into it
+// from `on_outbound_drop` (the real per-receiver downlink overflow), and this
+// closure reads it on every packet to decide emergency shedding + the one-shot
+// emit. This replaces the earlier draft's actor-mailbox-`Full` trigger (B1).
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn handle_msg(
     session_recipient: Recipient<Message>,
     room: String,
@@ -4246,14 +4409,64 @@ fn handle_msg(
     desired_streams: DesiredStreams,
     layer_prefs: LayerPrefs,
     transport: String,
-) -> impl Fn(async_nats::Message, Option<&PacketWrapper>) -> Result<(), std::io::Error> {
+    downlink_congested_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
+) -> (
+    impl Fn(async_nats::Message, Option<&PacketWrapper>) -> Result<(), std::io::Error>,
+    std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
     // `parsed` is the PacketWrapper decoded ONCE per packet by the NATS loop
     // and shared with every consumer (display-name interceptor, viewport
     // interceptor, and this closure). Decoding here as well would double the
     // protobuf parse on the relay's hottest path. Unparseable payloads arrive
     // as `None`, which every downstream check treats as its "fail-closed"
     // default.
-    move |msg, parsed| {
+
+    // --- #1219 Half 2: Per-receiver downlink congestion state ---
+    //
+    // The congestion SIGNAL is the windowed `CongestionTracker` epoch the
+    // transport actor publishes into `downlink_congested_epoch`; the closure
+    // reads it with `downlink_epoch_is_active` against `RECEIVER_DOWNLINK_RELIEF_WINDOW`.
+    // The only per-receiver state held HERE is the edge bookkeeping in
+    // `DownlinkRelayState` (a pure, unit-tested debouncer for the once-per-episode
+    // metrics + emit).
+    use crate::actors::session_logic::downlink_epoch_is_active;
+    use crate::constants::RECEIVER_DOWNLINK_RELIEF_WINDOW;
+    use crate::metrics::{
+        RELAY_DOWNLINK_SHED_TOTAL, RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL,
+        RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL,
+    };
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Arc;
+
+    // One edge detector per receiver session. `Cell` gives interior mutability
+    // with no runtime borrow-check cost; safe because the closure runs
+    // exclusively on this receiver's single NATS subscription task.
+    let relay_state: Cell<DownlinkRelayState> = Cell::new(DownlinkRelayState::new());
+
+    // --- #1219 Half 2: emit-DOWNLINK_CONGESTION handoff ---
+    //
+    // The forwarding closure is SYNCHRONOUS and runs on the relay's hottest path
+    // (every packet × every receiver), so it cannot `.await` a NATS publish. On the
+    // rising edge of a congestion episode the closure STORES `true` into this shared
+    // flag; the async NATS loop that owns `nc2`/`self_subject` reads-and-clears it
+    // (`swap(false, ..)`) after each `forward(...)` call and, when it was set,
+    // performs the actual publish off the hot path.
+    //
+    // `Arc<AtomicBool>` (not the cheaper `Rc<Cell<bool>>`) because the NATS loop
+    // runs inside `tokio::spawn`, whose future must be `Send` — `Rc` is not `Send`
+    // and would fail to compile there. HONEST COST: the `store(true)` happens at
+    // most once per episode (the `DownlinkRelayState` edge detector debounces it),
+    // but the loop's `swap(false, ..)` runs ONCE PER PACKET. That swap is a single
+    // uncontended `Relaxed` atomic on the receiver's own task — cheap, but not
+    // "off the hot path"; it is on it, just negligibly. The closure holds one clone
+    // (moved into it); the loop keeps the other.
+    let emit_downlink_congestion: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    let emit_flag = Arc::clone(&emit_downlink_congestion);
+
+    let forward = move |msg: async_nats::Message,
+                        parsed: Option<&PacketWrapper>|
+          -> Result<(), std::io::Error> {
         let is_congestion = parsed
             .map(|pw| pw.packet_type == PacketType::CONGESTION.into())
             .unwrap_or(false);
@@ -4265,6 +4478,15 @@ fn handle_msg(
         // the same reason CONGESTION does. (#1108 delivery gap.)
         let is_layer_hint = parsed
             .map(|pw| pw.packet_type == PacketType::LAYER_HINT.into())
+            .unwrap_or(false);
+
+        // DOWNLINK_CONGESTION is, like CONGESTION and LAYER_HINT, a
+        // RELAY-authored self-addressed control packet (#1219 Half 2). The relay
+        // emits it on the RECEIVER's own per-session subject to signal that
+        // receiver's downlink is congested. It must survive the self-echo guard
+        // for the same reason as the other relay-authored packets.
+        let is_downlink_congestion = parsed
+            .map(|pw| pw.packet_type == PacketType::DOWNLINK_CONGESTION.into())
             .unwrap_or(false);
 
         let is_meeting = parsed
@@ -4332,7 +4554,7 @@ fn handle_msg(
         } else {
             subject_self || inner_session_self
         };
-        if drop_self_echo && !is_congestion && !is_layer_hint {
+        if drop_self_echo && !is_congestion && !is_layer_hint && !is_downlink_congestion {
             return Ok(());
         }
 
@@ -4387,6 +4609,19 @@ fn handle_msg(
         // #1108 delivery fix); LAYER_HINT is intentionally left alone (#1220).
         if is_congestion && !subject_self && !inner_session_self {
             RELAY_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[&room])
+                .inc();
+            return Ok(());
+        }
+
+        // DOWNLINK_CONGESTION unicast filter (#1219 Half 2). Same model as the
+        // CONGESTION filter above: relay-authored, self-addressed to a specific
+        // receiver. Drop for every other session in the room — only the target
+        // receiver needs to see it. Counted on its OWN metric (not the CONGESTION
+        // sibling) so the two relay-authored unicast packet classes stay
+        // distinguishable on dashboards.
+        if is_downlink_congestion && !subject_self && !inner_session_self {
+            RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
                 .with_label_values(&[&room])
                 .inc();
             return Ok(());
@@ -4678,6 +4913,99 @@ fn handle_msg(
             }
         }
 
+        // --- #1219 Half 2: receiver-downlink relief signal + emergency shedding ---
+        //
+        // B1 FIX: the congestion SIGNAL is the windowed `CongestionTracker`
+        // crossing the transport actor published into `downlink_congested_epoch`
+        // from `on_outbound_drop` — i.e. the REAL per-receiver downlink overflow
+        // (the bounded `outbound_tx` channel filling on a slow socket), NOT the
+        // relay-side actor-mailbox `Full` (a room-wide fan-out / scheduling
+        // burst that says nothing about THIS receiver's downlink). We read it
+        // here on every packet and apply the same time-decaying window the #979
+        // keyframe-relax path uses.
+        //
+        // B2 FIX: `congested_now` is a windowed LEVEL — it goes false on its own
+        // once `RECEIVER_DOWNLINK_RELIEF_WINDOW` elapses with no fresh crossing.
+        // Recovery therefore can NOT be wedged by an occasional stray drop (the
+        // old strictly-consecutive-success exit could be, pinning a healthy link
+        // at base-layer-only video indefinitely).
+        let congested_now = downlink_epoch_is_active(
+            downlink_congested_epoch.load(AtomicOrdering::Relaxed),
+            RECEIVER_DOWNLINK_RELIEF_WINDOW,
+        );
+
+        // Edge-detect the episode so the metrics + the one-shot DOWNLINK_CONGESTION
+        // emit each fire exactly once per congested episode. Running this on every
+        // packet (not only when congested) is what lets the falling edge —
+        // recovery — be observed once the window decays while traffic still flows.
+        {
+            let mut state = relay_state.get();
+            let transition = state.observe(congested_now);
+            relay_state.set(state);
+
+            if transition.entered_congestion {
+                RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL
+                    .with_label_values(&[&transport])
+                    .inc();
+                warn!(
+                    "Receiver session {} entered downlink congestion shedding mode \
+                     (windowed CongestionTracker crossing; room: {}, transport: {}) (#1219)",
+                    session, room, transport
+                );
+                // The forwarding closure is SYNCHRONOUS and on the hot path, so it
+                // cannot publish directly. Raise the shared `emit_downlink_congestion`
+                // flag; the async NATS loop reads-and-clears it after this call and
+                // publishes a single DOWNLINK_CONGESTION to the receiver's own subject.
+                // `entered_congestion` is true at most once per episode, so the loop
+                // emits exactly one packet per episode.
+                emit_flag.store(true, AtomicOrdering::Relaxed);
+                info!(
+                    "DOWNLINK_CONGESTION signal queued for session {} (room: {}) — \
+                     relay will publish to the receiver's own subject (#1219)",
+                    session, room
+                );
+            } else if transition.recovered {
+                RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL
+                    .with_label_values(&[&transport])
+                    .inc();
+                info!(
+                    "Receiver session {} exited downlink congestion shedding mode \
+                     (relief window elapsed; room: {}, transport: {}) (#1219)",
+                    session, room, transport
+                );
+            }
+        }
+
+        // While congested, discard non-base-layer VIDEO/SCREEN BEFORE reaching
+        // try_send. This reduces volume, giving the slow downlink headroom to
+        // drain. AUDIO is NEVER shed (audio loss is worse than video quality
+        // loss). Control packets are NEVER shed. Base layer (layer 0) is NEVER
+        // shed.
+        //
+        // This runs AFTER the viewport and layer filters above — a packet that
+        // reaches here has already survived those gates, so shedding it is a
+        // FURTHER reduction beyond what the receiver's own preferences chose.
+        if congested_now {
+            if let Some(pw) = parsed {
+                use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+                let media_kind = pw.media_kind.enum_value();
+                let is_shed_candidate =
+                    matches!(media_kind, Ok(MediaKind::VIDEO) | Ok(MediaKind::SCREEN))
+                        && pw.simulcast_layer_id != 0;
+
+                if is_shed_candidate {
+                    RELAY_DOWNLINK_SHED_TOTAL
+                        .with_label_values(&[&transport])
+                        .inc();
+                    debug!(
+                        "Downlink shed: dropping layer {} {:?} for congested receiver session {} in room {}",
+                        pw.simulcast_layer_id, media_kind, session, room
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
         let message = Message {
             // FAN-OUT HOT PATH (#1063): `msg.payload` is an `async_nats`
             // `bytes::Bytes`. Cloning the handle is an O(1) atomic refcount
@@ -4691,6 +5019,10 @@ fn handle_msg(
             session,
         };
 
+        // A successful `try_send` no longer needs an arm: #1219 Half 2 moved the
+        // downlink relief signal off this mailbox outcome (B1) onto the windowed
+        // `CongestionTracker` read at the top of the closure, so the `Ok` path is
+        // a plain delivery with nothing to record here.
         if let Err(e) = session_recipient.try_send(message) {
             // PRIORITY-AWARE ATTRIBUTION on inbound fan-out overflow (#1145).
             //
@@ -4728,18 +5060,18 @@ fn handle_msg(
             // `mailbox_full` label and the warn, exactly as before.
             let is_full = matches!(e, SendError::Full(_));
             let priority = match parsed {
-                Some(pw) => OutboundPriority::classify_outer(
-                    true,
-                    pw.packet_type
-                        .enum_value()
-                        .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
-                    pw.media_kind.enum_value().unwrap_or(
-                        videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED,
+                    Some(pw) => OutboundPriority::classify_outer(
+                        true,
+                        pw.packet_type
+                            .enum_value()
+                            .unwrap_or(PacketType::PACKET_TYPE_UNKNOWN),
+                        pw.media_kind.enum_value().unwrap_or(
+                            videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind::MEDIA_KIND_UNSPECIFIED,
+                        ),
                     ),
-                ),
-                // Unparseable outer wrapper → fail-open Control (never a media shed).
-                None => OutboundPriority::Control,
-            };
+                    // Unparseable outer wrapper → fail-open Control (never a media shed).
+                    None => OutboundPriority::Control,
+                };
 
             // Pick the per-room `drop_reason` label. On a `Full` mailbox a
             // droppable media kind (VIDEO/SCREEN → `priority_drop_video`,
@@ -4779,11 +5111,221 @@ fn handle_msg(
             // label above, not in the log line. Do NOT edge-trigger or demote
             // this line without updating the parse script in lock-step.
             warn!(
-                "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
-                session, e
-            );
+                    "Dropping inbound message for session {}: {} (mailbox full — subscription continues)",
+                    session, e
+                );
+
+            // #1219 Half 2: the actor-mailbox `Full` here is DELIBERATELY no
+            // longer the downlink-shedding trigger (B1). It measures room-wide
+            // relay fan-out / scheduling pressure, not THIS receiver's downlink.
+            // The genuine per-receiver signal is the windowed `CongestionTracker`
+            // the transport actor publishes into `downlink_congested_epoch`,
+            // read at the top of this closure. `is_full` is still consumed above
+            // for the priority-aware `drop_reason` attribution.
         }
         Ok(())
+    };
+
+    (forward, emit_downlink_congestion)
+}
+
+// ==========================================================================
+// Unit Tests for the DownlinkRelayState edge detector (#1219 Half 2)
+// ==========================================================================
+//
+// These exercise the pure edge bookkeeping directly — no actix, NATS, or
+// protobuf — so they are deterministic and mutation-sensitive: each test fails
+// if the specific transition it names is broken (lost rising/falling edge,
+// missing once-per-episode debounce, etc.). The congestion SIGNAL itself is the
+// windowed `CongestionTracker` epoch (tested via `downlink_epoch_is_active`
+// below); this detector only debounces the episode metrics + the one-shot emit.
+#[cfg(test)]
+mod downlink_relay_state_tests {
+    use super::DownlinkRelayState;
+    use crate::actors::session_logic::{
+        downlink_congested_epoch_now, downlink_epoch_is_active, DOWNLINK_EPOCH_NEVER,
+    };
+    use crate::constants::RECEIVER_DOWNLINK_RELIEF_WINDOW;
+    use std::time::Duration;
+
+    #[test]
+    fn fresh_state_reports_no_edges_while_healthy() {
+        let mut s = DownlinkRelayState::new();
+        // A healthy stream produces NO transitions, ever.
+        for _ in 0..100 {
+            let t = s.observe(false);
+            assert!(
+                !t.entered_congestion && !t.recovered,
+                "healthy observations must not report any edge"
+            );
+        }
+    }
+
+    #[test]
+    fn rising_edge_reported_exactly_once_per_episode() {
+        let mut s = DownlinkRelayState::new();
+        // First congested observation = the rising edge: emit + count once.
+        let first = s.observe(true);
+        assert!(
+            first.entered_congestion && !first.recovered,
+            "first congested observation is the rising edge"
+        );
+        // Staying congested must NOT re-report entry (debounce the emit).
+        for _ in 0..10 {
+            let t = s.observe(true);
+            assert!(
+                !t.entered_congestion && !t.recovered,
+                "sustained congestion must not re-fire the rising edge"
+            );
+        }
+    }
+
+    #[test]
+    fn falling_edge_reported_exactly_once_per_episode() {
+        let mut s = DownlinkRelayState::new();
+        s.observe(true); // enter
+        let recovered = s.observe(false);
+        assert!(
+            recovered.recovered && !recovered.entered_congestion,
+            "first healthy observation after congestion is the falling edge"
+        );
+        // Staying healthy must NOT re-report recovery.
+        for _ in 0..10 {
+            let t = s.observe(false);
+            assert!(
+                !t.recovered && !t.entered_congestion,
+                "sustained recovery must not re-fire the falling edge"
+            );
+        }
+    }
+
+    #[test]
+    fn re_arms_for_a_second_episode_after_recovery() {
+        let mut s = DownlinkRelayState::new();
+        assert!(s.observe(true).entered_congestion, "episode 1 entry");
+        assert!(s.observe(false).recovered, "episode 1 recovery");
+        // A fresh congestion is a NEW episode and must emit a NEW rising edge.
+        let second = s.observe(true);
+        assert!(
+            second.entered_congestion && !second.recovered,
+            "a new congested window after recovery must re-fire the rising edge"
+        );
+    }
+
+    #[test]
+    fn flapping_each_transition_fires_its_own_edge() {
+        let mut s = DownlinkRelayState::new();
+        // Each genuine level change fires exactly one matching edge. This pins
+        // that the metrics are EDGE-counted (so congestion_total - recovered_total
+        // == 1 while congested, 0 while healthy), not level-counted per packet.
+        assert!(s.observe(true).entered_congestion);
+        assert!(s.observe(false).recovered);
+        assert!(s.observe(true).entered_congestion);
+        assert!(s.observe(false).recovered);
+        // A redundant same-level observation in the middle changes nothing.
+        assert!(s.observe(true).entered_congestion);
+        let redundant = s.observe(true);
+        assert!(!redundant.entered_congestion && !redundant.recovered);
+        assert!(s.observe(false).recovered);
+    }
+
+    // ----------------------------------------------------------------------
+    // The windowed SIGNAL itself (the B1/B2 fix) — exercised via the shared
+    // epoch helpers the closure reads.
+    // ----------------------------------------------------------------------
+
+    #[test]
+    fn never_epoch_is_not_active() {
+        assert!(
+            !downlink_epoch_is_active(DOWNLINK_EPOCH_NEVER, RECEIVER_DOWNLINK_RELIEF_WINDOW),
+            "the NEVER sentinel must never read as congested"
+        );
+    }
+
+    #[test]
+    fn fresh_epoch_is_active_within_window() {
+        // A crossing stamped right now is congested for the whole relief window.
+        let epoch = downlink_congested_epoch_now();
+        assert!(
+            downlink_epoch_is_active(epoch, RECEIVER_DOWNLINK_RELIEF_WINDOW),
+            "a just-stamped crossing must read as congested"
+        );
+    }
+
+    #[test]
+    fn epoch_decays_to_inactive_once_the_window_elapses() {
+        // B2: shed-exit is purely time-based decay of the window — no consecutive
+        // counter to wedge. An epoch older than the window reads as recovered even
+        // though nothing explicitly "cleared" it. We use a deliberately TINY test
+        // window + a real sleep so the test is deterministic regardless of how far
+        // into process life `downlink_congested_epoch_now()` is (subtracting a
+        // multi-second window from a fresh process clock would saturate to the
+        // NEVER sentinel and exercise the wrong branch).
+        let tiny = Duration::from_millis(20);
+        let epoch = downlink_congested_epoch_now();
+        // Real (non-sentinel) epoch, active immediately within its own window.
+        assert!(epoch > DOWNLINK_EPOCH_NEVER);
+        assert!(
+            downlink_epoch_is_active(epoch, tiny),
+            "a just-stamped epoch must be active within the window"
+        );
+        std::thread::sleep(tiny + Duration::from_millis(40));
+        assert!(
+            !downlink_epoch_is_active(epoch, tiny),
+            "an epoch older than the (tiny) relief window must read as recovered (B2)"
+        );
+        // And the same epoch is STILL active under the real production window,
+        // proving the read compares against the window it is given, not a fixed one.
+        assert!(
+            downlink_epoch_is_active(epoch, RECEIVER_DOWNLINK_RELIEF_WINDOW),
+            "still within the (much larger) production relief window"
+        );
+    }
+
+    #[test]
+    fn shed_candidate_classification_pins_base_layer_and_audio_exemptions() {
+        // This is the policy the closure applies when `congested_now` is true:
+        // only non-base-layer VIDEO/SCREEN is shed. Encoded here against the
+        // same predicate so a future edit to either must update both.
+        use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+        let is_shed_candidate = |kind: MediaKind, layer: u32| -> bool {
+            matches!(kind, MediaKind::VIDEO | MediaKind::SCREEN) && layer != 0
+        };
+        assert!(is_shed_candidate(MediaKind::VIDEO, 1));
+        assert!(is_shed_candidate(MediaKind::SCREEN, 2));
+        assert!(
+            !is_shed_candidate(MediaKind::VIDEO, 0),
+            "base layer is kept"
+        );
+        assert!(
+            !is_shed_candidate(MediaKind::SCREEN, 0),
+            "base layer is kept"
+        );
+        assert!(
+            !is_shed_candidate(MediaKind::AUDIO, 1),
+            "audio is never shed"
+        );
+        assert!(
+            !is_shed_candidate(MediaKind::MEDIA_KIND_UNSPECIFIED, 1),
+            "unspecified/control is never shed"
+        );
+    }
+
+    // Pin the production relief window so a careless retune that makes shedding
+    // either permanent or never-engaging is caught here rather than in the field.
+    #[test]
+    fn production_relief_window_is_sane() {
+        // The window must be positive (a zero window would never shed) and bounded
+        // to a few seconds (an unbounded window would pin a recovered link in
+        // base-layer-only mode — the #1219 Half-2 B2 wedge this fix removes).
+        assert!(
+            RECEIVER_DOWNLINK_RELIEF_WINDOW >= Duration::from_millis(500),
+            "relief window must be long enough to outlive a transient burst"
+        );
+        assert!(
+            RECEIVER_DOWNLINK_RELIEF_WINDOW <= Duration::from_secs(10),
+            "relief window must be short enough to recover within seconds (B2)"
+        );
     }
 }
 
@@ -4861,6 +5403,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4925,6 +5468,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -4961,6 +5505,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -5025,6 +5570,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -5045,6 +5591,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -5429,6 +5976,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -5542,6 +6090,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -5641,6 +6190,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -5746,6 +6296,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -5815,6 +6366,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -5929,6 +6481,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -6044,6 +6597,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -6172,6 +6726,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -6194,6 +6749,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -6296,7 +6852,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room1".to_string(),
             9001,
@@ -6305,6 +6861,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6330,7 +6887,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room2".to_string(),
             9002,
@@ -6339,6 +6896,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6364,7 +6922,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room3".to_string(),
             9003,
@@ -6373,6 +6931,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6398,7 +6957,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room4".to_string(),
             9004,
@@ -6407,6 +6966,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6432,7 +6992,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room5".to_string(),
             9005,
@@ -6441,6 +7001,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Send garbage bytes that cannot be parsed as a PacketWrapper.
@@ -6467,7 +7028,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room7".to_string(),
             9007,
@@ -6476,6 +7037,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6501,7 +7063,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room8".to_string(),
             9008,
@@ -6510,6 +7072,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6535,7 +7098,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "room6".to_string(),
             9006,
@@ -6544,6 +7107,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6583,7 +7147,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "selfskip-room".to_string(),
             7777,
@@ -6592,6 +7156,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6622,7 +7187,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "reconnect-room".to_string(),
             8888,
@@ -6631,6 +7196,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Subject points at a DIFFERENT session id; payload session_id is
@@ -6666,7 +7232,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "congestion-room".to_string(),
             5555,
@@ -6675,6 +7241,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6704,7 +7271,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "congestion-inner-room".to_string(),
             6666,
@@ -6713,6 +7280,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6759,7 +7327,7 @@ mod tests {
 
         // This receiver is session 7777. The CONGESTION targets sender 5555
         // (published on `room.{room}.5555` with inner session_id 5555).
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             room.to_string(),
             7777, // bystander receiver — NOT the target
@@ -6768,6 +7336,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6814,7 +7383,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "layerhint-room".to_string(),
             5151,
@@ -6823,6 +7392,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Subject == the receiver's own self-subject, mirroring the real
@@ -6858,7 +7428,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "layerhint-inner-room".to_string(),
             6161,
@@ -6867,6 +7437,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Subject points at a DIFFERENT session id; embedded session_id is ours
@@ -6901,7 +7472,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "layerhint-room".to_string(),
             5151,
@@ -6910,6 +7481,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Identical addressing to test_handle_msg_layer_hint_passes_self_filter_*
@@ -6941,7 +7513,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "media-self-room".to_string(),
             4242,
@@ -6950,6 +7522,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -6981,7 +7554,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "zero-session-room".to_string(),
             0,
@@ -6990,6 +7563,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7035,7 +7609,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "peer-event-room".to_string(),
             1111,
@@ -7044,6 +7618,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7069,7 +7644,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "peer-event-room".to_string(),
             2222,
@@ -7078,6 +7653,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7103,7 +7679,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "peer-event-room".to_string(),
             3333,
@@ -7112,6 +7688,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7137,7 +7714,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "peer-event-room".to_string(),
             4444,
@@ -7146,6 +7723,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let mut pw = PacketWrapper::new();
@@ -7191,7 +7769,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "disc-room".to_string(),
             7001,
@@ -7200,6 +7778,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7228,7 +7807,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "disc-room".to_string(),
             7001,
@@ -7237,6 +7816,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Reply addressed to session 9999, not us (7001).
@@ -7266,7 +7846,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "disc-room".to_string(),
             7001,
@@ -7275,6 +7855,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7328,6 +7909,16 @@ mod tests {
     /// layer filter forwards everything (byte-identical to pre-#989 behaviour).
     fn empty_layer_prefs() -> LayerPrefs {
         LayerPrefs::default()
+    }
+
+    /// Build the shared receiver-downlink-congestion epoch a `handle_msg` call
+    /// expects, seeded to the "never congested" sentinel (#1219 Half 2). Tests
+    /// that exercise the healthy path use this default; a test that wants the
+    /// closure to shed/emit stamps a fresh epoch into the returned `Arc`.
+    fn never_epoch() -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::actors::session_logic::DOWNLINK_EPOCH_NEVER,
+        ))
     }
 
     /// Build a `LayerPrefs` pre-populated with the given (source_session,
@@ -7468,7 +8059,7 @@ mod tests {
         .start();
 
         // Receiver renders sessions {200, 300}; video from 999 is off-screen.
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7477,6 +8068,7 @@ mod tests {
             desired_streams_with(&[200, 300]),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7510,7 +8102,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7519,6 +8111,7 @@ mod tests {
             desired_streams_with(&[200, 300]),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Forged payload session_id = 200 (visible), but arrives on 999's subject.
@@ -7550,7 +8143,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7559,6 +8152,7 @@ mod tests {
             desired_streams_with(&[200]),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7584,7 +8178,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7593,6 +8187,7 @@ mod tests {
             desired_streams_with(&[200, 300]),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Subject-derived source = 200 (in the viewport set).
@@ -7620,7 +8215,7 @@ mod tests {
         .start();
 
         // Empty set = no viewport signal yet = fail-open.
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7629,6 +8224,7 @@ mod tests {
             DesiredStreams::default(),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7656,7 +8252,7 @@ mod tests {
 
         // Off-screen sender, but AUDIO must NEVER be filtered (security:
         // off-screen speakers must be heard).
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7665,6 +8261,7 @@ mod tests {
             desired_streams_with(&[200]),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7691,7 +8288,7 @@ mod tests {
         .start();
 
         // SCREEN is not governed by the camera-tile viewport.
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7700,6 +8297,7 @@ mod tests {
             desired_streams_with(&[200]),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7727,7 +8325,7 @@ mod tests {
 
         // UNSPECIFIED (e.g. an older client) must fail open even with an
         // active viewport set and an off-screen source.
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7736,6 +8334,7 @@ mod tests {
             desired_streams_with(&[200]),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -7764,7 +8363,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "vp-room".to_string(),
             100,
@@ -7775,6 +8374,7 @@ mod tests {
             desired_streams_with(&[999]),
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -8129,6 +8729,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -8719,6 +9320,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: false,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed");
@@ -8820,6 +9422,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: false,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("JoinRoom should succeed")
@@ -8914,6 +9517,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: false,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("JoinRoom should succeed")
@@ -9008,6 +9612,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: false,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("JoinRoom should succeed")
@@ -9252,6 +9857,7 @@ mod tests {
                 is_host: true,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -9346,6 +9952,7 @@ mod tests {
                 is_host: true,
                 end_on_host_leave: false,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -9435,6 +10042,7 @@ mod tests {
                     is_host: false,
                     end_on_host_leave: false,
                     transport: "websocket".to_string(),
+                    downlink_congested_epoch: never_epoch(),
                 })
                 .await
                 .expect("Message delivery should succeed")
@@ -9544,6 +10152,7 @@ mod tests {
                 is_host: true,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -9631,6 +10240,7 @@ mod tests {
                 is_host: true,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -9754,6 +10364,7 @@ mod tests {
                 is_host: true,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -9804,6 +10415,7 @@ mod tests {
                 is_host: true,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -9883,6 +10495,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -9946,6 +10559,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -9998,6 +10612,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10081,6 +10696,7 @@ mod tests {
                 is_host: true,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10110,6 +10726,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10288,6 +10905,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10320,6 +10938,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10447,6 +11066,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10472,6 +11092,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10516,6 +11137,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10584,6 +11206,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10610,6 +11233,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10688,6 +11312,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10721,6 +11346,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10834,6 +11460,7 @@ mod tests {
                 is_host: true,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -10883,6 +11510,7 @@ mod tests {
                 is_host: true,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Message delivery should succeed")
@@ -11003,6 +11631,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Delivery A")
@@ -11031,6 +11660,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Delivery B")
@@ -11134,6 +11764,7 @@ mod tests {
                     is_host: false,
                     end_on_host_leave: true,
                     transport: "websocket".to_string(),
+                    downlink_congested_epoch: never_epoch(),
                 })
                 .await
                 .expect("Delivery")
@@ -11222,6 +11853,7 @@ mod tests {
                     is_host: false,
                     end_on_host_leave: true,
                     transport: "websocket".to_string(),
+                    downlink_congested_epoch: never_epoch(),
                 })
                 .await
                 .expect("Delivery")
@@ -11331,6 +11963,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Delivery A")
@@ -11375,6 +12008,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: true,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("Delivery B")
@@ -11710,7 +12344,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11719,6 +12353,7 @@ mod tests {
             DesiredStreams::default(), // empty viewport = fail-open (forward all senders)
             empty_layer_prefs(),       // empty prefs = no-op (forward all layers)
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -11746,7 +12381,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11755,6 +12390,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 1)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -11781,7 +12417,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11790,6 +12426,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 2)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -11807,6 +12444,167 @@ mod tests {
         );
     }
 
+    // =====================================================================
+    // #1219 Half 2 — closure-level relief: the shared epoch drives shedding +
+    // the one-shot emit (the integration of the windowed signal with the
+    // forwarding closure). Build the closure with an ARMED epoch and assert the
+    // closure reads it.
+    // =====================================================================
+
+    /// Build a `handle_msg` closure whose shared downlink epoch is ARMED (stamped
+    /// "now"), i.e. the receiver is currently inside the relief window — exactly
+    /// the state `on_outbound_drop` produces on a congested receiver.
+    // Same `(impl Fn, Arc<AtomicBool>)` return shape as `handle_msg`; the
+    // `impl Fn` half cannot be hoisted into a `type` alias (mirrors handle_msg).
+    #[allow(clippy::type_complexity)]
+    fn handle_msg_congested(
+        recipient: actix::Recipient<Message>,
+        room: &str,
+        session: u64,
+    ) -> (
+        impl Fn(async_nats::Message, Option<&PacketWrapper>) -> Result<(), std::io::Error>,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let epoch = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+            crate::actors::session_logic::downlink_congested_epoch_now(),
+        ));
+        handle_msg(
+            recipient,
+            room.to_string(),
+            session,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            epoch,
+        )
+    }
+
+    /// A congested receiver (armed epoch) must SHED a non-base VIDEO layer BEFORE
+    /// delivery and raise the one-shot DOWNLINK_CONGESTION emit flag on the rising
+    /// edge.
+    ///
+    /// MUTATION PROOF: changing the closure's shed gate from `congested_now` back
+    /// to the old mailbox-`Full` state machine (or to `false`) forwards the
+    /// non-base VIDEO, so `count == 0` FAILS. Dropping the `emit_flag.store(true)`
+    /// on the rising edge leaves the flag false, so the emit assert FAILS.
+    #[actix_rt::test]
+    async fn test_handle_msg_sheds_nonbase_video_when_downlink_congested() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let (handler, emit) = handle_msg_congested(actor.recipient(), "dl-room", 100);
+
+        // Non-base (layer 2) VIDEO from source 999 — survives the (empty) layer
+        // prefs, so only the relief shed can drop it.
+        let nats_msg = make_nats_message(
+            "room.dl-room.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "a congested receiver must SHED non-base VIDEO before delivery (#1219 Half 2)"
+        );
+        assert!(
+            emit.load(std::sync::atomic::Ordering::Relaxed),
+            "the rising edge of congestion must raise the one-shot DOWNLINK_CONGESTION emit flag"
+        );
+    }
+
+    /// INVARIANT: even while congested, AUDIO and the base VIDEO layer (0) are
+    /// NEVER shed — only non-base VIDEO/SCREEN is.
+    ///
+    /// MUTATION PROOF: broadening the shed predicate to include AUDIO or layer 0
+    /// would drop one of these and flip the corresponding `count == N` assert.
+    #[actix_rt::test]
+    async fn test_handle_msg_congested_never_sheds_audio_or_base_layer() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        let (handler, _emit) = handle_msg_congested(actor.recipient(), "dl-room2", 200);
+
+        // AUDIO (any layer) must be forwarded even when congested.
+        let audio = make_nats_message(
+            "room.dl-room2.999",
+            make_media_packet_bytes_with_layer(MediaKind::AUDIO, 999, 2),
+        );
+        let p1 = parse_pw(&audio);
+        handler(audio, p1.as_ref()).expect("ok");
+
+        // Base-layer (0) VIDEO must be forwarded even when congested.
+        let base_video = make_nats_message(
+            "room.dl-room2.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 0),
+        );
+        let p2 = parse_pw(&base_video);
+        handler(base_video, p2.as_ref()).expect("ok");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            2,
+            "AUDIO and base-layer VIDEO must NEVER be shed, even under downlink congestion"
+        );
+    }
+
+    /// A HEALTHY receiver (NEVER epoch) forwards non-base VIDEO and never raises
+    /// the emit flag — the relief path is inert when the downlink is fine.
+    ///
+    /// MUTATION PROOF: if the closure shed (or emitted) unconditionally rather
+    /// than gating on the windowed epoch, `count == 1` (or the no-emit assert)
+    /// FAILS.
+    #[actix_rt::test]
+    async fn test_handle_msg_healthy_forwards_nonbase_video_and_does_not_emit() {
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // never_epoch() == NEVER sentinel → not congested.
+        let (handler, emit) = handle_msg(
+            actor.recipient(),
+            "dl-room3".to_string(),
+            300,
+            false,
+            "recv".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            never_epoch(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.dl-room3.999",
+            make_media_packet_bytes_with_layer(MediaKind::VIDEO, 999, 2),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            1,
+            "a healthy receiver must forward non-base VIDEO (relief is inert)"
+        );
+        assert!(
+            !emit.load(std::sync::atomic::Ordering::Relaxed),
+            "a healthy receiver must never raise the DOWNLINK_CONGESTION emit flag"
+        );
+    }
+
     #[actix_rt::test]
     async fn test_handle_msg_layer_zero_always_forwarded() {
         // simulcast_layer_id == 0 (base / un-upgraded publisher) is ALWAYS
@@ -11818,7 +12616,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11827,6 +12625,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 2)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -11857,7 +12656,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -11866,6 +12665,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO)
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // AUDIO layer 2 with only a VIDEO preference for 999 → forward.
@@ -11932,7 +12732,7 @@ mod tests {
 
         // Unique room → fresh, isolated counter series.
         let room = "per-layer-room-l2";
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             room.to_string(),
             100,
@@ -11943,6 +12743,7 @@ mod tests {
             // and is forwarded.
             layer_prefs_with(&[(999, 2)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -11990,7 +12791,7 @@ mod tests {
         .start();
 
         let room = "per-layer-room-drop";
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             room.to_string(),
             100,
@@ -12001,6 +12802,7 @@ mod tests {
             // DROPPED by the layer filter.
             layer_prefs_with(&[(999, 0)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -12040,7 +12842,7 @@ mod tests {
         .start();
 
         let room = "per-layer-room-other";
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             room.to_string(),
             100,
@@ -12051,6 +12853,7 @@ mod tests {
             // forged-id packet reaches the per-layer counter.
             empty_layer_prefs(),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // A forged layer id well above the real ladder.
@@ -12222,7 +13025,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12231,6 +13034,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 0)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -12258,7 +13062,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12267,6 +13071,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with_kinds(&[(999, 3 /* SCREEN */, 1)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -12294,7 +13099,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12303,6 +13108,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with_kinds(&[(999, 2 /* AUDIO */, 0)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -12331,7 +13137,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12340,6 +13146,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with_kinds(&[(999, 1 /* VIDEO */, 2), (999, 3 /* SCREEN */, 0)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // VIDEO layer 2 matches the VIDEO pref → forward.
@@ -12377,7 +13184,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12386,6 +13193,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 1)]),
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -12419,7 +13227,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12428,6 +13236,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 1)]), // keyed (999, VIDEO) only
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // SCREEN layer 2 with only a VIDEO preference for 999 → forward (the
@@ -12461,7 +13270,7 @@ mod tests {
         }
         .start();
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12470,6 +13279,7 @@ mod tests {
             DesiredStreams::default(),
             layer_prefs_with(&[(999, 0)]), // (999, VIDEO) → desired layer 0 (base only)
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Layer 2 from 999 must be DROPPED (preference selects base 0, layer 2 != 0).
@@ -12531,7 +13341,7 @@ mod tests {
              path takes the read lock and exercises the fail-open arm"
         );
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12540,6 +13350,7 @@ mod tests {
             DesiredStreams::default(),
             prefs,
             "websocket".to_string(),
+            never_epoch(),
         );
 
         // Layer 2 from 999: the preference selects layer 1, so WITHOUT the
@@ -12665,7 +13476,7 @@ mod tests {
         let prefs = empty_layer_prefs();
         assert!(!prefs.has_any(), "precondition: prefs start empty");
 
-        let handler = handle_msg(
+        let (handler, _emit_downlink_congestion) = handle_msg(
             actor.recipient(),
             "lp-room".to_string(),
             100,
@@ -12674,6 +13485,7 @@ mod tests {
             DesiredStreams::default(),
             prefs,
             "websocket".to_string(),
+            never_epoch(),
         );
 
         let nats_msg = make_nats_message(
@@ -14017,6 +14829,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: false,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("JoinRoom delivery should succeed")
@@ -14224,6 +15037,7 @@ mod tests {
                 is_host: false,
                 end_on_host_leave: false,
                 transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
             })
             .await
             .expect("JoinRoom delivery should succeed")

@@ -3540,6 +3540,79 @@ impl Inner {
                 // VIEWPORT, a client should never receive one; ignore it
                 // defensively if it ever appears.
             }
+            Ok(PacketType::DOWNLINK_CONGESTION) => {
+                // DOWNLINK_CONGESTION is a relay -> receiver ONLY control packet
+                // (#1219 Half 2): the relay emits it when THIS receiver's downlink
+                // is congested (its bounded outbound channel overflowed, as
+                // observed by the relay's windowed CongestionTracker).
+                // The relay's emergency frame-shedding is transient; to make it
+                // DURABLE we step every connected peer's RECEIVER-side LayerChooser
+                // down one rung and publish a LAYER_PREFERENCE asking the relay for
+                // lower layers — so it forwards less to us until we recover.
+                //
+                // RECEIVER-ONLY SCOPE: this touches ONLY `peer_decode_manager`
+                // (the layers WE request from the relay for the streams we receive)
+                // plus the layer-preference publish path. It deliberately does NOT
+                // touch the LOCAL publisher's encoder (no congestion_step_down_flag,
+                // CameraEncoder, EncoderBitrateController, audio ceiling, etc.).
+                // Cutting our own encoder here would re-collapse our OUTBOUND stream
+                // for the WHOLE ROOM — the exact bug #1219 Half 1 fixed. This is
+                // about what I REQUEST for myself, never what I SEND to others.
+                //
+                // We are already inside `&mut self` (Inner) here, so we use direct
+                // field access — NOT the Weak<Inner> + try_borrow_mut dance the
+                // standalone early-seed timer uses (that would double-borrow panic).
+                // This mirrors the in-Inner publish in `set_receive_layer_bounds`.
+                //
+                // Field observability: the relay logs the EMIT; the client logs
+                // RECEIPT. Not WT-gated — the relay already decided, on whichever
+                // transport this client elected (WS or WT alike).
+                //
+                // Self-target check (defense-in-depth, mirroring CONGESTION and
+                // LAYER_HINT): the relay stamps THIS receiver's session_id and
+                // publishes to our own NATS subject, but the wildcard `room.{room}.*`
+                // fan-out means every session sees every packet, so we must confirm
+                // the embedded session_id is OURS before acting. A cross-session
+                // DOWNLINK_CONGESTION is noise — acting on it would step down our
+                // receive preferences in response to a PEER's congestion.
+                let is_self_targeted = self.own_session_id == Some(response.session_id)
+                    || self.session_id_history.contains(&response.session_id);
+
+                if !is_self_targeted {
+                    debug!(
+                        "Ignoring cross-session DOWNLINK_CONGESTION signal for session {} (our session: {:?})",
+                        response.session_id, self.own_session_id,
+                    );
+                } else {
+                    warn!(
+                        "Received DOWNLINK_CONGESTION signal from relay — downlink saturated; \
+                         stepping down receive layer preferences (#1219 Half 2)"
+                    );
+                    let now_ms = js_sys::Date::now() as u64;
+                    // Copy snapshot of the user's receive bounds to avoid aliasing the
+                    // `&mut peer_decode_manager` borrow below.
+                    let bounds = self.receive_layer_bounds;
+                    // Synthetic forced-congestion step-down: feeds a synthetic congested
+                    // sample into each peer's chooser, independent of the real (zero on
+                    // lossless transports) `last_video_downlink`. The early-seed primitive
+                    // would no-op here because the real sample is not congested.
+                    self.peer_decode_manager
+                        .seed_downlink_congestion_for_connected_peers(now_ms, &bounds);
+                    // Publish the resulting (possibly held) preference via the existing
+                    // change-detected sender, exactly as `set_receive_layer_bounds` does.
+                    let desired = self
+                        .peer_decode_manager
+                        .current_desired_preferences(now_ms, &bounds);
+                    if let Some(entries) = self
+                        .layer_preference_sender
+                        .take_if_changed(&desired, now_ms)
+                    {
+                        let user_id = self.options.user_id.clone();
+                        let cc = self.connection_controller.clone();
+                        send_layer_preference_via(&cc, &user_id, entries);
+                    }
+                }
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",

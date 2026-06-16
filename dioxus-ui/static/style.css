@@ -7148,6 +7148,14 @@ html[data-theme="light"]
   color: var(--text-tertiary);
 }
 
+/* Unified diagnostics timeline (issue 173 / upstream 712). The chart body reuses
+   the `.neteq-chart-*` scroll/axis layout and the `.signal-chart-legend` checkbox
+   styling verbatim; these rules only add the drawer-local spacing so the legend
+   sits a little tighter under the overlaid timeline. */
+.unified-timeline-chart .unified-timeline-legend {
+  margin-top: 10px;
+}
+
 .signal-chart-legend {
   display: flex;
   flex-wrap: wrap;
@@ -7170,6 +7178,13 @@ html[data-theme="light"]
   cursor: pointer;
   accent-color: var(--text-tertiary);
 }
+/* Keyboard focus ring on the legend checkboxes so keyboard users can see which
+   series toggle is focused (a11y, issue 173). Matches the project's existing
+   `:focus-visible` outline idiom; benefits the shared signal-quality legend too. */
+.signal-chart-legend .legend-item input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .signal-chart-legend span {
   display: flex;
   align-items: center;
@@ -7179,6 +7194,13 @@ html[data-theme="light"]
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  display: inline-block;
+}
+/* Unified-timeline legend swatch: a short line carrying the SAME stroke + dash
+   pattern as the chart line, so the legend distinguishes series by shape (not
+   hue alone — color-blind safety, issue 173). */
+.signal-chart-legend .legend-swatch {
+  flex-shrink: 0;
   display: inline-block;
 }
 .legend-help-btn {

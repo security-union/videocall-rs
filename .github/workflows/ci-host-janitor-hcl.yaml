@@ -60,13 +60,28 @@ jobs:
         run: |
           find /tmp -maxdepth 1 -name '.tmp*' -mmin +2880 -exec rm -rf {} + 2>/dev/null || true
 
-      - name: Prune dangling docker images + build cache (API-level only)
-        # API-level prune ONLY. Do NOT rm /var/lib/docker or /var/lib/containerd — under
-        # the containerd snapshotter those are the live image store. Try without sudo
-        # first (runner is typically in the docker group); fall back to sudo, then no-op.
+      - name: Prune unused docker images + bound build cache (API-level only)
+        # This scheduled janitor is the PRIMARY owner of daemon-wide docker cleanup on the
+        # shared 4-runner host (#1247). It runs off-peak so the per-PR jobs don't have to do
+        # heavyweight pruning on their critical path.
+        #
+        # `image prune -af` (was dangling-only `-f`): the real disk hog is *tagged but unused*
+        # images — every flake.nix/Dockerfile.actix.dev change leaves the previous tagged Nix
+        # dev image orphaned, and dangling-only pruning never touches those (that gap is why
+        # the per-job backend step had to escalate to a cache-nuking `system prune -af`). `-a`
+        # reclaims them; images referenced by a running container are preserved.
+        #
+        # `builder prune --filter until=168h` (was unbounded `-f`): trim BuildKit cache older
+        # than 7 days but KEEP recent cache warm, so the multi-GB Nix image build stays fast
+        # across all 4 runners. Unbounded `builder prune -f` nuked the whole cache → cold
+        # rebuilds; bounding it reclaims the unbounded growth without that penalty.
+        #
+        # API-level prune ONLY. Do NOT rm /var/lib/docker or /var/lib/containerd — under the
+        # containerd snapshotter those are the live image store. Try without sudo first (runner
+        # is typically in the docker group); fall back to sudo, then no-op.
         run: |
-          (docker image prune -f && docker builder prune -f) \
-            || (sudo docker image prune -f && sudo docker builder prune -f) \
+          (docker image prune -af && docker builder prune -f --filter until=168h) \
+            || (sudo docker image prune -af && sudo docker builder prune -f --filter until=168h) \
             || echo "docker prune unavailable (non-fatal)"
 
       - name: Disk usage after

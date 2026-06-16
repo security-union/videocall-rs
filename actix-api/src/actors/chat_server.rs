@@ -3195,13 +3195,20 @@ impl Handler<JoinRoom> for ChatServer {
         // Joins with no `instance_id` cannot be classified as a reconnection
         // because they have no stable identity that could match a prior
         // session's pending entry — they always fall through as fresh joins.
+        let mut reconnect_display_name: Option<String> = None;
         let is_reconnection = if let Some(ref iid) = instance_id {
             let departure_key = (room.clone(), iid.clone());
             if let Some(pending) = self.pending_departures.remove(&departure_key) {
                 ctx.cancel_future(pending.spawn_handle);
 
-                // Clean up stale room_members entry from the old session
+                // Capture the old session's display_name before cleanup —
+                // it may have been updated by an in-meeting rename and is
+                // more current than the JWT's frozen-at-login display_name.
                 if let Some(members) = self.room_members.get_mut(&room) {
+                    reconnect_display_name = members
+                        .iter()
+                        .find(|m| m.session == pending.old_session && m.user_id == user_id)
+                        .map(|m| m.display_name.clone());
                     members.retain(|m| m.session != pending.old_session);
                 }
 
@@ -3230,7 +3237,9 @@ impl Handler<JoinRoom> for ChatServer {
 
         let room_clone = room.clone();
         let user_id_clone = user_id.clone();
-        let display_name_clone = display_name.clone();
+        let display_name_clone = reconnect_display_name
+            .clone()
+            .unwrap_or_else(|| display_name.clone());
         let session_id = session;
         let nc = self.nats_connection.clone();
 
@@ -3307,7 +3316,10 @@ impl Handler<JoinRoom> for ChatServer {
                 .push(RoomMemberInfo {
                     session,
                     user_id: user_id.clone(),
-                    display_name: display_name.clone(),
+                    // Prefer the in-meeting display name from the old session
+                    // (which reflects any renames) over the JWT's
+                    // frozen-at-login name.
+                    display_name: reconnect_display_name.unwrap_or_else(|| display_name.clone()),
                     is_host,
                     end_on_host_leave,
                 });
@@ -8748,7 +8760,7 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client).await.start();
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
 
         struct DummySession;
         impl Actor for DummySession {
@@ -8764,6 +8776,17 @@ mod tests {
         let instance_id = "inst-alice-1".to_string();
         let session_a: SessionId = 5001;
         let session_b: SessionId = 5002;
+
+        // Subscribe to the room system subject BEFORE either activation so that
+        // session A's PARTICIPANT_JOINED (a real, non-suppressed broadcast) is
+        // buffered alongside whatever B's activation does. Capturing A's join is
+        // the control: it proves the subscription is live, so the *absence* of
+        // B's join later is genuine suppression rather than a dead subscriber.
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
 
         // Session A joins with instance_id
         let dummy_a = DummySession.start();
@@ -8782,6 +8805,7 @@ mod tests {
 
         // Activate session A so it is registered in instance_index. Eviction
         // during B's ActivateConnection needs the forward mapping to find A.
+        // This also publishes A's (legitimate) PARTICIPANT_JOINED.
         chat_server
             .send(ActivateConnection { session: session_a })
             .await
@@ -8857,8 +8881,31 @@ mod tests {
             "Session A should have no active NATS subscription"
         );
 
-        // PARTICIPANT_JOINED suppression is consumed inside ActivateConnection
-        // (the flag is removed when the broadcast is correctly skipped).
+        // Observable suppression outcome: drain the room system subject and
+        // collect the session_id of every PARTICIPANT_JOINED broadcast. A's
+        // activation has had time to spawn its publish; the full-deadline drain
+        // also gives a (wrongly) un-suppressed B join time to land.
+        let joined =
+            collect_joined_sessions(&mut system_sub, std::time::Duration::from_millis(1500)).await;
+
+        // Control: A's join MUST be observed. If it is absent the subscription
+        // never saw any broadcast, so the session_b assertion below would be a
+        // false green — fail loudly instead.
+        assert!(
+            joined.contains(&session_a),
+            "Expected PARTICIPANT_JOINED for the surviving predecessor (session A) \
+             on the room system subject, but captured joins were: {joined:?}"
+        );
+
+        // Core assertion: the re-elected session B evicted A, so its
+        // PARTICIPANT_JOINED must be suppressed and never reach the subject.
+        // This fails if `suppress_join_broadcast.insert(session)` is removed
+        // from the eviction path in ActivateConnection.
+        assert!(
+            !joined.contains(&session_b),
+            "Re-elected session B (same-instance eviction) must NOT broadcast \
+             PARTICIPANT_JOINED, but captured joins were: {joined:?}"
+        );
     }
 
     // ------------------------------------------------------------------
@@ -9718,6 +9765,46 @@ mod tests {
         out
     }
 
+    /// Drain `sub` for the full `deadline`, returning the `session_id` carried by
+    /// every PARTICIPANT_JOINED packet observed on the room system subject.
+    ///
+    /// The eviction tests use this to prove the *observable* outcome of
+    /// `suppress_join_broadcast`: after a same-instance eviction-reconnect, the
+    /// re-elected session's join must NOT be published, while the surviving
+    /// predecessor's join IS — so a non-empty result that omits the evicting
+    /// session distinguishes "suppression worked" from "subscription was dead".
+    async fn collect_joined_sessions(
+        sub: &mut async_nats::Subscriber,
+        deadline: tokio::time::Duration,
+    ) -> Vec<u64> {
+        use std::time::Instant;
+        use tokio::time::timeout;
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let start = Instant::now();
+        let mut joined = Vec::new();
+        while start.elapsed() < deadline {
+            let remaining = deadline.saturating_sub(start.elapsed());
+            match timeout(remaining, sub.next()).await {
+                Ok(Some(msg)) => {
+                    if let Ok(wrapper) =
+                        <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                    {
+                        if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                            if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                                joined.push(inner.session_id);
+                            }
+                        }
+                    }
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        joined
+    }
+
     // ──────────────────────────────────────────────────────────────────────
     // TEST 1: Stable end_on_host_leave=true, host disconnects ->
     //         MEETING_ENDED broadcast AND internal.meeting_ended_by_host
@@ -10358,6 +10445,212 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────────────
+    // TEST: Reconnect preserves renamed display name
+    //
+    // When a user renames mid-meeting ("Alice" -> "Alice-Renamed") and then
+    // reconnects (same instance_id, within grace period), the room_members
+    // entry must keep the renamed display_name — NOT the JWT's frozen name.
+    // A new joiner arriving after the reconnection must receive the renamed
+    // display_name in the PARTICIPANT_JOINED packets sent directly to them.
+    // ──────────────────────────────────────────────────────────────────────
+    #[actix_rt::test]
+    #[serial]
+    async fn test_reconnect_preserves_renamed_display_name() {
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+        let dummy = EohlDummySession.start();
+        let session_id_1 = 20_001u64;
+        let session_id_2 = 20_002u64;
+        let session_id_3 = 20_003u64;
+        let room = "test-reconnect-display-name-preservation";
+        let alice = "alice@example.com";
+
+        // ── Step 1: Alice joins with display_name="Alice" ──────────────
+        chat_server
+            .send(Connect {
+                id: session_id_1,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id_1,
+                room: room.to_string(),
+                user_id: alice.to_string(),
+                display_name: "Alice".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("iid-rename-reconnect".to_string()),
+                is_host: false,
+                end_on_host_leave: true,
+                transport: "websocket".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id_1,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        // ── Step 2: Alice renames to "Alice-Renamed" ───────────────────
+        chat_server
+            .send(UpdateMemberDisplayName {
+                room_id: room.to_string(),
+                user_id: alice.to_string(),
+                display_name: "Alice-Renamed".to_string(),
+                session_id: session_id_1,
+            })
+            .await
+            .expect("UpdateMemberDisplayName should succeed");
+        sleep(Duration::from_millis(100)).await;
+
+        // ── Step 3: Alice disconnects (JWT still says "Alice") ─────────
+        chat_server
+            .send(Disconnect {
+                session: session_id_1,
+                room: room.to_string(),
+                user_id: alice.to_string(),
+                display_name: "Alice".to_string(),
+                is_guest: false,
+                observer: false,
+                is_host: false,
+                end_on_host_leave: true,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // Wait 1s — within the 3s grace period.
+        sleep(Duration::from_secs(1)).await;
+
+        // ── Step 4: Alice reconnects with same instance_id ─────────────
+        // JWT still carries display_name="Alice" (frozen at login).
+        chat_server
+            .send(Connect {
+                id: session_id_2,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id_2,
+                room: room.to_string(),
+                user_id: alice.to_string(),
+                display_name: "Alice".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some("iid-rename-reconnect".to_string()),
+                is_host: false,
+                end_on_host_leave: true,
+                transport: "websocket".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id_2,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(300)).await;
+
+        // ── Step 5: Bob joins — capture messages sent to him ───────────
+        let received: Arc<Mutex<Vec<bytes::Bytes>>> = Arc::new(Mutex::new(Vec::new()));
+
+        struct CapturingSession {
+            received: Arc<Mutex<Vec<bytes::Bytes>>>,
+        }
+        impl Actor for CapturingSession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for CapturingSession {
+            type Result = ();
+            fn handle(&mut self, msg: Message, _ctx: &mut Self::Context) {
+                self.received.lock().unwrap().push(msg.msg);
+            }
+        }
+
+        let capturing = CapturingSession {
+            received: received.clone(),
+        }
+        .start();
+
+        chat_server
+            .send(Connect {
+                id: session_id_3,
+                addr: capturing.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: session_id_3,
+                room: room.to_string(),
+                user_id: "bob@example.com".to_string(),
+                display_name: "Bob".to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: None,
+                is_host: false,
+                end_on_host_leave: true,
+                transport: "websocket".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id_3,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+        sleep(Duration::from_millis(500)).await;
+
+        // ── Step 6: Parse captured messages — find Alice's PARTICIPANT_JOINED ──
+        let msgs = received.lock().unwrap();
+        let mut found_alice = false;
+        for raw in msgs.iter() {
+            if let Ok(wrapper) = <PacketWrapper as ProtobufMessage>::parse_from_bytes(raw) {
+                if wrapper.packet_type == PacketType::MEETING.into() {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                            let target = String::from_utf8_lossy(&inner.target_user_id);
+                            if target == alice {
+                                let dn = String::from_utf8_lossy(&inner.display_name);
+                                assert_eq!(
+                                    dn, "Alice-Renamed",
+                                    "Reconnected user should have renamed display name, not JWT name"
+                                );
+                                found_alice = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            found_alice,
+            "Bob should have received PARTICIPANT_JOINED for Alice"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
     // TEST 5: Mid-meeting toggle, NON-host disconnect -> the host's
     //         RoomMemberInfo.end_on_host_leave field gets updated by the
     //         settings-update consumer. Locks in the cache-update path
@@ -10979,13 +11272,22 @@ mod tests {
             .await
             .expect("Failed to connect to NATS");
 
-        let chat_server = ChatServer::new(nats_client).await.start();
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
         let dummy = EohlDummySession.start();
         let session_a: SessionId = 9_720;
         let session_b: SessionId = 9_721;
         let room = "issue-502-iid-path";
         let user = "dave@example.com";
         let iid = "inst-stable".to_string();
+
+        // Subscribe to the room system subject BEFORE either activation. A's
+        // PARTICIPANT_JOINED is the control (proves the subscription is live);
+        // B's must be absent because the eviction-reconnect suppresses it.
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let mut system_sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
 
         // Session A with instance_id.
         chat_server
@@ -11066,8 +11368,28 @@ mod tests {
             "In-tab reconnect (same instance_id) must still leave one member"
         );
         assert_eq!(members[0].session, session_b);
-        // PARTICIPANT_JOINED suppression is consumed inside ActivateConnection
-        // (the flag is removed when the broadcast is correctly skipped).
+
+        // Observable suppression outcome: drain the room system subject and
+        // collect the session_id of every PARTICIPANT_JOINED broadcast.
+        let joined = collect_joined_sessions(&mut system_sub, Duration::from_millis(1500)).await;
+
+        // Control: A's join MUST be observed, otherwise the subscription saw
+        // nothing and the session_b check would be a false green.
+        assert!(
+            joined.contains(&session_a),
+            "Expected PARTICIPANT_JOINED for the surviving predecessor (session A), \
+             but captured joins were: {joined:?}"
+        );
+
+        // Core assertion: the in-tab reconnect (same instance_id) evicted A, so
+        // session B's PARTICIPANT_JOINED must be suppressed. Fails if
+        // `suppress_join_broadcast.insert(session)` is removed from the eviction
+        // path in ActivateConnection.
+        assert!(
+            !joined.contains(&session_b),
+            "Re-elected session B (same-instance reconnect) must NOT broadcast \
+             PARTICIPANT_JOINED, but captured joins were: {joined:?}"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -404,6 +404,11 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                             "playout_paint_lag_ms",
                             stats_msg.playout_paint_lag_ms.unwrap_or(0.0)
                         ),
+                        // Resync-to-live governor skip count (#1252): cumulative counter, default 0.
+                        metric!(
+                            "playout_skip_to_live_total",
+                            stats_msg.playout_skip_to_live_total.unwrap_or(0)
+                        ),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);

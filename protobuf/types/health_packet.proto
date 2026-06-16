@@ -69,6 +69,15 @@ message VideoStats {
   // (frames_emitted − frames_painted) so the FIFO delay of the stats message
   // itself does not hide the backlog. Reported only while fps_received > 0.
   double playout_paint_lag_ms = 7;
+  // Cumulative count of resync-to-live governor skips (#1252): how many times the
+  // decode-side governor jumped this stream forward to live to shed accumulated
+  // lag. A COUNTER: it rises and is preserved across the jitter buffer's flush(),
+  // but resets to 0 when the decode pipeline is rebuilt (reset_pipeline() on
+  // decoder-error recovery), so consume via increase()/rate(). Unlike the ms gauges
+  // above it is folded UNCONDITIONALLY, not gated on fps_received > 0, because a
+  // counter must keep reporting even at fps 0. A rising value proves the governor
+  // fired in the field.
+  uint64 playout_skip_to_live_total = 8;
 }
 
 message PeerStats {

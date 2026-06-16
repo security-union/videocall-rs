@@ -14,6 +14,7 @@ mod pkce;
 mod provider_config;
 mod routing;
 mod theme;
+mod theme_file;
 mod types;
 
 use crate::components::search_modal::SearchVisibleCtx;

@@ -906,6 +906,16 @@ impl HealthReporter {
                                 video_stats["playout_paint_lag_ms"] = json!(v);
                             }
                         }
+                        // Resync-to-live governor skips (#1252): lifetime cumulative COUNTER (u64),
+                        // not an ms gauge. Stored in the camera/screen bucket that emitted the
+                        // worker stat. The health packet currently exports this counter from the
+                        // camera video_stats path only; screen-share export can be added when the
+                        // server consumes the sibling screen_video_stats playout fields.
+                        "playout_skip_to_live_total" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                video_stats["playout_skip_to_live_total"] = json!(v);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1864,6 +1874,18 @@ impl HealthReporter {
                         vs.playout_paint_lag_ms = v;
                     }
                 }
+                // Resync-to-live governor skips (#1252): folded UNCONDITIONALLY for camera video,
+                // OUTSIDE the fps_received > 0 gate above. The ms gauges are gated because a
+                // paused/hidden tile decodes nothing and any residual span isn't user-perceived
+                // latency. This is a cumulative COUNTER, not a gauge — it must keep reporting its
+                // lifetime value even when fps == 0, or a stream that fell idle would appear to
+                // "un-fire" the governor.
+                if let Some(v) = video
+                    .get("playout_skip_to_live_total")
+                    .and_then(|v| v.as_u64())
+                {
+                    vs.playout_skip_to_live_total = v;
+                }
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 
                 // Extract decode_errors_per_sec (windowed rate) from camera video stats
@@ -1888,7 +1910,9 @@ impl HealthReporter {
                 }
             }
 
-            // Screen share video mapping (new field, separate from camera)
+            // Screen share video mapping (new field, separate from camera). This mirrors the
+            // pre-existing screen export surface: fps/buffered/decoded/bitrate only. The camera
+            // playout/governor fields above are not exported for screen share in this pass.
             if let Some(screen) = &health_data.last_screen_stats {
                 let mut svs = PbVideoStats::new();
                 if let Some(v) = screen.get("fps_received").and_then(|v| v.as_f64()) {
@@ -2447,6 +2471,7 @@ mod tests {
             "playout_latency_ms": 1500.0,
             "playout_stage1_span_ms": 1200.0,
             "playout_paint_lag_ms": 1800.0,
+            "playout_skip_to_live_total": 4u64,
         }));
 
         let mut health_map = HashMap::new();
@@ -2558,6 +2583,47 @@ mod tests {
 
         assert_eq!(stats.fps_received, 0.0);
         assert_eq!(stats.playout_paint_lag_ms, 0.0);
+    }
+
+    /// #1252 resync governor counter folds at fps > 0 — like every other field. The DISTINCT
+    /// behavior (folds even at fps == 0) is pinned by the sibling test below; this one guards the
+    /// ordinary case so a regression that drops the field entirely is also caught.
+    #[test]
+    fn playout_skip_to_live_total_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_skip_to_live_total, 4);
+    }
+
+    /// #1252 resync governor counter folds UNCONDITIONALLY — even at fps == 0. This is the load-
+    /// bearing behavioral difference from the ms gauges (which are gated on fps_received > 0 and so
+    /// read 0 here, asserted in `playout_*_omitted_when_fps_received_zero`). A cumulative counter
+    /// must keep reporting its lifetime value when the stream falls idle, or the governor would
+    /// appear to "un-fire". Mutation check: moving the counter fold inside the `fps_received > 0`
+    /// guard makes this assert read 0 and fail.
+    #[test]
+    fn playout_skip_to_live_total_folds_even_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        // ms gauges are gated to 0 at fps 0; the COUNTER is NOT — it still reports its lifetime value.
+        assert_eq!(stats.playout_paint_lag_ms, 0.0);
+        assert_eq!(stats.playout_skip_to_live_total, 4);
     }
 
     /// Build a health packet whose peer carries NetEQ audio stats. `playout_latency_ms` is

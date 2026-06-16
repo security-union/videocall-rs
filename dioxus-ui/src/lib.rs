@@ -19,4 +19,5 @@ pub mod pkce;
 pub mod provider_config;
 pub mod routing;
 pub mod theme;
+pub mod theme_file;
 pub mod types;

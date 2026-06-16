@@ -40,7 +40,9 @@ use crate::server_diagnostics::{
 };
 use crate::session_manager::SessionManager;
 use actix::Addr;
+use lazy_static::lazy_static;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, trace, warn};
@@ -49,6 +51,69 @@ use uuid::Uuid;
 pub type SessionId = u64;
 pub type RoomId = String;
 pub type UserId = String;
+
+lazy_static! {
+    /// Process-global monotonic origin shared by the receiver-downlink relief
+    /// signal (#1219 Half 2). The transport actor (which owns the per-receiver
+    /// [`CongestionTracker`]) and the per-receiver NATS fan-out closure in
+    /// `chat_server::handle_msg` run on different tasks, so they cannot share an
+    /// `Instant` directly. Instead each side measures time as
+    /// `PROCESS_START.elapsed()` and exchanges a `u64` millis "epoch" through a
+    /// shared `AtomicU64` (see [`SessionLogic::downlink_congested_epoch`] /
+    /// [`downlink_congested_epoch_now`]). Both sides agree on the same origin so
+    /// the closure's windowed-decay read matches the writer's clock.
+    static ref PROCESS_START: Instant = Instant::now();
+}
+
+/// Sentinel for [`SessionLogic::downlink_congested_epoch`] meaning "this
+/// receiver has never crossed downlink congestion". Stored values are always
+/// `>= 1` (see [`downlink_congested_epoch_now`]), so `0` can never collide with
+/// a real epoch even in the first millisecond of process life.
+pub const DOWNLINK_EPOCH_NEVER: u64 = 0;
+
+/// Current monotonic epoch (millis since the process-global `PROCESS_START`
+/// origin, offset by `+1`) for stamping the shared receiver-downlink congestion
+/// signal. The `+1` keeps every real epoch strictly greater than the
+/// [`DOWNLINK_EPOCH_NEVER`] sentinel.
+pub fn downlink_congested_epoch_now() -> u64 {
+    (PROCESS_START.elapsed().as_millis() as u64).saturating_add(1)
+}
+
+/// Whether a receiver whose last downlink-congestion crossing was stamped at
+/// `epoch` (a value produced by [`downlink_congested_epoch_now`], or
+/// [`DOWNLINK_EPOCH_NEVER`]) is still inside the relief window `window` as of
+/// now. This is the READ side of the shared signal used by the fan-out closure:
+/// it makes shed-entry and shed-exit BOTH a time-based decay of the most recent
+/// real receiver-downlink drop, so a healthy link recovers automatically once
+/// `window` elapses with no fresh crossing (no consecutive-success counter that
+/// a single stray drop could reset — the #1219 Half-2 B2 wedge).
+pub fn downlink_epoch_is_active(epoch: u64, window: std::time::Duration) -> bool {
+    if epoch == DOWNLINK_EPOCH_NEVER {
+        return false;
+    }
+    let now = downlink_congested_epoch_now();
+    now.saturating_sub(epoch) <= window.as_millis() as u64
+}
+
+/// WRITE side of the #1219 Half-2 receiver-downlink relief signal (B1). When the
+/// windowed [`CongestionTracker`] reports this receiver `is_actively_congested()`
+/// — i.e. its REAL downlink (the bounded outbound channel) overflowed enough to
+/// cross the drop threshold within the tracker's window — stamp `epoch` with the
+/// current monotonic epoch so the fan-out closure can read it via
+/// [`downlink_epoch_is_active`] and shed/emit. Returns whether it stamped (so a
+/// caller / test can observe the decision). Refreshing on every congested drop
+/// (not only the threshold crossing) keeps the window alive while a receiver
+/// stays marginally congested; the closure debounces the actual emit to once per
+/// episode. Sub-threshold drops do NOT stamp — relief keys off the windowed
+/// tracker, never a single raw drop.
+pub fn stamp_downlink_epoch_if_congested(tracker: &CongestionTracker, epoch: &AtomicU64) -> bool {
+    if tracker.is_actively_congested() {
+        epoch.store(downlink_congested_epoch_now(), Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
 
 /// Connection state for session management during election
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,6 +399,21 @@ pub struct SessionLogic {
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
     pub keyframe_limiter: KeyframeRequestLimiter,
+    /// Shared receiver-downlink-congestion signal for #1219 Half 2.
+    ///
+    /// Written by THIS transport actor in [`SessionLogic::on_outbound_drop`]
+    /// (the REAL per-receiver downlink backpressure surface — the bounded
+    /// `outbound_tx` channel overflow that the windowed [`CongestionTracker`]
+    /// observes), and READ by the per-receiver NATS fan-out closure in
+    /// `chat_server::handle_msg` to decide emergency layer shedding + the
+    /// one-shot DOWNLINK_CONGESTION emit. The same `Arc` is handed to the
+    /// closure via [`JoinRoom`](crate::messages::server::JoinRoom).
+    ///
+    /// Holds a monotonic millis epoch ([`downlink_congested_epoch_now`]) of the
+    /// most recent crossing, or [`DOWNLINK_EPOCH_NEVER`]. The closure applies a
+    /// time-decaying window to it, so this is a level (not edge) signal: it
+    /// never needs an explicit "clear" write when the link recovers.
+    pub downlink_congested_epoch: Arc<AtomicU64>,
 }
 
 impl SessionLogic {
@@ -377,6 +457,7 @@ impl SessionLogic {
             end_on_host_leave,
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
+            downlink_congested_epoch: Arc::new(AtomicU64::new(DOWNLINK_EPOCH_NEVER)),
         }
     }
 
@@ -458,6 +539,10 @@ impl SessionLogic {
             is_host: self.is_host,
             end_on_host_leave: self.end_on_host_leave,
             transport: self.transport.clone(),
+            // #1219 Half 2: hand the per-receiver downlink-congestion signal to
+            // the fan-out closure. The closure reads it to drive emergency
+            // shedding; this actor writes it from `on_outbound_drop`.
+            downlink_congested_epoch: Arc::clone(&self.downlink_congested_epoch),
         }
     }
 
@@ -763,8 +848,35 @@ impl SessionLogic {
     /// KEYFRAME_REQUEST rate limiter (#979) so a congested receiver can recover
     /// its own frozen video faster. That is a per-receiver downlink response
     /// and is correct to keep; only the sender-keyed CONGESTION emit is removed.
+    ///
+    /// ## #1219 (Half 2) — this is also the TRIGGER for receiver-downlink relief
+    ///
+    /// This callback is the GENUINE receiver-downlink backpressure surface: it
+    /// fires only when the bounded `outbound_tx` channel to THIS one receiver
+    /// overflows (a slow socket / parked event loop), which is exactly the
+    /// per-receiver "slow downlink" condition Half 2 must react to — NOT the
+    /// relay-side actor-mailbox `Full` (room-wide fan-out burst / scheduling
+    /// pressure) that an earlier draft keyed off. When the windowed
+    /// [`CongestionTracker`] reports `is_actively_congested()` we stamp the
+    /// shared [`downlink_congested_epoch`](Self::downlink_congested_epoch) with
+    /// the current monotonic epoch. The fan-out closure
+    /// (`chat_server::handle_msg`) reads that epoch against a relief window to
+    /// (a) shed this receiver's non-base VIDEO/SCREEN layers and (b) emit one
+    /// DOWNLINK_CONGESTION packet so the client steps its own receive layers
+    /// down. Because the signal is a windowed, time-decaying LEVEL, recovery is
+    /// automatic once the window elapses with no fresh crossing — no
+    /// consecutive-success counter that a stray drop could reset. Receiver-only
+    /// scope is preserved: this never touches the publisher's encoder.
     pub fn on_outbound_drop(&mut self, sender_session_id: u64, sender_user_id: &[u8]) {
-        if let Some(sender_sid) = self.congestion_tracker.record_drop(sender_session_id) {
+        let crossed = self.congestion_tracker.record_drop(sender_session_id);
+
+        // #1219 Half 2: refresh the shared downlink-congestion epoch from the
+        // WINDOWED tracker on every drop. Extracted into a free function so the
+        // wiring is unit-testable without standing up a full `SessionLogic`
+        // (which needs NATS) — see `stamp_downlink_epoch_if_congested`.
+        stamp_downlink_epoch_if_congested(&self.congestion_tracker, &self.downlink_congested_epoch);
+
+        if let Some(sender_sid) = crossed {
             // #1219 (Half 1): intentionally do NOT publish a sender-keyed
             // CONGESTION signal here. See the doc comment above. `record_drop`
             // still ran (updating `last_congestion` for the #979 keyframe-relax
@@ -1440,6 +1552,84 @@ mod tests {
             received, 0,
             "#1219 Half 1: receiver-downlink overflow must NOT publish a \
              sender-keyed CONGESTION packet (got {received} on {subject})"
+        );
+    }
+
+    // =====================================================================
+    // #1219 Half 2 WRITER SIDE — the shared downlink-epoch stamp (B1)
+    // =====================================================================
+    //
+    // These exercise `stamp_downlink_epoch_if_congested` — the exact decision
+    // `SessionLogic::on_outbound_drop` makes — against a real `CongestionTracker`
+    // with NO NATS dependency, so they actually run in this environment (the
+    // `SessionLogic`-level NATS test would SKIP). `on_outbound_drop` is a thin
+    // wrapper over this function, so a regression in the wiring it pins surfaces
+    // here.
+
+    /// Sub-threshold drops must NOT arm relief: B1 keys off the windowed
+    /// `CongestionTracker`, never a single raw drop. The stamp stays at the
+    /// `NEVER` sentinel until the tracker crosses its threshold.
+    ///
+    /// MUTATION PROOF: making `stamp_downlink_epoch_if_congested` stamp
+    /// unconditionally (dropping the `is_actively_congested()` gate) arms the
+    /// epoch after the first drop, so this test's post-sub-threshold `== NEVER`
+    /// assert FAILS.
+    #[test]
+    fn stamp_downlink_epoch_skips_below_threshold() {
+        let mut tracker = CongestionTracker::new();
+        let epoch = AtomicU64::new(DOWNLINK_EPOCH_NEVER);
+        let sender = 7777u64;
+
+        // One short of the windowed crossing.
+        for _ in 0..(CONGESTION_DROP_THRESHOLD - 1) {
+            tracker.record_drop(sender);
+            assert!(
+                !stamp_downlink_epoch_if_congested(&tracker, &epoch),
+                "sub-threshold drop must not stamp the downlink epoch"
+            );
+        }
+        assert_eq!(
+            epoch.load(Ordering::Relaxed),
+            DOWNLINK_EPOCH_NEVER,
+            "sub-threshold drops must leave the epoch unarmed (B1: windowed \
+             tracker gates relief, not a single drop)"
+        );
+    }
+
+    /// Crossing the windowed `CongestionTracker` threshold stamps a real
+    /// (non-`NEVER`) epoch that reads as active within the production relief
+    /// window — the exact value the fan-out closure consumes.
+    ///
+    /// MUTATION PROOF: removing the `epoch.store(...)` inside
+    /// `stamp_downlink_epoch_if_congested` (or having it return without stamping)
+    /// leaves the epoch at `NEVER`, so the `!= NEVER` and `is_active` asserts
+    /// FAIL.
+    #[test]
+    fn stamp_downlink_epoch_arms_on_threshold_crossing() {
+        let mut tracker = CongestionTracker::new();
+        let epoch = AtomicU64::new(DOWNLINK_EPOCH_NEVER);
+        let sender = 7777u64;
+
+        for _ in 0..CONGESTION_DROP_THRESHOLD {
+            tracker.record_drop(sender);
+        }
+        assert!(
+            tracker.is_actively_congested(),
+            "test setup: crossing the threshold must flag the tracker congested"
+        );
+        assert!(
+            stamp_downlink_epoch_if_congested(&tracker, &epoch),
+            "a congested tracker must stamp the downlink epoch"
+        );
+
+        let stamped = epoch.load(Ordering::Relaxed);
+        assert_ne!(
+            stamped, DOWNLINK_EPOCH_NEVER,
+            "crossing downlink congestion must stamp a real epoch for the closure"
+        );
+        assert!(
+            downlink_epoch_is_active(stamped, crate::constants::RECEIVER_DOWNLINK_RELIEF_WINDOW),
+            "the stamped epoch must read as active within the relief window"
         );
     }
 }

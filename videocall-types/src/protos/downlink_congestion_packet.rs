@@ -28,10 +28,12 @@ const _PROTOBUF_VERSION_CHECK: () = ::protobuf::VERSION_3_7_2;
 ///  signal).
 ///
 ///  Carried inside a PacketWrapper whose `packet_type` is DOWNLINK_CONGESTION.
-///  The relay emits this when a receiver's inbound fan-out mailbox has been
-///  dropping packets (consecutive drops cross DOWNLINK_CONGESTION_DROP_THRESHOLD).
-///  The receiver should reduce its layer preferences to adapt to available
-///  downlink bandwidth.
+///  The relay emits this (once per episode) when a receiver's REAL downlink
+///  backpressure surface — its bounded per-session outbound channel overflowing
+///  on a slow socket — drives the windowed CongestionTracker across its drop
+///  threshold (the same signal the #979 keyframe-relax path uses), staying armed
+///  for RECEIVER_DOWNLINK_RELIEF_WINDOW. The receiver should reduce its layer
+///  preferences to adapt to available downlink bandwidth.
 ///
 ///  SCOPE: there is intentionally NO source/session id in this message. The
 ///  packet is delivered on the RECEIVER's OWN per-session subject

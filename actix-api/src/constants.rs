@@ -723,47 +723,51 @@ pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_se
 // Receiver Downlink Congestion (#1219 Half 2)
 // ---------------------------------------------------------------------------
 
-/// Consecutive inbound-mailbox drops (per-receiver) before entering downlink
-/// shedding mode (#1219 Half 2).
+/// How recently THIS receiver's downlink must have overflowed for the relay to
+/// keep it in downlink-relief mode (#1219 Half 2).
 ///
-/// When a receiver's Actix mailbox fills repeatedly (TCP socket stalled / actor
-/// event-loop parked on a slow link), the fan-out closure increments a per-call
-/// drop counter. Once it reaches this threshold the closure enters "shedding
-/// mode": non-base-layer simulcast VIDEO/SCREEN packets are discarded BEFORE
-/// `try_send`, reducing volume ~2-3x and giving the mailbox headroom to drain.
-/// A DOWNLINK_CONGESTION control packet is also emitted (once) so the client's
-/// LayerChooser can formally step down.
+/// ## What drives the signal (B1)
 ///
-/// `10` allows transient scheduling bursts (a few dropped packets during a
-/// fan-out spike) while still reacting within a few hundred milliseconds of
-/// sustained stall: at 30 fps video, 10 consecutive drops is ~330 ms of fully
-/// stalled drain — long enough to distinguish a real downlink problem from a
-/// single scheduling hiccup, short enough to intervene before the receiver's
-/// video freezes for seconds.
-pub const DOWNLINK_CONGESTION_DROP_THRESHOLD: u32 = 10;
-
-/// Consecutive successful `try_send` deliveries needed to EXIT shedding mode
-/// after entering it (#1219 Half 2).
+/// The relay enters relief mode for a receiver when that receiver's REAL
+/// downlink backpressure surface — the bounded per-session `outbound_tx`
+/// channel overflowing on a slow socket — drives the windowed
+/// [`CongestionTracker`](crate::actors::session_logic::CongestionTracker) across
+/// its drop threshold (`is_actively_congested()`). The transport actor stamps a
+/// monotonic epoch into a shared atomic on each such crossing
+/// (`SessionLogic::on_outbound_drop`), and the per-receiver fan-out closure
+/// reads it against THIS window. While the most recent crossing is within the
+/// window, the closure (a) discards non-base-layer VIDEO/SCREEN BEFORE
+/// `try_send`, giving the downlink headroom to drain, and (b) emits one
+/// DOWNLINK_CONGESTION control packet so the client's LayerChooser steps its own
+/// receive layers down. AUDIO and base layer are NEVER shed.
 ///
-/// Ensures the link has genuinely recovered — not just a single lucky drain —
-/// before resuming higher layers. At 30 fps video + ~50 audio pps, 50 successes
-/// spans roughly 600 ms of clean drain at typical packet rates. This is long
-/// enough to be confident the stall was transient, short enough to restore full
-/// quality within ~1 second of recovery.
+/// This is DELIBERATELY NOT keyed off the relay's actor-mailbox `Full` (which an
+/// earlier draft used): the mailbox sits in front of `outbound_tx` and overflows
+/// on a room-wide fan-out / scheduling burst that says nothing about any single
+/// receiver's downlink. The `CongestionTracker` one queue downstream is the
+/// genuine per-receiver signal — the same one the #979 keyframe-relax path
+/// already trusts.
 ///
-/// DELIBERATE TRADEOFF — recovery is STRICTLY CONSECUTIVE (any single `Full`
-/// drop resets the success streak to 0 in `DownlinkShedState::on_full_drop`).
-/// On a chronically lossy downlink that drops, say, one packet every ~40 sends,
-/// the receiver may NEVER accumulate 50 clean-in-a-row and so stays in
-/// relay-side shedding (base-layer-only video) for an extended period. This is
-/// INTENTIONAL and fail-safe: such a link genuinely cannot sustain the upper
-/// layers, audio is never shed (priority-protected), and the base layer is
-/// always forwarded, so the call stays usable. A windowed/decaying success
-/// count would recover more gracefully on steady-low-loss links but risks
-/// flapping; the consecutive rule is the conservative choice. Do NOT switch to
-/// a windowed count without a netsim sweep (#1080 rig) confirming it does not
-/// oscillate on a marginal link.
-pub const DOWNLINK_CONGESTION_SUCCESS_WINDOW: u32 = 50;
+/// ## Why a windowed decay, not a consecutive-success exit (B2)
+///
+/// Relief is a windowed LEVEL: it lapses on its own once this window elapses
+/// with no fresh downlink overflow, exactly like
+/// [`KEYFRAME_CONGESTION_RELAX_WINDOW`]. There is NO strictly-consecutive
+/// success counter — an earlier draft required N clean-in-a-row deliveries to
+/// exit, which on a link with even occasional drops could reset forever and pin
+/// a perfectly healthy receiver at base-layer-only video indefinitely. A
+/// time-decaying window recovers automatically: once the receiver stops
+/// overflowing for `RECEIVER_DOWNLINK_RELIEF_WINDOW`, full layers resume.
+///
+/// ## Why 2 s
+///
+/// Set equal to [`KEYFRAME_CONGESTION_RELAX_WINDOW`] so the relay-side shed, the
+/// #979 keyframe relaxation, and the client step-down all reason about "recently
+/// congested" over the SAME horizon. 2 s is long enough that a brief stall keeps
+/// relief armed through the recovery (avoiding flap), short enough that a
+/// receiver whose downlink genuinely recovers is back to full quality within a
+/// couple of seconds.
+pub const RECEIVER_DOWNLINK_RELIEF_WINDOW: Duration = Duration::from_secs(2);
 
 #[cfg(test)]
 mod tests {

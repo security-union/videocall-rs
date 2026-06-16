@@ -184,6 +184,9 @@ pub fn forget_room_metrics(room: &str) {
     let _ = RELAY_LAYER_FORWARDED_TOTAL.remove_label_values(&[room]);
     // relay_congestion_filtered_total{room} (#1220).
     let _ = RELAY_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
+    // relay_downlink_congestion_filtered_total{room} (#1219 Half 2) — same
+    // room-keyed unicast-filter sibling; swept alongside its CONGESTION cousin.
+    let _ = RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
 
     // relay_room_bytes_total{room, direction}.
     for direction in ["inbound", "outbound"] {
@@ -1643,18 +1646,21 @@ lazy_static! {
     /// Per-receiver downlink congestion shedding episodes (entered shedding mode)
     /// (#1219 Half 2).
     ///
-    /// Incremented each time a receiver crosses the
-    /// `DOWNLINK_CONGESTION_DROP_THRESHOLD` consecutive mailbox drops and enters
-    /// shedding mode. This is the receiver-directed complement of the existing
-    /// sender-directed CONGESTION signal: it detects when the relay-to-receiver
-    /// link (not the sender-to-relay link) is saturated and the relay must shed
-    /// non-base layers to create mailbox headroom.
+    /// Incremented once on the rising edge of each episode — when this receiver's
+    /// REAL downlink backpressure (its bounded per-session outbound channel
+    /// overflowing, observed by the windowed `CongestionTracker`) crosses into
+    /// active congestion and the relay begins shedding non-base layers. This is
+    /// the receiver-directed complement of the existing sender-directed
+    /// CONGESTION signal: it detects when the relay-to-receiver link (not the
+    /// sender-to-relay link) is saturated. (It is NOT keyed off the actor-mailbox
+    /// `Full`, which measures room-wide fan-out burst, not a single receiver's
+    /// downlink — see #1219 Half-2 B1.)
     ///
     /// CARDINALITY: bounded — `transport` only (2 values: `websocket`,
     /// `webtransport`). Safe for indefinite retention.
     pub static ref RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL: CounterVec = register_counter_vec!(
         "relay_receiver_downlink_congestion_total",
-        "Receivers entering downlink congestion shedding mode (mailbox drop threshold crossed) (#1219)",
+        "Receivers entering downlink congestion shedding mode (windowed CongestionTracker crossing) (#1219)",
         &["transport"]
     )
     .expect("Failed to create relay_receiver_downlink_congestion_total metric");
@@ -1662,17 +1668,20 @@ lazy_static! {
     /// Per-receiver downlink congestion recovery (exited shedding mode) (#1219
     /// Half 2).
     ///
-    /// Incremented each time a shedding receiver accumulates
-    /// `DOWNLINK_CONGESTION_SUCCESS_WINDOW` consecutive successful `try_send`
-    /// deliveries and exits shedding mode, resuming full-layer forwarding. The
-    /// difference `congestion_total - recovered_total` gives the current count of
-    /// receivers still in shedding mode (useful for alerting).
+    /// Incremented once on the falling edge of each episode — when the receiver's
+    /// downlink-congestion relief window (`RECEIVER_DOWNLINK_RELIEF_WINDOW`)
+    /// elapses with no fresh overflow, so the windowed signal goes inactive and
+    /// the relay resumes full-layer forwarding. Recovery is the natural decay of
+    /// the window, NOT a count of strictly-consecutive successful sends (which
+    /// could be reset forever by an occasional drop and wedge a healthy link —
+    /// #1219 Half-2 B2). The difference `congestion_total - recovered_total`
+    /// gives the current count of receivers still in shedding mode.
     ///
     /// CARDINALITY: bounded — `transport` only (2 values). Safe for indefinite
     /// retention.
     pub static ref RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL: CounterVec = register_counter_vec!(
         "relay_receiver_downlink_recovered_total",
-        "Receivers exiting downlink congestion shedding mode (success window cleared) (#1219)",
+        "Receivers exiting downlink congestion shedding mode (relief window elapsed) (#1219)",
         &["transport"]
     )
     .expect("Failed to create relay_receiver_downlink_recovered_total metric");
@@ -1681,12 +1690,14 @@ lazy_static! {
     /// (#1219 Half 2).
     ///
     /// Incremented each time a non-base (layer > 0) VIDEO/SCREEN packet is
-    /// discarded for a receiver in shedding mode BEFORE reaching `try_send`. This
-    /// is the volume of proactive shedding the congestion detection performs —
-    /// distinct from the `relay_packet_drops_total{drop_reason=mailbox_full}`
-    /// counter (which counts packets lost at the mailbox itself). Together they
-    /// tell the story: shedding should REDUCE mailbox drops by removing volume
-    /// before it reaches the mailbox.
+    /// discarded for a receiver in shedding mode (its windowed downlink signal is
+    /// active) BEFORE reaching `try_send`. This is the volume of proactive
+    /// shedding the congestion relief performs — distinct from the
+    /// `relay_packet_drops_total{drop_reason=mailbox_full}` counter (which counts
+    /// packets lost at the mailbox itself). Together they tell the story:
+    /// shedding removes volume before the mailbox enqueue, so it should REDUCE
+    /// the downstream mailbox/channel drops a saturated receiver would otherwise
+    /// incur.
     ///
     /// CARDINALITY: bounded — `transport` only (2 values). Safe for indefinite
     /// retention.
@@ -2097,6 +2108,9 @@ mod tests {
         RELAY_CONGESTION_FILTERED_TOTAL
             .with_label_values(&[room])
             .inc();
+        RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .inc();
         RELAY_ROOM_BYTES_TOTAL
             .with_label_values(&[room, "outbound"])
             .inc();
@@ -2153,6 +2167,13 @@ mod tests {
             5.0,
             "demand-gauge seed must be observable before removal (non-vacuous)"
         );
+        assert_eq!(
+            RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            1.0,
+            "downlink-congestion-filtered seed must be observable before removal (non-vacuous)"
+        );
 
         // Drain the room.
         forget_room_metrics(room);
@@ -2184,6 +2205,14 @@ mod tests {
                 .with_label_values(&[room])
                 .get(),
             0.0
+        );
+        assert_eq!(
+            RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0,
+            "relay_downlink_congestion_filtered_total{{room}} must be swept by \
+             forget_room_metrics (#1219 Half 2)"
         );
         assert_eq!(
             RELAY_ROOM_BYTES_TOTAL

@@ -168,52 +168,51 @@ const ALLOWLIST: &[(&str, Extractor)] = &[
     ("--focus-ring", extract_focus_ring),
 ];
 
-/// All CSS variable names that this module may set (used for cleanup).
-pub const MANAGED_CSS_VARS: &[&str] = &[
-    "--bg",
-    "--surface",
-    "--surface-elevated",
-    "--border",
-    "--border-emphasis",
-    "--text-primary",
-    "--text-secondary",
-    "--accent",
-    "--accent-hover",
-    "--success",
-    "--warning",
-    "--error",
-    "--error-text",
-    "--focus-ring",
-];
-
 // ── Validation ───────────────────────────────────────────────────────────────
 
 /// Lightweight format check: hex (#rgb/#rrggbb/#rrggbbaa), rgb()/rgba(), hsl()/hsla().
+///
+/// Security: this is the guard ahead of user-imported theme files. It uses a
+/// *positive* grammar rather than a blocklist — a value must be either a hex
+/// literal or a single rgb/rgba/hsl/hsla function call with no nested function.
+/// Rejecting any second `(` defeats url(), var(), expression(), image-set(),
+/// image(), -webkit-image-set(), attr(), etc. in one rule, case-insensitively,
+/// without enumerating names.
 fn is_valid_color_value(s: &str) -> bool {
     let trimmed = s.trim();
+
+    // Hex literals.
     if let Some(hex) = trimmed.strip_prefix('#') {
         let len = hex.len();
-        (len == 3 || len == 4 || len == 6 || len == 8) && hex.chars().all(|c| c.is_ascii_hexdigit())
-    } else if trimmed.starts_with("rgb(")
-        || trimmed.starts_with("rgba(")
-        || trimmed.starts_with("hsl(")
-        || trimmed.starts_with("hsla(")
-    {
-        // Reject anything that could smuggle a different CSS construct into the
-        // value: nested functions (url()/var()/expression()), comment sequences,
-        // statement/block terminators. `setProperty` is the real injection
-        // boundary, but this keeps the surface tight ahead of user-imported files.
-        trimmed.ends_with(')')
-            && !trimmed.contains('{')
-            && !trimmed.contains('}')
-            && !trimmed.contains(';')
-            && !trimmed.contains("/*")
-            && !trimmed.contains("url(")
-            && !trimmed.contains("var(")
-            && !trimmed.contains("expression(")
-    } else {
-        false
+        return (len == 3 || len == 4 || len == 6 || len == 8)
+            && hex.chars().all(|c| c.is_ascii_hexdigit());
     }
+
+    // Functional notation — lowercase for case-insensitive structural checks.
+    let lower = trimmed.to_ascii_lowercase();
+    let is_color_fn = lower.starts_with("rgb(")
+        || lower.starts_with("rgba(")
+        || lower.starts_with("hsl(")
+        || lower.starts_with("hsla(");
+    if !is_color_fn {
+        return false;
+    }
+
+    // Locate the function's opening paren; there must be no further `(` after
+    // it (no nested function), and the value must close with `)`.
+    let open = match lower.find('(') {
+        Some(i) => i,
+        None => return false,
+    };
+    if lower[open + 1..].contains('(') {
+        return false;
+    }
+
+    trimmed.ends_with(')')
+        && !trimmed.contains('{')
+        && !trimmed.contains('}')
+        && !trimmed.contains(';')
+        && !trimmed.contains("/*")
 }
 
 // ── Parse + resolve ──────────────────────────────────────────────────────────
@@ -277,7 +276,7 @@ fn clear_theme_overrides() {
         Some(s) => s,
         None => return,
     };
-    for var_name in MANAGED_CSS_VARS {
+    for &(var_name, _) in ALLOWLIST {
         let _ = style.remove_property(var_name);
     }
 }
@@ -393,6 +392,23 @@ mod tests {
         assert!(!is_valid_color_value("rgb(var(--x), 0, 0)"));
         assert!(!is_valid_color_value("rgba(0,0,0,1) /* x */"));
         assert!(!is_valid_color_value("rgb(expression(alert(1)), 0, 0)"));
+        // Case-insensitive: uppercase / mixed-case function names must not bypass.
+        assert!(!is_valid_color_value("rgb(0,0,0) URL(https://evil/x)"));
+        assert!(!is_valid_color_value("rgb(0,0,0) Url(https://evil/x)"));
+        assert!(!is_valid_color_value("rgb(0,0,0) uRl(https://evil/x)"));
+        // Image-fetching function family must not bypass (was not enumerated).
+        assert!(!is_valid_color_value(
+            "rgb(0,0,0) image-set('https://evil/x')"
+        ));
+        assert!(!is_valid_color_value(
+            "rgb(0,0,0) IMAGE-SET('https://evil/x')"
+        ));
+        assert!(!is_valid_color_value("rgb(0,0,0) image('https://evil/x')"));
+        assert!(!is_valid_color_value(
+            "rgb(0,0,0) -webkit-image-set('https://evil/x')"
+        ));
+        // attr() / any nested function.
+        assert!(!is_valid_color_value("rgb(0,0,0) attr(data-x)"));
     }
 
     #[test]

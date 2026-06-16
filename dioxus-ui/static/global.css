@@ -138,6 +138,7 @@ html[data-theme="dark"] {
   --surface: #1c1c1e;
   --surface-elevated: #2c2c2e;
   /* Derived from --surface via color-mix for brand coherence */
+  --surface-overlay: rgba(28, 28, 30, 0.9); /* fallback: color-mix below */
   --surface-overlay: color-mix(in oklch, var(--surface) 90%, transparent);
   --border: #38383a;
   --border-emphasis: #48484a;
@@ -189,7 +190,9 @@ html[data-theme="dark"] {
   --overlay-heavy: rgba(0, 0, 0, 0.6);
   --overlay-opaque: rgba(0, 0, 0, 0.8);
   /* Derived from --text-primary via color-mix for brand coherence */
+  --field-bg: rgba(255, 255, 255, 0.05); /* fallback: color-mix below */
   --field-bg: color-mix(in oklch, var(--text-primary) 5%, transparent);
+  --field-bg-hover: rgba(255, 255, 255, 0.07); /* fallback: color-mix below */
   --field-bg-hover: color-mix(in oklch, var(--text-primary) 7%, transparent);
   /* Tile border: softened from rgba(100,100,100,0.3) to a lighter,
      lower-opacity gray for a more subtle separation against dark
@@ -211,6 +214,7 @@ html[data-theme="dark"] {
   --shadow-overlay:
     0 8px 20px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
   /* Derived from --text-primary via color-mix for brand coherence */
+  --hairline: rgba(255, 255, 255, 0.14); /* fallback: color-mix below */
   --hairline: color-mix(in oklch, var(--text-primary) 14%, transparent);
   /* Generic interactive focus-ring outline color (keyboard focus-visible /
      active control accents). Bright blue reads clearly over dark surfaces. */
@@ -223,6 +227,7 @@ html[data-theme="light"] {
   --surface: #ffffff;
   --surface-elevated: #f9f9fb;
   /* Derived from --surface via color-mix for brand coherence */
+  --surface-overlay: rgba(255, 255, 255, 0.95); /* fallback: color-mix below */
   --surface-overlay: color-mix(in oklch, var(--surface) 95%, transparent);
   --border: #e0e0e2;
   --border-emphasis: #d0d0d4;
@@ -265,7 +270,9 @@ html[data-theme="light"] {
   --overlay-opaque: rgba(0, 0, 0, 0.6);
   /* Derived from --text-primary via color-mix for brand coherence;
      sub-perceptible micro-shift: #1a1a1a at 4%/6% vs pure black at same alpha */
+  --field-bg: rgba(0, 0, 0, 0.04); /* fallback: color-mix below */
   --field-bg: color-mix(in oklch, var(--text-primary) 4%, transparent);
+  --field-bg-hover: rgba(0, 0, 0, 0.06); /* fallback: color-mix below */
   --field-bg-hover: color-mix(in oklch, var(--text-primary) 6%, transparent);
   /* Tile border: softened from rgba(100,100,100,0.15) to a lighter,
      lower-opacity gray for a more subtle separation against light
@@ -320,11 +327,15 @@ html[data-theme="dark"] {
   --scrollbar-thumb-active: rgba(255, 255, 255, 0.5);
 
   /* Meeting state pills (active / idle / ended) — active/idle derived from --success/--warning */
+  --state-active-bg: rgba(48, 209, 88, 0.1); /* fallback: color-mix below */
   --state-active-bg: color-mix(in oklch, var(--success) 10%, transparent);
   --state-active-text: rgba(48, 209, 88, 0.8);
+  --state-active-border: rgba(48, 209, 88, 0.22); /* fallback: color-mix below */
   --state-active-border: color-mix(in oklch, var(--success) 22%, transparent);
+  --state-idle-bg: rgba(255, 159, 10, 0.1); /* fallback: color-mix below */
   --state-idle-bg: color-mix(in oklch, var(--warning) 10%, transparent);
   --state-idle-text: rgba(255, 159, 10, 0.8);
+  --state-idle-border: rgba(255, 159, 10, 0.22); /* fallback: color-mix below */
   --state-idle-border: color-mix(in oklch, var(--warning) 22%, transparent);
   --state-ended-bg: rgba(142, 142, 147, 0.1);
   --state-ended-text: rgba(142, 142, 147, 0.7);
@@ -395,10 +406,15 @@ html[data-theme="dark"] {
   --cta-glow-color: rgba(255, 255, 255, 0.6);
 
   /* OAuth (generic blue) — derived from --accent-hover for brand coherence */
+  --oauth-blue-bg: rgba(10, 132, 255, 0.25); /* fallback: color-mix below */
   --oauth-blue-bg: color-mix(in oklch, var(--accent-hover) 25%, transparent);
+  --oauth-blue-bg-hover: rgba(10, 132, 255, 0.35); /* fallback: color-mix below */
   --oauth-blue-bg-hover: color-mix(in oklch, var(--accent-hover) 35%, transparent);
+  --oauth-blue-bg-active: rgba(10, 132, 255, 0.4); /* fallback: color-mix below */
   --oauth-blue-bg-active: color-mix(in oklch, var(--accent-hover) 40%, transparent);
+  --oauth-blue-border: rgba(10, 132, 255, 0.35); /* fallback: color-mix below */
   --oauth-blue-border: color-mix(in oklch, var(--accent-hover) 35%, transparent);
+  --oauth-blue-border-hover: rgba(10, 132, 255, 0.5); /* fallback: color-mix below */
   --oauth-blue-border-hover: color-mix(in oklch, var(--accent-hover) 50%, transparent);
   --back-btn-hover-bg: rgba(10, 132, 255, 0.08);
 
@@ -483,6 +499,7 @@ html[data-theme="dark"] {
   --field-tooltip-text: rgba(255, 255, 255, 0.92);
 
   /* Invalid input focus ring — derived from --error */
+  --input-invalid-focus-ring: rgba(255, 69, 58, 0.25); /* fallback: color-mix below */
   --input-invalid-focus-ring: color-mix(in oklch, var(--error) 25%, transparent);
 
   /* Primary/secondary button specifics */
@@ -570,16 +587,25 @@ html[data-theme="dark"] {
   --diag-info-border: rgba(255, 255, 255, 0.04);
 
   /* Btn warning — derived from --warning via color-mix for brand coherence */
+  --btn-warning-bg: rgba(255, 159, 10, 0.18); /* fallback: color-mix below */
   --btn-warning-bg: color-mix(in oklch, var(--warning) 18%, transparent);
+  --btn-warning-bg-hover: rgba(255, 159, 10, 0.28); /* fallback: color-mix below */
   --btn-warning-bg-hover: color-mix(in oklch, var(--warning) 28%, transparent);
+  --btn-warning-border: rgba(255, 159, 10, 0.25); /* fallback: color-mix below */
   --btn-warning-border: color-mix(in oklch, var(--warning) 25%, transparent);
+  --btn-warning-border-hover: rgba(255, 159, 10, 0.4); /* fallback: color-mix below */
   --btn-warning-border-hover: color-mix(in oklch, var(--warning) 40%, transparent);
 
   /* Btn danger — derived from --error via color-mix for brand coherence */
+  --btn-danger-bg: rgba(255, 69, 58, 0.1); /* fallback: color-mix below */
   --btn-danger-bg: color-mix(in oklch, var(--error) 10%, transparent);
+  --btn-danger-bg-hover: rgba(255, 69, 58, 0.22); /* fallback: color-mix below */
   --btn-danger-bg-hover: color-mix(in oklch, var(--error) 22%, transparent);
+  --btn-danger-border: rgba(255, 69, 58, 0.18); /* fallback: color-mix below */
   --btn-danger-border: color-mix(in oklch, var(--error) 18%, transparent);
+  --btn-danger-border-hover: rgba(255, 69, 58, 0.35); /* fallback: color-mix below */
   --btn-danger-border-hover: color-mix(in oklch, var(--error) 35%, transparent);
+  --btn-danger-divider: rgba(255, 69, 58, 0.2); /* fallback: color-mix below */
   --btn-danger-divider: color-mix(in oklch, var(--error) 20%, transparent);
   --btn-danger-label: rgba(255, 69, 58, 0.6);
 
@@ -670,11 +696,15 @@ html[data-theme="light"] {
 
   /* Meeting state pills — active/idle derived from --success/--warning (light uses
      slightly different bases; converting to var() is an accepted micro-correction) */
+  --state-active-bg: rgba(48, 209, 88, 0.14); /* fallback: color-mix below */
   --state-active-bg: color-mix(in oklch, var(--success) 14%, transparent);
   --state-active-text: rgba(20, 140, 50, 0.95);
+  --state-active-border: rgba(48, 209, 88, 0.3); /* fallback: color-mix below */
   --state-active-border: color-mix(in oklch, var(--success) 30%, transparent);
+  --state-idle-bg: rgba(255, 149, 0, 0.14); /* fallback: color-mix below */
   --state-idle-bg: color-mix(in oklch, var(--warning) 14%, transparent);
   --state-idle-text: rgba(180, 100, 0, 0.95);
+  --state-idle-border: rgba(255, 149, 0, 0.3); /* fallback: color-mix below */
   --state-idle-border: color-mix(in oklch, var(--warning) 30%, transparent);
   --state-ended-bg: rgba(142, 142, 147, 0.12);
   --state-ended-text: rgba(99, 99, 102, 0.9);
@@ -735,10 +765,15 @@ html[data-theme="light"] {
   --cta-glow-color: rgba(255, 255, 255, 0.7);
 
   /* OAuth (generic blue) — derived from --accent-hover for brand coherence */
+  --oauth-blue-bg: rgba(10, 132, 255, 0.18); /* fallback: color-mix below */
   --oauth-blue-bg: color-mix(in oklch, var(--accent-hover) 18%, transparent);
+  --oauth-blue-bg-hover: rgba(10, 132, 255, 0.26); /* fallback: color-mix below */
   --oauth-blue-bg-hover: color-mix(in oklch, var(--accent-hover) 26%, transparent);
+  --oauth-blue-bg-active: rgba(10, 132, 255, 0.3); /* fallback: color-mix below */
   --oauth-blue-bg-active: color-mix(in oklch, var(--accent-hover) 30%, transparent);
+  --oauth-blue-border: rgba(10, 132, 255, 0.3); /* fallback: color-mix below */
   --oauth-blue-border: color-mix(in oklch, var(--accent-hover) 30%, transparent);
+  --oauth-blue-border-hover: rgba(10, 132, 255, 0.4); /* fallback: color-mix below */
   --oauth-blue-border-hover: color-mix(in oklch, var(--accent-hover) 40%, transparent);
   --back-btn-hover-bg: rgba(10, 132, 255, 0.1);
 
@@ -810,6 +845,7 @@ html[data-theme="light"] {
   --field-tooltip-text: rgba(20, 20, 20, 0.92);
 
   /* Invalid input focus ring — derived from --error */
+  --input-invalid-focus-ring: rgba(255, 59, 48, 0.2); /* fallback: color-mix below */
   --input-invalid-focus-ring: color-mix(in oklch, var(--error) 20%, transparent);
 
   --btn-primary-border: rgba(0, 0, 0, 0.08);
@@ -887,16 +923,25 @@ html[data-theme="light"] {
 
   /* Btn warning — derived from --warning via color-mix for brand coherence
      (light bases were rgba(255,149,0,x) — converting to var(--warning) is accepted) */
+  --btn-warning-bg: rgba(255, 149, 0, 0.14); /* fallback: color-mix below */
   --btn-warning-bg: color-mix(in oklch, var(--warning) 14%, transparent);
+  --btn-warning-bg-hover: rgba(255, 149, 0, 0.22); /* fallback: color-mix below */
   --btn-warning-bg-hover: color-mix(in oklch, var(--warning) 22%, transparent);
+  --btn-warning-border: rgba(255, 149, 0, 0.2); /* fallback: color-mix below */
   --btn-warning-border: color-mix(in oklch, var(--warning) 20%, transparent);
+  --btn-warning-border-hover: rgba(255, 149, 0, 0.32); /* fallback: color-mix below */
   --btn-warning-border-hover: color-mix(in oklch, var(--warning) 32%, transparent);
 
   /* Btn danger — derived from --error via color-mix for brand coherence */
+  --btn-danger-bg: rgba(255, 59, 48, 0.08); /* fallback: color-mix below */
   --btn-danger-bg: color-mix(in oklch, var(--error) 8%, transparent);
+  --btn-danger-bg-hover: rgba(255, 59, 48, 0.16); /* fallback: color-mix below */
   --btn-danger-bg-hover: color-mix(in oklch, var(--error) 16%, transparent);
+  --btn-danger-border: rgba(255, 59, 48, 0.14); /* fallback: color-mix below */
   --btn-danger-border: color-mix(in oklch, var(--error) 14%, transparent);
+  --btn-danger-border-hover: rgba(255, 59, 48, 0.28); /* fallback: color-mix below */
   --btn-danger-border-hover: color-mix(in oklch, var(--error) 28%, transparent);
+  --btn-danger-divider: rgba(255, 59, 48, 0.16); /* fallback: color-mix below */
   --btn-danger-divider: color-mix(in oklch, var(--error) 16%, transparent);
   --btn-danger-label: rgba(215, 0, 21, 0.85);
 
@@ -1378,7 +1423,9 @@ html[data-theme="light"] #invite-overlay p {
   --overlay-heavy: rgba(0, 0, 0, 0.6);
   --overlay-opaque: rgba(0, 0, 0, 0.8);
   /* Derived from --text-primary via color-mix for brand coherence */
+  --field-bg: rgba(255, 255, 255, 0.05); /* fallback: color-mix below */
   --field-bg: color-mix(in oklch, var(--text-primary) 5%, transparent);
+  --field-bg-hover: rgba(255, 255, 255, 0.07); /* fallback: color-mix below */
   --field-bg-hover: color-mix(in oklch, var(--text-primary) 7%, transparent);
   --signal-popup-bg: rgba(26, 26, 46, 0.97);
   --signal-popup-border: rgba(255, 255, 255, 0.12);

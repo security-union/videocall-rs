@@ -3543,7 +3543,8 @@ impl Inner {
             Ok(PacketType::DOWNLINK_CONGESTION) => {
                 // DOWNLINK_CONGESTION is a relay -> receiver ONLY control packet
                 // (#1219 Half 2): the relay emits it when THIS receiver's downlink
-                // is congested (its outbound mailbox drops crossed the threshold).
+                // is congested (its bounded outbound channel overflowed, as
+                // observed by the relay's windowed CongestionTracker).
                 // The relay's emergency frame-shedding is transient; to make it
                 // DURABLE we step every connected peer's RECEIVER-side LayerChooser
                 // down one rung and publish a LAYER_PREFERENCE asking the relay for

@@ -29,8 +29,8 @@ const _PROTOBUF_VERSION_CHECK: () = ::protobuf::VERSION_3_7_2;
 ///
 ///  Carried inside a PacketWrapper whose `packet_type` is DOWNLINK_CONGESTION.
 ///  The relay emits this (once per episode) when a receiver's REAL downlink
-///  backpressure surface — its bounded per-session outbound channel overflowing
-///  on a slow socket — drives the windowed CongestionTracker across its drop
+///  backpressure surface — its bounded per-session outbound channel overflowing on
+///  a slow socket — drives the windowed CongestionTracker across its drop
 ///  threshold (the same signal the #979 keyframe-relax path uses), staying armed
 ///  for RECEIVER_DOWNLINK_RELIEF_WINDOW. The receiver should reduce its layer
 ///  preferences to adapt to available downlink bandwidth.
@@ -153,38 +153,42 @@ impl ::protobuf::reflect::ProtobufValue for DownlinkCongestionPacket {
 
 static file_descriptor_proto_data: &'static [u8] = b"\
     \n&types/downlink_congestion_packet.proto\"\x1a\n\x18DownlinkCongestionP\
-    acketJ\xb9\x0b\n\x06\x12\x04\0\0\x1b\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\
-    \n\x98\x0b\n\x02\x04\0\x12\x04\x18\0\x1b\x01\x1a\xef\t\x20Relay\x20->\
+    acketJ\xf7\x0c\n\x06\x12\x04\0\0\x1d\x01\n\x08\n\x01\x0c\x12\x03\0\0\x12\
+    \n\xd6\x0c\n\x02\x04\0\x12\x04\x1a\0\x1d\x01\x1a\xad\x0b\x20Relay\x20->\
     \x20receiver\x20control\x20payload\x20(#1219\x20Half\x202;\x20receiver\
     \x20downlink\x20congestion\n\x20signal).\n\n\x20Carried\x20inside\x20a\
     \x20PacketWrapper\x20whose\x20`packet_type`\x20is\x20DOWNLINK_CONGESTION\
-    .\n\x20The\x20relay\x20emits\x20this\x20when\x20a\x20receiver's\x20inbou\
-    nd\x20fan-out\x20mailbox\x20has\x20been\n\x20dropping\x20packets\x20(con\
-    secutive\x20drops\x20cross\x20DOWNLINK_CONGESTION_DROP_THRESHOLD).\n\x20\
-    The\x20receiver\x20should\x20reduce\x20its\x20layer\x20preferences\x20to\
-    \x20adapt\x20to\x20available\n\x20downlink\x20bandwidth.\n\n\x20SCOPE:\
-    \x20there\x20is\x20intentionally\x20NO\x20source/session\x20id\x20in\x20\
-    this\x20message.\x20The\n\x20packet\x20is\x20delivered\x20on\x20the\x20R\
-    ECEIVER's\x20OWN\x20per-session\x20subject\n\x20(room.{room}.{receiver_s\
-    ession}),\x20so\x20the\x20delivery\x20subject\x20alone\x20scopes\x20the\
-    \n\x20signal\x20to\x20exactly\x20one\x20receiver\x20\xe2\x80\x94\x20ther\
-    e\x20is\x20nothing\x20to\x20address.\n\n\x20SECURITY\x20/\x20TRUST\x20BO\
-    UNDARY:\x20this\x20packet\x20is\x20RELAY-AUTHORED\x20and\x20consumed\x20\
-    by\x20the\n\x20RECEIVER\x20only.\x20It\x20travels\x20relay\x20->\x20rece\
-    iver,\x20never\x20client\x20->\x20relay.\x20The\x20relay\n\x20NEVER\x20p\
-    arses\x20an\x20inbound\x20DOWNLINK_CONGESTION:\x20there\x20is\x20no\x20i\
-    nterceptor\x20and\x20no\n\x20handler\x20that\x20records\x20or\x20acts\
-    \x20on\x20one\x20arriving\x20on\x20any\x20session\x20subject,\x20so\x20a\
-    \n\x20client\x20cannot\x20forge\x20one\x20to\x20influence\x20another\x20\
-    receiver.\x20The\x20signal\x20is\x20purely\n\x20ADVISORY\x20\xe2\x80\x94\
-    \x20a\x20missing\x20or\x20delayed\x20signal\x20simply\x20means\x20the\
-    \x20receiver\x20does\x20not\n\x20step\x20down\x20proactively\x20(fail-op\
-    en\x20to\x20today's\x20behaviour);\x20it\x20cannot\x20cause\x20data\n\
-    \x20loss\x20or\x20privilege\x20escalation.\n\"\x99\x01\x20Currently\x20e\
-    mpty\x20\xe2\x80\x94\x20the\x20presence\x20of\x20the\x20packet\x20IS\x20\
-    the\x20signal.\x20Reserved\x20for\n\x20future\x20use\x20(e.g.\x20severit\
-    y\x20level,\x20suggested\x20target\x20layer,\x20per-source\x20hints).\n\
-    \n\n\n\x03\x04\0\x01\x12\x03\x18\x08\x20b\x06proto3\
+    .\n\x20The\x20relay\x20emits\x20this\x20(once\x20per\x20episode)\x20when\
+    \x20a\x20receiver's\x20REAL\x20downlink\n\x20backpressure\x20surface\x20\
+    \xe2\x80\x94\x20its\x20bounded\x20per-session\x20outbound\x20channel\x20\
+    overflowing\x20on\n\x20a\x20slow\x20socket\x20\xe2\x80\x94\x20drives\x20\
+    the\x20windowed\x20CongestionTracker\x20across\x20its\x20drop\n\x20thres\
+    hold\x20(the\x20same\x20signal\x20the\x20#979\x20keyframe-relax\x20path\
+    \x20uses),\x20staying\x20armed\n\x20for\x20RECEIVER_DOWNLINK_RELIEF_WIND\
+    OW.\x20The\x20receiver\x20should\x20reduce\x20its\x20layer\n\x20preferen\
+    ces\x20to\x20adapt\x20to\x20available\x20downlink\x20bandwidth.\n\n\x20S\
+    COPE:\x20there\x20is\x20intentionally\x20NO\x20source/session\x20id\x20i\
+    n\x20this\x20message.\x20The\n\x20packet\x20is\x20delivered\x20on\x20the\
+    \x20RECEIVER's\x20OWN\x20per-session\x20subject\n\x20(room.{room}.{recei\
+    ver_session}),\x20so\x20the\x20delivery\x20subject\x20alone\x20scopes\
+    \x20the\n\x20signal\x20to\x20exactly\x20one\x20receiver\x20\xe2\x80\x94\
+    \x20there\x20is\x20nothing\x20to\x20address.\n\n\x20SECURITY\x20/\x20TRU\
+    ST\x20BOUNDARY:\x20this\x20packet\x20is\x20RELAY-AUTHORED\x20and\x20cons\
+    umed\x20by\x20the\n\x20RECEIVER\x20only.\x20It\x20travels\x20relay\x20->\
+    \x20receiver,\x20never\x20client\x20->\x20relay.\x20The\x20relay\n\x20NE\
+    VER\x20parses\x20an\x20inbound\x20DOWNLINK_CONGESTION:\x20there\x20is\
+    \x20no\x20interceptor\x20and\x20no\n\x20handler\x20that\x20records\x20or\
+    \x20acts\x20on\x20one\x20arriving\x20on\x20any\x20session\x20subject,\
+    \x20so\x20a\n\x20client\x20cannot\x20forge\x20one\x20to\x20influence\x20\
+    another\x20receiver.\x20The\x20signal\x20is\x20purely\n\x20ADVISORY\x20\
+    \xe2\x80\x94\x20a\x20missing\x20or\x20delayed\x20signal\x20simply\x20mea\
+    ns\x20the\x20receiver\x20does\x20not\n\x20step\x20down\x20proactively\
+    \x20(fail-open\x20to\x20today's\x20behaviour);\x20it\x20cannot\x20cause\
+    \x20data\n\x20loss\x20or\x20privilege\x20escalation.\n\"\x99\x01\x20Curr\
+    ently\x20empty\x20\xe2\x80\x94\x20the\x20presence\x20of\x20the\x20packet\
+    \x20IS\x20the\x20signal.\x20Reserved\x20for\n\x20future\x20use\x20(e.g.\
+    \x20severity\x20level,\x20suggested\x20target\x20layer,\x20per-source\
+    \x20hints).\n\n\n\n\x03\x04\0\x01\x12\x03\x1a\x08\x20b\x06proto3\
 ";
 
 /// `FileDescriptorProto` object which was a source for this generated file

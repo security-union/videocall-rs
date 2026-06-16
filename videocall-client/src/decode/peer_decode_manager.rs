@@ -1185,8 +1185,8 @@ impl Peer {
     ///     is NO packet loss, so that real sample is `{loss: 0, kf: 0}` and
     ///     [`DownlinkSample::is_congested`] is `false` → the early seed is a no-op.
     ///     That zero-loss blindness is exactly the #1219 condition the relay sees
-    ///     (it drops frames at its outbound mailbox) but the per-peer receive
-    ///     telemetry cannot.
+    ///     (it drops frames at its bounded per-receiver outbound channel) but the
+    ///     per-peer receive telemetry cannot.
     ///   * This method instead feeds a SYNTHETIC congested sample
     ///     (`{loss_per_sec: LOSS_STEP_DOWN_PER_SEC, kf_per_sec: 0.0}`, which makes
     ///     `is_congested()` true) so the chooser steps down even though the real
@@ -1205,7 +1205,7 @@ impl Peer {
     ///
     /// AUDIO is the ONE intentional divergence from `seed_early_congestion`: it is
     /// NOT stepped down here. Audio is priority-protected (the relay's emergency
-    /// mailbox-shed exempts it too), its base-layer bitrate is small, and keeping
+    /// downlink-shed exempts it too), its base-layer bitrate is small, and keeping
     /// voice clear while video degrades is the DESIRED behavior under downlink
     /// congestion. See the AUDIO note in the body.
     ///
@@ -1274,7 +1274,7 @@ impl Peer {
 
         // AUDIO — deliberately NOT stepped down (#1219 Half 2). This is the one
         // intentional divergence from `seed_early_congestion` (which DOES proxy
-        // audio off the video downlink). The relay's emergency mailbox-shed
+        // audio off the video downlink). The relay's emergency downlink-shed
         // (chat_server.rs `is_shed_candidate`) exempts AUDIO for the same reason:
         // audio is priority-protected, and "video froze but voice stayed clear"
         // is the DESIRED degradation under downlink congestion, not a bug. Audio's
@@ -2567,7 +2567,8 @@ impl PeerDecodeManager {
     /// speculative — the relay has ALREADY measured this receiver's downlink and
     /// decided it is saturated, on whatever transport this client elected (WS or
     /// WT alike). The gate (if any) lives at the relay, which only emits the
-    /// packet when its outbound mailbox crossed the drop threshold. So this method
+    /// packet when this receiver's outbound channel overflowed (windowed
+    /// CongestionTracker crossing via on_outbound_drop). So this method
     /// unconditionally steps down every connected peer whose chooser is not already
     /// constrained.
     ///

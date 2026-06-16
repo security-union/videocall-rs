@@ -196,7 +196,8 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
 
     // Drop client-originated DOWNLINK_CONGESTION packets (#1219 Half 2).
     // DOWNLINK_CONGESTION is relay-authored (emitted by the relay when a
-    // receiver's mailbox drops exceed threshold). A client-sent one is always
+    // receiver's outbound channel overflows, as observed by the windowed
+    // CongestionTracker via on_outbound_drop). A client-sent one is always
     // forged. Drop it to prevent a client from injecting fake congestion
     // signals that would trick OTHER receivers into stepping down their layers.
     if packet_wrapper.packet_type == PacketType::DOWNLINK_CONGESTION.into() {
@@ -1029,8 +1030,9 @@ mod tests {
     #[test]
     fn test_classify_downlink_congestion_packet_as_dropped() {
         // #1219 Half 2: DOWNLINK_CONGESTION is relay-authored-only (the relay
-        // emits it on a receiver's own subject when that receiver's mailbox
-        // drops cross the threshold). A client-sent one is always forged and is
+        // emits it on a receiver's own subject when that receiver's outbound
+        // channel overflows, as observed by the windowed CongestionTracker).
+        // A client-sent one is always forged and is
         // the PRIMARY trust boundary for the signal: if accepted and reflected,
         // a malicious client could trick OTHER receivers into stepping their
         // video layers down (denial-of-quality). It must be dropped at ingest —

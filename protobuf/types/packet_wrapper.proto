@@ -48,9 +48,10 @@ message PacketWrapper {
     // hint simply means "encode the full ladder" (fail-open).
     LAYER_HINT = 13;
     // Relay -> receiver ONLY control packet (#1219 Half 2). Signals a receiver
-    // that its downlink is congested (the relay's inbound fan-out mailbox is
-    // dropping packets destined for this session). The receiver should reduce
-    // its layer preferences to adapt to available bandwidth. Delivered on the
+    // that its downlink is congested (the relay's bounded per-session outbound
+    // channel to this receiver is overflowing on a slow socket, as observed by
+    // the windowed CongestionTracker via on_outbound_drop). The receiver should
+    // reduce its layer preferences to adapt to available bandwidth. Delivered on the
     // receiver's OWN per-session subject, like CONGESTION and LAYER_HINT.
     // Unlike CONGESTION (which was sender-directed), this is RECEIVER-directed:
     // the slow receiver itself must step down. See DownlinkCongestionPacket.

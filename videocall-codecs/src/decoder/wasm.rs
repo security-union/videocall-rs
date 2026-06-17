@@ -435,14 +435,6 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
         if skip_msg.kind == FRESHNESS_SKIP_KIND {
             #[cfg(feature = "wasm")]
             {
-                let from = skip_msg.from_peer.clone().unwrap_or_default();
-                let to = skip_msg.to_peer.clone().unwrap_or_default();
-                // `None` keyframe_seq is the keyframe-less held (last-good) case; otherwise the
-                // sequence we skipped forward to.
-                let keyframe = skip_msg
-                    .keyframe_seq
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "none (held last-good)".into());
                 // A skip means the head-of-line frame aged past the playout deadline and stale
                 // frames were evicted to recover — a real degradation signal, surfaced at WARN so
                 // it stands out in field logs. This cannot amplify per tick: the worker only
@@ -450,13 +442,12 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                 // coalescing in `JitterBuffer::record_freshness_skip`, gated on
                 // `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS`), so one console line maps to one
                 // forwarded event, not one per eviction.
-                console::warn_1(
-                    &format!(
-                        "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms dropped={} keyframe_seq={keyframe}",
-                        skip_msg.head_age_ms, skip_msg.dropped
-                    )
-                    .into(),
-                );
+                //
+                // The `[JITTER_BUFFER] freshness_skip` line is a grep contract the #1045/#1020
+                // field investigation keys on; its formatting lives in the pure, host-tested
+                // `FreshnessSkipMessage::console_line` (#1384) so a typo in the prefix or the
+                // keyframe-`None` rendering fails a host test rather than shipping green.
+                console::warn_1(&skip_msg.console_line().into());
 
                 let evt = DiagEvent {
                     subsystem: "video",

@@ -4444,6 +4444,14 @@ fn handle_msg(
     // exclusively on this receiver's single NATS subscription task.
     let relay_state: Cell<DownlinkRelayState> = Cell::new(DownlinkRelayState::new());
 
+    // TEMPORARY instrumentation (#1486) — verifies the #1481 root cause on a live
+    // high-RTT WT receiver before we code the fix. Holds the epoch-now at which we
+    // last emitted the relief-staleness line for THIS session, so the log is
+    // rate-limited to ~once/sec/session and cannot flood the relay log. `0` (==
+    // never-logged) is safe: real epoch-now values are always `>= 1`. Remove this
+    // Cell together with the log block once #1481 is settled.
+    let last_relief_log_epoch: Cell<u64> = Cell::new(0);
+
     // --- #1219 Half 2: emit-DOWNLINK_CONGESTION handoff ---
     //
     // The forwarding closure is SYNCHRONOUS and runs on the relay's hottest path
@@ -4929,10 +4937,47 @@ fn handle_msg(
         // Recovery therefore can NOT be wedged by an occasional stray drop (the
         // old strictly-consecutive-success exit could be, pinning a healthy link
         // at base-layer-only video indefinitely).
-        let congested_now = downlink_epoch_is_active(
-            downlink_congested_epoch.load(AtomicOrdering::Relaxed),
-            RECEIVER_DOWNLINK_RELIEF_WINDOW,
-        );
+        let relief_epoch = downlink_congested_epoch.load(AtomicOrdering::Relaxed);
+        let congested_now = downlink_epoch_is_active(relief_epoch, RECEIVER_DOWNLINK_RELIEF_WINDOW);
+
+        // --- TEMPORARY instrumentation (#1486) — REMOVE once #1481 is settled ---
+        //
+        // Confirms the #1481 root cause on a live high-RTT WT receiver: is the
+        // relief read seeing a STALE epoch (the relief-stamp window decaying
+        // between WT's clustered drop bursts → `now - epoch` routinely 2-10s while
+        // `Receiver-downlink overflow` warns still fire), or is the epoch never
+        // stamped at all (`relief_epoch == DOWNLINK_EPOCH_NEVER` despite overflows
+        // → a `stamp_downlink_epoch_if_congested` gating bug, not the freshness
+        // story)? We can't prove the runtime drop time-distribution from a static
+        // code trace, so we read it here.
+        //
+        // Only logged for receivers that have crossed congestion at least once
+        // (`relief_epoch != DOWNLINK_EPOCH_NEVER`) — a never-congested receiver
+        // would emit nothing useful and just flood the log. Rate-limited to
+        // ~once/sec/session via `last_relief_log_epoch`.
+        {
+            use crate::actors::session_logic::{
+                downlink_congested_epoch_now, DOWNLINK_EPOCH_NEVER,
+            };
+            if relief_epoch != DOWNLINK_EPOCH_NEVER {
+                let now = downlink_congested_epoch_now();
+                let last_logged = last_relief_log_epoch.get();
+                if last_logged == 0 || now.saturating_sub(last_logged) >= 1000 {
+                    last_relief_log_epoch.set(now);
+                    info!(
+                        "[#1486] downlink-relief read: session={} transport={} room={} \
+                         epoch={} now={} staleness_ms={} congested_now={}",
+                        session,
+                        transport,
+                        room,
+                        relief_epoch,
+                        now,
+                        now.saturating_sub(relief_epoch),
+                        congested_now,
+                    );
+                }
+            }
+        }
 
         // Edge-detect the episode so the metrics + the one-shot DOWNLINK_CONGESTION
         // emit each fire exactly once per congested episode. Running this on every

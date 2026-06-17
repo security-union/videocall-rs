@@ -131,6 +131,21 @@ impl WebNetEq {
         Ok(out)
     }
 
+    /// Flush the jitter/packet buffer and reset internal state (issue #1402).
+    ///
+    /// Called when a peer's audio stream ends (mic-off / host force-mute) so the
+    /// NetEq buffer stops emitting expand/comfort-noise concealment ("hiss")
+    /// packets for a stream that is no longer producing data. Delegates to
+    /// [`NetEq::flush`], which drains the packet buffer, clears leftover samples,
+    /// and resets the delay/governor state. A no-op (not an error) before
+    /// `init()` — there is nothing buffered to flush.
+    #[wasm_bindgen]
+    pub fn flush(&self) {
+        if let Some(neteq) = self.neteq.borrow_mut().as_mut() {
+            neteq.flush();
+        }
+    }
+
     /// Get current NetEq statistics as a JS object.
     #[wasm_bindgen(js_name = getStatistics)]
     pub fn get_statistics(&self) -> Result<JsValue, JsValue> {

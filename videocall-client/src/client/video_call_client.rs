@@ -33,7 +33,9 @@ use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::future::LocalBoxFuture;
 use gloo_timers::callback::{Interval, Timeout};
-use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent, MetricValue};
+#[cfg(target_arch = "wasm32")]
+use videocall_diagnostics::MetricValue;
+use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
 
 use log::{debug, error, info, trace, warn};
 use protobuf::Message;
@@ -781,6 +783,7 @@ fn freshness_skip_within_switch_window(now_ms: u64, last_switch_ms: u64) -> bool
 /// is `js_sys::Date::now()` — the SAME wall clock the Marker 1 stamps use (the
 /// manager tick / seed paths thread in `js_sys::Date::now()` as `now_ms`). Using
 /// the skip's own timestamp is the cleanest correlation point.
+#[cfg(target_arch = "wasm32")]
 fn spawn_layer_switch_freshness_observer(inner: &Rc<RefCell<Inner>>) {
     let inner_weak = Rc::downgrade(inner);
     wasm_bindgen_futures::spawn_local(async move {
@@ -1323,6 +1326,7 @@ impl VideoCallClient {
         // Issue #1460 observability: subscribe to the diagnostics bus to correlate
         // worker freshness_skip events with this peer's recent layer switches.
         // Pure telemetry; holds only a Weak handle to `Inner` (no cycle).
+        #[cfg(target_arch = "wasm32")]
         spawn_layer_switch_freshness_observer(&client.inner);
 
         client

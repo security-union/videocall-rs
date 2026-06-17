@@ -744,6 +744,7 @@ fn arm_camera_keyframe_cooldown_reset(slot: &Rc<RefCell<Option<Rc<AtomicBool>>>>
 /// layer-agnostic jitter buffer; the resulting freshness_skip freezes surface
 /// within a few seconds of the transition, so a 3s window captures them without
 /// spuriously attributing unrelated skips.
+#[cfg(any(target_arch = "wasm32", test))]
 const POST_SWITCH_WINDOW_MS: u64 = 3000;
 
 /// True iff a freshness_skip at `now_ms` falls within [`POST_SWITCH_WINDOW_MS`]
@@ -754,6 +755,7 @@ const POST_SWITCH_WINDOW_MS: u64 = 3000;
 ///
 /// Pure (no I/O, no global state) so it is directly unit-testable on the host
 /// target and mutation-sensitive at the `<` boundary (issue #1460).
+#[cfg(any(target_arch = "wasm32", test))]
 fn freshness_skip_within_switch_window(now_ms: u64, last_switch_ms: u64) -> bool {
     if last_switch_ms == 0 {
         return false;

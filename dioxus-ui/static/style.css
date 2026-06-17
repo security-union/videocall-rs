@@ -530,28 +530,117 @@ h3 {
   opacity: 0.82;
 }
 
-.decode-paused-badge {
+/* Issue #1466 (B1): the per-tile PLAY control. Previously a corner badge
+   anchored at top/right -6px with a 44px hit box created via negative margin —
+   but that box grew UP and RIGHT into the tile corner, where
+   `.canvas-container { overflow: hidden }` CLIPPED it, and its right edge ran
+   under the corner-pinned `.tile-top-icons` (z-index:3, which holds the
+   interactive signal button). The real tap area was well under 44px and
+   ambiguous taps landed on the signal button.
+
+   The control is now a CENTERED overlay over the PeerIcon. The placeholder
+   (`.placeholder-content--paused`) is `position: relative` and is itself
+   centered within the flex `.canvas-container`, so an absolutely-centered
+   element sits over the avatar in the middle of the visible tile — comfortably
+   inside the unclipped region and far from the corner icons. A 48px circular
+   target (> the 44px minimum) keeps it easily tappable on mobile. */
+.decode-play-overlay {
   position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 22px;
-  height: 22px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 48px;
+  height: 48px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
+  border: none;
   border-radius: var(--radius-pill, 999px);
   background: var(--btn-warning-bg);
   color: var(--warning);
   box-shadow: 0 0 0 1px var(--btn-warning-border);
-  pointer-events: none;
+  cursor: pointer;
+  font: inherit;
+  /* Sit above the dimmed PeerIcon, but below the corner `.tile-top-icons`
+     (z-index:3) which it never overlaps anyway. */
+  z-index: 2;
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.1s ease;
 }
 
-/* Override the generic `.placeholder-content svg` sizing/tint for the badge
-   glyph: it is a small amber pause icon, not the large tertiary PeerIcon. */
-.decode-paused-badge svg {
-  width: 14px;
-  height: 14px;
+/* Override the generic `.placeholder-content svg` sizing/tint for the play
+   glyph: a small amber triangle, not the large tertiary PeerIcon. */
+.decode-play-overlay svg {
+  width: 20px;
+  height: 20px;
   fill: currentColor;
+}
+
+.decode-play-overlay:hover {
+  background: var(--btn-warning-bg-hover);
+  box-shadow: 0 0 0 1px var(--btn-warning-border-hover);
+  /* Keep the centering translate while adding the hover bump. */
+  transform: translate(-50%, -50%) scale(1.06);
+}
+
+.decode-play-overlay:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
+}
+
+/* Issue #1466 (S2): respect prefers-reduced-motion. Suppress ONLY the hover
+   scale animation — but the button uses `transform` for centering too, so we
+   cannot use `transform: none` (that would un-center it). Reset the hover
+   transform back to the centering-only translate, and drop the transform from
+   the transition. Background/box-shadow hover feedback is preserved. */
+@media (prefers-reduced-motion: reduce) {
+  .decode-play-overlay {
+    transition:
+      background 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+
+  .decode-play-overlay:hover {
+    transform: translate(-50%, -50%);
+  }
+}
+
+/* Issue #1466: the persistent "show all paused videos" / "back to automatic"
+   escape hatch in the Appearance panel's Video-tiles area. Styled to match the
+   panel's warning-accent action buttons (same token family as the banner's
+   `.decode-budget-banner-action`), set apart from the segmented tile-count
+   picker above it. */
+.decode-budget-show-all-btn {
+  margin-top: 10px;
+  min-height: 36px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md, 10px);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--warning);
+  background: var(--btn-warning-bg);
+  border: 1px solid var(--btn-warning-border);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.decode-budget-show-all-btn:hover {
+  background: var(--btn-warning-bg-hover);
+  border-color: var(--btn-warning-border-hover);
+}
+
+.decode-budget-show-all-btn:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
 }
 
 /* ============================================================

@@ -739,6 +739,50 @@ pub fn AppearanceSettingsPanel() -> Element {
                     p { class: "appearance-section-helper",
                         "Auto reduces video tiles on slower devices to keep playback smooth — off-budget participants stay audible and appear as avatars. A fixed number always shows that many video tiles."
                     }
+
+                    // Issue #1466: persistent "show all paused videos" escape
+                    // hatch. This is the reliable GLOBAL recovery control —
+                    // always reachable in Settings, independent of the banner's
+                    // transient `pressured && avatar_count > 0` gate (the banner
+                    // can be backed off / not showing), and distinct from the
+                    // per-tile PLAY button (which un-pauses ONE peer). It is a
+                    // toggle so the user is never stuck: when the override is
+                    // already non-Auto (any Fixed(n) or All) it offers "Back to
+                    // automatic" (→ Auto); otherwise it offers "Show all videos"
+                    // (→ All) — wording aligned with the banner's "Show all
+                    // videos" action (#1466 S1). Both write the shared `DecodeBudgetCtx`
+                    // signal AND persist via `save_decode_budget_override`,
+                    // exactly like the picker above, so the change survives reloads.
+                    {
+                        let current = decode_budget_ctx.0();
+                        let is_overridden = current != DecodeBudgetOverride::Auto;
+                        let (target, label, aria) = if is_overridden {
+                            (
+                                DecodeBudgetOverride::Auto,
+                                "Back to automatic",
+                                "Return video tiles to automatic",
+                            )
+                        } else {
+                            (
+                                DecodeBudgetOverride::All,
+                                "Show all videos",
+                                "Show all videos",
+                            )
+                        };
+                        rsx! {
+                            button {
+                                r#type: "button",
+                                class: "decode-budget-show-all-btn",
+                                "data-testid": "decode-budget-show-all-persistent",
+                                "aria-label": aria,
+                                onclick: move |_| {
+                                    decode_budget_ctx.0.set(target);
+                                    save_decode_budget_override(target);
+                                },
+                                "{label}"
+                            }
+                        }
+                    }
                 }
             }
 
@@ -840,6 +884,11 @@ fn is_light_theme() -> bool {
 /// viewport, so picking a number larger than the grid can show is harmless. The
 /// chosen counts (4 / 6 / 9 / 16) mirror the tile-count vocabulary the density
 /// modes already describe (Standard ~4/~9, Auto ~6/~12, Dense ~16).
+// Issue #1466 (S1): "All" was dropped from the SEGMENTED picker — it was
+// redundant with the always-visible "Show all videos" persistent toggle below,
+// which sets the same `DecodeBudgetOverride::All`. The `All` enum variant and
+// all its handling (label/aria/testid/parse/serialize/effective_cap) stay
+// intact; only the picker option is removed.
 const DECODE_BUDGET_OPTIONS: [DecodeBudgetOverride; 5] = [
     DecodeBudgetOverride::Auto,
     DecodeBudgetOverride::Fixed(4),
@@ -852,6 +901,7 @@ const DECODE_BUDGET_OPTIONS: [DecodeBudgetOverride; 5] = [
 fn decode_budget_label(option: DecodeBudgetOverride) -> String {
     match option {
         DecodeBudgetOverride::Auto => "Auto".to_string(),
+        DecodeBudgetOverride::All => "All".to_string(),
         DecodeBudgetOverride::Fixed(n) => n.to_string(),
     }
 }
@@ -861,6 +911,7 @@ fn decode_budget_label(option: DecodeBudgetOverride) -> String {
 fn decode_budget_aria_label(option: DecodeBudgetOverride) -> String {
     match option {
         DecodeBudgetOverride::Auto => "Automatic video tile count".to_string(),
+        DecodeBudgetOverride::All => "Show all video tiles".to_string(),
         DecodeBudgetOverride::Fixed(n) => format!("Show {n} video tiles"),
     }
 }
@@ -869,6 +920,7 @@ fn decode_budget_aria_label(option: DecodeBudgetOverride) -> String {
 fn decode_budget_testid(option: DecodeBudgetOverride) -> String {
     match option {
         DecodeBudgetOverride::Auto => "decode-budget-auto".to_string(),
+        DecodeBudgetOverride::All => "decode-budget-all".to_string(),
         DecodeBudgetOverride::Fixed(n) => format!("decode-budget-{n}"),
     }
 }

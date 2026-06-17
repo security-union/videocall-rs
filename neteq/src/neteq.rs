@@ -1212,7 +1212,7 @@ mod tests {
                 .unwrap();
         }
         assert!(
-            neteq.packet_buffer.len() > 0,
+            !neteq.packet_buffer.is_empty(),
             "precondition: packets should be buffered before flush (was {})",
             neteq.packet_buffer.len()
         );

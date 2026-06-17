@@ -19,7 +19,8 @@
 use crate::components::decode_budget::{
     decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
     is_sole_real_tile, merge_user_requested_decode, partition_camera_tiles,
-    promote_requested_into_decoded, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
+    promote_pinned_into_decoded, promote_requested_into_decoded, BudgetSample, BudgetState,
+    BudgetStep, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
@@ -3689,14 +3690,16 @@ pub fn AttendantsComponent(
         );
     }
 
-    // --- Pinned-peer promotion (HCL #987 review FIX 7) ---
+    // --- Pinned-peer promotion (HCL #987 review FIX 7; bounded per issue #1470) ---
     // A pinned peer is force-added to `active_decode_set` (phase 3, below), so
     // it is ALWAYS decoded regardless of the budget cap. If that peer is ranked
-    // beyond `visible_tile_count` (e.g. it joined late and is silent), it would
-    // otherwise land in `avatar_tiles` and render with `force_avatar = true`
-    // ("Video paused") while it is in fact being decoded — wasted decode AND a
-    // misleading UI. Promote it into the decoded bucket so decode and render
-    // agree. We swap it into the LAST decoded slot to disturb ordering least.
+    // in the displayed off-budget window, it would otherwise land in
+    // `avatar_tiles` and render with `force_avatar = true` ("Video paused")
+    // while it is in fact being decoded — wasted decode AND a misleading UI.
+    // `promote_pinned_into_decoded` swaps it into the LAST decoded slot so
+    // decode and render agree, BOUNDED to `[visible_tile_count,
+    // displayed_tile_count)` so a true-overflow pin can't evict a displayed tile
+    // off the grid (issue #1470 — the same defect bounded on the PLAY path).
     if visible_tile_count > 0 && visible_tile_count < all_tiles.len() {
         if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
             // `all_tiles` holds session_ids; the pin is keyed by user_id. Find
@@ -3706,10 +3709,12 @@ pub fn AttendantsComponent(
                 client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
             });
             if let Some(idx) = pinned_idx {
-                if idx >= visible_tile_count {
-                    // Swap the pinned peer into the last decoded slot.
-                    all_tiles.swap(visible_tile_count - 1, idx);
-                }
+                promote_pinned_into_decoded(
+                    &mut all_tiles,
+                    visible_tile_count,
+                    displayed_tile_count,
+                    idx,
+                );
             }
         }
     }

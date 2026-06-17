@@ -813,6 +813,58 @@ pub fn promote_requested_into_decoded(
     }
 }
 
+/// Promote a pinned peer ranked beyond the decoded window INWARD into the last
+/// decoded slot, so it renders live video instead of decoded-but-shown-paused
+/// (HCL #987 review FIX 7). A pinned peer is force-added to `active_decode_set`
+/// (phase 3) regardless of rank, so without this swap an off-budget pin would be
+/// decoded yet rendered as a "Video paused" avatar — wasted decode AND a
+/// misleading UI.
+///
+/// `all_tiles` is the unified, display-ordered tile list. `visible_tile_count`
+/// is the decoded-window size; `displayed_tile_count` is the number of real grid
+/// cells (everything past it folds into the +N badge). `pinned_idx` is the
+/// pinned peer's index in `all_tiles` (the caller resolves it via
+/// `client.get_peer_user_id`, which is not host-testable, so it is passed in).
+///
+/// ## Bounded by `displayed_tile_count` (issue #1470)
+///
+/// Only a pin in the DISPLAYED off-budget window
+/// `[visible_tile_count, displayed_tile_count)` is swapped inward. A pin in the
+/// true-overflow region (`pinned_idx >= displayed_tile_count` — e.g. a pinned,
+/// silent, late-joiner in a meeting whose camera-ON + mock tiles exceed
+/// `layout_limit`) is NOT promoted: swapping it inward would evict the peer at
+/// `visible_tile_count - 1` OUT to `pinned_idx >= displayed_tile_count`, where
+/// neither the off-budget `avatar_tiles` slice (capped at `displayed_tile_count`)
+/// nor the `camera_off_tiles` group renders it — the evicted peer would silently
+/// vanish from the grid while the +N badge count stayed unchanged. This is the
+/// exact defect bounded on the PLAY path in
+/// [`promote_requested_into_decoded`] (PR #1467 review B1); the pin path shares
+/// the mechanism and is bounded identically here. A true-overflow pin correctly
+/// stays in the +N badge with no decoded slot — consistent with the
+/// POST-EXPANSION INVARIANT documented for the PLAY path. (Phase 3 still
+/// force-adds it to `active_decode_set` by user_id regardless of rank; that is a
+/// distinct concern — admitting the pin's decode — tracked separately and
+/// unchanged here.)
+///
+/// Kept pure / DOM-free / signal-free so it is host-unit-testable.
+pub fn promote_pinned_into_decoded(
+    all_tiles: &mut [String],
+    visible_tile_count: usize,
+    displayed_tile_count: usize,
+    pinned_idx: usize,
+) {
+    if visible_tile_count == 0 || visible_tile_count >= all_tiles.len() {
+        return;
+    }
+    // Only promote a pin in the displayed off-budget window. A pin already inside
+    // the decoded window (`< visible_tile_count`) needs no swap; a pin in true
+    // overflow (`>= displayed_tile_count`) must not evict a displayed tile
+    // off-grid — see the B1 note above.
+    if pinned_idx >= visible_tile_count && pinned_idx < displayed_tile_count {
+        all_tiles.swap(visible_tile_count - 1, pinned_idx);
+    }
+}
+
 /// True when exactly ONE real-peer tile is displayed across ALL THREE render
 /// groups combined: decoded video tiles (`visible`), off-budget avatar tiles
 /// (`avatar`), and camera-off avatar tiles (`camera_off`) (issues #1465, #508).
@@ -2173,5 +2225,86 @@ mod tests {
         let before = all.clone();
         promote_requested_into_decoded(&mut all, 2, 4, &HashSet::new(), None);
         assert_eq!(all, before, "no requests ⇒ list unchanged");
+    }
+
+    /// #1470: a pinned peer ranked in the true-overflow region
+    /// (`pinned_idx >= displayed_tile_count`) must NOT be promoted, and no
+    /// previously-displayed tile may be pushed off the grid past
+    /// `displayed_tile_count`. Mirrors
+    /// `promote_skips_true_overflow_request_and_keeps_displaced_renderable` for the
+    /// PLAY path.
+    ///
+    /// Setup: 10 tiles, `visible_tile_count = 4`, `displayed_tile_count = 8`. The
+    /// pin sits at index 9 (true overflow, beyond the 8 grid cells). The bounded
+    /// swap must leave the list untouched.
+    ///
+    /// MUTATION SENSITIVITY: with the bug (the `pinned_idx < displayed_tile_count`
+    /// bound dropped, i.e. the old unconditional `idx >= visible_tile_count` swap),
+    /// the pin at 9 is swapped into slot 3 and the slot-3 peer "p3" is evicted to
+    /// index 9 (off the grid). Both the decoded-window and index-9 assertions fail
+    /// under that mutation.
+    #[test]
+    fn promote_pinned_skips_true_overflow_and_keeps_displaced_renderable() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
+        let before = all.clone();
+        promote_pinned_into_decoded(&mut all, 4, 8, 9);
+        assert_eq!(
+            all, before,
+            "a pin at idx 9 (>= displayed_tile_count=8) must not be promoted"
+        );
+        assert_eq!(
+            all[9], "p9",
+            "true-overflow pin stays at its overflow index"
+        );
+        assert_eq!(
+            &all[0..4],
+            &["p0", "p1", "p2", "p3"],
+            "the decoded window is undisturbed"
+        );
+    }
+
+    /// #1470: a pin INSIDE the displayed off-budget window
+    /// (`visible <= pinned_idx < displayed`) IS swapped into the last decoded slot
+    /// — the bound must not be so tight that it suppresses the legitimate promotion
+    /// the swap exists for.
+    ///
+    /// Setup: same 10 tiles, `visible = 4`, `displayed = 8`. The pin sits at index 6
+    /// (inside the displayed window). It must move into the last decoded slot
+    /// (index 3), and the displaced "p3" must remain renderable (idx < 8).
+    ///
+    /// MUTATION SENSITIVITY: if the swap were dropped the list is unchanged and the
+    /// `all[3] == "p6"` assertion fails; if the displaced tile went past index 8 the
+    /// `displaced < 8` assertion fails.
+    #[test]
+    fn promote_pinned_admits_in_window() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
+        promote_pinned_into_decoded(&mut all, 4, 8, 6);
+        assert_eq!(
+            all[3], "p6",
+            "in-window pin promoted into last decoded slot"
+        );
+        let displaced = all.iter().position(|t| t == "p3").unwrap();
+        assert!(
+            displaced < 8,
+            "the displaced tile stays in the renderable window, not the +N overflow (was {displaced})"
+        );
+    }
+
+    /// #1470: a pin ALREADY inside the decoded window (`pinned_idx <
+    /// visible_tile_count`) needs no swap and must be left in place.
+    ///
+    /// MUTATION SENSITIVITY: if the lower bound (`pinned_idx >= visible_tile_count`)
+    /// were dropped, the pin at slot 1 would swap with slot 3
+    /// (`visible_tile_count - 1`), reordering the decoded window — the
+    /// `all == before` assertion fails.
+    #[test]
+    fn promote_pinned_already_decoded_is_noop() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5"]);
+        let before = all.clone();
+        promote_pinned_into_decoded(&mut all, 4, 6, 1);
+        assert_eq!(
+            all, before,
+            "a pin already in the decoded window is left untouched"
+        );
     }
 }

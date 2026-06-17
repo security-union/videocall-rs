@@ -18,8 +18,8 @@
 
 use crate::components::decode_budget::{
     decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
-    is_sole_real_tile, merge_user_requested_decode, partition_camera_tiles, BudgetSample,
-    BudgetState, BudgetStep, MIN_CAP,
+    is_sole_real_tile, merge_user_requested_decode, partition_camera_tiles,
+    promote_requested_into_decoded, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
@@ -3650,9 +3650,16 @@ pub fn AttendantsComponent(
         if requested.is_empty() {
             0
         } else {
+            // Only count requested peers in the DISPLAYED off-budget window
+            // `[base_visible_tile_count, displayed_tile_count)`. Requests in the
+            // true-overflow region (`idx >= displayed_tile_count`) have no grid
+            // cell to render in, so they must NOT expand the decoded window —
+            // they fold into the +N badge and stay paused (see the promotion
+            // loop's POST-EXPANSION INVARIANT below).
             all_tiles
                 .iter()
                 .skip(base_visible_tile_count)
+                .take(displayed_tile_count - base_visible_tile_count)
                 .filter(|tile_id| requested.contains(*tile_id))
                 .count()
         }
@@ -3741,42 +3748,28 @@ pub fn AttendantsComponent(
     // Reading `user_requested_decode.read()` HERE is one of the two parent-scope
     // reactive reads (the other is the phase-4 merge) that make a per-tile PLAY
     // click re-render the parent — see the reactivity note on the signal.
-    if visible_tile_count > 0 && visible_tile_count < all_tiles.len() {
+    {
         let requested = user_requested_decode.read();
-        if !requested.is_empty() {
-            // The slot the pinned peer occupies after the pin-swap (if it was
-            // promoted into the decoded region), so the cursor can skip it.
-            let pinned_slot: Option<usize> = pinned_peer_id.peek().as_deref().and_then(|pu| {
+        // The slot the pinned peer occupies after the pin-swap (if it was
+        // promoted into the decoded region), so the cursor can skip it. Resolved
+        // here (needs `client`) and passed into the pure promotion helper.
+        let pinned_slot: Option<usize> = if visible_tile_count > 0 && !requested.is_empty() {
+            pinned_peer_id.peek().as_deref().and_then(|pu| {
                 all_tiles
                     .iter()
                     .take(visible_tile_count)
                     .position(|tile_id| client.get_peer_user_id(tile_id).as_deref() == Some(pu))
-            });
-            // Cursor: the next free decoded slot, walking down from the last one.
-            // `isize` so the "ran out of slots" boundary (-1) is representable.
-            let mut next_free_slot: isize = visible_tile_count as isize - 1;
-            // Collect the indices to promote first (an immutable borrow), then
-            // perform the swaps (a mutable borrow), so we never alias `all_tiles`.
-            let promote_indices: Vec<usize> = all_tiles
-                .iter()
-                .enumerate()
-                .skip(visible_tile_count)
-                .filter(|(_, tile_id)| requested.contains(*tile_id))
-                .map(|(idx, _)| idx)
-                .collect();
-            for idx in promote_indices {
-                // Advance the cursor past the pinned slot (never evict the pin)
-                // and stop if we have exhausted the decoded slots.
-                while next_free_slot >= 0 && Some(next_free_slot as usize) == pinned_slot {
-                    next_free_slot -= 1;
-                }
-                if next_free_slot < 0 {
-                    break;
-                }
-                all_tiles.swap(next_free_slot as usize, idx);
-                next_free_slot -= 1;
-            }
-        }
+            })
+        } else {
+            None
+        };
+        promote_requested_into_decoded(
+            &mut all_tiles,
+            visible_tile_count,
+            displayed_tile_count,
+            &requested,
+            pinned_slot,
+        );
     }
 
     // Bucket 1: the DECODED portion of the unified tile list. These render live
@@ -4782,7 +4775,17 @@ pub fn AttendantsComponent(
                     // `decode_budget_pressured()` reactively keeps the props live.
                     DecodeBudgetBanner {
                         pressured: decode_budget_pressured(),
-                        avatar_count: avatar_tile_count,
+                        // Count only the tiles that ACTUALLY render as paused
+                        // video — i.e. the shed camera-ON/mock tiles in
+                        // `avatar_tiles`. `avatar_tile_count`
+                        // (`displayed_tile_count - visible_tile_count`) also
+                        // includes displayed cells filled by camera-OFF peers,
+                        // which render as plain (non-paused) avatars from the
+                        // separate `camera_off_tiles` group (#1465); counting
+                        // those would over-state "N videos paused" and re-surface
+                        // the "camera-off looks sheddable" inconsistency #1465
+                        // set out to kill.
+                        avatar_count: avatar_tiles.len(),
                         natural: total_tiles,
                     }
 

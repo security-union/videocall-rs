@@ -745,6 +745,74 @@ pub fn merge_user_requested_decode(
     }
 }
 
+/// Promote user-requested ("PLAY") peers that are still ranked beyond the
+/// decoded window INWARD into decoded slots, so they render live instead of
+/// decoded-but-shown-paused (issues #1466 / #1286).
+///
+/// `all_tiles` is the unified, display-ordered tile list. `visible_tile_count`
+/// is the (already-expanded) decoded-window size; `displayed_tile_count` is the
+/// number of real grid cells (everything past it folds into the +N badge).
+/// `requested` is the set of force-decode `session_id`s. `pinned_slot`, if
+/// `Some`, is the decoded-slot index the pinned peer occupies after the pin
+/// swap — the cursor skips it so a promotion never evicts the pin.
+///
+/// ## Bounded by `displayed_tile_count` (PR #1467 review B1)
+///
+/// Only peers in the DISPLAYED off-budget window
+/// `[visible_tile_count, displayed_tile_count)` are eligible to promote. A
+/// requested peer in the true-overflow region (`idx >= displayed_tile_count`)
+/// is NOT swapped inward: doing so would pull a true-overflow peer onto the grid
+/// and evict a previously-displayed tile OUT to `idx >= displayed_tile_count`,
+/// where neither the off-budget `avatar_tiles` slice (capped at
+/// `displayed_tile_count`) nor the `camera_off_tiles` group renders it — the
+/// evicted peer would silently vanish from the grid while the +N badge count
+/// stayed unchanged. Bounding the eligible range to `displayed_tile_count`
+/// guarantees every displaced tile lands back in the renderable
+/// `[visible_tile_count, displayed_tile_count)` range, and true-overflow
+/// requests genuinely stay in the +N badge (they get no decoded slot, so the
+/// phase-4 merge keeps them out of `active_decode_set` and decode⇄render still
+/// agree).
+///
+/// Kept pure / DOM-free / signal-free so it is host-unit-testable; the caller
+/// resolves `pinned_slot` (via `client.get_peer_user_id`) before calling.
+pub fn promote_requested_into_decoded(
+    all_tiles: &mut [String],
+    visible_tile_count: usize,
+    displayed_tile_count: usize,
+    requested: &std::collections::HashSet<String>,
+    pinned_slot: Option<usize>,
+) {
+    if visible_tile_count == 0 || visible_tile_count >= all_tiles.len() || requested.is_empty() {
+        return;
+    }
+    // Cursor: the next free decoded slot, walking down from the last one.
+    // `isize` so the "ran out of slots" boundary (-1) is representable.
+    let mut next_free_slot: isize = visible_tile_count as isize - 1;
+    // Collect the indices to promote first (an immutable borrow), then perform
+    // the swaps, so we never alias `all_tiles`. `take(displayed_tile_count)`
+    // bounds eligibility to the renderable window — see the B1 note above.
+    let promote_indices: Vec<usize> = all_tiles
+        .iter()
+        .enumerate()
+        .take(displayed_tile_count)
+        .skip(visible_tile_count)
+        .filter(|(_, tile_id)| requested.contains(*tile_id))
+        .map(|(idx, _)| idx)
+        .collect();
+    for idx in promote_indices {
+        // Advance the cursor past the pinned slot (never evict the pin) and
+        // stop if we have exhausted the decoded slots.
+        while next_free_slot >= 0 && Some(next_free_slot as usize) == pinned_slot {
+            next_free_slot -= 1;
+        }
+        if next_free_slot < 0 {
+            break;
+        }
+        all_tiles.swap(next_free_slot as usize, idx);
+        next_free_slot -= 1;
+    }
+}
+
 /// True when exactly ONE real-peer tile is displayed across ALL THREE render
 /// groups combined: decoded video tiles (`visible`), off-budget avatar tiles
 /// (`avatar`), and camera-off avatar tiles (`camera_off`) (issues #1465, #508).
@@ -2010,5 +2078,100 @@ mod tests {
 
         // Zero tiles → not sole.
         assert!(!is_sole_real_tile(0, 0, 0), "no tiles is not a sole tile");
+    }
+
+    fn tiles(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn req(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// B1 REGRESSION (PR #1467 review): a requested peer ranked in the
+    /// true-overflow region (`idx >= displayed_tile_count`) must NOT be promoted,
+    /// and no previously-displayed tile may be pushed past `displayed_tile_count`.
+    ///
+    /// Setup: 10 tiles, `visible_tile_count = 4`, `displayed_tile_count = 8`.
+    /// Peer "p9" sits at index 9 (true overflow, beyond the 8 grid cells) and is
+    /// the only PLAY request. The bounded promotion must leave the list untouched.
+    ///
+    /// MUTATION SENSITIVITY: with the bug (`take(displayed_tile_count)` dropped, or
+    /// `.take()` widened to `all_tiles.len()`), "p9" is swapped into slot 3 and the
+    /// slot-3 peer "p3" is evicted to index 9 (off the grid). The assertions on
+    /// both the decoded window AND index 9 fail under that mutation.
+    #[test]
+    fn promote_skips_true_overflow_request_and_keeps_displaced_renderable() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
+        let before = all.clone();
+        promote_requested_into_decoded(&mut all, 4, 8, &req(&["p9"]), None);
+        // True-overflow request was ignored: list is completely unchanged.
+        assert_eq!(
+            all, before,
+            "a request at idx 9 (>= displayed_tile_count=8) must not be promoted"
+        );
+        // No previously-displayed tile was pushed into the overflow region.
+        assert_eq!(
+            all[9], "p9",
+            "true-overflow peer stays at its overflow index"
+        );
+        assert_eq!(
+            &all[0..4],
+            &["p0", "p1", "p2", "p3"],
+            "the decoded window is undisturbed"
+        );
+    }
+
+    /// A requested peer INSIDE the displayed off-budget window
+    /// (`visible <= idx < displayed`) IS promoted into the decoded slice — the
+    /// bound must not be so tight that it suppresses legitimate promotions.
+    ///
+    /// Setup: same 10 tiles, `visible = 4`, `displayed = 8`. "p6" (index 6, inside
+    /// the displayed window) is requested. It must move into the last decoded slot
+    /// (index 3), and the displaced "p3" must remain renderable (idx < 8).
+    ///
+    /// MUTATION SENSITIVITY: if the promotion were dropped entirely the list would
+    /// be unchanged and the `all[3] == "p6"` assertion fails; if the displaced tile
+    /// went past index 8 the `displaced index < 8` assertion fails.
+    #[test]
+    fn promote_admits_in_window_request() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
+        promote_requested_into_decoded(&mut all, 4, 8, &req(&["p6"]), None);
+        assert_eq!(
+            all[3], "p6",
+            "in-window request promoted into last decoded slot"
+        );
+        let displaced = all.iter().position(|t| t == "p3").unwrap();
+        assert!(
+            displaced < 8,
+            "the displaced tile stays in the renderable window, not the +N overflow (was {displaced})"
+        );
+    }
+
+    /// The promotion cursor skips the pinned slot so a PLAY promotion never evicts
+    /// the pinned peer. With `visible = 3`, `displayed = 6`, pin at slot 2, and
+    /// "p4" requested, the request must land in slot 1 (slot 2 is skipped) and the
+    /// pinned tile at slot 2 must be preserved.
+    ///
+    /// MUTATION SENSITIVITY: dropping the `pinned_slot` skip swaps "p4" into slot 2,
+    /// evicting the pin — the `all[2] == "p2"` assertion fails.
+    #[test]
+    fn promote_skips_pinned_slot() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5"]);
+        promote_requested_into_decoded(&mut all, 3, 6, &req(&["p4"]), Some(2));
+        assert_eq!(all[2], "p2", "pinned slot is never evicted by a promotion");
+        assert_eq!(
+            all[1], "p4",
+            "request lands in the next free slot below the pin"
+        );
+    }
+
+    /// Empty request set is a no-op (the unpressured / no-PLAY path).
+    #[test]
+    fn promote_empty_request_is_noop() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3"]);
+        let before = all.clone();
+        promote_requested_into_decoded(&mut all, 2, 4, &HashSet::new(), None);
+        assert_eq!(all, before, "no requests ⇒ list unchanged");
     }
 }

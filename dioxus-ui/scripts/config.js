@@ -18,7 +18,7 @@ window.__APP_CONFIG = ({
   oauthEnabled: "false",
   e2eeEnabled: "false",
   webTransportEnabled: "true",
-  transportBadgeEnabled: "false",
+  transportBadgeEnabled: "true",
   firefoxEnabled: "false",
   usersAllowedToStream: "",
   serverElectionPeriodMs: 2000,

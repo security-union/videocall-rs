@@ -4001,34 +4001,34 @@ pub fn AttendantsComponent(
         // expansion could NOT admit (beyond the device ceiling #1286) have no
         // slot, correctly stay paused avatars, and are kept OUT of
         // `active_decode_set` by the decoded-bucket-intersecting phase-4 merge.
-        if ss_budget > 0 && ss_budget < ss_all.len() {
+        {
             let requested = user_requested_decode.read();
-            if !requested.is_empty() {
-                let pinned_slot: Option<usize> = pinned_peer_id.peek().as_deref().and_then(|pu| {
-                    ss_all
-                        .iter()
-                        .take(ss_budget)
-                        .position(|tile_id| client.get_peer_user_id(tile_id).as_deref() == Some(pu))
-                });
-                let mut next_free_slot: isize = ss_budget as isize - 1;
-                let promote_indices: Vec<usize> = ss_all
-                    .iter()
-                    .enumerate()
-                    .skip(ss_budget)
-                    .filter(|(_, tile_id)| requested.contains(*tile_id))
-                    .map(|(idx, _)| idx)
-                    .collect();
-                for idx in promote_indices {
-                    while next_free_slot >= 0 && Some(next_free_slot as usize) == pinned_slot {
-                        next_free_slot -= 1;
-                    }
-                    if next_free_slot < 0 {
-                        break;
-                    }
-                    ss_all.swap(next_free_slot as usize, idx);
-                    next_free_slot -= 1;
-                }
-            }
+            // Resolve the pinned peer's post-swap decoded slot (needs `client`, not
+            // host-testable) and pass it into the shared pure helper. The SS panel renders ALL
+            // tiles (vertical scroll, no +N badge), so `displayed_tile_count = ss_all.len()` —
+            // every off-budget tile is renderable, so the helper's true-overflow bound (#1470)
+            // never excludes an SS peer, preserving the prior inline-loop behaviour.
+            // `ss_budget < ss_all.len()` mirrors the helper's own early-return bound, so we skip
+            // the `get_peer_user_id` scan in the budget-covers-all-tiles case (where the helper
+            // does nothing anyway).
+            let pinned_slot: Option<usize> =
+                if ss_budget > 0 && ss_budget < ss_all.len() && !requested.is_empty() {
+                    pinned_peer_id.peek().as_deref().and_then(|pu| {
+                        ss_all.iter().take(ss_budget).position(|tile_id| {
+                            client.get_peer_user_id(tile_id).as_deref() == Some(pu)
+                        })
+                    })
+                } else {
+                    None
+                };
+            let ss_displayed = ss_all.len();
+            promote_requested_into_decoded(
+                &mut ss_all,
+                ss_budget,
+                ss_displayed,
+                &requested,
+                pinned_slot,
+            );
         }
 
         // Split: first ss_budget tiles get video decode, rest get avatars.
@@ -4789,8 +4789,15 @@ pub fn AttendantsComponent(
                         // separate `camera_off_tiles` group (#1465); counting
                         // those would over-state "N videos paused" and re-surface
                         // the "camera-off looks sheddable" inconsistency #1465
-                        // set out to kill.
-                        avatar_count: avatar_tiles.len(),
+                        // set out to kill. During screen share the active layout
+                        // is the SS panel, whose paused-video tiles live in
+                        // `ss_avatar_tiles` — use that count so "N videos paused"
+                        // matches what the user actually sees (#1472).
+                        avatar_count: if has_screen_share {
+                            ss_avatar_tiles.len()
+                        } else {
+                            avatar_tiles.len()
+                        },
                         natural: total_tiles,
                     }
 

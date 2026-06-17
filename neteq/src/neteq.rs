@@ -1156,7 +1156,28 @@ mod tests {
     use std::{thread::sleep, time::Duration};
 
     use super::*;
+    use crate::codec::AudioDecoder;
     use crate::packet::RtpHeader;
+
+    struct TestPcmDecoder {
+        sample_rate: u32,
+        channels: u8,
+        samples: usize,
+    }
+
+    impl AudioDecoder for TestPcmDecoder {
+        fn sample_rate(&self) -> u32 {
+            self.sample_rate
+        }
+
+        fn channels(&self) -> u8 {
+            self.channels
+        }
+
+        fn decode(&mut self, _encoded: &[u8]) -> Result<Vec<f32>> {
+            Ok(vec![0.25; self.samples])
+        }
+    }
 
     fn create_test_packet(seq: u16, ts: u32, duration_ms: u32) -> AudioPacket {
         let header = RtpHeader::new(seq, ts, 12345, 96, false);
@@ -1184,19 +1205,11 @@ mod tests {
         AudioPacket::new(header, payload, 48000, 1, 20)
     }
 
-    /// Issue #1402: `NetEq::flush` must actually DRAIN the packet buffer.
+    /// Regression guard: `NetEq::flush` must keep draining the packet buffer.
     ///
-    /// This is the production behavior the worker's `WorkerMsg::Flush` handler relies
-    /// on when a peer's audio stream ends (mic-off / host force-mute): the buffer must
-    /// be emptied so NetEq stops emitting expand/comfort-noise concealment ("hiss") for
-    /// a stream that is no longer producing packets. The handler was a no-op (it only
-    /// logged), so the buffer was never cleared and the un-muted path kept hissing.
-    /// `WebNetEq::flush` delegates to this method, so pinning it here pins the fix's
-    /// load-bearing behavior on the host target (the worker's wasm `WebNetEq` wrapper
-    /// has no host-runnable harness).
-    ///
-    /// MUTATION CHECK: if `NetEq::flush` were reverted to a no-op (or the worker handler
-    /// left calling nothing), the post-flush `packet_buffer.len() == 0` assertion fails.
+    /// The worker's wasm `WebNetEq` wrapper has no host-runnable harness here, so
+    /// this host test does not prove the worker dispatch. It preserves the
+    /// existing core flush contract that the worker dispatch delegates to.
     #[test]
     fn test_flush_drains_packet_buffer() {
         let config = NetEqConfig {
@@ -1217,7 +1230,7 @@ mod tests {
             neteq.packet_buffer.len()
         );
 
-        // The peer's audio stream ends → flush.
+        // The peer's audio stream ends; flush should leave no queued packets.
         neteq.flush();
 
         assert_eq!(
@@ -1226,6 +1239,52 @@ mod tests {
             "flush must drain the packet buffer so no concealment is emitted for the \
              ended stream; {} packet(s) remained",
             neteq.packet_buffer.len()
+        );
+    }
+
+    /// Issue #1402: `flush()` must also drain the decoded-PCM bypass queue.
+    ///
+    /// Packet-buffer draining already existed before this PR. The host-testable
+    /// behavior added here is the `bypass_audio_queue.clear()` path: in bypass
+    /// mode, `insert_packet` decodes immediately and stores PCM outside the
+    /// packet buffer, so `flush()` must empty that backlog too.
+    ///
+    /// MUTATION CHECK: removing `self.bypass_audio_queue.clear()` from
+    /// `NetEq::flush` leaves this test's final assertion non-empty.
+    #[test]
+    fn test_flush_drains_bypass_audio_queue() {
+        let config = NetEqConfig {
+            sample_rate: 48_000,
+            channels: 1,
+            bypass_mode: true,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+        neteq.register_decoder(
+            96,
+            Box::new(TestPcmDecoder {
+                sample_rate: 48_000,
+                channels: 1,
+                samples: 960,
+            }),
+        );
+
+        neteq.insert_packet(create_48k_20ms_packet(0, 0)).unwrap();
+        assert!(
+            !neteq.bypass_audio_queue.is_empty(),
+            "precondition: bypass mode should queue decoded PCM before flush"
+        );
+        assert!(
+            neteq.packet_buffer.is_empty(),
+            "precondition: bypass mode should not use the packet buffer"
+        );
+
+        neteq.flush();
+
+        assert!(
+            neteq.bypass_audio_queue.is_empty(),
+            "flush must drain bypass decoded PCM; {} sample(s) remained",
+            neteq.bypass_audio_queue.len()
         );
     }
 

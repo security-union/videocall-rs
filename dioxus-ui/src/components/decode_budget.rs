@@ -2200,6 +2200,35 @@ mod tests {
         );
     }
 
+    /// Screen-share configuration (issue #1472): the SS panel renders ALL tiles (no +N
+    /// overflow badge), so it calls the helper with `displayed_tile_count == all_tiles.len()`.
+    /// In that configuration the true-overflow region `[displayed_tile_count, len)` is empty,
+    /// so the `.take(displayed_tile_count)` eligibility bound is a no-op and EVERY off-budget
+    /// requested peer must be promoted into the decoded window — identical to the old inline SS
+    /// loop that had no `.take()` at all. This pins the equivalence the #1472 DRY refactor
+    /// relies on.
+    ///
+    /// MUTATION SENSITIVITY: if the helper's `.take(displayed_tile_count)` were tightened to a
+    /// smaller bound (e.g. a hard-coded grid size < len), the deepest requested peer "p5" would
+    /// fall in a spurious overflow region and NOT be promoted — `all[0] == "p5"` would fail.
+    #[test]
+    fn promote_with_displayed_eq_len_admits_all_offbudget_requests() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5"]);
+        let len = all.len();
+        // visible (ss_budget) = 2, displayed = len (no +N region). Request the two deepest
+        // off-budget peers; both must be pulled into the decoded window [0, 2).
+        promote_requested_into_decoded(&mut all, 2, len, &req(&["p4", "p5"]), None);
+        // Cursor walks down from slot 1: first eligible (p4) → slot 1, next (p5) → slot 0.
+        assert_eq!(
+            all[1], "p4",
+            "first off-budget request promoted into slot 1"
+        );
+        assert_eq!(
+            all[0], "p5",
+            "second off-budget request promoted into slot 0 (no overflow region excludes it)"
+        );
+    }
+
     /// The promotion cursor skips the pinned slot so a PLAY promotion never evicts
     /// the pinned peer. With `visible = 3`, `displayed = 6`, pin at slot 2, and
     /// "p4" requested, the request must land in slot 1 (slot 2 is skipped) and the

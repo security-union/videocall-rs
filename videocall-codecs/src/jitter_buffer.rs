@@ -48,13 +48,48 @@ const MAX_PLAYOUT_DELAY_MS: f64 = 500.0;
 /// - This is a live videoconference: liveness beats completeness. ~1.8s is the boundary past which
 ///   continuing to drain buffered video does more harm (A/V desync, growing lag) than dropping it.
 const MAX_PLAYOUT_AGE_MS: f64 = 1800.0;
-/// Minimum interval between proactive keyframe requests fired by the keyframe-less
-/// eviction path (issue #1025). Matched to the relay's KEYFRAME_REQUEST window
-/// (`KEYFRAME_REQUEST_WINDOW_MS`, ~1s) so a sustained keyframe-less stall emits at
-/// most ~1 request/sec from this receiver's uplink — the rate the relay will
-/// actually honor — instead of one per ~10ms eviction tick. See
-/// `last_keyframe_request_ms`.
+/// *Base* (first-strike) interval between proactive keyframe requests fired by the
+/// keyframe-less eviction path (issue #1025). Matched to the relay's KEYFRAME_REQUEST
+/// window (`KEYFRAME_REQUEST_WINDOW_MS`, ~1s) so the FIRST request of a stall emits at
+/// the rate the relay will actually honor — instead of one per ~10ms eviction tick.
+///
+/// Under a *sustained or recurring* stall this is only the first step: each subsequent
+/// request doubles the interval (exponential backoff, capped via
+/// `PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP`) so the receiver does not spray ~1 PLI/sec
+/// at the speaker for the whole meeting — the #1479 keyframe-storm amplifier. Crucially the
+/// backoff is keyed to *request* cadence, not to playout release: the #1479 field shape is
+/// many short (1–5s) freezes interleaved with smooth playout, NOT one long stall, so a reset
+/// on every frame release would zero the exponent between episodes and never damp the
+/// meeting-wide storm. Instead the exponent persists across closely-spaced re-freezes and
+/// only resets after a genuinely quiet interval with no proactive request — see
+/// `PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS` and
+/// `consecutive_proactive_keyframe_requests`. See `last_keyframe_request_ms`.
 const PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS: f64 = 1000.0;
+/// Maximum backoff exponent applied to `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS` under a
+/// sustained/recurring keyframe-less stall (issue #1479). With a 1000ms base, exponent 3 caps
+/// the proactive-PLI cadence at `1000 * 2^3 = 8000ms` — i.e. once recovery is clearly not
+/// arriving, this receiver pokes the speaker at most ~1/8s instead of ~1/s, damping the
+/// self-sustaining PLI storm. Going quiet is safe: the independent reactive gap-driven request
+/// path (`peer_decode_manager::should_request_keyframe`, 1s base + its own backoff + uncapped
+/// slow-retry) remains the binding lower bound on freeze recovery; this proactive path is only
+/// an accelerator on top of it, and the whole point of #1479 is to stop it from amplifying.
+const PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP: u32 = 3;
+/// Quiet interval (ms) since the last proactive keyframe request after which the backoff
+/// exponent resets to 0 (issue #1479). Set comfortably ABOVE the maximum backed-off interval
+/// (`1000 * 2^3 = 8000ms`) so a receiver legitimately firing at the capped ~1/8s cadence
+/// during an ongoing stall does NOT spuriously reset itself, while a genuinely recovered
+/// stream — one that has not needed a proactive request for >12s — re-arms at full speed for
+/// the next independent stall. This time-based reset is what makes the backoff accumulate
+/// across the storm's short, recurring freezes (each spaced well under 12s) instead of being
+/// zeroed by the brief smooth playout between them.
+///
+/// Note: this is intentionally shorter than the *reactive* gap-driven path's decay window
+/// (`peer_decode_manager`'s `KEYFRAME_BACKOFF_DECAY_MS`, 30s). The two paths are independent;
+/// the proactive path here is a more aggressive accelerator, so re-arming it sooner after a
+/// genuine recovery is fine — and it must stay strictly above this path's own 8s cap (see
+/// `PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP`) so a stall firing at the capped cadence never
+/// self-resets mid-storm.
+const PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS: f64 = 12_000.0;
 /// A multiplier applied to the jitter estimate to provide a safety margin.
 /// A value of 3.0 means we buffer enough to handle jitter up to 3x the running average.
 const JITTER_MULTIPLIER: f64 = 3.0;
@@ -297,11 +332,28 @@ pub struct JitterBuffer<T> {
     /// eviction cadence tracks the delta rate (~10–30/s), and without this gate the
     /// hook would spray the already-struggling receiver's uplink + worker→main bus
     /// with that many KEYFRAME_REQUESTs — packets the relay limiter then drops
-    /// anyway. We fire at most once per `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS`
-    /// so the emitted rate matches the rate the relay will honor (~1/s). `None`
-    /// until the first fire; reset on `flush()` so a fresh stream can request
-    /// immediately.
+    /// anyway. The first request of a stall fires after
+    /// `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS`; under a sustained stall the
+    /// interval then grows exponentially (see
+    /// `consecutive_proactive_keyframe_requests`) so the emitted rate decays from
+    /// ~1/s toward ~1/8s instead of pinning at the relay window. `None` until the
+    /// first fire; reset on `flush()` so a fresh stream can request immediately.
     last_keyframe_request_ms: Option<u128>,
+
+    /// Backoff exponent for the proactive keyframe-request interval (issues #1025/#1479):
+    /// the number of proactive requests fired without a long enough quiet gap to reset.
+    /// Incremented on every fire; reset to 0 when the gap since the last fire exceeds
+    /// `PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS` (genuine sustained recovery) or on
+    /// `flush()`.
+    ///
+    /// Deliberately keyed to *request cadence*, NOT to frame release. The #1479 storm is many
+    /// short (1–5s) freezes interleaved with smooth playout, not one long stall; resetting on
+    /// frame release would zero the exponent during every smooth gap and the backoff would
+    /// never accumulate across the storm — defeating the fix. Keying the reset to a quiet
+    /// interval (> the capped 8s cadence) means the exponent persists across the storm's
+    /// closely-spaced re-freezes and only resets once the stream has genuinely stopped needing
+    /// proactive requests.
+    consecutive_proactive_keyframe_requests: u32,
 
     /// Most recent freshness-deadline skip this poll produced (issue #1045), set by
     /// `enforce_freshness_deadline` and consumed by the worker via
@@ -377,6 +429,7 @@ impl<T> JitterBuffer<T> {
             decoder,
             request_keyframe,
             last_keyframe_request_ms: None,
+            consecutive_proactive_keyframe_requests: 0,
             last_freshness_skip: None,
             last_freshness_skip_emit_ms: None,
             pending_freshness_skip: None,
@@ -879,21 +932,55 @@ impl<T> JitterBuffer<T> {
                 // until a fresh keyframe arrives — fetching one sooner directly shortens that
                 // freeze.
                 //
-                // Source-side throttle: a *sustained* keyframe-less stall evicts on ~every
-                // ~10ms tick (the head delta ages past the deadline as fast as deltas arrive),
-                // so firing per-eviction would spray this already-struggling receiver's uplink
-                // + worker→main bus at ~10–30/s. The relay limiter (#979/#1011) coalesces for
-                // the publisher but not for our uplink, so we gate at the source: fire at most
-                // once per PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS (≈ the relay window).
+                // Source-side throttle + backoff: a *sustained or recurring* keyframe-less stall
+                // evicts on ~every ~10ms tick (the head delta ages past the deadline as fast as
+                // deltas arrive), so firing per-eviction would spray this already-struggling
+                // receiver's uplink + worker→main bus at ~10–30/s. The relay limiter (#979/#1011)
+                // coalesces for the publisher but not for our uplink, so we gate at the source.
+                //
+                // First, reset the backoff exponent if the stream has been quiet (no proactive
+                // request) for longer than PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS — a genuine
+                // sustained recovery. The reset is keyed to *request quiet time*, NOT to frame
+                // release: the #1479 storm is many short (1–5s) freezes interleaved with smooth
+                // playout, so a release-driven reset would zero the exponent during each smooth
+                // gap and the backoff would never accumulate across the storm. Keying it to a
+                // quiet interval well above the capped 8s cadence means the exponent persists
+                // across closely-spaced re-freezes (damping the storm) yet still re-arms a truly
+                // recovered stream for the next independent stall.
+                if let Some(last) = self.last_keyframe_request_ms {
+                    if (current_time_ms.saturating_sub(last)) as f64
+                        >= PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS
+                    {
+                        self.consecutive_proactive_keyframe_requests = 0;
+                    }
+                }
+
+                // The FIRST request fires after PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS
+                // (≈ the relay window). Each subsequent request within the backoff window then
+                // doubles the interval — exponential backoff capped at
+                // PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP (issue #1479). A fixed ~1/s cadence
+                // across a meeting-long sequence of freezes is precisely the receiver-side
+                // amplifier of the PLI keyframe storm: every receiver pokes the active speaker
+                // every second, and the relay's delivery-unaware limiter then delays the very
+                // recovery keyframe those pokes are asking for. Backing off decays the cadence
+                // toward ~1/8s while the stall persists, then the quiet-interval reset above
+                // restores full speed once the stream genuinely recovers.
+                let backoff_exp = self
+                    .consecutive_proactive_keyframe_requests
+                    .min(PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP);
+                let required_interval_ms =
+                    PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS * (2u32.pow(backoff_exp) as f64);
                 let should_request = match self.last_keyframe_request_ms {
                     Some(last) => {
-                        (current_time_ms.saturating_sub(last)) as f64
-                            >= PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS
+                        (current_time_ms.saturating_sub(last)) as f64 >= required_interval_ms
                     }
                     None => true,
                 };
                 if should_request {
                     self.last_keyframe_request_ms = Some(current_time_ms);
+                    self.consecutive_proactive_keyframe_requests = self
+                        .consecutive_proactive_keyframe_requests
+                        .saturating_add(1);
                     (self.request_keyframe)();
                 }
             }
@@ -1069,8 +1156,10 @@ impl<T> JitterBuffer<T> {
         self.last_released_arrival_time_ms = None;
         // Reset the proactive keyframe-request throttle (issue #1025) so a fresh stream after a
         // flush (e.g. stream restart) can request a recovery keyframe immediately rather than
-        // inheriting the pre-flush cooldown.
+        // inheriting the pre-flush cooldown. Reset the backoff exponent too (issue #1479) so the
+        // post-flush stream is not handicapped by a prior stall's accumulated backoff.
         self.last_keyframe_request_ms = None;
+        self.consecutive_proactive_keyframe_requests = 0;
         // Reset freshness-skip diagnostic throttling too: a post-flush stream should not inherit
         // stale diagnostic cooldown or coalesced skip details from before the stream reset.
         self.last_freshness_skip = None;
@@ -1903,12 +1992,12 @@ mod tests {
 
     /// Issue #1025 (source-side throttle): a SUSTAINED keyframe-less stall evicts
     /// one stale head per poll (~every 10ms tick in production). The proactive
-    /// keyframe request must fire at most once per
-    /// PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS so the struggling receiver does
-    /// not spray its uplink/worker bus with requests the relay would only drop.
+    /// keyframe request must fire at most once per the *current* backoff interval so
+    /// the struggling receiver does not spray its uplink/worker bus with requests the
+    /// relay would only drop.
     ///
     /// Mutation coverage: removing the throttle (firing on every eviction) makes
-    /// the within-window evictions fire too, failing the `== 1` assert; not
+    /// the within-window evictions fire too, failing the first `== 1` assert; not
     /// updating `last_keyframe_request_ms` makes the second window never fire,
     /// failing the `== 2` assert.
     #[test]
@@ -1932,7 +2021,7 @@ mod tests {
         jb.insert_frame(create_test_frame(4, FrameType::DeltaFrame), 300);
 
         // Three evictions in quick succession (10ms apart, well within the 1000ms
-        // throttle). Only the FIRST may fire a proactive request.
+        // base interval). Only the FIRST may fire a proactive request.
         jb.find_and_move_continuous_frames(2150); // evict seq 2 → fires (#1)
         jb.find_and_move_continuous_frames(2160); // evict seq 3 → throttled
         jb.find_and_move_continuous_frames(2170); // evict seq 4 → throttled
@@ -1942,13 +2031,145 @@ mod tests {
             "sustained eviction within one throttle window must fire exactly once"
         );
 
-        // A later eviction PAST the throttle window fires again.
+        // After the first fire the backoff exponent is 1, so the next interval is
+        // 1000 * 2^1 = 2000ms. An eviction only 1050ms after the first must STILL be
+        // throttled — proving the interval grew (issue #1479). Without backoff (fixed
+        // 1000ms) this would fire and bump the count to 2.
         jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1400);
-        jb.find_and_move_continuous_frames(3200); // 3200 - 2150 = 1050ms ≥ 1000 → fires (#2)
+        jb.find_and_move_continuous_frames(3200); // 3200 - 2150 = 1050ms < 2000ms → throttled
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "within the backed-off (2000ms) window the request must still be throttled"
+        );
+
+        // Past the backed-off window (>= 2000ms after the first fire) it fires again.
+        jb.insert_frame(create_test_frame(6, FrameType::DeltaFrame), 1450);
+        jb.find_and_move_continuous_frames(4200); // 4200 - 2150 = 2050ms >= 2000ms → fires (#2)
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,
-            "an eviction past the throttle window fires a fresh request"
+            "an eviction past the backed-off window fires a fresh request"
+        );
+    }
+
+    /// Issue #1479: under a SUSTAINED keyframe-less stall the proactive-PLI interval
+    /// must grow exponentially (1s → 2s → 4s → 8s, capped) so the receiver stops poking
+    /// the active speaker ~1/s for the whole stall — the receiver-side amplifier of the
+    /// PLI keyframe storm. The backoff exponent must reset ONLY after a genuinely quiet
+    /// interval (> PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS with no proactive request),
+    /// NOT on a mere frame release — the #1479 storm is many short freezes interleaved with
+    /// smooth playout, so a release-driven reset would zero the exponent during each smooth
+    /// gap and the backoff would never accumulate across the storm.
+    ///
+    /// Mutation coverage: deleting the backoff (firing at the fixed base interval) lets the
+    /// 2nd fire land at 1s instead of 2s — a "still throttled" assert fails. Deleting the
+    /// quiet-interval reset leaves the exponent pinned at the cap, so the post-quiet fire is
+    /// throttled for 8s and the final "fires at base after a long quiet gap" assert fails.
+    #[test]
+    fn proactive_keyframe_request_backs_off_and_resets_after_quiet_interval() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // last-good = seq 1.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+
+        let base = PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS as u128; // 1000
+
+        // Pre-insert a keyframe-LESS delta backlog, all at the SAME early arrival (300). Each poll
+        // evicts exactly one head delta (keyframe-less branch drops only the head); the next delta
+        // then becomes the head with the same old arrival, so it too is instantly stale on the next
+        // poll. last_decoded stays at 1 the whole stall (nothing is released), so every poll is
+        // *eligible* to fire — gated only by the backoff interval. Inserting all at one arrival
+        // keeps the jitter estimator's inter-arrival delta non-negative (it underflows on
+        // backwards-moving arrival times). Each poll below evicts one head delta, so the backlog
+        // must be at least as large as the total number of polls (12 here); 2..=24 is generous.
+        for s in 2u64..=24 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 300);
+        }
+
+        // First fire (no prior request → fires immediately).
+        let mut last_fire = 5000u128;
+        jb.find_and_move_continuous_frames(last_fire);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "first proactive request fires"
+        );
+
+        // Sustained stall: the interval after each fire doubles — 2s, 4s, 8s, then capped at 8s.
+        let expected_gaps_ms = [2 * base, 4 * base, 8 * base, 8 * base];
+        for (i, gap) in expected_gaps_ms.iter().enumerate() {
+            // Just BEFORE the backed-off interval → still throttled.
+            jb.find_and_move_continuous_frames(last_fire + gap - 100);
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                (i + 1) as u32,
+                "request {} must still be throttled just before the {}ms backed-off window",
+                i + 2,
+                gap
+            );
+            // Just AFTER the backed-off interval → fires.
+            let after_t = last_fire + gap + 50;
+            jb.find_and_move_continuous_frames(after_t);
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                (i + 2) as u32,
+                "request {} fires once past the {}ms backed-off window",
+                i + 2,
+                gap
+            );
+            last_fire = after_t;
+        }
+        let fires_during_stall = requests.load(Ordering::SeqCst);
+        assert_eq!(fires_during_stall, 5, "5 fires across the backed-off stall");
+        // The exponent is now pinned at the cap; the next interval would be 8s WITHOUT a reset.
+
+        // QUIET INTERVAL (genuine recovery): no proactive request fires for longer than
+        // PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS. The next keyframe-less eviction after
+        // that gap must reset the exponent to 0 and fire at the BASE interval again. We poll
+        // once, `RESET_MS + a bit` after the last fire: that single poll is >= base (so it is
+        // eligible) and, because it crossed the reset threshold, the exponent is cleared FIRST,
+        // so it fires. With the reset deleted the exponent stays at the cap and the required
+        // interval is 8s — but RESET_MS (12s) > 8s, so to prove the *reset* (not just elapsed
+        // time) we follow with a second poll exactly base+ after this fire: that only fires if
+        // the exponent is now back at 0.
+        let reset_ms = PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS as u128;
+        let quiet_fire = last_fire + reset_ms + 100;
+        jb.find_and_move_continuous_frames(quiet_fire);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            fires_during_stall + 1,
+            "after a quiet interval the next eviction fires"
+        );
+
+        // The DISCRIMINATING assert: a follow-up eviction only `2*base` after `quiet_fire` must
+        // FIRE — proving the exponent was reset to 0 (interval back to base), not still at the
+        // cap (which would require 8s). 2*base = 2000ms is >= base(1000, after the now-1 exponent
+        // doubles to 2s) … so we instead poll base+50 after, before the post-reset exponent's
+        // own 2s step. Precisely: after the reset-fire the exponent is 1, so the next interval is
+        // 2s; a poll at base+50 (1050ms) is < 2s and must be THROTTLED, and a poll at 2*base+50
+        // must FIRE. We assert the throttle first (distinguishes reset-to-0 from no-reset, since
+        // no-reset would also be throttled here — so this alone is not enough), then the fire.
+        jb.find_and_move_continuous_frames(quiet_fire + base + 50); // 1050ms < 2000ms post-reset step
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            fires_during_stall + 1,
+            "immediately after the reset-fire, the exponent-1 (2s) step throttles a base-spaced poll"
+        );
+        jb.find_and_move_continuous_frames(quiet_fire + 2 * base + 50); // 2050ms >= 2000ms → fires
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            fires_during_stall + 2,
+            "post-reset the cadence is back on the base schedule (2s after the reset-fire), proving the exponent reset to 0 — not pinned at the 8s cap"
         );
     }
 
@@ -1987,6 +2208,84 @@ mod tests {
             requests.load(Ordering::SeqCst),
             2,
             "post-flush eviction fires immediately despite being inside the pre-flush throttle window"
+        );
+    }
+
+    /// `flush()` must reset the backoff EXPONENT (issue #1479), not just the
+    /// `last_keyframe_request_ms` anchor. The sibling `flush_resets_..._throttle` test cannot
+    /// catch the exponent reset because `flush()` also nulls `last_keyframe_request_ms`, so the
+    /// first post-flush eviction fires via the `None => true` arm regardless of the exponent.
+    /// This test drives the exponent to the cap pre-flush, flushes, then asserts the post-flush
+    /// cadence is back on the BASE schedule (exponent 1 → 2s after the first post-flush fire),
+    /// not the inherited cap (8s).
+    ///
+    /// Mutation coverage: deleting `consecutive_proactive_keyframe_requests = 0` from `flush()`
+    /// leaves the exponent at the cap, so after the first post-flush fire the interval is 8s and
+    /// the `2*base` poll would NOT fire — failing the final assert.
+    #[test]
+    fn flush_resets_proactive_keyframe_request_backoff_exponent() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let base = PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS as u128; // 1000
+
+        // Drive the exponent to the cap: last-good = seq 1, then a keyframe-less backlog polled
+        // past each backed-off window so several requests fire (exponent climbs to >= cap).
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        for s in 2u64..=12 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 300);
+        }
+        let mut last_fire = 5000u128;
+        jb.find_and_move_continuous_frames(last_fire); // fire #1 (exp→1)
+        for gap in [2 * base, 4 * base, 8 * base, 8 * base] {
+            last_fire += gap + 50;
+            jb.find_and_move_continuous_frames(last_fire); // fires; exponent climbs to the cap
+        }
+        let pre_flush = requests.load(Ordering::SeqCst);
+        assert_eq!(
+            pre_flush, 5,
+            "exponent driven to the cap via 5 backed-off fires"
+        );
+
+        jb.flush();
+
+        // Post-flush stall. First eviction fires immediately (last_keyframe_request_ms is None).
+        // After it, the exponent is 1 ONLY IF flush reset it (else it is cap+1, still cap).
+        jb.last_decoded_sequence_number = Some(100);
+        for s in 101u64..=104 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 20_000);
+        }
+        let t0 = 22_000u128; // > 20_000 + MAX_PLAYOUT_AGE_MS so the head delta is stale
+        jb.find_and_move_continuous_frames(t0);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            pre_flush + 1,
+            "first post-flush eviction fires"
+        );
+
+        // Discriminator: with the exponent reset to 0 → now 1, the next interval is 2s. A poll
+        // base+50 (1050ms) after the post-flush fire must be THROTTLED, and a poll 2*base+50 must
+        // FIRE. If flush did NOT reset the exponent (still at cap), the interval would be 8s and
+        // the 2*base poll would NOT fire.
+        jb.find_and_move_continuous_frames(t0 + base + 50); // 1050ms < 2000ms (exp-1 step) → throttled
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            pre_flush + 1,
+            "exp-1 (2s) step throttles a base-spaced poll right after the post-flush fire"
+        );
+        jb.find_and_move_continuous_frames(t0 + 2 * base + 50); // 2050ms >= 2000ms → fires
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            pre_flush + 2,
+            "post-flush cadence is back on the base schedule, proving flush reset the exponent (not pinned at the 8s cap)"
         );
     }
 

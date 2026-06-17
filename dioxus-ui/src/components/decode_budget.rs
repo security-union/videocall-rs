@@ -1525,7 +1525,7 @@ mod tests {
         assert_eq!(
             effective_cap(DecodeBudgetOverride::All, false, 12, 99, Some(4)),
             4,
-            "All is still clamped by the iOS device ceiling (#1286)"
+            "All is still clamped by the iOS device ceiling (issue 1286)"
         );
         // Natural above the canvas limit is capped at CANVAS_LIMIT.
         assert_eq!(
@@ -1763,7 +1763,7 @@ mod tests {
         assert_eq!(on, vec!["alice".to_string(), "bob".to_string()]);
         assert!(
             off.is_empty(),
-            "no camera-off peers ⇒ empty group ⇒ budget population identical to pre-#1465"
+            "no camera-off peers ⇒ empty group ⇒ budget population identical to pre-1465"
         );
     }
 
@@ -2005,7 +2005,7 @@ mod tests {
         );
         assert!(
             !is_sole_real_tile(1, 0, 1),
-            "one camera-on + one camera-off = two tiles (the #1465 mixed case)"
+            "one camera-on + one camera-off = two tiles (the issue-1465 mixed case)"
         );
 
         // Zero tiles → not sole.

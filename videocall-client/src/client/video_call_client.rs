@@ -33,7 +33,7 @@ use crate::health_reporter::{ClimbLimiterSnapshot, HealthReporter};
 use anyhow::{anyhow, Result};
 use futures::future::LocalBoxFuture;
 use gloo_timers::callback::{Interval, Timeout};
-use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent};
+use videocall_diagnostics::{subscribe as subscribe_global_diagnostics, DiagEvent, MetricValue};
 
 use log::{debug, error, info, trace, warn};
 use protobuf::Message;
@@ -734,6 +734,164 @@ fn arm_camera_keyframe_cooldown_reset(slot: &Rc<RefCell<Option<Rc<AtomicBool>>>>
     let _ = arm_keyframe_cooldown_reset_slot(slot);
 }
 
+// === Issue #1460: layer-switch ↔ freshness_skip correlation observability ===
+
+/// Window after an in-place simulcast layer switch within which a
+/// `freshness_skip` is considered correlated with the switch (issue #1460).
+/// A switch collides two disjoint per-layer sequence spaces in one
+/// layer-agnostic jitter buffer; the resulting freshness_skip freezes surface
+/// within a few seconds of the transition, so a 3s window captures them without
+/// spuriously attributing unrelated skips.
+const POST_SWITCH_WINDOW_MS: u64 = 3000;
+
+/// True iff a freshness_skip at `now_ms` falls within [`POST_SWITCH_WINDOW_MS`]
+/// of the peer's last layer switch at `last_switch_ms`. `last_switch_ms == 0` is
+/// the never-switched sentinel and always returns false. `saturating_sub`
+/// tolerates clock skew (`now_ms < last_switch_ms`) by treating the delta as 0
+/// (still within the window).
+///
+/// Pure (no I/O, no global state) so it is directly unit-testable on the host
+/// target and mutation-sensitive at the `<` boundary (issue #1460).
+fn freshness_skip_within_switch_window(now_ms: u64, last_switch_ms: u64) -> bool {
+    if last_switch_ms == 0 {
+        return false;
+    }
+    now_ms.saturating_sub(last_switch_ms) < POST_SWITCH_WINDOW_MS
+}
+
+/// Spawn the issue #1460 observability subscriber on the diagnostics bus.
+///
+/// Mirrors `HealthReporter::start_diagnostics_subscription`: a `spawn_local`
+/// loop over `subscribe().recv()` holding a `Weak<RefCell<Inner>>` (NOT a strong
+/// `Rc`, to avoid a reference cycle keeping `Inner` alive forever). On each
+/// `subsystem == "video"` `freshness_skip` event it parses the receiving session
+/// id (`to_peer`, the `connected_peers` key — see below) and `head_age_ms`,
+/// looks up the peer, and if the skip lands within [`POST_SWITCH_WINDOW_MS`] of
+/// that peer's last VIDEO layer switch (Marker 1 stamp), emits a single WARN.
+///
+/// Identity note (load-bearing): the worker's freshness_skip carries
+/// `from_peer` = the LOCAL reporting user id (passed as `userid` into
+/// `PeerDecodeManager::decode`) and `to_peer` = the REMOTE source peer's
+/// `session_id` string (`Peer::sid_str`, set via `set_stream_context`).
+/// `connected_peers` is keyed by that remote source `session_id`, so `to_peer`
+/// is the correct lookup key — NOT `from_peer`.
+///
+/// Clock note: the delta uses the event's own `ts_ms` (the skip's timestamp,
+/// stamped by the worker via `videocall_diagnostics::now_ms()`), which on wasm
+/// is `js_sys::Date::now()` — the SAME wall clock the Marker 1 stamps use (the
+/// manager tick / seed paths thread in `js_sys::Date::now()` as `now_ms`). Using
+/// the skip's own timestamp is the cleanest correlation point.
+fn spawn_layer_switch_freshness_observer(inner: &Rc<RefCell<Inner>>) {
+    let inner_weak = Rc::downgrade(inner);
+    wasm_bindgen_futures::spawn_local(async move {
+        let mut receiver = subscribe_global_diagnostics();
+        while let Ok(event) = receiver.recv().await {
+            if event.subsystem != "video" {
+                continue;
+            }
+            // Mirror freshness_inject.rs: confirm this is a freshness_skip event
+            // (the "video" subsystem also carries decoder stats / worker logs).
+            let is_skip = event.metrics.iter().any(|m| {
+                m.name == "event"
+                    && matches!(&m.value, MetricValue::Text(v) if v == "freshness_skip")
+            });
+            if !is_skip {
+                continue;
+            }
+
+            let mut to_peer: Option<String> = None;
+            let mut head_age_ms: Option<f64> = None;
+            for m in &event.metrics {
+                match (m.name, &m.value) {
+                    ("to_peer", MetricValue::Text(v)) => to_peer = Some(v.clone()),
+                    ("head_age_ms", MetricValue::F64(v)) => head_age_ms = Some(*v),
+                    _ => {}
+                }
+            }
+
+            // `to_peer` is the remote source peer's session_id string = the
+            // `connected_peers` key.
+            let Some(sid) = to_peer.as_deref().and_then(|s| s.parse::<u64>().ok()) else {
+                continue;
+            };
+            let age = head_age_ms.unwrap_or_default();
+
+            let Some(inner_rc) = Weak::upgrade(&inner_weak) else {
+                // Client torn down — stop the loop so it doesn't spin forever.
+                break;
+            };
+            // try_borrow (not borrow_mut) so we never panic if another path
+            // holds Inner; this is a read-only correlation.
+            let Ok(inner) = inner_rc.try_borrow() else {
+                continue;
+            };
+            let Some(peer) = inner.peer_decode_manager.get(&sid) else {
+                continue;
+            };
+            let last = peer.last_video_switch();
+            // Sentinel guard: skip peers that have never switched.
+            if !freshness_skip_within_switch_window(event.ts_ms, last.ms) {
+                continue;
+            }
+            let d = event.ts_ms.saturating_sub(last.ms);
+            warn!(
+                "LAYER_SWITCH_FRESHNESS_SKIP session_id={} kind=video ms_since_switch={} head_age_ms={:.0} from_layer={} to_layer={}",
+                sid, d, age, last.from, last.to
+            );
+        }
+    });
+}
+
+#[cfg(test)]
+mod layer_switch_freshness_window_tests {
+    use super::{freshness_skip_within_switch_window, POST_SWITCH_WINDOW_MS};
+
+    // Guard: the cases below are derived assuming a 3000ms window. If the const
+    // changes, the just_inside/just_outside boundary cases must be revisited.
+    #[test]
+    fn window_const_is_three_seconds() {
+        assert_eq!(POST_SWITCH_WINDOW_MS, 3000);
+    }
+
+    #[test]
+    fn just_inside_window_is_correlated() {
+        // d = 2999 < 3000 → true. Fails if the window shrinks below 3000.
+        let last = 1000;
+        let now = last + 2999;
+        assert!(freshness_skip_within_switch_window(now, last));
+    }
+
+    #[test]
+    fn just_outside_window_is_not_correlated() {
+        // d = 3000, which is NOT < 3000 → false. This case is the mutation
+        // sentinel: flipping `<` to `<=` would make this return true.
+        let last = 1000;
+        let now = last + POST_SWITCH_WINDOW_MS; // d == 3000
+        assert!(!freshness_skip_within_switch_window(now, last));
+    }
+
+    #[test]
+    fn never_switched_sentinel_is_not_correlated() {
+        // last == 0 → always false, regardless of `now`. Fails if the sentinel
+        // guard is removed (0 + huge `now` would otherwise be far outside the
+        // window → false anyway, so use a `now` that WOULD be inside if the
+        // guard treated 0 as a real timestamp).
+        assert!(!freshness_skip_within_switch_window(2999, 0));
+        assert!(!freshness_skip_within_switch_window(u64::MAX, 0));
+    }
+
+    #[test]
+    fn clock_skew_now_before_last_saturates_to_zero() {
+        // now < last (clock skew): saturating_sub → 0, 0 < 3000 → true.
+        // Documents the skew-tolerance: a skip stamped slightly before the
+        // switch is still attributed to it. last != 0 so the sentinel does not
+        // short-circuit.
+        let last = 1000;
+        let now = 500;
+        assert!(freshness_skip_within_switch_window(now, last));
+    }
+}
+
 fn handle_connected_reconnect_resets(
     inner: &Weak<RefCell<Inner>>,
     early_seed_timer: &Rc<RefCell<Option<Interval>>>,
@@ -1161,6 +1319,11 @@ impl VideoCallClient {
                 debug!("Health reporting started with real diagnostics subscription");
             }
         }
+
+        // Issue #1460 observability: subscribe to the diagnostics bus to correlate
+        // worker freshness_skip events with this peer's recent layer switches.
+        // Pure telemetry; holds only a Weak handle to `Inner` (no cycle).
+        spawn_layer_switch_freshness_observer(&client.inner);
 
         client
     }

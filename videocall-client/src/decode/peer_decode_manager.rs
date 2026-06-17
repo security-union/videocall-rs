@@ -503,6 +503,22 @@ pub struct PeerReceiveDiag {
     pub audio: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
 }
 
+/// Last in-place simulcast layer switch for this peer, stamped by Marker 1
+/// (issue #1460 observability). `ms == 0` is the never-switched sentinel.
+///
+/// `ms` is the manager-tick wall-clock timestamp at which the switch was
+/// applied (the same `now_ms` threaded into the chooser tick / seed paths,
+/// which on wasm is `js_sys::Date::now()` — identical to the clock the worker
+/// stamps on its `freshness_skip` DiagEvent `ts_ms`), so the subscriber's
+/// `ts_ms - ms` delta is directly comparable. `pub` so the diagnostics-bus
+/// subscriber in `video_call_client` can read a copy via the accessors below.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct LastLayerSwitch {
+    pub ms: u64,
+    pub from: u32,
+    pub to: u32,
+}
+
 pub struct Peer {
     pub audio: Box<dyn AudioPeerDecoderTrait>,
     pub video: VideoPeerDecoder,
@@ -613,6 +629,14 @@ pub struct Peer {
     last_video_frame_ms: u64,
     /// HCL bug #1: same idea for the audio stream.
     last_audio_frame_ms: u64,
+    /// Issue #1460 observability: timestamp + from/to of this peer's most recent
+    /// in-place VIDEO simulcast layer switch (stamped by Marker 1 at the 6 switch
+    /// sites). Read by the diagnostics-bus subscriber to correlate a
+    /// `freshness_skip` with a recent layer transition. Never read by adaptation
+    /// logic — pure telemetry.
+    last_video_switch: LastLayerSwitch,
+    /// Issue #1460 observability: SCREEN-kind sibling of `last_video_switch`.
+    last_screen_switch: LastLayerSwitch,
 }
 
 /// HCL bug #1: window during which a recent media frame suppresses a stale
@@ -885,6 +909,9 @@ impl Peer {
             last_screen_frame_ms: 0,
             last_video_frame_ms: 0,
             last_audio_frame_ms: 0,
+            // Issue #1460 observability: never-switched sentinel.
+            last_video_switch: LastLayerSwitch::default(),
+            last_screen_switch: LastLayerSwitch::default(),
         })
     }
 
@@ -1010,7 +1037,25 @@ impl Peer {
         // Re-anchor on an actual layer change (#1079 H1) — see
         // `set_selected_video_layer` for the rationale. No-op when unchanged.
         if desired != self.selected_video_layer {
+            let old = self.selected_video_layer;
             self.video_seq_tracker.reanchor_for_layer_switch();
+            // Issue #1460 observability (Marker 1): record EVERY actual switch,
+            // including the unconstrained `highest_available` flap (the only path
+            // that emits no LAYER_PREFERENCE). NOT gated on `constrained` — that
+            // unconstrained path is precisely the suspected freshness_skip cause.
+            log::info!(
+                "LAYER_SWITCH session_id={} kind=video from={} to={} site=tick constrained={} highest_available={}",
+                self.session_id,
+                old,
+                desired,
+                self.video_layer_chooser.is_constrained(),
+                highest
+            );
+            self.last_video_switch = LastLayerSwitch {
+                ms: now_ms,
+                from: old,
+                to: desired,
+            };
         }
         self.selected_video_layer = desired;
         desired
@@ -1032,7 +1077,22 @@ impl Peer {
         // Re-anchor on an actual layer change (#1079 H1) — see
         // `set_selected_video_layer` for the rationale. No-op when unchanged.
         if desired != self.selected_screen_layer {
+            let old = self.selected_screen_layer;
             self.screen_seq_tracker.reanchor_for_layer_switch();
+            // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+            log::info!(
+                "LAYER_SWITCH session_id={} kind=screen from={} to={} site=tick constrained={} highest_available={}",
+                self.session_id,
+                old,
+                desired,
+                self.screen_layer_chooser.is_constrained(),
+                highest
+            );
+            self.last_screen_switch = LastLayerSwitch {
+                ms: now_ms,
+                from: old,
+                to: desired,
+            };
         }
         self.selected_screen_layer = desired;
         desired
@@ -1042,6 +1102,20 @@ impl Peer {
     /// screen stream.
     pub fn selected_screen_layer(&self) -> u32 {
         self.selected_screen_layer
+    }
+
+    /// Issue #1460 observability: a copy of this peer's most recent in-place
+    /// VIDEO simulcast layer switch (timestamp + from/to). `ms == 0` means no
+    /// switch has happened yet. Read by the diagnostics-bus subscriber to
+    /// correlate a `freshness_skip` with a recent layer transition. Pure
+    /// telemetry — never consulted by adaptation logic.
+    pub fn last_video_switch(&self) -> LastLayerSwitch {
+        self.last_video_switch
+    }
+
+    /// Issue #1460 observability: SCREEN-kind sibling of [`Self::last_video_switch`].
+    pub fn last_screen_switch(&self) -> LastLayerSwitch {
+        self.last_screen_switch
     }
 
     /// Run the AUDIO layer chooser one tick (issue #989, Phase 3) and apply the
@@ -1128,7 +1202,22 @@ impl Peer {
                 .for_kind(PrefMediaKind::Video)
                 .clamp(self.video_layer_chooser.current());
             if layer != self.selected_video_layer {
+                let old = self.selected_video_layer;
                 self.video_seq_tracker.reanchor_for_layer_switch();
+                // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+                log::info!(
+                    "LAYER_SWITCH session_id={} kind=video from={} to={} site=early_seed constrained={} highest_available={}",
+                    self.session_id,
+                    old,
+                    layer,
+                    self.video_layer_chooser.is_constrained(),
+                    vh
+                );
+                self.last_video_switch = LastLayerSwitch {
+                    ms: now_ms,
+                    from: old,
+                    to: layer,
+                };
             }
             self.selected_video_layer = layer;
             seeded = true;
@@ -1144,7 +1233,22 @@ impl Peer {
                 .for_kind(PrefMediaKind::Screen)
                 .clamp(self.screen_layer_chooser.current());
             if layer != self.selected_screen_layer {
+                let old = self.selected_screen_layer;
                 self.screen_seq_tracker.reanchor_for_layer_switch();
+                // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+                log::info!(
+                    "LAYER_SWITCH session_id={} kind=screen from={} to={} site=early_seed constrained={} highest_available={}",
+                    self.session_id,
+                    old,
+                    layer,
+                    self.screen_layer_chooser.is_constrained(),
+                    sh
+                );
+                self.last_screen_switch = LastLayerSwitch {
+                    ms: now_ms,
+                    from: old,
+                    to: layer,
+                };
             }
             self.selected_screen_layer = layer;
             seeded = true;
@@ -1250,7 +1354,22 @@ impl Peer {
                 .for_kind(PrefMediaKind::Video)
                 .clamp(self.video_layer_chooser.current());
             if layer != self.selected_video_layer {
+                let old = self.selected_video_layer;
                 self.video_seq_tracker.reanchor_for_layer_switch();
+                // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+                log::info!(
+                    "LAYER_SWITCH session_id={} kind=video from={} to={} site=downlink_seed constrained={} highest_available={}",
+                    self.session_id,
+                    old,
+                    layer,
+                    self.video_layer_chooser.is_constrained(),
+                    vh
+                );
+                self.last_video_switch = LastLayerSwitch {
+                    ms: now_ms,
+                    from: old,
+                    to: layer,
+                };
             }
             self.selected_video_layer = layer;
             seeded = true;
@@ -1266,7 +1385,22 @@ impl Peer {
                 .for_kind(PrefMediaKind::Screen)
                 .clamp(self.screen_layer_chooser.current());
             if layer != self.selected_screen_layer {
+                let old = self.selected_screen_layer;
                 self.screen_seq_tracker.reanchor_for_layer_switch();
+                // Issue #1460 observability (Marker 1). NOT gated on `constrained`.
+                log::info!(
+                    "LAYER_SWITCH session_id={} kind=screen from={} to={} site=downlink_seed constrained={} highest_available={}",
+                    self.session_id,
+                    old,
+                    layer,
+                    self.screen_layer_chooser.is_constrained(),
+                    sh
+                );
+                self.last_screen_switch = LastLayerSwitch {
+                    ms: now_ms,
+                    from: old,
+                    to: layer,
+                };
             }
             self.selected_screen_layer = layer;
             seeded = true;
@@ -3705,6 +3839,8 @@ mod tests {
             last_screen_frame_ms: 0,
             last_video_frame_ms: 0,
             last_audio_frame_ms: 0,
+            last_video_switch: LastLayerSwitch::default(),
+            last_screen_switch: LastLayerSwitch::default(),
         };
         (peer, muted_handle)
     }
@@ -7343,6 +7479,8 @@ mod tests {
                 last_screen_frame_ms: 0,
                 last_video_frame_ms: 0,
                 last_audio_frame_ms: 0,
+                last_video_switch: LastLayerSwitch::default(),
+                last_screen_switch: LastLayerSwitch::default(),
             };
             manager.connected_peers.insert(sid, peer);
         }
@@ -7448,6 +7586,8 @@ mod tests {
             last_screen_frame_ms: 0,
             last_video_frame_ms: 0,
             last_audio_frame_ms: 0,
+            last_video_switch: LastLayerSwitch::default(),
+            last_screen_switch: LastLayerSwitch::default(),
         };
         manager.connected_peers.insert(510, peer);
 
@@ -7524,6 +7664,8 @@ mod tests {
             last_screen_frame_ms: 0,
             last_video_frame_ms: 0,
             last_audio_frame_ms: 0,
+            last_video_switch: LastLayerSwitch::default(),
+            last_screen_switch: LastLayerSwitch::default(),
         };
         manager.connected_peers.insert(520, peer);
 

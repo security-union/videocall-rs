@@ -28,6 +28,7 @@ videocall-ui:
     oauthProvider: "google"
     e2eeEnabled: "false"
     webTransportEnabled: "true"
+    transportBadgeEnabled: "false"
     usersAllowedToStream: ""
     serverElectionPeriodMs: 2000
     audioBitrateKbps: 16

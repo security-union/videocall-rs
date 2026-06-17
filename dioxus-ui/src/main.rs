@@ -16,6 +16,7 @@ mod routing;
 mod theme;
 mod theme_file;
 mod types;
+mod util;
 
 use crate::components::search_modal::SearchVisibleCtx;
 use crate::routing::Route;

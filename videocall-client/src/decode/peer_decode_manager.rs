@@ -701,6 +701,31 @@ const MEDIA_FRESH_WINDOW_MS: u64 = 5000;
 /// screen-sized window for these continuous streams.
 pub(crate) const LIVE_STREAM_FRESH_WINDOW_MS: u64 = 500;
 
+/// #1399: coalescing window (ms) for the per-`delete_peer` #508 decode
+/// snapshot.
+///
+/// The #508 instrumentation snapshots the *full remaining-peer set* (one
+/// `log::info!` line per remaining peer) on each single-peer removal. In a
+/// mass-leave / reconnection wave where N peers each leave one-by-one through
+/// `delete_peer` (the `PARTICIPANT_LEFT` path), an ungated snapshot is
+/// O(N^2) info-level lines (~N^2/2) landing on the main thread at exactly the
+/// moment the UI is already churning teardown + re-render — i.e. it risks
+/// perturbing the very #510 re-render storm this instrumentation is meant to
+/// diagnose.
+///
+/// Coalescing to at most one full snapshot per this window bounds an
+/// individual-leave cascade from O(N^2) to at most one snapshot per window
+/// (the whole snapshot — header AND remaining-set body — is gated, so
+/// intermediate cascade removals emit nothing), while a single *isolated*
+/// peer-leave — more than one window after the previous one — still produces
+/// its full remaining-set snapshot for the analyst. 250ms is short enough that
+/// a genuinely-spaced leave (human-paced, seconds apart) is never coalesced,
+/// yet long enough that a tight teardown cascade collapses to a single
+/// snapshot. The per-leave breadcrumb is not lost: `delete_peer` still fires
+/// `on_peers_removed_batch` with the departed id on EVERY removal — only the
+/// diagnostic decode-state snapshot of the *remaining* peers is coalesced.
+const DELETE_PEER_SNAPSHOT_COALESCE_MS: u64 = 250;
+
 /// HCL bug #1: decide what `*_enabled` value to apply when a heartbeat
 /// arrives, given:
 ///   * `current` — our locally tracked flag for this peer
@@ -2312,6 +2337,20 @@ pub struct PeerDecodeManager {
     /// retries, keyed by publisher user_id. Set to `false` when the peer
     /// stops screen-sharing or is removed, causing pending retries to no-op.
     screen_decode_retry_tokens: HashMap<String, Rc<std::cell::Cell<bool>>>,
+    /// #1399: timestamp (ms) of the last per-`delete_peer` #508 decode
+    /// snapshot. Used to coalesce the full-set snapshot during an
+    /// individual-leave cascade so an N-peer one-by-one teardown emits O(N)
+    /// snapshot lines instead of O(N^2). See `delete_peer_snapshot_due` and
+    /// `DELETE_PEER_SNAPSHOT_COALESCE_MS`. Only the per-`delete_peer` path is
+    /// gated; the `clear_all_peers` (remaining=0 marker) and `run_peer_monitor`
+    /// (one snapshot per removal batch) paths stay unconditional.
+    last_delete_peer_snapshot_ms: u64,
+    /// Test-only count of how many times `log_peer_leave_decode_snapshot`
+    /// actually emitted, so #1399 coalescing can be asserted directly
+    /// (O(N) -> constant under a within-window cascade). `Cell` because the
+    /// emitter takes `&self`. Compiled out of production builds.
+    #[cfg(test)]
+    snapshot_emits: std::cell::Cell<u32>,
 }
 
 impl Default for PeerDecodeManager {
@@ -2337,6 +2376,9 @@ impl PeerDecodeManager {
             local_user_id: String::new(),
             cached_sorted_string_keys: RefCell::new(None),
             screen_decode_retry_tokens: HashMap::new(),
+            last_delete_peer_snapshot_ms: 0,
+            #[cfg(test)]
+            snapshot_emits: std::cell::Cell::new(0),
         }
     }
 
@@ -2356,6 +2398,9 @@ impl PeerDecodeManager {
             local_user_id: String::new(),
             cached_sorted_string_keys: RefCell::new(None),
             screen_decode_retry_tokens: HashMap::new(),
+            last_delete_peer_snapshot_ms: 0,
+            #[cfg(test)]
+            snapshot_emits: std::cell::Cell::new(0),
         }
     }
 
@@ -3297,6 +3342,8 @@ impl PeerDecodeManager {
     /// `PEER_LEAVE_DECODE_SNAPSHOT` is unique (verified not keyed on by
     /// `scripts/parse_meeting_console_logs.sh`).
     fn log_peer_leave_decode_snapshot(&self, departed_session_id: u64, trigger: &str) {
+        #[cfg(test)]
+        self.snapshot_emits.set(self.snapshot_emits.get() + 1);
         let now = now_ms();
         let remaining = self.connected_peers.ordered_keys().len();
         log::info!(
@@ -3334,6 +3381,13 @@ impl PeerDecodeManager {
     }
 
     pub fn delete_peer(&mut self, session_id: u64) {
+        self.delete_peer_at(session_id, now_ms());
+    }
+
+    /// `delete_peer` with the clock threaded in so the #1399 snapshot-coalesce
+    /// decision is deterministically testable. The public `delete_peer` reads
+    /// `now_ms()` once and delegates here.
+    fn delete_peer_at(&mut self, session_id: u64, now_ms: u64) {
         if let Some(peer) = self.connected_peers.remove(&session_id) {
             if let Some(token) = self.screen_decode_retry_tokens.remove(&peer.user_id) {
                 token.set(false);
@@ -3356,8 +3410,34 @@ impl PeerDecodeManager {
             // decode state right after this single-peer removal. Pure read of
             // `self.connected_peers`; emits no events and alters no teardown
             // ordering — the departed peer is already removed above.
-            self.log_peer_leave_decode_snapshot(session_id, "delete_peer");
+            //
+            // #1399: coalesce so an individual-leave cascade (N peers leaving
+            // one-by-one through this path) emits O(N) lines, not O(N^2). The
+            // first leave in a burst — and any isolated leave more than
+            // `DELETE_PEER_SNAPSHOT_COALESCE_MS` after the previous one — emits
+            // the full remaining-set snapshot; intermediate cascade removals
+            // are suppressed (the per-removal `on_peers_removed_batch` above
+            // already carries the departed id, so no peer-leave event is lost).
+            if self.delete_peer_snapshot_due(now_ms) {
+                self.last_delete_peer_snapshot_ms = now_ms;
+                self.log_peer_leave_decode_snapshot(session_id, "delete_peer");
+            }
         }
+    }
+
+    /// #1399: returns `true` when the per-`delete_peer` #508 snapshot should be
+    /// emitted, i.e. when no snapshot has fired within the trailing
+    /// `DELETE_PEER_SNAPSHOT_COALESCE_MS` window.
+    ///
+    /// `last_delete_peer_snapshot_ms == 0` is the never-fired sentinel and
+    /// always emits. The `saturating_sub` guards a non-monotonic clock
+    /// (`now_ms < last`, possible across a `Date.now()` step on wasm): a
+    /// backwards clock yields `0 < window` and so *emits* rather than wedging
+    /// the snapshot off — fail-open, matching the diagnostic intent.
+    fn delete_peer_snapshot_due(&self, now_ms: u64) -> bool {
+        self.last_delete_peer_snapshot_ms == 0
+            || now_ms.saturating_sub(self.last_delete_peer_snapshot_ms)
+                >= DELETE_PEER_SNAPSHOT_COALESCE_MS
     }
 
     /// Remove all peers and terminate their decoder workers immediately.
@@ -7970,6 +8050,144 @@ mod tests {
             batch_sink.borrow().len(),
             0,
             "batch callback must not fire when no peers were removed"
+        );
+    }
+
+    // -- #1399: coalesce the per-delete_peer #508 decode snapshot ---------
+
+    /// Decision-helper truth table: a never-fired snapshot always emits; a
+    /// snapshot within `DELETE_PEER_SNAPSHOT_COALESCE_MS` of the previous one
+    /// is suppressed; one at/after the window boundary emits again.
+    #[wasm_bindgen_test]
+    fn delete_peer_snapshot_due_truth_table() {
+        let mut manager = PeerDecodeManager::new();
+
+        // Never fired (sentinel 0) -> always due, regardless of `now`.
+        assert!(
+            manager.delete_peer_snapshot_due(0),
+            "never-fired snapshot must be due"
+        );
+        assert!(
+            manager.delete_peer_snapshot_due(10_000),
+            "never-fired snapshot must be due even at a large now"
+        );
+
+        // Record a fire at t=10_000.
+        manager.last_delete_peer_snapshot_ms = 10_000;
+
+        // Strictly inside the window -> suppressed.
+        assert!(
+            !manager.delete_peer_snapshot_due(10_000),
+            "same-instant re-fire must be coalesced"
+        );
+        assert!(
+            !manager.delete_peer_snapshot_due(10_000 + DELETE_PEER_SNAPSHOT_COALESCE_MS - 1),
+            "a snapshot one ms inside the window must be coalesced"
+        );
+
+        // Exactly at the boundary and beyond -> due again.
+        assert!(
+            manager.delete_peer_snapshot_due(10_000 + DELETE_PEER_SNAPSHOT_COALESCE_MS),
+            "a snapshot at the window boundary must be due"
+        );
+        assert!(
+            manager.delete_peer_snapshot_due(10_000 + DELETE_PEER_SNAPSHOT_COALESCE_MS + 5),
+            "a snapshot past the window must be due"
+        );
+
+        // Backwards clock (now < last) -> fail-open, emit.
+        assert!(
+            manager.delete_peer_snapshot_due(9_000),
+            "a backwards clock must fail open (emit), not wedge the snapshot off"
+        );
+    }
+
+    /// An N-peer individual-leave cascade within a single coalesce window must
+    /// emit O(1) full snapshots, not O(N). Without #1399 this fires the
+    /// remaining-set snapshot on every one of the N `delete_peer` calls
+    /// (O(N) emits, O(N^2) lines); with coalescing only the first call in the
+    /// window emits.
+    #[wasm_bindgen_test]
+    fn delete_peer_cascade_within_window_coalesces_snapshot() {
+        let mut manager = PeerDecodeManager::new();
+        let session_ids: [u64; 6] = [901, 902, 903, 904, 905, 906];
+        for sid in &session_ids {
+            let (peer, _muted) = make_test_peer(*sid);
+            manager.connected_peers.insert(*sid, peer);
+        }
+        assert_eq!(manager.snapshot_emits.get(), 0);
+
+        // All six leave one-by-one at the SAME instant (a tight teardown
+        // cascade). Use the clock-threaded entry point so the window math is
+        // deterministic and not subject to wall-clock drift between calls.
+        let t = 50_000;
+        for sid in &session_ids {
+            manager.delete_peer_at(*sid, t);
+        }
+
+        assert_eq!(
+            manager.connected_peers.ordered_keys().len(),
+            0,
+            "all peers should be removed by the cascade"
+        );
+        assert_eq!(
+            manager.snapshot_emits.get(),
+            1,
+            "a within-window cascade must emit exactly one full snapshot (#1399), \
+             not one per removal"
+        );
+    }
+
+    /// Isolated peer-leaves spaced MORE than the coalesce window apart must
+    /// each still produce a full snapshot — coalescing must not starve the
+    /// analyst of the per-leave remaining-set view on genuinely-spaced leaves.
+    #[wasm_bindgen_test]
+    fn delete_peer_spaced_leaves_each_emit_snapshot() {
+        let mut manager = PeerDecodeManager::new();
+        let session_ids: [u64; 3] = [911, 912, 913];
+        for sid in &session_ids {
+            let (peer, _muted) = make_test_peer(*sid);
+            manager.connected_peers.insert(*sid, peer);
+        }
+
+        // Three leaves, each one full window + 1ms after the previous.
+        let step = DELETE_PEER_SNAPSHOT_COALESCE_MS + 1;
+        manager.delete_peer_at(911, 1_000);
+        manager.delete_peer_at(912, 1_000 + step);
+        manager.delete_peer_at(913, 1_000 + 2 * step);
+
+        assert_eq!(
+            manager.snapshot_emits.get(),
+            3,
+            "leaves spaced beyond the coalesce window must each emit a snapshot"
+        );
+    }
+
+    /// A `delete_peer` for an unknown session id must NOT emit a snapshot and
+    /// must NOT advance the coalesce clock — only an actual removal counts.
+    #[wasm_bindgen_test]
+    fn delete_peer_missing_id_emits_no_snapshot() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _muted) = make_test_peer(920);
+        manager.connected_peers.insert(920, peer);
+
+        manager.delete_peer_at(999, 5_000); // no such peer
+        assert_eq!(
+            manager.snapshot_emits.get(),
+            0,
+            "removing a non-existent peer must not emit a snapshot"
+        );
+        assert_eq!(
+            manager.last_delete_peer_snapshot_ms, 0,
+            "a no-op removal must not advance the coalesce clock"
+        );
+
+        // The real removal that follows must still emit (clock was not armed).
+        manager.delete_peer_at(920, 5_010);
+        assert_eq!(
+            manager.snapshot_emits.get(),
+            1,
+            "the first real removal must emit even after a prior no-op delete"
         );
     }
 

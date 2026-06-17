@@ -358,7 +358,9 @@ pub fn MeetingPage(id: String) -> Element {
     if !auth_checked() && oauth_enabled().unwrap_or(false) {
         return rsx! {
             div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
-                p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;", "Checking authentication..." }
+                p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
+                    "Checking authentication..."
+                }
             }
         };
     }
@@ -585,7 +587,21 @@ pub fn MeetingPage(id: String) -> Element {
     rsx! {
         match (&maybe_username, &current_meeting_status) {
             // User is admitted - show the meeting
-            (Some(username), MeetingStatus::Admitted { is_host, host_display_name, host_user_id, room_token, waiting_room_enabled, admitted_can_admit, allow_guests, end_on_host_leave }) => rsx! {
+            (
+                Some(username),
+                MeetingStatus::Admitted {
+                    is_host,
+                    host_display_name,
+                    host_user_id,
+                    room_token,
+                    waiting_room_enabled,
+                    admitted_can_admit,
+                    allow_guests,
+                    end_on_host_leave,
+
+                    // Waiting room
+                },
+            ) => rsx! {
                 AttendantsComponent {
                     display_name: username.clone(),
                     id: id.clone(),
@@ -602,24 +618,20 @@ pub fn MeetingPage(id: String) -> Element {
                     waiting_room_enabled: *waiting_room_enabled,
                     admitted_can_admit: *admitted_can_admit,
                     end_on_host_leave: *end_on_host_leave,
-                    allow_guests: *allow_guests,
+                    allow_guests:*allow_guests,
                 }
             },
-
-            // Waiting room
             (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {
                 WaitingRoom {
                     meeting_id: id.clone(),
                     user_id: current_user_id().unwrap_or_default(),
                     display_name: input_value_state(),
                     observer_token: observer_token.clone(),
-                    on_admitted: on_admitted,
-                    on_rejected: on_rejected,
+                    on_admitted,
+                    on_rejected,
                     on_cancel: on_cancel_waiting,
                 }
             },
-
-            // Waiting for host to start
             (Some(_), MeetingStatus::WaitingForMeeting { .. }) => rsx! {
                 // `data-testid` added for the bots-app waiting-room detection
                 // path (see e2e/bots-app/src/meeting-join.ts). The bot uses it
@@ -646,8 +658,6 @@ pub fn MeetingPage(id: String) -> Element {
                     }
                 }
             },
-
-            // Rejected
             (Some(_), MeetingStatus::Rejected) => rsx! {
                 // `data-testid` for bots-app rejection detection
                 // (see e2e/bots-app/src/meeting-join.ts). Lets the bot
@@ -655,25 +665,42 @@ pub fn MeetingPage(id: String) -> Element {
                 // misleading "join button reappeared" diagnostic.
                 div { class: "rejected-container", "data-testid": "meeting-rejected",
                     div { class: "rejected-card card-apple",
-                        svg { xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64", view_box: "0 0 24 24", fill: "none", stroke: "#ff6b6b", stroke_width: "1.5",
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg",
+                            width: "64",
+                            height: "64",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: theme_color::ERROR_ICON,
+                            stroke_width: "1.5",
                             circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "15", y1: "9", x2: "9", y2: "15" }
-                            line { x1: "9", y1: "9", x2: "15", y2: "15" }
+                            line {
+                                x1: "15",
+                                y1: "9",
+                                x2: "9",
+                                y2: "15",
+                            }
+                            line {
+                                x1: "9",
+                                y1: "9", // Username is set; the auto-join effect will fire momentarily
+                                x2: "15",
+                                y2: "15",
+                            }
                         }
                         h2 { "Entry denied" }
                         p { "The meeting host has denied your request to join." }
                         button {
                             class: "btn-apple btn-primary",
                             onclick: move |_| {
-                                if let Some(w) = web_sys::window() { let _ = w.location().set_href("/"); }
+                                if let Some(w) = web_sys::window() {
+                                    let _ = w.location().set_href("/");
+                                }
                             },
                             "Return to Home"
                         }
                     }
                 }
             },
-
-            // Error
             (Some(_), MeetingStatus::Error(error)) => rsx! {
                 // `data-testid` for bots-app meeting-error detection
                 // (see e2e/bots-app/src/meeting-join.ts). The base
@@ -683,30 +710,50 @@ pub fn MeetingPage(id: String) -> Element {
                 // unambiguous selector.
                 div { class: "error-container", "data-testid": "meeting-error",
                     div { class: "error-card card-apple",
-                        svg { xmlns: "http://www.w3.org/2000/svg", width: "64", height: "64", view_box: "0 0 24 24", fill: "none", stroke: "#ff9800", stroke_width: "1.5",
+                        svg {
+                            xmlns: "http://www.w3.org/2000/svg",
+                            width: "64",
+                            height: "64",
+                            view_box: "0 0 24 24",
+                            fill: "none",
+                            stroke: theme_color::WARNING_ICON,
+                            stroke_width: "1.5",
                             circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "12", y1: "8", x2: "12", y2: "12" }
-                            line { x1: "12", y1: "16", x2: "12.01", y2: "16" }
+                            line {
+                                x1: "12",
+                                y1: "8",
+                                x2: "12",
+                                y2: "12",
+                            }
+                            line {
+                                x1: "12",
+                                y1: "16",
+                                x2: "12.01",
+                                y2: "16",
+                            }
                         }
                         h2 { "Unable to join" }
                         p { "{error}" }
                         button {
                             class: "btn-apple btn-primary",
                             onclick: move |_| {
-                                if let Some(w) = web_sys::window() { let _ = w.location().set_href("/"); }
+                                if let Some(w) = web_sys::window() {
+                                    let _ = w.location().set_href("/");
+                                }
                             },
                             "Return to Home"
                         }
                     }
                 }
             },
-
-            // Joining in progress
             (Some(_), MeetingStatus::Joining) => {
                 let display_name = maybe_username.as_deref().unwrap_or("...");
                 rsx! {
                     div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
-                        div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
+                        div {
+                            class: "loading-spinner",
+                            style: "width: 40px; height: 40px; margin-bottom: 1rem;",
+                        }
                         p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
                             "Joining as "
                             strong { "{display_name}" }
@@ -714,24 +761,16 @@ pub fn MeetingPage(id: String) -> Element {
                         }
                     }
                 }
-            },
-
-            // No username set, or waiting for auto-join to fire
+            }
             _ => {
                 if maybe_username.is_none() {
-                    // Show inline display name prompt instead of redirecting
                     rsx! {
-                        div {
-                            style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
-                            div {
-                                class: "card-apple p-8",
-                                style: "max-width: 400px; width: 90%;",
-                                h2 {
-                                    style: "color: {theme_color::TEXT_PRIMARY}; text-align: center; margin-bottom: 0.5rem;",
+                        div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
+                            div { class: "card-apple p-8", style: "max-width: 400px; width: 90%;",
+                                h2 { style: "color: {theme_color::TEXT_PRIMARY}; text-align: center; margin-bottom: 0.5rem;",
                                     "Enter your display name"
                                 }
-                                p {
-                                    style: "color: rgba(255,255,255,0.6); text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;",
+                                p { style: "color: {theme_color::TEXT_ON_GLASS_MUTED}; text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;",
                                     "Choose a name to join the meeting"
                                 }
                                 form {
@@ -772,11 +811,13 @@ pub fn MeetingPage(id: String) -> Element {
                         }
                     }
                 } else {
-                    // Username is set; the auto-join effect will fire momentarily
                     let display_name = maybe_username.as_deref().unwrap_or("Unknown");
                     rsx! {
                         div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
-                            div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
+                            div {
+                                class: "loading-spinner",
+                                style: "width: 40px; height: 40px; margin-bottom: 1rem;",
+                            }
                             p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
                                 "Joining as "
                                 strong { "{display_name}" }

@@ -34,6 +34,7 @@ pub mod performance_settings;
 pub mod search_modal;
 pub mod signal_quality;
 pub mod toggle_switch;
+
 pub mod top_bar;
 pub mod update_display_name_modal;
 pub mod video_control_buttons;

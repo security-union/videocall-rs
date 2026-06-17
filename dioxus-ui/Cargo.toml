@@ -47,6 +47,13 @@ urlencoding = "2.1"
 sha2 = "0.10"
 base64 = "0.22"
 getrandom = { version = "0.2", features = ["js"] }
+uuid = { version = "1", features = ["v4", "js"] }
+# `clock` (default) pulls in chrono's `wasmbind` -> `js-sys` integration on the
+# wasm32 target, which is what makes `chrono::Local` read the *browser's* local
+# timezone (via `js_sys::Date`) instead of silently falling back to UTC. It is
+# listed explicitly so a future `default-features = false` can't quietly break
+# local-time conversion in chat timestamps.
+chrono = { version = "0.4.44", features = ["serde", "clock"] }
 
 [dependencies.web-sys]
 version = "0.3.72"
@@ -99,8 +106,13 @@ features = [
     "ResizeObserverEntry",
     "Storage",
     "MediaQueryList",
+    "Url",
+    "UrlSearchParams",
     "Window",
     "console",
+    "EventSource",
+    "EventSourceInit",
+    "MessageEvent",
 ]
 
 [dev-dependencies]

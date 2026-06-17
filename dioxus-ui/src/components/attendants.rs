@@ -4470,6 +4470,7 @@ pub fn AttendantsComponent(
         div {
             // Provide MeetingTime context
             // Provide VideoCallClient context
+            style:"display:flex;gap:0.5rem",
             div { id: "main-container", class: "meeting-page",
                 onclick: move |_| {
                     dock_menu_open.set(false);
@@ -5178,6 +5179,7 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     }
+
                                     // Primary: Camera button - always visible
                                     {
                                         let mda_cam = mda.clone();
@@ -5919,6 +5921,9 @@ pub fn AttendantsComponent(
                         }
                     }
                 }
+
+
+
 
                 // Waiting room controls (host or admitted participants when allowed)
                 if is_owner || admitted_can_admit_toggle() {

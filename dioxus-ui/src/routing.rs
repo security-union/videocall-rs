@@ -9,6 +9,7 @@ use crate::components::search_modal::SearchModal;
 use crate::pages::guest_join::GuestJoinPage;
 use crate::pages::home::Home;
 use crate::pages::meeting::MeetingPage;
+
 use crate::pages::meeting_settings::MeetingSettingsPage;
 use crate::pages::oauth_callback::OAuthCallback;
 use crate::theme::color as theme_color;

@@ -7413,6 +7413,79 @@ mod tests {
         crate::metrics::forget_room_metrics(room);
     }
 
+    /// #1462: relay-side bystander-drop coverage for the DOWNLINK_CONGESTION
+    /// unicast filter (#1219 Half 2), mirroring the CONGESTION test above.
+    ///
+    /// DOWNLINK_CONGESTION is relay-authored and self-addressed to ONE receiver
+    /// (published on that receiver's own subject with its `session_id`). The relay
+    /// unicast filter must drop it for every OTHER session in the room — until now
+    /// only the CLIENT-side self-target guard was directly tested; the relay filter
+    /// was covered only transitively. This pins the relay filter so a future
+    /// refactor that loosened it (re-fanning the signal to bystanders) would be
+    /// caught relay-side, not just at client runtime.
+    ///
+    /// MUTATION PROOF: removing the
+    /// `if is_downlink_congestion && !subject_self && !inner_session_self { return }`
+    /// filter forwards the packet to the bystander → `count` becomes 1 and the
+    /// `== 0` assert FAILS (and the metric-delta assert also fails, since the
+    /// filter never ran). Distinct metric (RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL,
+    /// not the CONGESTION sibling) so the two unicast classes stay distinguishable.
+    #[actix_rt::test]
+    async fn test_handle_msg_downlink_congestion_dropped_for_non_target_receiver() {
+        let room = "downlink-congestion-nontarget-room-1462";
+        let before = RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // This receiver is session 7777. The DOWNLINK_CONGESTION targets receiver
+        // 5555 (published on `room.{room}.5555` with inner session_id 5555).
+        let (handler, _emit_downlink_congestion) = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            7777, // bystander receiver — NOT the target
+            false,
+            "recv-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            never_epoch(),
+        );
+
+        let nats_msg = make_nats_message(
+            "room.downlink-congestion-nontarget-room-1462.5555",
+            make_packet_bytes_with_session(PacketType::DOWNLINK_CONGESTION, 5555),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "#1462: DOWNLINK_CONGESTION targeting receiver 5555 must NOT be \
+             forwarded to bystander receiver 7777"
+        );
+
+        let after = RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            1.0,
+            "#1462: dropping a non-target DOWNLINK_CONGESTION must increment \
+             relay_downlink_congestion_filtered_total exactly once"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
     #[actix_rt::test]
     async fn test_handle_msg_layer_hint_passes_self_filter_via_subject() {
         // #1108 delivery-gap carve-out. `emit_layer_hint` publishes the

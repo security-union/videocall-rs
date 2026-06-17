@@ -133,6 +133,26 @@ For significant changes that require broader discussion, we use a Request for Co
 * Use the testing guide to choose the right test layer:
   [docs/TESTING.md](docs/TESTING.md)
 
+### Secret scanning (gitleaks)
+
+This repo runs [gitleaks](https://github.com/gitleaks/gitleaks) as a secret-scanning
+gate. Real OAuth client secrets, API keys, and JWT signing keys must never be
+committed — keep them in `.env` (gitignored); only placeholders belong in
+`.env.example`.
+
+* **CI:** the `Secret Scan (HCL)` workflow fails any PR/push that introduces a
+  secret. Allowlisting of placeholders lives in `.gitleaks.toml`.
+* **Locally (recommended):** install the pre-commit hook so leaks are caught
+  before they leave your machine:
+
+  ```bash
+  pip install pre-commit   # or: brew install pre-commit
+  pre-commit install       # one-time, in your clone of this repo
+  ```
+
+  After `pre-commit install`, `gitleaks` runs automatically on every `git commit`.
+  Run it on demand with `pre-commit run gitleaks --all-files`.
+
 ### Documentation
 
 * Update API documentation for public interfaces

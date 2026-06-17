@@ -80,9 +80,33 @@ impl FromRequestParts<AppState> for AuthUser {
                     None,
                 )
                 .await
-                .map_err(|e| {
-                    tracing::warn!("Bearer token validation failed: {e:?}");
-                    AppError::unauthorized_msg("invalid or expired bearer token")
+                .map_err(|inner| {
+                    // Distinguish a token-validation rejection (401) from a
+                    // genuine server fault (e.g. JWKS endpoint unreachable or
+                    // an unparseable JWKS response).
+                    //
+                    // For a 401, verify_and_decode_id_token has already logged
+                    // the specific reason server-side (without token material),
+                    // so we return a generic bearer-auth message and do NOT log
+                    // the token. For anything else we preserve the original
+                    // status but return a sanitized body: JWKS fetch errors can
+                    // include internal URLs in their engineering detail.
+                    if inner.status == StatusCode::UNAUTHORIZED {
+                        tracing::warn!(
+                            "Bearer auth rejected (401): invalid or expired bearer token"
+                        );
+                        AppError::unauthorized_msg("invalid or expired bearer token")
+                    } else {
+                        tracing::error!(
+                            status = %inner.status,
+                            detail = inner.body.engineering_error.as_deref().unwrap_or(""),
+                            "Bearer auth failed due to a server fault (not a token rejection)"
+                        );
+                        AppError::new(
+                            inner.status,
+                            APIError::internal_error("authentication temporarily unavailable"),
+                        )
+                    }
                 })?;
 
                 let name = claims.display_name();
@@ -752,6 +776,55 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(err.status, StatusCode::UNAUTHORIZED);
+    }
+
+    /// HCL #1468 regression: a genuine server fault on the Bearer path (JWKS
+    /// endpoint unreachable or unparseable) must NOT be masked as a 401. The
+    /// structurally-valid token forces `verify_and_decode_id_token` past header
+    /// parsing into `get_key`, whose cache miss triggers a refresh against an
+    /// unreachable JWKS URL and returns a 500 the extractor must preserve.
+    #[tokio::test]
+    async fn jwks_path_server_fault_not_masked_as_401() {
+        let (enc, _dec, _kid) = test_rsa_keypair();
+
+        // Empty cache backed by an unreachable JWKS URL. The token's kid is not
+        // cached, so get_key() triggers a refresh against the dead URL. The
+        // failed refresh is the 500; the absent kid is only what reaches it.
+        // Port 1 is unbound/privileged, so connection fails fast.
+        let jwks = JwksCache::new("http://127.0.0.1:1/jwks".to_string());
+
+        let token = sign_id_token(
+            &enc,
+            "kid-not-in-jwks",
+            "alice@example.com",
+            "Alice",
+            "test-client",
+            "https://provider.example.com",
+            3600, // not expired — only the missing key should fail
+        );
+
+        let state = make_jwks_state(jwks);
+        let req = Request::builder()
+            .uri("/test")
+            .method("GET")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(())
+            .unwrap();
+        let (mut parts, _) = req.into_parts();
+        let err = AuthUser::from_request_parts(&mut parts, &state)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            err.status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "JWKS-retrieval server fault must surface as 500, not be flattened to 401"
+        );
+        assert_eq!(
+            err.body.engineering_error.as_deref(),
+            Some("authentication temporarily unavailable"),
+            "client-facing auth outage body must not expose the JWKS URL"
+        );
     }
 
     #[tokio::test]

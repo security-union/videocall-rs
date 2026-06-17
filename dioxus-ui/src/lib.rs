@@ -21,3 +21,4 @@ pub mod routing;
 pub mod theme;
 pub mod theme_file;
 pub mod types;
+pub mod util;

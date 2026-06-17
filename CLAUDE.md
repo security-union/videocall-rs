@@ -67,7 +67,7 @@ Run agents in parallel when tasks are independent. Always run `code-reviewer` af
 
 **All code changes MUST pass project linters before being considered complete.** Agents must run the appropriate linter/formatter after editing any file:
 
-- **Rust code:** Run `cargo fmt` on changed crates. Run `cargo clippy` to catch warnings and fix them.
+- **Rust code:** Run `cargo fmt` on changed crates. To catch clippy warnings the way CI does, run **`make clippy-ci`** — a plain `cargo clippy` (or `cargo clippy --all`) lints only library/binary targets and MISSES `#[test]`-target lints and crate-specific feature flags (e.g. `neteq --no-default-features --features web --tests`), which then fail in CI on an already-pushed PR. `make clippy-ci` mirrors the exact command set in `.github/workflows/pr-check-rust-hcl.yaml`; it is the only local command that reproduces the CI clippy job.
 - **TypeScript / JS (e2e/):** Run `cd e2e && npx prettier --write <files> && npx eslint <files> && npx tsc --noEmit` to match the CI `ci:lint` check.
 - **General:** No unused imports, no unused variables, follow existing code style. Respect all project lint configs (`.eslintrc`, `rustfmt.toml`, `.prettierrc`, etc.).
 

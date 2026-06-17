@@ -102,6 +102,15 @@ jobs:
         env:
           CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
         run: cargo clippy -p videocall-codecs --tests -- -D warnings
+      # videocall-ui (the Dioxus UI crate) also runs NATIVE libtest, so its
+      # `#[test]` code is lint-invisible to `cargo clippy --all` for the same
+      # reason as the crates above. Lint its test targets on the host (no
+      # `--target wasm32-unknown-unknown`).
+      - name: clippy (videocall-ui test targets)
+        working-directory: rust-repo
+        env:
+          CARGO_TARGET_DIR: /var/lib/ci/target/${{ runner.name }}
+        run: cargo clippy -p videocall-ui --tests -- -D warnings
       - name: clippy (neteq test targets)
         working-directory: rust-repo
         env:

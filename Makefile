@@ -55,6 +55,7 @@ clippy-ci:
 		cargo clippy --target wasm32-unknown-unknown -p videocall-client --tests -- -D warnings
 		cargo clippy -p videocall-aq --tests -- -D warnings
 		cargo clippy -p videocall-codecs --tests -- -D warnings
+		cargo clippy -p videocall-ui --tests -- -D warnings
 		cargo clippy -p neteq --no-default-features --features web --tests -- -D warnings
 
 fmt:

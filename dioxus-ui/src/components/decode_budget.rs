@@ -1785,10 +1785,12 @@ mod tests {
             ios_decode_tile_ceiling(true, 16),
             Some(IOS_DECODE_TILE_CEILING_ABS)
         );
-        assert!(
-            IOS_DECODE_TILE_CEILING_ABS < 9,
-            "abs mobile cap below ratchet start"
-        );
+        const {
+            assert!(
+                IOS_DECODE_TILE_CEILING_ABS < 9,
+                "abs mobile cap below ratchet start"
+            )
+        };
     }
 
     #[test]

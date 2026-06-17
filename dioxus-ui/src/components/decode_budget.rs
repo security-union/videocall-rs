@@ -569,6 +569,14 @@ pub fn effective_cap(
             MIN_CAP,
             natural.clamp(MIN_CAP, crate::constants::CANVAS_LIMIT),
         ),
+        // Issue #1466: `All` = "decode every natural tile". Like un-pressured
+        // Auto it returns `natural` capped at `CANVAS_LIMIT`, and — crucially —
+        // it IGNORES `pressured` (it never consults `cap`), so engaging `All`
+        // reveals every tile on the next render WITHOUT having to clear the
+        // pressured latch. The device_ceiling clamp below STILL binds (the
+        // #1286 iOS hardware ceiling is NOT bypassed): "All" means all the
+        // layout would show, still subject to the hardware ceiling.
+        DecodeBudgetOverride::All => natural.min(crate::constants::CANVAS_LIMIT),
         DecodeBudgetOverride::Auto if !pressured => natural.min(crate::constants::CANVAS_LIMIT),
         DecodeBudgetOverride::Auto => cap,
     };
@@ -579,6 +587,257 @@ pub fn effective_cap(
         Some(ceiling) => base.min(ceiling.max(MIN_CAP)),
         None => base,
     }
+}
+
+/// Expand the decoded-tile bucket to admit the user's explicit force-decode
+/// (PLAY) requests, while STILL honouring the device-class ceiling (issues
+/// #1466 / #1286).
+///
+/// ## Why expand at all
+///
+/// A user who taps PLAY on a decode-budget-paused tile is making an explicit
+/// "decode this peer NOW" request. Before #1466 those requests were folded into
+/// `active_decode_set` (so the peer's frames decoded) but the render scope still
+/// sliced the visible/avatar buckets off the UN-expanded budget cap, so a
+/// requested peer that ranked beyond the cap stayed rendered as a paused avatar
+/// (`force_avatar = true`) even though it was being decoded — decode and render
+/// DISAGREED. The fix is to RAISE the decoded count so each requested peer lands
+/// in the visible bucket and renders live.
+///
+/// ## Why the device ceiling must still win (#1286)
+///
+/// On a phone the user must NOT be able to force more simultaneous decodes than
+/// the hardware can sustain. The device ceiling (computed by
+/// [`ios_decode_tile_ceiling`]) is the SAME hard upper bound `effective_cap`
+/// enforces, and it binds LAST here too — identical clamp order to
+/// `effective_cap` (canvas first, then device ceiling, floored at [`MIN_CAP`]),
+/// so the two helpers can never disagree on the binding cap. If the user
+/// requests more peers than the ceiling permits, we decode up to the ceiling
+/// (the caller promotes requested peers first) and the excess requests stay
+/// paused avatars — and, critically, are NOT placed in `active_decode_set`
+/// (the caller intersects the merge with the decoded bucket), so decode and
+/// render still agree.
+///
+/// ## Semantics
+///
+/// * `base_decoded` — the decode-budget ceiling BEFORE user requests (the
+///   `effective_cap`-derived count the adaptive loop / Fixed / All produced).
+/// * `requested_off_budget` — the number of DISTINCT user-requested peers that
+///   are present in the tile list but ranked at/after `base_decoded` (i.e. the
+///   ones not already decoded). Peers already inside `base_decoded` need no
+///   expansion.
+/// * `device_ceiling` — the optional #1286 hardware ceiling. `None` ⇒ no device
+///   ceiling on this platform.
+/// * `canvas_limit` — [`crate::constants::CANVAS_LIMIT`], the absolute canvas
+///   cap, passed in so this stays pure / unit-testable.
+///
+/// Returns the EXPANDED decoded count. It can only GROW the bucket
+/// (`>= base_decoded`): requesting peers never shrinks what was already
+/// decoded. We raise to `base + requested`, then apply BOTH upper bounds —
+/// `canvas_limit` and `device_ceiling.max(MIN_CAP)` (if `Some`) — and finally
+/// floor back up to `base_decoded`. The two upper bounds are independent `min`s,
+/// so their relative order is immaterial (`x.min(a).min(b) == x.min(b).min(a)`);
+/// what matters is that both bind and that the `.max(base_decoded)` floor is
+/// applied LAST.
+///
+/// The floor cannot lift the result back above either ceiling in production:
+/// `base_decoded` was itself produced by `effective_cap` (which already applied
+/// the same device ceiling and canvas cap), so `base <= min(canvas, ceiling)` on
+/// entry. The floor therefore only bites on the `requested == 0` path (returning
+/// exactly `base`) and as a defensive guarantee that we never return less than
+/// `base`.
+pub fn expand_decoded_for_requested(
+    base_decoded: usize,
+    requested_off_budget: usize,
+    device_ceiling: Option<usize>,
+    canvas_limit: usize,
+) -> usize {
+    // Raise the target to admit the off-budget requests.
+    let target = base_decoded.saturating_add(requested_off_budget);
+    // Canvas cap first (mirrors `effective_cap`'s per-mode `min(CANVAS_LIMIT)`).
+    let target = target.min(canvas_limit);
+    // Device-class ceiling binds last (mirrors `effective_cap`), floored at
+    // MIN_CAP so a tiny/zero ceiling never starves the view below one tile.
+    let target = match device_ceiling {
+        Some(ceiling) => target.min(ceiling.max(MIN_CAP)),
+        None => target,
+    };
+    // Never shrink below the pre-request base: PLAY can only expand the bucket.
+    target.max(base_decoded)
+}
+
+/// Camera-on vs camera-off partition for the decode-budget tile list
+/// (issue #1465).
+///
+/// A camera-OFF peer produces zero video to decode, so it must NOT consume a
+/// decode-budget slot and must NOT be rendered with the dashed off-budget
+/// outline (it would look "paused"/sheddable when there is nothing to shed).
+/// This pure helper is the single source of truth for that split: callers pass
+/// the candidate peers as `(tile_id, camera_on)` pairs (already in their final
+/// display order), and it returns `(camera_on_real, camera_off_real)`.
+///
+/// Only peers in `camera_on_real` (plus any mock placeholders the caller
+/// appends separately) feed the decode-budget split; `camera_off_real` peers
+/// render as plain avatars outside the budget. Order within each output is the
+/// input order (stable), so the caller controls deterministic rendering.
+///
+/// Kept pure / DOM-free / signal-free so it is host-unit-testable: the caller
+/// resolves each peer's live `camera_on` (via `is_video_enabled_for_peer`)
+/// before calling.
+pub fn partition_camera_tiles(peers: &[(String, bool)]) -> (Vec<String>, Vec<String>) {
+    let mut camera_on_real = Vec::with_capacity(peers.len());
+    let mut camera_off_real = Vec::with_capacity(peers.len());
+    for (tile_id, camera_on) in peers {
+        if *camera_on {
+            camera_on_real.push(tile_id.clone());
+        } else {
+            camera_off_real.push(tile_id.clone());
+        }
+    }
+    (camera_on_real, camera_off_real)
+}
+
+/// Merge the user's explicit "force-decode this peer" requests (issue #1466)
+/// into the active decode set — but ONLY for peers that actually landed in the
+/// decoded bucket this render.
+///
+/// The per-tile PLAY button (rendered on a decode-budget-PAUSED tile) toggles a
+/// peer's `session_id` into `UserRequestedDecodeCtx`. The render scope reacts by
+/// EXPANDING the decoded bucket (via [`expand_decoded_for_requested`]) and
+/// promoting requested peers into the visible/decoded slice, clamped by the
+/// device ceiling (#1286) and the canvas/displayed limits. Some requests may not
+/// fit — when the user asks for more peers than the device ceiling (or the grid)
+/// can decode, the excess requests STAY paused avatars and must NOT be decoded.
+///
+/// This helper enforces the decode⇄render invariant at the merge point: it
+/// inserts a requested id ONLY when that id is present in `decoded_bucket` (the
+/// session_ids of the tiles actually rendering live video this frame —
+/// `visible_tiles` for the normal grid, `ss_decoded_tiles` for screen share).
+/// A requested peer that did not get a decoded slot is skipped, so it never
+/// appears in `active_decode_set` while rendering as a paused avatar. Non-numeric
+/// ids (e.g. `"mock-0"`) parse-fail and are silently skipped — EXACTLY mirroring
+/// how `active_decode_set` is seeded from the decoded bucket
+/// (`filter_map(|id| id.parse::<u64>().ok())`), so a mock or malformed id can
+/// never poison the set.
+///
+/// In practice the decoded bucket already SEEDS `active_decode_set`, so every id
+/// this helper inserts is already present — the call is a redundant-but-explicit
+/// guard (defense in depth) that documents and pins the invariant. It is a union
+/// (existing entries are preserved) and idempotent (re-merging the same requests
+/// is a no-op), so calling it once per render is safe.
+///
+/// Kept pure / DOM-free / signal-free so it is host-unit-testable; the caller
+/// passes `active` (the in-progress set), a borrow of the requested-id set, and
+/// a borrow of the decoded-bucket id set.
+pub fn merge_user_requested_decode(
+    active: &mut std::collections::HashSet<u64>,
+    requested: &std::collections::HashSet<String>,
+    decoded_bucket: &std::collections::HashSet<u64>,
+) {
+    for id in requested {
+        if let Ok(session_id) = id.parse::<u64>() {
+            // Only force-decode a requested peer that actually got a decoded
+            // slot this render (decode⇄render must agree — #1466).
+            if decoded_bucket.contains(&session_id) {
+                active.insert(session_id);
+            }
+        }
+    }
+}
+
+/// Promote user-requested ("PLAY") peers that are still ranked beyond the
+/// decoded window INWARD into decoded slots, so they render live instead of
+/// decoded-but-shown-paused (issues #1466 / #1286).
+///
+/// `all_tiles` is the unified, display-ordered tile list. `visible_tile_count`
+/// is the (already-expanded) decoded-window size; `displayed_tile_count` is the
+/// number of real grid cells (everything past it folds into the +N badge).
+/// `requested` is the set of force-decode `session_id`s. `pinned_slot`, if
+/// `Some`, is the decoded-slot index the pinned peer occupies after the pin
+/// swap — the cursor skips it so a promotion never evicts the pin.
+///
+/// ## Bounded by `displayed_tile_count` (PR #1467 review B1)
+///
+/// Only peers in the DISPLAYED off-budget window
+/// `[visible_tile_count, displayed_tile_count)` are eligible to promote. A
+/// requested peer in the true-overflow region (`idx >= displayed_tile_count`)
+/// is NOT swapped inward: doing so would pull a true-overflow peer onto the grid
+/// and evict a previously-displayed tile OUT to `idx >= displayed_tile_count`,
+/// where neither the off-budget `avatar_tiles` slice (capped at
+/// `displayed_tile_count`) nor the `camera_off_tiles` group renders it — the
+/// evicted peer would silently vanish from the grid while the +N badge count
+/// stayed unchanged. Bounding the eligible range to `displayed_tile_count`
+/// guarantees every displaced tile lands back in the renderable
+/// `[visible_tile_count, displayed_tile_count)` range, and true-overflow
+/// requests genuinely stay in the +N badge (they get no decoded slot, so the
+/// phase-4 merge keeps them out of `active_decode_set` and decode⇄render still
+/// agree).
+///
+/// Kept pure / DOM-free / signal-free so it is host-unit-testable; the caller
+/// resolves `pinned_slot` (via `client.get_peer_user_id`) before calling.
+pub fn promote_requested_into_decoded(
+    all_tiles: &mut [String],
+    visible_tile_count: usize,
+    displayed_tile_count: usize,
+    requested: &std::collections::HashSet<String>,
+    pinned_slot: Option<usize>,
+) {
+    if visible_tile_count == 0 || visible_tile_count >= all_tiles.len() || requested.is_empty() {
+        return;
+    }
+    // Cursor: the next free decoded slot, walking down from the last one.
+    // `isize` so the "ran out of slots" boundary (-1) is representable.
+    let mut next_free_slot: isize = visible_tile_count as isize - 1;
+    // Collect the indices to promote first (an immutable borrow), then perform
+    // the swaps, so we never alias `all_tiles`. `take(displayed_tile_count)`
+    // bounds eligibility to the renderable window — see the B1 note above.
+    let promote_indices: Vec<usize> = all_tiles
+        .iter()
+        .enumerate()
+        .take(displayed_tile_count)
+        .skip(visible_tile_count)
+        .filter(|(_, tile_id)| requested.contains(*tile_id))
+        .map(|(idx, _)| idx)
+        .collect();
+    for idx in promote_indices {
+        // Advance the cursor past the pinned slot (never evict the pin) and
+        // stop if we have exhausted the decoded slots.
+        while next_free_slot >= 0 && Some(next_free_slot as usize) == pinned_slot {
+            next_free_slot -= 1;
+        }
+        if next_free_slot < 0 {
+            break;
+        }
+        all_tiles.swap(next_free_slot as usize, idx);
+        next_free_slot -= 1;
+    }
+}
+
+/// True when exactly ONE real-peer tile is displayed across ALL THREE render
+/// groups combined: decoded video tiles (`visible`), off-budget avatar tiles
+/// (`avatar`), and camera-off avatar tiles (`camera_off`) (issues #1465, #508).
+///
+/// ## Why a cross-group sum and not `visible == 1`
+///
+/// Before the #1465 partition, the only way to have one on-screen tile was
+/// `visible_tiles.len() == 1`, so the lone-peer full-bleed presentation (the
+/// #508 single-peer view: one remote peer filling the tile) keyed off that.
+/// The #1465 partition split camera-OFF real peers OUT of `visible`/`avatar`
+/// into their own `camera_off` group, so `visible == 1` no longer implies the
+/// peer is alone on screen — a camera-on peer and a camera-off peer can render
+/// side by side (`visible == 1`, `camera_off == 1`). Both the visible-tiles
+/// full-bleed rule and the camera-off-tiles full-bleed rule must therefore key
+/// off the TOTAL displayed real-peer tiles, which is exactly this sum.
+///
+/// ## #1465 no-cap byte-identity invariant
+///
+/// With exactly one camera-ON peer and zero camera-off peers, the budget cap is
+/// inactive: `visible == 1`, `avatar == 0`, `camera_off == 0`, so the sum is 1
+/// and this returns `true` — the lone peer is full-bleed exactly as before the
+/// partition. (`avatar` is empty unless a budget cap is active; `camera_off` is
+/// empty when every peer is camera-on — see `partition_camera_tiles`.)
+pub fn is_sole_real_tile(visible: usize, avatar: usize, camera_off: usize) -> bool {
+    visible + avatar + camera_off == 1
 }
 
 #[cfg(test)]
@@ -1311,6 +1570,40 @@ mod tests {
     }
 
     #[test]
+    fn effective_cap_all_is_natural_capped_subject_to_ceiling() {
+        // Issue #1466: `All` decodes every natural tile, capped at CANVAS_LIMIT,
+        // and IGNORES `pressured` (so engaging All reveals all tiles without
+        // clearing the latch). The independent expected literals pin each clamp.
+        // No ceiling: returns the raw natural (12).
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::All, false, 12, 99, None),
+            12,
+            "All with no ceiling returns the natural tile count"
+        );
+        // Pressured is ignored under All (same as Fixed): still 12, not `cap`.
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::All, true, 12, 3, None),
+            12,
+            "All ignores the pressured flag and the loop-owned cap"
+        );
+        // The #1286 device ceiling STILL binds on All — it is NOT a ceiling
+        // bypass. With natural 12 and a 4-tile ceiling, the effective cap is 4.
+        // MUTATION THAT BREAKS IT: making the All arm skip the device_ceiling
+        // clamp (returning natural unconditionally) yields 12 here.
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::All, false, 12, 99, Some(4)),
+            4,
+            "All is still clamped by the iOS device ceiling (issue 1286)"
+        );
+        // Natural above the canvas limit is capped at CANVAS_LIMIT.
+        assert_eq!(
+            effective_cap(DecodeBudgetOverride::All, false, CANVAS_LIMIT + 5, 99, None),
+            CANVAS_LIMIT,
+            "All never exceeds CANVAS_LIMIT"
+        );
+    }
+
+    #[test]
     fn effective_cap_floors_at_min_cap_for_zero_peers() {
         // 0-peer layout: the clamp upper bound is floored at MIN_CAP so the
         // result is never below MIN_CAP and `clamp` never sees max < min.
@@ -1492,5 +1785,393 @@ mod tests {
             effective_cap(DecodeBudgetOverride::Auto, false, 12, 99, None),
             12
         );
+    }
+
+    // ── issue #1465: camera-off peers are excluded from the decode-budget set ──
+
+    /// Camera-OFF peers must be split out of the budget population (they have no
+    /// video to decode), while camera-ON peers stay in — preserving input order
+    /// in each bucket.
+    ///
+    /// MUTATION SENSITIVITY: this is the load-bearing #1465 assertion. If
+    /// `partition_camera_tiles` is reverted to "include camera-off peers in the
+    /// budget" — e.g. by pushing every peer into `camera_on_real` (dropping the
+    /// `if *camera_on` branch), or by flipping the branch — then `b` ("bob",
+    /// camera off) lands in `camera_on_real` and/or `camera_off_real` is empty,
+    /// and BOTH asserts below fail. There are no `X == X` tautologies here: the
+    /// expected vectors are independent literals, not derived from the output.
+    #[test]
+    fn partition_excludes_camera_off_from_budget() {
+        let peers = vec![
+            ("alice".to_string(), true),
+            ("bob".to_string(), false),
+            ("carol".to_string(), true),
+            ("dave".to_string(), false),
+        ];
+        let (on, off) = partition_camera_tiles(&peers);
+        assert_eq!(
+            on,
+            vec!["alice".to_string(), "carol".to_string()],
+            "only camera-ON peers feed the decode budget"
+        );
+        assert_eq!(
+            off,
+            vec!["bob".to_string(), "dave".to_string()],
+            "camera-OFF peers are partitioned out of the budget population"
+        );
+    }
+
+    /// When every peer is camera-ON, the camera-off bucket is empty and the
+    /// budget population is unchanged (the #1465 no-cap byte-identity invariant:
+    /// nothing is diverted away from `all_tiles`).
+    #[test]
+    fn partition_all_camera_on_leaves_budget_intact() {
+        let peers = vec![("alice".to_string(), true), ("bob".to_string(), true)];
+        let (on, off) = partition_camera_tiles(&peers);
+        assert_eq!(on, vec!["alice".to_string(), "bob".to_string()]);
+        assert!(
+            off.is_empty(),
+            "no camera-off peers ⇒ empty group ⇒ budget population identical to pre-1465"
+        );
+    }
+
+    // ── issue #1466: user-requested force-decode merge ────────────────────────
+
+    use std::collections::HashSet;
+
+    /// Build a `HashSet<u64>` decoded-bucket from a slice of ids (test helper).
+    fn bucket(ids: &[u64]) -> HashSet<u64> {
+        ids.iter().copied().collect()
+    }
+
+    /// A numeric requested id that IS in the decoded bucket is inserted.
+    ///
+    /// MUTATION SENSITIVITY: if `merge_user_requested_decode` dropped the
+    /// `.parse::<u64>()`/insert (made a no-op) the set stays empty and this
+    /// fails. The expected value (123) is an independent literal.
+    #[test]
+    fn merge_inserts_requested_id_in_decoded_bucket() {
+        let mut active: HashSet<u64> = HashSet::new();
+        let mut requested: HashSet<String> = HashSet::new();
+        requested.insert("123".to_string());
+        merge_user_requested_decode(&mut active, &requested, &bucket(&[123]));
+        assert!(active.contains(&123), "decoded requested id is force-added");
+        assert_eq!(active.len(), 1, "exactly the one decoded id was inserted");
+    }
+
+    /// A requested id that did NOT get a decoded slot (not in the decoded
+    /// bucket — e.g. it exceeded the device ceiling) must NOT be force-decoded.
+    /// This is the #1466/#1286 decode⇄render invariant: a paused avatar is never
+    /// in `active_decode_set`.
+    ///
+    /// MUTATION SENSITIVITY: if the helper dropped the `decoded_bucket.contains`
+    /// gate (reverting to the old unconditional insert), id 555 would be added
+    /// and this fails.
+    #[test]
+    fn merge_skips_requested_id_not_in_decoded_bucket() {
+        let mut active: HashSet<u64> = HashSet::new();
+        let mut requested: HashSet<String> = HashSet::new();
+        requested.insert("555".to_string());
+        // Decoded bucket holds a DIFFERENT peer (777), so 555 was not decoded.
+        merge_user_requested_decode(&mut active, &requested, &bucket(&[777]));
+        assert!(
+            active.is_empty(),
+            "an un-decoded requested peer must not enter active_decode_set"
+        );
+    }
+
+    /// Non-numeric ids (mock placeholders, garbage) are silently skipped —
+    /// matching the `filter_map(parse::<u64>)` discipline of `active_decode_set`.
+    ///
+    /// MUTATION SENSITIVITY: if the helper inserted on parse failure (or used a
+    /// default/hash of the string), `active` would be non-empty and this fails.
+    #[test]
+    fn merge_skips_non_numeric_requested_id() {
+        let mut active: HashSet<u64> = HashSet::new();
+        let mut requested: HashSet<String> = HashSet::new();
+        requested.insert("mock-0".to_string());
+        requested.insert("abc".to_string());
+        // Even if the (impossible) parse succeeded, the bucket is empty.
+        merge_user_requested_decode(&mut active, &requested, &HashSet::new());
+        assert!(active.is_empty(), "non-numeric ids must not be inserted");
+    }
+
+    /// The merge is a UNION with existing entries (pre-seeded ids survive) and is
+    /// idempotent (merging twice yields the same set).
+    ///
+    /// MUTATION SENSITIVITY: if the helper cleared/replaced `active` instead of
+    /// inserting, the pre-seeded 999 would vanish and the first assert fails.
+    /// The idempotency assert pins that a second merge adds nothing new.
+    #[test]
+    fn merge_is_union_and_idempotent() {
+        let mut active: HashSet<u64> = HashSet::new();
+        active.insert(999);
+        let mut requested: HashSet<String> = HashSet::new();
+        requested.insert("123".to_string());
+
+        merge_user_requested_decode(&mut active, &requested, &bucket(&[123]));
+        assert!(
+            active.contains(&999),
+            "pre-existing entry preserved (union)"
+        );
+        assert!(active.contains(&123), "requested entry added");
+        let after_first: HashSet<u64> = active.clone();
+
+        // Idempotent: a second identical merge changes nothing.
+        merge_user_requested_decode(&mut active, &requested, &bucket(&[123]));
+        assert_eq!(active, after_first, "re-merging the same set is a no-op");
+    }
+
+    /// An empty requested set leaves `active` untouched.
+    ///
+    /// MUTATION SENSITIVITY: if the helper mutated `active` regardless of the
+    /// requested set (e.g. cleared it) this fails.
+    #[test]
+    fn merge_empty_requested_leaves_active_unchanged() {
+        let mut active: HashSet<u64> = HashSet::new();
+        active.insert(7);
+        active.insert(42);
+        let requested: HashSet<String> = HashSet::new();
+        merge_user_requested_decode(&mut active, &requested, &bucket(&[7, 42]));
+        let mut expected: HashSet<u64> = HashSet::new();
+        expected.insert(7);
+        expected.insert(42);
+        assert_eq!(active, expected, "empty request set is a no-op");
+    }
+
+    // ── issue #1466 / #1286: expand_decoded_for_requested ─────────────────────
+
+    /// Zero requested off-budget peers returns the base unchanged (no expansion).
+    ///
+    /// MUTATION SENSITIVITY: if the helper added a constant or used a wrong base,
+    /// the exact `3` literal fails.
+    #[test]
+    fn expand_zero_requested_returns_base() {
+        assert_eq!(
+            expand_decoded_for_requested(3, 0, None, CANVAS_LIMIT),
+            3,
+            "no requests ⇒ bucket unchanged"
+        );
+    }
+
+    /// Requests within an absent ceiling expand the bucket by exactly the
+    /// off-budget count.
+    ///
+    /// MUTATION SENSITIVITY: base=1 + requested=2 must be exactly 3. Using `+1`,
+    /// `*`, or dropping the `saturating_add` of `requested_off_budget` all break
+    /// this exact literal.
+    #[test]
+    fn expand_within_no_ceiling_adds_requested() {
+        assert_eq!(
+            expand_decoded_for_requested(1, 2, None, CANVAS_LIMIT),
+            3,
+            "base 1 + 2 requested ⇒ 3 decoded (no device ceiling)"
+        );
+    }
+
+    /// The device ceiling BINDS even when the requests would push past it
+    /// (#1286): base 1 + 6 requested, ceiling 4 ⇒ 4. The ceiling wins.
+    ///
+    /// MUTATION SENSITIVITY: if the device-ceiling clamp were dropped, the result
+    /// would be 7; if it clamped before the canvas/expansion or used the wrong
+    /// operand, it would not be exactly 4.
+    #[test]
+    fn expand_device_ceiling_binds() {
+        assert_eq!(
+            expand_decoded_for_requested(1, 6, Some(4), CANVAS_LIMIT),
+            4,
+            "device ceiling 4 caps the expansion regardless of request count"
+        );
+    }
+
+    /// The device ceiling wins even when `base` already equals it: base 4 +
+    /// 3 requested, ceiling 4 ⇒ 4 (no growth past the hardware cap).
+    ///
+    /// MUTATION SENSITIVITY: dropping the ceiling clamp yields 7; applying the
+    /// `.max(base)` floor in the wrong order is still 4 here, but the
+    /// `expand_device_ceiling_binds` case above catches a missing clamp.
+    #[test]
+    fn expand_device_ceiling_wins_when_base_equals_ceiling() {
+        assert_eq!(
+            expand_decoded_for_requested(4, 3, Some(4), CANVAS_LIMIT),
+            4,
+            "cannot expand past the device ceiling even from base == ceiling"
+        );
+    }
+
+    /// The canvas limit binds when there is no device ceiling: a huge request
+    /// count is capped at CANVAS_LIMIT.
+    ///
+    /// MUTATION SENSITIVITY: dropping the canvas clamp yields base+1000; the
+    /// exact `CANVAS_LIMIT` literal pins the clamp.
+    #[test]
+    fn expand_canvas_limit_binds() {
+        assert_eq!(
+            expand_decoded_for_requested(2, 1000, None, CANVAS_LIMIT),
+            CANVAS_LIMIT,
+            "the absolute canvas limit caps the expansion when no device ceiling"
+        );
+    }
+
+    /// Never shrinks below base: a tiny (but `Some`) ceiling below `base` is
+    /// re-floored to `base` by `.max(base_decoded)`. (In production `base` is
+    /// already `<= ceiling` because `effective_cap` applied the same ceiling, so
+    /// this floor only ever bites on the degenerate test input.)
+    ///
+    /// MUTATION SENSITIVITY: if the `.max(base_decoded)` floor were dropped, this
+    /// would return 2 (the ceiling), not 5.
+    #[test]
+    fn expand_never_shrinks_below_base() {
+        assert_eq!(
+            expand_decoded_for_requested(5, 0, Some(2), CANVAS_LIMIT),
+            5,
+            "PLAY can only expand; result is never below base even under a tiny ceiling"
+        );
+    }
+
+    /// A zero device ceiling is floored to MIN_CAP (1) by `ceiling.max(MIN_CAP)`
+    /// before binding, so the bucket never collapses to zero. base=1 keeps the
+    /// `.max(base)` from masking the floor.
+    ///
+    /// MUTATION SENSITIVITY: if `ceiling.max(MIN_CAP)` were `ceiling` alone, the
+    /// `min` would force 0 and the `.max(base=1)` would mask it to 1 anyway —
+    /// so to pin the MIN_CAP floor specifically, use base 0: a 0 ceiling must
+    /// still yield MIN_CAP (1), not 0.
+    #[test]
+    fn expand_min_cap_floor_on_zero_ceiling() {
+        assert_eq!(
+            expand_decoded_for_requested(0, 3, Some(0), CANVAS_LIMIT),
+            MIN_CAP,
+            "a zero device ceiling is floored to MIN_CAP, never zero"
+        );
+    }
+
+    /// `is_sole_real_tile` is the shared full-bleed predicate for the normal
+    /// grid (issues #1465, #508): a peer renders full-bleed IFF it is the only
+    /// real-peer tile across ALL THREE groups. The lone peer can live in ANY
+    /// single group (a camera-on decoded tile, an off-budget avatar tile, or a
+    /// camera-off avatar tile), so all three single-group cases must be true and
+    /// every multi-tile / empty combination must be false.
+    ///
+    /// MUTATION SENSITIVITY: the expected booleans are independent literals, not
+    /// derived from the function. Weakening `== 1` to `<= 1` flips `(0,0,0)`
+    /// from false → true; dropping any term from the sum (e.g. ignoring
+    /// `camera_off`) flips `(0,0,1)` from true → false or `(1,0,1)` from false →
+    /// true. Each such mutation breaks at least one assertion below.
+    #[test]
+    fn is_sole_real_tile_only_when_total_is_one() {
+        // Exactly one tile in any single group → sole.
+        assert!(is_sole_real_tile(1, 0, 0), "lone camera-on decoded tile");
+        assert!(is_sole_real_tile(0, 1, 0), "lone off-budget avatar tile");
+        assert!(is_sole_real_tile(0, 0, 1), "lone camera-off avatar tile");
+
+        // Two or more across any groups → not sole.
+        assert!(!is_sole_real_tile(2, 0, 0), "two decoded tiles");
+        assert!(
+            !is_sole_real_tile(1, 1, 0),
+            "one decoded + one avatar = two tiles"
+        );
+        assert!(
+            !is_sole_real_tile(1, 0, 1),
+            "one camera-on + one camera-off = two tiles (the issue-1465 mixed case)"
+        );
+
+        // Zero tiles → not sole.
+        assert!(!is_sole_real_tile(0, 0, 0), "no tiles is not a sole tile");
+    }
+
+    fn tiles(ids: &[&str]) -> Vec<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn req(ids: &[&str]) -> HashSet<String> {
+        ids.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// B1 REGRESSION (PR #1467 review): a requested peer ranked in the
+    /// true-overflow region (`idx >= displayed_tile_count`) must NOT be promoted,
+    /// and no previously-displayed tile may be pushed past `displayed_tile_count`.
+    ///
+    /// Setup: 10 tiles, `visible_tile_count = 4`, `displayed_tile_count = 8`.
+    /// Peer "p9" sits at index 9 (true overflow, beyond the 8 grid cells) and is
+    /// the only PLAY request. The bounded promotion must leave the list untouched.
+    ///
+    /// MUTATION SENSITIVITY: with the bug (`take(displayed_tile_count)` dropped, or
+    /// `.take()` widened to `all_tiles.len()`), "p9" is swapped into slot 3 and the
+    /// slot-3 peer "p3" is evicted to index 9 (off the grid). The assertions on
+    /// both the decoded window AND index 9 fail under that mutation.
+    #[test]
+    fn promote_skips_true_overflow_request_and_keeps_displaced_renderable() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
+        let before = all.clone();
+        promote_requested_into_decoded(&mut all, 4, 8, &req(&["p9"]), None);
+        // True-overflow request was ignored: list is completely unchanged.
+        assert_eq!(
+            all, before,
+            "a request at idx 9 (>= displayed_tile_count=8) must not be promoted"
+        );
+        // No previously-displayed tile was pushed into the overflow region.
+        assert_eq!(
+            all[9], "p9",
+            "true-overflow peer stays at its overflow index"
+        );
+        assert_eq!(
+            &all[0..4],
+            &["p0", "p1", "p2", "p3"],
+            "the decoded window is undisturbed"
+        );
+    }
+
+    /// A requested peer INSIDE the displayed off-budget window
+    /// (`visible <= idx < displayed`) IS promoted into the decoded slice — the
+    /// bound must not be so tight that it suppresses legitimate promotions.
+    ///
+    /// Setup: same 10 tiles, `visible = 4`, `displayed = 8`. "p6" (index 6, inside
+    /// the displayed window) is requested. It must move into the last decoded slot
+    /// (index 3), and the displaced "p3" must remain renderable (idx < 8).
+    ///
+    /// MUTATION SENSITIVITY: if the promotion were dropped entirely the list would
+    /// be unchanged and the `all[3] == "p6"` assertion fails; if the displaced tile
+    /// went past index 8 the `displaced index < 8` assertion fails.
+    #[test]
+    fn promote_admits_in_window_request() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5", "p6", "p7", "p8", "p9"]);
+        promote_requested_into_decoded(&mut all, 4, 8, &req(&["p6"]), None);
+        assert_eq!(
+            all[3], "p6",
+            "in-window request promoted into last decoded slot"
+        );
+        let displaced = all.iter().position(|t| t == "p3").unwrap();
+        assert!(
+            displaced < 8,
+            "the displaced tile stays in the renderable window, not the +N overflow (was {displaced})"
+        );
+    }
+
+    /// The promotion cursor skips the pinned slot so a PLAY promotion never evicts
+    /// the pinned peer. With `visible = 3`, `displayed = 6`, pin at slot 2, and
+    /// "p4" requested, the request must land in slot 1 (slot 2 is skipped) and the
+    /// pinned tile at slot 2 must be preserved.
+    ///
+    /// MUTATION SENSITIVITY: dropping the `pinned_slot` skip swaps "p4" into slot 2,
+    /// evicting the pin — the `all[2] == "p2"` assertion fails.
+    #[test]
+    fn promote_skips_pinned_slot() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3", "p4", "p5"]);
+        promote_requested_into_decoded(&mut all, 3, 6, &req(&["p4"]), Some(2));
+        assert_eq!(all[2], "p2", "pinned slot is never evicted by a promotion");
+        assert_eq!(
+            all[1], "p4",
+            "request lands in the next free slot below the pin"
+        );
+    }
+
+    /// Empty request set is a no-op (the unpressured / no-PLAY path).
+    #[test]
+    fn promote_empty_request_is_noop() {
+        let mut all = tiles(&["p0", "p1", "p2", "p3"]);
+        let before = all.clone();
+        promote_requested_into_decoded(&mut all, 2, 4, &HashSet::new(), None);
+        assert_eq!(all, before, "no requests ⇒ list unchanged");
     }
 }

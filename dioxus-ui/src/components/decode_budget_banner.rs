@@ -302,8 +302,11 @@ pub fn DecodeBudgetBanner(
     /// Number of off-budget avatar tiles (`avatar_tile_count`).
     avatar_count: usize,
     /// The uncapped natural tile count (`total_tiles ∩ CANVAS_LIMIT` is applied
-    /// downstream by `decode_budget::effective_cap`). "Show all videos" sets the
-    /// override to `Fixed(natural)`.
+    /// downstream by `decode_budget::effective_cap`). Issue #1466: "Show all
+    /// videos" now sets the override to `All` (which tracks the live natural
+    /// count itself, so this prop is no longer the source of the target). It is
+    /// retained because it carries meaningful context for the action button's
+    /// accessible label ("Show all N videos").
     natural: usize,
 ) -> Element {
     // The damper persists across renders. `use_signal` gives us a mutable,
@@ -382,6 +385,11 @@ pub fn DecodeBudgetBanner(
     let aria = format!(
         "{count} {plural} paused to keep the call smooth. Click Show all videos to override."
     );
+    // Issue #1466: accessible label for the action button, naming the natural
+    // tile count so screen-reader users hear how many videos "Show all" reveals.
+    // This is the one remaining consumer of the `natural` prop after the action
+    // switched from `Fixed(natural)` to `All` (which tracks the live count itself).
+    let show_all_aria = format!("Show all {natural} videos — may stutter on a busy device");
 
     rsx! {
         div {
@@ -421,15 +429,17 @@ pub fn DecodeBudgetBanner(
                 // so screen-reader users hear the same caveat as the visible
                 // button name plus the consequence.
                 title: "Show all videos (may stutter on a busy device)",
-                "aria-label": "Show all videos — may stutter on a busy device",
+                "aria-label": "{show_all_aria}",
                 onclick: move |_| {
-                    // One-click escape hatch: pin the decode budget to the natural
-                    // tile count so EVERY present peer decodes. This is the exact
+                    // One-click escape hatch: pin the decode budget to `All`
+                    // (issue #1466) so EVERY present peer decodes — and stays
+                    // decoded as peers join, since `All` tracks the live natural
+                    // count rather than a frozen `Fixed(n)`. This is the exact
                     // path the appearance settings panel uses — set the shared
                     // context signal AND persist to localStorage — so the render
-                    // scope's `effective_cap(Fixed(natural), …)` re-reveals all
-                    // tiles on the next frame and the choice survives reloads.
-                    let target = DecodeBudgetOverride::Fixed(natural.max(1));
+                    // scope's `effective_cap(All, …)` re-reveals all tiles on the
+                    // next frame and the choice survives reloads.
+                    let target = DecodeBudgetOverride::All;
                     decode_budget_ctx.0.set(target);
                     save_decode_budget_override(target);
                     // Hide immediately; the override drives avatar_count to 0, so

@@ -79,6 +79,15 @@ pub fn PeerTile(
     #[props(default = false)]
     force_avatar: bool,
     on_toggle_pin: EventHandler<String>,
+    /// Issue #1466: fired when the user clicks the per-tile PLAY button on a
+    /// decode-budget-PAUSED tile to force-decode this peer. Receives the tile's
+    /// `session_id` (the `peer_id`/`key`), which `attendants.rs` toggles into
+    /// `UserRequestedDecodeCtx`. Defaulted to a no-op `EventHandler` so the many
+    /// call sites that never reach the paused-avatar arm (mock tiles, visible /
+    /// camera-off / SS-decoded tiles) need not pass it; only the off-budget
+    /// avatar real-peer call sites wire a real handler.
+    #[props(default)]
+    on_request_decode: EventHandler<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -578,6 +587,7 @@ pub fn PeerTile(
         pinned_peer_id.as_deref(),
         on_toggle_pin,
         &appearance,
+        on_request_decode,
         force_avatar,
     )
 }

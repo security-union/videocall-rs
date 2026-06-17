@@ -17,8 +17,9 @@
  */
 
 use crate::components::decode_budget::{
-    decide_step, effective_cap, ios_decode_tile_ceiling, BudgetSample, BudgetState, BudgetStep,
-    MIN_CAP,
+    decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
+    is_sole_real_tile, merge_user_requested_decode, partition_camera_tiles,
+    promote_requested_into_decoded, BudgetSample, BudgetState, BudgetStep, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::pre_join_preview::PreviewEngine;
@@ -60,7 +61,7 @@ use crate::context::{
     AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride,
     DensityModeCtx, DisplayNameCtx, DockPosition, DockPositionCtx, HostRefreshNonceCtx, HostSetCtx,
     LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap,
-    SignalPopupStateMap, TransportPreference, TransportPreferenceCtx,
+    SignalPopupStateMap, TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
 };
 use crate::local_storage::{load_f64, save_f64};
 use crate::types::DeviceInfo;
@@ -642,6 +643,12 @@ pub fn AttendantsComponent(
     //     `decode_budget_cap`.
     let initial_cap = match *decode_budget_override.peek() {
         DecodeBudgetOverride::Fixed(n) => n.clamp(MIN_CAP, CANVAS_LIMIT),
+        // Issue #1466: `All` is count-free — the render-side `effective_cap`
+        // returns natural-capped regardless of `decode_budget_cap`, so this
+        // initial seed is not load-bearing for All. Seed at CANVAS_LIMIT
+        // (decode all the layout could show) so any incidental reader sees the
+        // permissive value rather than the MIN_CAP floor.
+        DecodeBudgetOverride::All => CANVAS_LIMIT,
         DecodeBudgetOverride::Auto => MIN_CAP,
     };
     let mut decode_budget_cap = use_signal(|| initial_cap);
@@ -2395,6 +2402,14 @@ pub fn AttendantsComponent(
     // Provide the decode-budget override so the settings UI (task 1a.5) can read
     // and mutate it. Exposed exactly like density: a single shared signal.
     use_context_provider(|| DecodeBudgetCtx(decode_budget_override));
+    // Issue #1466: per-session "force-decode this peer" requests. Created in the
+    // PARENT render scope (so a per-tile PLAY click that writes it re-renders the
+    // parent and recomputes the partition / active_decode_set — see the `.read()`
+    // in the phase-4 merge + the promotion step below) and shared via context so
+    // the per-tile PLAY button (threaded down as `on_request_decode`) can toggle
+    // it. Empty at mount; NOT persisted (see `UserRequestedDecodeCtx` doc).
+    let mut user_requested_decode = use_signal(HashSet::<String>::new);
+    use_context_provider(|| UserRequestedDecodeCtx(user_requested_decode));
 
     // Single diagnostics subscriber shared by all PeerTile components.
     // Instead of each PeerTile spawning its own async task, one task
@@ -2465,10 +2480,72 @@ pub fn AttendantsComponent(
                                 let next = *screen_share_version.peek() + 1;
                                 screen_share_version.set(next);
                             }
+                            // #1465 reactivity gap fix: when an EXISTING peer's
+                            // `video_enabled` flips, the parent MUST re-render so
+                            // the DecodeBudget partition (which runs in the
+                            // `AttendantsComponent` render body and classifies each
+                            // peer via the NON-reactive `is_video_enabled_for_peer`)
+                            // re-runs and re-derives the `active_decode_set`.
+                            //
+                            // #1465 excluded camera-OFF peers from the budget, so a
+                            // camera-OFF peer is NOT in `active_decode_set` and never
+                            // gets `peer.visible = true`. The video decode path then
+                            // SKIPs its frames (`peer_decode_manager.rs`, `if
+                            // !self.visible { return SKIPPED }`). The MAJORITY case is
+                            // a peer joining camera-OFF (the default,
+                            // `load_preferred_camera_on()` == false) and turning the
+                            // camera ON mid-call: without this bump the parent never
+                            // re-renders, `active_decode_set` stays stale, `visible`
+                            // stays false, and the tile shows a blank/frozen canvas
+                            // until some UNRELATED re-render happens to fire. The
+                            // per-peer PeerTile self-heals its own canvas subscription,
+                            // but the active_decode_set is owned by the parent.
+                            //
+                            // Use the THROTTLED `peer_list_version` bump (mirroring the
+                            // speaker-activity path above), NOT a direct set: during a
+                            // reconnection wave many peers' media flags settle at once,
+                            // and a direct set per peer would drive a re-render storm.
+                            // 50 ms coalescing collapses that into one re-render.
+                            //
+                            // NOTE: audio_enabled deliberately does NOT trigger a bump.
+                            // Audio is independent of the decode-set/`visible`
+                            // partition (it plays through NetEQ, not gated by
+                            // `visible`), so bumping on audio toggles would add
+                            // re-renders for no rendering benefit.
+                            if sig.peek().video_enabled != state.video_enabled {
+                                let v = peer_list_version;
+                                schedule_throttled_bump(
+                                    bump_pending.clone(),
+                                    PEER_LIST_VERSION_THROTTLE_MS,
+                                    Rc::new(move || {
+                                        let mut v = v;
+                                        let next = *v.peek() + 1;
+                                        v.set(next);
+                                    }),
+                                );
+                            }
                             sig.set(state);
                         }
                     } else {
                         // First event for this peer — create a new signal.
+                        //
+                        // #1465: no `peer_list_version` bump is needed here even when
+                        // this first event carries `video_enabled = true`. A brand-new
+                        // peer is created by `ensure_peer()` in
+                        // `video_call_client::on_inbound_media`, which returns
+                        // `PeerStatus::Added` and (at the END of the same
+                        // synchronous call) emits `on_peer_added`, whose callback
+                        // (~attendants.rs:1275) bumps `peer_list_version` directly.
+                        // That bump fires AFTER the decode step that may have flipped
+                        // `video_enabled` true, and `is_video_enabled_for_peer` reads
+                        // the live `peer_decode_manager` state, so the parent
+                        // re-render the `on_peer_added` bump triggers already sees the
+                        // correct video state and partitions the new peer correctly.
+                        // This `peer_status` event is delivered asynchronously
+                        // (`global_sender().try_broadcast` -> `rx.recv().await`)
+                        // strictly AFTER that bump, so it is redundant for the
+                        // partition. Adding a second bump here would only add an
+                        // extra re-render on every join.
                         let screen_enabled = state.screen_enabled;
                         let sig = Signal::new(state);
                         if screen_enabled {
@@ -2662,6 +2739,28 @@ pub fn AttendantsComponent(
                                 *decode_budget_cap.peek(),
                             )
                         }
+                        // Issue #1466: into/out of the `All` override.
+                        (DecodeBudgetOverride::Auto, DecodeBudgetOverride::All) => {
+                            log::info!("DecodeBudget: override=all prev=auto natural={natural}")
+                        }
+                        (DecodeBudgetOverride::Fixed(prev_n), DecodeBudgetOverride::All) => {
+                            log::info!(
+                                "DecodeBudget: override=all prev=fixed prev_n={prev_n} natural={natural}"
+                            )
+                        }
+                        (DecodeBudgetOverride::All, DecodeBudgetOverride::Auto) => {
+                            log::info!(
+                                "DecodeBudget: override=auto prev=all natural={} cap={}",
+                                natural,
+                                *decode_budget_cap.peek(),
+                            )
+                        }
+                        (DecodeBudgetOverride::All, DecodeBudgetOverride::Fixed(n)) => {
+                            log::info!(
+                                "DecodeBudget: override=fixed n={n} prev=all natural={natural}"
+                            )
+                        }
+                        (DecodeBudgetOverride::All, DecodeBudgetOverride::All) => {}
                         (DecodeBudgetOverride::Auto, DecodeBudgetOverride::Auto) => {}
                     }
                     if current_override == DecodeBudgetOverride::Auto {
@@ -2682,16 +2781,27 @@ pub fn AttendantsComponent(
                     last_override = current_override;
                 }
 
-                if let DecodeBudgetOverride::Fixed(n) = current_override {
-                    // Hard override: bypass decide_step entirely and clamp the
-                    // actuator to n, the natural count, and CANVAS_LIMIT. The
-                    // upper bound (natural ∩ CANVAS_LIMIT) is floored at MIN_CAP
-                    // so `clamp` can never see `max < min` (natural may be 0
-                    // before any peers join).
-                    // MIN_CAP (1) < CANVAS_LIMIT, so this clamp never sees
-                    // `max < min`; it also floors a 0 natural count at MIN_CAP.
-                    let upper = natural.clamp(MIN_CAP, CANVAS_LIMIT);
-                    let forced = n.clamp(MIN_CAP, upper);
+                // Hard overrides (Fixed and All — issue #1466) bypass decide_step
+                // entirely. `forced_cap` is the clamped target for each:
+                //   - Fixed(n): clamp `n` into [MIN_CAP, natural ∩ CANVAS_LIMIT].
+                //   - All:      the full natural count, clamped to
+                //               [MIN_CAP, CANVAS_LIMIT] (decode all the layout
+                //               shows). This parallels the render-side
+                //               `effective_cap` All arm, which ignores `pressured`
+                //               and the loop cap, so `All` reveals every tile on
+                //               the next render without touching the latch.
+                // The upper bound (natural ∩ CANVAS_LIMIT) is floored at MIN_CAP
+                // so `clamp` can never see `max < min` (natural may be 0 before
+                // peers join). MIN_CAP (1) < CANVAS_LIMIT, both consts.
+                let forced_cap: Option<usize> = match current_override {
+                    DecodeBudgetOverride::Fixed(n) => {
+                        let upper = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+                        Some(n.clamp(MIN_CAP, upper))
+                    }
+                    DecodeBudgetOverride::All => Some(natural.clamp(MIN_CAP, CANVAS_LIMIT)),
+                    DecodeBudgetOverride::Auto => None,
+                };
+                if let Some(forced) = forced_cap {
                     if *decode_budget_cap.peek() != forced {
                         decode_budget_cap.set(forced);
                     }
@@ -3117,6 +3227,13 @@ pub fn AttendantsComponent(
     // override stays Auto `prev == current == Auto` makes the body a no-op — it
     // therefore never fights the loop's mid-Auto pressure latch (the loop sets
     // pressured=true on a real down-step; this effect leaves that alone).
+    //
+    // Issue #1466: going All -> Auto is covered here (All != Auto, so the latch
+    // clears). Going Auto -> All does NOT need to touch the latch: traced through
+    // `effective_cap`, the `All` arm returns `natural.min(CANVAS_LIMIT)`
+    // UNCONDITIONALLY (it never consults `pressured` or `cap`), so engaging All
+    // reveals every tile on the next render even if `pressured` is still latched
+    // true — exactly how Fixed achieves immediate reveal. No extra code needed.
     use_effect(move || {
         let current = decode_budget_override();
         let previous = *prev_override.peek();
@@ -3125,6 +3242,20 @@ pub fn AttendantsComponent(
             // Pressured-latch edge (true->false): leaving a Fixed override for Auto
             // clears the latch render-side so all natural tiles re-reveal at once.
             log::info!("DecodeBudget: pressured_latch=false trigger=override_resume_auto");
+            // Issue #1466: returning to Auto from ANY non-Auto state (Fixed/All)
+            // discards the per-tile force-decode requests. Auto is "let the
+            // adaptive loop decide", so stale PLAY requests must not keep peers
+            // pinned-decoded across the mode switch. This same edge fires for BOTH
+            // entry points that write `decode_budget_override` — the Settings
+            // picker AND the persistent "Back to automatic" toggle (both call
+            // `decode_budget_ctx.0.set`) — so a single clear here covers both.
+            // Guarded on non-empty so we don't trigger a needless write-driven
+            // re-render when there was nothing to clear. We do NOT clear on a
+            // transition to All or Fixed(n): those are explicit manual modes where
+            // an existing PLAY request is still meaningful.
+            if !user_requested_decode.peek().is_empty() {
+                user_requested_decode.write().clear();
+            }
         }
         if previous != current {
             prev_override.set(current);
@@ -3179,11 +3310,24 @@ pub fn AttendantsComponent(
         // would otherwise silently truncate on the `as u64 -> as u32` path in
         // the consumer. `effective_cap` is already clamped, so this only aligns
         // the telemetry `override_fixed_n` with what is actually rendered.
+        // Issue #1466: the proto `OverrideMode` enum
+        // (videocall-types/.../health_packet.rs) has ONLY UNSPECIFIED=0, AUTO=1,
+        // FIXED=2 — there is NO `All` value, and the wire format is NOT changed
+        // here. Map `All` onto the FIXED discriminator with `fixed_n =
+        // natural_capped` (the count All actually decodes). This is the
+        // least-misleading mapping: dashboards see "all N tiles decoded as a hard
+        // cap of N", which is exactly what All does, rather than inventing a wire
+        // value or mislabelling it Auto (which would imply adaptive shedding).
+        let report_as_fixed = matches!(
+            override_mode,
+            DecodeBudgetOverride::Fixed(_) | DecodeBudgetOverride::All
+        );
         let fixed_n = match override_mode {
             DecodeBudgetOverride::Fixed(n) => n.min(CANVAS_LIMIT),
+            DecodeBudgetOverride::All => natural_capped,
             DecodeBudgetOverride::Auto => 0,
         };
-        let is_fixed = matches!(override_mode, DecodeBudgetOverride::Fixed(_));
+        let is_fixed = report_as_fixed;
         let snapshot = (effective, natural_capped, pressured, is_fixed, fixed_n);
         if *prev_db_snapshot.peek() == snapshot {
             return;
@@ -3404,11 +3548,15 @@ pub fn AttendantsComponent(
     } else {
         (total_tiles, 0)
     };
-    // Bucket 1 / bucket 2 split within the displayed tiles. `visible_tile_count`
-    // keeps its meaning: the count of DECODED video tiles. The remainder are
-    // off-budget avatar tiles.
-    let visible_tile_count = displayed_tile_count.min(decoded_limit);
-    let avatar_tile_count = displayed_tile_count - visible_tile_count;
+    // Bucket 1 / bucket 2 split within the displayed tiles. `base_visible_tile_count`
+    // is the count of DECODED video tiles BEFORE user PLAY requests expand it.
+    // The final `visible_tile_count` (and `avatar_tile_count`) are computed
+    // AFTER `all_tiles` is built — once we can count how many user-requested
+    // peers fall OUTSIDE this base window (issue #1466). The split itself
+    // (visible vs off-budget avatar) is unchanged; only the boundary may move
+    // outward to admit explicit force-decode requests, still bounded by the
+    // device ceiling (#1286), the canvas limit, and `displayed_tile_count`.
+    let base_visible_tile_count = displayed_tile_count.min(decoded_limit);
     // --- Build unified tile list (real + mock peers) sorted by join time ---
     // Tiles are ordered by join time (earliest first) rather than by speech
     // activity. This provides a stable, predictable grid that doesn't shuffle
@@ -3423,10 +3571,51 @@ pub fn AttendantsComponent(
     // Pre-build mock IDs once to avoid repeated format!() in the hot path.
     let mock_ids: Vec<String> = (0..mock_count).map(|i| format!("mock-{i}")).collect();
 
-    let mut all_tiles: Vec<String> = Vec::with_capacity(total_tiles);
-    for peer_id in display_peers.iter().take(capped_real) {
-        all_tiles.push(peer_id.clone());
+    // --- Camera-on / camera-off partition (issue #1465) ---
+    // A camera-OFF peer produces zero video to decode, so it must NOT consume a
+    // decode-budget slot and must NOT land in the dashed off-budget avatar
+    // bucket (it would look "paused" / sheddable when there is nothing to shed).
+    // Partition the capped real peers up front: camera-ON real peers feed the
+    // decode-budget split (alongside mocks); camera-OFF real peers render in a
+    // separate plain-avatar group (no `force_avatar`, no dash).
+    //
+    // Camera-on predicate (applied uniformly here and in canvas_generator.rs):
+    //   mock peer                     → treated camera-ON (it is a layout-only
+    //                                   placeholder that exercises the decode path)
+    //   real peer, video_enabled true → camera-ON
+    //   real peer, video_enabled false→ camera-OFF
+    // `is_video_enabled_for_peer` returns false for any non-numeric key (incl.
+    // mock-N), which is why mocks are handled by the `take(capped_real)` slice
+    // here (they are not in `display_peers`) and need no explicit OR.
+    let camera_candidates: Vec<(String, bool)> = display_peers
+        .iter()
+        .take(capped_real)
+        .map(|peer_id| (peer_id.clone(), client.is_video_enabled_for_peer(peer_id)))
+        .collect();
+    let (camera_on_real, mut camera_off_real) = partition_camera_tiles(&camera_candidates);
+    // Stable join-order sort for the camera-off group so its render order is
+    // deterministic and matches the rest of the grid's earliest-first ordering.
+    {
+        let join_map = peer_join_time.read();
+        camera_off_real.sort_by(|a, b| {
+            let jt_a = join_map.get(a).copied().unwrap_or(0.0);
+            let jt_b = join_map.get(b).copied().unwrap_or(0.0);
+            jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal)
+        });
     }
+
+    // `all_tiles` now holds ONLY the peers with video to decode: camera-ON real
+    // peers + mock placeholders. The decode-budget split (visible/avatar) below
+    // operates on this shrunken population. The LAYOUT counters (`total_tiles`,
+    // `displayed_tile_count`, `overflow_count`, `tile_count`) are UNCHANGED by the
+    // #1465 partition — they still size over the FULL population so the grid
+    // geometry and the +N badge are identical; only which peers feed the decode
+    // split changes. (The decode-split counters `visible_tile_count` /
+    // `avatar_tile_count` ARE recomputed below: the #1466 expansion may move the
+    // visible/avatar boundary outward within `displayed_tile_count` to admit PLAY
+    // requests — that does not touch the layout counters above.)
+    let mut all_tiles: Vec<String> = Vec::with_capacity(camera_on_real.len() + mock_count);
+    all_tiles.extend_from_slice(&camera_on_real);
     all_tiles.extend_from_slice(&mock_ids);
     // Stable sort by join time (earliest first).
     {
@@ -3437,6 +3626,54 @@ pub fn AttendantsComponent(
             jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal)
         });
     }
+
+    // --- User-requested decode bucket expansion (issues #1466 / #1286) ---
+    // A user who taps PLAY on a paused tile is explicitly asking to decode that
+    // peer. Count the DISTINCT requested peers that are present in `all_tiles`
+    // but ranked AT/AFTER `base_visible_tile_count` (i.e. the ones the budget did
+    // NOT already decode), then EXPAND the decoded window to admit them so they
+    // render live (`force_avatar = false`) rather than decoded-but-shown-paused.
+    //
+    // The expansion is clamped by `expand_decoded_for_requested` to the device
+    // ceiling (#1286 — a phone can't be forced past its hardware tile ceiling)
+    // and the canvas limit, and then re-clamped here to `displayed_tile_count`
+    // (we cannot show more decoded tiles than there are grid cells; requests in
+    // the true-overflow region beyond `displayed_tile_count` fold into the +N
+    // badge and stay paused — the phase-4 merge keeps them OUT of the decode set
+    // so decode⇄render still agree). `layout_limit` / `displayed_tile_count` /
+    // `overflow_count` / the +N badge are UNCHANGED — they key off layout, not
+    // budget. With no requests, `requested_off_budget == 0` and
+    // `expand_decoded_for_requested` returns `base_visible_tile_count` verbatim,
+    // so the unpressured / no-PLAY path is byte-identical to before.
+    let requested_off_budget = {
+        let requested = user_requested_decode.read();
+        if requested.is_empty() {
+            0
+        } else {
+            // Only count requested peers in the DISPLAYED off-budget window
+            // `[base_visible_tile_count, displayed_tile_count)`. Requests in the
+            // true-overflow region (`idx >= displayed_tile_count`) have no grid
+            // cell to render in, so they must NOT expand the decoded window —
+            // they fold into the +N badge and stay paused (see the promotion
+            // loop's POST-EXPANSION INVARIANT below).
+            all_tiles
+                .iter()
+                .skip(base_visible_tile_count)
+                .take(displayed_tile_count - base_visible_tile_count)
+                .filter(|tile_id| requested.contains(*tile_id))
+                .count()
+        }
+    };
+    let visible_tile_count = expand_decoded_for_requested(
+        base_visible_tile_count,
+        requested_off_budget,
+        device_decode_ceiling,
+        CANVAS_LIMIT,
+    )
+    .min(displayed_tile_count);
+    // Off-budget avatar tiles are the displayed remainder after the (possibly
+    // expanded) decoded window.
+    let avatar_tile_count = displayed_tile_count - visible_tile_count;
 
     // --- Overflow speaker promotion (see promote_speakers() docs) ---
     {
@@ -3477,6 +3714,64 @@ pub fn AttendantsComponent(
         }
     }
 
+    // --- User-requested decode promotion (issue #1466 / #1286) ---
+    // `visible_tile_count` was just EXPANDED above to admit the user's PLAY
+    // requests, so the decoded window already has room for the requested peers
+    // (up to the device ceiling, the canvas limit, and `displayed_tile_count`).
+    // This step swaps each requested peer that is still ranked beyond the window
+    // INWARD into a decoded slot, so it renders live (`force_avatar = false`)
+    // instead of decoded-but-shown-paused — the SAME render-must-agree-with-
+    // decode lesson as the pinned peer above (a peer that is decoded but rendered
+    // as a paused avatar wastes decode AND shows a misleading "Video paused"
+    // placeholder).
+    //
+    // CRITICAL — distinct slots: several peers may be requested at once, so we
+    // must NOT reuse `visible_tile_count - 1` for every one (that would overwrite
+    // a previously-promoted requested peer). We walk a `next_free_slot` cursor
+    // DOWN from `visible_tile_count - 1`, the same end of the decoded region the
+    // pin-swap targets, filling distinct slots toward index 0. The cursor skips
+    // the slot now holding the pinned peer (`visible_tile_count - 1` after the
+    // pin-swap, if a pin was promoted) so we never evict the pin.
+    //
+    // POST-EXPANSION INVARIANT (issue #1466 / #1286): the expansion sized
+    // `visible_tile_count` to fit every requested off-budget peer EXCEPT those it
+    // could not admit — the requests beyond the device ceiling (#1286) or beyond
+    // `displayed_tile_count` (true overflow → +N badge). For those un-admittable
+    // requests there is deliberately NO decoded slot: the cursor runs out and the
+    // peer correctly STAYS a paused avatar. This is NOT the old "decode-but-show-
+    // paused" bug: phase 4 below intersects the merge with the decoded bucket, so
+    // an un-promoted requested peer is NOT placed in `active_decode_set` either —
+    // decode and render agree (it is neither decoded nor shown live). On a phone
+    // this is exactly the desired hardware-ceiling behaviour: PLAY cannot force
+    // more simultaneous decodes than the device can sustain.
+    //
+    // Reading `user_requested_decode.read()` HERE is one of the two parent-scope
+    // reactive reads (the other is the phase-4 merge) that make a per-tile PLAY
+    // click re-render the parent — see the reactivity note on the signal.
+    {
+        let requested = user_requested_decode.read();
+        // The slot the pinned peer occupies after the pin-swap (if it was
+        // promoted into the decoded region), so the cursor can skip it. Resolved
+        // here (needs `client`) and passed into the pure promotion helper.
+        let pinned_slot: Option<usize> = if visible_tile_count > 0 && !requested.is_empty() {
+            pinned_peer_id.peek().as_deref().and_then(|pu| {
+                all_tiles
+                    .iter()
+                    .take(visible_tile_count)
+                    .position(|tile_id| client.get_peer_user_id(tile_id).as_deref() == Some(pu))
+            })
+        } else {
+            None
+        };
+        promote_requested_into_decoded(
+            &mut all_tiles,
+            visible_tile_count,
+            displayed_tile_count,
+            &requested,
+            pinned_slot,
+        );
+    }
+
     // Bucket 1: the DECODED portion of the unified tile list. These render live
     // video and seed `active_decode_set` below. (Used by the normal grid layout.)
     let visible_tiles: Vec<String> = all_tiles.iter().take(visible_tile_count).cloned().collect();
@@ -3492,6 +3787,67 @@ pub fn AttendantsComponent(
         .take(avatar_tile_count)
         .cloned()
         .collect();
+
+    // --- Camera-off group displayed window (issue #1465) ---
+    // The layout reserves `displayed_tile_count` real grid cells (the rest fold
+    // into the +N badge). Camera-ON + mock tiles fill the first
+    // `visible_tiles.len() + avatar_tiles.len()` of those cells; camera-OFF peers
+    // fill the REMAINING displayed cells (camera-on peers get priority for the
+    // displayed window since they carry video). Any camera-off peers past that
+    // belong to the overflow region and must NOT render as tiles — they are
+    // already accounted for in `overflow_count` / the +N badge.
+    //
+    // Arithmetic proof that rendered-tile-count == `tile_count` (the value that
+    // drives `participants-N` + `compute_layout`):
+    //   rendered_on   = visible_tiles.len() + avatar_tiles.len()
+    //                 = min(all_tiles.len(), displayed_tile_count)   [take/skip]
+    //   off_to_render = displayed_tile_count - rendered_on           [below]
+    //   rendered      = rendered_on + off_to_render + (overflow ? 1 : 0)
+    //                 = displayed_tile_count + (overflow ? 1 : 0)
+    //                 = tile_count                                    ∎
+    // No-cap byte-identity (issue #1465 invariant 1): when EVERY peer is
+    // camera-on, `camera_off_real` is empty, `all_tiles` equals the pre-#1465
+    // list, `rendered_on == displayed_tile_count`, so `off_to_render == 0` and
+    // `camera_off_tiles` is empty — output is byte-identical to before.
+    let rendered_on = visible_tiles.len() + avatar_tiles.len();
+    let off_to_render = displayed_tile_count.saturating_sub(rendered_on);
+    let camera_off_tiles: Vec<String> = camera_off_real
+        .iter()
+        .take(off_to_render)
+        .cloned()
+        .collect();
+
+    // --- Lone-peer full-bleed predicate (issues #1465, #508) ---
+    // The #508 single-peer presentation renders the SOLE remote peer full-bleed
+    // (its content — live video, or the "Camera Off" placeholder — filling the
+    // tile). Before #1465 that was keyed off `visible_tile_count == 1`, because
+    // a single on-screen tile could only ever be a decoded video tile.
+    //
+    // The #1465 partition broke that assumption: camera-OFF real peers are no
+    // longer in `visible_tiles`/`avatar_tiles` — they render from the separate
+    // `camera_off_tiles` group. So `visible_tile_count == 1` no longer means the
+    // peer is alone on screen: a camera-on peer (visible) can render ALONGSIDE a
+    // camera-off peer (camera_off), giving `visible == 1` while two tiles are
+    // actually shown. Keying full-bleed off `visible_tile_count` would then make
+    // BOTH the lone-camera-on rule and the camera-off rule believe they are
+    // alone, full-bleeding two tiles at once.
+    //
+    // The correct key is the TOTAL displayed real-peer tiles across all three
+    // render groups. `is_sole_real_tile` computes exactly that sum; the
+    // visible_tiles loop and the camera_off_tiles loop below both gate full-bleed
+    // on this single shared value, so at most one tile can ever be full-bleed.
+    //
+    // No-cap byte-identity invariant (#1465): with exactly one camera-ON peer and
+    // zero camera-off peers the cap is inactive, so `visible_tiles.len() == 1`
+    // while `avatar_tiles` and `camera_off_tiles` are empty. The sum is 1 →
+    // `sole_real_tile` is true → that lone peer is full-bleed, exactly as before
+    // the partition. (Mocks are excluded from full-bleed separately via the
+    // `!is_mock` guard on the visible_tiles rule.)
+    let sole_real_tile = is_sole_real_tile(
+        visible_tiles.len(),
+        avatar_tiles.len(),
+        camera_off_tiles.len(),
+    );
 
     // Build the peer-list sidebar entries keyed by `session_id` so each open
     // browser tab is its own row. `user_id` is carried alongside only for
@@ -3546,11 +3902,15 @@ pub fn AttendantsComponent(
     // during screen share on constrained hardware.
 
     // Build a separate tile list for the screen-share right panel.
-    let (ss_decoded_tiles, ss_avatar_tiles) = if has_screen_share {
-        let mut ss_all: Vec<String> = Vec::with_capacity(total_tiles);
-        for peer_id in display_peers.iter().take(capped_real) {
-            ss_all.push(peer_id.clone());
-        }
+    // (issue #1465) Same partition as the normal grid: only camera-ON real peers
+    // + mocks consume the SS decode budget; camera-OFF peers render in a separate
+    // plain-avatar group (`ss_camera_off_tiles`), never dashed, never budgeted.
+    // The SS panel renders ALL tiles in the DOM (vertical scroll, no +N badge),
+    // so the camera-off group is the WHOLE `camera_off_real` set here — there is
+    // no displayed-window cap to apply.
+    let (ss_decoded_tiles, ss_avatar_tiles, ss_camera_off_tiles) = if has_screen_share {
+        let mut ss_all: Vec<String> = Vec::with_capacity(camera_on_real.len() + mock_count);
+        ss_all.extend_from_slice(&camera_on_real);
         ss_all.extend_from_slice(&mock_ids);
         {
             let join_map = peer_join_time.read();
@@ -3561,8 +3921,37 @@ pub fn AttendantsComponent(
             });
         }
 
-        // Promote active speakers into the decoded budget window.
-        let ss_budget = budget_cap.max(MIN_CAP).min(ss_all.len());
+        // Base decoded window before user PLAY requests expand it.
+        let ss_base_budget = budget_cap.max(MIN_CAP).min(ss_all.len());
+        // --- SS user-requested decode bucket expansion (issues #1466 / #1286) ---
+        // Mirrors the normal-grid expansion: count the DISTINCT user-requested
+        // peers present in `ss_all` but ranked AT/AFTER `ss_base_budget`, then
+        // expand the decoded window to admit them so they render live rather than
+        // decoded-but-shown-paused. Clamped by the device ceiling (#1286) and the
+        // canvas limit, then by `ss_all.len()` — the SS panel renders ALL tiles
+        // (vertical scroll, no +N badge), so the displayed-window clamp is the
+        // full `ss_all` length, NOT `displayed_tile_count`.
+        let ss_requested_off_budget = {
+            let requested = user_requested_decode.read();
+            if requested.is_empty() {
+                0
+            } else {
+                ss_all
+                    .iter()
+                    .skip(ss_base_budget)
+                    .filter(|tile_id| requested.contains(*tile_id))
+                    .count()
+            }
+        };
+        let ss_budget = expand_decoded_for_requested(
+            ss_base_budget,
+            ss_requested_off_budget,
+            device_decode_ceiling,
+            CANVAS_LIMIT,
+        )
+        .min(ss_all.len());
+
+        // Promote active speakers into the (possibly expanded) decoded window.
         {
             let speech_map = peer_speech_priority.read();
             let join_map = peer_join_time.read();
@@ -3596,21 +3985,75 @@ pub fn AttendantsComponent(
             }
         }
 
+        // --- SS user-requested decode promotion (issue #1466 / #1286) ---
+        // Mirrors the normal-grid user-requested promotion: `ss_budget` was just
+        // EXPANDED above to admit the PLAY requests, so the decoded window has
+        // room for them. Any requested peer still ranked beyond `ss_budget` is
+        // swapped into a DISTINCT decoded slot (cursor walking down from
+        // `ss_budget - 1`, skipping the pinned slot) so render agrees with the
+        // phase-4 decode set. Same distinct-slot discipline so multiple requested
+        // peers never overwrite each other or the pinned peer. Requests the
+        // expansion could NOT admit (beyond the device ceiling #1286) have no
+        // slot, correctly stay paused avatars, and are kept OUT of
+        // `active_decode_set` by the decoded-bucket-intersecting phase-4 merge.
+        if ss_budget > 0 && ss_budget < ss_all.len() {
+            let requested = user_requested_decode.read();
+            if !requested.is_empty() {
+                let pinned_slot: Option<usize> = pinned_peer_id.peek().as_deref().and_then(|pu| {
+                    ss_all
+                        .iter()
+                        .take(ss_budget)
+                        .position(|tile_id| client.get_peer_user_id(tile_id).as_deref() == Some(pu))
+                });
+                let mut next_free_slot: isize = ss_budget as isize - 1;
+                let promote_indices: Vec<usize> = ss_all
+                    .iter()
+                    .enumerate()
+                    .skip(ss_budget)
+                    .filter(|(_, tile_id)| requested.contains(*tile_id))
+                    .map(|(idx, _)| idx)
+                    .collect();
+                for idx in promote_indices {
+                    while next_free_slot >= 0 && Some(next_free_slot as usize) == pinned_slot {
+                        next_free_slot -= 1;
+                    }
+                    if next_free_slot < 0 {
+                        break;
+                    }
+                    ss_all.swap(next_free_slot as usize, idx);
+                    next_free_slot -= 1;
+                }
+            }
+        }
+
         // Split: first ss_budget tiles get video decode, rest get avatars.
         let decoded: Vec<String> = ss_all.iter().take(ss_budget).cloned().collect();
         let avatars: Vec<String> = ss_all.iter().skip(ss_budget).cloned().collect();
-        (decoded, avatars)
+        // Camera-off peers (issue #1465): plain avatars, never dashed/budgeted.
+        (decoded, avatars, camera_off_real.clone())
     } else {
-        (Vec::new(), Vec::new())
+        (Vec::new(), Vec::new(), Vec::new())
     };
 
-    // ORDERING INVARIANT: the active decode set is built in 3 phases:
+    // ORDERING INVARIANT: the active decode set is built in 4 phases:
     //   1. Visible layout peers (here)
     //   2. Active screen sharer (here)
     //   3. Pinned peer (below, after tile rendering)
+    //   4. User-requested force-decode peers (below, issue #1466) — the
+    //      `merge_user_requested_decode` call after the stale-request prune,
+    //      INTERSECTED with the decoded bucket so it can only re-affirm peers
+    //      already decoded (it never force-adds a paused avatar).
     // The dedup check against previous_active_decode_set must run AFTER all
-    // three phases. Moving any insertion after the dedup will silently desync.
-    let mut active_decode_set: HashSet<u64> = if has_screen_share {
+    // four phases. Moving any insertion after the dedup will silently desync.
+    //
+    // `decoded_bucket` is the session_ids of the tiles ACTUALLY rendering live
+    // video this frame (the expanded/promoted visible window for the active
+    // path). It is the same source that seeds `active_decode_set`, captured
+    // separately so the phase-4 merge can intersect against it (issue #1466 /
+    // #1286: a requested peer that did not get a decoded slot — e.g. it exceeded
+    // the device ceiling — must NOT enter the decode set while it renders as a
+    // paused avatar).
+    let decoded_bucket: HashSet<u64> = if has_screen_share {
         // In screen share mode, decode only the budget-capped tiles.
         // Avatar-tier tiles are rendered but not decoded.
         ss_decoded_tiles
@@ -3618,13 +4061,14 @@ pub fn AttendantsComponent(
             .filter_map(|pid| pid.parse::<u64>().ok())
             .collect()
     } else {
-        // Use visible_tiles (post-promotion) so promoted speakers are decoded.
-        // .parse::<u64>() naturally filters out mock-N IDs.
+        // Use visible_tiles (post-expansion/promotion) so promoted speakers and
+        // PLAY-requested peers are decoded. .parse::<u64>() filters out mock-N.
         visible_tiles
             .iter()
             .filter_map(|id| id.parse::<u64>().ok())
             .collect()
     };
+    let mut active_decode_set: HashSet<u64> = decoded_bucket.clone();
     if let Some(active_peer) = active_screen_sharer.as_ref() {
         if let Ok(session_id) = active_peer.parse::<u64>() {
             active_decode_set.insert(session_id);
@@ -3923,6 +4367,48 @@ pub fn AttendantsComponent(
             active_decode_set.insert(pinned_session_id);
         }
     }
+
+    // Clean stale force-decode requests (issue #1466) — mirrors the stale-pin
+    // cleanup above. A PLAY-requested peer that has left the meeting is no longer
+    // in `display_peers`, so drop its session_id from the set. BOTH `display_peers`
+    // and `user_requested_decode` hold session_ids, so we compare them directly
+    // (no user_id mapping, unlike the pin which is user_id-keyed). Pruned BEFORE
+    // the phase-4 merge so a stale id can never be force-decoded. Guarded so we
+    // only write the signal when something actually changed (avoids a
+    // write-triggered re-render loop).
+    {
+        let stale: Vec<String> = user_requested_decode
+            .peek()
+            .iter()
+            .filter(|session_id| !display_peers.contains(*session_id))
+            .cloned()
+            .collect();
+        if !stale.is_empty() {
+            let mut set = user_requested_decode.write();
+            for session_id in stale {
+                set.remove(&session_id);
+            }
+        }
+    }
+
+    // Phase 4 of active_decode_set construction (issue #1466 / #1286): fold in
+    // the user's explicit force-decode requests, INTERSECTED with `decoded_bucket`
+    // so we only re-affirm requested peers that actually got a decoded slot this
+    // frame. A request the expansion could not admit (beyond the device ceiling
+    // or `displayed_tile_count`) is NOT in `decoded_bucket`, so it is skipped and
+    // never enters the decode set while rendering as a paused avatar — decode and
+    // render agree. Since `decoded_bucket` already seeded `active_decode_set`,
+    // this is a redundant-but-explicit guard that pins the invariant. The
+    // `.read()` here is the authoritative PARENT-scope reactive read that makes a
+    // per-tile PLAY click re-render the parent → recompute expansion + promotion +
+    // this merge → `set_active_decode_set` below → peer.visible=true → frames
+    // decode → next render `force_avatar` is false for the promoted tile → live
+    // canvas.
+    merge_user_requested_decode(
+        &mut active_decode_set,
+        &user_requested_decode.read(),
+        &decoded_bucket,
+    );
     {
         // Dedup: only push to client when the set actually changed.
         let mut previous_active_decode_set = previous_active_decode_set.borrow_mut();
@@ -3955,6 +4441,25 @@ pub fn AttendantsComponent(
             }
         }
     };
+
+    // Issue #1466: toggle a peer's force-decode request. Mirrors `toggle_pin`
+    // but is keyed on the tile's SESSION_ID (the `key`/`peer_id` the avatar tile
+    // passes to `on_request_decode`), NOT user_id — `user_requested_decode` and
+    // `display_peers` both hold session_ids and the phase-4 merge parses them to
+    // u64. Toggle semantics: a second click removes the id so the budget may
+    // re-pause the peer (the PLAY button is not a one-way latch). Writing this
+    // signal re-renders the parent (it is `.read()` in the promotion + phase-4
+    // merge above), which recomputes the partition and pushes the new
+    // active_decode_set.
+    let toggle_request_decode: EventHandler<String> =
+        EventHandler::new(move |session_id: String| {
+            let mut set = user_requested_decode.write();
+            if set.contains(&session_id) {
+                set.remove(&session_id);
+            } else {
+                set.insert(session_id);
+            }
+        });
 
     rsx! {
         div {
@@ -4270,7 +4775,17 @@ pub fn AttendantsComponent(
                     // `decode_budget_pressured()` reactively keeps the props live.
                     DecodeBudgetBanner {
                         pressured: decode_budget_pressured(),
-                        avatar_count: avatar_tile_count,
+                        // Count only the tiles that ACTUALLY render as paused
+                        // video — i.e. the shed camera-ON/mock tiles in
+                        // `avatar_tiles`. `avatar_tile_count`
+                        // (`displayed_tile_count - visible_tile_count`) also
+                        // includes displayed cells filled by camera-OFF peers,
+                        // which render as plain (non-paused) avatars from the
+                        // separate `camera_off_tiles` group (#1465); counting
+                        // those would over-state "N videos paused" and re-surface
+                        // the "camera-off looks sheddable" inconsistency #1465
+                        // set out to kill.
+                        avatar_count: avatar_tiles.len(),
                         natural: total_tiles,
                     }
 
@@ -4380,11 +4895,32 @@ pub fn AttendantsComponent(
                                                         my_session_id: my_session_id.clone(),
                                                         pinned_peer_id: current_pinned.clone(),
                                                         on_toggle_pin: toggle_pin.clone(),
+                                                        // Issue #1466: PLAY button force-decodes this SS off-budget peer.
+                                                        on_request_decode: toggle_request_decode,
                                                         room_id: Some(id.clone()),
                                                         is_current_user_host: is_owner,
                                                     }
                                                 }
                                             }
+                                        }
+                                    }
+                                    // Camera-off peers (issue #1465): real peers
+                                    // with no video to decode. Rendered as PLAIN
+                                    // avatars (no `force_avatar` → no dashed
+                                    // off-budget outline). Always the real-peer
+                                    // arm — these are never mocks.
+                                    for tile_id in ss_camera_off_tiles.iter() {
+                                        PeerTile {
+                                            key: "tile-{tile_id}",
+                                            peer_id: tile_id.clone(),
+                                            full_bleed: false,
+                                            host_user_id: host_user_id.clone(),
+                                            render_mode: TileMode::VideoOnly,
+                                            my_session_id: my_session_id.clone(),
+                                            pinned_peer_id: current_pinned.clone(),
+                                            on_toggle_pin: toggle_pin.clone(),
+                                            room_id: Some(id.clone()),
+                                            is_current_user_host: is_owner,
                                         }
                                     }
                                 }
@@ -4395,8 +4931,13 @@ pub fn AttendantsComponent(
                         for tile_id in visible_tiles.iter() {
                             {
                                 let is_mock = tile_id.starts_with("mock-");
+                                // Full-bleed only when this is the single tile on
+                                // screen across ALL render groups (issues #1465,
+                                // #508) — see `sole_real_tile` above. Was keyed
+                                // off `visible_tile_count == 1`, which the #1465
+                                // camera-off split made unsafe.
                                 let full_bleed = !is_mock
-                                    && visible_tile_count == 1
+                                    && sole_real_tile
                                     && !client.is_screen_share_enabled_for_peer(tile_id);
                                 if is_mock {
                                     rsx! {
@@ -4463,9 +5004,53 @@ pub fn AttendantsComponent(
                                             my_session_id: my_session_id.clone(),
                                             pinned_peer_id: current_pinned.clone(),
                                             on_toggle_pin: toggle_pin.clone(),
+                                            // Issue #1466: PLAY button force-decodes this off-budget peer.
+                                            on_request_decode: toggle_request_decode,
                                             room_id: Some(id.clone()),
                                             is_current_user_host: is_owner,
                                         }
+                                    }
+                                }
+                            }
+                        }
+
+                        // ---- Camera-off peers (issue #1465) ----
+                        // Real peers with no video to decode. They occupy the
+                        // remaining displayed grid cells (after camera-on +
+                        // avatar tiles) and render as PLAIN avatars — NO
+                        // `force_avatar`, so NO dashed off-budget outline (the
+                        // #1465 fix: a cameraless peer is not "paused", it has
+                        // nothing to shed). Capped to `off_to_render` so any
+                        // camera-off peers in the overflow region stay folded
+                        // into the +N badge and the rendered tile count still
+                        // equals `tile_count` (see proof above). Always the
+                        // real-peer arm — these are never mocks.
+                        //
+                        // Full-bleed (issues #1465, #508): a lone camera-off
+                        // remote peer renders full-bleed — the "Camera Off"
+                        // placeholder fills the tile, matching the pre-#1465
+                        // single-peer presentation (canvas_generator renders this
+                        // correctly with no change). `sole_real_tile` guarantees
+                        // there is no other decoded / avatar / camera-off tile, so
+                        // this rule and the visible_tiles rule can never both
+                        // believe their tile is alone. These entries are never
+                        // mocks, so the `!is_mock` guard the visible rule carries
+                        // is unconditionally true here and omitted.
+                        for tile_id in camera_off_tiles.iter() {
+                            {
+                                let full_bleed = sole_real_tile
+                                    && !client.is_screen_share_enabled_for_peer(tile_id);
+                                rsx! {
+                                    PeerTile {
+                                        key: "tile-{tile_id}",
+                                        peer_id: tile_id.clone(),
+                                        full_bleed,
+                                        host_user_id: host_user_id.clone(),
+                                        my_session_id: my_session_id.clone(),
+                                        pinned_peer_id: current_pinned.clone(),
+                                        on_toggle_pin: toggle_pin.clone(),
+                                        room_id: Some(id.clone()),
+                                        is_current_user_host: is_owner,
                                     }
                                 }
                             }
@@ -4478,8 +5063,16 @@ pub fn AttendantsComponent(
                             }
                         }
 
-                        // Invitation overlay when no peers
-                        if visible_tiles.is_empty() {
+                        // Invitation overlay when no peers (issue #1465).
+                        // Previously gated on `visible_tiles.is_empty()`, but a
+                        // call where every remote peer is camera-off now has an
+                        // empty `visible_tiles` while those peers still render in
+                        // `camera_off_tiles` — showing "Your meeting is ready!"
+                        // over a populated grid would be wrong. Gate instead on
+                        // there being NO peers at all: `all_tiles` (camera-ON real
+                        // peers + mock placeholders) AND `camera_off_real` (real
+                        // camera-off peers) must both be empty.
+                        if all_tiles.is_empty() && camera_off_real.is_empty() {
                             div {
                                 id: "invite-overlay",
                                 class: "invite-glass-card",

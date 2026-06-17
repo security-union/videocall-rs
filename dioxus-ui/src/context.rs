@@ -162,16 +162,54 @@ pub fn save_density_mode(mode: DensityMode) {
 /// forces exactly `n` decoded tiles and bypasses the auto-loop entirely. This
 /// type is purely the persisted/shared state — the bypass behavior lives in
 /// the control loop (task 1a.3), not here.
+///
+/// `All` (issue #1466) is a second hard override meaning "decode all the tiles
+/// the layout would show". Like `Fixed(n)` it bypasses the adaptive loop, but
+/// instead of a literal count it tracks the live natural tile count, so it
+/// stays correct as peers join/leave. It is the persistent "show all paused
+/// videos" escape hatch reachable from the Appearance/Settings panel,
+/// independent of the banner's `pressured && avatar_count > 0` gate. The #1286
+/// iOS device ceiling STILL binds on `All` (see `effective_cap`): "All" means
+/// "everything the layout shows, still subject to the hardware ceiling", never
+/// a ceiling bypass.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DecodeBudgetOverride {
     #[default]
     Auto,
     Fixed(usize),
+    /// Issue #1466: decode every natural tile (clamped at `CANVAS_LIMIT` and the
+    /// #1286 device ceiling). A hard override like `Fixed`, but count-free.
+    All,
 }
 
 /// Context for the decode-budget override.
 #[derive(Clone, Copy)]
 pub struct DecodeBudgetCtx(pub Signal<DecodeBudgetOverride>);
+
+/// Issue #1466: the set of peer `session_id`s the local user has explicitly
+/// asked to keep decoding via the per-tile PLAY button, even when the decode
+/// budget would otherwise pause (avatar) them.
+///
+/// Holds `session_id`s (the `key`/`peer_id` `generate_for_peer` receives, which
+/// `parse::<u64>()` cleanly into the wire id). The merge into `active_decode_set`
+/// is the single union point (see `decode_budget::merge_user_requested_decode`).
+///
+/// NOT persisted to `localStorage` — deliberately. Each entry is a per-session,
+/// transient request bounded by the live peer set: a `session_id` is unique to
+/// one browser connection and is regenerated on every reload, so a persisted id
+/// would be stale (match no live peer) the moment the page reloads. Persisting
+/// it would therefore be inert at best and confusing at worst, so this state
+/// lives only in render-scope signal memory and is cleaned up when its peer
+/// leaves (`attendants.rs` stale-request prune).
+///
+/// The parent (`AttendantsComponent`) owns the backing signal directly and
+/// threads a `toggle` `EventHandler` down to the per-tile PLAY button, so the
+/// current wiring does not read this context back out — it is provided for API
+/// symmetry with the other decode-budget contexts and for future child access.
+/// Hence `#[allow(dead_code)]` on the field (mirrors `LocalAudioLevelCtx`).
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct UserRequestedDecodeCtx(pub Signal<std::collections::HashSet<String>>);
 
 const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
 
@@ -183,6 +221,8 @@ const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
 fn parse_decode_budget_override(raw: &str) -> DecodeBudgetOverride {
     match raw {
         "auto" => DecodeBudgetOverride::Auto,
+        // Issue #1466: the persistent "show all paused videos" choice.
+        "all" => DecodeBudgetOverride::All,
         other => match other.parse::<usize>() {
             Ok(n) if n > 0 => DecodeBudgetOverride::Fixed(n),
             _ => DecodeBudgetOverride::Auto,
@@ -191,10 +231,12 @@ fn parse_decode_budget_override(raw: &str) -> DecodeBudgetOverride {
 }
 
 /// Serialize a decode-budget override to its compact storage string: `"auto"`
-/// for `Auto`, or the bare integer for `Fixed(n)`.
+/// for `Auto`, `"all"` for `All` (issue #1466), or the bare integer for
+/// `Fixed(n)`.
 fn serialize_decode_budget_override(value: DecodeBudgetOverride) -> String {
     match value {
         DecodeBudgetOverride::Auto => "auto".to_string(),
+        DecodeBudgetOverride::All => "all".to_string(),
         DecodeBudgetOverride::Fixed(n) => n.to_string(),
     }
 }
@@ -215,6 +257,9 @@ pub fn save_decode_budget_override(value: DecodeBudgetOverride) {
     match value {
         DecodeBudgetOverride::Fixed(n) => {
             log::info!("DecodeBudget: override=fixed n={n} source=user_setting")
+        }
+        DecodeBudgetOverride::All => {
+            log::info!("DecodeBudget: override=all source=user_setting")
         }
         DecodeBudgetOverride::Auto => {
             log::info!("DecodeBudget: override=auto source=user_setting")
@@ -1488,6 +1533,30 @@ mod tests {
             parse_decode_budget_override(&serialized),
             DecodeBudgetOverride::Fixed(12)
         );
+    }
+
+    #[test]
+    fn decode_budget_override_roundtrip_all() {
+        // Issue #1466: `All` serializes to the independent literal "all" and
+        // parses back. The literal is the external storage contract (the string
+        // the persisted value must use), not derived from the enum — so a
+        // mutation that emitted/parsed any other token breaks this.
+        let serialized = serialize_decode_budget_override(DecodeBudgetOverride::All);
+        assert_eq!(serialized, "all");
+        assert_eq!(
+            parse_decode_budget_override("all"),
+            DecodeBudgetOverride::All
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_all_is_distinct() {
+        // `All` is its own variant: not Auto, not any Fixed(n). A mutation that
+        // collapsed `All` into Auto or Fixed (e.g. parsing "all" => Auto) breaks
+        // at least one of these.
+        assert_ne!(DecodeBudgetOverride::All, DecodeBudgetOverride::Auto);
+        assert_ne!(DecodeBudgetOverride::All, DecodeBudgetOverride::Fixed(6));
+        assert_ne!(DecodeBudgetOverride::All, DecodeBudgetOverride::Fixed(1));
     }
 
     #[test]

@@ -482,6 +482,13 @@ pub fn generate_for_peer(
     pinned_peer_id: Option<&str>,
     on_toggle_pin: EventHandler<String>,
     appearance: &AppearanceSettings,
+    // Issue #1466: fired when the user clicks the per-tile PLAY button on a
+    // decode-budget-PAUSED tile (only rendered when `paused_by_device`). It
+    // carries the tile's `session_id` (`key`) up to `attendants.rs`, which
+    // toggles it into `UserRequestedDecodeCtx` so the peer is force-decoded.
+    // `PeerTile` supplies a no-op default for call sites that never reach the
+    // paused arm, so threading it everywhere is unnecessary.
+    on_request_decode: EventHandler<String>,
     // Issue #987, task 1a.4: when `true`, this tile is "off-budget" — the
     // adaptive decode-budget controller has excluded the peer from video decode
     // to save CPU. The tile renders the avatar/initials placeholder instead of a
@@ -757,21 +764,70 @@ pub fn generate_for_peer(
                     } else if force_avatar && is_video_enabled_for_peer {
                         // Device-paused avatar: peer's camera is on but our
                         // decode budget excluded this tile. Mirror the grid
-                        // path's paused placeholder (pause badge + tooltip).
+                        // path's paused placeholder, with a real PLAY button
+                        // (issue #1466) so the user can opt this one peer back
+                        // into decode. Camera-OFF tiles never reach this arm
+                        // (`is_video_enabled_for_peer` is false for them) — they
+                        // fall into the plain `else` below — so the PLAY button
+                        // only ever appears on a recoverable "paused" tile.
                         div {
+                            // Issue #1466 (B1/B2): the paused placeholder no longer
+                            // carries `role="img"` + `aria-label`. A `role="img"`
+                            // wrapper collapses its whole subtree into one graphic and
+                            // can drop the descendant PLAY <button> from the
+                            // accessibility tree. The "paused by your device" reason
+                            // now lives on the BUTTON itself (`title` + per-button
+                            // `aria-label`), keeping the interactive control fully
+                            // exposed to AT while still explaining WHY the tile paused.
                             class: "placeholder-content placeholder-content--paused",
-                            title: "Paused by your device to keep the call smooth. Audio is still on.",
-                            "aria-label": "Paused by your device to keep the call smooth. Audio is still on.",
-                            role: "img",
-                            span { class: "decode-paused-badge", aria_hidden: "true",
-                                svg {
-                                    width: "14",
-                                    height: "14",
-                                    view_box: "0 0 24 24",
-                                    fill: "currentColor",
-                                    stroke: "none",
-                                    rect { x: "6", y: "5", width: "4", height: "14", rx: "1" }
-                                    rect { x: "14", y: "5", width: "4", height: "14", rx: "1" }
+                            // Issue #1466 (B1): PLAY control is now a CENTERED overlay
+                            // over the PeerIcon, not a corner badge. The old corner
+                            // badge (top/right -6px, 44px via negative margin) grew UP
+                            // and RIGHT into the tile corner where
+                            // `.canvas-container { overflow: hidden }` CLIPPED it, and
+                            // its right edge ran under `.tile-top-icons` (z-index:3,
+                            // holds the interactive signal button) — so the real tap
+                            // area was well under 44px and ambiguous taps hit the
+                            // signal button. A button centered on the placeholder
+                            // (which is itself centered in the tile via the flex
+                            // `.canvas-container`) gives a full, unclipped ≥44px target
+                            // that is far from the corner-pinned `.tile-top-icons`.
+                            // `stop_propagation()` runs FIRST so a tap does NOT also
+                            // hit the parent `.canvas-container` mobile-pin handler
+                            // (mirrors the host-menu button pattern), then request
+                            // force-decode for THIS peer's session_id (`key`).
+                            {
+                                // Owned session_id clone for the `move` onclick:
+                                // event handlers must be `'static`, so we cannot
+                                // capture the borrowed `key: &String` directly.
+                                let request_decode_key = key.clone();
+                                rsx! {
+                                    button {
+                                        r#type: "button",
+                                        class: "decode-play-overlay",
+                                        // #1466: stable E2E hook for the per-tile
+                                        // un-pause (PLAY) control on a
+                                        // decode-budget-paused tile.
+                                        "data-testid": "decode-play-btn",
+                                        "aria-label": format!("Play {peer_display_name}'s video"),
+                                        // #1466 (B2): explanatory reason moved off the
+                                        // role=img wrapper onto the interactive control
+                                        // so it stays accessible without hiding the
+                                        // button from AT.
+                                        title: "Paused by your device to keep the call smooth. Audio is still on.",
+                                        onclick: move |e: MouseEvent| {
+                                            e.stop_propagation();
+                                            on_request_decode.call(request_decode_key.clone());
+                                        },
+                                        svg {
+                                            width: "20",
+                                            height: "20",
+                                            view_box: "0 0 24 24",
+                                            fill: "currentColor",
+                                            stroke: "none",
+                                            polygon { points: "8 5 19 12 8 19 8 5" }
+                                        }
+                                    }
                                 }
                             }
                             PeerIcon {}
@@ -1007,11 +1063,6 @@ pub fn generate_for_peer(
             let grid_tile_style = tile_style.clone();
             let grid_mic_style = mic_inline_style.clone();
             let grid_speaking = speaking_class;
-            // Issue #987, task 1a.4: tag off-budget tiles with `off-budget-tile`
-            // so CSS can style them and E2E can query them
-            // (`.grid-item.off-budget-tile`). Empty string in the no-cap path,
-            // so the rendered class list is unchanged when no budget is active.
-            let off_budget_class = if force_avatar { " off-budget-tile" } else { "" };
             // issue 508: the surviving single peer (full_bleed) is now rendered
             // from THIS one grid template with `full-bleed` as a plain CLASS
             // toggle, instead of a separate full-bleed rsx! branch. Dioxus 0.7
@@ -1050,6 +1101,27 @@ pub fn generate_for_peer(
             // not to decode their live video. That case gets a distinct pause
             // glyph + tooltip; a genuine camera-off tile keeps the plain wording.
             let paused_by_device = force_avatar && is_video_enabled_for_peer;
+            // Issue #1465: only DASH a tile (`.off-budget-tile`) when it is a
+            // budget-SHED tile that actually has video to decode — i.e. the
+            // local decode budget chose not to decode a live stream. A genuine
+            // camera-off real peer (force_avatar but camera off) must render a
+            // PLAIN avatar with no dash: there is nothing being shed, so the
+            // "paused/sheddable" outline is misleading (the field complaint).
+            //   real camera-OFF  → is_video_enabled_for_peer false, is_mock false
+            //                      → no dash (the #1465 fix)
+            //   real camera-ON, budget-shed → is_video_enabled_for_peer true → dash
+            //   mock, budget-shed → is_video_enabled_for_peer is FALSE for mocks
+            //                      (non-numeric key), so the `is_mock` OR is what
+            //                      keeps the mock's dash for local layout testing.
+            // Tag with `off-budget-tile` so CSS can style it and E2E can query
+            // `.grid-item.off-budget-tile`. Empty string in the no-cap path
+            // (force_avatar false), so the class list is unchanged with no budget.
+            let is_mock = key.starts_with("mock-");
+            let off_budget_class = if force_avatar && (is_mock || is_video_enabled_for_peer) {
+                " off-budget-tile"
+            } else {
+                ""
+            };
             let placeholder_label = if paused_by_device {
                 "Video paused"
             } else {
@@ -1092,25 +1164,67 @@ pub fn generate_for_peer(
                         if show_canvas {
                             UserVideo { id: key_clone.clone(), hidden: false }
                         } else if paused_by_device {
-                            // Device-paused avatar: PeerIcon + a small pause-glyph
-                            // badge so it reads as "paused by us", not "camera off".
-                            // `title` + `aria-label` explain WHY and reassure that
-                            // audio is unaffected (the mic indicator below stays
-                            // live regardless).
+                            // Device-paused avatar: PeerIcon + a PLAY button so it
+                            // reads as "paused by us, click to resume", not "camera
+                            // off". `title` + `aria-label` on the placeholder
+                            // explain WHY and reassure that audio is unaffected (the
+                            // mic indicator below stays live regardless).
+                            // `paused_by_device` is ONLY true when the peer's camera
+                            // is on but our budget excluded the tile — a genuine
+                            // camera-off tile lands in the plain `else` arm below and
+                            // never gets this PLAY affordance (issue #1466).
                             div {
+                                // Issue #1466 (B2): dropped `role="img"` +
+                                // `aria-label` from this paused placeholder. The
+                                // role=img wrapper collapses the subtree into a single
+                                // graphic and can hide the descendant PLAY <button>
+                                // from AT. The `{paused_help}` reason now rides on the
+                                // BUTTON (`title` + per-button `aria-label`), so it
+                                // stays accessible without masking the control.
                                 class: "placeholder-content placeholder-content--paused",
-                                title: "{paused_help}",
-                                "aria-label": "{paused_help}",
-                                role: "img",
-                                span { class: "decode-paused-badge", aria_hidden: "true",
-                                    svg {
-                                        width: "14",
-                                        height: "14",
-                                        view_box: "0 0 24 24",
-                                        fill: "currentColor",
-                                        stroke: "none",
-                                        rect { x: "6", y: "5", width: "4", height: "14", rx: "1" }
-                                        rect { x: "14", y: "5", width: "4", height: "14", rx: "1" }
+                                // Issue #1466 (B1): PLAY control is a CENTERED overlay
+                                // over the PeerIcon, not a corner badge. The old corner
+                                // badge was clipped by `.canvas-container { overflow:
+                                // hidden }` and overlapped the corner-pinned
+                                // `.tile-top-icons` (interactive signal button), so its
+                                // real tap area was sub-44px and ambiguous. Centering
+                                // over the placeholder (itself centered in the tile)
+                                // yields a full, unclipped ≥44px target clear of the
+                                // corner icons. `stop_propagation` runs FIRST so a
+                                // mobile tap does not also fire the parent
+                                // `.canvas-container` pin handler, then force-decode
+                                // THIS peer via its session_id (`key`).
+                                {
+                                    // Owned session_id clone for the `move`
+                                    // onclick (handlers must be `'static`; the
+                                    // borrowed `key: &String` cannot be captured).
+                                    let request_decode_key = key.clone();
+                                    rsx! {
+                                        button {
+                                            r#type: "button",
+                                            class: "decode-play-overlay",
+                                            // #1466: stable E2E hook for the
+                                            // per-tile un-pause (PLAY) control on a
+                                            // decode-budget-paused tile.
+                                            "data-testid": "decode-play-btn",
+                                            "aria-label": format!("Play {peer_display_name}'s video"),
+                                            // #1466 (B2): explanatory reason moved off
+                                            // the role=img wrapper onto the interactive
+                                            // control so it stays accessible.
+                                            title: "{paused_help}",
+                                            onclick: move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                on_request_decode.call(request_decode_key.clone());
+                                            },
+                                            svg {
+                                                width: "20",
+                                                height: "20",
+                                                view_box: "0 0 24 24",
+                                                fill: "currentColor",
+                                                stroke: "none",
+                                                polygon { points: "8 5 19 12 8 19 8 5" }
+                                            }
+                                        }
                                     }
                                 }
                                 PeerIcon {}

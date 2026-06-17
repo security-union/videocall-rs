@@ -555,6 +555,11 @@ impl NetEq {
     pub fn flush(&mut self) {
         self.packet_buffer.flush(&mut self.statistics);
         self.leftover_samples.clear();
+        // Drain any decoded-PCM backlog held in bypass mode too, so flush() fully
+        // empties every audio-holding structure regardless of mode (issue #1402).
+        // No-op on the shipped wasm path (bypass mode is never enabled there), but
+        // keeps the primitive correct-by-construction if it ever is.
+        self.bypass_audio_queue.clear();
         self.reset();
     }
 
@@ -1177,6 +1182,51 @@ mod tests {
             payload.extend_from_slice(&sample.to_le_bytes());
         }
         AudioPacket::new(header, payload, 48000, 1, 20)
+    }
+
+    /// Issue #1402: `NetEq::flush` must actually DRAIN the packet buffer.
+    ///
+    /// This is the production behavior the worker's `WorkerMsg::Flush` handler relies
+    /// on when a peer's audio stream ends (mic-off / host force-mute): the buffer must
+    /// be emptied so NetEq stops emitting expand/comfort-noise concealment ("hiss") for
+    /// a stream that is no longer producing packets. The handler was a no-op (it only
+    /// logged), so the buffer was never cleared and the un-muted path kept hissing.
+    /// `WebNetEq::flush` delegates to this method, so pinning it here pins the fix's
+    /// load-bearing behavior on the host target (the worker's wasm `WebNetEq` wrapper
+    /// has no host-runnable harness).
+    ///
+    /// MUTATION CHECK: if `NetEq::flush` were reverted to a no-op (or the worker handler
+    /// left calling nothing), the post-flush `packet_buffer.len() == 0` assertion fails.
+    #[test]
+    fn test_flush_drains_packet_buffer() {
+        let config = NetEqConfig {
+            sample_rate: 48_000,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        // Buffer several packets, as a live peer stream would.
+        for i in 0..5u32 {
+            neteq
+                .insert_packet(create_48k_20ms_packet(i as u16, i * 960))
+                .unwrap();
+        }
+        assert!(
+            neteq.packet_buffer.len() > 0,
+            "precondition: packets should be buffered before flush (was {})",
+            neteq.packet_buffer.len()
+        );
+
+        // The peer's audio stream ends → flush.
+        neteq.flush();
+
+        assert_eq!(
+            neteq.packet_buffer.len(),
+            0,
+            "flush must drain the packet buffer so no concealment is emitted for the \
+             ended stream; {} packet(s) remained",
+            neteq.packet_buffer.len()
+        );
     }
 
     /// Regression guard for issue #624: NetEQ's `delay_manager` treats the per-packet

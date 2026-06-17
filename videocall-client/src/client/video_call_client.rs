@@ -2911,10 +2911,36 @@ impl Inner {
         // and for session_id 0 (reserved; MEETING packets and unassigned packets use 0).
         // Also skip creating peers when media decoding is disabled (observer mode): there
         // is no point spinning up decoder workers for packets that will be dropped anyway.
-        let peer_status = if response.user_id == SYSTEM_USER_ID.as_bytes()
-            || response.session_id == 0
-            || !self.options.decode_media
-        {
+        // Never spin up a peer for our OWN session. SESSION_ASSIGNED is a control
+        // packet carrying our own session_id (and the synthetic one emitted at
+        // election completion bypasses the connection-layer self-filter), so it
+        // must not create a peer. This is suppressed purely on packet type — we
+        // do NOT compare session_id against our own id here, because at election
+        // completion the SESSION_ASSIGNED packet is precisely what tells us our
+        // id, so a comparison would race with learning it.
+        // Without this the client renders ITSELF as a ghost peer tile (the
+        // losing election candidate shows the user_id/email fallback because it
+        // never gets a PARTICIPANT_JOINED). See connection_manager's
+        // `own_session_ids` self-filter for the transport-layer half.
+        // CONGESTION and LAYER_HINT are relay-authored control packets stamped
+        // with the RECIPIENT's own session_id (the throttled / layer-capped
+        // publisher). The connection-layer self-filter deliberately whitelists
+        // them so AQ can act on them, so they reach here even though they are
+        // "self" — but they must NEVER spawn a peer tile. During an election the
+        // relay can emit a LAYER_HINT addressed to the LOSING candidate's
+        // session_id, which the local client does not yet recognise as its own,
+        // so without this guard the client renders that losing session as a
+        // ghost peer (shown with the user_id/email fallback because that session
+        // never gets a PARTICIPANT_JOINED).
+        let is_self_addressed_control = response.packet_type == PacketType::CONGESTION.into()
+            || response.packet_type == PacketType::LAYER_HINT.into();
+        let peer_status = if suppresses_peer_creation(
+            response.user_id == SYSTEM_USER_ID.as_bytes(),
+            response.session_id,
+            self.options.decode_media,
+            response.packet_type == PacketType::SESSION_ASSIGNED.into(),
+            is_self_addressed_control,
+        ) {
             PeerStatus::NoChange
         } else {
             let peer_user_id = String::from_utf8_lossy(&response.user_id);
@@ -4688,5 +4714,70 @@ mod cooldown_reset_hardening_tests {
             u32::MAX,
             "reconnect must reset the audio congestion ceiling to fail-open"
         );
+    }
+}
+
+/// A peer must NOT be created for: system messages, the unstamped `session_id
+/// == 0` sentinel, observer/no-decode mode, `SESSION_ASSIGNED` control packets
+/// (these carry OUR OWN session_id; the synthetic one emitted at election
+/// completion bypasses the connection-layer self-filter and would otherwise
+/// render us as our own peer), or relay-authored self-addressed control packets
+/// (`CONGESTION` / `LAYER_HINT`). The last group is whitelisted by the
+/// connection-layer self-filter so AQ can act on it, so it reaches the decode
+/// path even though it is "self" — and the relay can stamp a `LAYER_HINT` with a
+/// LOSING election candidate's session_id (not yet recognised as ours), which
+/// without this guard the client renders as a ghost peer tile (shown with the
+/// user_id/email fallback because that session never gets a PARTICIPANT_JOINED).
+fn suppresses_peer_creation(
+    is_system_user: bool,
+    session_id: u64,
+    decode_media: bool,
+    is_session_assigned: bool,
+    is_self_addressed_control: bool,
+) -> bool {
+    is_system_user
+        || session_id == 0
+        || !decode_media
+        || is_session_assigned
+        || is_self_addressed_control
+}
+
+#[cfg(test)]
+mod self_peer_suppression_tests {
+    use super::suppresses_peer_creation;
+
+    #[test]
+    fn foreign_media_creates_a_peer() {
+        // A normal media packet from another participant: none of the suppress
+        // conditions hold, so a peer IS created.
+        assert!(!suppresses_peer_creation(false, 42, true, false, false));
+    }
+
+    #[test]
+    fn session_assigned_never_creates_a_peer() {
+        // Regression guard: the synthetic SESSION_ASSIGNED emitted at election
+        // completion carries our own elected session_id and previously spawned a
+        // self peer tile (logged as "New user joined: <own session>"). It must
+        // be suppressed purely on packet type.
+        assert!(suppresses_peer_creation(false, 42, true, true, false));
+    }
+
+    #[test]
+    fn self_addressed_control_never_creates_a_peer() {
+        // Regression guard for the losing-candidate ghost: the relay emits
+        // CONGESTION / LAYER_HINT stamped with a session_id (e.g. a LOSING
+        // election candidate the client does not recognise as its own). The
+        // connection-layer self-filter whitelists these so AQ can act on them —
+        // so they reach the decode path — but they must NOT spawn a peer tile.
+        // If this guard is removed, the relay's LAYER_HINT to the loser session
+        // renders a ghost peer.
+        assert!(suppresses_peer_creation(false, 42, true, false, true));
+    }
+
+    #[test]
+    fn observer_and_zero_session_are_suppressed() {
+        assert!(suppresses_peer_creation(false, 0, true, false, false));
+        assert!(suppresses_peer_creation(false, 42, false, false, false));
+        assert!(suppresses_peer_creation(true, 42, true, false, false));
     }
 }

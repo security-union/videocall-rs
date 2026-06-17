@@ -22,7 +22,24 @@ use web_time::{Duration, Instant};
 /// RTP Header information
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RtpHeader {
-    /// RTP sequence number
+    /// RTP sequence number — intentionally `u16` to match the RFC 3550 wire format.
+    ///
+    /// Wrap-safety: comparisons are performed via [`RtpHeader::is_sequence_newer`], which
+    /// uses a 0x8000 half-window (`wrapping_sub`) and is therefore correct across the
+    /// natural 65535 → 0 rollover that occurs roughly every 21.8 minutes at 50 pps.
+    ///
+    /// Role in packet ordering and deduplication:
+    /// - Ordering and jitter-buffer decisions are driven exclusively by
+    ///   `header.timestamp` (the sample-domain RTP timestamp set per issue #624);
+    ///   `sequence_number` is never used for ordering, flush triggers, or reject logic.
+    /// - `sequence_number` participates only in (a) diagnostic logging and (b) the
+    ///   three-field duplicate-suppression tuple `(timestamp, sequence_number, ssrc)`
+    ///   in `buffer.rs::is_duplicate`. Because `timestamp` is part of that tuple, two
+    ///   packets whose u16 seq wraps to the same value but carry different sample-domain
+    ///   timestamps are correctly treated as distinct — they will NOT be deduped.
+    ///
+    /// See the regression tests `test_seq_wrap_no_buffer_flush` and
+    /// `test_seq_collision_at_wrap_not_deduped` in `neteq.rs` for live proof.
     pub sequence_number: u16,
     /// RTP timestamp
     pub timestamp: u32,

@@ -32,6 +32,10 @@ message MeetingPacket {
     PARTICIPANT_KICKED = 13;
     // Server-internal: triggers Active peers to re-broadcast PARTICIPANT_JOINED
     PARTICIPANT_LIST_REQUEST = 14;
+    // Host granted to a participant
+    HOST_GRANTED = 15;
+    // Host revoked from a participant
+    HOST_REVOKED = 16;
   }
 
   MeetingEventType event_type = 1;

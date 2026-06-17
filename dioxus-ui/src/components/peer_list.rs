@@ -19,7 +19,7 @@
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
 use crate::constants::meeting_api_client;
-use crate::context::VideoCallClientCtx;
+use crate::context::{HostSetCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
 use futures::future::{AbortHandle, Abortable};
 use std::cell::RefCell;
@@ -120,10 +120,17 @@ pub fn PeerList(
     // (not display names, which are user-chosen and spoofable).
     // We need the current user's user_id from the client context.
     let current_user_id_val = client_ctx.user_id().clone();
-    let is_current_user_host = host_user_id
-        .as_ref()
-        .map(|h| h == &current_user_id_val)
-        .unwrap_or(false);
+    // Single-host model: the current host comes from the reactive `HostSetCtx`
+    // (updated live on HOST_GRANTED/HOST_REVOKED), with a fallback to the
+    // `host_user_id` prop when the context is absent.
+    let host_set = try_use_context::<HostSetCtx>();
+    let is_host_uid = move |uid: &str| -> bool {
+        match host_set.as_ref() {
+            Some(hs) => hs.is_host(uid),
+            None => host_user_id.as_deref() == Some(uid),
+        }
+    };
+    let is_current_user_host = is_host_uid(&current_user_id_val);
 
     rsx! {
         div {
@@ -349,11 +356,8 @@ pub fn PeerList(
                                     // Compare using authenticated user_id, not display name.
                                     // Host is a per-user role, not per-session, so every
                                     // session of the host's user_id renders with the host
-                                    // indicator.
-                                    let is_peer_host = host_user_id
-                                        .as_ref()
-                                        .map(|h| h == &user_id)
-                                        .unwrap_or(false);
+                                    // indicator. Read from `is_host_uid`.
+                                    let is_peer_host = is_host_uid(&user_id);
                                     let muted = audio_states
                                         .get(sid)
                                         .copied()
@@ -471,6 +475,30 @@ pub fn PeerList(
                                     } else {
                                         None
                                     };
+                                    // Transfer host action is shown when the local user is the host, the peer is not the local user, and the peer is not a guest.
+                                    let on_transfer_host = if is_current_user_host
+                                        && user_id != current_user_id_val
+                                        && !peer_is_guest
+                                    {
+                                        let meeting_id = room_id.clone();
+                                        let peer_user_id = user_id.clone();
+                                        Some(EventHandler::new(move |_| {
+                                            let meeting_id = meeting_id.clone();
+                                            let peer_user_id = peer_user_id.clone();
+                                            spawn(async move {
+                                                match meeting_api_client() {
+                                                    Ok(client) => {
+                                                        if let Err(e) = client.transfer_host(&meeting_id, &peer_user_id).await {
+                                                            log::warn!("transfer_host failed: {e}");
+                                                        }
+                                                    }
+                                                    Err(e) => log::warn!("meeting_api_client error: {e}"),
+                                                }
+                                            });
+                                        }))
+                                    } else {
+                                        None
+                                    };
                                     let row_key = peer.session_id.clone();
                                     let tooltip_user_id = user_id.clone();
                                     rsx! {
@@ -487,6 +515,7 @@ pub fn PeerList(
                                                 on_mute: on_mute,
                                                 on_disable_video: on_disable_video,
                                                 on_kick: on_kick,
+                                                on_transfer_host: on_transfer_host,
                                             }
                                         }
                                     }

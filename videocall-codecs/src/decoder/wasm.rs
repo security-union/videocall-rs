@@ -237,6 +237,26 @@ impl WasmDecoder {
         }
     }
 
+    /// **Test-only** (issue #1022): post a crafted frame the worker will insert at the
+    /// `arrival_time_ms` carried in the `FrameBuffer` (NOT the worker's wall clock the way
+    /// [`push_frame`](Self::push_frame) does). With a back-dated arrival, an E2E spec can form a
+    /// stale head-of-line backlog so the worker's ~10ms tick trips the #1020 freshness deadline
+    /// and emits an observable `freshness_skip` (#1045). Only the `MOCK_PEERS_ENABLED`-gated
+    /// injection hook (`videocall_client::freshness_inject`) calls this; production never does.
+    pub fn inject_stale_frame(&self, frame: FrameBuffer) {
+        let message = WorkerMessage::InjectStaleFrame(frame);
+        match serde_wasm_bindgen::to_value(&message) {
+            Ok(js_message) => {
+                if let Err(e) = self.worker.post_message(&js_message) {
+                    log::error!("Error posting inject-stale-frame message to worker: {e:?}");
+                }
+            }
+            Err(e) => {
+                log::error!("Error serializing inject-stale-frame message: {e:?}");
+            }
+        }
+    }
+
     /// Provide diagnostic context to the worker so that metrics include original peer IDs
     pub fn set_context(&self, from_peer: String, to_peer: String) {
         let message = WorkerMessage::SetContext { from_peer, to_peer };
@@ -384,6 +404,11 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                             "playout_paint_lag_ms",
                             stats_msg.playout_paint_lag_ms.unwrap_or(0.0)
                         ),
+                        // Resync-to-live governor skip count (#1252): cumulative counter, default 0.
+                        metric!(
+                            "playout_skip_to_live_total",
+                            stats_msg.playout_skip_to_live_total.unwrap_or(0)
+                        ),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);
@@ -393,12 +418,37 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
     }
 
     // freshness_skip (issue #1045): the #1020 freshness-deadline outcome, forwarded
-    // from the worker so it lands in uploaded field logs. Re-broadcast as a
-    // DiagEvent with the worker's peer context, mirroring the video_stats path.
+    // from the worker so it lands in uploaded field logs.
+    //
+    // Delivery (issue #1045 follow-up): the upload pipeline captures the main thread's
+    // `console.*` (see `console-log-collector.js`), so the load-bearing delivery is the
+    // re-emitted `console` line below — NOT the DiagEvent. The DiagEvent broadcast goes only
+    // to the in-process diagnostics bus, which has no console bridge: its `"video"` subsystem
+    // is consumed by `health_reporter` (folded into the Prometheus health packet, where every
+    // freshness field hits a catch-all and is dropped) and the diagnostics drawer (rendered to
+    // the DOM, never uploaded) — so on its own it would NOT reach the field logs the issue
+    // targets. This was the same gap fixed for `worker_log` in #1356/#1372; the skip path was
+    // missed there and is corrected here. The DiagEvent is kept for any future structured
+    // consumer, mirroring the other worker->main diagnostics. The `[JITTER_BUFFER]` prefix
+    // matches the grep the field investigation already uses for this signal.
     if let Ok(skip_msg) = serde_wasm_bindgen::from_value::<FreshnessSkipMessage>(js_val.clone()) {
         if skip_msg.kind == FRESHNESS_SKIP_KIND {
             #[cfg(feature = "wasm")]
             {
+                // A skip means the head-of-line frame aged past the playout deadline and stale
+                // frames were evicted to recover — a real degradation signal, surfaced at WARN so
+                // it stands out in field logs. This cannot amplify per tick: the worker only
+                // surfaces a skip for forwarding at most ~once/sec/stream (the rate-limit +
+                // coalescing in `JitterBuffer::record_freshness_skip`, gated on
+                // `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS`), so one console line maps to one
+                // forwarded event, not one per eviction.
+                //
+                // The `[JITTER_BUFFER] freshness_skip` line is a grep contract the #1045/#1020
+                // field investigation keys on; its formatting lives in the pure, host-tested
+                // `FreshnessSkipMessage::console_line` (#1384) so a typo in the prefix or the
+                // keyframe-`None` rendering fails a host test rather than shipping green.
+                console::warn_1(&skip_msg.console_line().into());
+
                 let evt = DiagEvent {
                     subsystem: "video",
                     stream_id: None,

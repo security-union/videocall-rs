@@ -399,8 +399,12 @@ test.describe("Adaptive decode budget (#987)", () => {
     await expect(offBudgetTiles(page)).toHaveCount(0, { timeout: 15_000 });
     await expect(banner).not.toBeVisible({ timeout: 5_000 });
 
+    // Issue #1466: the banner "Show all videos" button now pins the override to
+    // the `All` variant (persisted as "all"), NOT a frozen integer cap. `All`
+    // tracks the live natural count so newly-joining peers also decode. (Before
+    // #1466 this wrote the current natural count as a bare integer, e.g. "12".)
     const stored = await page.evaluate(() => localStorage.getItem("vc_decode_budget_override"));
-    expect(stored).toBe(String(MOCK_PEERS));
+    expect(stored).toBe("all");
   });
 
   test("pressured auto banner dismiss button hides the current episode", async ({ page }) => {
@@ -614,6 +618,130 @@ test.describe("Adaptive decode budget (#987)", () => {
       "aria-checked",
       "true",
     );
+    await closeSettingsModal(page);
+
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0, { timeout: 15_000 });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test 7 — persistent recovery toggle, two-way semantics (issue #1466).
+  //
+  // `data-testid="decode-budget-show-all-persistent"` is the always-reachable
+  // GLOBAL recovery control in Settings — independent of the transient banner
+  // (no "tiles paused" episode is required to reach it). It is a TOGGLE:
+  //   - when the override is Auto  → label "Show all videos", click sets
+  //     override = All  (persisted "all");
+  //   - when the override is non-Auto (All or any Fixed) → label "Back to
+  //     automatic", click sets override = Auto (persisted "auto").
+  //
+  // We assert the label flips and the localStorage value round-trips for the
+  // full Auto → All → Auto cycle. Mock peers (no FPS pressure needed) make the
+  // tile-count side deterministic too: All decodes everything, Auto un-pressured
+  // also decodes everything, so we additionally confirm all tiles stay decoded.
+  //
+  // Note (#1466 S1): the segmented picker no longer has an "All" option — the
+  // toggle is now the sole control that sets the `All` override — so this test
+  // proves the variant via the persisted "all" literal, not a picker selection.
+  // ──────────────────────────────────────────────────────────────────────
+  test("persistent show-all toggle flips between All and Auto and persists", async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "persistent_toggle");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+
+    // Start from a known Auto baseline.
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+
+    const toggle = page.locator('[data-testid="decode-budget-show-all-persistent"]');
+    await expect(toggle).toBeVisible({ timeout: 5_000 });
+
+    // In Auto the toggle offers "Show all videos".
+    await expect(toggle).toHaveText("Show all videos");
+
+    // Click once → override becomes All, persisted "all", label flips to the
+    // recovery wording. (The picker has no "All" option (#1466 S1); the
+    // persisted literal is the source of truth for the `All` variant.)
+    await toggle.click();
+    await expect(toggle).toHaveText("Back to automatic");
+    let stored = await page.evaluate(() => localStorage.getItem("vc_decode_budget_override"));
+    expect(stored).toBe("all");
+
+    // Click again → override returns to Auto, persisted "auto", label flips back.
+    await toggle.click();
+    await expect(toggle).toHaveText("Show all videos");
+    await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    stored = await page.evaluate(() => localStorage.getItem("vc_decode_budget_override"));
+    expect(stored).toBe("auto");
+
+    await closeSettingsModal(page);
+
+    // Un-pressured throughout (no FPS injected), so every tile stays decoded
+    // regardless of the toggle position.
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0, { timeout: 15_000 });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test 8 — persistent toggle shows "Back to automatic" when a Fixed cap is
+  // active (issue #1466 toggle wording is non-Auto-wide, not All-specific).
+  //
+  // The toggle's label depends only on `override != Auto`, so a Fixed(6) cap
+  // must also surface "Back to automatic", and clicking it must return to Auto
+  // (persisted "auto") and re-reveal all tiles — proving the recovery hatch is
+  // reachable from a Fixed cap, not just from All.
+  // ──────────────────────────────────────────────────────────────────────
+  test("persistent toggle recovers from a Fixed cap back to Auto", async ({ page }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "persistent_toggle_fixed");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-6"]').click();
+    await expect(page.locator('[data-testid="decode-budget-6"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+
+    // A Fixed cap is non-Auto, so the toggle offers the recovery wording.
+    const toggle = page.locator('[data-testid="decode-budget-show-all-persistent"]');
+    await expect(toggle).toHaveText("Back to automatic");
+
+    await closeSettingsModal(page);
+    await expect(decodedTiles(page)).toHaveCount(6, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(MOCK_PEERS - 6, { timeout: 15_000 });
+
+    // Click the recovery toggle: override → Auto, persisted "auto", all tiles
+    // decode again (un-pressured Auto cap == natural).
+    await openAppearancePanel(page);
+    await toggle.click();
+    await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    const stored = await page.evaluate(() => localStorage.getItem("vc_decode_budget_override"));
+    expect(stored).toBe("auto");
     await closeSettingsModal(page);
 
     await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });

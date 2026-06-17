@@ -19,7 +19,7 @@
 use crate::components::neteq_chart::{
     push_capped, should_push, single_peer_selected, AdvancedChartType, ChartType,
     NetEqAdvancedChart, NetEqChart, NetEqHistory, NetEqSample, NetEqStatusDisplay,
-    NETEQ_SAMPLE_CAP,
+    UnifiedTimelineChart, NETEQ_SAMPLE_CAP,
 };
 use crate::components::performance_settings::{
     format_kbps_compact, format_mbps, format_peer_kind_line, format_send_header, format_send_layer,
@@ -1425,6 +1425,12 @@ const HELP_CHART_PACKETS: &str = "Queue depth over time — how many encoded pac
 /// Packet Reordering chart explanation (#1222).
 const HELP_CHART_REORDER: &str = "Two lifetime measures: the share of packets that arrived out of order (rate, ‱ of received) and the largest sequence gap seen (running max, in packets). Both are cumulative by design, so they only ever hold or rise. Healthy: flat at 0 on a clean LAN; slow, occasional growth is normal on the public internet.";
 
+/// Unified timeline chart explanation (issue 173 / upstream 712). One shared
+/// time-axis overlays several NetEq health metrics so trends line up at a glance;
+/// each series has its own on/off checkbox and is scaled to its own range (the Y
+/// axis reads % of each series' max), so different units (ms, count, ‰) coexist.
+const HELP_CHART_UNIFIED: &str = "One shared timeline overlaying the most-watched NetEq health metrics — Buffer, Target, Packets awaiting decode, and Expand rate — so you can see how they move together at a glance. Toggle any series on or off with its checkbox. Because the metrics use different units, each is scaled to its own range and the Y axis reads as a percent of that series' max; hover the chart to read the real values for every visible series at that moment. Use the per-metric charts below for absolute values on a single dedicated axis.";
+
 /// Current Status tiles + the scrollable NetEq charts, with one info-icon
 /// popover on each cluster header (#1131 cleanup). Pulled into its own child so
 /// opening a popover (a per-subtree signal toggle) re-renders ONLY this subtree —
@@ -1487,13 +1493,59 @@ fn NetEqStatusAndCharts(
             NetEqStatusDisplay { latest_stats }
         }
         if has_history {
+            // Unified timeline (issue 173 / upstream 712): ONE shared time-axis
+            // with the most-watched NetEq metrics OVERLAID and a per-series on/off
+            // checkbox legend, mounted ABOVE the per-type charts. It is seeded from
+            // the SAME per-peer deque (no new signal reads) and the per-type charts
+            // are kept as a drill-down behind the disclosure below.
+            section { class: "diagnostics-section", "aria-labelledby": "diag-h-neteq-unified",
+                div { class: "diag-section-head",
+                    h3 { id: "diag-h-neteq-unified", "Timeline" }
+                    HelpPopover {
+                        key_id: "diag-chart-unified",
+                        help_testid: "diag-chart-unified-help",
+                        help_label: "About the unified timeline chart",
+                        help_body: HELP_CHART_UNIFIED,
+                        open_help,
+                    }
+                }
+                div { class: "diagnostics-charts neteq-charts-stack",
+                    div { class: "chart-container", "data-testid": "diag-unified-timeline",
+                        // Pass the Rc-wrapped history (O(1) `Rc::ptr_eq` prop memo);
+                        // the chart builds + memoizes the overlaid series INSIDE,
+                        // so the per-peer deque is never deep-copied per render and
+                        // the prop diff doesn't walk all points. (issue 173 perf)
+                        UnifiedTimelineChart {
+                            history: stats_history.clone(),
+                            scroll_id: "neteq-chart-scroll-unified".to_string(),
+                            capped,
+                        }
+                    }
+                }
+            }
             section { class: "diagnostics-section", "aria-labelledby": "diag-h-neteq-charts",
-                // The section keeps its heading (aria anchor), but the single
-                // section-level help popover is gone (Directive 3): each chart now
-                // carries its OWN per-chart ⓘ in a `.diag-chart-head` so the
-                // explanation sits where the user is looking. All four popovers
-                // share the existing `open_help` signal (single-open contract).
-                h3 { id: "diag-h-neteq-charts", "NetEQ charts" }
+                // Per-metric charts kept as a DRILL-DOWN (issue 173): collapsed by
+                // default in a native `<details>` so the unified timeline above is
+                // the primary view, but the dedicated per-axis charts stay one
+                // click away (not deleted). Each chart still carries its OWN
+                // per-chart ⓘ in a `.diag-chart-head`; all popovers share the
+                // existing `open_help` signal (single-open contract).
+                details { class: "diag-disclosure",
+                    summary { id: "diag-h-neteq-charts", class: "diag-disclosure-summary",
+                        svg {
+                            class: "diag-disclosure-chev",
+                            width: "12",
+                            height: "12",
+                            view_box: "0 0 12 12",
+                            path {
+                                d: "M4 2 L8 6 L4 10",
+                                fill: "none",
+                                stroke: "currentColor",
+                                stroke_width: "1.5",
+                            }
+                        }
+                        "Per-metric charts"
+                    }
                 // Four scrollable charts, 1-up full drawer width, stacked. Each
                 // has a UNIQUE scroll id so the shared `onscroll` scroll-sync can
                 // copy scroll_left onto the other three siblings (one timeline).
@@ -1552,6 +1604,7 @@ fn NetEqStatusAndCharts(
                         }
                         NetEqAdvancedChart { stats_history: stats_history.clone(), chart_type: AdvancedChartType::ReorderingAnalysis, scroll_id: "neteq-chart-scroll-reorder".to_string(), capped, show_title: false }
                     }
+                }
                 }
             }
         } else {

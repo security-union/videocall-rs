@@ -719,6 +719,56 @@ pub const LAYER_HINT_RECOMPUTE_COALESCE_MS: u64 = 300;
 /// 10 s cadence keeps its amortized cost negligible even with many rooms.
 pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
 
+// ---------------------------------------------------------------------------
+// Receiver Downlink Congestion (#1219 Half 2)
+// ---------------------------------------------------------------------------
+
+/// How recently THIS receiver's downlink must have overflowed for the relay to
+/// keep it in downlink-relief mode (#1219 Half 2).
+///
+/// ## What drives the signal (B1)
+///
+/// The relay enters relief mode for a receiver when that receiver's REAL
+/// downlink backpressure surface — the bounded per-session `outbound_tx`
+/// channel overflowing on a slow socket — drives the windowed
+/// [`CongestionTracker`](crate::actors::session_logic::CongestionTracker) across
+/// its drop threshold (`is_actively_congested()`). The transport actor stamps a
+/// monotonic epoch into a shared atomic on each such crossing
+/// (`SessionLogic::on_outbound_drop`), and the per-receiver fan-out closure
+/// reads it against THIS window. While the most recent crossing is within the
+/// window, the closure (a) discards non-base-layer VIDEO/SCREEN BEFORE
+/// `try_send`, giving the downlink headroom to drain, and (b) emits one
+/// DOWNLINK_CONGESTION control packet so the client's LayerChooser steps its own
+/// receive layers down. AUDIO and base layer are NEVER shed.
+///
+/// This is DELIBERATELY NOT keyed off the relay's actor-mailbox `Full` (which an
+/// earlier draft used): the mailbox sits in front of `outbound_tx` and overflows
+/// on a room-wide fan-out / scheduling burst that says nothing about any single
+/// receiver's downlink. The `CongestionTracker` one queue downstream is the
+/// genuine per-receiver signal — the same one the #979 keyframe-relax path
+/// already trusts.
+///
+/// ## Why a windowed decay, not a consecutive-success exit (B2)
+///
+/// Relief is a windowed LEVEL: it lapses on its own once this window elapses
+/// with no fresh downlink overflow, exactly like
+/// [`KEYFRAME_CONGESTION_RELAX_WINDOW`]. There is NO strictly-consecutive
+/// success counter — an earlier draft required N clean-in-a-row deliveries to
+/// exit, which on a link with even occasional drops could reset forever and pin
+/// a perfectly healthy receiver at base-layer-only video indefinitely. A
+/// time-decaying window recovers automatically: once the receiver stops
+/// overflowing for `RECEIVER_DOWNLINK_RELIEF_WINDOW`, full layers resume.
+///
+/// ## Why 2 s
+///
+/// Set equal to [`KEYFRAME_CONGESTION_RELAX_WINDOW`] so the relay-side shed, the
+/// #979 keyframe relaxation, and the client step-down all reason about "recently
+/// congested" over the SAME horizon. 2 s is long enough that a brief stall keeps
+/// relief armed through the recovery (avoiding flap), short enough that a
+/// receiver whose downlink genuinely recovers is back to full quality within a
+/// couple of seconds.
+pub const RECEIVER_DOWNLINK_RELIEF_WINDOW: Duration = Duration::from_secs(2);
+
 #[cfg(test)]
 mod tests {
     use super::*;

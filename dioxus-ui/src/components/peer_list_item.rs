@@ -35,6 +35,7 @@ pub fn PeerListItem(
     #[props(default)] on_mute: Option<EventHandler<()>>,
     #[props(default)] on_disable_video: Option<EventHandler<()>>,
     #[props(default)] on_kick: Option<EventHandler<()>>,
+    #[props(default)] on_transfer_host: Option<EventHandler<()>>,
 ) -> Element {
     let effective_tooltip = if tooltip.is_empty() {
         name.clone()
@@ -111,7 +112,9 @@ pub fn PeerListItem(
                     }
                 }
             }
-            if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some() {
+            if on_mute.is_some() || on_disable_video.is_some() || on_kick.is_some()
+                || on_transfer_host.is_some()
+            {
                 div { class: "peer_item_menu_wrapper",
                     button {
                         class: "peer_item_menu_btn",
@@ -216,6 +219,32 @@ pub fn PeerListItem(
                                         line { x1: "21", y1: "12", x2: "9", y2: "12" }
                                     }
                                     "Remove from meeting"
+                                }
+                            }
+                            if let Some(on_transfer_host) = on_transfer_host {
+                                button {
+                                    class: "context-menu-item",
+                                    onclick: move |e: MouseEvent| {
+                                        e.stop_propagation();
+                                        peer_menu_open.set(false);
+                                        on_transfer_host.call(());
+                                    },
+                                    svg {
+                                        xmlns: "http://www.w3.org/2000/svg",
+                                        width: "16",
+                                        height: "16",
+                                        view_box: "0 0 24 24",
+                                        fill: "none",
+                                        stroke: "currentColor",
+                                        stroke_width: "2",
+                                        stroke_linecap: "round",
+                                        stroke_linejoin: "round",
+                                        polyline { points: "17 1 21 5 17 9" }
+                                        path { d: "M3 11V9a4 4 0 0 1 4-4h14" }
+                                        polyline { points: "7 23 3 19 7 15" }
+                                        path { d: "M21 13v2a4 4 0 0 1-4 4H3" }
+                                    }
+                                    "Transfer host"
                                 }
                             }
                         }

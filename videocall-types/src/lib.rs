@@ -105,6 +105,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             protos::packet_wrapper::packet_wrapper::PacketType::LAYER_HINT => {
                 write!(f, "LAYER_HINT")
             }
+            protos::packet_wrapper::packet_wrapper::PacketType::DOWNLINK_CONGESTION => {
+                write!(f, "DOWNLINK_CONGESTION")
+            }
         }
     }
 }

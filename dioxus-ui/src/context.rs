@@ -162,16 +162,54 @@ pub fn save_density_mode(mode: DensityMode) {
 /// forces exactly `n` decoded tiles and bypasses the auto-loop entirely. This
 /// type is purely the persisted/shared state — the bypass behavior lives in
 /// the control loop (task 1a.3), not here.
+///
+/// `All` (issue #1466) is a second hard override meaning "decode all the tiles
+/// the layout would show". Like `Fixed(n)` it bypasses the adaptive loop, but
+/// instead of a literal count it tracks the live natural tile count, so it
+/// stays correct as peers join/leave. It is the persistent "show all paused
+/// videos" escape hatch reachable from the Appearance/Settings panel,
+/// independent of the banner's `pressured && avatar_count > 0` gate. The #1286
+/// iOS device ceiling STILL binds on `All` (see `effective_cap`): "All" means
+/// "everything the layout shows, still subject to the hardware ceiling", never
+/// a ceiling bypass.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum DecodeBudgetOverride {
     #[default]
     Auto,
     Fixed(usize),
+    /// Issue #1466: decode every natural tile (clamped at `CANVAS_LIMIT` and the
+    /// #1286 device ceiling). A hard override like `Fixed`, but count-free.
+    All,
 }
 
 /// Context for the decode-budget override.
 #[derive(Clone, Copy)]
 pub struct DecodeBudgetCtx(pub Signal<DecodeBudgetOverride>);
+
+/// Issue #1466: the set of peer `session_id`s the local user has explicitly
+/// asked to keep decoding via the per-tile PLAY button, even when the decode
+/// budget would otherwise pause (avatar) them.
+///
+/// Holds `session_id`s (the `key`/`peer_id` `generate_for_peer` receives, which
+/// `parse::<u64>()` cleanly into the wire id). The merge into `active_decode_set`
+/// is the single union point (see `decode_budget::merge_user_requested_decode`).
+///
+/// NOT persisted to `localStorage` — deliberately. Each entry is a per-session,
+/// transient request bounded by the live peer set: a `session_id` is unique to
+/// one browser connection and is regenerated on every reload, so a persisted id
+/// would be stale (match no live peer) the moment the page reloads. Persisting
+/// it would therefore be inert at best and confusing at worst, so this state
+/// lives only in render-scope signal memory and is cleaned up when its peer
+/// leaves (`attendants.rs` stale-request prune).
+///
+/// The parent (`AttendantsComponent`) owns the backing signal directly and
+/// threads a `toggle` `EventHandler` down to the per-tile PLAY button, so the
+/// current wiring does not read this context back out — it is provided for API
+/// symmetry with the other decode-budget contexts and for future child access.
+/// Hence `#[allow(dead_code)]` on the field (mirrors `LocalAudioLevelCtx`).
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub struct UserRequestedDecodeCtx(pub Signal<std::collections::HashSet<String>>);
 
 const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
 
@@ -183,6 +221,8 @@ const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
 fn parse_decode_budget_override(raw: &str) -> DecodeBudgetOverride {
     match raw {
         "auto" => DecodeBudgetOverride::Auto,
+        // Issue #1466: the persistent "show all paused videos" choice.
+        "all" => DecodeBudgetOverride::All,
         other => match other.parse::<usize>() {
             Ok(n) if n > 0 => DecodeBudgetOverride::Fixed(n),
             _ => DecodeBudgetOverride::Auto,
@@ -191,10 +231,12 @@ fn parse_decode_budget_override(raw: &str) -> DecodeBudgetOverride {
 }
 
 /// Serialize a decode-budget override to its compact storage string: `"auto"`
-/// for `Auto`, or the bare integer for `Fixed(n)`.
+/// for `Auto`, `"all"` for `All` (issue #1466), or the bare integer for
+/// `Fixed(n)`.
 fn serialize_decode_budget_override(value: DecodeBudgetOverride) -> String {
     match value {
         DecodeBudgetOverride::Auto => "auto".to_string(),
+        DecodeBudgetOverride::All => "all".to_string(),
         DecodeBudgetOverride::Fixed(n) => n.to_string(),
     }
 }
@@ -215,6 +257,9 @@ pub fn save_decode_budget_override(value: DecodeBudgetOverride) {
     match value {
         DecodeBudgetOverride::Fixed(n) => {
             log::info!("DecodeBudget: override=fixed n={n} source=user_setting")
+        }
+        DecodeBudgetOverride::All => {
+            log::info!("DecodeBudget: override=all source=user_setting")
         }
         DecodeBudgetOverride::Auto => {
             log::info!("DecodeBudget: override=auto source=user_setting")
@@ -561,31 +606,75 @@ impl MeetingHost {
 #[allow(dead_code)]
 pub type MeetingHostCtx = Signal<MeetingHost>;
 
+/// Reactive set of the `user_id`(s) currently holding host in the meeting.
+///
+/// Single-host model, so this holds at most one entry — but a `HashSet` keeps
+/// the update path trivial and order-free. Transfer-host moves host between
+/// participants, and `host_user_id` (= the meeting CREATOR) is stale once host
+/// has been transferred away, so the crown / "(Host)" indicator is driven by
+/// this set instead. Seeded authoritatively from the `/participants` roster and
+/// updated live on `HOST_GRANTED` / `HOST_REVOKED` broadcasts, so every client
+/// paints the crown on the current host without a reload.
+#[derive(Clone, Copy)]
+pub struct HostSetCtx(pub Signal<std::collections::HashSet<String>>);
+
+/// Nonce bumped by `AttendantsComponent` when the LOCAL user is granted or has
+/// their host revoked. `MeetingPage` watches it, re-fetches the participant
+/// status (which re-signs the room token from the live DB `is_host`), and
+/// updates its `MeetingStatus::Admitted`. That flips the `is_owner` prop and
+/// re-renders `AttendantsComponent` IN PLACE — deliberately WITHOUT a `key`, so
+/// the media client is NOT torn down and the user is not bounced back to the
+/// join screen. Host REST actions authorize on the session + DB `is_host`, and
+/// the media server learns the new host via the `meeting_host_changed` NATS
+/// fanout, so no reconnect is required.
+#[derive(Clone, Copy)]
+pub struct HostRefreshNonceCtx(pub Signal<u64>);
+
+impl HostSetCtx {
+    /// Whether `user_id` is currently a host.
+    pub fn is_host(&self, user_id: &str) -> bool {
+        self.0.read().contains(user_id)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Local-storage helpers
 // ---------------------------------------------------------------------------
 
 const STORAGE_KEY: &str = "vc_display_name";
 
+/// Secondary plain-text key that bypasses CBOR+zlib serialization.  On Safari,
+/// ITP can cause `dioxus_sdk_storage::LocalStorage` reads (which deserialize
+/// CBOR+zlib) to silently return `None` during or right after programmatic
+/// navigation.  Storing a plain-text copy under this key gives us a reliable
+/// fallback.
+const RAW_STORAGE_KEY: &str = "vc_display_name_raw";
+
 /// Load the persisted display name from local storage.
 ///
-/// Uses [`dioxus_sdk_storage::LocalStorage`] which maps to the browser's
-/// `localStorage` on web and the file system on native platforms.  Returns
-/// `None` when no name has been saved yet, or when the stored value is empty.
+/// Tries the primary CBOR+zlib key first (via [`dioxus_sdk_storage::LocalStorage`]),
+/// then falls back to the plain-text key which survives Safari ITP
+/// deserialization failures.  Returns `None` when no name has been saved yet,
+/// or when the stored value is empty.
 pub fn load_display_name_from_storage() -> Option<String> {
     LocalStorage::get::<Option<String>>(&STORAGE_KEY.to_string())
         .flatten()
         .filter(|s| !s.is_empty())
+        // Fallback: plain-text key (survives Safari ITP deserialization failures)
+        .or_else(|| read_local_storage(RAW_STORAGE_KEY))
 }
 
 /// Persist the display name to local storage.
 pub fn save_display_name_to_storage(display_name: &str) {
     LocalStorage::set(STORAGE_KEY.to_string(), &Some(display_name.to_string()));
+    // Also persist as plain text for Safari ITP resilience
+    write_local_storage(RAW_STORAGE_KEY, display_name);
 }
 
 /// Remove the display name from local storage entirely (e.g. on logout).
 pub fn clear_display_name_from_storage() {
     LocalStorage::set(STORAGE_KEY.to_string(), &None::<String>);
+    remove_local_storage(RAW_STORAGE_KEY);
 }
 
 // ---------------------------------------------------------------------------
@@ -615,6 +704,12 @@ fn read_local_storage(key: &str) -> Option<String> {
 fn write_local_storage(key: &str, value: &str) {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.set_item(key, value);
+    }
+}
+
+fn remove_local_storage(key: &str) {
+    if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
+        let _ = storage.remove_item(key);
     }
 }
 
@@ -1272,6 +1367,7 @@ pub fn apply_theme_to_dom(theme: Theme) {
     {
         let _ = root.set_attribute("data-theme", resolved);
     }
+    crate::theme_file::apply_theme_file_tokens(resolved);
 }
 
 /// Persist theme to localStorage and apply `data-theme` on `<html>`.
@@ -1437,6 +1533,30 @@ mod tests {
             parse_decode_budget_override(&serialized),
             DecodeBudgetOverride::Fixed(12)
         );
+    }
+
+    #[test]
+    fn decode_budget_override_roundtrip_all() {
+        // Issue #1466: `All` serializes to the independent literal "all" and
+        // parses back. The literal is the external storage contract (the string
+        // the persisted value must use), not derived from the enum — so a
+        // mutation that emitted/parsed any other token breaks this.
+        let serialized = serialize_decode_budget_override(DecodeBudgetOverride::All);
+        assert_eq!(serialized, "all");
+        assert_eq!(
+            parse_decode_budget_override("all"),
+            DecodeBudgetOverride::All
+        );
+    }
+
+    #[test]
+    fn decode_budget_override_all_is_distinct() {
+        // `All` is its own variant: not Auto, not any Fixed(n). A mutation that
+        // collapsed `All` into Auto or Fixed (e.g. parsing "all" => Auto) breaks
+        // at least one of these.
+        assert_ne!(DecodeBudgetOverride::All, DecodeBudgetOverride::Auto);
+        assert_ne!(DecodeBudgetOverride::All, DecodeBudgetOverride::Fixed(6));
+        assert_ne!(DecodeBudgetOverride::All, DecodeBudgetOverride::Fixed(1));
     }
 
     #[test]

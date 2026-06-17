@@ -343,9 +343,13 @@ mod wasm_worker {
                 });
             }
             WorkerMsg::Flush => {
+                // Issue #1402: actually drain/reset the NetEq buffer. Previously
+                // this only logged (the "handled by the NetEq instance" comment was
+                // inaccurate — nothing downstream flushed), so a peer audio-off left
+                // the buffer emitting expand/hiss concealment on the un-muted path.
                 NETEQ.with(|cell| {
-                    if let Some(_eq) = cell.borrow().as_ref() {
-                        // Flush is handled by the NetEq instance
+                    if let Some(eq) = cell.borrow().as_ref() {
+                        eq.flush();
                         console::log_1(&"[neteq-worker] flush".into());
                     }
                 });

@@ -43,6 +43,18 @@ static CAMERA_ENCODER_ERRORS_VPX_MEM_ALLOC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_ERRORS_GENERIC: AtomicU64 = AtomicU64::new(0);
 static CAMERA_ENCODER_FRAMES_SUBMITTED_OK: AtomicU64 = AtomicU64::new(0);
+// Encoder auto-RESTART cycles (issue #527), partitioned by reason. Bumped once
+// per `restart_count += 1` (the loop re-enters `'restart`), NOT per error event:
+// distinct from the *_ERRORS_* counters above, which count fault occurrences
+// (one restart may follow several classified errors, and a restart may have no
+// classified error, e.g. a getUserMedia failure). Exported as
+// `videocall_encoder_restart_total{kind="camera", reason}`. Cold start (the
+// first `'restart` iteration with `restart_count == 0`) and user-initiated
+// `stop()`/supersede returns do NOT bump these.
+static CAMERA_ENCODER_RESTARTS_CLOSED_CODEC: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_RESTARTS_MEMORY: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_RESTARTS_CONFIGURE: AtomicU64 = AtomicU64::new(0);
+static CAMERA_ENCODER_RESTARTS_OTHER: AtomicU64 = AtomicU64::new(0);
 // Cumulative count of upper-rung `VideoEncoder`s torn down after a sustained
 // shed dwell (issue #1230). Bumped once per rung freed in the encode loop; the
 // freed encoder + its ~100KB output buffer are reclaimed and the existing lazy
@@ -63,6 +75,47 @@ pub fn camera_encoder_errors_generic() -> u64 {
 }
 pub fn camera_encoder_frames_submitted_ok() -> u64 {
     CAMERA_ENCODER_FRAMES_SUBMITTED_OK.load(Ordering::Relaxed)
+}
+
+/// Cumulative camera encoder auto-restart cycles classified as a closed/invalid
+/// codec (issue #527). See [`record_camera_restart`].
+pub fn camera_encoder_restarts_closed_codec() -> u64 {
+    CAMERA_ENCODER_RESTARTS_CLOSED_CODEC.load(Ordering::Relaxed)
+}
+/// Cumulative camera encoder auto-restart cycles classified as a memory fault.
+pub fn camera_encoder_restarts_memory() -> u64 {
+    CAMERA_ENCODER_RESTARTS_MEMORY.load(Ordering::Relaxed)
+}
+/// Cumulative camera encoder auto-restart cycles caused by a fatal `configure()`
+/// or an encoder found already-closed at a reconfigure/guard point.
+pub fn camera_encoder_restarts_configure() -> u64 {
+    CAMERA_ENCODER_RESTARTS_CONFIGURE.load(Ordering::Relaxed)
+}
+/// Cumulative camera encoder auto-restart cycles with no codec/memory/configure
+/// cause (media-acquisition failures and unclassified errors).
+pub fn camera_encoder_restarts_other() -> u64 {
+    CAMERA_ENCODER_RESTARTS_OTHER.load(Ordering::Relaxed)
+}
+
+/// Record one camera encoder auto-restart cycle, partitioned by [`RestartReason`]
+/// (issue #527). Call this at EACH `restart_count += 1` site, with the reason
+/// that triggered the restart. Cold start and user-initiated stop must NOT call
+/// this (they do not bump `restart_count`).
+fn record_camera_restart(reason: RestartReason) {
+    let counter = match reason {
+        RestartReason::ClosedCodec => &CAMERA_ENCODER_RESTARTS_CLOSED_CODEC,
+        RestartReason::Memory => &CAMERA_ENCODER_RESTARTS_MEMORY,
+        RestartReason::Configure => &CAMERA_ENCODER_RESTARTS_CONFIGURE,
+        RestartReason::Other => &CAMERA_ENCODER_RESTARTS_OTHER,
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    // `trace!` (off by default) so this adds no production noise; it records the
+    // exact `reason` label the metric uses (RestartReason::as_label) for local
+    // debugging and is NOT a periodic/analyzer-consumed line.
+    log::trace!(
+        "camera encoder restart recorded (reason={})",
+        reason.as_label()
+    );
 }
 /// Cumulative count of upper-rung simulcast `VideoEncoder`s torn down after a
 /// sustained shed dwell (issue #1230). A pure observability hook: it lets
@@ -96,8 +149,10 @@ use web_sys::VideoFrame;
 use web_sys::VideoTrack;
 
 use super::super::client::VideoCallClient;
-use super::classify_encode_error::{classify_encode_error, EncodeErrorBucket};
-use super::encoder_state::{pli_keyframe_allowed, EncoderState};
+use super::classify_encode_error::{
+    classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
+};
+use super::encoder_state::{keyframe_tick_decision, EncoderState, KeyframeTickInput};
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
@@ -928,6 +983,65 @@ fn next_single_layer_pin(
     }
 }
 
+/// One AQ tick of the camera's WebTransport uplink-DROP self-congestion axis
+/// (#1104). Given the cumulative `unistream_drop_count()` reading, the window
+/// snapshot, and how long the window has been open, return the
+/// [`SelfCongestionDecision`] — applying the WebTransport DROP window/threshold
+/// (`WT_SELF_CONGESTION_WINDOW_MS` / `WT_SELF_CONGESTION_DROP_THRESHOLD`), NOT
+/// the WebSocket or saturation constants.
+///
+/// Extracted from the wasm-only AQ loop so the encoder's CHOICE OF SIGNAL — the
+/// drop counter wired through `evaluate_self_congestion` with the WT-drop
+/// constants — is pinned by a NATIVE `#[test]` (the loop itself depends on
+/// `js_sys::Date::now()` and cannot run on host). A mutation that fed the WS
+/// constants, the saturation constants, or inverted the comparison changes the
+/// returned decision and fails the test. The wasm loop calls this with
+/// `videocall_transport::webtransport::unistream_drop_count()` as `current`, so
+/// the counter the test reasons about is the one the encoder consults.
+#[inline]
+fn wt_drop_step_down_decision(
+    current_drops: u64,
+    snapshot_drops: u64,
+    elapsed_ms: f64,
+) -> videocall_aq::constants::SelfCongestionDecision {
+    use crate::adaptive_quality_constants::{
+        evaluate_self_congestion, WT_SELF_CONGESTION_DROP_THRESHOLD, WT_SELF_CONGESTION_WINDOW_MS,
+    };
+    evaluate_self_congestion(
+        current_drops,
+        snapshot_drops,
+        elapsed_ms,
+        WT_SELF_CONGESTION_WINDOW_MS,
+        WT_SELF_CONGESTION_DROP_THRESHOLD,
+    )
+}
+
+/// One AQ tick of the camera's WebTransport uplink-SATURATION self-congestion
+/// axis (#1219 prerequisite). Mirrors [`wt_drop_step_down_decision`] but applies
+/// the SATURATION window/threshold (`WT_SATURATION_WINDOW_MS` /
+/// `WT_SATURATION_STALL_THRESHOLD`) over the slow-`ready()` counter. The wasm
+/// loop calls this with
+/// `videocall_transport::webtransport::unistream_ready_stall_count()` as
+/// `current`, so a mutation that fed the drop counter / drop constants here is
+/// caught by the native test (the saturation boundary differs).
+#[inline]
+fn wt_saturation_step_down_decision(
+    current_stalls: u64,
+    snapshot_stalls: u64,
+    elapsed_ms: f64,
+) -> videocall_aq::constants::SelfCongestionDecision {
+    use crate::adaptive_quality_constants::{
+        evaluate_self_congestion, WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS,
+    };
+    evaluate_self_congestion(
+        current_stalls,
+        snapshot_stalls,
+        elapsed_ms,
+        WT_SATURATION_WINDOW_MS,
+        WT_SATURATION_STALL_THRESHOLD,
+    )
+}
+
 impl CameraEncoder {
     /// Construct a camera encoder, with arguments:
     ///
@@ -1332,19 +1446,16 @@ impl CameraEncoder {
                 // into a runaway double step-down. For WebSocket users this
                 // counter stays flat at 0, so the block is a true no-op.
                 {
-                    use crate::adaptive_quality_constants::{
-                        evaluate_self_congestion, WT_SELF_CONGESTION_DROP_THRESHOLD,
-                        WT_SELF_CONGESTION_WINDOW_MS,
-                    };
                     let current_wt_drops =
                         videocall_transport::webtransport::unistream_drop_count();
                     let elapsed_ms = now - wt_drop_window_start_ms;
-                    let decision = evaluate_self_congestion(
+                    // Decision + WT-drop constants live in the host-testable
+                    // `wt_drop_step_down_decision` helper so a mutation to the
+                    // signal/constants is caught by a native test (#509 item #2).
+                    let decision = wt_drop_step_down_decision(
                         current_wt_drops,
                         last_wt_drop_snapshot,
                         elapsed_ms,
-                        WT_SELF_CONGESTION_WINDOW_MS,
-                        WT_SELF_CONGESTION_DROP_THRESHOLD,
                     );
                     if decision.step_down {
                         log::warn!(
@@ -1388,19 +1499,15 @@ impl CameraEncoder {
                 // be removed: a WT publisher now sees its own uplink saturation
                 // directly.
                 {
-                    use crate::adaptive_quality_constants::{
-                        evaluate_self_congestion, WT_SATURATION_STALL_THRESHOLD,
-                        WT_SATURATION_WINDOW_MS,
-                    };
                     let current_wt_stalls =
                         videocall_transport::webtransport::unistream_ready_stall_count();
                     let elapsed_ms = now - wt_stall_window_start_ms;
-                    let decision = evaluate_self_congestion(
+                    // Decision + WT-saturation constants live in the host-testable
+                    // `wt_saturation_step_down_decision` helper (#509 item #2).
+                    let decision = wt_saturation_step_down_decision(
                         current_wt_stalls,
                         last_wt_stall_snapshot,
                         elapsed_ms,
-                        WT_SATURATION_WINDOW_MS,
-                        WT_SATURATION_STALL_THRESHOLD,
                     );
                     if decision.step_down {
                         log::warn!(
@@ -2206,6 +2313,7 @@ impl CameraEncoder {
                         if let Some(cb) = &on_error {
                             cb.emit(msg);
                         }
+                        record_camera_restart(RestartReason::Other);
                         restart_count += 1;
                         continue 'restart;
                     }
@@ -2242,6 +2350,7 @@ impl CameraEncoder {
                             if let Some(cb) = &on_error {
                                 cb.emit(msg);
                             }
+                            record_camera_restart(RestartReason::Other);
                             restart_count += 1;
                             continue 'restart;
                         }
@@ -2255,6 +2364,7 @@ impl CameraEncoder {
                         if let Some(cb) = &on_error {
                             cb.emit(msg);
                         }
+                        record_camera_restart(RestartReason::Other);
                         restart_count += 1;
                         continue 'restart;
                     }
@@ -2621,6 +2731,9 @@ impl CameraEncoder {
                                 let _ = built.encoder.close();
                             }
                             stop_media_stream_tracks(&device);
+                            // Classify by the create error message BEFORE it is
+                            // moved into the on_error callback (memory vs other).
+                            record_camera_restart(restart_reason_from_message(&msg));
                             if let Some(cb) = &on_error {
                                 cb.emit(msg);
                             }
@@ -2632,6 +2745,7 @@ impl CameraEncoder {
                                 let _ = built.encoder.close();
                             }
                             stop_media_stream_tracks(&device);
+                            record_camera_restart(RestartReason::Configure);
                             restart_count += 1;
                             continue 'restart;
                         }
@@ -2748,6 +2862,7 @@ impl CameraEncoder {
                         .any(|l| l.encoder.state() == CodecState::Closed)
                     {
                         log::warn!("CameraEncoder: an encoder state is Closed, triggering restart");
+                        record_camera_restart(RestartReason::ClosedCodec);
                         restart_count += 1;
                         break 'encode;
                     }
@@ -2782,7 +2897,9 @@ impl CameraEncoder {
                     {
                         let want = encoders_to_build(local_active_layers, n_layers);
                         let already_built = layers.len();
-                        let mut build_failed = false;
+                        // Restart reason captured from the failing build (issue
+                        // #527); `None` while the rung builds succeed.
+                        let mut build_failed: Option<RestartReason> = None;
                         for (offset, &initial_seq) in
                             sequence_numbers[already_built..want].iter().enumerate()
                         {
@@ -2808,7 +2925,7 @@ impl CameraEncoder {
                                     );
                                     layers.push(le);
                                 }
-                                Err(_) => {
+                                Err(e) => {
                                     // VideoEncoder::new or a fatal configure failed
                                     // for the newly-activated rung. Restart the
                                     // whole encode cycle (the normal 'encode
@@ -2817,12 +2934,21 @@ impl CameraEncoder {
                                         "CameraEncoder: failed to lazily construct simulcast layer {}, restarting",
                                         layer_idx
                                     );
-                                    build_failed = true;
+                                    // #527: classify by the build error variant —
+                                    // a create failure carries a message (memory/
+                                    // other), a fatal configure is structural.
+                                    build_failed = Some(match &e {
+                                        LayerBuildError::CreateFailed(msg) => {
+                                            restart_reason_from_message(msg)
+                                        }
+                                        LayerBuildError::ConfigureFatal => RestartReason::Configure,
+                                    });
                                     break;
                                 }
                             }
                         }
-                        if build_failed {
+                        if let Some(reason) = build_failed {
+                            record_camera_restart(reason);
                             restart_count += 1;
                             break 'encode;
                         }
@@ -2957,7 +3083,10 @@ impl CameraEncoder {
                     //    Layers with layer_id >= active count are skipped entirely
                     //    (not reconfigured, not encoded) so a dropped top layer
                     //    costs no encode CPU.
-                    let mut fatal_reconfigure = false;
+                    // Restart reason captured from a fatal reconfigure cause
+                    // (issue #527): a closed-codec guard vs a fatal configure().
+                    // `None` while reconfigure succeeds.
+                    let mut fatal_reconfigure: Option<RestartReason> = None;
                     for layer in layers.iter_mut() {
                         // Simulcast: skip inactive (shed) top layers entirely.
                         if simulcast && (layer.layer_id as usize) >= local_active_layers {
@@ -2978,7 +3107,7 @@ impl CameraEncoder {
                             if new_layer_bitrate > 0 && new_layer_bitrate != layer.local_bitrate {
                                 if layer.encoder.state() == CodecState::Closed {
                                     log::warn!("CameraEncoder: encoder closed before per-layer bitrate reconfigure (layer {})", layer.layer_id);
-                                    fatal_reconfigure = true;
+                                    fatal_reconfigure = Some(RestartReason::ClosedCodec);
                                     break;
                                 }
                                 layer.local_bitrate = new_layer_bitrate;
@@ -2988,7 +3117,7 @@ impl CameraEncoder {
                                         .fetch_add(1, Ordering::Relaxed);
                                     if is_fatal_encoder_error(&e) {
                                         error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                        fatal_reconfigure = true;
+                                        fatal_reconfigure = Some(RestartReason::Configure);
                                         break;
                                     }
                                     error!(
@@ -3005,7 +3134,7 @@ impl CameraEncoder {
                             // Guard: do not configure a closed encoder.
                             if layer.encoder.state() == CodecState::Closed {
                                 log::warn!("CameraEncoder: encoder closed before tier reconfigure (layer {})", layer.layer_id);
-                                fatal_reconfigure = true;
+                                fatal_reconfigure = Some(RestartReason::ClosedCodec);
                                 break;
                             }
 
@@ -3053,7 +3182,7 @@ impl CameraEncoder {
                                     .fetch_add(1, Ordering::Relaxed);
                                 if is_fatal_encoder_error(&e) {
                                     error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                    fatal_reconfigure = true;
+                                    fatal_reconfigure = Some(RestartReason::Configure);
                                     break;
                                 }
                                 error!("Error reconfiguring camera encoder for tier change (layer {}): {e:?}", layer.layer_id);
@@ -3067,7 +3196,7 @@ impl CameraEncoder {
                             // Guard: do not configure a closed encoder.
                             if layer.encoder.state() == CodecState::Closed {
                                 log::warn!("CameraEncoder: encoder closed before bitrate reconfigure (layer {})", layer.layer_id);
-                                fatal_reconfigure = true;
+                                fatal_reconfigure = Some(RestartReason::ClosedCodec);
                                 break;
                             }
                             log::info!(
@@ -3081,7 +3210,7 @@ impl CameraEncoder {
                                     .fetch_add(1, Ordering::Relaxed);
                                 if is_fatal_encoder_error(&e) {
                                     error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                    fatal_reconfigure = true;
+                                    fatal_reconfigure = Some(RestartReason::Configure);
                                     break;
                                 }
                                 error!(
@@ -3094,7 +3223,8 @@ impl CameraEncoder {
                             layer.local_bitrate = new_current_bitrate;
                         }
                     }
-                    if fatal_reconfigure {
+                    if let Some(reason) = fatal_reconfigure {
+                        record_camera_restart(reason);
                         restart_count += 1;
                         break 'encode;
                     }
@@ -3187,27 +3317,6 @@ impl CameraEncoder {
                             // never lost; added recovery latency is bounded by the
                             // cooldown. The periodic GOP keyframe is never gated.
                             let now_ms = window().performance().unwrap().now();
-                            // Issue #1311: a reconnect or re-election just happened.
-                            // Clear the forced-keyframe cooldown clock so the FIRST
-                            // post-transition PLI below emits immediately instead of
-                            // being coalesced away by a stale pre-transition keyframe
-                            // timestamp (the cooldown window is up to
-                            // FORCED_KEYFRAME_COOLDOWN_MS = 250ms of suppressed
-                            // recovery). One-shot edge: `.swap(false)` consumes it so
-                            // a single transition resets exactly once; a spurious set
-                            // only matters when a PLI is pending and merely allows an
-                            // emission a receiver already asked for (never forces an
-                            // unrequested keyframe — the periodic GOP is unaffected).
-                            if keyframe_cooldown_reset.swap(false, Ordering::AcqRel) {
-                                last_keyframe_emit_ms = None;
-                            }
-                            let pli_pending = force_keyframe.load(Ordering::Acquire);
-                            let pli_requested = pli_pending
-                                && pli_keyframe_allowed(
-                                    now_ms,
-                                    last_keyframe_emit_ms,
-                                    FORCED_KEYFRAME_COOLDOWN_MS,
-                                );
                             // Use tier-controlled keyframe interval instead of the
                             // static constant, allowing adaptive quality to adjust it.
                             // Using `%` instead of `.is_multiple_of()` for compatibility
@@ -3215,18 +3324,43 @@ impl CameraEncoder {
                             #[allow(clippy::manual_is_multiple_of)]
                             let is_periodic_keyframe = local_keyframe_interval > 0
                                 && video_frame_counter % local_keyframe_interval == 0;
-                            let want_keyframe = is_periodic_keyframe || pli_requested;
-                            if want_keyframe {
+                            // Resolve the keyframe decision via the shared single
+                            // source of truth (issue #1347 item 2: the camera AND
+                            // screen loops call the same pure `keyframe_tick_decision`,
+                            // which the host tests pin). It folds:
+                            //  * #1311 cooldown reset — a reconnect or re-election just
+                            //    happened (the `keyframe_cooldown_reset` one-shot edge,
+                            //    `.swap(false)`-consumed here so a single transition
+                            //    resets exactly once); the decision clears the stale
+                            //    cooldown clock so the FIRST post-transition PLI emits
+                            //    immediately instead of being coalesced away (up to
+                            //    FORCED_KEYFRAME_COOLDOWN_MS = 250ms of suppressed
+                            //    recovery). It only un-gates an ALREADY-pending PLI —
+                            //    never forces an unrequested keyframe.
+                            //  * #1287 PLI coalescer — PEEK the request flag (`load`,
+                            //    not `swap`) so a mid-cooldown PLI stays pending and is
+                            //    honored at window expiry rather than dropped.
+                            //  * periodic GOP — never gated by the cooldown.
+                            let decision = keyframe_tick_decision(KeyframeTickInput {
+                                now_ms,
+                                pli_pending: force_keyframe.load(Ordering::Acquire),
+                                is_periodic: is_periodic_keyframe,
+                                cooldown_reset: keyframe_cooldown_reset
+                                    .swap(false, Ordering::AcqRel),
+                                last_keyframe_emit_ms,
+                                cooldown_ms: FORCED_KEYFRAME_COOLDOWN_MS,
+                            });
+                            let want_keyframe = decision.want_keyframe;
+                            last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
+                            if decision.clear_force_keyframe {
                                 // ANY keyframe (periodic or forced) is broadcast to
                                 // the whole room and satisfies every pending PLI, so
-                                // clear the request flag and (re)start the cooldown
-                                // window from this emission. Clearing here — only when
-                                // we actually emit — is what lets a mid-cooldown
-                                // request survive to be honored at window expiry.
+                                // clear the request flag. Clearing only on an actual
+                                // emit is what lets a mid-cooldown request survive to
+                                // be honored at window expiry.
                                 force_keyframe.store(false, Ordering::Release);
-                                last_keyframe_emit_ms = Some(now_ms);
                             }
-                            if pli_requested {
+                            if decision.pli_forced {
                                 log::info!(
                                     "CameraEncoder: forcing keyframe at frame {} (PLI)",
                                     video_frame_counter
@@ -3238,7 +3372,10 @@ impl CameraEncoder {
                             let frame_width = video_frame.display_width();
                             let frame_height = video_frame.display_height();
 
-                            let mut fatal_encode = false;
+                            // Restart reason captured from a fatal per-frame
+                            // encode/reconfigure cause (issue #527). `None` while
+                            // the frame encodes cleanly.
+                            let mut fatal_encode: Option<RestartReason> = None;
                             // Health is anchored to the BASE layer (layer_id == 0),
                             // NOT "≥1 layer encoded". Every receiver currently decodes
                             // only layer 0 (receiver default `selected_video_layer = 0`),
@@ -3315,7 +3452,7 @@ impl CameraEncoder {
                                         // Guard: do not configure a closed encoder.
                                         if layer.encoder.state() == CodecState::Closed {
                                             log::warn!("CameraEncoder: encoder closed before per-layer dimension reconfigure (layer {})", layer.layer_id);
-                                            fatal_encode = true;
+                                            fatal_encode = Some(RestartReason::ClosedCodec);
                                             break;
                                         }
 
@@ -3349,7 +3486,7 @@ impl CameraEncoder {
                                                 .fetch_add(1, Ordering::Relaxed);
                                             if is_fatal_encoder_error(&e) {
                                                 error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                                fatal_encode = true;
+                                                fatal_encode = Some(RestartReason::Configure);
                                                 break;
                                             }
                                             error!("Error reconfiguring camera layer for dimension change (layer {}): {e:?}", layer.layer_id);
@@ -3385,7 +3522,7 @@ impl CameraEncoder {
                                         // Guard: do not configure a closed encoder.
                                         if layer.encoder.state() == CodecState::Closed {
                                             log::warn!("CameraEncoder: encoder closed before dimension reconfigure (layer {})", layer.layer_id);
-                                            fatal_encode = true;
+                                            fatal_encode = Some(RestartReason::ClosedCodec);
                                             break;
                                         }
 
@@ -3406,7 +3543,7 @@ impl CameraEncoder {
                                                 .fetch_add(1, Ordering::Relaxed);
                                             if is_fatal_encoder_error(&e) {
                                                 error!("CameraEncoder: fatal configure error (layer {}), restarting: {e:?}", layer.layer_id);
-                                                fatal_encode = true;
+                                                fatal_encode = Some(RestartReason::Configure);
                                                 break;
                                             }
                                             error!("Error reconfiguring camera encoder with new dimensions (layer {}): {e:?}", layer.layer_id);
@@ -3461,7 +3598,11 @@ impl CameraEncoder {
                                         }
                                         if is_fatal_encoder_error(&e) {
                                             error!("CameraEncoder: fatal encode error (layer {}, restart {restart_count}): {e:?}", layer.layer_id);
-                                            fatal_encode = true;
+                                            // #527: reuse the same message classification
+                                            // as the error counter just bumped above so the
+                                            // restart reason agrees with the error bucket
+                                            // (closed_codec vs memory).
+                                            fatal_encode = Some(restart_reason_from_message(&msg));
                                             break;
                                         }
                                         error!(
@@ -3517,7 +3658,8 @@ impl CameraEncoder {
                                 encoded_ok_this_cycle = true;
                             }
 
-                            if fatal_encode {
+                            if let Some(reason) = fatal_encode {
+                                record_camera_restart(reason);
                                 restart_count += 1;
                                 break 'encode;
                             }
@@ -3558,16 +3700,43 @@ impl CameraEncoder {
 
 #[cfg(test)]
 mod tests {
+    use super::RestartReason;
     use super::{
-        build_simulcast_layers, clamp_layer_count, encoders_to_build, format_layer_transition,
-        frame_is_healthy, initial_active_layer_count, is_fatal_encoder_error_message,
-        layer_ceiling_to_count, loop_is_superseded, next_single_layer_pin, pli_keyframe_allowed,
-        shed_reason, should_pin_single_layer_low, should_teardown_shed_layer, LayerView,
-        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
-        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
-        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        build_simulcast_layers, camera_encoder_restarts_closed_codec,
+        camera_encoder_restarts_configure, camera_encoder_restarts_memory,
+        camera_encoder_restarts_other, clamp_layer_count, encoders_to_build,
+        format_layer_transition, frame_is_healthy, initial_active_layer_count,
+        is_fatal_encoder_error_message, keyframe_tick_decision, layer_ceiling_to_count,
+        loop_is_superseded, next_single_layer_pin, record_camera_restart, shed_reason,
+        should_pin_single_layer_low, should_teardown_shed_layer, wt_drop_step_down_decision,
+        wt_saturation_step_down_decision, KeyframeTickInput, LayerView, SimulcastLayerInfo,
+        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+    };
+    use crate::adaptive_quality_constants::{
+        WS_SELF_CONGESTION_DROP_THRESHOLD, WS_SELF_CONGESTION_WINDOW_MS,
+        WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS, WT_SELF_CONGESTION_DROP_THRESHOLD,
+        WT_SELF_CONGESTION_WINDOW_MS,
     };
     use videocall_aq::constants::simulcast_layers;
+
+    #[test]
+    fn record_camera_restart_increments_each_reason_counter() {
+        let before_closed = camera_encoder_restarts_closed_codec();
+        let before_memory = camera_encoder_restarts_memory();
+        let before_configure = camera_encoder_restarts_configure();
+        let before_other = camera_encoder_restarts_other();
+
+        record_camera_restart(RestartReason::ClosedCodec);
+        record_camera_restart(RestartReason::Memory);
+        record_camera_restart(RestartReason::Configure);
+        record_camera_restart(RestartReason::Other);
+
+        assert!(camera_encoder_restarts_closed_codec() > before_closed);
+        assert!(camera_encoder_restarts_memory() > before_memory);
+        assert!(camera_encoder_restarts_configure() > before_configure);
+        assert!(camera_encoder_restarts_other() > before_other);
+    }
 
     #[test]
     fn simulcast_layers_emit_shed_rungs_with_zero_bitrate() {
@@ -4014,58 +4183,45 @@ mod tests {
 
     #[test]
     fn forced_keyframe_pli_coalesces_within_cooldown_window() {
-        // Issue #1287: pins the SINGLE SOURCE OF TRUTH for the publisher-side PLI
-        // emit coalescer (`pli_keyframe_allowed`). The encode loop emits a forced
-        // keyframe iff this returns true AND a PLI is pending, so pinning it here
-        // pins the behavior off-wasm (the live encode loop is not host-runnable).
+        // Issue #1287 / #1347 item 2: drives the REAL per-frame keyframe decision the
+        // camera encode loop calls (`keyframe_tick_decision` — the production loop
+        // calls this exact fn, so a mutation to the real decision logic breaks this
+        // test off-wasm; the live encode loop is not host-runnable).
         //
-        // Mutations these assertions CATCH:
-        //  * dropping the `None` guard (the first forced keyframe would be blocked) — case 1
-        //  * inverting the comparison (`>=`→`<`) — every Some case flips and FAILS
-        //  * swapping `>=`→`>` — the exact-boundary case (249 suppress, 250 allow) flips
+        // ACCEPTANCE (#1287): a frame stream where EVERY frame has a PLI pending
+        // (worst case: N receivers hammering one publisher), replicating the encode
+        // loop's state update by feeding the decision's returned
+        // `last_keyframe_emit_ms` back in each tick. Assert the burst coalesces to
+        // ~one forced keyframe per cooldown. Removing the cooldown gate from the
+        // decision makes `forced` jump to 30 (one per frame), failing `== 4`; the
+        // inclusive-`>=` boundary itself is pinned exactly by
+        // `keyframe_tick_decision_coalesces_and_holds_pli` in `encoder_state`.
+        // 30fps => a frame every ~33.33ms; no periodic GOP in this 1s slice, so all
+        // emits are PLI-forced.
         let cd = FORCED_KEYFRAME_COOLDOWN_MS; // 250.0
-
-        // No keyframe emitted yet (None) → the first PLI is always allowed.
-        assert!(
-            pli_keyframe_allowed(0.0, None, cd),
-            "the first forced keyframe (no prior keyframe) must always be allowed"
-        );
-        // 249ms after the last keyframe (< 250ms) → SUPPRESS (still in cooldown).
-        assert!(
-            !pli_keyframe_allowed(249.0, Some(0.0), cd),
-            "a PLI 249ms after the last keyframe must be coalesced (suppressed)"
-        );
-        // Exactly 250ms → ALLOW (pins the inclusive `>=`; a `>` mutation fails here).
-        assert!(
-            pli_keyframe_allowed(250.0, Some(0.0), cd),
-            "a PLI exactly one cooldown after the last keyframe must be allowed (>= is inclusive)"
-        );
-        // Well past the window → ALLOW.
-        assert!(
-            pli_keyframe_allowed(1_000.0, Some(250.0), cd),
-            "a PLI long after the window must be allowed"
-        );
-
-        // ACCEPTANCE (#1287): drive the REAL decision over a frame stream where EVERY
-        // frame has a PLI pending (worst case: N receivers hammering one publisher),
-        // replicating the encode loop's state update (any emitted keyframe resets the
-        // window — see the `if want_keyframe` block in the loop), and assert the burst
-        // coalesces to ~one forced keyframe per cooldown. This drives the real helper —
-        // NOT a literal vs itself: remove the gate and `forced` jumps to 30 (one per
-        // frame), failing the `== 4` assertion below. (The inclusive-`>=` boundary is
-        // pinned by the scalar `pli_keyframe_allowed(250.0, Some(0.0), cd)` case above,
-        // not here: at 30fps no frame lands exactly on a 250ms boundary.) 30fps => a
-        // frame every ~33.33ms; no periodic GOP in this 1s slice, so all are PLI-forced.
         let frame_interval_ms = 1000.0 / 30.0;
         let mut last_keyframe_emit_ms: Option<f64> = None;
         let mut forced = 0u32;
         let mut now = 0.0_f64;
         for _ in 0..30 {
-            // pli_pending is ALWAYS true in this saturated worst case.
-            if pli_keyframe_allowed(now, last_keyframe_emit_ms, cd) {
+            // pli_pending is ALWAYS true in this saturated worst case; no reconnect.
+            let decision = keyframe_tick_decision(KeyframeTickInput {
+                now_ms: now,
+                pli_pending: true,
+                is_periodic: false,
+                cooldown_reset: false,
+                last_keyframe_emit_ms,
+                cooldown_ms: cd,
+            });
+            if decision.want_keyframe {
+                assert!(
+                    decision.pli_forced,
+                    "with no periodic GOP, every emit in this slice is PLI-forced"
+                );
                 forced += 1;
-                last_keyframe_emit_ms = Some(now);
             }
+            // Feed the decision's post-tick clock back, exactly like the loop.
+            last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
             now += frame_interval_ms;
         }
         // 1s of saturated PLI at a 250ms cooldown: the first frame at/after each window
@@ -4083,19 +4239,16 @@ mod tests {
         // running (it is NOT torn down — only the connection is rebuilt / the
         // re-election atomic flips), so `last_keyframe_emit_ms` carries a STALE
         // pre-transition timestamp. Without a reset, a recovery PLI on the first
-        // post-transition frame would be coalesced away by `pli_keyframe_allowed`
-        // for up to FORCED_KEYFRAME_COOLDOWN_MS. The fix arms a one-shot reset
+        // post-transition frame would be coalesced away for up to
+        // FORCED_KEYFRAME_COOLDOWN_MS. The fix arms a one-shot reset
         // (`keyframe_cooldown_reset`) that the encode loop `.swap(false)`-consumes
-        // each frame and, when set, clears `last_keyframe_emit_ms` to `None` so the
-        // PLI emits immediately.
+        // each frame and passes into the decision as `cooldown_reset`, which clears
+        // the stale clock so the PLI emits immediately.
         //
-        // This test models that exact encode-loop state machine off-wasm (the live
-        // loop is not host-runnable) and drives the REAL `pli_keyframe_allowed`
-        // helper. It is mutation-proof: the CONTROL arm pins that the cooldown
-        // genuinely WOULD suppress (so the assert is not vacuous), and the RESET
-        // arm fails if the `last_keyframe_emit_ms = None` reset is removed or the
-        // `.swap` consume is broken.
-        use std::sync::atomic::{AtomicBool, Ordering};
+        // This drives the REAL `keyframe_tick_decision` (the exact fn the camera
+        // production loop calls). It is mutation-proof: the CONTROL arm pins that the
+        // cooldown genuinely WOULD suppress (so the assert is not vacuous), and the
+        // RESET arm fails if the `cooldown_reset` clear is removed from the decision.
         let cd = FORCED_KEYFRAME_COOLDOWN_MS; // 250.0
 
         // A keyframe was emitted just before the transition.
@@ -4104,70 +4257,61 @@ mod tests {
         // 250ms cooldown window, with a PLI pending (a receiver requesting recovery).
         let first_frame_after_ms = pre_reconnect_emit_ms + 33.0;
 
-        // CONTROL: no reset armed. The stale timestamp must SUPPRESS the PLI — this
+        // CONTROL: reset NOT armed. The stale timestamp must SUPPRESS the PLI — this
         // pins that the window is real, so the reset arm below is a true behavioral
-        // difference, not an always-true assertion. (If this fired, the reset arm
-        // would prove nothing.)
-        {
-            let mut last_keyframe_emit_ms = Some(pre_reconnect_emit_ms);
-            let reset = AtomicBool::new(false); // NOT armed
-            if reset.swap(false, Ordering::AcqRel) {
-                last_keyframe_emit_ms = None;
-            }
-            let pli_pending = true;
-            let pli_emits = pli_pending
-                && pli_keyframe_allowed(first_frame_after_ms, last_keyframe_emit_ms, cd);
-            assert!(
-                !pli_emits,
-                "control: a PLI {}ms after the last keyframe must be coalesced \
-                 (suppressed) when no reconnect reset is armed",
-                first_frame_after_ms - pre_reconnect_emit_ms
-            );
-        }
+        // difference, not an always-true assertion.
+        let control = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: first_frame_after_ms,
+            pli_pending: true,
+            is_periodic: false,
+            cooldown_reset: false,
+            last_keyframe_emit_ms: Some(pre_reconnect_emit_ms),
+            cooldown_ms: cd,
+        });
+        assert!(
+            !control.want_keyframe,
+            "control: a PLI {}ms after the last keyframe must be coalesced when no \
+             reconnect reset is armed",
+            first_frame_after_ms - pre_reconnect_emit_ms
+        );
 
-        // RESET ARM: a reconnect/re-election armed the reset. The encode loop
-        // consumes it and clears `last_keyframe_emit_ms`, so the SAME PLI on the
-        // SAME early frame now EMITS. Removing the `last_keyframe_emit_ms = None`
-        // line (the mutation this test guards) makes `pli_emits` false and FAILS.
-        {
-            let mut last_keyframe_emit_ms = Some(pre_reconnect_emit_ms);
-            let reset = AtomicBool::new(true); // armed by the transition
-            let consumed = reset.swap(false, Ordering::AcqRel);
-            assert!(
-                consumed,
-                "the armed reset edge must be observed exactly once"
-            );
-            if consumed {
-                last_keyframe_emit_ms = None;
-            }
-            let pli_pending = true;
-            let pli_emits = pli_pending
-                && pli_keyframe_allowed(first_frame_after_ms, last_keyframe_emit_ms, cd);
-            assert!(
-                pli_emits,
-                "after a reconnect/re-election reset, the first PLI must emit a forced \
-                 keyframe immediately even {}ms < cooldown ({}ms) since the last keyframe",
-                first_frame_after_ms - pre_reconnect_emit_ms,
-                cd
-            );
+        // RESET ARM: a reconnect/re-election armed the reset (the loop
+        // `.swap(false)`-consumed it → `cooldown_reset: true`). The SAME PLI on the
+        // SAME early frame now EMITS. Removing the `cooldown_reset` clear from the
+        // decision makes `want_keyframe` false and FAILS.
+        let reset = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: first_frame_after_ms,
+            pli_pending: true,
+            is_periodic: false,
+            cooldown_reset: true,
+            last_keyframe_emit_ms: Some(pre_reconnect_emit_ms),
+            cooldown_ms: cd,
+        });
+        assert!(
+            reset.want_keyframe,
+            "after a reconnect/re-election reset, the first PLI must emit a forced \
+             keyframe immediately even {}ms < cooldown ({}ms) since the last keyframe",
+            first_frame_after_ms - pre_reconnect_emit_ms,
+            cd
+        );
 
-            // One-shot: the reset is consumed, so a SUBSEQUENT early frame (still
-            // inside the cooldown of the keyframe we just emitted) is coalesced
-            // again — the reset does not stick and disable the coalescer.
-            assert!(
-                !reset.swap(false, Ordering::AcqRel),
-                "the reset edge must be one-shot (already consumed)"
-            );
-            last_keyframe_emit_ms = Some(first_frame_after_ms); // we emitted above
-            let next_frame_ms = first_frame_after_ms + 33.0;
-            // pli_pending stays true (the receiver is still requesting).
-            let next_emits = pli_keyframe_allowed(next_frame_ms, last_keyframe_emit_ms, cd);
-            assert!(
-                !next_emits,
-                "after the one-shot reset is consumed, the coalescer must resume \
-                 suppressing PLIs inside the cooldown window"
-            );
-        }
+        // One-shot: the reset is a per-frame edge (the loop already consumed it via
+        // `.swap`), so a SUBSEQUENT early frame — still inside the cooldown of the
+        // keyframe we just emitted, reset NOT re-armed — is coalesced again. The reset
+        // does not stick and disable the coalescer.
+        let next = keyframe_tick_decision(KeyframeTickInput {
+            now_ms: first_frame_after_ms + 33.0,
+            pli_pending: true,
+            is_periodic: false,
+            cooldown_reset: false,
+            last_keyframe_emit_ms: reset.last_keyframe_emit_ms,
+            cooldown_ms: cd,
+        });
+        assert!(
+            !next.want_keyframe,
+            "after the one-shot reset is consumed, the coalescer must resume \
+             suppressing PLIs inside the cooldown window"
+        );
     }
 
     #[test]
@@ -4347,6 +4491,110 @@ mod tests {
         assert!(
             !next_single_layer_pin(2, Some(50), true),
             "simulcast publisher: a real reading releases the pin"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // WebTransport backpressure wiring (#509 parity audit, item #2).
+    //
+    // These pin that the camera AQ loop consults the WT *drop* and *saturation*
+    // counters through the WT constants — the client-side congestion signal WT
+    // would otherwise lack (WS-only, per PR #339). The wasm loop itself depends
+    // on `js_sys::Date::now()` and cannot run on host, so the per-axis decision
+    // (counter → `evaluate_self_congestion` → WT window/threshold) is extracted
+    // into `wt_drop_step_down_decision` / `wt_saturation_step_down_decision`,
+    // which the loop calls with the live transport counters. A mutation that
+    // pointed an axis at the WRONG constants (e.g. the WS or the sibling WT
+    // axis) shifts the firing boundary and is caught below; the transport-side
+    // increment of those counters is pinned separately by the
+    // `record_unistream_drop` / `record_ready_stall` tests in
+    // `videocall-transport`.
+    // -----------------------------------------------------------------------
+
+    /// A sustained WT unistream-drop cluster at/above the WT-drop threshold,
+    /// observed over a fully-elapsed WT-drop window, MUST request a step-down.
+    #[test]
+    fn camera_wt_drop_axis_fires_on_sustained_drops() {
+        let current = WT_SELF_CONGESTION_DROP_THRESHOLD; // exactly at threshold
+        let decision = wt_drop_step_down_decision(
+            current,
+            0, // snapshot
+            WT_SELF_CONGESTION_WINDOW_MS,
+        );
+        assert!(
+            decision.step_down,
+            "a WT-drop delta == WT threshold over a closed WT window must step down"
+        );
+    }
+
+    /// A drop count BELOW the WT-drop threshold must NOT fire — a transient
+    /// stream reset on a lossy link cannot shed a layer.
+    #[test]
+    fn camera_wt_drop_axis_does_not_fire_below_threshold() {
+        let current = WT_SELF_CONGESTION_DROP_THRESHOLD - 1;
+        let decision = wt_drop_step_down_decision(current, 0, WT_SELF_CONGESTION_WINDOW_MS);
+        assert!(
+            !decision.step_down,
+            "a WT-drop delta below the WT threshold must NOT step down"
+        );
+    }
+
+    /// The drop axis must use the WT-drop constants, NOT the WS constants. This
+    /// is the anti-misweave pin: at an elapsed past the (narrower) WS window but
+    /// before the WT window closes, the WT axis must still treat the window as
+    /// OPEN. If the helper were mutated to the WS window the same elapsed would
+    /// CLOSE the window and roll/fire. The test is meaningful only because the
+    /// two windows genuinely differ — that premise is pinned at COMPILE TIME by
+    /// `WT_WINDOW_WIDER_THAN_WS` below (a const assert, so it cannot be a
+    /// runtime `assert!` on constants — clippy `assertions_on_constants`).
+    #[test]
+    fn camera_wt_drop_axis_uses_wt_constants_not_ws() {
+        // Compile-time premise: the WT drop window is strictly wider than the
+        // WS window, so an elapsed between them is "open" under WT but "closed"
+        // under WS. If a future tuning made them equal, this fails the BUILD,
+        // flagging that the anti-misweave test below no longer discriminates.
+        const _: () = assert!(
+            WT_SELF_CONGESTION_WINDOW_MS > WS_SELF_CONGESTION_WINDOW_MS,
+            "test premise: WT drop window must be wider than WS window"
+        );
+        // Elapsed sits past the WS window but before the WT window closes.
+        let elapsed = WS_SELF_CONGESTION_WINDOW_MS + 1.0;
+        // A delta at/above BOTH thresholds, evaluated over a still-OPEN WT
+        // window, must not fire or roll.
+        let delta = WS_SELF_CONGESTION_DROP_THRESHOLD.max(WT_SELF_CONGESTION_DROP_THRESHOLD);
+        let decision = wt_drop_step_down_decision(delta, 0, elapsed);
+        assert!(
+            !decision.step_down,
+            "the WT-drop axis must treat the WT window as still open at WS-window elapsed \
+             (proves WT constants, not WS, are used)"
+        );
+        assert!(
+            !decision.roll_window,
+            "an open WT window must not roll (would roll early under WS window)"
+        );
+    }
+
+    /// A sustained slow-`ready()` cluster at/above the WT-saturation threshold
+    /// over a fully-elapsed saturation window MUST request a step-down — the
+    /// slow-but-alive uplink case the drop axis structurally cannot see.
+    #[test]
+    fn camera_wt_saturation_axis_fires_on_sustained_stalls() {
+        let current = WT_SATURATION_STALL_THRESHOLD;
+        let decision = wt_saturation_step_down_decision(current, 0, WT_SATURATION_WINDOW_MS);
+        assert!(
+            decision.step_down,
+            "a saturation delta == saturation threshold over a closed window must step down"
+        );
+    }
+
+    /// A flat saturation counter (a WS user, or a healthy WT uplink that never
+    /// crosses the producer-side ready-stall threshold) must NEVER fire.
+    #[test]
+    fn camera_wt_saturation_axis_never_fires_when_flat() {
+        let decision = wt_saturation_step_down_decision(0, 0, WT_SATURATION_WINDOW_MS);
+        assert!(
+            !decision.step_down,
+            "a flat-at-0 saturation counter must never step down (WS users / healthy WT)"
         );
     }
 }

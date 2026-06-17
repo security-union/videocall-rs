@@ -710,6 +710,17 @@ pub struct SignalInfo {
     /// reason chip the perf dialog's per-peer row shows for the same peer at the
     /// same moment.
     pub receive_diag: Option<PeerReceiveDiag>,
+    /// Issue #1483: the per-tile "WT"/"WS" transport badge to render next to
+    /// the signal meter. Already gated UPSTREAM in `peer_tile` by BOTH the
+    /// server-side `transportBadgeEnabled` flag AND the transport being known:
+    /// it is `Some(Wt | Ws)` only when both hold, and `None` otherwise (flag
+    /// off, or transport unknown / not yet observed). Unlike the popup's
+    /// `transport: Option<String>` field — which is populated only while the
+    /// popup is open — this is computed on EVERY tile render so the badge can
+    /// show without the popup being open. The render-site helper renders
+    /// nothing for `None`, so the "flag OFF → nothing / Unknown → nothing"
+    /// contract lives in one place.
+    pub badge_transport: Option<crate::components::canvas_generator::TransportBadge>,
 }
 
 // ---------------------------------------------------------------------------

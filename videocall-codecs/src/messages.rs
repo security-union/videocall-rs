@@ -38,6 +38,19 @@ pub enum WorkerMessage {
     /// decoded-but-unpainted backlog living in the postMessage + paint task queues —
     /// a region `decode_queue_size()` cannot observe.
     PaintProgress { painted: u64 },
+    /// **Test-only** (issue #1022): insert a crafted frame into the worker's
+    /// [`JitterBuffer`](crate::jitter_buffer::JitterBuffer) using the `arrival_time_ms`
+    /// carried in the `FrameBuffer` itself, instead of stamping it with the worker's
+    /// wall clock the way [`WorkerMessage::DecodeFrame`] does.
+    ///
+    /// This exists solely so an E2E spec can deterministically form a *stale* head-of-line
+    /// backlog (back-dated arrival time) and let the worker's ~10ms tick trip the #1020
+    /// freshness deadline (`MAX_PLAYOUT_AGE_MS`), making the resulting `freshness_skip`
+    /// diagnostic (#1045) observable from a browser test. It is emitted ONLY by the
+    /// `MOCK_PEERS_ENABLED`-gated injection hook (see
+    /// `videocall_client::freshness_inject`); no production code path sends it, so the
+    /// production decode pipeline is byte-for-byte unaffected when the flag is off.
+    InjectStaleFrame(FrameBuffer),
 }
 
 /// Video statistics message sent by the worker
@@ -58,6 +71,13 @@ pub struct VideoStatsMessage {
     /// `frames_emitted - frames_painted` so the backlog isn't hidden by the FIFO delay that
     /// the worker's own stats message rides through.
     pub playout_paint_lag_ms: Option<f64>,
+    /// Cumulative count of resync-to-live governor skips (issue #1252): how many times the
+    /// decode-side governor jumped this stream forward to live to shed accumulated lag. A COUNTER,
+    /// not a gauge: it rises within a decoder-pipeline lifetime and is preserved across `flush()`,
+    /// but resets to 0 when the pipeline is rebuilt (`reset_pipeline()` on decoder-error recovery).
+    /// Consume via `increase()`/`rate()`, which tolerate the reset; a rising value proves the
+    /// governor fired in the field.
+    pub playout_skip_to_live_total: Option<u64>,
 }
 
 impl VideoStatsMessage {
@@ -68,6 +88,7 @@ impl VideoStatsMessage {
         playout_latency_ms: f64,
         playout_stage1_span_ms: f64,
         playout_paint_lag_ms: f64,
+        playout_skip_to_live_total: u64,
     ) -> Self {
         Self {
             kind: "video_stats".to_string(),
@@ -77,6 +98,7 @@ impl VideoStatsMessage {
             playout_latency_ms: Some(playout_latency_ms),
             playout_stage1_span_ms: Some(playout_stage1_span_ms),
             playout_paint_lag_ms: Some(playout_paint_lag_ms),
+            playout_skip_to_live_total: Some(playout_skip_to_live_total),
         }
     }
 }
@@ -130,9 +152,11 @@ pub const FRESHNESS_SKIP_KIND: &str = "freshness_skip";
 /// The jitter buffer's freshness deadline (#1020) runs INSIDE the decoder worker,
 /// whose `log`/`console` output the main-thread console-log capture+upload pipeline
 /// never sees — so in the field we could not confirm the freeze fix actually fired.
-/// The worker posts this the instant a skip occurs; the main thread re-broadcasts it
-/// as a `DiagEvent` (`handle_worker_diag_message`) so it lands in uploaded logs with
-/// the worker's `from_peer`/`to_peer` context. Mirrors `VideoStatsMessage`'s path.
+/// The worker posts this the instant a skip occurs; the main thread re-emits it
+/// as a real `console.warn` line (the load-bearing upload path) and also keeps a
+/// `DiagEvent` broadcast for structured in-process consumers. Both carry the
+/// worker's `from_peer`/`to_peer` context. Mirrors `VideoStatsMessage`'s
+/// worker->main forwarding shape, with console delivery added for field logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FreshnessSkipMessage {
     pub kind: String,
@@ -162,6 +186,31 @@ impl FreshnessSkipMessage {
             keyframe_seq,
             dropped,
         }
+    }
+
+    /// Render the field-log console line for this skip (issue #1384, follow-up to
+    /// #1045).
+    ///
+    /// This is the load-bearing delivery for the freshness-deadline signal: the
+    /// main thread re-emits the returned string via `console.warn`, which the
+    /// console-log upload pipeline captures. The `[JITTER_BUFFER] freshness_skip`
+    /// prefix and the `head_age=`/`dropped=`/`keyframe_seq=` field tokens are a
+    /// **grep contract** the #1045/#1020 field investigation keys on, so the
+    /// formatting is pinned by host tests below rather than living only in the
+    /// wasm-gated emit arm (which no host test can exercise). `head_age` rounds to
+    /// whole milliseconds (`{:.0}`); a `keyframe_seq` of `None` is the keyframe-less
+    /// held-last-good case and renders as `none (held last-good)`.
+    pub fn console_line(&self) -> String {
+        let from = self.from_peer.as_deref().unwrap_or_default();
+        let to = self.to_peer.as_deref().unwrap_or_default();
+        let keyframe = self
+            .keyframe_seq
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "none (held last-good)".to_string());
+        format!(
+            "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms dropped={} keyframe_seq={keyframe}",
+            self.head_age_ms, self.dropped
+        )
     }
 }
 
@@ -285,7 +334,7 @@ mod worker_log_disambiguation_tests {
         // fields (level/target/message) are absent from every other message, so none of them can
         // deserialize into WorkerLogMessage at all -> the branch is structurally unable to swallow
         // them, independent of the kind guard.
-        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0);
+        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
         );
@@ -298,6 +347,101 @@ mod worker_log_disambiguation_tests {
         let rk = RequestKeyframeMessage::new(None, None);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&rk).unwrap()).is_err()
+        );
+    }
+}
+
+#[cfg(test)]
+mod freshness_skip_console_line_tests {
+    //! Grep-contract for the freshness-skip field-log line (issue #1384, follow-up to #1045).
+    //!
+    //! The `[JITTER_BUFFER] freshness_skip` console line is the load-bearing delivery of the
+    //! #1020 freshness-deadline signal to uploaded field logs, and the field investigation for
+    //! #1045/#1020 greps for that exact prefix + field tokens. The emit itself lives in the
+    //! wasm-gated `decoder/wasm.rs` arm (`console::warn_1`), which no host test can exercise, so
+    //! the formatting was extracted into `FreshnessSkipMessage::console_line` and pinned here.
+    //! Mutating the prefix, a field token, or the keyframe-`None` rendering in source must fail
+    //! one of these tests (acceptance criterion of #1384).
+    use super::*;
+
+    #[test]
+    fn pins_prefix_and_field_tokens() {
+        let line = FreshnessSkipMessage::new(
+            Some("alice".into()),
+            Some("bob".into()),
+            1234.0,
+            Some(42),
+            7,
+        )
+        .console_line();
+        // The load-bearing grep prefix.
+        assert!(
+            line.starts_with("[JITTER_BUFFER] freshness_skip"),
+            "prefix grep contract broken: {line}"
+        );
+        // Each field token the investigation keys on.
+        assert!(
+            line.contains("head_age="),
+            "missing head_age= token: {line}"
+        );
+        assert!(line.contains("dropped="), "missing dropped= token: {line}");
+        assert!(
+            line.contains("keyframe_seq="),
+            "missing keyframe_seq= token: {line}"
+        );
+        // Peer attribution rendered as from->to.
+        assert!(
+            line.contains("alice->bob"),
+            "missing peer attribution: {line}"
+        );
+    }
+
+    #[test]
+    fn renders_keyframe_some_as_bare_sequence() {
+        let line = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7).console_line();
+        assert!(
+            line.contains("keyframe_seq=42"),
+            "Some(42) should render as keyframe_seq=42: {line}"
+        );
+        assert!(
+            !line.contains("none (held last-good)"),
+            "Some(_) must not render the held-last-good marker: {line}"
+        );
+    }
+
+    #[test]
+    fn renders_keyframe_none_as_held_last_good() {
+        // The keyframe-less held case (#1020 evict-and-hold) is the distinct signal the
+        // investigation distinguishes from a skip-to-live, so its rendering is pinned.
+        let line = FreshnessSkipMessage::new(None, None, 1800.0, None, 7).console_line();
+        assert!(
+            line.contains("keyframe_seq=none (held last-good)"),
+            "None should render as keyframe_seq=none (held last-good): {line}"
+        );
+    }
+
+    #[test]
+    fn rounds_head_age_to_whole_millis() {
+        // `{:.0}` rounds: 1234.6 -> 1235.
+        let line = FreshnessSkipMessage::new(None, None, 1234.6, Some(1), 0).console_line();
+        assert!(
+            line.contains("head_age=1235ms"),
+            "head_age should round to 1235ms: {line}"
+        );
+        assert!(
+            !line.contains("1234.6"),
+            "head_age must not carry fractional digits: {line}"
+        );
+    }
+
+    #[test]
+    fn empty_peers_render_as_empty_arrow() {
+        // `None` peers (a skip forwarded before SetContext) render as `->`, matching the prior
+        // inline `unwrap_or_default()` behavior — keeps the line shape stable for the grep.
+        let line = FreshnessSkipMessage::new(None, None, 100.0, Some(5), 1).console_line();
+        assert!(
+            line.contains("freshness_skip ->:"),
+            "empty peers should render as `->`: {line}"
         );
     }
 }

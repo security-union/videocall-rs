@@ -530,28 +530,117 @@ h3 {
   opacity: 0.82;
 }
 
-.decode-paused-badge {
+/* Issue #1466 (B1): the per-tile PLAY control. Previously a corner badge
+   anchored at top/right -6px with a 44px hit box created via negative margin —
+   but that box grew UP and RIGHT into the tile corner, where
+   `.canvas-container { overflow: hidden }` CLIPPED it, and its right edge ran
+   under the corner-pinned `.tile-top-icons` (z-index:3, which holds the
+   interactive signal button). The real tap area was well under 44px and
+   ambiguous taps landed on the signal button.
+
+   The control is now a CENTERED overlay over the PeerIcon. The placeholder
+   (`.placeholder-content--paused`) is `position: relative` and is itself
+   centered within the flex `.canvas-container`, so an absolutely-centered
+   element sits over the avatar in the middle of the visible tile — comfortably
+   inside the unclipped region and far from the corner icons. A 48px circular
+   target (> the 44px minimum) keeps it easily tappable on mobile. */
+.decode-play-overlay {
   position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 22px;
-  height: 22px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 48px;
+  height: 48px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
+  border: none;
   border-radius: var(--radius-pill, 999px);
   background: var(--btn-warning-bg);
   color: var(--warning);
   box-shadow: 0 0 0 1px var(--btn-warning-border);
-  pointer-events: none;
+  cursor: pointer;
+  font: inherit;
+  /* Sit above the dimmed PeerIcon, but below the corner `.tile-top-icons`
+     (z-index:3) which it never overlaps anyway. */
+  z-index: 2;
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.1s ease;
 }
 
-/* Override the generic `.placeholder-content svg` sizing/tint for the badge
-   glyph: it is a small amber pause icon, not the large tertiary PeerIcon. */
-.decode-paused-badge svg {
-  width: 14px;
-  height: 14px;
+/* Override the generic `.placeholder-content svg` sizing/tint for the play
+   glyph: a small amber triangle, not the large tertiary PeerIcon. */
+.decode-play-overlay svg {
+  width: 20px;
+  height: 20px;
   fill: currentColor;
+}
+
+.decode-play-overlay:hover {
+  background: var(--btn-warning-bg-hover);
+  box-shadow: 0 0 0 1px var(--btn-warning-border-hover);
+  /* Keep the centering translate while adding the hover bump. */
+  transform: translate(-50%, -50%) scale(1.06);
+}
+
+.decode-play-overlay:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
+}
+
+/* Issue #1466 (S2): respect prefers-reduced-motion. Suppress ONLY the hover
+   scale animation — but the button uses `transform` for centering too, so we
+   cannot use `transform: none` (that would un-center it). Reset the hover
+   transform back to the centering-only translate, and drop the transform from
+   the transition. Background/box-shadow hover feedback is preserved. */
+@media (prefers-reduced-motion: reduce) {
+  .decode-play-overlay {
+    transition:
+      background 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+
+  .decode-play-overlay:hover {
+    transform: translate(-50%, -50%);
+  }
+}
+
+/* Issue #1466: the persistent "show all paused videos" / "back to automatic"
+   escape hatch in the Appearance panel's Video-tiles area. Styled to match the
+   panel's warning-accent action buttons (same token family as the banner's
+   `.decode-budget-banner-action`), set apart from the segmented tile-count
+   picker above it. */
+.decode-budget-show-all-btn {
+  margin-top: 10px;
+  min-height: 36px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md, 10px);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--warning);
+  background: var(--btn-warning-bg);
+  border: 1px solid var(--btn-warning-border);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.decode-budget-show-all-btn:hover {
+  background: var(--btn-warning-bg-hover);
+  border-color: var(--btn-warning-border-hover);
+}
+
+.decode-budget-show-all-btn:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
 }
 
 /* ============================================================
@@ -1802,8 +1891,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   position: fixed;
   inset: 0;
   background: var(--device-settings-overlay-bg-image);
-  backdrop-filter: blur(6px) saturate(100%);
-  -webkit-backdrop-filter: blur(6px) saturate(100%);
+  backdrop-filter: blur(3px) saturate(100%);
+  -webkit-backdrop-filter: blur(3px) saturate(100%);
   z-index: 9500;
 
   display: flex;
@@ -4006,34 +4095,28 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* Screen share split-layout — right-panel peer video tile.
-   Height-driven sizing mirrors `.grid-item`: the tile fills the grid-auto-row
-   height set by the parent right-panel, derives its width from
-   `aspect-ratio: 3 / 2` (the max ratio we accept), and is clamped by
-   `max-width: 100%` so narrow grid cells (2-column layout) still fill their
-   full width.
-   HCL issues #3 + #4: the parent right-panel now sizes columns to
-   `ss_tile_h * 1.5` px instead of `1fr`, so each grid cell is exactly the
-   tile's natural 3:2 footprint. With `place-self: stretch` (not the prior
-   `center`) the tile fills its cell edge-to-edge, leaving the inter-tile
-   gap exactly `8px` and packing all tiles to the left edge of the panel.
-   The dominant shared-content tile (`.split-screen-tile`) intentionally
-   does NOT get this cap — it stays as a large, dominant display. */
+   The parent `.ss-peer-panel` is a flex-wrap container; each tile gets
+   `flex: 1 1 160px` so tiles grow to fill available width with a 160px
+   flex basis, collapsing to one column when the panel is narrow.
+   `aspect-ratio: 3 / 2` derives height from width. Off-budget tiles
+   render with `force_avatar: true` (avatar placeholder, no decode) —
+   the decode budget caps live decoders just as the normal grid does
+   (issue 987). */
 .split-peer-tile {
-  width: 100%;
-  height: 100%;
+  position: relative;
+  flex: 1 1 160px;
   max-width: 100%;
-  max-height: 100%;
   aspect-ratio: 3 / 2;
-  place-self: stretch;
   min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: visible; /* allow speaking glow box-shadow to extend beyond tile */
+  overflow: hidden;
   background-color: var(--surface-elevated);
   border: 2px solid var(--grid-item-border);
   border-radius: var(--radius-lg);
+  box-sizing: border-box;
   /* Speaking glow transition is driven by inline style from Rust speak_style(). */
 }
 
@@ -4055,6 +4138,101 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: var(--gradient-fade-video);
   pointer-events: none;
   z-index: 1;
+}
+
+/* ── Screen-share right panel ─────────────────────────────────────────
+   CSS flex-wrap panel. Tiles auto-wrap into as many columns as fit;
+   scrolls vertically when rows exceed height. */
+.ss-peer-panel {
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 14px;
+  align-content: flex-start;
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+.ss-peer-panel::-webkit-scrollbar { width: 6px; }
+.ss-peer-panel::-webkit-scrollbar-track { background: transparent; }
+.ss-peer-panel::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+.ss-peer-panel::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+
+/* ── Split-peer tile internals ───────────────────────────────────────
+   Fixed sizes that don't depend on --tile-h / --tile-w CSS vars.
+   These override the grid-item defaults which use calc(var(--tile-h)). */
+
+/* Name label — wraps "(Host)" to its own line via flex-wrap */
+.split-peer-tile .floating-name {
+  top: 6px;
+  left: 6px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  gap: 2px;
+  font-size: 13px;
+  max-width: 70%;
+  white-space: normal;
+  text-overflow: clip;
+  overflow: visible;
+  line-height: 1.3;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+/* "(Host)" label: wraps below name via flex-basis: 100% */
+.split-peer-tile .host-indicator {
+  flex-basis: 100%;
+  display: block !important;
+  font-size: 10px !important;
+  margin-left: 0 !important;
+  margin-top: 1px;
+  color: var(--text-quaternary) !important;
+  line-height: 1.2;
+}
+
+/* Placeholder (camera-off) */
+.split-peer-tile .placeholder-content {
+  gap: 0.4rem;
+}
+.split-peer-tile .placeholder-content svg {
+  width: 40px;
+  height: 40px;
+}
+.split-peer-tile .placeholder-text {
+  font-size: 0.75rem;
+}
+
+/* Top icon bar */
+.split-peer-tile .tile-top-icons {
+  top: 4px;
+  right: 4px;
+  gap: 3px;
+}
+/* All icon buttons: uniform 22×22 containers, 14×14 SVGs */
+.split-peer-tile .audio-indicator,
+.split-peer-tile .signal-indicator,
+.split-peer-tile .pin-icon,
+.split-peer-tile .crop-icon,
+.split-peer-tile .tile-mute-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+}
+.split-peer-tile .audio-indicator svg,
+.split-peer-tile .signal-indicator svg,
+.split-peer-tile .pin-icon svg,
+.split-peer-tile .crop-icon svg,
+.split-peer-tile .tile-mute-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.split-peer-tile .guest-badge {
+  font-size: 0.65em;
+  padding: 1px 5px;
 }
 
 /* Local screen-share preview — rendered below camera inside .host */
@@ -5678,19 +5856,12 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .color-swatches {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   width: var(--speaker-control-width);
-  gap: 10px;
-  flex-wrap: nowrap;
-  overflow: visible;
+  gap: 8px;
+  flex-wrap: wrap;
+  overflow: hidden;
   padding: 2px 0;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-
-
-.color-swatches::-webkit-scrollbar {
-  display: none; /* WebKit/Blink */
 }
 
 .color-swatch {
@@ -6504,8 +6675,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 html[data-theme="light"] .device-settings-modal-overlay {
   background: var(--device-settings-overlay-bg-image);
-  backdrop-filter: blur(6px) saturate(100%);
-  -webkit-backdrop-filter: blur(6px) saturate(100%);
+  backdrop-filter: blur(3px) saturate(100%);
+  -webkit-backdrop-filter: blur(3px) saturate(100%);
 }
 
 
@@ -7066,6 +7237,14 @@ html[data-theme="light"]
   color: var(--text-tertiary);
 }
 
+/* Unified diagnostics timeline (issue 173 / upstream 712). The chart body reuses
+   the `.neteq-chart-*` scroll/axis layout and the `.signal-chart-legend` checkbox
+   styling verbatim; these rules only add the drawer-local spacing so the legend
+   sits a little tighter under the overlaid timeline. */
+.unified-timeline-chart .unified-timeline-legend {
+  margin-top: 10px;
+}
+
 .signal-chart-legend {
   display: flex;
   flex-wrap: wrap;
@@ -7088,6 +7267,13 @@ html[data-theme="light"]
   cursor: pointer;
   accent-color: var(--text-tertiary);
 }
+/* Keyboard focus ring on the legend checkboxes so keyboard users can see which
+   series toggle is focused (a11y, issue 173). Matches the project's existing
+   `:focus-visible` outline idiom; benefits the shared signal-quality legend too. */
+.signal-chart-legend .legend-item input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .signal-chart-legend span {
   display: flex;
   align-items: center;
@@ -7097,6 +7283,13 @@ html[data-theme="light"]
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  display: inline-block;
+}
+/* Unified-timeline legend swatch: a short line carrying the SAME stroke + dash
+   pattern as the chart line, so the legend distinguishes series by shape (not
+   hue alone — color-blind safety, issue 173). */
+.signal-chart-legend .legend-swatch {
+  flex-shrink: 0;
   display: inline-block;
 }
 .legend-help-btn {
@@ -7698,18 +7891,18 @@ html[data-theme="dark"] .settings-modal {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.045) 0% /* @token-exempt: theme variant */,
-    rgba(255, 255, 255, 0.028) 100% /* @token-exempt: theme variant */
+    rgba(28, 26, 24, 0.92) 0% /* @token-exempt: theme variant */,
+    rgba(22, 21, 19, 0.88) 100% /* @token-exempt: theme variant */
   );
 
-  border: 1px solid rgba(255, 255, 255, 0.085); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.10); /* @token-exempt: theme variant */
 
   box-shadow:
     0 42px 120px rgba(0, 0, 0, 0.58) /* @token-exempt: theme variant */,
     0 18px 48px rgba(0, 0, 0, 0.34); /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(26px) saturate(145%) contrast(104%);
-  -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
+  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
 }
 
 .settings-sidebar-title-icon {
@@ -7734,15 +7927,15 @@ html[data-theme="dark"] .settings-panel {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.055) 0% /* @token-exempt: theme variant */,
-    rgba(255, 255, 255, 0.035) 100% /* @token-exempt: theme variant */
+    rgba(255, 255, 255, 0.08) 0% /* @token-exempt: theme variant */,
+    rgba(255, 255, 255, 0.055) 100% /* @token-exempt: theme variant */
   );
 
   box-shadow:
-    inset 1px 0 0 rgba(255, 255, 255, 0.045) /* @token-exempt: theme variant */,
-    inset 0 1px 0 rgba(255, 255, 255, 0.035); /* @token-exempt: theme variant */
+    inset 1px 0 0 rgba(255, 255, 255, 0.06) /* @token-exempt: theme variant */,
+    inset 0 1px 0 rgba(255, 255, 255, 0.05); /* @token-exempt: theme variant */
 
-  border: 1px solid rgba(255, 255, 255, 0.055); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.08); /* @token-exempt: theme variant */
 }
 
 html:not([data-theme]) .settings-panel::before,
@@ -7783,7 +7976,7 @@ html[data-theme="dark"] .settings-nav-button.active {
 
   margin: 8px 0 0;
 
-  background: rgba(255, 255, 255, 0.038); /* @token-exempt: theme variant */
+  background: rgba(255, 255, 255, 0.07); /* @token-exempt: theme variant */
 }
 
 /* INPUTS */
@@ -7817,8 +8010,8 @@ html[data-theme="dark"] .settings-input {
 html[data-theme="light"] .settings-modal {
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.52) 0% /* @token-exempt: theme variant */,
-    rgba(238, 242, 248, 0.38) 100% /* @token-exempt: theme variant */
+    rgba(255, 255, 255, 0.78) 0% /* @token-exempt: theme variant */,
+    rgba(238, 242, 248, 0.72) 100% /* @token-exempt: theme variant */
   );
 
   border: 1px solid rgba(255, 255, 255, 0.7); /* @token-exempt: theme variant */
@@ -7827,8 +8020,8 @@ html[data-theme="light"] .settings-modal {
     0 42px 120px rgba(90, 105, 130, 0.22) /* @token-exempt: theme variant */,
     0 18px 48px rgba(90, 105, 130, 0.14); /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(26px) saturate(145%) contrast(104%);
-  -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
+  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
 }
 
 html[data-theme="light"] .settings-layout {
@@ -7846,12 +8039,12 @@ html[data-theme="light"] .settings-panel {
 
   background: linear-gradient(
     180deg,
-    rgba(244, 243, 248, 0.94) 0% /* @token-exempt: theme variant */,
-    rgba(232, 233, 240, 0.92) 100% /* @token-exempt: theme variant */
+    rgba(244, 243, 248, 0.97) 0% /* @token-exempt: theme variant */,
+    rgba(232, 233, 240, 0.95) 100% /* @token-exempt: theme variant */
   );
 
-  backdrop-filter: blur(30px) saturate(130%);
-  -webkit-backdrop-filter: blur(30px) saturate(130%);
+  backdrop-filter: blur(16px) saturate(120%);
+  -webkit-backdrop-filter: blur(16px) saturate(120%);
 }
 
 html[data-theme="light"] .settings-panel::before,

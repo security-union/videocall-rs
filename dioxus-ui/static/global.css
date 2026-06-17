@@ -137,7 +137,9 @@ html[data-theme="dark"] {
   --bg-image: url("/static/themes/darktheme.png");
   --surface: #1c1c1e;
   --surface-elevated: #2c2c2e;
-  --surface-overlay: rgba(28, 28, 30, 0.9);
+  /* Derived from --surface via color-mix for brand coherence */
+  --surface-overlay: rgba(28, 28, 30, 0.9); /* fallback: color-mix below */
+  --surface-overlay: color-mix(in oklch, var(--surface) 90%, transparent);
   --border: #38383a;
   --border-emphasis: #48484a;
   --text-primary: #ffffff;
@@ -187,8 +189,11 @@ html[data-theme="dark"] {
   --overlay-strong: rgba(0, 0, 0, 0.5);
   --overlay-heavy: rgba(0, 0, 0, 0.6);
   --overlay-opaque: rgba(0, 0, 0, 0.8);
-  --field-bg: rgba(255, 255, 255, 0.05);
-  --field-bg-hover: rgba(255, 255, 255, 0.07);
+  /* Derived from --text-primary via color-mix for brand coherence */
+  --field-bg: rgba(255, 255, 255, 0.05); /* fallback: color-mix below */
+  --field-bg: color-mix(in oklch, var(--text-primary) 5%, transparent);
+  --field-bg-hover: rgba(255, 255, 255, 0.07); /* fallback: color-mix below */
+  --field-bg-hover: color-mix(in oklch, var(--text-primary) 7%, transparent);
   /* Tile border: softened from rgba(100,100,100,0.3) to a lighter,
      lower-opacity gray for a more subtle separation against dark
      surfaces (see PR refining peer-tile layout). */
@@ -208,7 +213,9 @@ html[data-theme="dark"] {
   --search-badge-idle-text: #facc15;
   --shadow-overlay:
     0 8px 20px rgba(0, 0, 0, 0.45), inset 0 1px 0 rgba(255, 255, 255, 0.05);
-  --hairline: rgba(255, 255, 255, 0.14);
+  /* Derived from --text-primary via color-mix for brand coherence */
+  --hairline: rgba(255, 255, 255, 0.14); /* fallback: color-mix below */
+  --hairline: color-mix(in oklch, var(--text-primary) 14%, transparent);
   /* Generic interactive focus-ring outline color (keyboard focus-visible /
      active control accents). Bright blue reads clearly over dark surfaces. */
   --focus-ring: #6ea8fe;
@@ -219,7 +226,9 @@ html[data-theme="light"] {
   --bg-image: url("/static/themes/theme_light_v1.png");
   --surface: #ffffff;
   --surface-elevated: #f9f9fb;
-  --surface-overlay: rgba(255, 255, 255, 0.95);
+  /* Derived from --surface via color-mix for brand coherence */
+  --surface-overlay: rgba(255, 255, 255, 0.95); /* fallback: color-mix below */
+  --surface-overlay: color-mix(in oklch, var(--surface) 95%, transparent);
   --border: #e0e0e2;
   --border-emphasis: #d0d0d4;
   --text-primary: #1a1a1a;
@@ -259,8 +268,12 @@ html[data-theme="light"] {
   --overlay-strong: rgba(0, 0, 0, 0.3);
   --overlay-heavy: rgba(0, 0, 0, 0.4);
   --overlay-opaque: rgba(0, 0, 0, 0.6);
-  --field-bg: rgba(0, 0, 0, 0.04);
-  --field-bg-hover: rgba(0, 0, 0, 0.06);
+  /* Derived from --text-primary via color-mix for brand coherence;
+     sub-perceptible micro-shift: #1a1a1a at 4%/6% vs pure black at same alpha */
+  --field-bg: rgba(0, 0, 0, 0.04); /* fallback: color-mix below */
+  --field-bg: color-mix(in oklch, var(--text-primary) 4%, transparent);
+  --field-bg-hover: rgba(0, 0, 0, 0.06); /* fallback: color-mix below */
+  --field-bg-hover: color-mix(in oklch, var(--text-primary) 6%, transparent);
   /* Tile border: softened from rgba(100,100,100,0.15) to a lighter,
      lower-opacity gray for a more subtle separation against light
      surfaces (see PR refining peer-tile layout). */
@@ -280,6 +293,8 @@ html[data-theme="light"] {
   --search-badge-idle-text: #ff9500;
   --shadow-overlay:
     0 8px 20px rgba(0, 0, 0, 0.1), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+  /* Light hairline retains literal: intentional blue-gray cast not derivable
+     from the neutral --text-primary semantic token */
   --hairline: rgba(100, 100, 120, 0.12);
   /* Generic interactive focus-ring outline color. Deeper system blue keeps
      contrast on the light theme's bright surfaces. */
@@ -311,13 +326,17 @@ html[data-theme="dark"] {
   --scrollbar-thumb-strong: rgba(255, 255, 255, 0.35);
   --scrollbar-thumb-active: rgba(255, 255, 255, 0.5);
 
-  /* Meeting state pills (active / idle / ended) */
-  --state-active-bg: rgba(48, 209, 88, 0.1);
+  /* Meeting state pills (active / idle / ended) — active/idle derived from --success/--warning */
+  --state-active-bg: rgba(48, 209, 88, 0.1); /* fallback: color-mix below */
+  --state-active-bg: color-mix(in oklch, var(--success) 10%, transparent);
   --state-active-text: rgba(48, 209, 88, 0.8);
-  --state-active-border: rgba(48, 209, 88, 0.22);
-  --state-idle-bg: rgba(255, 159, 10, 0.1);
+  --state-active-border: rgba(48, 209, 88, 0.22); /* fallback: color-mix below */
+  --state-active-border: color-mix(in oklch, var(--success) 22%, transparent);
+  --state-idle-bg: rgba(255, 159, 10, 0.1); /* fallback: color-mix below */
+  --state-idle-bg: color-mix(in oklch, var(--warning) 10%, transparent);
   --state-idle-text: rgba(255, 159, 10, 0.8);
-  --state-idle-border: rgba(255, 159, 10, 0.22);
+  --state-idle-border: rgba(255, 159, 10, 0.22); /* fallback: color-mix below */
+  --state-idle-border: color-mix(in oklch, var(--warning) 22%, transparent);
   --state-ended-bg: rgba(142, 142, 147, 0.1);
   --state-ended-text: rgba(142, 142, 147, 0.7);
   --state-ended-border: rgba(142, 142, 147, 0.18);
@@ -386,12 +405,17 @@ html[data-theme="dark"] {
   /* CTA glow overlay */
   --cta-glow-color: rgba(255, 255, 255, 0.6);
 
-  /* OAuth (generic blue) */
-  --oauth-blue-bg: rgba(10, 132, 255, 0.25);
-  --oauth-blue-bg-hover: rgba(10, 132, 255, 0.35);
-  --oauth-blue-bg-active: rgba(10, 132, 255, 0.4);
-  --oauth-blue-border: rgba(10, 132, 255, 0.35);
-  --oauth-blue-border-hover: rgba(10, 132, 255, 0.5);
+  /* OAuth (generic blue) — derived from --accent-hover for brand coherence */
+  --oauth-blue-bg: rgba(10, 132, 255, 0.25); /* fallback: color-mix below */
+  --oauth-blue-bg: color-mix(in oklch, var(--accent-hover) 25%, transparent);
+  --oauth-blue-bg-hover: rgba(10, 132, 255, 0.35); /* fallback: color-mix below */
+  --oauth-blue-bg-hover: color-mix(in oklch, var(--accent-hover) 35%, transparent);
+  --oauth-blue-bg-active: rgba(10, 132, 255, 0.4); /* fallback: color-mix below */
+  --oauth-blue-bg-active: color-mix(in oklch, var(--accent-hover) 40%, transparent);
+  --oauth-blue-border: rgba(10, 132, 255, 0.35); /* fallback: color-mix below */
+  --oauth-blue-border: color-mix(in oklch, var(--accent-hover) 35%, transparent);
+  --oauth-blue-border-hover: rgba(10, 132, 255, 0.5); /* fallback: color-mix below */
+  --oauth-blue-border-hover: color-mix(in oklch, var(--accent-hover) 50%, transparent);
   --back-btn-hover-bg: rgba(10, 132, 255, 0.08);
 
   /* Settings card (in-page settings — distinct from settings-modal-*) */
@@ -474,8 +498,9 @@ html[data-theme="dark"] {
   --field-tooltip-inset: rgba(255, 255, 255, 0.04);
   --field-tooltip-text: rgba(255, 255, 255, 0.92);
 
-  /* Invalid input focus ring */
-  --input-invalid-focus-ring: rgba(255, 69, 58, 0.25);
+  /* Invalid input focus ring — derived from --error */
+  --input-invalid-focus-ring: rgba(255, 69, 58, 0.25); /* fallback: color-mix below */
+  --input-invalid-focus-ring: color-mix(in oklch, var(--error) 25%, transparent);
 
   /* Primary/secondary button specifics */
   --btn-primary-border: rgba(255, 255, 255, 0.12);
@@ -561,18 +586,27 @@ html[data-theme="dark"] {
   /* Diag info border (peer-toast inner divider) */
   --diag-info-border: rgba(255, 255, 255, 0.04);
 
-  /* Btn warning */
-  --btn-warning-bg: rgba(255, 159, 10, 0.18);
-  --btn-warning-bg-hover: rgba(255, 159, 10, 0.28);
-  --btn-warning-border: rgba(255, 159, 10, 0.25);
-  --btn-warning-border-hover: rgba(255, 159, 10, 0.4);
+  /* Btn warning — derived from --warning via color-mix for brand coherence */
+  --btn-warning-bg: rgba(255, 159, 10, 0.18); /* fallback: color-mix below */
+  --btn-warning-bg: color-mix(in oklch, var(--warning) 18%, transparent);
+  --btn-warning-bg-hover: rgba(255, 159, 10, 0.28); /* fallback: color-mix below */
+  --btn-warning-bg-hover: color-mix(in oklch, var(--warning) 28%, transparent);
+  --btn-warning-border: rgba(255, 159, 10, 0.25); /* fallback: color-mix below */
+  --btn-warning-border: color-mix(in oklch, var(--warning) 25%, transparent);
+  --btn-warning-border-hover: rgba(255, 159, 10, 0.4); /* fallback: color-mix below */
+  --btn-warning-border-hover: color-mix(in oklch, var(--warning) 40%, transparent);
 
-  /* Btn danger */
-  --btn-danger-bg: rgba(255, 69, 58, 0.1);
-  --btn-danger-bg-hover: rgba(255, 69, 58, 0.22);
-  --btn-danger-border: rgba(255, 69, 58, 0.18);
-  --btn-danger-border-hover: rgba(255, 69, 58, 0.35);
-  --btn-danger-divider: rgba(255, 69, 58, 0.2);
+  /* Btn danger — derived from --error via color-mix for brand coherence */
+  --btn-danger-bg: rgba(255, 69, 58, 0.1); /* fallback: color-mix below */
+  --btn-danger-bg: color-mix(in oklch, var(--error) 10%, transparent);
+  --btn-danger-bg-hover: rgba(255, 69, 58, 0.22); /* fallback: color-mix below */
+  --btn-danger-bg-hover: color-mix(in oklch, var(--error) 22%, transparent);
+  --btn-danger-border: rgba(255, 69, 58, 0.18); /* fallback: color-mix below */
+  --btn-danger-border: color-mix(in oklch, var(--error) 18%, transparent);
+  --btn-danger-border-hover: rgba(255, 69, 58, 0.35); /* fallback: color-mix below */
+  --btn-danger-border-hover: color-mix(in oklch, var(--error) 35%, transparent);
+  --btn-danger-divider: rgba(255, 69, 58, 0.2); /* fallback: color-mix below */
+  --btn-danger-divider: color-mix(in oklch, var(--error) 20%, transparent);
   --btn-danger-label: rgba(255, 69, 58, 0.6);
 
   /* Crop active foreground */
@@ -607,6 +641,19 @@ html[data-theme="dark"] {
   --transport-badge-bg: #1c1c1e;
   --transport-badge-text: #0a84ff;
   --transport-badge-border: #38383a;
+
+  /* Issue 1483: per-tile WT/WS transport badge — OPAQUE fills with fixed text
+     colors for guaranteed AA contrast over arbitrary peer video (translucent
+     tints failed WCAG on mid-tone video). WT (primary) = solid blue + white;
+     WS (fallback) = solid amber + black — the same amber-on-video combo
+     .guest-badge already uses. Distinct hues keep the two transports CVD-safe.
+     @token-exempt: explicit fixed-contrast badge colors over arbitrary peer video (see .guest-badge precedent) */
+  --transport-badge-wt-text: #ffffff;
+  --transport-badge-wt-bg: #0062cc;
+  --transport-badge-wt-border: rgba(255, 255, 255, 0.25);
+  --transport-badge-ws-text: #000000;
+  --transport-badge-ws-bg: #ff9f0a;
+  --transport-badge-ws-border: rgba(0, 0, 0, 0.25);
 
   /* Generic context-menu inner divider */
   --context-menu-shadow: rgba(0, 0, 0, 0.5);
@@ -660,12 +707,18 @@ html[data-theme="light"] {
   --scrollbar-thumb-strong: rgba(0, 0, 0, 0.35);
   --scrollbar-thumb-active: rgba(0, 0, 0, 0.5);
 
-  --state-active-bg: rgba(48, 209, 88, 0.14);
+  /* Meeting state pills — active/idle derived from --success/--warning (light uses
+     slightly different bases; converting to var() is an accepted micro-correction) */
+  --state-active-bg: rgba(48, 209, 88, 0.14); /* fallback: color-mix below */
+  --state-active-bg: color-mix(in oklch, var(--success) 14%, transparent);
   --state-active-text: rgba(20, 140, 50, 0.95);
-  --state-active-border: rgba(48, 209, 88, 0.3);
-  --state-idle-bg: rgba(255, 149, 0, 0.14);
+  --state-active-border: rgba(48, 209, 88, 0.3); /* fallback: color-mix below */
+  --state-active-border: color-mix(in oklch, var(--success) 30%, transparent);
+  --state-idle-bg: rgba(255, 149, 0, 0.14); /* fallback: color-mix below */
+  --state-idle-bg: color-mix(in oklch, var(--warning) 14%, transparent);
   --state-idle-text: rgba(180, 100, 0, 0.95);
-  --state-idle-border: rgba(255, 149, 0, 0.3);
+  --state-idle-border: rgba(255, 149, 0, 0.3); /* fallback: color-mix below */
+  --state-idle-border: color-mix(in oklch, var(--warning) 30%, transparent);
   --state-ended-bg: rgba(142, 142, 147, 0.12);
   --state-ended-text: rgba(99, 99, 102, 0.9);
   --state-ended-border: rgba(142, 142, 147, 0.24);
@@ -724,11 +777,17 @@ html[data-theme="light"] {
 
   --cta-glow-color: rgba(255, 255, 255, 0.7);
 
-  --oauth-blue-bg: rgba(10, 132, 255, 0.18);
-  --oauth-blue-bg-hover: rgba(10, 132, 255, 0.26);
-  --oauth-blue-bg-active: rgba(10, 132, 255, 0.3);
-  --oauth-blue-border: rgba(10, 132, 255, 0.3);
-  --oauth-blue-border-hover: rgba(10, 132, 255, 0.4);
+  /* OAuth (generic blue) — derived from --accent-hover for brand coherence */
+  --oauth-blue-bg: rgba(10, 132, 255, 0.18); /* fallback: color-mix below */
+  --oauth-blue-bg: color-mix(in oklch, var(--accent-hover) 18%, transparent);
+  --oauth-blue-bg-hover: rgba(10, 132, 255, 0.26); /* fallback: color-mix below */
+  --oauth-blue-bg-hover: color-mix(in oklch, var(--accent-hover) 26%, transparent);
+  --oauth-blue-bg-active: rgba(10, 132, 255, 0.3); /* fallback: color-mix below */
+  --oauth-blue-bg-active: color-mix(in oklch, var(--accent-hover) 30%, transparent);
+  --oauth-blue-border: rgba(10, 132, 255, 0.3); /* fallback: color-mix below */
+  --oauth-blue-border: color-mix(in oklch, var(--accent-hover) 30%, transparent);
+  --oauth-blue-border-hover: rgba(10, 132, 255, 0.4); /* fallback: color-mix below */
+  --oauth-blue-border-hover: color-mix(in oklch, var(--accent-hover) 40%, transparent);
   --back-btn-hover-bg: rgba(10, 132, 255, 0.1);
 
   --settings-card-bg: rgba(0, 0, 0, 0.04);
@@ -798,7 +857,9 @@ html[data-theme="light"] {
   --field-tooltip-inset: rgba(255, 255, 255, 0.5);
   --field-tooltip-text: rgba(20, 20, 20, 0.92);
 
-  --input-invalid-focus-ring: rgba(255, 59, 48, 0.2);
+  /* Invalid input focus ring — derived from --error */
+  --input-invalid-focus-ring: rgba(255, 59, 48, 0.2); /* fallback: color-mix below */
+  --input-invalid-focus-ring: color-mix(in oklch, var(--error) 20%, transparent);
 
   --btn-primary-border: rgba(0, 0, 0, 0.08);
   --btn-primary-shadow-1: rgba(0, 122, 255, 0.18);
@@ -873,16 +934,28 @@ html[data-theme="light"] {
 
   --diag-info-border: rgba(0, 0, 0, 0.04);
 
-  --btn-warning-bg: rgba(255, 149, 0, 0.14);
-  --btn-warning-bg-hover: rgba(255, 149, 0, 0.22);
-  --btn-warning-border: rgba(255, 149, 0, 0.2);
-  --btn-warning-border-hover: rgba(255, 149, 0, 0.32);
+  /* Btn warning — derived from --warning via color-mix for brand coherence
+     (light bases were rgba(255,149,0,x) — converting to var(--warning) is accepted) */
+  --btn-warning-bg: rgba(255, 149, 0, 0.14); /* fallback: color-mix below */
+  --btn-warning-bg: color-mix(in oklch, var(--warning) 14%, transparent);
+  --btn-warning-bg-hover: rgba(255, 149, 0, 0.22); /* fallback: color-mix below */
+  --btn-warning-bg-hover: color-mix(in oklch, var(--warning) 22%, transparent);
+  --btn-warning-border: rgba(255, 149, 0, 0.2); /* fallback: color-mix below */
+  --btn-warning-border: color-mix(in oklch, var(--warning) 20%, transparent);
+  --btn-warning-border-hover: rgba(255, 149, 0, 0.32); /* fallback: color-mix below */
+  --btn-warning-border-hover: color-mix(in oklch, var(--warning) 32%, transparent);
 
-  --btn-danger-bg: rgba(255, 59, 48, 0.08);
-  --btn-danger-bg-hover: rgba(255, 59, 48, 0.16);
-  --btn-danger-border: rgba(255, 59, 48, 0.14);
-  --btn-danger-border-hover: rgba(255, 59, 48, 0.28);
-  --btn-danger-divider: rgba(255, 59, 48, 0.16);
+  /* Btn danger — derived from --error via color-mix for brand coherence */
+  --btn-danger-bg: rgba(255, 59, 48, 0.08); /* fallback: color-mix below */
+  --btn-danger-bg: color-mix(in oklch, var(--error) 8%, transparent);
+  --btn-danger-bg-hover: rgba(255, 59, 48, 0.16); /* fallback: color-mix below */
+  --btn-danger-bg-hover: color-mix(in oklch, var(--error) 16%, transparent);
+  --btn-danger-border: rgba(255, 59, 48, 0.14); /* fallback: color-mix below */
+  --btn-danger-border: color-mix(in oklch, var(--error) 14%, transparent);
+  --btn-danger-border-hover: rgba(255, 59, 48, 0.28); /* fallback: color-mix below */
+  --btn-danger-border-hover: color-mix(in oklch, var(--error) 28%, transparent);
+  --btn-danger-divider: rgba(255, 59, 48, 0.16); /* fallback: color-mix below */
+  --btn-danger-divider: color-mix(in oklch, var(--error) 16%, transparent);
   --btn-danger-label: rgba(215, 0, 21, 0.85);
 
   --crop-active-color: rgb(48, 160, 100);
@@ -910,6 +983,17 @@ html[data-theme="light"] {
   --transport-badge-text: #0a84ff;
   --transport-badge-border: #e0e0e2;
 
+  /* Issue 1483: light-theme per-tile WT/WS badge — identical OPAQUE fixed
+     fills to dark theme. The badge sits over arbitrary peer VIDEO (not the UI
+     surface), so its contrast must be theme-independent.
+     @token-exempt: explicit fixed-contrast badge colors over arbitrary peer video (see .guest-badge precedent) */
+  --transport-badge-wt-text: #ffffff;
+  --transport-badge-wt-bg: #0062cc;
+  --transport-badge-wt-border: rgba(255, 255, 255, 0.25);
+  --transport-badge-ws-text: #000000;
+  --transport-badge-ws-bg: #ff9f0a;
+  --transport-badge-ws-border: rgba(0, 0, 0, 0.25);
+
   --context-menu-shadow: rgba(0, 0, 0, 0.18);
   --context-menu-shadow-strong: rgba(0, 0, 0, 0.14);
   --context-menu-shadow-deep: rgba(0, 0, 0, 0.16);
@@ -936,18 +1020,18 @@ html[data-theme="dark"] {
   /* Modal structure — simple frosted glass */
   --settings-modal-bg: linear-gradient(
     180deg,
-    rgba(32, 30, 26, 0.72) 0%,
-    rgba(25, 24, 21, 0.68) 55%,
-    rgba(18, 18, 16, 0.72) 100%
+    rgba(28, 26, 24, 0.92) 0%,
+    rgba(22, 21, 19, 0.88) 55%,
+    rgba(18, 18, 16, 0.92) 100%
   );
 
-  --settings-modal-border: rgba(255, 255, 255, 0.075);
+  --settings-modal-border: rgba(255, 255, 255, 0.10);
 
   --settings-modal-shadow:
     0 36px 90px rgba(0, 0, 0, 0.48), 0 10px 28px rgba(0, 0, 0, 0.24);
 
-  --settings-backdrop-blur: 26px;
-  --settings-backdrop-saturation: 145%;
+  --settings-backdrop-blur: 16px;
+  --settings-backdrop-saturation: 130%;
   --settings-backdrop-contrast: 102%;
 
   /* Rim layer (::before) — very subtle glass edge */
@@ -1006,10 +1090,10 @@ html[data-theme="dark"] {
 
   /* Settings panel — solid grouped panel (dark): a hint lighter than the
      modal background so it reads as a layered card without feeling heavy. */
-  --settings-panel-bg: rgba(255, 255, 255, 0.012);
-  --settings-panel-border: rgba(255, 255, 255, 0.04);
-  --settings-panel-divider: rgba(255, 255, 255, 0.045);
-  --settings-panel-shadow: 0 1px 1px rgba(0, 0, 0, 0.1);
+  --settings-panel-bg: rgba(255, 255, 255, 0.04);
+  --settings-panel-border: rgba(255, 255, 255, 0.09);
+  --settings-panel-divider: rgba(255, 255, 255, 0.07);
+  --settings-panel-shadow: 0 1px 2px rgba(0, 0, 0, 0.18);
 
   /* Settings shell — filled button (dark) */
   --settings-button-bg: rgba(255, 255, 255, 0.1);
@@ -1026,10 +1110,10 @@ html[data-theme="dark"] {
   --device-settings-overlay-bg-image:
     radial-gradient(
       80% 80% at 50% 20%,
-      rgba(115, 170, 185, 0.16),
+      rgba(115, 170, 185, 0.10),
       transparent 58%
     ),
-    rgba(0, 0, 0, 0.34);
+    rgba(0, 0, 0, 0.62);
 
   /* Glass-select trigger open/active border (dark) */
   --glass-select-trigger-open-border: rgba(95, 130, 180, 0.3);
@@ -1103,8 +1187,8 @@ html[data-theme="light"] {
   /* Modal structure — simple frosted glass */
   --settings-modal-bg: linear-gradient(
     180deg,
-    rgba(244, 246, 250, 0.88) 0%,
-    rgba(228, 232, 238, 0.82) 100%
+    rgba(244, 246, 250, 0.95) 0%,
+    rgba(228, 232, 238, 0.92) 100%
   );
 
   --settings-modal-border: rgba(255, 255, 255, 0.72);
@@ -1114,14 +1198,14 @@ html[data-theme="light"] {
 
   /* --settings-modal-top-highlight: rgba(255, 255, 255, 0.92); */
 
-  --settings-backdrop-blur: 24px;
+  --settings-backdrop-blur: 16px;
   --settings-backdrop-saturation: 140%;
   --settings-backdrop-contrast: 102%;
 
   --device-settings-overlay-bg-image: linear-gradient(
     180deg,
-    rgba(232, 234, 239, 0.52) 0%,
-    rgba(214, 218, 225, 0.46) 100%
+    rgba(232, 234, 239, 0.72) 0%,
+    rgba(214, 218, 225, 0.66) 100%
   );
 
   --settings-rim-opacity: 0;
@@ -1180,10 +1264,10 @@ html[data-theme="light"] {
 
   /* Settings panel — solid grouped panel (light): a hint darker than the
      modal background so it reads as a layered card without feeling heavy. */
-  --settings-panel-bg: rgba(0, 0, 0, 0.025);
-  --settings-panel-border: rgba(0, 0, 0, 0.06);
-  --settings-panel-divider: rgba(0, 0, 0, 0.05);
-  --settings-panel-shadow: 0 1px 1px rgba(0, 0, 0, 0.025);
+  --settings-panel-bg: rgba(0, 0, 0, 0.05);
+  --settings-panel-border: rgba(0, 0, 0, 0.10);
+  --settings-panel-divider: rgba(0, 0, 0, 0.08);
+  --settings-panel-shadow: 0 1px 2px rgba(0, 0, 0, 0.05);
 
   /* Settings shell — filled button (light) */
   --settings-button-bg: rgba(0, 0, 0, 0.06);
@@ -1362,8 +1446,11 @@ html[data-theme="light"] #invite-overlay p {
   --overlay-strong: rgba(0, 0, 0, 0.5);
   --overlay-heavy: rgba(0, 0, 0, 0.6);
   --overlay-opaque: rgba(0, 0, 0, 0.8);
-  --field-bg: rgba(255, 255, 255, 0.05);
-  --field-bg-hover: rgba(255, 255, 255, 0.07);
+  /* Derived from --text-primary via color-mix for brand coherence */
+  --field-bg: rgba(255, 255, 255, 0.05); /* fallback: color-mix below */
+  --field-bg: color-mix(in oklch, var(--text-primary) 5%, transparent);
+  --field-bg-hover: rgba(255, 255, 255, 0.07); /* fallback: color-mix below */
+  --field-bg-hover: color-mix(in oklch, var(--text-primary) 7%, transparent);
   --signal-popup-bg: rgba(26, 26, 46, 0.97);
   --signal-popup-border: rgba(255, 255, 255, 0.12);
   --tooltip-bg: rgba(0, 0, 0, 0.92);
@@ -3538,4 +3625,45 @@ html[data-theme="light"] #invite-overlay p {
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
     monospace;
   font-size: 0.65rem;
+}
+
+/* Issue 1483: per-peer-tile WT/WS transport badge. A small pill that sits
+   beside the .signal-indicator meter in .tile-top-icons. Sized to match the
+   signal-popup .connection-type pill (11px/600/letter-spacing) but styled as
+   an independent rule here (server-gated, default OFF). Distinct colors via
+   the --transport-badge-wt-* / --transport-badge-ws-* theme vars so WT and WS
+   are visually separable. */
+.transport-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: clamp(9px, calc(var(--tile-h, 240px) * 0.05), 11px);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+  /* Prevent the 2-letter label wrapping if the row gets cramped. */
+  white-space: nowrap;
+  user-select: none;
+}
+
+.transport-badge--wt {
+  color: var(--transport-badge-wt-text);
+  background: var(--transport-badge-wt-bg);
+  border: 1px solid var(--transport-badge-wt-border);
+}
+
+.transport-badge--ws {
+  color: var(--transport-badge-ws-text);
+  background: var(--transport-badge-ws-bg);
+  border: 1px solid var(--transport-badge-ws-border);
+}
+
+/* Issue 1483: denser badge on split-screen peer tiles, mirroring the sibling
+   .tile-top-icons icon density there (see .split-peer-tile .guest-badge). */
+.split-peer-tile .transport-badge {
+  font-size: 9px;
+  padding: 1px 4px;
 }

@@ -25,6 +25,7 @@ mod transform;
 
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU32};
+use std::sync::Arc;
 
 use crate::VideoCallClient;
 use videocall_types::Callback;
@@ -32,14 +33,18 @@ use videocall_types::Callback;
 pub use camera_encoder::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
-    camera_encoder_frames_submitted_ok, camera_encoder_layers_torn_down, CameraEncoder,
+    camera_encoder_frames_submitted_ok, camera_encoder_layers_torn_down,
+    camera_encoder_restarts_closed_codec, camera_encoder_restarts_configure,
+    camera_encoder_restarts_memory, camera_encoder_restarts_other, CameraEncoder,
     LiveQualitySnapshot, QualityTierBounds, SimulcastLayerInfo, SimulcastSendSnapshot,
 };
 pub use microphone_encoder::MicrophoneEncoder;
 pub use screen_encoder::{
     screen_encoder_errors_closed_codec, screen_encoder_errors_configure_fatal,
     screen_encoder_errors_generic, screen_encoder_errors_vpx_mem_alloc,
-    screen_encoder_frames_submitted_ok, screen_encoder_layers_torn_down, ScreenEncoder,
+    screen_encoder_frames_submitted_ok, screen_encoder_layers_torn_down,
+    screen_encoder_restarts_closed_codec, screen_encoder_restarts_configure,
+    screen_encoder_restarts_memory, screen_encoder_restarts_other, ScreenEncoder,
     ScreenQualitySnapshot, ScreenQualityTierBounds, ScreenShareEvent,
 };
 
@@ -59,6 +64,10 @@ pub trait MicrophoneEncoderTrait {
     fn set_user_layer_ceiling(&self, ceiling: Option<u32>);
     /// The current user SEND audio layer-ceiling (layer COUNT), or `None` for Auto.
     fn user_layer_ceiling(&self) -> Option<u32>;
+    /// Share the CONGESTION-driven audio layer-ceiling atom (issue #621) so a
+    /// self-targeted server CONGESTION signal cuts the audio simulcast ladder to
+    /// base-only. See [`MicrophoneEncoder::set_congestion_layer_ceiling`].
+    fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>);
 }
 
 // Implement trait for Safari microphone encoder
@@ -89,6 +98,10 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
     fn user_layer_ceiling(&self) -> Option<u32> {
         self.user_layer_ceiling()
+    }
+
+    fn set_congestion_layer_ceiling(&mut self, ceiling: Arc<AtomicU32>) {
+        self.set_congestion_layer_ceiling(ceiling)
     }
 }
 

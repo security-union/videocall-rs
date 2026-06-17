@@ -48,13 +48,48 @@ const MAX_PLAYOUT_DELAY_MS: f64 = 500.0;
 /// - This is a live videoconference: liveness beats completeness. ~1.8s is the boundary past which
 ///   continuing to drain buffered video does more harm (A/V desync, growing lag) than dropping it.
 const MAX_PLAYOUT_AGE_MS: f64 = 1800.0;
-/// Minimum interval between proactive keyframe requests fired by the keyframe-less
-/// eviction path (issue #1025). Matched to the relay's KEYFRAME_REQUEST window
-/// (`KEYFRAME_REQUEST_WINDOW_MS`, ~1s) so a sustained keyframe-less stall emits at
-/// most ~1 request/sec from this receiver's uplink — the rate the relay will
-/// actually honor — instead of one per ~10ms eviction tick. See
-/// `last_keyframe_request_ms`.
+/// *Base* (first-strike) interval between proactive keyframe requests fired by the
+/// keyframe-less eviction path (issue #1025). Matched to the relay's KEYFRAME_REQUEST
+/// window (`KEYFRAME_REQUEST_WINDOW_MS`, ~1s) so the FIRST request of a stall emits at
+/// the rate the relay will actually honor — instead of one per ~10ms eviction tick.
+///
+/// Under a *sustained or recurring* stall this is only the first step: each subsequent
+/// request doubles the interval (exponential backoff, capped via
+/// `PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP`) so the receiver does not spray ~1 PLI/sec
+/// at the speaker for the whole meeting — the #1479 keyframe-storm amplifier. Crucially the
+/// backoff is keyed to *request* cadence, not to playout release: the #1479 field shape is
+/// many short (1–5s) freezes interleaved with smooth playout, NOT one long stall, so a reset
+/// on every frame release would zero the exponent between episodes and never damp the
+/// meeting-wide storm. Instead the exponent persists across closely-spaced re-freezes and
+/// only resets after a genuinely quiet interval with no proactive request — see
+/// `PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS` and
+/// `consecutive_proactive_keyframe_requests`. See `last_keyframe_request_ms`.
 const PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS: f64 = 1000.0;
+/// Maximum backoff exponent applied to `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS` under a
+/// sustained/recurring keyframe-less stall (issue #1479). With a 1000ms base, exponent 3 caps
+/// the proactive-PLI cadence at `1000 * 2^3 = 8000ms` — i.e. once recovery is clearly not
+/// arriving, this receiver pokes the speaker at most ~1/8s instead of ~1/s, damping the
+/// self-sustaining PLI storm. Going quiet is safe: the independent reactive gap-driven request
+/// path (`peer_decode_manager::should_request_keyframe`, 1s base + its own backoff + uncapped
+/// slow-retry) remains the binding lower bound on freeze recovery; this proactive path is only
+/// an accelerator on top of it, and the whole point of #1479 is to stop it from amplifying.
+const PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP: u32 = 3;
+/// Quiet interval (ms) since the last proactive keyframe request after which the backoff
+/// exponent resets to 0 (issue #1479). Set comfortably ABOVE the maximum backed-off interval
+/// (`1000 * 2^3 = 8000ms`) so a receiver legitimately firing at the capped ~1/8s cadence
+/// during an ongoing stall does NOT spuriously reset itself, while a genuinely recovered
+/// stream — one that has not needed a proactive request for >12s — re-arms at full speed for
+/// the next independent stall. This time-based reset is what makes the backoff accumulate
+/// across the storm's short, recurring freezes (each spaced well under 12s) instead of being
+/// zeroed by the brief smooth playout between them.
+///
+/// Note: this is intentionally shorter than the *reactive* gap-driven path's decay window
+/// (`peer_decode_manager`'s `KEYFRAME_BACKOFF_DECAY_MS`, 30s). The two paths are independent;
+/// the proactive path here is a more aggressive accelerator, so re-arming it sooner after a
+/// genuine recovery is fine — and it must stay strictly above this path's own 8s cap (see
+/// `PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP`) so a stall firing at the capped cadence never
+/// self-resets mid-storm.
+const PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS: f64 = 12_000.0;
 /// A multiplier applied to the jitter estimate to provide a safety margin.
 /// A value of 3.0 means we buffer enough to handle jitter up to 3x the running average.
 const JITTER_MULTIPLIER: f64 = 3.0;
@@ -155,6 +190,61 @@ const SOURCE_FRAME_INTERVAL_EWMA_ALPHA: f64 = 0.1;
 const MIN_SOURCE_FRAME_INTERVAL_MS: f64 = 8.0;
 const MAX_SOURCE_FRAME_INTERVAL_MS: f64 = 1000.0;
 
+// --- Resync-to-live governor (issue #1252, v1) ---
+//
+// Field read on conceptcar7 confirmed H1: under loss a slow receiver's
+// `playout_latency` total tracks the stage-1 jitter-buffer backlog span while the decode
+// queue stays ≈ 0, so the multi-second video-behind-audio lag lives in THIS buffer. The
+// 1800ms freshness deadline (`MAX_PLAYOUT_AGE_MS`) only fires when the *head-of-line* frame
+// is itself stale; a backlog can sit at 1.2–1.7s of accumulated lag with a perfectly fresh
+// head (frames keep arriving) and never trip it. The governor adds a second, latency-driven
+// trigger that resyncs to live by skipping the buffered backlog to the newest buffered
+// keyframe — reusing the exact same skip helper the deadline uses, so the two cannot diverge.
+//
+// v1 is a SAFE SUBSET: it introduces ZERO new keyframe-request / PLI sources. If there is no
+// buffered keyframe to skip to, the governor does nothing and leaves that case entirely to the
+// 1800ms deadline (which owns keyframe-less eviction + the throttled proactive request). This
+// preserves the #1287/#1297/#814 keyframe-storm-avoidance invariant.
+
+/// Buffered playout-latency total (ms) at/above which the governor begins counting toward a
+/// resync skip. Chosen within the designed 1200–1500ms engage band and comfortably below the
+/// 1800ms freshness deadline so the governor resyncs the *fresh-head* backlog case the deadline
+/// structurally cannot see, while still leaving the deadline as the backstop. The loss repro
+/// pins steady-state lag near ~1700ms, so 1300ms engages well before the deadline would.
+const GOVERNOR_ENGAGE_MS: f64 = 1300.0;
+/// Buffered playout-latency total (ms) below which the engaged EPISODE is considered recovered
+/// and `governor_engaged` clears. Set just below `MAX_PLAYOUT_DELAY_MS` (500) so the episode is
+/// marked recovered once the stream is back inside the normal adaptive-delay envelope. This is an
+/// observability/episode boundary, NOT a skip gate — the skip is gated by sustain re-accumulation
+/// plus `GOVERNOR_COOLDOWN_MS` (see `run_resync_governor`). A latch-gate here would deadlock
+/// because post-skip latency can settle above this value (see the `governor_engaged` field doc).
+const GOVERNOR_DISENGAGE_MS: f64 = 450.0;
+/// Consecutive ticks the latency total must stay at/above `GOVERNOR_ENGAGE_MS` before the
+/// governor skips. At the ~10ms worker tick this is ~400ms of sustained high latency, long
+/// enough that transient jitter/reordering spikes cannot trip a skip but short enough to react
+/// well within the engage band.
+const GOVERNOR_SUSTAIN_TICKS: u32 = 40;
+/// Minimum wall-clock interval (ms) between governor skips. ~one keyframe RTT: after a skip the
+/// buffer must be allowed to refill and the latency to recompute before another skip is even
+/// considered, so the governor cannot thrash-skip during recovery.
+const GOVERNOR_COOLDOWN_MS: f64 = 2500.0;
+
+/// Compile-time guard on the load-bearing governor/deadline threshold ordering:
+/// `GOVERNOR_DISENGAGE_MS (450) < MAX_PLAYOUT_DELAY_MS (500) < GOVERNOR_ENGAGE_MS (1300) <
+/// MAX_PLAYOUT_AGE_MS (1800)`. This ordering is what makes the governor coexist with the
+/// freshness deadline rather than fight it: disengage sits inside the normal adaptive-delay
+/// envelope (so an engaged episode is marked recovered there), engage sits above that envelope but below the
+/// deadline (so the governor handles the fresh-head backlog the deadline cannot see, while the
+/// deadline remains the backstop for a genuinely stale head). If any of these constants is
+/// re-tuned across a boundary this assert fails the build, forcing a re-derivation rather than a
+/// silent behavior change. (f64 comparison in a const assert is permitted on current Rust; if
+/// const eval ever rejects it, that is a real signal to stop, not to work around.)
+const _: () = assert!(
+    GOVERNOR_DISENGAGE_MS < MAX_PLAYOUT_DELAY_MS
+        && MAX_PLAYOUT_DELAY_MS < GOVERNOR_ENGAGE_MS
+        && GOVERNOR_ENGAGE_MS < MAX_PLAYOUT_AGE_MS
+);
+
 /// Details of a freshness-deadline skip/eviction, surfaced to the worker so it can
 /// forward the event to the main thread's console-log upload pipeline (issue #1045).
 /// The freshness deadline runs INSIDE the decoder worker, so its outcome was
@@ -242,11 +332,28 @@ pub struct JitterBuffer<T> {
     /// eviction cadence tracks the delta rate (~10–30/s), and without this gate the
     /// hook would spray the already-struggling receiver's uplink + worker→main bus
     /// with that many KEYFRAME_REQUESTs — packets the relay limiter then drops
-    /// anyway. We fire at most once per `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS`
-    /// so the emitted rate matches the rate the relay will honor (~1/s). `None`
-    /// until the first fire; reset on `flush()` so a fresh stream can request
-    /// immediately.
+    /// anyway. The first request of a stall fires after
+    /// `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS`; under a sustained stall the
+    /// interval then grows exponentially (see
+    /// `consecutive_proactive_keyframe_requests`) so the emitted rate decays from
+    /// ~1/s toward ~1/8s instead of pinning at the relay window. `None` until the
+    /// first fire; reset on `flush()` so a fresh stream can request immediately.
     last_keyframe_request_ms: Option<u128>,
+
+    /// Backoff exponent for the proactive keyframe-request interval (issues #1025/#1479):
+    /// the number of proactive requests fired without a long enough quiet gap to reset.
+    /// Incremented on every fire; reset to 0 when the gap since the last fire exceeds
+    /// `PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS` (genuine sustained recovery) or on
+    /// `flush()`.
+    ///
+    /// Deliberately keyed to *request cadence*, NOT to frame release. The #1479 storm is many
+    /// short (1–5s) freezes interleaved with smooth playout, not one long stall; resetting on
+    /// frame release would zero the exponent during every smooth gap and the backoff would
+    /// never accumulate across the storm — defeating the fix. Keying the reset to a quiet
+    /// interval (> the capped 8s cadence) means the exponent persists across the storm's
+    /// closely-spaced re-freezes and only resets once the stream has genuinely stopped needing
+    /// proactive requests.
+    consecutive_proactive_keyframe_requests: u32,
 
     /// Most recent freshness-deadline skip this poll produced (issue #1045), set by
     /// `enforce_freshness_deadline` and consumed by the worker via
@@ -262,6 +369,38 @@ pub struct JitterBuffer<T> {
     /// Coalesced freshness-skip details accumulated while the diagnostic gate is
     /// closed. The next emitted diagnostic includes this pending dropped count.
     pending_freshness_skip: Option<FreshnessSkip>,
+
+    /// Resync-governor (issue #1252): count of consecutive ~10ms ticks on which the buffered
+    /// playout-latency total was at/above `GOVERNOR_ENGAGE_MS`. Resets to 0 whenever the total
+    /// drops below the engage threshold and after a successful governor skip. The governor only
+    /// skips once this reaches `GOVERNOR_SUSTAIN_TICKS`, so a transient jitter spike cannot trip
+    /// a resync. Runtime state — reset on `flush()`.
+    governor_sustain_ticks: u32,
+
+    /// Resync-governor (issue #1252): engaged-EPISODE flag, `true` from the tick a governor skip
+    /// fires until the latency total falls back below `GOVERNOR_DISENGAGE_MS`. This is an
+    /// OBSERVABILITY / lifecycle flag, NOT a control gate: it is not read by the skip decision in
+    /// `run_resync_governor` — it is written on skip/disengage and `flush()` resets it, but the
+    /// only readers today are the unit tests (reserved for a future engaged-state export; the
+    /// metric commit exports the skip COUNT, not this flag). The actual re-skip guard / hysteresis is the
+    /// `governor_sustain_ticks` re-accumulation (reset to 0 after every skip, so the latency must
+    /// climb back and hold for `GOVERNOR_SUSTAIN_TICKS` again) PLUS `GOVERNOR_COOLDOWN_MS`.
+    /// Gating the skip on this latch was deliberately rejected: post-skip latency commonly settles
+    /// BETWEEN `GOVERNOR_DISENGAGE_MS` (450) and `GOVERNOR_ENGAGE_MS` (1300), so the latch would
+    /// not clear and a latch-gate would deadlock the next legitimate excursion. Runtime state —
+    /// reset on `flush()`.
+    governor_engaged: bool,
+
+    /// Resync-governor (issue #1252): wall-clock (ms) of the last governor skip, used as the
+    /// `GOVERNOR_COOLDOWN_MS` anchor so the governor cannot skip again while a prior resync is
+    /// still recovering. `None` until the first skip. Runtime state — reset on `flush()`.
+    governor_last_skip_ms: Option<u128>,
+
+    /// Resync-governor (issue #1252): LIFETIME count of governor skips. This is the
+    /// observability counter exposed via [`JitterBuffer::governor_skip_count`] for the
+    /// Prometheus metric wired in a follow-up commit. Deliberately NOT reset by `flush()` — it
+    /// is a cumulative metric, not runtime state.
+    governor_skips: u64,
 }
 
 impl<T> JitterBuffer<T> {
@@ -290,9 +429,14 @@ impl<T> JitterBuffer<T> {
             decoder,
             request_keyframe,
             last_keyframe_request_ms: None,
+            consecutive_proactive_keyframe_requests: 0,
             last_freshness_skip: None,
             last_freshness_skip_emit_ms: None,
             pending_freshness_skip: None,
+            governor_sustain_ticks: 0,
+            governor_engaged: false,
+            governor_last_skip_ms: None,
+            governor_skips: 0,
         }
     }
 
@@ -427,6 +571,14 @@ impl<T> JitterBuffer<T> {
             self.buffered_frames.len(),
             self.target_playout_delay_ms
         );
+
+        // Resync-to-live governor (issue #1252): evaluate the tick-level buffered playout latency
+        // ONCE per tick, before the release loop. A successful governor skip drops the stale
+        // backlog to the newest buffered keyframe; the loop below (freshness deadline + release
+        // gate) then drains the post-governor state normally, releasing that keyframe through the
+        // usual gap-recovery path. Placed before the loop (not inside it) because the governor's
+        // trigger is the once-per-tick latency total, not a per-loop-iteration condition.
+        self.run_resync_governor(current_time_ms);
 
         loop {
             let mut found_frame_to_move = false;
@@ -697,39 +849,37 @@ impl<T> JitterBuffer<T> {
             return false;
         }
 
-        // Backlog is stale. Find the NEWEST buffered keyframe to skip to so we land as close to
-        // live as possible while still resuming from a self-contained frame.
-        let newest_keyframe = self
-            .buffered_frames
-            .iter()
-            .rev()
-            .find(|(_, f)| f.is_keyframe())
-            .map(|(&s, _)| s);
+        // Backlog is stale. Determine whether ANY buffered keyframe exists. We must keep this
+        // presence check SEPARATE from the drop result: the shared
+        // `skip_to_newest_buffered_keyframe` helper collapses "no keyframe found" and "keyframe
+        // found but already the head (nothing dropped)" into a single `None`, but the original
+        // deadline semantics treat those two cases very differently — only the genuinely
+        // keyframe-LESS case may evict deltas + fire a proactive keyframe request. Routing the
+        // helper's `None` blindly into the keyframe-less branch would (a) evict a keyframe that
+        // sits at the head and (b) spuriously fire a PLI. So we branch on `has_keyframe` first.
+        let has_keyframe = self.buffered_frames.values().any(|f| f.is_keyframe());
 
-        match newest_keyframe {
-            Some(keyframe_seq) => {
-                // Drop the stale delta/keyframe backlog before the chosen keyframe. The keyframe
-                // itself is preserved and will be released by the normal gate on the next loop
-                // iteration. Because we resume from a keyframe, `find_and_move_continuous_frames`
-                // treats it as gap/restart recovery and decoding continues cleanly.
-                //
-                // CRITICAL termination guard: `drop_frames_before(seq)` only removes keys strictly
-                // `< seq`, so when the chosen keyframe is ALREADY the head of the buffer (nothing
-                // before it) it removes nothing. If we returned `true` unconditionally in that case,
-                // the caller would `continue`, re-enter with an unchanged buffer, and spin forever
-                // (the 10ms worker tick → tab freeze). This is reachable: e.g. background-tab
-                // throttling clamps/pauses `setInterval`, so on refocus the first tick's
-                // `Date::now()` delta is multi-second and a buffered post-gap keyframe is instantly
-                // ≥ MAX_PLAYOUT_AGE_MS old while sitting at the head. So we only report progress
-                // (return `true`) when we actually shrank the buffer. When 0 were dropped, return
-                // `false` and let the normal CASE-2 (gap) / CASE-3 (never-decoded) path select this
-                // head keyframe and release it through the normal gate — which advances
-                // `last_decoded_sequence_number` correctly.
-                let dropped_before = self.dropped_frames_count;
-                self.drop_frames_before(keyframe_seq);
-                let dropped_any = self.dropped_frames_count > dropped_before;
-                if dropped_any {
-                    let dropped = self.dropped_frames_count - dropped_before;
+        if has_keyframe {
+            // Drop the stale delta/keyframe backlog before the NEWEST keyframe so we land as close
+            // to live as possible while resuming from a self-contained frame. The keyframe itself
+            // is preserved and released by the normal gate on the next loop iteration; because we
+            // resume from a keyframe, `find_and_move_continuous_frames` treats it as gap/restart
+            // recovery and decoding continues cleanly.
+            //
+            // CRITICAL termination guard: the helper returns `None` when the chosen keyframe is
+            // ALREADY the head (nothing before it to drop). If we returned `true` unconditionally
+            // in that case, the caller would `continue`, re-enter with an unchanged buffer, and
+            // spin forever (the 10ms worker tick → tab freeze). This is reachable: e.g.
+            // background-tab throttling clamps/pauses `setInterval`, so on refocus the first tick's
+            // `Date::now()` delta is multi-second and a buffered post-gap keyframe is instantly
+            // ≥ MAX_PLAYOUT_AGE_MS old while sitting at the head. So we only report progress
+            // (return `true`) when we actually shrank the buffer. When 0 were dropped, return
+            // `false` and let the normal CASE-2 (gap) / CASE-3 (never-decoded) path select this
+            // head keyframe and release it through the normal gate — which advances
+            // `last_decoded_sequence_number` correctly. We must NOT fall through to the
+            // keyframe-less eviction/PLI branch here: a keyframe genuinely exists.
+            match self.skip_to_newest_buffered_keyframe() {
+                Some((keyframe_seq, dropped)) => {
                     log::debug!(
                         "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms >= {MAX_PLAYOUT_AGE_MS:.0}ms). Skipped to live keyframe {keyframe_seq}, dropped {dropped} stale frame(s)."
                     );
@@ -742,64 +892,190 @@ impl<T> JitterBuffer<T> {
                             dropped,
                         },
                     );
+                    true
                 }
-                dropped_any
+                // Keyframe is already the head, nothing before it to drop — fall through and let
+                // the normal release gate pick it up. Do NOT evict / fire a PLI.
+                None => false,
             }
-            None => {
-                // No keyframe to skip to. We must NOT drop to a delta (that throws
-                // `DataError: A key frame is required` -> reset_pipeline stall). Evict the stale
-                // delta backlog so the buffer cannot keep growing while we wait, then hold the
-                // last-good frame on screen and rely on the existing keyframe-request recovery.
+        } else {
+            // No keyframe to skip to. We must NOT drop to a delta (that throws
+            // `DataError: A key frame is required` -> reset_pipeline stall). Evict the stale
+            // delta backlog so the buffer cannot keep growing while we wait, then hold the
+            // last-good frame on screen and rely on the existing keyframe-request recovery.
+            //
+            // We keep only frames newer than the (now-evicted) stale head so a subsequently
+            // arriving keyframe can still be matched, but we do not advance playout.
+            let stale_cutoff = head_key + 1;
+            let dropped_before = self.dropped_frames_count;
+            self.drop_frames_before(stale_cutoff);
+            let dropped_any = self.dropped_frames_count > dropped_before;
+            if dropped_any {
+                let dropped = self.dropped_frames_count - dropped_before;
+                log::debug!(
+                    "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {dropped} stale delta frame(s); holding last-good frame and proactively requesting a keyframe (#1025)."
+                );
+                // Surface the skip for field-log visibility (#1045); the worker forwards it.
+                // `keyframe_seq: None` marks the keyframe-less (held last-good) case.
+                self.record_freshness_skip(
+                    current_time_ms,
+                    FreshnessSkip {
+                        head_age_ms,
+                        keyframe_seq: None,
+                        dropped,
+                    },
+                );
+                // Issue #1025 (resolves the TODO(#1020) here): proactively ask the client to
+                // request a keyframe when we evict a stale keyframe-less backlog, rather than
+                // waiting for the client's reactive gap-driven request to notice. There is no
+                // buffered keyframe to skip to, so playout is frozen on the last-good frame
+                // until a fresh keyframe arrives — fetching one sooner directly shortens that
+                // freeze.
                 //
-                // We keep only frames newer than the (now-evicted) stale head so a subsequently
-                // arriving keyframe can still be matched, but we do not advance playout.
-                let stale_cutoff = head_key + 1;
-                let dropped_before = self.dropped_frames_count;
-                self.drop_frames_before(stale_cutoff);
-                let dropped_any = self.dropped_frames_count > dropped_before;
-                if dropped_any {
-                    let dropped = self.dropped_frames_count - dropped_before;
-                    log::debug!(
-                        "[JITTER_BUFFER] Freshness deadline exceeded (head age {head_age_ms:.0}ms) with NO buffered keyframe. Evicted {dropped} stale delta frame(s); holding last-good frame and proactively requesting a keyframe (#1025)."
-                    );
-                    // Surface the skip for field-log visibility (#1045); the worker forwards it.
-                    // `keyframe_seq: None` marks the keyframe-less (held last-good) case.
-                    self.record_freshness_skip(
-                        current_time_ms,
-                        FreshnessSkip {
-                            head_age_ms,
-                            keyframe_seq: None,
-                            dropped,
-                        },
-                    );
-                    // Issue #1025 (resolves the TODO(#1020) here): proactively ask the client to
-                    // request a keyframe when we evict a stale keyframe-less backlog, rather than
-                    // waiting for the client's reactive gap-driven request to notice. There is no
-                    // buffered keyframe to skip to, so playout is frozen on the last-good frame
-                    // until a fresh keyframe arrives — fetching one sooner directly shortens that
-                    // freeze.
-                    //
-                    // Source-side throttle: a *sustained* keyframe-less stall evicts on ~every
-                    // ~10ms tick (the head delta ages past the deadline as fast as deltas arrive),
-                    // so firing per-eviction would spray this already-struggling receiver's uplink
-                    // + worker→main bus at ~10–30/s. The relay limiter (#979/#1011) coalesces for
-                    // the publisher but not for our uplink, so we gate at the source: fire at most
-                    // once per PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS (≈ the relay window).
-                    let should_request = match self.last_keyframe_request_ms {
-                        Some(last) => {
-                            (current_time_ms.saturating_sub(last)) as f64
-                                >= PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS
-                        }
-                        None => true,
-                    };
-                    if should_request {
-                        self.last_keyframe_request_ms = Some(current_time_ms);
-                        (self.request_keyframe)();
+                // Source-side throttle + backoff: a *sustained or recurring* keyframe-less stall
+                // evicts on ~every ~10ms tick (the head delta ages past the deadline as fast as
+                // deltas arrive), so firing per-eviction would spray this already-struggling
+                // receiver's uplink + worker→main bus at ~10–30/s. The relay limiter (#979/#1011)
+                // coalesces for the publisher but not for our uplink, so we gate at the source.
+                //
+                // First, reset the backoff exponent if the stream has been quiet (no proactive
+                // request) for longer than PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS — a genuine
+                // sustained recovery. The reset is keyed to *request quiet time*, NOT to frame
+                // release: the #1479 storm is many short (1–5s) freezes interleaved with smooth
+                // playout, so a release-driven reset would zero the exponent during each smooth
+                // gap and the backoff would never accumulate across the storm. Keying it to a
+                // quiet interval well above the capped 8s cadence means the exponent persists
+                // across closely-spaced re-freezes (damping the storm) yet still re-arms a truly
+                // recovered stream for the next independent stall.
+                if let Some(last) = self.last_keyframe_request_ms {
+                    if (current_time_ms.saturating_sub(last)) as f64
+                        >= PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS
+                    {
+                        self.consecutive_proactive_keyframe_requests = 0;
                     }
                 }
-                false
+
+                // The FIRST request fires after PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS
+                // (≈ the relay window). Each subsequent request within the backoff window then
+                // doubles the interval — exponential backoff capped at
+                // PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP (issue #1479). A fixed ~1/s cadence
+                // across a meeting-long sequence of freezes is precisely the receiver-side
+                // amplifier of the PLI keyframe storm: every receiver pokes the active speaker
+                // every second, and the relay's delivery-unaware limiter then delays the very
+                // recovery keyframe those pokes are asking for. Backing off decays the cadence
+                // toward ~1/8s while the stall persists, then the quiet-interval reset above
+                // restores full speed once the stream genuinely recovers.
+                let backoff_exp = self
+                    .consecutive_proactive_keyframe_requests
+                    .min(PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP);
+                let required_interval_ms =
+                    PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS * (2u32.pow(backoff_exp) as f64);
+                let should_request = match self.last_keyframe_request_ms {
+                    Some(last) => {
+                        (current_time_ms.saturating_sub(last)) as f64 >= required_interval_ms
+                    }
+                    None => true,
+                };
+                if should_request {
+                    self.last_keyframe_request_ms = Some(current_time_ms);
+                    self.consecutive_proactive_keyframe_requests = self
+                        .consecutive_proactive_keyframe_requests
+                        .saturating_add(1);
+                    (self.request_keyframe)();
+                }
+            }
+            false
+        }
+    }
+
+    /// Skip to the newest buffered keyframe, dropping every frame before it.
+    ///
+    /// Returns `Some((keyframe_seq, dropped_count))` when a keyframe was found AND at least one
+    /// frame was dropped; `None` when there is no buffered keyframe OR the keyframe is already the
+    /// head (nothing before it to drop). The caller is responsible for any logging / diagnostics /
+    /// counters — this helper only mutates the buffer and `dropped_frames_count`.
+    ///
+    /// This is the single source of truth for "resync to live": BOTH the freshness deadline
+    /// (issue #1020) and the resync governor (issue #1252) call it, so the newest-keyframe
+    /// selection and drop logic cannot diverge between the two trigger paths. The keyframe itself
+    /// is preserved and released by the normal gate (gap/restart recovery), so a skip can never
+    /// feed a bare delta to the decoder.
+    fn skip_to_newest_buffered_keyframe(&mut self) -> Option<(u64, u64)> {
+        let newest_keyframe = self
+            .buffered_frames
+            .iter()
+            .rev()
+            .find(|(_, f)| f.is_keyframe())
+            .map(|(&s, _)| s)?;
+        let dropped_before = self.dropped_frames_count;
+        self.drop_frames_before(newest_keyframe);
+        let dropped = self.dropped_frames_count - dropped_before;
+        if dropped > 0 {
+            Some((newest_keyframe, dropped))
+        } else {
+            None
+        }
+    }
+
+    /// v1 resync-to-live governor (issue #1252). Evaluated once per 10ms tick. When the buffered
+    /// playout-latency total stays `>= GOVERNOR_ENGAGE_MS` for `GOVERNOR_SUSTAIN_TICKS` consecutive
+    /// ticks AND we are past `GOVERNOR_COOLDOWN_MS` since the last governor skip, skip to the newest
+    /// buffered keyframe (reusing the same helper the freshness deadline uses, so they cannot
+    /// diverge). If there is NO buffered keyframe, the governor does NOTHING — no eviction, NO PLI,
+    /// no keyframe request. That case is left entirely to the existing 1800ms freshness deadline.
+    /// This is the #1287/#1297/#814 storm-avoidance invariant: v1 introduces ZERO new
+    /// keyframe-request sources. Thrash-prevention/hysteresis comes from TWO guards that DO gate
+    /// the skip: (1) `governor_sustain_ticks` resets to 0 after every skip, so the latency must
+    /// re-accumulate `>= GOVERNOR_ENGAGE_MS` for `GOVERNOR_SUSTAIN_TICKS` again; (2)
+    /// `GOVERNOR_COOLDOWN_MS` since the last skip. The `governor_engaged` flag / `GOVERNOR_DISENGAGE_MS`
+    /// only track the engaged episode for observability + lifecycle — they are NOT read by the skip
+    /// decision (see the `governor_engaged` field doc for why a latch-gate would deadlock).
+    fn run_resync_governor(&mut self, current_time_ms: u128) {
+        let total = self.playout_latency_parts_ms(current_time_ms).0;
+
+        // Hysteresis disengage.
+        if total < GOVERNOR_DISENGAGE_MS {
+            self.governor_engaged = false;
+        }
+
+        // Sustain counter.
+        if total >= GOVERNOR_ENGAGE_MS {
+            self.governor_sustain_ticks = self.governor_sustain_ticks.saturating_add(1);
+        } else {
+            self.governor_sustain_ticks = 0;
+        }
+
+        if self.governor_sustain_ticks < GOVERNOR_SUSTAIN_TICKS {
+            return;
+        }
+
+        // Cooldown: do not skip again within GOVERNOR_COOLDOWN_MS of the last governor skip.
+        if let Some(last) = self.governor_last_skip_ms {
+            if ((current_time_ms.saturating_sub(last)) as f64) < GOVERNOR_COOLDOWN_MS {
+                return;
             }
         }
+
+        // Engage: skip to the newest buffered keyframe ONLY. No keyframe -> do nothing (no PLI).
+        // On a no-keyframe engage condition we intentionally do NOT reset the sustain counter or
+        // set `last_skip`, so the governor keeps trying each tick until either a keyframe appears
+        // or the 1800ms deadline fires — the deadline owns the keyframe-less case.
+        if let Some((keyframe_seq, dropped)) = self.skip_to_newest_buffered_keyframe() {
+            self.governor_engaged = true;
+            self.governor_last_skip_ms = Some(current_time_ms);
+            self.governor_skips += 1;
+            self.governor_sustain_ticks = 0; // reset so we re-accumulate before another skip
+            log::debug!(
+                "[JITTER_BUFFER] Resync governor engaged (playout latency {total:.0}ms >= {GOVERNOR_ENGAGE_MS:.0}ms sustained). Skipped to newest buffered keyframe {keyframe_seq}, dropped {dropped} frame(s). (issue #1252)"
+            );
+        }
+        // else: no buffered keyframe — governor takes NO action; the 1800ms deadline remains the
+        // backstop. We deliberately do NOT set `last_skip_ms` here, so while sustain stays high and
+        // no keyframe is buffered the governor re-attempts the (bounded) newest-keyframe scan every
+        // tick until a keyframe arrives or the deadline fires. That scan is O(buffered_frames),
+        // hard-bounded by `MAX_BUFFER_SIZE` (200) and time-bounded by the 1800ms deadline that owns
+        // the keyframe-less case, so the worst case is a few hundred trivial comparisons per tick
+        // for at most ~the engage→deadline gap — negligible on the low-power target.
     }
 
     /// Pushes a single frame to the shared decodable queue.
@@ -880,13 +1156,21 @@ impl<T> JitterBuffer<T> {
         self.last_released_arrival_time_ms = None;
         // Reset the proactive keyframe-request throttle (issue #1025) so a fresh stream after a
         // flush (e.g. stream restart) can request a recovery keyframe immediately rather than
-        // inheriting the pre-flush cooldown.
+        // inheriting the pre-flush cooldown. Reset the backoff exponent too (issue #1479) so the
+        // post-flush stream is not handicapped by a prior stall's accumulated backoff.
         self.last_keyframe_request_ms = None;
+        self.consecutive_proactive_keyframe_requests = 0;
         // Reset freshness-skip diagnostic throttling too: a post-flush stream should not inherit
         // stale diagnostic cooldown or coalesced skip details from before the stream reset.
         self.last_freshness_skip = None;
         self.last_freshness_skip_emit_ms = None;
         self.pending_freshness_skip = None;
+        // Reset resync-governor runtime state (issue #1252) so a fresh post-flush stream
+        // re-accumulates from scratch. The lifetime `governor_skips` counter is NOT reset — it is a
+        // cumulative metric.
+        self.governor_sustain_ticks = 0;
+        self.governor_engaged = false;
+        self.governor_last_skip_ms = None;
         // Consider resetting jitter estimator as well if needed
         self.jitter_estimator = JitterEstimator::new();
     }
@@ -965,6 +1249,12 @@ impl<T> JitterBuffer<T> {
     /// valued at one source frame interval per queued frame. Read-only: never mutates state.
     pub fn playout_latency_ms(&self, now_ms: u128) -> f64 {
         self.playout_latency_parts_ms(now_ms).0
+    }
+
+    /// Lifetime count of resync-governor skips (issue #1252). Exposed for the Prometheus metric
+    /// wired in a follow-up commit; not reset by flush().
+    pub fn governor_skip_count(&self) -> u64 {
+        self.governor_skips
     }
 }
 
@@ -1702,12 +1992,12 @@ mod tests {
 
     /// Issue #1025 (source-side throttle): a SUSTAINED keyframe-less stall evicts
     /// one stale head per poll (~every 10ms tick in production). The proactive
-    /// keyframe request must fire at most once per
-    /// PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS so the struggling receiver does
-    /// not spray its uplink/worker bus with requests the relay would only drop.
+    /// keyframe request must fire at most once per the *current* backoff interval so
+    /// the struggling receiver does not spray its uplink/worker bus with requests the
+    /// relay would only drop.
     ///
     /// Mutation coverage: removing the throttle (firing on every eviction) makes
-    /// the within-window evictions fire too, failing the `== 1` assert; not
+    /// the within-window evictions fire too, failing the first `== 1` assert; not
     /// updating `last_keyframe_request_ms` makes the second window never fire,
     /// failing the `== 2` assert.
     #[test]
@@ -1731,7 +2021,7 @@ mod tests {
         jb.insert_frame(create_test_frame(4, FrameType::DeltaFrame), 300);
 
         // Three evictions in quick succession (10ms apart, well within the 1000ms
-        // throttle). Only the FIRST may fire a proactive request.
+        // base interval). Only the FIRST may fire a proactive request.
         jb.find_and_move_continuous_frames(2150); // evict seq 2 → fires (#1)
         jb.find_and_move_continuous_frames(2160); // evict seq 3 → throttled
         jb.find_and_move_continuous_frames(2170); // evict seq 4 → throttled
@@ -1741,13 +2031,145 @@ mod tests {
             "sustained eviction within one throttle window must fire exactly once"
         );
 
-        // A later eviction PAST the throttle window fires again.
+        // After the first fire the backoff exponent is 1, so the next interval is
+        // 1000 * 2^1 = 2000ms. An eviction only 1050ms after the first must STILL be
+        // throttled — proving the interval grew (issue #1479). Without backoff (fixed
+        // 1000ms) this would fire and bump the count to 2.
         jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1400);
-        jb.find_and_move_continuous_frames(3200); // 3200 - 2150 = 1050ms ≥ 1000 → fires (#2)
+        jb.find_and_move_continuous_frames(3200); // 3200 - 2150 = 1050ms < 2000ms → throttled
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "within the backed-off (2000ms) window the request must still be throttled"
+        );
+
+        // Past the backed-off window (>= 2000ms after the first fire) it fires again.
+        jb.insert_frame(create_test_frame(6, FrameType::DeltaFrame), 1450);
+        jb.find_and_move_continuous_frames(4200); // 4200 - 2150 = 2050ms >= 2000ms → fires (#2)
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,
-            "an eviction past the throttle window fires a fresh request"
+            "an eviction past the backed-off window fires a fresh request"
+        );
+    }
+
+    /// Issue #1479: under a SUSTAINED keyframe-less stall the proactive-PLI interval
+    /// must grow exponentially (1s → 2s → 4s → 8s, capped) so the receiver stops poking
+    /// the active speaker ~1/s for the whole stall — the receiver-side amplifier of the
+    /// PLI keyframe storm. The backoff exponent must reset ONLY after a genuinely quiet
+    /// interval (> PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS with no proactive request),
+    /// NOT on a mere frame release — the #1479 storm is many short freezes interleaved with
+    /// smooth playout, so a release-driven reset would zero the exponent during each smooth
+    /// gap and the backoff would never accumulate across the storm.
+    ///
+    /// Mutation coverage: deleting the backoff (firing at the fixed base interval) lets the
+    /// 2nd fire land at 1s instead of 2s — a "still throttled" assert fails. Deleting the
+    /// quiet-interval reset leaves the exponent pinned at the cap, so the post-quiet fire is
+    /// throttled for 8s and the final "fires at base after a long quiet gap" assert fails.
+    #[test]
+    fn proactive_keyframe_request_backs_off_and_resets_after_quiet_interval() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // last-good = seq 1.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+
+        let base = PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS as u128; // 1000
+
+        // Pre-insert a keyframe-LESS delta backlog, all at the SAME early arrival (300). Each poll
+        // evicts exactly one head delta (keyframe-less branch drops only the head); the next delta
+        // then becomes the head with the same old arrival, so it too is instantly stale on the next
+        // poll. last_decoded stays at 1 the whole stall (nothing is released), so every poll is
+        // *eligible* to fire — gated only by the backoff interval. Inserting all at one arrival
+        // keeps the jitter estimator's inter-arrival delta non-negative (it underflows on
+        // backwards-moving arrival times). Each poll below evicts one head delta, so the backlog
+        // must be at least as large as the total number of polls (12 here); 2..=24 is generous.
+        for s in 2u64..=24 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 300);
+        }
+
+        // First fire (no prior request → fires immediately).
+        let mut last_fire = 5000u128;
+        jb.find_and_move_continuous_frames(last_fire);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "first proactive request fires"
+        );
+
+        // Sustained stall: the interval after each fire doubles — 2s, 4s, 8s, then capped at 8s.
+        let expected_gaps_ms = [2 * base, 4 * base, 8 * base, 8 * base];
+        for (i, gap) in expected_gaps_ms.iter().enumerate() {
+            // Just BEFORE the backed-off interval → still throttled.
+            jb.find_and_move_continuous_frames(last_fire + gap - 100);
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                (i + 1) as u32,
+                "request {} must still be throttled just before the {}ms backed-off window",
+                i + 2,
+                gap
+            );
+            // Just AFTER the backed-off interval → fires.
+            let after_t = last_fire + gap + 50;
+            jb.find_and_move_continuous_frames(after_t);
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                (i + 2) as u32,
+                "request {} fires once past the {}ms backed-off window",
+                i + 2,
+                gap
+            );
+            last_fire = after_t;
+        }
+        let fires_during_stall = requests.load(Ordering::SeqCst);
+        assert_eq!(fires_during_stall, 5, "5 fires across the backed-off stall");
+        // The exponent is now pinned at the cap; the next interval would be 8s WITHOUT a reset.
+
+        // QUIET INTERVAL (genuine recovery): no proactive request fires for longer than
+        // PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS. The next keyframe-less eviction after
+        // that gap must reset the exponent to 0 and fire at the BASE interval again. We poll
+        // once, `RESET_MS + a bit` after the last fire: that single poll is >= base (so it is
+        // eligible) and, because it crossed the reset threshold, the exponent is cleared FIRST,
+        // so it fires. With the reset deleted the exponent stays at the cap and the required
+        // interval is 8s — but RESET_MS (12s) > 8s, so to prove the *reset* (not just elapsed
+        // time) we follow with a second poll exactly base+ after this fire: that only fires if
+        // the exponent is now back at 0.
+        let reset_ms = PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS as u128;
+        let quiet_fire = last_fire + reset_ms + 100;
+        jb.find_and_move_continuous_frames(quiet_fire);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            fires_during_stall + 1,
+            "after a quiet interval the next eviction fires"
+        );
+
+        // The DISCRIMINATING assert: a follow-up eviction only `2*base` after `quiet_fire` must
+        // FIRE — proving the exponent was reset to 0 (interval back to base), not still at the
+        // cap (which would require 8s). 2*base = 2000ms is >= base(1000, after the now-1 exponent
+        // doubles to 2s) … so we instead poll base+50 after, before the post-reset exponent's
+        // own 2s step. Precisely: after the reset-fire the exponent is 1, so the next interval is
+        // 2s; a poll at base+50 (1050ms) is < 2s and must be THROTTLED, and a poll at 2*base+50
+        // must FIRE. We assert the throttle first (distinguishes reset-to-0 from no-reset, since
+        // no-reset would also be throttled here — so this alone is not enough), then the fire.
+        jb.find_and_move_continuous_frames(quiet_fire + base + 50); // 1050ms < 2000ms post-reset step
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            fires_during_stall + 1,
+            "immediately after the reset-fire, the exponent-1 (2s) step throttles a base-spaced poll"
+        );
+        jb.find_and_move_continuous_frames(quiet_fire + 2 * base + 50); // 2050ms >= 2000ms → fires
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            fires_during_stall + 2,
+            "post-reset the cadence is back on the base schedule (2s after the reset-fire), proving the exponent reset to 0 — not pinned at the 8s cap"
         );
     }
 
@@ -1786,6 +2208,84 @@ mod tests {
             requests.load(Ordering::SeqCst),
             2,
             "post-flush eviction fires immediately despite being inside the pre-flush throttle window"
+        );
+    }
+
+    /// `flush()` must reset the backoff EXPONENT (issue #1479), not just the
+    /// `last_keyframe_request_ms` anchor. The sibling `flush_resets_..._throttle` test cannot
+    /// catch the exponent reset because `flush()` also nulls `last_keyframe_request_ms`, so the
+    /// first post-flush eviction fires via the `None => true` arm regardless of the exponent.
+    /// This test drives the exponent to the cap pre-flush, flushes, then asserts the post-flush
+    /// cadence is back on the BASE schedule (exponent 1 → 2s after the first post-flush fire),
+    /// not the inherited cap (8s).
+    ///
+    /// Mutation coverage: deleting `consecutive_proactive_keyframe_requests = 0` from `flush()`
+    /// leaves the exponent at the cap, so after the first post-flush fire the interval is 8s and
+    /// the `2*base` poll would NOT fire — failing the final assert.
+    #[test]
+    fn flush_resets_proactive_keyframe_request_backoff_exponent() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        let base = PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS as u128; // 1000
+
+        // Drive the exponent to the cap: last-good = seq 1, then a keyframe-less backlog polled
+        // past each backed-off window so several requests fire (exponent climbs to >= cap).
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        for s in 2u64..=12 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 300);
+        }
+        let mut last_fire = 5000u128;
+        jb.find_and_move_continuous_frames(last_fire); // fire #1 (exp→1)
+        for gap in [2 * base, 4 * base, 8 * base, 8 * base] {
+            last_fire += gap + 50;
+            jb.find_and_move_continuous_frames(last_fire); // fires; exponent climbs to the cap
+        }
+        let pre_flush = requests.load(Ordering::SeqCst);
+        assert_eq!(
+            pre_flush, 5,
+            "exponent driven to the cap via 5 backed-off fires"
+        );
+
+        jb.flush();
+
+        // Post-flush stall. First eviction fires immediately (last_keyframe_request_ms is None).
+        // After it, the exponent is 1 ONLY IF flush reset it (else it is cap+1, still cap).
+        jb.last_decoded_sequence_number = Some(100);
+        for s in 101u64..=104 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 20_000);
+        }
+        let t0 = 22_000u128; // > 20_000 + MAX_PLAYOUT_AGE_MS so the head delta is stale
+        jb.find_and_move_continuous_frames(t0);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            pre_flush + 1,
+            "first post-flush eviction fires"
+        );
+
+        // Discriminator: with the exponent reset to 0 → now 1, the next interval is 2s. A poll
+        // base+50 (1050ms) after the post-flush fire must be THROTTLED, and a poll 2*base+50 must
+        // FIRE. If flush did NOT reset the exponent (still at cap), the interval would be 8s and
+        // the 2*base poll would NOT fire.
+        jb.find_and_move_continuous_frames(t0 + base + 50); // 1050ms < 2000ms (exp-1 step) → throttled
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            pre_flush + 1,
+            "exp-1 (2s) step throttles a base-spaced poll right after the post-flush fire"
+        );
+        jb.find_and_move_continuous_frames(t0 + 2 * base + 50); // 2050ms >= 2000ms → fires
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            pre_flush + 2,
+            "post-flush cadence is back on the base schedule, proving flush reset the exponent (not pinned at the 8s cap)"
         );
     }
 
@@ -2533,6 +3033,397 @@ mod tests {
         assert_eq!(
             got, 0.0,
             "painted > emitted must floor to 0.0 (at live), got {got}"
+        );
+    }
+
+    // --- Resync-to-live governor (issue #1252, v1) ---
+
+    /// Insert a `FrameBuffer` directly into the jitter buffer at a controlled arrival time. Used by
+    /// the governor tests to build precise latency state (a known head/newest arrival span) without
+    /// the side effects of `insert_frame` (which re-derives the playout target and runs a poll).
+    fn buffer_frame_at(
+        jb: &mut JitterBuffer<crate::decoder::DecodedFrame>,
+        seq: u64,
+        frame_type: FrameType,
+        arrival_ms: u128,
+    ) {
+        jb.buffered_frames.insert(
+            seq,
+            FrameBuffer::new(create_test_frame(seq, frame_type), arrival_ms),
+        );
+    }
+
+    /// Build the canonical governor backlog directly: mid-stream (last decoded = 1) behind a gap
+    /// (seq 2 is missing), a few stale deltas, and a NEWEST keyframe positioned so the buffered
+    /// arrival span equals 1300ms (>= `GOVERNOR_ENGAGE_MS`) while the head age stays below the
+    /// 1800ms freshness deadline across the poll window. The playout target is pinned absurdly high
+    /// so the normal release gate never drains the backlog mid-test — only the governor (or, if we
+    /// crossed it, the deadline) can change the buffer. `head_arrival` anchors the head; the newest
+    /// keyframe arrives 1300ms later. Returns the keyframe sequence number.
+    fn build_governor_backlog(
+        jb: &mut JitterBuffer<crate::decoder::DecodedFrame>,
+        head_arrival: u128,
+        first_seq: u64,
+    ) -> u64 {
+        jb.buffered_frames.clear();
+        jb.last_decoded_sequence_number = Some(1);
+        // Pin the target so the release gate cannot drain the backlog during the sustain window.
+        jb.target_playout_delay_ms = 100_000.0;
+        let key_seq = first_seq + 5;
+        buffer_frame_at(jb, first_seq, FrameType::DeltaFrame, head_arrival);
+        buffer_frame_at(jb, first_seq + 1, FrameType::DeltaFrame, head_arrival + 100);
+        buffer_frame_at(jb, first_seq + 2, FrameType::DeltaFrame, head_arrival + 200);
+        // Newest keyframe at head_arrival + 1300 → buffered arrival span == 1300ms.
+        buffer_frame_at(jb, key_seq, FrameType::KeyFrame, head_arrival + 1300);
+        key_seq
+    }
+
+    /// (a) The governor must engage after the latency total has stayed at/above
+    /// `GOVERNOR_ENGAGE_MS` for `GOVERNOR_SUSTAIN_TICKS` consecutive ticks, and on engaging it must
+    /// skip the stale backlog to the NEWEST buffered keyframe (dropping the deltas before it) so the
+    /// buffered span collapses back toward live.
+    ///
+    /// Mutation coverage: removing the skip (the `skip_to_newest_buffered_keyframe` call / the
+    /// `governor_skips += 1`) leaves the count at 0 — first assert fails. Lowering
+    /// `GOVERNOR_SUSTAIN_TICKS` so it fires earlier changes when the deltas drop but is also caught
+    /// by test (b)'s 39-tick sub-case; here, dropping the skip entirely fails both the count and the
+    /// "deltas dropped"/"span collapsed" asserts.
+    #[test]
+    fn governor_engages_after_sustained_high_latency_and_skips_to_newest_keyframe() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+        let head_arrival = 100u128;
+        let key_seq = build_governor_backlog(&mut jb, head_arrival, 5);
+
+        assert_eq!(jb.governor_skip_count(), 0, "no skips before the window");
+
+        // Poll the head age band [1350, 1740) — always >= GOVERNOR_ENGAGE_MS (1300) via the span,
+        // always < MAX_PLAYOUT_AGE_MS (1800) so the deadline never fires. The keyframe arrived at
+        // head_arrival + 1300 = 1400 <= the first poll time (1450), so the release gate's
+        // arrival-subtraction can never underflow.
+        let mut now = head_arrival + 1350; // 1450
+        for _ in 0..GOVERNOR_SUSTAIN_TICKS {
+            // Latency total must sit at the engage threshold throughout the sustain window.
+            assert!(
+                jb.playout_latency_parts_ms(now).0 >= GOVERNOR_ENGAGE_MS,
+                "setup invariant: latency must stay >= engage threshold (now={now})"
+            );
+            jb.find_and_move_continuous_frames(now);
+            now += 10;
+        }
+
+        assert_eq!(
+            jb.governor_skip_count(),
+            1,
+            "governor must skip exactly once after the sustained window"
+        );
+        // The deltas before the newest keyframe were dropped by the skip.
+        assert!(
+            !jb.buffered_frames.contains_key(&5)
+                && !jb.buffered_frames.contains_key(&6)
+                && !jb.buffered_frames.contains_key(&7),
+            "stale deltas before the newest keyframe must be dropped"
+        );
+        assert!(
+            jb.buffered_frames.contains_key(&key_seq),
+            "the newest keyframe must be preserved as the resync target"
+        );
+        assert_eq!(
+            jb.get_dropped_frames_count(),
+            3,
+            "exactly the three deltas before the keyframe were dropped"
+        );
+        // Span collapsed toward live: with only the keyframe left, the buffered span is 0.
+        assert_eq!(
+            jb.buffered_span_ms(now),
+            0.0,
+            "playout latency span must collapse after the resync skip"
+        );
+    }
+
+    /// (b) The governor must NOT engage when the latency total is below `GOVERNOR_ENGAGE_MS`, and
+    /// must NOT engage when the total is high but sustained for FEWER than `GOVERNOR_SUSTAIN_TICKS`
+    /// ticks.
+    ///
+    /// Mutation coverage: the 39-tick sub-case fails if the sustain counter is made to fire at
+    /// fewer than `GOVERNOR_SUSTAIN_TICKS` (e.g. `< SUSTAIN` weakened to `<= SUSTAIN - 1` off-by-one
+    /// the other way, or the threshold lowered). The low-latency sub-case fails if the engage
+    /// threshold is removed or set too low.
+    #[test]
+    fn governor_does_not_engage_below_engage_threshold() {
+        // Sub-case 1: latency comfortably below the engage threshold (span ~600ms).
+        {
+            let (mut jb, _decoded) = create_test_jitter_buffer();
+            jb.last_decoded_sequence_number = Some(1);
+            jb.target_playout_delay_ms = 100_000.0; // never release during the test
+            buffer_frame_at(&mut jb, 5, FrameType::DeltaFrame, 100);
+            buffer_frame_at(&mut jb, 10, FrameType::KeyFrame, 700); // span 600
+
+            // Poll past the sustain window (proving non-engagement is not a too-short window) while
+            // keeping the head age below the 1800ms freshness deadline so the deadline cannot drop
+            // anything either.
+            let mut now = 760u128; // head age 660; keyframe arrival 700 <= now
+            for _ in 0..(GOVERNOR_SUSTAIN_TICKS + 4) {
+                let total = jb.playout_latency_parts_ms(now).0;
+                assert!(
+                    total < GOVERNOR_ENGAGE_MS,
+                    "setup invariant: total must stay below engage (now={now}, total={total})"
+                );
+                assert!(
+                    ((now - 100) as f64) < MAX_PLAYOUT_AGE_MS,
+                    "setup invariant: head age must stay below the freshness deadline (now={now})"
+                );
+                jb.find_and_move_continuous_frames(now);
+                now += 10;
+            }
+            assert_eq!(
+                jb.governor_skip_count(),
+                0,
+                "governor must not engage below the engage threshold"
+            );
+            assert_eq!(
+                jb.get_dropped_frames_count(),
+                0,
+                "nothing may be dropped when the governor never engages and latency is low"
+            );
+        }
+
+        // Sub-case 2: latency >= engage threshold, but only for SUSTAIN_TICKS - 1 ticks.
+        {
+            let (mut jb, _decoded) = create_test_jitter_buffer();
+            build_governor_backlog(&mut jb, 100, 5);
+            let mut now = 1450u128;
+            for _ in 0..(GOVERNOR_SUSTAIN_TICKS - 1) {
+                jb.find_and_move_continuous_frames(now);
+                now += 10;
+            }
+            assert_eq!(
+                jb.governor_skip_count(),
+                0,
+                "governor must not skip before reaching GOVERNOR_SUSTAIN_TICKS consecutive ticks"
+            );
+            assert_eq!(
+                jb.governor_sustain_ticks,
+                GOVERNOR_SUSTAIN_TICKS - 1,
+                "the sustain counter must have accumulated to exactly SUSTAIN_TICKS - 1"
+            );
+        }
+    }
+
+    /// (c) THE no-PLI / storm-avoidance invariant. With a sustained high latency total but NO
+    /// buffered keyframe to skip to, the governor must take ZERO action: no skip, no eviction, and
+    /// crucially NO keyframe request. The keyframe-less case belongs entirely to the 1800ms
+    /// freshness deadline, which we deliberately keep below its threshold so it does not fire either.
+    ///
+    /// Mutation coverage: if the governor ever fired a keyframe request in the no-keyframe case the
+    /// request-count assert fails; if it ever evicted deltas the "deltas retained" assert fails; if
+    /// it ever counted a skip the skip-count assert fails.
+    #[test]
+    fn governor_does_nothing_with_no_buffered_keyframe() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // Mid-stream, behind a gap, with ONLY deltas buffered (no keyframe). Span == 1300ms so the
+        // governor's latency trigger qualifies, while the head age stays below 1800ms so the
+        // freshness deadline does NOT fire and cannot be confused for governor action.
+        jb.last_decoded_sequence_number = Some(1);
+        jb.target_playout_delay_ms = 100_000.0;
+        buffer_frame_at(&mut jb, 5, FrameType::DeltaFrame, 100);
+        buffer_frame_at(&mut jb, 6, FrameType::DeltaFrame, 200);
+        buffer_frame_at(&mut jb, 7, FrameType::DeltaFrame, 1400); // span 1300, no keyframe
+
+        // Poll past the sustain window while keeping the head age below the 1800ms freshness
+        // deadline, so neither the governor (no keyframe) nor the deadline (sub-threshold) can act.
+        let mut now = 1450u128;
+        for _ in 0..(GOVERNOR_SUSTAIN_TICKS + 4) {
+            assert!(
+                jb.playout_latency_parts_ms(now).0 >= GOVERNOR_ENGAGE_MS,
+                "setup invariant: total must qualify (now={now})"
+            );
+            assert!(
+                ((now - 100) as f64) < MAX_PLAYOUT_AGE_MS,
+                "setup invariant: head age must stay below the freshness deadline (now={now})"
+            );
+            jb.find_and_move_continuous_frames(now);
+            now += 10;
+        }
+
+        assert_eq!(
+            jb.governor_skip_count(),
+            0,
+            "governor must take no action when there is no buffered keyframe"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "governor must NEVER fire a keyframe request (v1 introduces zero new PLI sources)"
+        );
+        assert!(
+            jb.buffered_frames.contains_key(&5)
+                && jb.buffered_frames.contains_key(&6)
+                && jb.buffered_frames.contains_key(&7),
+            "governor must not evict the keyframe-less backlog (that case belongs to the deadline)"
+        );
+        assert_eq!(
+            jb.get_dropped_frames_count(),
+            0,
+            "nothing may be dropped: neither the governor nor the (sub-threshold) deadline acted"
+        );
+    }
+
+    /// (d) After a governor skip, a second skip must be suppressed until `GOVERNOR_COOLDOWN_MS` of
+    /// wall-clock time has elapsed since the first, even if a fresh qualifying backlog re-accumulates
+    /// and the sustain window is satisfied again. Once past the cooldown, the governor may skip again.
+    ///
+    /// Mutation coverage: removing the cooldown guard lets the within-window re-accumulation skip
+    /// immediately, failing the `== 1` assert; the post-cooldown phase then proves the guard is a
+    /// cooldown (time-bounded) and not a permanent lockout via the `== 2` assert.
+    #[test]
+    fn governor_cooldown_prevents_second_skip_within_window() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+
+        // Phase 1: engage skip #1 at t = first poll + window. Head anchored at 100.
+        build_governor_backlog(&mut jb, 100, 5);
+        let mut now = 1450u128;
+        for _ in 0..GOVERNOR_SUSTAIN_TICKS {
+            jb.find_and_move_continuous_frames(now);
+            now += 10;
+        }
+        assert_eq!(jb.governor_skip_count(), 1, "first skip must fire");
+        let first_skip_at = jb
+            .governor_last_skip_ms
+            .expect("first skip records its time");
+
+        // Phase 2: rebuild a fresh qualifying backlog and poll a FULL sustain window, but entirely
+        // WITHIN GOVERNOR_COOLDOWN_MS of the first skip. The head is re-anchored so its age stays
+        // below the freshness deadline at these later poll times.
+        build_governor_backlog(&mut jb, 600, 20);
+        let mut now2 = 1900u128;
+        for _ in 0..(GOVERNOR_SUSTAIN_TICKS + 5) {
+            assert!(
+                ((now2 - first_skip_at) as f64) < GOVERNOR_COOLDOWN_MS,
+                "phase-2 polls must stay inside the cooldown window (now2={now2})"
+            );
+            jb.find_and_move_continuous_frames(now2);
+            now2 += 10;
+        }
+        assert_eq!(
+            jb.governor_skip_count(),
+            1,
+            "cooldown must suppress a second skip within GOVERNOR_COOLDOWN_MS"
+        );
+
+        // Phase 3: rebuild again with a fresh head and poll PAST the cooldown. The sustain counter is
+        // already saturated from phase 2, so the first qualifying post-cooldown tick skips.
+        build_governor_backlog(&mut jb, 3000, 40);
+        let mut now3 = 4350u128; // 4350 - 1840 = 2510 >= 2500 cooldown; head age 1350 < 1800
+        for _ in 0..GOVERNOR_SUSTAIN_TICKS {
+            jb.find_and_move_continuous_frames(now3);
+            now3 += 10;
+            if jb.governor_skip_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            jb.governor_skip_count(),
+            2,
+            "past the cooldown a fresh qualifying backlog must skip again"
+        );
+        assert!(
+            jb.governor_last_skip_ms
+                .expect("second skip records its time")
+                >= 4350,
+            "the second skip's cooldown anchor must advance to the post-cooldown time"
+        );
+    }
+
+    /// (e) Disengage hysteresis: once engaged, the latch must clear when the latency total falls
+    /// below `GOVERNOR_DISENGAGE_MS`, and the sustain counter must reset when the total drops below
+    /// `GOVERNOR_ENGAGE_MS`.
+    ///
+    /// Mutation coverage: removing the `total < GOVERNOR_DISENGAGE_MS` disengage clause leaves the
+    /// latch stuck `true`, failing the `!governor_engaged` assert.
+    #[test]
+    fn governor_disengage_hysteresis_clears_latch() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+
+        // Engage: latch becomes true after a skip.
+        build_governor_backlog(&mut jb, 100, 5);
+        let mut now = 1450u128;
+        for _ in 0..GOVERNOR_SUSTAIN_TICKS {
+            jb.find_and_move_continuous_frames(now);
+            now += 10;
+        }
+        assert_eq!(jb.governor_skip_count(), 1, "must engage to set the latch");
+        assert!(jb.governor_engaged, "latch must be set after engaging");
+
+        // Drive the total below GOVERNOR_DISENGAGE_MS (450): a tiny fresh backlog (span 100ms).
+        jb.buffered_frames.clear();
+        jb.last_decoded_sequence_number = Some(1);
+        jb.target_playout_delay_ms = 100_000.0;
+        buffer_frame_at(&mut jb, 50, FrameType::DeltaFrame, 3000);
+        buffer_frame_at(&mut jb, 51, FrameType::DeltaFrame, 3100); // span 100
+        let low_now = 3150u128; // head age 150; total = min(100, 150) = 100 < 450
+        assert!(
+            jb.playout_latency_parts_ms(low_now).0 < GOVERNOR_DISENGAGE_MS,
+            "setup invariant: total must be below the disengage threshold"
+        );
+        jb.find_and_move_continuous_frames(low_now);
+
+        assert!(
+            !jb.governor_engaged,
+            "disengage hysteresis must clear the latch once total < GOVERNOR_DISENGAGE_MS"
+        );
+        assert_eq!(
+            jb.governor_sustain_ticks, 0,
+            "the sustain counter must reset once total < GOVERNOR_ENGAGE_MS"
+        );
+    }
+
+    /// (f) `flush()` resets the governor's RUNTIME state (sustain counter, engaged latch, last-skip
+    /// anchor) but must NOT reset the LIFETIME `governor_skips` counter, which is a cumulative metric.
+    ///
+    /// Mutation coverage: resetting `governor_skips` in `flush()` fails the `== 1` assert; failing
+    /// to reset any of `governor_sustain_ticks` / `governor_engaged` / `governor_last_skip_ms` fails
+    /// the corresponding runtime-state assert.
+    #[test]
+    fn flush_resets_governor_runtime_state_but_not_lifetime_count() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+
+        build_governor_backlog(&mut jb, 100, 5);
+        let mut now = 1450u128;
+        for _ in 0..GOVERNOR_SUSTAIN_TICKS {
+            jb.find_and_move_continuous_frames(now);
+            now += 10;
+        }
+        assert_eq!(jb.governor_skip_count(), 1, "must engage once before flush");
+        assert!(jb.governor_engaged, "latch set before flush");
+        assert!(
+            jb.governor_last_skip_ms.is_some(),
+            "last-skip set before flush"
+        );
+
+        jb.flush();
+
+        assert_eq!(
+            jb.governor_skip_count(),
+            1,
+            "flush must NOT reset the lifetime governor skip count"
+        );
+        assert_eq!(
+            jb.governor_sustain_ticks, 0,
+            "flush must reset the sustain counter"
+        );
+        assert!(!jb.governor_engaged, "flush must clear the engaged latch");
+        assert!(
+            jb.governor_last_skip_ms.is_none(),
+            "flush must clear the last-skip anchor"
         );
     }
 }

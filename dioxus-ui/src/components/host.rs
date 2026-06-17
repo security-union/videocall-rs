@@ -199,7 +199,7 @@ pub fn Host(
         });
         // Microphone encoder is created after camera so it can share the
         // camera's audio tier atomics (avoiding a duplicate quality manager).
-        let microphone = create_microphone_encoder(
+        let mut microphone = create_microphone_encoder(
             client.clone(),
             audio_bitrate,
             mic_settings_cb,
@@ -258,6 +258,13 @@ pub fn Host(
         // client sets both flags on a self-targeted CONGESTION; each AQ loop
         // consumes its own (separate atoms avoid a swap race).
         screen.set_congestion_step_down_flag(client.screen_congestion_step_down_flag());
+        // Issue #621: give the microphone encoder the CONGESTION-driven audio
+        // layer-ceiling atom so a self-targeted CONGESTION cuts the audio simulcast
+        // ladder to base-only. Unlike the camera/screen step-down flags (consumed
+        // by an AQ loop), this is a layer-count atom the client drives directly —
+        // the mic has no AQ loop of its own, so the cut + recovery work even when
+        // the camera is off (audio-only).
+        microphone.set_congestion_layer_ceiling(client.audio_congestion_layer_ceiling());
 
         // Wire the relay layer-union hint atoms (issue #1108, Stage 3). Each
         // encoder OWNS its `shared_union_requested_layer` atom (initialized to the
@@ -270,14 +277,17 @@ pub fn Host(
         client.set_screen_union_requested_layer(screen.shared_union_requested_layer());
 
         // Forced-keyframe cooldown reset on reconnect (issue #1311). Hand the
-        // camera-owned reset atom to the client so its `Connected` lifecycle
-        // callback clears the encode loop's `last_keyframe_emit_ms` on every
-        // reconnect — the first post-reconnect PLI then emits immediately instead
-        // of being coalesced away by a stale pre-reconnect cooldown timestamp. The
-        // re-election case is handled inside the encoder itself (quality task).
-        // Screen has no equivalent yet (deferred #1311 follow-up, gated on the
-        // screen `last_keyframe_emit_ms` added by #1322/#1344).
+        // camera- and screen-owned reset atoms to the client so its `Connected`
+        // lifecycle callback clears each encode loop's `last_keyframe_emit_ms` on
+        // every reconnect — the first post-reconnect PLI then emits immediately
+        // instead of being coalesced away by a stale pre-reconnect cooldown
+        // timestamp. The re-election case is handled inside each encoder itself
+        // (quality task). Both encoders are armed from the SAME `Connected`
+        // transition so they reset together (camera was #1348; screen is the #1311
+        // follow-up, now unblocked by the screen `last_keyframe_emit_ms` from
+        // #1322/#1344).
         client.set_camera_keyframe_cooldown_reset(camera.keyframe_cooldown_reset());
+        client.set_screen_keyframe_cooldown_reset(screen.keyframe_cooldown_reset());
 
         // Wire adaptive quality tier indices to health reporter for metrics
         client.set_adaptive_tier_sources(

@@ -56,16 +56,17 @@ use sec_api::metrics::{
     CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE,
     DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N,
     DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS,
-    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_TARGET_BITRATE_KBPS,
-    HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL,
-    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
-    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
+    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL,
+    ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC,
+    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
+    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
+    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
+    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
+    RTT_PROBE_DROPPED_TOTAL, RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_SHARING_ACTIVE,
     SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
     TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
     VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
-    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -274,6 +275,10 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = DATAGRAM_DROPS.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
+    // #522 RTT-probe resilience gauges: same per-reporter GC so the high-cardinality
+    // session_id label leaves no residual series on disconnect.
+    let _ = RTT_PROBE_DROPPED_TOTAL.remove_label_values(&reporter_labels);
+    let _ = RTT_PROBE_STALE_SUPPRESSIONS_TOTAL.remove_label_values(&reporter_labels);
     let _ = ENCODER_QUEUE_DEPTH.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_SCREEN_TIER.remove_label_values(&reporter_labels);
     let _ = SCREEN_SHARING_ACTIVE.remove_label_values(&reporter_labels);
@@ -319,6 +324,19 @@ fn remove_session_metrics(session_info: &SessionInfo) {
             &session_info.session_id,
             result,
         ]);
+    }
+    // #527: encoder restart series (meeting_id, session_id, kind, reason). Remove
+    // the full bounded cartesian (2 kinds × 4 reasons) for this session so the
+    // session_id label leaves no residual series on disconnect.
+    for kind in ["camera", "screen"] {
+        for reason in ["closed_codec", "memory", "configure", "other"] {
+            let _ = ENCODER_RESTART_TOTAL.remove_label_values(&[
+                &session_info.meeting_id,
+                &session_info.session_id,
+                kind,
+                reason,
+            ]);
+        }
     }
     // TELEM-7: remove CLIENT_INFO using stored label values
     if let Some(ref info_labels) = session_info.client_info_labels {
@@ -446,6 +464,7 @@ fn remove_per_peer_metrics(
     let _ = VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
+    let _ = VIDEO_SKIP_TO_LIVE_TOTAL.remove_label_values(&labels);
     let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
@@ -545,9 +564,12 @@ fn process_health_packet_to_metrics_pb(
         let server_url_clean = server_url_clean.as_str();
 
         // For the RTT metric we allow the server_type label to be an empty string when
-        // unknown, because the URL scrub also zeroes active_server_type and dashboards
-        // already treat blank labels as "unknown source". The CLIENT_ACTIVE_SERVER gauge
-        // below keeps its original "unknown" placeholder since it still requires a URL.
+        // unset — dashboards already treat blank labels as "unknown source". Note: the
+        // upstream URL scrub (`client_diagnostics.rs::scrub_client_supplied_urls`) clears
+        // `active_server_url` but does NOT touch `active_server_type`, so this branch
+        // handles the legitimate "client didn't populate type" case. The
+        // CLIENT_ACTIVE_SERVER gauge below keeps its "unknown" placeholder since it still
+        // requires a URL.
         let server_type_for_rtt = health_packet.active_server_type.as_str();
         let server_type_for_active = if health_packet.active_server_type.is_empty() {
             "unknown"
@@ -744,6 +766,60 @@ fn process_health_packet_to_metrics_pb(
             }
         }
 
+        // #527: encoder auto-restart cycles, expanded into a single labeled
+        // gauge videocall_encoder_restart_total{kind, reason}. Same set()-to-
+        // cumulative convention as the re-election counter above. Each field is
+        // absent until the encoder has actually restarted for that reason, so a
+        // series only appears once a restart of that (kind, reason) has occurred.
+        for (kind, reason, value) in [
+            (
+                "camera",
+                "closed_codec",
+                health_packet.camera_encoder_restarts_closed_codec,
+            ),
+            (
+                "camera",
+                "memory",
+                health_packet.camera_encoder_restarts_memory,
+            ),
+            (
+                "camera",
+                "configure",
+                health_packet.camera_encoder_restarts_configure,
+            ),
+            (
+                "camera",
+                "other",
+                health_packet.camera_encoder_restarts_other,
+            ),
+            (
+                "screen",
+                "closed_codec",
+                health_packet.screen_encoder_restarts_closed_codec,
+            ),
+            (
+                "screen",
+                "memory",
+                health_packet.screen_encoder_restarts_memory,
+            ),
+            (
+                "screen",
+                "configure",
+                health_packet.screen_encoder_restarts_configure,
+            ),
+            (
+                "screen",
+                "other",
+                health_packet.screen_encoder_restarts_other,
+            ),
+        ] {
+            if let Some(total) = value {
+                ENCODER_RESTART_TOTAL
+                    .with_label_values(&[meeting_id, session_id, kind, reason])
+                    .set(total as f64);
+            }
+        }
+
         // Communication and browser state metrics
         let reporter_labels: [&str; 4] = [
             meeting_id,
@@ -803,6 +879,22 @@ fn process_health_packet_to_metrics_pb(
             KEYFRAME_REQUESTS_SENT_TOTAL
                 .with_label_values(&reporter_labels)
                 .set(kf_reqs as f64);
+        }
+
+        // RTT-probe resilience signals (#522). Each is a CUMULATIVE total reported by
+        // the client every packet; .set() the gauge to that value keyed by the
+        // reporter labels (NOT .inc(), NOT summed across reporters — that would
+        // multiply/double-count). Absent until the client has seen at least one
+        // event, so the series only appears once there is something to show.
+        if let Some(dropped) = health_packet.rtt_probe_dropped_total {
+            RTT_PROBE_DROPPED_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(dropped as f64);
+        }
+        if let Some(suppressions) = health_packet.rtt_probe_stale_suppressions_total {
+            RTT_PROBE_STALE_SUPPRESSIONS_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(suppressions as f64);
         }
 
         // Encoder decision inputs (P0). NOTE(#1184): encoder_fps_ratio removed
@@ -914,6 +1006,7 @@ fn process_health_packet_to_metrics_pb(
             || health_packet.client_gpu_family.is_some()
             || health_packet.client_network_effective_type.is_some()
             || health_packet.client_capability_score.is_some()
+            || health_packet.client_battery_level.is_some()
         {
             let cores_str = health_packet
                 .client_cores
@@ -1223,6 +1316,14 @@ fn process_health_packet_to_metrics_pb(
                     VIDEO_PLAYOUT_PAINT_LAG_MS
                         .with_label_values(&peer_labels)
                         .set(video_stats.playout_paint_lag_ms);
+                    // Resync-to-live governor skips (#1252): cumulative COUNTER value held in a
+                    // gauge. Set UNCONDITIONALLY (same recover-to-0 pattern as the gauges above): the
+                    // client folds this field unconditionally, so an absent/idle stream reports its
+                    // last cumulative total (or the proto default 0 if never set) rather than a stale
+                    // latch. A monotonically-rising value proves the governor fired.
+                    VIDEO_SKIP_TO_LIVE_TOTAL
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_skip_to_live_total as f64);
                 }
 
                 // Screen video metrics (separate from camera)
@@ -1548,6 +1649,26 @@ mod tests {
             }
         }
         false
+    }
+
+    fn gauge_value(metric_name: &str, expected_labels: &[(&str, &str)]) -> Option<f64> {
+        let families = prometheus::gather();
+        for family in families {
+            if family.get_name() == metric_name {
+                for metric in family.get_metric() {
+                    let labels_match = expected_labels.iter().all(|(lname, lval)| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.get_name() == *lname && label.get_value() == *lval)
+                    });
+                    if labels_match {
+                        return Some(metric.get_gauge().get_value());
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Helper function to create test peer stats with NetEQ data (protobuf)
@@ -1923,6 +2044,152 @@ mod tests {
                 ("to_peer", "bob"),
             ],
         ));
+    }
+
+    #[test]
+    fn test_rtt_probe_resilience_metrics_exported_and_gc() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // Build a packet with the two #522 RTT-probe cumulative totals set to
+        // distinct non-zero values. create_test_health_packet leaves display_name
+        // unset, so the exported series' display_name label falls back to the
+        // reporting_user_id ("probeuser") via reporter_display_name (see the
+        // .unwrap_or(reporting_user_id) fallback in process_health_packet_to_metrics_pb).
+        let peer_stats: std::collections::HashMap<String, PbPeerStats> =
+            std::collections::HashMap::new();
+        let mut packet =
+            create_test_health_packet("session_rtt522", "meeting_rtt522", "probeuser", peer_stats);
+        packet.rtt_probe_dropped_total = Some(7);
+        packet.rtt_probe_stale_suppressions_total = Some(3);
+
+        let result = process_health_packet_to_metrics_pb(
+            &packet,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        // Value-checking helper: mirrors series_exists's label-matching loop but
+        // returns the gauge value of the first fully-matching metric. series_exists
+        // only checks existence, so this is the mutation-stronger value assertion.
+        let gauge_value = |metric_name: &str, expected_labels: &[(&str, &str)]| -> Option<f64> {
+            for family in prometheus::gather() {
+                if family.get_name() == metric_name {
+                    for metric in family.get_metric() {
+                        let all_match = expected_labels.iter().all(|(lname, lval)| {
+                            metric.get_label().iter().any(|label| {
+                                label.get_name() == *lname && label.get_value() == *lval
+                            })
+                        });
+                        if all_match {
+                            return Some(metric.get_gauge().get_value());
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        let dropped_labels = [
+            ("meeting_id", "meeting_rtt522"),
+            ("session_id", "session_rtt522"),
+            ("peer_id", "probeuser"),
+            ("display_name", "probeuser"),
+        ];
+        let suppressions_labels = dropped_labels;
+
+        assert!(series_exists(
+            "videocall_rtt_probe_dropped_total",
+            &dropped_labels
+        ));
+        assert!(series_exists(
+            "videocall_rtt_probe_stale_suppressions_total",
+            &suppressions_labels,
+        ));
+        assert_eq!(
+            gauge_value("videocall_rtt_probe_dropped_total", &dropped_labels),
+            Some(7.0),
+        );
+        assert_eq!(
+            gauge_value(
+                "videocall_rtt_probe_stale_suppressions_total",
+                &suppressions_labels,
+            ),
+            Some(3.0),
+        );
+
+        // GC the session and confirm both series disappear.
+        let session_key = "meeting_rtt522_session_rtt522_probeuser".to_string();
+        let info = {
+            let g = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            g.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(!series_exists(
+            "videocall_rtt_probe_dropped_total",
+            &dropped_labels
+        ));
+        assert!(!series_exists(
+            "videocall_rtt_probe_stale_suppressions_total",
+            &suppressions_labels,
+        ));
+    }
+
+    #[test]
+    fn encoder_restart_metric_expands_cumulative_fields_and_gc_removes_series() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let meeting_id = "meeting_restart_metric";
+        let session_id = "session_restart_metric";
+        let reporting_user_id = "alice";
+        let mut hp =
+            create_test_health_packet(session_id, meeting_id, reporting_user_id, HashMap::new());
+        hp.camera_encoder_restarts_closed_codec = Some(3);
+        hp.screen_encoder_restarts_configure = Some(5);
+
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        let camera_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("kind", "camera"),
+            ("reason", "closed_codec"),
+        ];
+        let screen_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("kind", "screen"),
+            ("reason", "configure"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_encoder_restart_total", &camera_labels),
+            Some(3.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_restart_total", &screen_labels),
+            Some(5.0)
+        );
+
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
+        let info = {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(
+            !series_exists("videocall_encoder_restart_total", &camera_labels),
+            "camera restart series must be removed by session GC"
+        );
+        assert!(
+            !series_exists("videocall_encoder_restart_total", &screen_labels),
+            "screen restart series must be removed by session GC"
+        );
     }
 
     #[test]
@@ -2696,6 +2963,35 @@ mod tests {
         assert!(
             after > before,
             "HEALTH_REPORTS_TOTAL should be incremented on each health packet"
+        );
+    }
+
+    #[test]
+    fn test_client_info_published_for_battery_only_metadata() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet("s_battery", "m_battery", "alice", HashMap::new());
+        hp.client_battery_level = Some(0.42);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            series_exists(
+                "videocall_client_info",
+                &[
+                    ("meeting_id", "m_battery"),
+                    ("session_id", "s_battery"),
+                    ("display_name", "alice"),
+                    ("cores", ""),
+                    ("architecture", ""),
+                    ("gpu_family", ""),
+                    ("network_effective_type", ""),
+                    ("capability_score", ""),
+                ],
+            ),
+            "battery-only client metadata must publish CLIENT_INFO"
         );
     }
 

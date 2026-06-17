@@ -23,7 +23,7 @@ use crate::constants::{
 use crate::context::{
     email_to_display_name, get_or_create_local_user_id, is_guid_like,
     load_display_name_from_storage, resolve_transport_config, save_display_name_to_storage,
-    validate_display_name, DisplayNameCtx, TransportPreferenceCtx,
+    validate_display_name, DisplayNameCtx, HostRefreshNonceCtx, TransportPreferenceCtx,
 };
 use crate::meeting_api::{get_meeting_guest_info, join_meeting, JoinError, JoinMeetingResponse};
 use crate::theme::color as theme_color;
@@ -67,6 +67,8 @@ pub fn MeetingPage(id: String) -> Element {
     let mut host_user_id = use_signal(|| None::<String>);
     let mut current_user_id = use_signal(|| None::<String>);
     let mut came_from_waiting_room = use_signal(|| false);
+    let host_refresh_nonce = use_signal(|| 0u64);
+    use_context_provider(|| HostRefreshNonceCtx(host_refresh_nonce));
 
     // Separate signal that tracks only the observer token for the WaitingForMeeting
     // state. The observer `use_effect` subscribes to THIS signal instead of
@@ -317,6 +319,8 @@ pub fn MeetingPage(id: String) -> Element {
                 on_host_mute: None,
                 on_host_disable_video: None,
                 on_participant_kicked: None,
+                on_host_granted: None,
+                on_host_revoked: None,
                 on_peer_event: None,
                 on_speaking_changed: None,
                 on_audio_level_changed: None,
@@ -491,6 +495,54 @@ pub fn MeetingPage(id: String) -> Element {
             });
         }
     };
+
+    // Self host-change refresh: when `AttendantsComponent` bumps the nonce (the
+    // local user was granted host or demoted), re-fetch our status so the room
+    // token reflects the new DB `is_host`, then update `meeting_status`. This
+    // flips the `is_owner` prop, which re-renders `AttendantsComponent` IN PLACE
+    // (no `key` → no remount), so host UI updates without dropping the call or
+    // bouncing the user back to the join screen.
+    {
+        let id = id.clone();
+        use_effect(move || {
+            let nonce = host_refresh_nonce();
+            // Skip the initial value — only react to actual host changes.
+            if nonce == 0 {
+                return;
+            }
+            let id = id.clone();
+            let mut meeting_status = meeting_status;
+            let mut host_display_name = host_display_name;
+            let mut host_user_id = host_user_id;
+            wasm_bindgen_futures::spawn_local(async move {
+                match crate::meeting_api::check_status(&id).await {
+                    Ok(status) => {
+                        if status.status == "admitted" {
+                            if let Some(token) = status.room_token.clone() {
+                                let determined_host = status.host_display_name.clone();
+                                let determined_host_uid = status.host_user_id.clone();
+                                host_display_name.set(determined_host.clone());
+                                host_user_id.set(determined_host_uid.clone());
+                                meeting_status.set(MeetingStatus::Admitted {
+                                    is_host: status.is_host,
+                                    host_display_name: determined_host,
+                                    host_user_id: determined_host_uid,
+                                    room_token: token,
+                                    waiting_room_enabled: status.waiting_room_enabled,
+                                    admitted_can_admit: status.admitted_can_admit,
+                                    end_on_host_leave: status.end_on_host_leave,
+                                    allow_guests: status.allow_guests,
+                                });
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Host-change status refresh failed: {e}");
+                    }
+                }
+            });
+        });
+    }
 
     let on_rejected = move |_| {
         observer_token_signal.set(None);

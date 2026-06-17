@@ -24,6 +24,21 @@ pub struct RuntimeConfig {
     pub e2ee_enabled: String,
     #[serde(rename = "webTransportEnabled")]
     pub web_transport_enabled: String,
+    /// Issue #1483: server-side gate for the per-peer-tile "WT"/"WS" transport
+    /// badge. When truthy (`"true"`/`"1"`/…) each peer tile renders a small
+    /// badge next to its signal meter showing whether that peer's media is
+    /// flowing over WebTransport or WebSocket; when absent/empty/falsey the
+    /// badge is never rendered. **Default OFF.**
+    ///
+    /// CRITICAL (config.js bind-mount trap, see project memory): `#[serde(default)]`
+    /// so a stale bind-mounted `config.js` that predates this key still parses —
+    /// a missing key yields the empty-string default (→ `truthy` returns false →
+    /// badge OFF), never a startup-bricking parse failure. The e2e docker stack
+    /// bind-mounts the host's committed `config.js`, which does NOT contain this
+    /// key, so the UI must (and does) behave identically when it is absent.
+    #[serde(rename = "transportBadgeEnabled")]
+    #[serde(default)]
+    pub transport_badge_enabled: String,
     #[serde(rename = "firefoxEnabled")]
     #[serde(default)]
     pub firefox_enabled: String,
@@ -383,6 +398,14 @@ pub fn webtransport_host_base() -> Result<String, String> {
 
 pub fn webtransport_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.web_transport_enabled.as_str())))
+}
+/// Issue #1483: whether the per-peer-tile "WT"/"WS" transport badge is enabled.
+/// Mirrors [`webtransport_enabled`]: empty / missing / falsey → `false` (badge
+/// OFF, the default), so the badge is gated entirely by the server-provided
+/// `transportBadgeEnabled` flag. Callers gate rendering on
+/// `transport_badge_enabled().unwrap_or(false)`.
+pub fn transport_badge_enabled() -> Result<bool, String> {
+    app_config().map(|c| truthy(Some(c.transport_badge_enabled.as_str())))
 }
 pub fn oauth_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.oauth_enabled.as_str())))

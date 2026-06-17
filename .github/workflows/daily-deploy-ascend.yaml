@@ -450,6 +450,7 @@ jobs:
             --set "runtimeConfig.wsUrl=wss://websocket.videocall.conceptcar7.com" \
             --set "runtimeConfig.webTransportHost=https://webtransport.videocall.conceptcar7.com:30056" \
             --set-string "runtimeConfig.webTransportEnabled=true" \
+            --set-string "runtimeConfig.transportBadgeEnabled=false" \
             --set-string "runtimeConfig.oauthEnabled=true" \
             --set-string "runtimeConfig.oauthFlow=pkce" \
             --set "runtimeConfig.oauthClientId=client_01KRGZ7VSEAEMBJW0RF110J8R2" \

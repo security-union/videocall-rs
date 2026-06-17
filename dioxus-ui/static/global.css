@@ -642,6 +642,19 @@ html[data-theme="dark"] {
   --transport-badge-text: #0a84ff;
   --transport-badge-border: #38383a;
 
+  /* Issue 1483: per-tile WT/WS transport badge — OPAQUE fills with fixed text
+     colors for guaranteed AA contrast over arbitrary peer video (translucent
+     tints failed WCAG on mid-tone video). WT (primary) = solid blue + white;
+     WS (fallback) = solid amber + black — the same amber-on-video combo
+     .guest-badge already uses. Distinct hues keep the two transports CVD-safe.
+     @token-exempt: explicit fixed-contrast badge colors over arbitrary peer video (see .guest-badge precedent) */
+  --transport-badge-wt-text: #ffffff;
+  --transport-badge-wt-bg: #0062cc;
+  --transport-badge-wt-border: rgba(255, 255, 255, 0.25);
+  --transport-badge-ws-text: #000000;
+  --transport-badge-ws-bg: #ff9f0a;
+  --transport-badge-ws-border: rgba(0, 0, 0, 0.25);
+
   /* Generic context-menu inner divider */
   --context-menu-shadow: rgba(0, 0, 0, 0.5);
   --context-menu-shadow-strong: rgba(0, 0, 0, 0.4);
@@ -969,6 +982,17 @@ html[data-theme="light"] {
   --transport-badge-bg: #f0f0f2;
   --transport-badge-text: #0a84ff;
   --transport-badge-border: #e0e0e2;
+
+  /* Issue 1483: light-theme per-tile WT/WS badge — identical OPAQUE fixed
+     fills to dark theme. The badge sits over arbitrary peer VIDEO (not the UI
+     surface), so its contrast must be theme-independent.
+     @token-exempt: explicit fixed-contrast badge colors over arbitrary peer video (see .guest-badge precedent) */
+  --transport-badge-wt-text: #ffffff;
+  --transport-badge-wt-bg: #0062cc;
+  --transport-badge-wt-border: rgba(255, 255, 255, 0.25);
+  --transport-badge-ws-text: #000000;
+  --transport-badge-ws-bg: #ff9f0a;
+  --transport-badge-ws-border: rgba(0, 0, 0, 0.25);
 
   --context-menu-shadow: rgba(0, 0, 0, 0.18);
   --context-menu-shadow-strong: rgba(0, 0, 0, 0.14);
@@ -3601,4 +3625,45 @@ html[data-theme="light"] #invite-overlay p {
     ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono",
     monospace;
   font-size: 0.65rem;
+}
+
+/* Issue 1483: per-peer-tile WT/WS transport badge. A small pill that sits
+   beside the .signal-indicator meter in .tile-top-icons. Sized to match the
+   signal-popup .connection-type pill (11px/600/letter-spacing) but styled as
+   an independent rule here (server-gated, default OFF). Distinct colors via
+   the --transport-badge-wt-* / --transport-badge-ws-* theme vars so WT and WS
+   are visually separable. */
+.transport-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 2px 6px;
+  border-radius: 6px;
+  font-size: clamp(9px, calc(var(--tile-h, 240px) * 0.05), 11px);
+  font-weight: 600;
+  line-height: 1;
+  letter-spacing: 0.02em;
+  flex-shrink: 0;
+  /* Prevent the 2-letter label wrapping if the row gets cramped. */
+  white-space: nowrap;
+  user-select: none;
+}
+
+.transport-badge--wt {
+  color: var(--transport-badge-wt-text);
+  background: var(--transport-badge-wt-bg);
+  border: 1px solid var(--transport-badge-wt-border);
+}
+
+.transport-badge--ws {
+  color: var(--transport-badge-ws-text);
+  background: var(--transport-badge-ws-bg);
+  border: 1px solid var(--transport-badge-ws-border);
+}
+
+/* Issue 1483: denser badge on split-screen peer tiles, mirroring the sibling
+   .tile-top-icons icon density there (see .split-peer-tile .guest-badge). */
+.split-peer-tile .transport-badge {
+  font-size: 9px;
+  padding: 1px 4px;
 }

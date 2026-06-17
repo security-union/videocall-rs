@@ -436,6 +436,7 @@ jobs:
             --set "runtimeConfig.wsUrl=wss://websocket.videocall.fnxlabs.com" \
             --set "runtimeConfig.webTransportHost=https://webtransport.videocall.fnxlabs.com:4433" \
             --set-string "runtimeConfig.webTransportEnabled=true" \
+            --set-string "runtimeConfig.transportBadgeEnabled=false" \
             --set-string "runtimeConfig.oauthEnabled=true" \
             --set-string "runtimeConfig.oauthProvider=google" \
             --set-string "runtimeConfig.e2eeEnabled=false" \

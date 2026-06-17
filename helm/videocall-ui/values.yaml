@@ -47,6 +47,7 @@ runtimeConfig:
   oauthPrompt: ""                # "login", "consent", "select_account", or "" to omit
   e2eeEnabled: "false"
   webTransportEnabled: "true"
+  transportBadgeEnabled: "false"
   firefoxEnabled: "false"
   usersAllowedToStream: ""
   serverElectionPeriodMs: 2000

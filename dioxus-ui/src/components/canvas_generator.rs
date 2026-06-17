@@ -226,6 +226,69 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceS
     )
 }
 
+/// Issue #1483: which transport a peer's media is flowing over, for the
+/// per-tile "WT"/"WS" badge. `Unknown` covers the raw `"unknown"` string, an
+/// empty string, `None`, and any unrecognised value — the badge is NEVER
+/// rendered for `Unknown` (see `transport_badge` below), so an unclassified
+/// transport produces no badge rather than a misleading one.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TransportBadge {
+    /// WebTransport (the primary production transport).
+    Wt,
+    /// WebSocket (fallback transport).
+    Ws,
+    /// Unknown / unreported — no badge rendered.
+    Unknown,
+}
+
+/// Pure map from the raw per-peer transport string (as carried on the
+/// `peer_status` diagnostics `peer_transport` metric) to a [`TransportBadge`].
+///
+/// `"webtransport"` → `Wt`, `"websocket"` → `Ws`; everything else — including
+/// `"unknown"`, the empty string, and any junk value — maps to `Unknown`. Kept
+/// pure (no `app_config()` / DOM / signal access) so it is host-unit-testable.
+pub fn transport_badge_from_str(raw: &str) -> TransportBadge {
+    match raw {
+        "webtransport" => TransportBadge::Wt,
+        "websocket" => TransportBadge::Ws,
+        _ => TransportBadge::Unknown,
+    }
+}
+
+/// Render the per-tile transport badge (issue #1483) next to the
+/// `.signal-indicator` button. Factored out so the markup is shared by all
+/// three `.tile-top-icons` arms (split screen-share, split peer-video, and the
+/// normal grid tile) instead of being triplicated.
+///
+/// The caller passes `Some(TransportBadge::Wt | Ws)` ONLY when BOTH the
+/// server-side `transportBadgeEnabled` flag is on AND the transport is known —
+/// that gating happens once per tile render in `peer_tile.rs` (so the JSON
+/// re-parse in `transport_badge_enabled()` is paid once, not per render arm).
+/// This helper therefore renders nothing for `None` or `Some(Unknown)`, which
+/// keeps the "flag OFF → nothing" and "Unknown → nothing" contract in one place.
+fn transport_badge(badge: Option<TransportBadge>) -> Element {
+    match badge {
+        Some(TransportBadge::Wt) => rsx! {
+            span {
+                class: "transport-badge transport-badge--wt",
+                "aria-label": "Transport reported by peer: WebTransport",
+                title: "Transport reported by peer: WebTransport",
+                "WT"
+            }
+        },
+        Some(TransportBadge::Ws) => rsx! {
+            span {
+                class: "transport-badge transport-badge--ws",
+                "aria-label": "Transport reported by peer: WebSocket",
+                title: "Transport reported by peer: WebSocket",
+                "WS"
+            }
+        },
+        // `None` (flag off / no transport yet) or `Some(Unknown)`: render nothing.
+        _ => rsx! {},
+    }
+}
+
 /// Controls what a `PeerTile` renders in the split screen-share layout.
 #[derive(Debug, PartialEq, Clone, Default)]
 pub enum TileMode {
@@ -515,6 +578,12 @@ pub fn generate_for_peer(
     // `peer_tile` by `session_id == peer_id`). Cloned per popup call site
     // below so the popup's Layers section matches the perf dialog.
     let signal_receive_diag = signal_info.receive_diag;
+    // Issue #1483: per-tile "WT"/"WS" transport badge. `Copy`, so it can be
+    // passed to `transport_badge(...)` in each `.tile-top-icons` arm without
+    // cloning. Already gated upstream: `Some(Wt | Ws)` only when the
+    // `transportBadgeEnabled` flag is on AND the transport is known; `None`
+    // otherwise. `transport_badge` renders nothing for `None`/`Unknown`.
+    let badge_transport = signal_info.badge_transport;
     // Bundled popup handlers (lifted out of per-tile state for bugs #8 + #9).
     let SignalPopupHandlers {
         show: show_signal_popup,
@@ -657,6 +726,10 @@ pub fn generate_for_peer(
                             onclick: move |_| on_toggle_signal_popup.call(()),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
+                        // Issue #1483: transport badge adjacent to the signal
+                        // meter. Renders nothing unless the flag is on AND the
+                        // transport is known (gated upstream → `badge_transport`).
+                        {transport_badge(badge_transport)}
                         button {
                             onclick: move |_| {
                                 toggle_pinned_div(&ss_div_pin);
@@ -869,6 +942,9 @@ pub fn generate_for_peer(
                             onclick: move |_| on_toggle_signal_popup.call(()),
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
+                        // Issue #1483: transport badge adjacent to the signal
+                        // meter (renders nothing unless flag on + transport known).
+                        {transport_badge(badge_transport)}
                         // Crop (visible on hover only, hidden when video disabled)
                         if is_video_enabled_for_peer {
                             {
@@ -1265,6 +1341,9 @@ pub fn generate_for_peer(
                                 onclick: move |_| on_toggle_signal_popup.call(()),
                                 SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                             }
+                            // Issue #1483: transport badge adjacent to the signal
+                            // meter (renders nothing unless flag on + transport known).
+                            {transport_badge(badge_transport)}
                             // Crop (visible on hover only). Gated on `show_canvas`
                             // so off-budget avatar tiles — which have no canvas —
                             // don't show a no-op crop button (task 1a.4).
@@ -1671,5 +1750,58 @@ mod tests {
         let ct: Option<&HashMap<String, bool>> = None;
         let result = ct.and_then(|m| m.get("any-id").copied()).unwrap_or(false);
         assert!(!result);
+    }
+
+    // -- Issue #1483: transport badge string → enum mapping -------------------
+    //
+    // `transport_badge_from_str` is a pure host-testable map (no app_config /
+    // DOM / signals), so these run on the host like the split-layout tests
+    // above. The assertions are mutation-sensitive: each known input is pinned
+    // to its enum AND asserted NOT to equal the other transport, so swapping
+    // the `"webtransport" => Wt` / `"websocket" => Ws` arms would fail here.
+
+    #[test]
+    fn transport_badge_webtransport_maps_to_wt() {
+        assert_eq!(transport_badge_from_str("webtransport"), TransportBadge::Wt);
+        // Mutation guard: if the WT arm were swapped to Ws this fails.
+        assert_ne!(transport_badge_from_str("webtransport"), TransportBadge::Ws);
+    }
+
+    #[test]
+    fn transport_badge_websocket_maps_to_ws() {
+        assert_eq!(transport_badge_from_str("websocket"), TransportBadge::Ws);
+        // Mutation guard: if the WS arm were swapped to Wt this fails.
+        assert_ne!(transport_badge_from_str("websocket"), TransportBadge::Wt);
+    }
+
+    #[test]
+    fn transport_badge_unknown_literal_maps_to_unknown() {
+        assert_eq!(transport_badge_from_str("unknown"), TransportBadge::Unknown);
+    }
+
+    #[test]
+    fn transport_badge_empty_maps_to_unknown() {
+        assert_eq!(transport_badge_from_str(""), TransportBadge::Unknown);
+    }
+
+    #[test]
+    fn transport_badge_junk_maps_to_unknown() {
+        assert_eq!(
+            transport_badge_from_str("quic-but-not-really"),
+            TransportBadge::Unknown
+        );
+        // Case sensitivity: the diagnostics metric emits lowercase, so a
+        // mixed-case value is NOT a known transport.
+        assert_eq!(
+            transport_badge_from_str("WebTransport"),
+            TransportBadge::Unknown
+        );
+    }
+
+    #[test]
+    fn transport_badge_wt_and_ws_are_distinct() {
+        // The two transports must render distinctly; a single-variant collapse
+        // (both → same) would defeat the whole feature.
+        assert_ne!(TransportBadge::Wt, TransportBadge::Ws);
     }
 }

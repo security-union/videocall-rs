@@ -2932,21 +2932,14 @@ impl Inner {
         // so without this guard the client renders that losing session as a
         // ghost peer (shown with the user_id/email fallback because that session
         // never gets a PARTICIPANT_JOINED).
-        let is_self_addressed_control = response.packet_type == PacketType::CONGESTION.into()
-            || response.packet_type == PacketType::LAYER_HINT.into();
-        let peer_status = if suppresses_peer_creation(
-            response.user_id == SYSTEM_USER_ID.as_bytes(),
-            response.session_id,
-            self.options.decode_media,
-            response.packet_type == PacketType::SESSION_ASSIGNED.into(),
-            is_self_addressed_control,
-        ) {
-            PeerStatus::NoChange
-        } else {
-            let peer_user_id = String::from_utf8_lossy(&response.user_id);
-            self.peer_decode_manager
-                .ensure_peer(response.session_id, &peer_user_id)
-        };
+        let peer_status =
+            if suppresses_peer_creation_for_packet(&response, self.options.decode_media) {
+                PeerStatus::NoChange
+            } else {
+                let peer_user_id = String::from_utf8_lossy(&response.user_id);
+                self.peer_decode_manager
+                    .ensure_peer(response.session_id, &peer_user_id)
+            };
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 // Observer/lobby clients must not receive encryption keys (defense-in-depth).
@@ -4742,9 +4735,57 @@ fn suppresses_peer_creation(
         || is_self_addressed_control
 }
 
+/// Call-site wiring for [`suppresses_peer_creation`]: derive its five boolean
+/// inputs from a real inbound [`PacketWrapper`] + the receiver's `decode_media`
+/// mode. This is the thin seam the `on_inbound_media` hot path goes through, so a
+/// test driving a real `PacketWrapper` through here pins the `packet_type → bool`
+/// derivation (issue #1496) — a wrong `PacketType` constant or a swapped/omitted
+/// flag would compile and pass the pure-predicate tests but break HERE.
+///
+/// `CONGESTION` and `LAYER_HINT` are relay-authored control packets stamped with
+/// the RECIPIENT's own session_id; the connection-layer self-filter
+/// (`connection_manager.rs::should_filter_self_packet`) whitelists exactly these
+/// two so AQ can act on them, so they reach this path even though they are
+/// "self" — but they must never spawn a peer tile. `SESSION_ASSIGNED` carries our
+/// own session_id and is likewise suppressed purely on packet type (see the
+/// detailed rationale on [`suppresses_peer_creation`] and at the call site).
+///
+/// `DOWNLINK_CONGESTION` is intentionally NOT in this set even though the relay
+/// classifies it as a self-addressed control packet too: the transport self-filter
+/// does NOT whitelist it, so a self-addressed `DOWNLINK_CONGESTION` is dropped one
+/// layer up (in `should_filter_self_packet`) and never reaches here once our own
+/// session_id is known. The pre-`SESSION_ASSIGNED` window where it could slip
+/// through unfiltered is the subject of the open #1481 investigation; do not add it
+/// to this set without first reconciling it with the transport-filter whitelist
+/// (the two gates must agree), which is exactly what #1481 tracks.
+fn suppresses_peer_creation_for_packet(response: &PacketWrapper, decode_media: bool) -> bool {
+    let is_self_addressed_control = response.packet_type == PacketType::CONGESTION.into()
+        || response.packet_type == PacketType::LAYER_HINT.into();
+    suppresses_peer_creation(
+        response.user_id == SYSTEM_USER_ID.as_bytes(),
+        response.session_id,
+        decode_media,
+        response.packet_type == PacketType::SESSION_ASSIGNED.into(),
+        is_self_addressed_control,
+    )
+}
+
 #[cfg(test)]
 mod self_peer_suppression_tests {
-    use super::suppresses_peer_creation;
+    use super::{suppresses_peer_creation, suppresses_peer_creation_for_packet};
+    use videocall_types::protos::packet_wrapper::{packet_wrapper::PacketType, PacketWrapper};
+    use videocall_types::SYSTEM_USER_ID;
+
+    /// Build a minimal inbound `PacketWrapper` with the given type/session/user.
+    fn packet(packet_type: PacketType, session_id: u64, user_id: &[u8]) -> PacketWrapper {
+        PacketWrapper {
+            packet_type: packet_type.into(),
+            session_id,
+            user_id: user_id.to_vec(),
+            data: Vec::new(),
+            ..Default::default()
+        }
+    }
 
     #[test]
     fn foreign_media_creates_a_peer() {
@@ -4779,5 +4820,90 @@ mod self_peer_suppression_tests {
         assert!(suppresses_peer_creation(false, 0, true, false, false));
         assert!(suppresses_peer_creation(false, 42, false, false, false));
         assert!(suppresses_peer_creation(true, 42, true, false, false));
+    }
+
+    // -----------------------------------------------------------------------
+    // Issue #1496: call-site WIRING tests. These drive a real `PacketWrapper`
+    // through `suppresses_peer_creation_for_packet` (the seam `on_inbound_media`
+    // uses) to pin the `packet_type -> bool` derivation. The pure-predicate tests
+    // above cannot see this wiring: a wrong `PacketType` constant, a swapped bool
+    // argument, or an omitted flag would compile and keep them green while
+    // silently reintroducing the ghost tile (or suppressing a real peer).
+    // -----------------------------------------------------------------------
+
+    /// A normal MEDIA packet from a foreign nonzero session MUST create a peer
+    /// (none of the suppress conditions hold). If the call site mis-wired
+    /// `decode_media` or compared MEDIA against a suppress constant, this flips.
+    #[test]
+    fn wiring_foreign_media_packet_is_not_suppressed() {
+        let p = packet(PacketType::MEDIA, 42, b"alice@example.com");
+        assert!(
+            !suppresses_peer_creation_for_packet(&p, true),
+            "a foreign nonzero-session MEDIA packet must create a peer"
+        );
+    }
+
+    /// CONGESTION is a relay-authored self-addressed control packet — it reaches
+    /// the decode path (self-filter whitelists it for AQ) but must NOT spawn a
+    /// peer. Mutating the call site's `CONGESTION` constant makes this fail.
+    #[test]
+    fn wiring_congestion_packet_is_suppressed() {
+        // Nonzero session, foreign-looking user_id, decode on: ONLY the
+        // packet_type derivation can suppress this — so it pins that wiring.
+        let p = packet(PacketType::CONGESTION, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "CONGESTION must be suppressed purely on packet type (self-addressed control)"
+        );
+    }
+
+    /// LAYER_HINT is the other relay-authored self-addressed control packet
+    /// (the losing-election-candidate ghost vector). Same wiring lock.
+    #[test]
+    fn wiring_layer_hint_packet_is_suppressed() {
+        let p = packet(PacketType::LAYER_HINT, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "LAYER_HINT must be suppressed purely on packet type (self-addressed control)"
+        );
+    }
+
+    /// SESSION_ASSIGNED carries OUR OWN session_id; dropping the
+    /// `is_session_assigned` argument at the call site would render us as our
+    /// own ghost peer at election completion.
+    #[test]
+    fn wiring_session_assigned_packet_is_suppressed() {
+        let p = packet(PacketType::SESSION_ASSIGNED, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "SESSION_ASSIGNED must be suppressed purely on packet type (our own session)"
+        );
+    }
+
+    /// Observer mode (`decode_media == false`) suppresses even a normal MEDIA
+    /// packet — pins that the call site threads `decode_media` through.
+    #[test]
+    fn wiring_observer_mode_suppresses_media() {
+        let p = packet(PacketType::MEDIA, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, false),
+            "observer/no-decode mode must suppress peer creation for any packet"
+        );
+    }
+
+    /// The `session_id == 0` sentinel and the system user_id are derived from the
+    /// packet fields (not the type) — pin both so a refactor can't drop them.
+    #[test]
+    fn wiring_zero_session_and_system_user_are_suppressed() {
+        let zero_session = packet(PacketType::MEDIA, 0, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&zero_session, true),
+            "session_id == 0 sentinel must be suppressed"
+        );
+        let system = packet(PacketType::MEDIA, 42, SYSTEM_USER_ID.as_bytes());
+        assert!(
+            suppresses_peer_creation_for_packet(&system, true),
+            "system-user packets must be suppressed"
+        );
     }
 }

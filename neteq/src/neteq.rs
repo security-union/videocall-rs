@@ -579,8 +579,15 @@ impl NetEq {
         self.leftover_time_stretched_samples.clear();
         self.timestretch_added_samples = 0;
         // Resync-to-live governor (issue #1299): clear the cooldown anchor so a stale lag episode
-        // (e.g. a full flush or a prolonged disconnect/safety-valve reset) cannot mis-gate a
-        // freshly recalibrating stream.
+        // cannot mis-gate a freshly recalibrating stream. `reset()` has exactly two LIVE callers in
+        // the shipped wasm path — the ~6 s expand safety-valve (`get_decision`, below) and `flush()`
+        // — so this clear runs on those recalibration points. `flush()` is reached on the peer
+        // audio-off path (`peer_decode_manager::force_media_off` → `audio.flush()` →
+        // `WorkerMsg::Flush` → `eq.flush()`), which #1402 made an actual flush (it was formerly a
+        // no-op log). `WorkerMsg::Clear` is never sent. NOTE the governor's own `flush_to_live` does
+        // NOT go through `reset()` — it resets the delay manager directly and manages `last_resync`
+        // itself (setting it to `Some(now)` to anchor the cooldown) — so it is not counted among
+        // these `reset()` callers.
         self.last_resync = None;
     }
 
@@ -720,6 +727,13 @@ impl NetEq {
 
         // Hysteresis/cooldown: do not fire again until `resync_cooldown_ms` has elapsed since the
         // last flush, so the governor cannot thrash while the filter settles to the new level.
+        //
+        // BOUNDED-TARGET ASSUMPTION: the one-shot 5 s cooldown is safe only because the production
+        // wasm path bounds the adaptive target (`max_delay_ms = 300`, #1299 part 2), which keeps
+        // Accelerate engaged to drain between flushes — so lag cannot re-accumulate to the ceiling
+        // within a cooldown window. With an UNBOUNDED target (`max_delay_ms = 0`) a true standing
+        // wave could re-accumulate up to ~1 s of lag per cooldown window before the next flush. If
+        // the target is ever unbounded in production, this cooldown must be revisited.
         let now = Instant::now();
         if let Some(last) = self.last_resync {
             if now.duration_since(last) < Duration::from_millis(self.config.resync_cooldown_ms) {
@@ -2633,14 +2647,15 @@ mod tests {
     }
 
     /// Part 2 (issue #1299): the bounded `max_delay_ms` caps `target_delay_ms`, so the adaptive
-    /// target can never ratchet to the 3000ms regime that gates Accelerate off.
+    /// target can never ratchet into the multi-second regime that gates Accelerate off.
     ///
     /// Drives a pathological all-identical-timestamp burst (the same pattern that
     /// `test_buffer_duration_calculation_with_identical_timestamps` shows pushes the delay manager
     /// to high targets) and asserts the target stays at/below the configured cap. FAILS if the
-    /// `max_delay_ms` plumbing (NetEqConfig field → set_maximum_delay) is removed: the default
-    /// derived cap is 3000ms (200 packets × 20 × 3/4), so without the bound the target can climb far
-    /// past 300ms.
+    /// `max_delay_ms` plumbing (NetEqConfig field → set_maximum_delay) is removed: 3000ms is the
+    /// configured `base_maximum_delay_ms` ceiling (200 × 20 × 3/4), while the EFFECTIVE uncapped
+    /// target tops out near 2000ms (the histogram is 100 buckets × 20ms) — either way, without the
+    /// bound the target climbs far past 300ms.
     #[test]
     fn bounded_target_cannot_reach_3s() {
         const CAP_MS: u32 = 300;
@@ -2665,7 +2680,7 @@ mod tests {
         let target = neteq.target_delay_ms();
         assert!(
             target <= CAP_MS,
-            "target_delay_ms must be capped at {CAP_MS}ms by max_delay_ms, got {target}ms (would ratchet toward the 3000ms cap unbounded)"
+            "target_delay_ms must be capped at {CAP_MS}ms by max_delay_ms, got {target}ms (would ratchet into the multi-second regime unbounded)"
         );
     }
 

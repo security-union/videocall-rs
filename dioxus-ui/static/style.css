@@ -6166,10 +6166,17 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .color-swatch-delete-btn {
   position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 18px;
-  height: 18px;
+  /* Inset to the swatch's top-right corner (was top/right: -6px, which spilled
+     outside the swatch box and got cropped by `.color-swatches { overflow: hidden }`
+     — issue #1406). At 0/0 the whole button renders inside the swatch's 24px box,
+     so it is never clipped regardless of which row/cell the swatch lands in.
+     Sized 16px (not the old 18px) so a corner-anchored button leaves more of the
+     24px swatch face visible on hover — the user can still see which color they
+     are deleting. */
+  top: 0;
+  right: 0;
+  width: 16px;
+  height: 16px;
   display: flex;
   align-items: center;
   justify-content: center;

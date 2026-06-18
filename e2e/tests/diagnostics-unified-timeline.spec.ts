@@ -504,4 +504,163 @@ test.describe("Diagnostics — unified timeline chart (issue 173)", () => {
       await Promise.all(browsers.map((b) => b.close().catch(() => undefined)));
     }
   });
+
+  // ── Issue #1452: the crosshair tooltip is a singleton <body>-level
+  // <div id="unified-timeline-tooltip-global"> shown via display:block on
+  // onmousemove and hidden on onmouseleave. If the chart UNMOUNTS while the
+  // tooltip is visible (drawer closed / "All Peers" / peer left) WITHOUT the
+  // pointer first leaving the chart, no onmouseleave fires and the singleton
+  // used to stay display:block at its last position. The fix adds
+  // `use_drop(hide_unified_tooltip)` to UnifiedTimelineChart so the hide runs
+  // on unmount regardless of pointer path. This test drives that exact flow:
+  // show the tooltip via mousemove, then close the drawer (unmounts the chart)
+  // WITHOUT a prior mouseleave, and assert the tooltip hid. ──
+  test("crosshair tooltip hides when the chart unmounts (drawer close) without a prior mouseleave (#1452)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(240_000);
+    const uiURL = baseURL || DEFAULT_UI_URL;
+    const meetingId = `e2e_unified_unmount_${Date.now()}`;
+
+    const browsers = await Promise.all([
+      chromium.launch({ args: BROWSER_ARGS }),
+      chromium.launch({ args: BROWSER_ARGS }),
+    ]);
+
+    const members: MeetingMember[] = [];
+
+    try {
+      const profiles = [
+        { email: "host-unmount@videocall.rs", name: "UnmountHost" },
+        { email: "guest-unmount@videocall.rs", name: "UnmountGuest" },
+      ];
+
+      for (let i = 0; i < 2; i++) {
+        const ctx = await createAuthenticatedContext(
+          browsers[i],
+          profiles[i].email,
+          profiles[i].name,
+          uiURL,
+        );
+        members.push({
+          page: null as unknown as Page,
+          context: ctx,
+          email: profiles[i].email,
+          name: profiles[i].name,
+        });
+      }
+
+      members[0].page = await joinMeetingAs(members[0].context, meetingId, profiles[0].name);
+      await clickJoinAndEnterGrid(members[0].page);
+      members[1].page = await joinMeetingAs(members[1].context, meetingId, profiles[1].name, {
+        ensureMediaOn: true,
+      });
+      await admitGuestIfNeeded(members[0].page, members[1].page);
+
+      const hostPage = members[0].page;
+      await expect(hostPage.locator("#grid-container .canvas-container")).toHaveCount(1, {
+        timeout: 45_000,
+      });
+
+      await openDiagnosticsDrawer(hostPage);
+      const sidebar = hostPage.locator("#diagnostics-sidebar");
+      await expect(sidebar.locator("h3", { hasText: /^Current Status$/ })).toBeVisible({
+        timeout: 45_000,
+      });
+
+      // Same history gate as the sibling test — skip cleanly if the
+      // containerized audio pipeline never accumulates NetEq history.
+      const unifiedChart = sidebar.locator('[data-testid="diag-unified-timeline"]');
+      const appeared = await unifiedChart
+        .waitFor({ state: "visible", timeout: 90_000 })
+        .then(() => true)
+        .catch(() => false);
+      if (!appeared) {
+        test.skip(
+          true,
+          "Unified Timeline never rendered (no audio NetEq history in this harness run); " +
+            "the #1452 unmount-hide flow needs the chart mounted to exercise.",
+        );
+        return;
+      }
+
+      // Show the tooltip: hover the crosshair OVERLAY. The onmousemove handler
+      // lives on an absolute HTML <div data-testid="unified-timeline-crosshair">
+      // layered over the SVG (NOT the SVG itself), and only shows the tooltip
+      // when it resolves at least one series value at the pointer's time-offset.
+      // The singleton tooltip lives at <body>, NOT inside the sidebar.
+      const tooltip = hostPage.locator("#unified-timeline-tooltip-global");
+      const crosshair = sidebar.locator('[data-testid="unified-timeline-crosshair"]').first();
+      await crosshair.scrollIntoViewIfNeeded();
+      await expect(crosshair).toBeVisible();
+
+      await expect(crosshair).toBeVisible();
+      const cbox = await crosshair.boundingBox();
+      expect(cbox, "crosshair overlay has a layout box").not.toBeNull();
+      const cb = cbox as { width: number; height: number };
+      // Sweep a REAL pointer across the overlay (Dioxus's delegated listener
+      // receives genuine browser mousemoves; a synthetic dispatchEvent does not
+      // carry the offsetX Dioxus reads). `hover({position})` scrolls the element
+      // into view and moves the pointer to an element-relative point, so at least
+      // one column resolves a nearest series sample and shows the tooltip.
+      await expect
+        .poll(
+          async () => {
+            for (const frac of [0.5, 0.35, 0.65, 0.25, 0.8]) {
+              await crosshair.hover({
+                position: { x: cb.width * frac, y: cb.height / 2 },
+                force: true,
+              });
+            }
+            return (await tooltip
+              .evaluate((el) => (el as HTMLElement).style.display)
+              .catch(() => "absent")) === "block"
+              ? "shown"
+              : "hidden";
+          },
+          {
+            timeout: 15_000,
+            message:
+              "crosshair tooltip never showed on mousemove (precondition for the unmount-hide check)",
+          },
+        )
+        .toBe("shown");
+
+      // CRITICAL: close the drawer WITHOUT moving the pointer off the chart
+      // first — this UNMOUNTS UnifiedTimelineChart with the tooltip still
+      // display:block. No onmouseleave fires on this path; only the #1452
+      // use_drop can hide it. (Use a programmatic click so no pointer travels
+      // over the chart's onmouseleave on the way to the button.)
+      await sidebar.locator('button[aria-label="Close panel"]').dispatchEvent("click");
+      // When closed, attendants.rs keeps a lightweight #diagnostics-sidebar
+      // PLACEHOLDER in the DOM (it does not unmount the shell), so assert the
+      // CHART itself unmounted — that is the event that drives the use_drop.
+      await expect(sidebar.locator('[data-testid="diag-unified-timeline"]')).toHaveCount(0, {
+        timeout: 10_000,
+      });
+
+      // The fix: the singleton tooltip is now display:none (or removed). Pre-fix
+      // it stayed display:block at its last position.
+      await expect
+        .poll(
+          async () =>
+            tooltip.evaluate((el) => (el as HTMLElement).style.display).catch(() => "none"),
+          {
+            timeout: 10_000,
+            message:
+              "issue #1452 regression: the crosshair tooltip stayed visible after the chart " +
+              "unmounted (drawer closed) — use_drop(hide_unified_tooltip) did not fire.",
+          },
+        )
+        .not.toBe("block");
+    } finally {
+      for (const m of members) {
+        if (m.page) {
+          await m.page.close().catch(() => undefined);
+        }
+        await m.context.close().catch(() => undefined);
+      }
+      await Promise.all(browsers.map((b) => b.close().catch(() => undefined)));
+    }
+  });
 });

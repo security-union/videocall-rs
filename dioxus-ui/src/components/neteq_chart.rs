@@ -672,6 +672,20 @@ pub fn UnifiedTimelineChart(
     let series_memo = use_memo(move || unified_series_from_samples(&history().0));
     let series = series_memo();
 
+    // Hide the singleton crosshair tooltip when this chart unmounts (#1452).
+    // The tooltip is a `<body>`-level `<div id="unified-timeline-tooltip-global">`
+    // shown via `display:block` on `onmousemove` and hidden on `onmouseleave`.
+    // If the user closes the drawer / switches to "All Peers" / the peer leaves
+    // while the tooltip is visible — WITHOUT first moving the pointer off the
+    // chart — the overlay unmounts so no `onmouseleave` fires, and the singleton
+    // would otherwise stay `display:block` at its last position until the next
+    // hover repositions it. `use_drop` runs the hide on unmount regardless of
+    // pointer path. Mirrors `meetings_list::hide_meeting_info_tooltip`'s
+    // `use_drop`. MUST precede the empty-data early-return below so the hook is
+    // unconditional (a hook skipped on some render paths breaks Dioxus's hook
+    // ordering).
+    use_drop(hide_unified_tooltip);
+
     // Per-label visibility, seeded once (honours default_on, capped at
     // UNIFIED_DEFAULT_ON_CAP). Keyed by &'static label per the issue-173 spec.
     let seed = series.clone();
@@ -895,6 +909,10 @@ pub fn UnifiedTimelineChart(
                         let visible_for_move = visible_map.clone();
                         rsx! {
                             div {
+                                // Stable hook for the crosshair-tooltip E2E (#1452): the
+                                // onmousemove handler lives on this absolute HTML overlay, NOT
+                                // the SVG, so tests must hover THIS element to show the tooltip.
+                                "data-testid": "unified-timeline-crosshair",
                                 style: "{overlay_style}",
                                 onmousemove: move |evt: MouseEvent| {
                                     let client = evt.client_coordinates();

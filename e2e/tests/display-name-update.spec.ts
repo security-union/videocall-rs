@@ -819,15 +819,11 @@ test.describe("Display name live update", () => {
   });
 
   /**
-   * Verify that the display name persists after leaving a meeting and
-   * returning to the home page. This tests the plain-text localStorage
-   * fallback (`vc_display_name_raw`) that was added to work around Safari
-   * ITP clearing the CBOR+zlib key (`vc_display_name`). The test also
-   * verifies that the raw fallback survives corruption of the CBOR key.
+   * Verify that the display name persists as a plain-text string in
+   * localStorage after joining a meeting and returning to the home page.
+   * The stored value must be human-readable (no CBOR/zlib encoding).
    */
-  test("display name persists after leaving meeting and returning to home page", async ({
-    baseURL,
-  }) => {
+  test("display name persists as plain text after leaving meeting", async ({ baseURL }) => {
     test.skip(
       baseURL === "http://localhost:80" || baseURL === "http://localhost",
       "Yew UI does not support display name persistence",
@@ -855,9 +851,9 @@ test.describe("Display name live update", () => {
       expect(result).toBe("in-meeting");
       await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
-      // Verify the display name is in localStorage (plain-text fallback key)
+      // Verify the display name is stored as plain text in localStorage
       const storedName = await page.evaluate(() => {
-        return localStorage.getItem("vc_display_name_raw");
+        return localStorage.getItem("vc_display_name");
       });
       expect(storedName).toBe(displayName);
 
@@ -867,25 +863,6 @@ test.describe("Display name live update", () => {
 
       // Verify display name field is pre-populated on the home page
       const usernameInput = page.locator("#username");
-      await expect(usernameInput).toBeVisible({ timeout: 10_000 });
-      await expect(usernameInput).toHaveValue(displayName, { timeout: 5_000 });
-
-      // --- Test the fallback path ---
-      // Corrupt the CBOR key to simulate Safari ITP failure, keep the raw key
-      await page.evaluate(() => {
-        // The CBOR key stores data in a format that won't deserialize as a
-        // simple string — corrupting it simulates what Safari ITP does
-        localStorage.setItem("vc_display_name", "CORRUPTED_CBOR_DATA");
-      });
-
-      // Navigate away and back to force a fresh load
-      await page.goto("/");
-      await page.waitForTimeout(2000);
-
-      // The username should still be pre-populated via the raw fallback.
-      // This assertion is the load-bearing check: it fails on un-fixed code
-      // (corrupted CBOR + no fallback → empty field) and passes only when
-      // load_display_name_from_storage falls through to vc_display_name_raw.
       await expect(usernameInput).toBeVisible({ timeout: 10_000 });
       await expect(usernameInput).toHaveValue(displayName, { timeout: 5_000 });
     } finally {

@@ -596,10 +596,13 @@ impl SessionLogic {
         // `kind` taxonomy [`crate::metrics::RELAY_DROP_KINDS`] UNCONDITIONALLY
         // rather than a per-session "kinds I emitted" tracking set, so a session
         // that only ever incremented a subset of kinds is still fully cleaned.
-        // The sweep lives in `metrics` as the single source of truth so the #1090
-        // GC test pins this exact code path rather than an inline copy of it
-        // (issue #1186): reverting this to a per-session subset would fail that
-        // test.
+        // The sweep lives in `metrics` as the single source of truth (issue #1186)
+        // so the #1090 GC test pins the HELPER's full-taxonomy behavior rather than
+        // an inline copy. NOTE (issue #1380): that test calls `forget_session_drops`
+        // directly and does NOT exercise this call site — reverting THIS line to an
+        // inline per-session-subset loop would still pass CI. Keep this call wired to
+        // the full-taxonomy helper; it is the only thing standing between #1090 and a
+        // re-regression here.
         let session_id = self.id.to_string();
         crate::metrics::forget_session_drops(&self.room, &self.transport, &session_id);
         send_connection_ended(&self.tracker_sender, self.id);

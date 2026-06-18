@@ -18,7 +18,7 @@
 
 use crate::components::decode_budget::{
     decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
-    is_sole_real_tile, merge_user_requested_decode, partition_camera_tiles,
+    is_sole_real_tile, merge_pinned_decode, merge_user_requested_decode, partition_camera_tiles,
     promote_pinned_into_decoded, promote_requested_into_decoded, BudgetSample, BudgetState,
     BudgetStep, MIN_CAP,
 };
@@ -3691,15 +3691,17 @@ pub fn AttendantsComponent(
     }
 
     // --- Pinned-peer promotion (HCL #987 review FIX 7; bounded per issue #1470) ---
-    // A pinned peer is force-added to `active_decode_set` (phase 3, below), so
-    // it is ALWAYS decoded regardless of the budget cap. If that peer is ranked
-    // in the displayed off-budget window, it would otherwise land in
-    // `avatar_tiles` and render with `force_avatar = true` ("Video paused")
-    // while it is in fact being decoded — wasted decode AND a misleading UI.
-    // `promote_pinned_into_decoded` swaps it into the LAST decoded slot so
-    // decode and render agree, BOUNDED to `[visible_tile_count,
-    // displayed_tile_count)` so a true-overflow pin can't evict a displayed tile
-    // off the grid (issue #1470 — the same defect bounded on the PLAY path).
+    // A pinned peer is force-added to `active_decode_set` (phase 3, below) when it
+    // got a decoded slot this render. If that peer is ranked in the displayed
+    // off-budget window, it would otherwise land in `avatar_tiles` and render with
+    // `force_avatar = true` ("Video paused") while it is in fact being decoded —
+    // wasted decode AND a misleading UI. `promote_pinned_into_decoded` swaps it
+    // into the LAST decoded slot so decode and render agree, BOUNDED to
+    // `[visible_tile_count, displayed_tile_count)` so a true-overflow pin can't
+    // evict a displayed tile off the grid (issue #1470 — the same defect bounded
+    // on the PLAY path). A true-overflow pin is NOT promoted, gets no decoded
+    // slot, and so phase 3's `decoded_bucket` intersection (#1489) keeps it OUT of
+    // the decode set — it is neither decoded nor shown live (decode⇄render agree).
     if visible_tile_count > 0 && visible_tile_count < all_tiles.len() {
         if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
             // `all_tiles` holds session_ids; the pin is keyed by user_id. Find
@@ -3973,9 +3975,10 @@ pub fn AttendantsComponent(
         // --- SS pin-swap (mirrors the normal grid's pin-swap at lines above) ---
         // If the pinned peer is ranked beyond `ss_budget`, swap it into the
         // last decoded slot so it renders with live video instead of avatar.
-        // Without this, a pinned off-budget SS peer gets force-added to
-        // `active_decode_set` (phase 3) which silently exceeds budget_cap,
-        // AND renders as avatar despite being decoded (wasted decode +
+        // The SS panel renders ALL tiles (no +N badge), so this swap always lands
+        // the pin in `ss_decoded_tiles` → `decoded_bucket`, so phase 3's #1489
+        // intersection admits it. Without the swap a pinned off-budget SS peer
+        // would render as avatar despite being decoded (wasted decode +
         // misleading UI).
         if ss_budget > 0 && ss_budget < ss_all.len() {
             if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
@@ -4043,7 +4046,9 @@ pub fn AttendantsComponent(
     // ORDERING INVARIANT: the active decode set is built in 4 phases:
     //   1. Visible layout peers (here)
     //   2. Active screen sharer (here)
-    //   3. Pinned peer (below, after tile rendering)
+    //   3. Pinned peer (below, after tile rendering) — INTERSECTED with the
+    //      decoded bucket (issue #1489) so a true-overflow pin with no decoded
+    //      slot is not decoded-but-invisible (mirrors phase 4).
     //   4. User-requested force-decode peers (below, issue #1466) — the
     //      `merge_user_requested_decode` call after the stale-request prune,
     //      INTERSECTED with the decoded bucket so it can only re-affirm peers
@@ -4362,6 +4367,17 @@ pub fn AttendantsComponent(
     }
 
     // Phase 3 of active_decode_set construction (see ordering invariant above).
+    // INTERSECTED with `decoded_bucket` (issue #1489), mirroring the phase-4 PLAY
+    // merge: the pin-swap above already moved a promotable pin
+    // (`[visible_tile_count, displayed_tile_count)`) into a decoded slot, so it is
+    // in `decoded_bucket` and is admitted. A true-overflow pin
+    // (`idx >= displayed_tile_count`) is deliberately NOT promoted (#1470 — it
+    // would evict a displayed tile off-grid) and so stays in the +N badge with no
+    // decoded slot; gating the insert here keeps it OUT of the decode set rather
+    // than decoding it while it renders in no grid bucket (decode⇄render agree).
+    // A camera-OFF pin is never in `decoded_bucket` (it is in `camera_off_tiles`,
+    // not `visible_tiles`/`ss_decoded_tiles`) so it is intentionally excluded —
+    // it has no video to decode and its audio is independent of this set.
     let current_pinned = pinned_peer_id();
     if let Some(pinned_user_id) = current_pinned.as_deref() {
         if let Some(pinned_session_id) = display_peers
@@ -4369,7 +4385,7 @@ pub fn AttendantsComponent(
             .find(|peer_id| client.get_peer_user_id(peer_id).as_deref() == Some(pinned_user_id))
             .and_then(|peer_id| peer_id.parse::<u64>().ok())
         {
-            active_decode_set.insert(pinned_session_id);
+            merge_pinned_decode(&mut active_decode_set, pinned_session_id, &decoded_bucket);
         }
     }
 

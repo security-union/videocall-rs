@@ -31,14 +31,9 @@ use dioxus::prelude::*;
 fn main() {
     console_error_panic_hook::set_once();
 
-    // Set the storage directory for the file-system LocalStorage backend.
-    // This is a no-op on WASM (web) — on native it resolves to the platform's
-    // local app-data directory so that LocalStorage writes go to disk.
-    dioxus_sdk_storage::set_dir!();
-
-    // Migrate any legacy plain-string localStorage keys (written by older
-    // releases) to the new CBOR+zlib format used by dioxus-sdk-storage.
-    // Must run after set_dir!() and before the component tree mounts.
+    // Migrate any legacy CBOR+zlib or renamed localStorage keys (written by
+    // older releases that used dioxus-sdk-storage) to plain-text format.
+    // Must run before the component tree mounts.
     migrate_legacy_storage();
 
     // Initialise the WASM logger to the operator-configured level
@@ -89,7 +84,7 @@ fn App() -> Element {
     // Keep html[data-theme] in sync whenever the user changes the signal.
     // Skip the first firing: initialize_document_theme() already applied the
     // correct theme synchronously before the first render, so re-running it
-    // here would cause a redundant (and potentially slower CBOR) write.
+    // here would cause a redundant write.
     let is_first_effect = use_hook(|| std::cell::Cell::new(true));
     use_effect(move || {
         let current_theme = theme();
@@ -153,10 +148,8 @@ fn App() -> Element {
 }
 
 fn initialize_document_theme() {
-    // Use the CBOR-aware loader so this stays consistent with apply_and_save_theme,
-    // which writes via dioxus_sdk_storage (CBOR+zlib encoded). Reading with raw
-    // web_sys::Storage::get_item would see the encoded blob and fall back to "dark"
-    // for every non-default theme, causing a flash-of-wrong-theme on each page load.
+    // Read the persisted theme preference and apply it to the DOM before the
+    // component tree mounts, preventing a flash-of-wrong-theme on page load.
     let theme = load_theme_from_storage();
     apply_theme_to_dom(theme);
 }

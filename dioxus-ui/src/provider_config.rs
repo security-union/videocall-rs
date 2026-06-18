@@ -11,8 +11,9 @@
 //! first successful fetch so that subsequent calls within the same tab are
 //! free (no network round-trip).
 
-use dioxus_sdk_storage::{SessionStorage, StorageBacking};
 use serde::Deserialize;
+
+use crate::context::{read_session_storage, write_session_storage};
 use videocall_meeting_types::responses::OAuthProviderConfigResponse;
 
 use crate::constants::meeting_api_base_url;
@@ -41,7 +42,7 @@ struct Envelope {
 /// redirect, `token_url` non-empty for the token exchange).
 pub(crate) async fn fetch_provider_config() -> Result<OAuthProviderConfigResponse, String> {
     // 1. Session cache — no network needed.
-    if let Some(json) = SessionStorage::get::<Option<String>>(&CACHE_KEY.to_string()).flatten() {
+    if let Some(json) = read_session_storage(CACHE_KEY) {
         if let Ok(cfg) = serde_json::from_str::<OAuthProviderConfigResponse>(&json) {
             return Ok(cfg);
         }
@@ -78,7 +79,7 @@ pub(crate) async fn fetch_provider_config() -> Result<OAuthProviderConfigRespons
 
     // 3. Populate the cache.
     if let Ok(json) = serde_json::to_string(&cfg) {
-        SessionStorage::set(CACHE_KEY.to_string(), &Some(json));
+        write_session_storage(CACHE_KEY, &json);
     }
 
     Ok(cfg)

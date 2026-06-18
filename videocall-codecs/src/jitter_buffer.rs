@@ -69,10 +69,15 @@ const PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS: f64 = 1000.0;
 /// sustained/recurring keyframe-less stall (issue #1479). With a 1000ms base, exponent 3 caps
 /// the proactive-PLI cadence at `1000 * 2^3 = 8000ms` — i.e. once recovery is clearly not
 /// arriving, this receiver pokes the speaker at most ~1/8s instead of ~1/s, damping the
-/// self-sustaining PLI storm. Going quiet is safe: the independent reactive gap-driven request
-/// path (`peer_decode_manager::should_request_keyframe`, 1s base + its own backoff + uncapped
-/// slow-retry) remains the binding lower bound on freeze recovery; this proactive path is only
-/// an accelerator on top of it, and the whole point of #1479 is to stop it from amplifying.
+/// self-sustaining PLI storm. Going quiet is safe: the binding lower bound on freeze recovery is
+/// the *publisher's periodic GOP keyframe* (~5s camera / ~3s screen — the encoder's own
+/// `keyframe_interval_frames` cadence, NOT gated by the PLI cooldown; see `videocall-aq`'s tier
+/// `keyframe_interval_frames` and `camera_encoder`'s emit coalescer, which exempts the periodic
+/// keyframe). The reactive gap-driven path (`peer_decode_manager::should_request_keyframe`) is an
+/// additional accelerator but does NOT fire on a contiguous-delta *lossless* (WS) keyframe-less
+/// stall — the exact #1479 shape — because it gates on `lost_count > 0`. So this proactive path is
+/// one accelerator above the periodic-keyframe floor, and the whole point of #1479 is to stop it
+/// from amplifying.
 const PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP: u32 = 3;
 /// Quiet interval (ms) since the last proactive keyframe request after which the backoff
 /// exponent resets to 0 (issue #1479). Set comfortably ABOVE the maximum backed-off interval
@@ -90,6 +95,22 @@ const PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP: u32 = 3;
 /// `PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP`) so a stall firing at the capped cadence never
 /// self-resets mid-storm.
 const PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS: f64 = 12_000.0;
+
+/// Compile-time guard on the load-bearing backoff invariant (issue #1499):
+/// `PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS` must stay STRICTLY ABOVE the
+/// maximum backed-off interval `PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS *
+/// 2^PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP` (= 1000 * 2^3 = 8000ms). If a
+/// future re-tune lowered RESET below the cap (or raised MAX_BACKOFF_EXP / the
+/// base past it), a stall firing at the capped ~1/8s cadence would cross the
+/// reset threshold between fires and zero its own exponent every cycle —
+/// silently defeating #1479's storm damping, with no unit test catching it (the
+/// tests hardcode the `[2,4,8,8]·base` gap sequence). Mirrors the
+/// governor-ordering assert at the `GOVERNOR_*` block below.
+const _: () = assert!(
+    PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS
+        * (2u32.pow(PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP) as f64)
+        < PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS
+);
 /// A multiplier applied to the jitter estimate to provide a safety margin.
 /// A value of 3.0 means we buffer enough to handle jitter up to 3x the running average.
 const JITTER_MULTIPLIER: f64 = 3.0;
@@ -961,8 +982,13 @@ impl<T> JitterBuffer<T> {
                 // PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP (issue #1479). A fixed ~1/s cadence
                 // across a meeting-long sequence of freezes is precisely the receiver-side
                 // amplifier of the PLI keyframe storm: every receiver pokes the active speaker
-                // every second, and the relay's delivery-unaware limiter then delays the very
-                // recovery keyframe those pokes are asking for. Backing off decays the cadence
+                // every second. The relay's KEYFRAME_REQUEST limiter became delivery-aware in
+                // #1297 (a ~200ms still-waiting retry under a global cap — see actix-api's
+                // packet_handler `KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS` / `observe_delivery`),
+                // so it coalesces these pokes rather than forwarding each one; but a meeting-wide
+                // ~1/s spray from every receiver still wastes the speaker's uplink and the relay's
+                // limiter budget on requests for a keyframe already in flight. Backing off decays
+                // the cadence
                 // toward ~1/8s while the stall persists, then the quiet-interval reset above
                 // restores full speed once the stream genuinely recovers.
                 let backoff_exp = self

@@ -277,6 +277,8 @@ pub fn forget_room_metrics(room: &str) {
 /// called by `SessionLogic::on_stopping` (the runtime path) AND pinned directly
 /// by `metrics::tests::session_drop_gc_iterates_full_taxonomy_unconditionally`,
 /// so the test exercises the real GC code instead of an inline replica of it.
+/// (That test pins THIS helper's full-taxonomy sweep; it does not exercise the
+/// `on_stopping` call site itself — see #1380.)
 ///
 /// LEAK-PROOF: we iterate the entire fixed [`RELAY_DROP_KINDS`] taxonomy
 /// unconditionally rather than a per-session "kinds I emitted" tracking set.
@@ -943,6 +945,22 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create capability_score metric");
+
+    /// Client battery level (0.0–1.0) as a NUMERIC gauge (#1392). PR #1368 widened
+    /// the TELEM-7 `CLIENT_INFO` publish gate to admit a battery-only health packet,
+    /// but the battery *value* rode on no metric — `CLIENT_INFO`'s labels are
+    /// cores/architecture/gpu_family/network_effective_type/capability_score only.
+    /// This exposes the reported level as a real measurement so it can be
+    /// thresholded/averaged/quantiled in PromQL (e.g. "fraction of clients under
+    /// 20% battery"). Mirrors `CAPABILITY_SCORE`: same per-reporter label set, set
+    /// only when actually reported so an absent battery stays absent (not a
+    /// misleading 0).
+    pub static ref BATTERY_LEVEL: GaugeVec = register_gauge_vec!(
+        "videocall_client_battery_level",
+        "Client battery level as a numeric value in [0,1] (0.0 = empty, 1.0 = full); absent when the client did not report a battery level",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_battery_level metric");
 
     /// Effective simulcast layer count the publisher is configured to encode/send
     /// (#1143). p90==1 across a meeting is the inert-simulcast signal that the
@@ -2304,15 +2322,19 @@ mod tests {
     /// incremented — i.e. the GC does not depend on a per-session "kinds I
     /// emitted" tracking set.
     ///
-    /// CRITICAL (issue #1186): this calls the REAL GC entry point
-    /// [`forget_session_drops`] — the same function `SessionLogic::on_stopping`
-    /// invokes — instead of replicating its loop inline. Mutating `on_stopping`
-    /// back to per-session-subset iteration (the exact #1090 regression) routes
-    /// the runtime through `forget_session_drops`, so this test pins the real
-    /// path. To prove the helper itself is exhaustive, we additionally seed a
-    /// SECOND kind the session never "officially" emitted and assert the sweep
-    /// removes it too: shrinking the loop in `forget_session_drops` to a subset
-    /// would leave a residual series and fail this test.
+    /// SCOPE (issue #1186 / #1380): this pins the GC HELPER
+    /// [`forget_session_drops`] — the function `SessionLogic::on_stopping`
+    /// invokes — by calling it directly and asserting it sweeps the FULL
+    /// taxonomy. It seeds a SECOND kind the session never "officially" emitted
+    /// and asserts the sweep removes it too, so shrinking the loop in
+    /// `forget_session_drops` to a subset leaves a residual series and fails
+    /// here. What this test does NOT cover (#1380): the `on_stopping` CALL SITE
+    /// wiring. `on_stopping` needs an `Addr<ChatServer>` + NATS client + tracker
+    /// to drive, so reverting it to an inline per-session-subset loop that
+    /// bypasses this helper (the exact #1090 regression shape) would still pass
+    /// CI — that wiring is guarded only by the one-line call site under the
+    /// LEAK-PROOF comment in `session_logic.rs::on_stopping`, not by this test.
+    /// Do not over-trust this as a guard against re-breaking the call site.
     #[test]
     #[serial(session_drops_gc)]
     fn session_drop_gc_iterates_full_taxonomy_unconditionally() {

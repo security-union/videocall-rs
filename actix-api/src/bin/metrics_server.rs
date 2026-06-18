@@ -48,25 +48,26 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
-    AUDIO_CONCEALMENT_PCT, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE,
-    CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES,
-    CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
-    CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL,
-    CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE,
-    CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE,
-    DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N,
-    DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS,
-    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL,
-    ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC,
-    KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC,
-    NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC,
-    NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS,
-    PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED,
-    RTT_PROBE_DROPPED_TOTAL, RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_SHARING_ACTIVE,
-    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
-    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
+    AUDIO_CONCEALMENT_PCT, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, BATTERY_LEVEL,
+    CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
+    CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES,
+    CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
+    CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
+    CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL,
+    DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
+    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
+    ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH,
+    ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
+    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
+    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
+    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RTT_PROBE_DROPPED_TOTAL,
+    RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
+    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
+    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS,
+    VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE,
+    VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -293,6 +294,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     // label leaves no residual series on disconnect.
     let _ = DECODE_ACTIVE_SET_SIZE.remove_label_values(&reporter_labels);
     let _ = CAPABILITY_SCORE.remove_label_values(&reporter_labels);
+    let _ = BATTERY_LEVEL.remove_label_values(&reporter_labels);
     // Layer gauges carry an extra media_kind label; the client only reports the
     // camera encoder, so the single series GC'd is media_kind="camera".
     let layer_labels: [&str; 5] = [
@@ -1083,6 +1085,17 @@ fn process_health_packet_to_metrics_pb(
                 CAPABILITY_SCORE
                     .with_label_values(&reporter_labels)
                     .set(cap as f64);
+            }
+
+            // #1392: also export the battery level as a NUMERIC gauge so it can be
+            // thresholded/averaged/quantiled in PromQL directly, instead of only
+            // gating CLIENT_INFO's publish (PR #1368). Only set when actually
+            // reported, so an absent battery stays absent (not a misleading 0).
+            // Same per-reporter label set as the sibling gauges.
+            if let Some(battery) = health_packet.client_battery_level {
+                BATTERY_LEVEL
+                    .with_label_values(&reporter_labels)
+                    .set(battery);
             }
         }
 
@@ -2992,6 +3005,56 @@ mod tests {
                 ],
             ),
             "battery-only client metadata must publish CLIENT_INFO"
+        );
+    }
+
+    #[test]
+    fn test_battery_level_gauge_published_with_reported_value() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet("s_batval", "m_batval", "alice", HashMap::new());
+        hp.client_battery_level = Some(0.37);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        // #1392: the battery VALUE must ride on its own numeric gauge (peer_id is
+        // the reporting_user_id; display_name defaults to the reporting_user_id).
+        let labels = [
+            ("meeting_id", "m_batval"),
+            ("session_id", "s_batval"),
+            ("peer_id", "alice"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_client_battery_level", &labels),
+            Some(0.37),
+            "the reported battery level must be published as the gauge value"
+        );
+    }
+
+    #[test]
+    fn test_battery_level_gauge_absent_when_not_reported() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // A packet with OTHER client metadata (so the TELEM-7 block runs) but no
+        // battery level: the gauge must stay absent, not publish a misleading 0.
+        let mut hp = create_test_health_packet("s_nobat", "m_nobat", "carol", HashMap::new());
+        hp.client_cores = Some(8);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        let labels = [
+            ("meeting_id", "m_nobat"),
+            ("session_id", "s_nobat"),
+            ("peer_id", "carol"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_client_battery_level", &labels),
+            None,
+            "an absent battery level must leave the gauge absent (not a 0)"
         );
     }
 

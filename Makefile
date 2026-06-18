@@ -49,7 +49,10 @@ clippy-fix:
 # tests slip through a plain `--all` run and fail in CI instead (e.g. PR #1491
 # shipped a `clippy::len_zero` in a neteq `--features web` test). Run this
 # locally before every push; /pre-submit runs it and fails the gate on any error.
-# Keep these lines BYTE-IDENTICAL to the workflow steps — if CI changes, change here.
+# Keep these lines BYTE-IDENTICAL to the workflow steps — if CI changes, change
+# here. `scripts/check-clippy-ci-sync.sh` (run by the fmt job in
+# pr-check-rust-hcl.yaml) enforces this: editing one list without the other
+# turns CI red, so the byte-identical contract is self-enforcing (issue #1500).
 clippy-ci:
 		cargo clippy --all -- -D warnings
 		cargo clippy --target wasm32-unknown-unknown -p videocall-client --tests -- -D warnings

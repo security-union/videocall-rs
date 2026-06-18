@@ -58,12 +58,12 @@ use crate::constants::{
     meeting_api_base_url, oauth_client_id, oauth_issuer, oauth_redirect_url, oauth_token_url,
 };
 use crate::context::{
-    email_to_display_name, is_guid_like, save_display_name_to_storage, validate_display_name,
+    email_to_display_name, is_guid_like, read_session_storage, save_display_name_to_storage,
+    validate_display_name, write_session_storage,
 };
 use crate::id_token::decode_and_validate_id_token;
 use crate::pkce::exchange_code_with_provider;
 use dioxus::prelude::*;
-use dioxus_sdk_storage::{SessionStorage, StorageBacking};
 use gloo_utils::window;
 use serde::Deserialize;
 
@@ -132,11 +132,7 @@ async fn resolve_token_endpoint() -> Result<String, String> {
     }
 
     // 2. Per-session cache from a previous discovery call.
-    if let Some(cached) =
-        SessionStorage::get::<Option<String>>(&CACHED_TOKEN_ENDPOINT_KEY.to_string())
-            .flatten()
-            .filter(|s| !s.is_empty())
-    {
+    if let Some(cached) = read_session_storage(CACHED_TOKEN_ENDPOINT_KEY) {
         return Ok(cached);
     }
 
@@ -214,10 +210,7 @@ async fn fetch_token_endpoint_from_backend() -> Result<String, String> {
 }
 
 fn cache_token_endpoint(url: &str) {
-    SessionStorage::set(
-        CACHED_TOKEN_ENDPOINT_KEY.to_string(),
-        &Some(url.to_string()),
-    );
+    write_session_storage(CACHED_TOKEN_ENDPOINT_KEY, url);
 }
 
 // ---------------------------------------------------------------------------

@@ -745,6 +745,39 @@ pub fn merge_user_requested_decode(
     }
 }
 
+/// Merge the pinned peer into the active decode set — but ONLY when it actually
+/// landed in the decoded bucket this render (issue #1489).
+///
+/// Phase 3 of `active_decode_set` construction force-adds the pinned peer. The
+/// pin-swap ([`promote_pinned_into_decoded`]) earlier in the render moves a pin
+/// ranked in the displayed off-budget window `[visible_tile_count,
+/// displayed_tile_count)` INWARD into a decoded slot, so a promotable pin is
+/// already in `decoded_bucket` and passes this gate. But a pin in the
+/// true-overflow region (`pinned_idx >= displayed_tile_count`) is deliberately
+/// NOT promoted (it would evict a displayed tile off-grid — #1470), so it stays
+/// in the +N badge with no decoded slot. Force-adding such a pin would decode it
+/// while it renders in no grid bucket — the "decode but show nothing" waste
+/// #1489 removes. Gating the insert on `decoded_bucket` membership keeps phase 3
+/// in agreement with render, EXACTLY mirroring the phase-4 PLAY-path
+/// [`merge_user_requested_decode`].
+///
+/// `pinned_session_id` is the pinned peer's resolved `session_id` (the caller
+/// maps the user_id-keyed pin to a session_id via `client.get_peer_user_id`,
+/// which is not host-testable, so it is passed in). Kept pure / DOM-free /
+/// signal-free so the decode⇄render invariant is host-unit-testable.
+pub fn merge_pinned_decode(
+    active: &mut std::collections::HashSet<u64>,
+    pinned_session_id: u64,
+    decoded_bucket: &std::collections::HashSet<u64>,
+) {
+    // Only force-decode the pin when it actually got a decoded slot this render
+    // (decode⇄render must agree — #1489). A true-overflow pin (#1470) has no
+    // decoded slot and so must not be decoded while rendering in no grid bucket.
+    if decoded_bucket.contains(&pinned_session_id) {
+        active.insert(pinned_session_id);
+    }
+}
+
 /// Promote user-requested ("PLAY") peers that are still ranked beyond the
 /// decoded window INWARD into decoded slots, so they render live instead of
 /// decoded-but-shown-paused (issues #1466 / #1286).
@@ -815,10 +848,11 @@ pub fn promote_requested_into_decoded(
 
 /// Promote a pinned peer ranked beyond the decoded window INWARD into the last
 /// decoded slot, so it renders live video instead of decoded-but-shown-paused
-/// (HCL #987 review FIX 7). A pinned peer is force-added to `active_decode_set`
-/// (phase 3) regardless of rank, so without this swap an off-budget pin would be
-/// decoded yet rendered as a "Video paused" avatar — wasted decode AND a
-/// misleading UI.
+/// (HCL #987 review FIX 7). A pin promoted into the decoded window is force-added
+/// to `active_decode_set` (phase 3, intersected with the decoded bucket — see the
+/// note below and [`merge_pinned_decode`]); without this swap an off-budget pin in
+/// the displayed window would be decoded yet rendered as a "Video paused" avatar
+/// — wasted decode AND a misleading UI.
 ///
 /// `all_tiles` is the unified, display-ordered tile list. `visible_tile_count`
 /// is the decoded-window size; `displayed_tile_count` is the number of real grid
@@ -841,10 +875,10 @@ pub fn promote_requested_into_decoded(
 /// [`promote_requested_into_decoded`] (PR #1467 review B1); the pin path shares
 /// the mechanism and is bounded identically here. A true-overflow pin correctly
 /// stays in the +N badge with no decoded slot — consistent with the
-/// POST-EXPANSION INVARIANT documented for the PLAY path. (Phase 3 still
-/// force-adds it to `active_decode_set` by user_id regardless of rank; that is a
-/// distinct concern — admitting the pin's decode — tracked separately and
-/// unchanged here.)
+/// POST-EXPANSION INVARIANT documented for the PLAY path. Phase 3 then
+/// intersects the pin's decode admission with the decoded bucket (issue #1489 —
+/// [`merge_pinned_decode`]), so a true-overflow pin that got no decoded slot here
+/// is NOT decoded either: decode and render agree (neither decoded nor shown).
 ///
 /// Kept pure / DOM-free / signal-free so it is host-unit-testable.
 pub fn promote_pinned_into_decoded(
@@ -1991,6 +2025,63 @@ mod tests {
         expected.insert(7);
         expected.insert(42);
         assert_eq!(active, expected, "empty request set is a no-op");
+    }
+
+    // ── issue #1489: pinned-peer decode-admission merge ───────────────────────
+
+    /// A pin that got a decoded slot (it IS in the decoded bucket) is force-added.
+    /// This is the promotable-pin case (`[visible_tile_count,
+    /// displayed_tile_count)`), where the pin-swap already placed it in
+    /// `decoded_bucket`.
+    ///
+    /// MUTATION SENSITIVITY: if `merge_pinned_decode` dropped the insert (made a
+    /// no-op) the set stays empty and this fails. The literal (321) is
+    /// independent.
+    #[test]
+    fn merge_pinned_inserts_pin_in_decoded_bucket() {
+        let mut active: HashSet<u64> = HashSet::new();
+        merge_pinned_decode(&mut active, 321, &bucket(&[321]));
+        assert!(active.contains(&321), "a decoded pin is force-added");
+        assert_eq!(active.len(), 1, "exactly the one decoded pin was inserted");
+    }
+
+    /// A true-overflow pin (#1470) that got NO decoded slot — it is not in the
+    /// decoded bucket — must NOT be force-decoded. This is the #1489
+    /// decode⇄render invariant: a pin rendered in the +N badge (no grid bucket)
+    /// is never decoded-but-invisible.
+    ///
+    /// MUTATION SENSITIVITY: if the helper dropped the `decoded_bucket.contains`
+    /// gate (reverting to the old unconditional `active.insert(pin)`), id 555
+    /// would be added and this fails — this is the exact regression #1489 fixes.
+    #[test]
+    fn merge_pinned_skips_pin_not_in_decoded_bucket() {
+        let mut active: HashSet<u64> = HashSet::new();
+        // Decoded bucket holds a DIFFERENT peer (777); the pin (555) is in the
+        // true-overflow +N badge with no decoded slot.
+        merge_pinned_decode(&mut active, 555, &bucket(&[777]));
+        assert!(
+            active.is_empty(),
+            "an off-grid (true-overflow) pin must not enter active_decode_set"
+        );
+    }
+
+    /// The merge is a UNION (pre-seeded ids survive) and idempotent.
+    ///
+    /// MUTATION SENSITIVITY: if the helper cleared/replaced `active`, the
+    /// pre-seeded 999 would vanish and the first assert fails.
+    #[test]
+    fn merge_pinned_is_union_and_idempotent() {
+        let mut active: HashSet<u64> = HashSet::new();
+        active.insert(999);
+        merge_pinned_decode(&mut active, 321, &bucket(&[321]));
+        assert!(
+            active.contains(&999),
+            "pre-existing entry preserved (union)"
+        );
+        assert!(active.contains(&321), "decoded pin added");
+        let after_first: HashSet<u64> = active.clone();
+        merge_pinned_decode(&mut active, 321, &bucket(&[321]));
+        assert_eq!(active, after_first, "re-merging the same pin is a no-op");
     }
 
     // ── issue #1466 / #1286: expand_decoded_for_requested ─────────────────────

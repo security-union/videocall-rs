@@ -288,10 +288,11 @@ impl DelayManager {
         // accumulated (possibly ratcheted-high) distribution intact, so the very next `update()`
         // re-derived the old high target via the quantile — i.e. the "reset" did not actually
         // recalibrate the adaptive target. This matters for the #1299 resync-to-live governor
-        // (which resets here after flushing the backlog so playback can resume against a live
-        // setpoint) and is the correct behavior for the other callers too (a full flush / a 6s
-        // expand safety-valve are exactly the discontinuities after which stale jitter history
-        // should be abandoned). Resets to ~80ms like WebRTC.
+        // (`flush_to_live` resets here after flushing the backlog so playback can resume against a
+        // live setpoint) and is correct for the other LIVE caller too — `NetEq::reset()`, reached
+        // via either the ~6 s expand safety-valve or `flush()` (the peer audio-off path) — exactly
+        // the discontinuities after which stale jitter history should be abandoned. Resets to ~80ms
+        // like WebRTC.
         self.histogram.reset();
     }
 

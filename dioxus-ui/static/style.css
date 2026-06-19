@@ -81,6 +81,17 @@ canvas {
 #peer-list-container.visible {
   transform: translateX(0);
   visibility: visible;
+  /* Open INSTANTLY (no slide) so the drag-resize handle — an absolutely
+     positioned child that rides the drawer's `transform` — is at its FINAL hit
+     position the moment `.visible` applies, instead of being a moving target
+     during a 0.3s slide-in. Close stays animated: the base rule's
+     `transition: transform 0.3s ease` governs the transition INTO the closed
+     state, and this 0s duration only applies while opening (in the `.visible`
+     state). Without this, a pointer drag that grabs the handle's transient
+     mid-slide position misses the moving handle entirely. The transform VALUE is
+     unchanged, so the closed full-hide at custom widths and the popover
+     containing-block behaviour are preserved. (issue 1296) */
+  transition-duration: 0s;
 }
 
 /* Shared sidebar styles */
@@ -188,7 +199,8 @@ h3 {
   padding: 1px 7px;
   border-radius: 8px;
   background-color: var(--warning);
-  color: #000; /* @token-exempt: explicit black text on yellow warning badge for AA contrast */
+  color: #000;
+  /* @token-exempt: explicit black text on yellow warning badge for AA contrast */
   font-size: 0.7em;
   font-weight: 700;
   line-height: 1.4;
@@ -213,7 +225,8 @@ h3 {
   padding: 2px 8px;
   border-radius: 8px;
   background-color: var(--warning);
-  color: #000; /* @token-exempt: explicit black text on yellow warning badge for AA contrast */
+  color: #000;
+  /* @token-exempt: explicit black text on yellow warning badge for AA contrast */
   font-size: 0.7em;
   font-weight: 700;
   z-index: 30;
@@ -415,8 +428,10 @@ h3 {
   inset: 0;
   z-index: 0;
   display: grid;
-  grid-template-columns: repeat(4, 1fr); /* fallback; Rust overrides */
-  grid-template-rows: repeat(3, 1fr); /* fallback; Rust overrides */
+  grid-template-columns: repeat(4, 1fr);
+  /* fallback; Rust overrides */
+  grid-template-rows: repeat(3, 1fr);
+  /* fallback; Rust overrides */
   /* Desktop gap/padding — keep in sync with attendants.rs (vw >= 568.0 branch) */
   gap: 16px;
   padding: 20px 20px 84px 20px;
@@ -519,28 +534,117 @@ h3 {
   opacity: 0.82;
 }
 
-.decode-paused-badge {
+/* Issue #1466 (B1): the per-tile PLAY control. Previously a corner badge
+   anchored at top/right -6px with a 44px hit box created via negative margin —
+   but that box grew UP and RIGHT into the tile corner, where
+   `.canvas-container { overflow: hidden }` CLIPPED it, and its right edge ran
+   under the corner-pinned `.tile-top-icons` (z-index:3, which holds the
+   interactive signal button). The real tap area was well under 44px and
+   ambiguous taps landed on the signal button.
+
+   The control is now a CENTERED overlay over the PeerIcon. The placeholder
+   (`.placeholder-content--paused`) is `position: relative` and is itself
+   centered within the flex `.canvas-container`, so an absolutely-centered
+   element sits over the avatar in the middle of the visible tile — comfortably
+   inside the unclipped region and far from the corner icons. A 48px circular
+   target (> the 44px minimum) keeps it easily tappable on mobile. */
+.decode-play-overlay {
   position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 22px;
-  height: 22px;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  width: 48px;
+  height: 48px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  padding: 0;
+  border: none;
   border-radius: var(--radius-pill, 999px);
   background: var(--btn-warning-bg);
   color: var(--warning);
   box-shadow: 0 0 0 1px var(--btn-warning-border);
-  pointer-events: none;
+  cursor: pointer;
+  font: inherit;
+  /* Sit above the dimmed PeerIcon, but below the corner `.tile-top-icons`
+     (z-index:3) which it never overlaps anyway. */
+  z-index: 2;
+  transition:
+    background 0.15s ease,
+    box-shadow 0.15s ease,
+    transform 0.1s ease;
 }
 
-/* Override the generic `.placeholder-content svg` sizing/tint for the badge
-   glyph: it is a small amber pause icon, not the large tertiary PeerIcon. */
-.decode-paused-badge svg {
-  width: 14px;
-  height: 14px;
+/* Override the generic `.placeholder-content svg` sizing/tint for the play
+   glyph: a small amber triangle, not the large tertiary PeerIcon. */
+.decode-play-overlay svg {
+  width: 20px;
+  height: 20px;
   fill: currentColor;
+}
+
+.decode-play-overlay:hover {
+  background: var(--btn-warning-bg-hover);
+  box-shadow: 0 0 0 1px var(--btn-warning-border-hover);
+  /* Keep the centering translate while adding the hover bump. */
+  transform: translate(-50%, -50%) scale(1.06);
+}
+
+.decode-play-overlay:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
+}
+
+/* Issue #1466 (S2): respect prefers-reduced-motion. Suppress ONLY the hover
+   scale animation — but the button uses `transform` for centering too, so we
+   cannot use `transform: none` (that would un-center it). Reset the hover
+   transform back to the centering-only translate, and drop the transform from
+   the transition. Background/box-shadow hover feedback is preserved. */
+@media (prefers-reduced-motion: reduce) {
+  .decode-play-overlay {
+    transition:
+      background 0.15s ease,
+      box-shadow 0.15s ease;
+  }
+
+  .decode-play-overlay:hover {
+    transform: translate(-50%, -50%);
+  }
+}
+
+/* Issue #1466: the persistent "show all paused videos" / "back to automatic"
+   escape hatch in the Appearance panel's Video-tiles area. Styled to match the
+   panel's warning-accent action buttons (same token family as the banner's
+   `.decode-budget-banner-action`), set apart from the segmented tile-count
+   picker above it. */
+.decode-budget-show-all-btn {
+  margin-top: 10px;
+  min-height: 36px;
+  padding: 0 14px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-md, 10px);
+  font-family: inherit;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  color: var(--warning);
+  background: var(--btn-warning-bg);
+  border: 1px solid var(--btn-warning-border);
+  transition:
+    background 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.decode-budget-show-all-btn:hover {
+  background: var(--btn-warning-bg-hover);
+  border-color: var(--btn-warning-border-hover);
+}
+
+.decode-budget-show-all-btn:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
 }
 
 /* ============================================================
@@ -581,6 +685,7 @@ h3 {
     box-shadow: none !important;
     border-radius: 0 !important;
   }
+
   #peer-list-container.visible {
     transform: translateX(0) !important;
     visibility: visible !important;
@@ -606,6 +711,7 @@ h3 {
     box-shadow: none !important;
     border-radius: 0 !important;
   }
+
   #diagnostics-sidebar.visible {
     transform: translateX(0) !important;
     visibility: visible !important;
@@ -623,11 +729,13 @@ h3 {
     background-color: var(--surface) !important;
     border-bottom: 2px solid var(--border) !important;
   }
+
   #peer-list-container .sidebar-header h2,
   #diagnostics-sidebar .sidebar-header h2 {
     font-size: 20px !important;
     font-weight: 600 !important;
   }
+
   #peer-list-container .close-button,
   #diagnostics-sidebar .close-button {
     font-size: 28px !important;
@@ -640,20 +748,24 @@ h3 {
     align-items: center !important;
     justify-content: center !important;
   }
+
   #peer-list-container .sidebar-content,
   #diagnostics-sidebar .sidebar-content {
     padding: 20px !important;
   }
+
   .peer_item {
     padding: 15px !important;
     margin-bottom: 8px !important;
     border-radius: var(--radius-md) !important;
     background-color: var(--field-bg) !important;
   }
+
   .peer_item_text {
     font-size: 16px !important;
     padding: 0 15px !important;
   }
+
   #diagnostics-sidebar .diagnostics-section {
     /* Zero the additive margin — `.sidebar-content` flex `gap` spaces sections
        (Fix A). Padding / background / radius keep the mobile card look. */
@@ -662,6 +774,7 @@ h3 {
     background-color: var(--field-bg) !important;
     border-radius: 8px !important;
   }
+
   #diagnostics-sidebar .diagnostics-data pre {
     font-size: 12px !important;
     padding: 15px !important;
@@ -744,8 +857,7 @@ canvas {
   display: inline-flex;
   align-items: center;
   gap: min(6px, calc(var(--tile-w, 320px) * 0.02));
-  padding: min(6px, calc(var(--tile-h, 240px) * 0.03))
-    min(10px, calc(var(--tile-w, 320px) * 0.03));
+  padding: min(6px, calc(var(--tile-h, 240px) * 0.03)) min(10px, calc(var(--tile-w, 320px) * 0.03));
   border-radius: min(12px, calc(var(--tile-h, 240px) * 0.06));
   background-color: var(--overlay-backdrop);
   color: var(--text-primary);
@@ -765,12 +877,11 @@ canvas {
 
 .floating-name:hover,
 .floating-name:focus {
-  background-color: rgba(
-    0,
-    0,
-    0,
-    0.44
-  ); /* @token-exempt: hover overlay, no matching token */
+  background-color: rgba(0,
+      0,
+      0,
+      0.44);
+  /* @token-exempt: hover overlay, no matching token */
 }
 
 .grid-item.full-bleed .floating-name {
@@ -795,7 +906,8 @@ canvas {
 .floating-name .host-crown-icon {
   margin-right: 6px;
   filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.3))
-    /* @token-exempt: filter value */;
+    /* @token-exempt: filter value */
+  ;
 }
 
 .peer_item_text .host-crown-icon {
@@ -1014,7 +1126,8 @@ select {
   bottom: 10px;
   right: 10px;
   background-color: var(--overlay-heavy);
-  color: #00ff00; /* @token-exempt: debug indicator, not a design token */
+  color: #00ff00;
+  /* @token-exempt: debug indicator, not a design token */
   padding: 10px;
   border-radius: 5px;
   font-family: monospace;
@@ -1182,6 +1295,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 #diagnostics-sidebar.visible {
   transform: translateX(0);
   visibility: visible;
+  /* Open INSTANTLY (no slide) so the drag-resize handle is at its FINAL hit
+     position the moment `.visible` applies — same rationale as
+     `#peer-list-container.visible`. The right drawer happens to pass the resize
+     e2e today only because its heavier component mounts slowly enough that the
+     handle's box is read post-settle; that is timing-luck, so it gets the same
+     deterministic fix for symmetry. Close stays animated via the base
+     `transition: transform 0.3s ease`; the transform VALUE is unchanged so the
+     fixed help-popover's containing block is unaffected. (issue 1296) */
+  transition-duration: 0s;
 }
 
 #diagnostics-sidebar .diagnostics-data {
@@ -1351,12 +1473,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   white-space: pre-wrap;
   margin: 0;
   padding: 10px;
-  background-color: rgba(
-    0,
-    0,
-    0,
-    0.3
-  ); /* @token-exempt: dark translucent bg, no matching token */
+  background-color: rgba(0,
+      0,
+      0,
+      0.3);
+  /* @token-exempt: dark translucent bg, no matching token */
   border-radius: 3px;
   font-size: 0.9em;
 }
@@ -1375,9 +1496,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 2px 10px;
   font-size: 0.85em;
 }
+
 .build-info-header {
   display: contents;
 }
+
 .build-info-header .build-info-cell {
   color: var(--text-tertiary);
   font-weight: 600;
@@ -1385,9 +1508,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding-bottom: 4px;
   margin-bottom: 2px;
 }
+
 .build-info-row {
   display: contents;
 }
+
 .build-info-cell {
   color: var(--text-primary);
   padding: 2px 0;
@@ -1395,10 +1520,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
 .build-info-cell.monospace {
   font-family: monospace;
   color: var(--diag-mono-text);
 }
+
 .build-info-cell.build-info-service {
   color: var(--text-secondary);
 }
@@ -1703,11 +1830,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   .neteq-advanced-chart {
     padding: 10px;
   }
+
   .peer-summary-item {
     flex-direction: column;
     gap: 4px;
     text-align: center;
   }
+
   .peer-summary-item span {
     font-size: 10px;
   }
@@ -1740,7 +1869,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    ============================================================ */
 
 .simulation-info-message {
-  color: #ffcc00 /* @token-exempt: simulation alert, no matching token */;
+  color: #ffcc00
+    /* @token-exempt: simulation alert, no matching token */
+  ;
   text-align: center;
   margin-top: 10px;
   font-size: 0.9em;
@@ -1782,8 +1913,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   position: fixed;
   inset: 0;
   background: var(--device-settings-overlay-bg-image);
-  backdrop-filter: blur(6px) saturate(100%);
-  -webkit-backdrop-filter: blur(6px) saturate(100%);
+  backdrop-filter: blur(3px) saturate(100%);
+  -webkit-backdrop-filter: blur(3px) saturate(100%);
   z-index: 9500;
 
   display: flex;
@@ -1929,7 +2060,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   top: calc(100% + 0.5rem);
   right: 0;
   background: rgba(30, 30, 30, 0.98)
-    /* @token-exempt: dark near-opaque, no matching token */;
+    /* @token-exempt: dark near-opaque, no matching token */
+  ;
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid var(--glass-border);
@@ -1948,6 +2080,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     opacity: 0;
     transform: translateY(-10px) scale(0.95);
   }
+
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
@@ -2032,15 +2165,18 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .status-active {
   color: var(--success);
 }
+
 .status-ended {
   color: var(--error-text);
 }
 
 @keyframes blink {
+
   0%,
   100% {
     opacity: 1;
   }
+
   50% {
     opacity: 0.3;
   }
@@ -2051,6 +2187,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    ============================================================ */
 
 @media (min-width: 37.5em) {
+
   .mobile-only-grid-toggle,
   .mobile-only-device-settings {
     display: none !important;
@@ -2068,6 +2205,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     width: 36px;
     height: 36px;
   }
+
   .device-settings-menu-button svg {
     width: 18px;
     height: 18px;
@@ -2081,7 +2219,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     top: 0 !important;
     width: 100% !important;
     height: 100% !important;
-    background: #0c0e15 !important; /* @token-exempt: pre-existing mobile fullscreen background */
+    background: #0c0e15 !important;
+    /* @token-exempt: pre-existing mobile fullscreen background */
     transition: transform 0.3s ease !important;
     z-index: 9500 !important;
     overflow-y: auto !important;
@@ -2091,10 +2230,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     backdrop-filter: none !important;
     -webkit-backdrop-filter: none !important;
   }
+
   .device-settings-modal-overlay.visible {
     transform: translateX(0) !important;
     visibility: visible !important;
   }
+
   .device-settings-modal {
     position: fixed !important;
     left: 0 !important;
@@ -2108,42 +2249,49 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     backdrop-filter: none !important;
     -webkit-backdrop-filter: none !important;
   }
+
   .device-settings-modal.settings-modal,
   .settings-modal {
     backdrop-filter: none !important;
     -webkit-backdrop-filter: none !important;
   }
+
   html[data-theme="light"] .device-settings-modal-overlay {
-    background: rgba(
-      238,
-      244,
-      252,
-      0.94
-    ) !important; /* @token-exempt: light theme modal background */
+    background: rgba(238,
+        244,
+        252,
+        0.94) !important;
+    /* @token-exempt: light theme modal background */
   }
+
   .device-settings-header {
     padding: 20px !important;
     background: transparent !important;
     border-bottom: 1px solid var(--glass-bg) !important;
   }
+
   .device-settings-header h2 {
     font-size: 20px !important;
     font-weight: 600 !important;
   }
+
   .device-settings-content {
     padding: 20px !important;
     max-height: none !important;
   }
+
   .device-setting-group {
     margin-bottom: 25px !important;
     padding: 15px !important;
     background-color: var(--field-bg) !important;
     border-radius: 8px !important;
   }
+
   .device-selector-modal {
     font-size: 16px !important;
     padding: 15px !important;
   }
+
   .glass-select-trigger {
     font-size: 16px !important;
     padding: 15px !important;
@@ -2164,7 +2312,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 2px solid var(--connection-led-border);
   z-index: 5;
   transition: all 0.3s ease;
-  box-shadow: 0 2px 4px var(--connection-led-shadow); /* @token-exempt: LED glow, no matching token */
+  box-shadow: 0 2px 4px var(--connection-led-shadow);
+  /* @token-exempt: LED glow, no matching token */
 }
 
 .connection-led.connected {
@@ -2182,10 +2331,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     opacity: 1;
     transform: scale(1);
   }
+
   50% {
     opacity: 0.7;
     transform: scale(1.1);
   }
+
   100% {
     opacity: 1;
     transform: scale(1);
@@ -2247,6 +2398,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 @media (prefers-reduced-motion: reduce) {
+
   .connection-quality-indicator,
   .connection-quality-indicator.exiting {
     transition: none;
@@ -2257,6 +2409,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   .connection-quality-label {
     display: none;
   }
+
   .connection-quality-indicator svg {
     width: 14px;
     height: 14px;
@@ -2269,10 +2422,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .meetings-list-container {
   margin-top: 0.75rem;
-  background: var(
-    --surface-tint-3,
-    rgba(255, 255, 255, 0.03)
-  ); /* @token-exempt: legacy var() fallback for very-faint glass */
+  background: var(--surface-tint-3,
+      rgba(255, 255, 255, 0.03));
+  /* @token-exempt: legacy var() fallback for very-faint glass */
   border-radius: var(--radius-card, 16px);
   /* NOTE: no `overflow: hidden` here — it was clipping the filter/sort
      popovers. The inner `.meetings-list-content` owns the scroll region and
@@ -2307,15 +2459,19 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
+
 .meetings-list-toggle:hover {
   background: var(--field-bg);
 }
+
 .meetings-list-toggle .chevron-icon {
   transition: transform 0.2s ease;
 }
+
 .meetings-list-toggle .chevron-icon.expanded {
   transform: rotate(180deg);
 }
+
 .meetings-list-toggle .meeting-count {
   margin-left: auto;
   color: var(--text-quaternary);
@@ -2395,6 +2551,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
+
 .retry-btn:hover {
   background: var(--glass-bg-hover);
 }
@@ -2430,8 +2587,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    its own); clicking the SAME trigger toggles it closed; clicking anywhere
    ELSE hits the backdrop and closes the popover. The popover (z 9300) still
    paints above the triggers. */
-.meetings-toolbar-group > .meetings-icon-btn,
-.meetings-toolbar-group > .meetings-sort-btn {
+.meetings-toolbar-group>.meetings-icon-btn,
+.meetings-toolbar-group>.meetings-sort-btn {
   position: relative;
   z-index: 9291;
 }
@@ -2453,11 +2610,17 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
     border-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.meetings-icon-btn:hover { background: var(--glass-bg-hover); color: var(--text-primary); }
+
+.meetings-icon-btn:hover {
+  background: var(--glass-bg-hover);
+  color: var(--text-primary);
+}
+
 .meetings-icon-btn:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
+
 .meetings-icon-btn.is-active {
   color: var(--text-primary);
   border-color: var(--focus-ring);
@@ -2477,7 +2640,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   justify-content: center;
   border-radius: 8px;
   background: var(--focus-ring);
-  color: #fff /* @token-exempt: badge text on accent fill */;
+  color: #fff
+    /* @token-exempt: badge text on accent fill */
+  ;
   font-size: 0.625rem;
   font-weight: 700;
   line-height: 1;
@@ -2498,17 +2663,33 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
     color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.meetings-sort-btn:hover { background: var(--glass-bg-hover); color: var(--text-primary); }
+
+.meetings-sort-btn:hover {
+  background: var(--glass-bg-hover);
+  color: var(--text-primary);
+}
+
 .meetings-sort-btn:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
 }
-.meetings-sort-label { white-space: nowrap; }
 
-.meetings-sort-dir-icon { transition: transform 0.2s ease; }
-.meetings-sort-dir-icon.is-desc { transform: rotate(0deg); }
+.meetings-sort-label {
+  white-space: nowrap;
+}
+
+.meetings-sort-dir-icon {
+  transition: transform 0.2s ease;
+}
+
+.meetings-sort-dir-icon.is-desc {
+  transform: rotate(0deg);
+}
+
 /* Ascending flips the down-arrow glyph to point up. */
-.meetings-sort-dir-icon:not(.is-desc) { transform: rotate(180deg); }
+.meetings-sort-dir-icon:not(.is-desc) {
+  transform: rotate(180deg);
+}
 
 /* Transparent click-catcher behind a popover for outside-click dismissal. */
 .meetings-popover-backdrop {
@@ -2546,13 +2727,29 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 0.75rem;
   animation: meetings-popover-in 0.14s cubic-bezier(0.4, 0, 0.2, 1);
 }
+
 @keyframes meetings-popover-in {
-  from { opacity: 0; transform: translateY(-4px); }
-  to   { opacity: 1; transform: translateY(0); }
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
 }
-@media (prefers-reduced-motion: reduce) { .meetings-popover { animation: none; } }
+
+@media (prefers-reduced-motion: reduce) {
+  .meetings-popover {
+    animation: none;
+  }
+}
+
 /* Per-popover min-widths are CSS-only now (no JS anchoring); tune freely. */
-.meetings-filter-popover { min-width: 220px; }
+.meetings-filter-popover {
+  min-width: 220px;
+}
 
 .meetings-filter-group {
   /* Reset the fieldset so legend + options form a tidy left-aligned column. */
@@ -2598,16 +2795,30 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   border-radius: var(--radius-button, 8px);
 }
-.meetings-filter-option:hover { background: var(--field-bg); color: var(--text-primary); }
+
+.meetings-filter-option:hover {
+  background: var(--field-bg);
+  color: var(--text-primary);
+}
+
 .meetings-filter-option input {
   flex: 0 0 auto;
   margin: 0;
   cursor: pointer;
   accent-color: var(--focus-ring);
 }
-.meetings-filter-option span { flex: 1 1 auto; text-align: left; }
 
-.meetings-sort-popover { min-width: 180px; padding: 0.25rem; gap: 0; }
+.meetings-filter-option span {
+  flex: 1 1 auto;
+  text-align: left;
+}
+
+.meetings-sort-popover {
+  min-width: 180px;
+  padding: 0.25rem;
+  gap: 0;
+}
+
 .meetings-sort-option {
   width: 100%;
   text-align: left;
@@ -2619,11 +2830,17 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-size: 0.8125rem;
   cursor: pointer;
 }
-.meetings-sort-option:hover { background: var(--field-bg); color: var(--text-primary); }
+
+.meetings-sort-option:hover {
+  background: var(--field-bg);
+  color: var(--text-primary);
+}
+
 .meetings-sort-option:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
 }
+
 .meetings-sort-option.is-selected {
   background: var(--field-bg);
   color: var(--text-primary);
@@ -2637,6 +2854,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   align-items: center;
   gap: 0.625rem;
 }
+
 .meetings-clear-filters-btn {
   height: 32px;
   padding: 0 0.875rem;
@@ -2648,7 +2866,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
-.meetings-clear-filters-btn:hover { background: var(--glass-bg-hover); }
+
+.meetings-clear-filters-btn:hover {
+  background: var(--glass-bg-hover);
+}
+
 .meetings-clear-filters-btn:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
@@ -2657,17 +2879,35 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 /* Touch targets: bump all interactive controls in the toolbar / popovers to
    the 44px minimum on coarse pointers (phones, tablets). */
 @media (pointer: coarse) {
-  .meetings-icon-btn { width: 44px; height: 44px; }
+  .meetings-icon-btn {
+    width: 44px;
+    height: 44px;
+  }
+
   .meetings-sort-btn,
-  .meetings-clear-filters-btn { min-height: 44px; }
-  .meetings-filter-option { min-height: 44px; padding: 0.5rem; }
-  .meetings-filter-option input { width: 20px; height: 20px; }
-  .meetings-sort-option { min-height: 44px; }
+  .meetings-clear-filters-btn {
+    min-height: 44px;
+  }
+
+  .meetings-filter-option {
+    min-height: 44px;
+    padding: 0.5rem;
+  }
+
+  .meetings-filter-option input {
+    width: 20px;
+    height: 20px;
+  }
+
+  .meetings-sort-option {
+    min-height: 44px;
+  }
 }
 
 /* Honour the user's reduced-motion preference: drop the toolbar/popover
    hover transitions and the sort-direction icon rotation animation. */
 @media (prefers-reduced-motion: reduce) {
+
   .meetings-icon-btn,
   .meetings-sort-btn,
   .meetings-clear-filters-btn,
@@ -2676,7 +2916,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 }
 
-.meetings-list { list-style: none; margin: 0; padding: 0; }
+.meetings-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
 
 .meeting-item {
   padding: 0.625rem 1rem;
@@ -2687,9 +2931,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   align-items: center;
   justify-content: space-between;
 }
+
 .meeting-item:hover {
   background: var(--glass-bg);
 }
+
 .meeting-item:last-child {
   border-bottom: none;
 }
@@ -2725,16 +2971,19 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border-radius: var(--radius-pill, 9999px);
   font-weight: 500;
 }
+
 .meeting-state.state-active {
   background: var(--state-active-bg);
   color: var(--state-active-text);
   border: 1px solid var(--state-active-border);
 }
+
 .meeting-state.state-idle {
   background: var(--state-idle-bg);
   color: var(--state-idle-text);
   border: 1px solid var(--state-idle-border);
 }
+
 .meeting-state.state-ended {
   background: var(--state-ended-bg);
   color: var(--state-ended-text);
@@ -2757,11 +3006,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+
 .meeting-participants {
   display: flex;
   align-items: center;
   gap: 0.25rem;
 }
+
 .meeting-password {
   display: flex;
   align-items: center;
@@ -2792,10 +3043,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   transition: all 0.2s ease;
   flex-shrink: 0;
 }
+
 .meeting-delete-btn:hover {
   background: var(--delete-bg-hover);
   color: var(--delete-text);
 }
+
 .meeting-delete-btn svg {
   width: 16px;
   height: 16px;
@@ -2809,6 +3062,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-item.meeting-ended {
   background: var(--state-ended-row-bg);
 }
+
 .meeting-item.meeting-ended .meeting-id {
   color: var(--text-on-glass-muted);
 }
@@ -2821,10 +3075,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   white-space: nowrap;
   flex-shrink: 0;
 }
+
 .meeting-duration-live {
   color: var(--success-text-soft);
   font-weight: 500;
 }
+
 .meeting-waiting {
   display: flex;
   align-items: center;
@@ -2834,12 +3090,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   white-space: nowrap;
   flex-shrink: 0;
 }
+
 .meeting-time {
   color: var(--text-on-glass-faint);
   font-size: 0.75rem;
   white-space: nowrap;
   flex-shrink: 0;
 }
+
 .meeting-time-separator {
   color: var(--text-on-glass-ghost);
   font-size: 0.75rem;
@@ -2876,6 +3134,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 @media (prefers-reduced-motion: reduce) {
+
   .meeting-info-tooltip-portal,
   .meeting-info-tooltip-portal.is-visible {
     transition: none;
@@ -2919,6 +3178,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex-shrink: 0;
   line-height: 0;
 }
+
 .meeting-owner-icon svg {
   width: 14px;
   height: 14px;
@@ -2931,6 +3191,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding-bottom: 0.1875rem;
   margin-bottom: 0.125rem;
 }
+
 .meeting-info-tooltip-label--owner {
   display: inline-flex;
   align-items: center;
@@ -2938,6 +3199,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--brand-gold);
   font-weight: 500;
 }
+
 .meeting-info-tooltip-label--owner svg {
   width: 10px;
   height: 10px;
@@ -3014,19 +3276,23 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border-radius: 50%;
   animation: bounce 1.4s infinite ease-in-out both;
 }
+
 .spinner-dot:nth-child(1) {
   animation-delay: -0.32s;
 }
+
 .spinner-dot:nth-child(2) {
   animation-delay: -0.16s;
 }
 
 @keyframes bounce {
+
   0%,
   80%,
   100% {
     transform: scale(0);
   }
+
   40% {
     transform: scale(1);
   }
@@ -3043,7 +3309,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   transform: translateX(-50%);
   z-index: 9000;
   background: rgba(30, 30, 30, 0.95)
-    /* @token-exempt: dark near-opaque, no matching token */;
+    /* @token-exempt: dark near-opaque, no matching token */
+  ;
   border-radius: var(--radius-lg);
   box-shadow: 0 4px 20px var(--shadow-error);
   min-width: 300px;
@@ -3065,13 +3332,16 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   transition: background-color 0.2s ease;
 }
+
 .host-controls-toggle:hover {
   background: var(--field-bg);
 }
+
 .host-controls-toggle .chevron-icon {
   margin-left: auto;
   transition: transform 0.2s ease;
 }
+
 .host-controls-toggle .chevron-icon.expanded {
   transform: rotate(180deg);
 }
@@ -3100,6 +3370,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--field-bg);
 }
+
 .waiting-participant:last-child {
   border-bottom: none;
 }
@@ -3146,18 +3417,23 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   transition: all 0.2s ease;
 }
+
 .btn-admit {
   background: var(--success-bg-soft)
-    /* @token-exempt: translucent success bg, no matching token */;
+    /* @token-exempt: translucent success bg, no matching token */
+  ;
   color: var(--success);
 }
+
 .btn-admit:hover {
   background: var(--success-bg-soft-hover);
 }
+
 .btn-reject {
   background: var(--error-bg-soft);
   color: var(--error-text-strong);
 }
+
 .btn-reject:hover {
   background: var(--error-bg-soft-hover);
 }
@@ -3184,9 +3460,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   transition: all 0.2s ease;
 }
+
 .btn-admit-all:hover {
   background: var(--success-bg-soft-hover);
 }
+
 .btn-admit-all:active {
   transform: scale(0.98);
 }
@@ -3227,6 +3505,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-size: 1.5rem;
   font-weight: 600;
 }
+
 .rejected-card p,
 .error-card p {
   color: var(--text-on-glass-soft);
@@ -3315,12 +3594,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: var(--glass-bg);
   border-color: var(--glass-border);
 }
+
 .gsi-material-button:disabled .gsi-material-button-state {
   background-color: var(--glass-bg);
 }
+
 .gsi-material-button:disabled .gsi-material-button-contents {
   opacity: 38%;
 }
+
 .gsi-material-button:disabled .gsi-material-button-icon {
   opacity: 38%;
 }
@@ -3330,9 +3612,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background-color: white;
   opacity: 12%;
 }
+
 .gsi-material-button:not(:disabled):active {
   transform: scale(0.98);
 }
+
 .gsi-material-button:not(:disabled):hover {
   background: var(--glass-bg-hover);
   border-color: var(--glass-border-hover);
@@ -3340,6 +3624,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     0 4px 16px var(--glass-shadow),
     inset 0 1px 0 var(--glass-highlight);
 }
+
 .gsi-material-button:not(:disabled):hover .gsi-material-button-state {
   background-color: white;
   opacity: 6%;
@@ -3395,12 +3680,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   position: relative;
   width: 100%;
 }
+
 .okta-sign-in-button .okta-sign-in-button-icon {
   height: 20px;
   margin-right: 10px;
   min-width: 20px;
   width: 20px;
 }
+
 .okta-sign-in-button .okta-sign-in-button-label {
   flex-grow: 1;
   font-family: inherit;
@@ -3409,11 +3696,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   text-overflow: ellipsis;
   vertical-align: top;
 }
+
 .okta-sign-in-button:not(:disabled):active,
 .okta-sign-in-button:not(:disabled):focus {
   background: var(--glass-bg-hover);
   transform: scale(0.98);
 }
+
 .okta-sign-in-button:not(:disabled):hover {
   background: var(--glass-bg-hover);
   border-color: var(--glass-border-hover);
@@ -3453,6 +3742,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     transform 0.15s cubic-bezier(0.4, 0, 0.2, 1);
   white-space: nowrap;
 }
+
 .generic-sign-in-button:not(:disabled):hover {
   background: var(--oauth-blue-bg-hover);
   border-color: var(--oauth-blue-border-hover);
@@ -3460,6 +3750,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     0 4px 16px var(--glass-shadow),
     inset 0 1px 0 var(--glass-border);
 }
+
 .generic-sign-in-button:not(:disabled):active {
   background: var(--oauth-blue-bg-active);
   transform: scale(0.98);
@@ -3482,10 +3773,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   transition: all 0.2s ease;
   flex-shrink: 0;
 }
+
 .meeting-edit-btn:hover {
   background: var(--glass-bg-hover);
   color: var(--text-on-glass-strong-2);
 }
+
 .meeting-edit-btn svg {
   width: 16px;
   height: 16px;
@@ -3515,9 +3808,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     background 0.2s ease,
     opacity 0.2s ease;
 }
+
 .settings-back-btn:hover {
   background: var(--back-btn-hover-bg);
 }
+
 .settings-back-btn:active {
   opacity: 0.7;
 }
@@ -3531,6 +3826,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   box-shadow: inset 0 1px 0 var(--settings-card-inset);
   transition: border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
+
 .settings-card:hover {
   border-color: var(--settings-card-border-hover);
 }
@@ -3547,6 +3843,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .settings-card-compact {
   padding: 1rem 1.5rem;
 }
+
 .settings-card-compact .settings-card-title {
   margin-bottom: 0.75rem;
 }
@@ -3623,7 +3920,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   align-items: center;
   justify-content: center;
   gap: 0.4rem;
-  min-height: 44px; /* WCAG 2.5.8 / Apple HIG tap target */
+  min-height: 44px;
+  /* WCAG 2.5.8 / Apple HIG tap target */
   padding: 0.5rem 0.75rem;
   border-radius: var(--radius-input, 12px);
   border: 1px solid var(--settings-card-border);
@@ -3689,12 +3987,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   height: 100%;
   /* Activity ramp: green (quiet/OK) → amber (loud) → red (clipping), all
      semantic tokens. */
-  background: linear-gradient(
-    90deg,
-    var(--success) 0%,
-    var(--warning) 65%,
-    var(--error) 100%
-  );
+  background: linear-gradient(90deg,
+      var(--success) 0%,
+      var(--warning) 65%,
+      var(--error) 100%);
   border-radius: 4px;
   /* Light smoothing between the engine's per-frame width writes. */
   transition: width 0.06s linear;
@@ -3721,7 +4017,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .prejoin-select {
   width: 100%;
-  min-height: 44px; /* WCAG 2.5.8 / Apple HIG tap target */
+  min-height: 44px;
+  /* WCAG 2.5.8 / Apple HIG tap target */
   padding: 0.5rem 0.75rem;
   border-radius: var(--radius-input, 12px);
   border: 1px solid var(--settings-card-border);
@@ -3748,6 +4045,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   outline: none;
   box-shadow: 0 0 0 2px var(--accent);
 }
+
 .prejoin-toggle:focus:not(:focus-visible),
 .prejoin-select:focus:not(:focus-visible),
 .prejoin-permission-allow:focus:not(:focus-visible) {
@@ -3821,6 +4119,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   .join-meeting-title {
     font-size: 1.1875rem;
   }
+
   .join-meeting-id {
     font-size: 0.8125rem;
     padding: 0.125rem 0.5rem;
@@ -3835,10 +4134,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border-bottom: 1px solid var(--glass-bg);
   min-height: 44px;
 }
+
 .settings-field:last-child {
   border-bottom: none;
   padding-bottom: 0;
 }
+
 .settings-field:first-of-type {
   padding-top: 0;
 }
@@ -3874,10 +4175,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.5rem 0;
   border-bottom: 1px solid var(--glass-bg);
 }
+
 .settings-field-compact:last-child {
   border-bottom: none;
   padding-bottom: 0;
 }
+
 .settings-field-compact:first-of-type {
   padding-top: 0;
 }
@@ -3894,13 +4197,16 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.375rem 0;
   border-bottom: 1px solid var(--glass-bg);
 }
+
 .settings-stat-row:last-child {
   border-bottom: none;
   padding-bottom: 0;
 }
+
 .settings-stat-row:first-of-type {
   padding-top: 0;
 }
+
 .settings-stat-row svg {
   flex-shrink: 0;
   color: var(--text-quaternary);
@@ -3910,6 +4216,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-size: 0.8125rem;
   color: var(--text-tertiary);
 }
+
 .settings-stat-value {
   margin-left: auto;
   font-size: 0.8125rem;
@@ -3917,6 +4224,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-secondary);
   white-space: nowrap;
 }
+
 .settings-stat-separator {
   color: var(--text-tertiary);
   font-weight: 400;
@@ -3927,6 +4235,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .settings-stat-warning .settings-stat-value {
   color: var(--warning);
 }
+
 .settings-stat-waiting {
   color: var(--warning);
 }
@@ -3938,18 +4247,22 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.625rem 0;
   border-bottom: 1px solid var(--glass-bg);
 }
+
 .settings-option-row:last-child {
   border-bottom: none;
   padding-bottom: 0;
 }
+
 .settings-option-row:first-of-type {
   padding-top: 0;
 }
+
 .settings-option-label {
   font-size: 0.9375rem;
   font-weight: 500;
   color: var(--text-primary);
 }
+
 .settings-option-controls {
   display: flex;
   align-items: center;
@@ -3980,48 +4293,45 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex-shrink: 0;
   align-self: stretch;
 }
+
 .screen-share-resize-handle:hover,
 .screen-share-resize-handle.dragging {
   background: var(--resize-handle-bg-active);
 }
 
 /* Screen share split-layout — right-panel peer video tile.
-   Height-driven sizing mirrors `.grid-item`: the tile fills the grid-auto-row
-   height set by the parent right-panel, derives its width from
-   `aspect-ratio: 3 / 2` (the max ratio we accept), and is clamped by
-   `max-width: 100%` so narrow grid cells (2-column layout) still fill their
-   full width.
-   HCL issues #3 + #4: the parent right-panel now sizes columns to
-   `ss_tile_h * 1.5` px instead of `1fr`, so each grid cell is exactly the
-   tile's natural 3:2 footprint. With `place-self: stretch` (not the prior
-   `center`) the tile fills its cell edge-to-edge, leaving the inter-tile
-   gap exactly `8px` and packing all tiles to the left edge of the panel.
-   The dominant shared-content tile (`.split-screen-tile`) intentionally
-   does NOT get this cap — it stays as a large, dominant display. */
+   The parent `.ss-peer-panel` is a flex-wrap container; each tile gets
+   `flex: 1 1 160px` so tiles grow to fill available width with a 160px
+   flex basis, collapsing to one column when the panel is narrow.
+   `aspect-ratio: 3 / 2` derives height from width. Off-budget tiles
+   render with `force_avatar: true` (avatar placeholder, no decode) —
+   the decode budget caps live decoders just as the normal grid does
+   (issue 987). */
 .split-peer-tile {
-  width: 100%;
-  height: 100%;
+  position: relative;
+  flex: 1 1 160px;
   max-width: 100%;
-  max-height: 100%;
   aspect-ratio: 3 / 2;
-  place-self: stretch;
   min-width: 0;
   min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
-  overflow: visible; /* allow speaking glow box-shadow to extend beyond tile */
+  overflow: hidden;
   background-color: var(--surface-elevated);
   border: 2px solid var(--grid-item-border);
   border-radius: var(--radius-lg);
+  box-sizing: border-box;
   /* Speaking glow transition is driven by inline style from Rust speak_style(). */
 }
 
 .split-peer-tile .canvas-container {
   width: 100%;
   height: 100%;
-  overflow: hidden; /* clip video content within tile boundaries */
-  border-radius: 10px; /* match parent radius minus border */
+  overflow: hidden;
+  /* clip video content within tile boundaries */
+  border-radius: 10px;
+  /* match parent radius minus border */
 }
 
 /* Bottom gradient scrim on split-peer video tiles (mirrors .grid-item rule) */
@@ -4035,6 +4345,101 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: var(--gradient-fade-video);
   pointer-events: none;
   z-index: 1;
+}
+
+/* ── Screen-share right panel ─────────────────────────────────────────
+   CSS flex-wrap panel. Tiles auto-wrap into as many columns as fit;
+   scrolls vertically when rows exceed height. */
+.ss-peer-panel {
+  min-width: 0;
+  height: 100%;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 14px;
+  align-content: flex-start;
+  overflow-y: auto;
+  overflow-x: hidden;
+  box-sizing: border-box;
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+.ss-peer-panel::-webkit-scrollbar { width: 6px; }
+.ss-peer-panel::-webkit-scrollbar-track { background: transparent; }
+.ss-peer-panel::-webkit-scrollbar-thumb { background: var(--scrollbar-thumb); border-radius: 3px; }
+.ss-peer-panel::-webkit-scrollbar-thumb:hover { background: var(--scrollbar-thumb-hover); }
+
+/* ── Split-peer tile internals ───────────────────────────────────────
+   Fixed sizes that don't depend on --tile-h / --tile-w CSS vars.
+   These override the grid-item defaults which use calc(var(--tile-h)). */
+
+/* Name label — wraps "(Host)" to its own line via flex-wrap */
+.split-peer-tile .floating-name {
+  top: 6px;
+  left: 6px;
+  padding: 3px 7px;
+  border-radius: 6px;
+  gap: 2px;
+  font-size: 13px;
+  max-width: 70%;
+  white-space: normal;
+  text-overflow: clip;
+  overflow: visible;
+  line-height: 1.3;
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+/* "(Host)" label: wraps below name via flex-basis: 100% */
+.split-peer-tile .host-indicator {
+  flex-basis: 100%;
+  display: block !important;
+  font-size: 10px !important;
+  margin-left: 0 !important;
+  margin-top: 1px;
+  color: var(--text-quaternary) !important;
+  line-height: 1.2;
+}
+
+/* Placeholder (camera-off) */
+.split-peer-tile .placeholder-content {
+  gap: 0.4rem;
+}
+.split-peer-tile .placeholder-content svg {
+  width: 40px;
+  height: 40px;
+}
+.split-peer-tile .placeholder-text {
+  font-size: 0.75rem;
+}
+
+/* Top icon bar */
+.split-peer-tile .tile-top-icons {
+  top: 4px;
+  right: 4px;
+  gap: 3px;
+}
+/* All icon buttons: uniform 22×22 containers, 14×14 SVGs */
+.split-peer-tile .audio-indicator,
+.split-peer-tile .signal-indicator,
+.split-peer-tile .pin-icon,
+.split-peer-tile .crop-icon,
+.split-peer-tile .tile-mute-btn {
+  width: 22px;
+  height: 22px;
+  padding: 0;
+}
+.split-peer-tile .audio-indicator svg,
+.split-peer-tile .signal-indicator svg,
+.split-peer-tile .pin-icon svg,
+.split-peer-tile .crop-icon svg,
+.split-peer-tile .tile-mute-btn svg {
+  width: 14px;
+  height: 14px;
+}
+.split-peer-tile .guest-badge {
+  font-size: 0.65em;
+  padding: 1px 5px;
 }
 
 /* Local screen-share preview — rendered below camera inside .host */
@@ -4063,10 +4468,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     color 0.2s ease,
     background 0.2s ease;
 }
+
 .settings-info-icon:hover {
   color: var(--text-secondary);
   background: var(--glass-bg);
 }
+
 .settings-info-icon::after {
   content: attr(title);
   position: absolute;
@@ -4074,7 +4481,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   top: 50%;
   transform: translateY(-50%);
   background: rgba(30, 30, 30, 0.95)
-    /* @token-exempt: dark near-opaque, no matching token */;
+    /* @token-exempt: dark near-opaque, no matching token */
+  ;
   backdrop-filter: blur(12px);
   border: 1px solid var(--settings-tooltip-border);
   border-radius: 8px;
@@ -4091,6 +4499,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   z-index: 10;
   box-shadow: 0 4px 12px var(--settings-tooltip-shadow);
 }
+
 .settings-info-icon:hover::after {
   opacity: 1;
 }
@@ -4098,6 +4507,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .settings-action-row {
   margin-bottom: 0.75rem;
 }
+
 .settings-action-row:last-child {
   margin-bottom: 0;
 }
@@ -4118,10 +4528,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--btn-warning-border);
   color: var(--warning);
 }
+
 .btn-warning:hover {
   background: var(--btn-warning-bg-hover);
   border-color: var(--btn-warning-border-hover);
 }
+
 .btn-warning:active {
   transform: scale(0.98);
 }
@@ -4132,11 +4544,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 0.75rem;
   margin: 1.25rem 0;
 }
+
 .settings-danger-divider {
   flex: 1;
   height: 1px;
   background: var(--btn-danger-divider);
 }
+
 .settings-danger-label {
   font-size: 0.6875rem;
   font-weight: 600;
@@ -4151,10 +4565,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--btn-danger-border);
   color: var(--error);
 }
+
 .btn-danger:hover {
   background: var(--btn-danger-bg-hover);
   border-color: var(--btn-danger-border-hover);
 }
+
 .btn-danger:active {
   transform: scale(0.98);
 }
@@ -4169,6 +4585,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-secondary);
   font-size: 0.9375rem;
 }
+
 .settings-loading-state .loading-spinner {
   width: 28px;
   height: 28px;
@@ -4185,12 +4602,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   text-align: center;
   color: var(--text-secondary);
 }
+
 .settings-empty-state h2 {
   margin: 0.5rem 0 0;
   font-size: 1.25rem;
   font-weight: 600;
   color: var(--text-primary);
 }
+
 .settings-empty-state p {
   font-size: 0.875rem;
   color: var(--text-tertiary);
@@ -4208,10 +4627,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   .settings-card {
     padding: 1.25rem;
   }
+
   .settings-field-label {
     font-size: 0.875rem;
     margin-right: 1.5rem;
   }
+
   .settings-field-value {
     font-size: 0.875rem;
   }
@@ -4222,15 +4643,18 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     padding: 1rem;
     border-radius: var(--radius-input, 12px);
   }
+
   .settings-info-icon::after {
     right: auto;
     left: 50%;
     top: calc(100% + 8px);
     transform: translateX(-50%);
   }
+
   .settings-field {
     padding: 0.75rem 0;
   }
+
   .settings-field-label {
     margin-right: 0.75rem;
   }
@@ -4250,6 +4674,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-tertiary);
   transition: all 0.2s ease;
 }
+
 .peer_item_mic svg {
   width: 100%;
   height: 100%;
@@ -4258,6 +4683,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .peer_item_mic.speaking {
   filter: drop-shadow(0 0 6px currentColor);
 }
+
 .peer_item_mic.speaking svg {
   stroke: currentColor;
 }
@@ -4280,6 +4706,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     color 0.4s ease,
     filter 0.4s ease;
 }
+
 .audio-indicator.speaking svg {
   stroke: currentColor;
 }
@@ -4475,7 +4902,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   align-items: center;
   gap: 10px;
   background: rgba(30, 30, 30, 0.88)
-    /* @token-exempt: dark near-opaque, no matching token */;
+    /* @token-exempt: dark near-opaque, no matching token */
+  ;
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid var(--glass-bg-hover);
@@ -4577,11 +5005,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    ------------------------------------------------------------------ */
 
 .peer-toast.screen-share-toast {
-    animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+  animation: toast-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
 }
 
 .peer-toast.toast-loading .toast-icon {
-    background: var(--toast-icon-neutral-bg);
+  background: var(--toast-icon-neutral-bg);
 }
 
 .peer-toast.toast-loading .toast-icon svg {
@@ -4596,15 +5024,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-success .toast-icon {
-    background: var(--success-icon-bg);
+  background: var(--success-icon-bg);
 }
 
 .peer-toast.toast-success .toast-icon svg {
-    color: var(--success);
+  color: var(--success);
 }
 
 .peer-toast.toast-error .toast-icon {
-    background: var(--danger-icon-bg, var(--toast-icon-neutral-bg));
+  background: var(--danger-icon-bg, var(--toast-icon-neutral-bg));
 }
 
 .peer-toast.toast-error .toast-icon svg {
@@ -4619,18 +5047,19 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 @keyframes screen-share-spin {
-    from {
-        transform: rotate(0deg);
-    }
-    to {
-        transform: rotate(360deg);
-    }
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
-    .peer-toast.toast-loading .toast-icon svg {
-        animation: none;
-    }
+  .peer-toast.toast-loading .toast-icon svg {
+    animation: none;
+  }
 }
 
 @keyframes toast-enter {
@@ -4638,6 +5067,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     opacity: 0;
     transform: translateY(-12px) scale(0.96);
   }
+
   to {
     opacity: 1;
     transform: translateY(0) scale(1);
@@ -4649,6 +5079,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     opacity: 1;
     transform: translateY(0) scale(1);
   }
+
   to {
     opacity: 0;
     transform: translateY(-8px) scale(0.98);
@@ -4666,6 +5097,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     from {
       opacity: 0;
     }
+
     to {
       opacity: 1;
     }
@@ -4675,6 +5107,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     from {
       opacity: 1;
     }
+
     to {
       opacity: 0;
     }
@@ -4757,7 +5190,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 
-.settings-nav { 
+.settings-nav {
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -4776,7 +5209,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   line-height: 1;
   letter-spacing: -0.028em;
 
-  color: rgba(255, 255, 255, 0.96); /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.96);
+  /* @token-exempt: theme variant */
 
   text-align: left;
   position: relative;
@@ -4792,7 +5226,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   width: 170px;
   height: 1px;
 
-  background: rgba(255, 255, 255, 0.035); /* @token-exempt: theme variant */
+  background: rgba(255, 255, 255, 0.035);
+  /* @token-exempt: theme variant */
 }
 
 /* Floating close button — replaces the old header bar. */
@@ -4823,7 +5258,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-modal-close:focus-visible {
-  outline: 2px solid var(--accent, rgba(120, 160, 220, 0.55)); /* @token-exempt: var() fallback */
+  outline: 2px solid var(--accent, rgba(120, 160, 220, 0.55));
+  /* @token-exempt: var() fallback */
   outline-offset: 2px;
 }
 
@@ -4847,9 +5283,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
 
   transition:
-  background 0.18s ease,
-  color 0.18s ease,
-  opacity 0.18s ease;
+    background 0.18s ease,
+    color 0.18s ease,
+    opacity 0.18s ease;
 
   position: relative;
   overflow: visible;
@@ -4859,7 +5295,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-nav-button:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px var(--accent, rgba(120, 160, 220, 0.45)); /* @token-exempt: var() fallback */
+  box-shadow: 0 0 0 2px var(--accent, rgba(120, 160, 220, 0.45));
+  /* @token-exempt: var() fallback */
 }
 
 .settings-nav-icon {
@@ -5150,9 +5587,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   .glass-select-trigger {
     transition: none;
   }
+
   .glass-select-chevron {
     transition: none;
   }
+
   .glass-select-option {
     transition: none;
   }
@@ -5277,11 +5716,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    surface. Active = subtle luminance lift only. */
 .transport-segmented {
   display: flex;
-  gap: 0; /* segments touch — single object */
-  padding: 3px; /* inner inset frame */
+  gap: 0;
+  /* segments touch — single object */
+  padding: 3px;
+  /* inner inset frame */
   background: var(--settings-panel-bg);
   border: 1px solid var(--settings-panel-border);
-  border-radius: 999px; /* full pill */
+  border-radius: 999px;
+  /* full pill */
   box-shadow: var(--settings-panel-shadow);
   isolation: isolate;
 }
@@ -5293,7 +5735,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: transparent;
   border: none;
   border-radius: 999px;
-  color: rgba(255, 255, 255, 0.62); /* @token-exempt: calm secondary */
+  color: rgba(255, 255, 255, 0.62);
+  /* @token-exempt: calm secondary */
   cursor: pointer;
   font-family: inherit;
   font-size: 0.875rem;
@@ -5309,13 +5752,16 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .transport-segmented-option:hover {
-  background: rgba(255, 255, 255, 0.04); /* @token-exempt: barely-there */
-  color: rgba(255, 255, 255, 0.85); /* @token-exempt: visionOS hover */
+  background: rgba(255, 255, 255, 0.04);
+  /* @token-exempt: barely-there */
+  color: rgba(255, 255, 255, 0.85);
+  /* @token-exempt: visionOS hover */
 }
 
 .transport-segmented-option:focus-visible {
   outline: none;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18); /* @token-exempt: gentle inset ring */
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  /* @token-exempt: gentle inset ring */
 }
 
 .transport-segmented-option:focus:not(:focus-visible) {
@@ -5324,20 +5770,23 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .transport-segmented-option.selected,
 .transport-segmented-option.selected:hover {
-  background: rgba(
-    255,
-    255,
-    255,
-    0.1
-  ); /* @token-exempt: visionOS active panel */
-  color: rgba(255, 255, 255, 0.96); /* @token-exempt: visionOS active label */
+  background: rgba(255,
+      255,
+      255,
+      0.1);
+  /* @token-exempt: visionOS active panel */
+  color: rgba(255, 255, 255, 0.96);
+  /* @token-exempt: visionOS active label */
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    /* @token-exempt: top edge light */ inset 0 -1px 0 rgba(0, 0, 0, 0.12); /* @token-exempt: bottom shade */
+    /* @token-exempt: top edge light */
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12);
+  /* @token-exempt: bottom shade */
 }
 
 .transport-segmented-option:active:not(.selected) {
-  background: rgba(255, 255, 255, 0.05); /* @token-exempt: press feedback */
+  background: rgba(255, 255, 255, 0.05);
+  /* @token-exempt: press feedback */
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -5354,29 +5803,38 @@ html[data-theme="light"] .transport-segmented {
 }
 
 html[data-theme="light"] .transport-segmented-option {
-  color: rgba(0, 0, 0, 0.55); /* @token-exempt: calm secondary */
+  color: rgba(0, 0, 0, 0.55);
+  /* @token-exempt: calm secondary */
 }
 
 html[data-theme="light"] .transport-segmented-option:hover {
-  background: rgba(0, 0, 0, 0.03); /* @token-exempt: barely-there */
-  color: rgba(0, 0, 0, 0.82); /* @token-exempt: hover label */
+  background: rgba(0, 0, 0, 0.03);
+  /* @token-exempt: barely-there */
+  color: rgba(0, 0, 0, 0.82);
+  /* @token-exempt: hover label */
 }
 
 html[data-theme="light"] .transport-segmented-option:focus-visible {
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.14); /* @token-exempt: gentle inset ring */
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.14);
+  /* @token-exempt: gentle inset ring */
 }
 
 html[data-theme="light"] .transport-segmented-option.selected,
 html[data-theme="light"] .transport-segmented-option.selected:hover {
-  background: rgba(255, 255, 255, 0.85); /* @token-exempt: lifted panel */
-  color: rgba(0, 0, 0, 0.92); /* @token-exempt: active label */
+  background: rgba(255, 255, 255, 0.85);
+  /* @token-exempt: lifted panel */
+  color: rgba(0, 0, 0, 0.92);
+  /* @token-exempt: active label */
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.9),
-    /* @token-exempt: highlight */ 0 1px 2px rgba(0, 0, 0, 0.06); /* @token-exempt: subtle lift */
+    /* @token-exempt: highlight */
+    0 1px 2px rgba(0, 0, 0, 0.06);
+  /* @token-exempt: subtle lift */
 }
 
 html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
-  background: rgba(0, 0, 0, 0.04); /* @token-exempt: press feedback */
+  background: rgba(0, 0, 0, 0.04);
+  /* @token-exempt: press feedback */
 }
 
 /* ── Transport "Apply" action row ──────────────────────────────── */
@@ -5424,7 +5882,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .transport-apply-button:focus-visible {
   outline: none;
-  box-shadow: 0 0 0 2px var(--accent, rgba(120, 160, 220, 0.45)); /* @token-exempt: var() fallback */
+  box-shadow: 0 0 0 2px var(--accent, rgba(120, 160, 220, 0.45));
+  /* @token-exempt: var() fallback */
 }
 
 .transport-apply-button:active {
@@ -5553,7 +6012,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   flex-shrink: 0;
 
   opacity: 0.68;
-  color: rgba(255, 255, 255, 0.74); /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.74);
+  /* @token-exempt: theme variant */
 
   transform: translateY(-1px);
 }
@@ -5569,7 +6029,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   line-height: 1.55;
   letter-spacing: -0.01em;
 
-  color: rgba(255, 255, 255, 0.56); /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.56);
+  /* @token-exempt: theme variant */
 }
 
 .appearance-section-helper--muted {
@@ -5618,9 +6079,11 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 36px;
   height: 20px;
   border-radius: 999px;
-  background: rgba(90, 90, 96, 0.88); /* @token-exempt: theme variant */
+  background: rgba(90, 90, 96, 0.88);
+  /* @token-exempt: theme variant */
   border: none;
-  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22); /* @token-exempt: theme variant */
+  box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.22);
+  /* @token-exempt: theme variant */
   position: relative;
   transition: background 0.2s ease;
 }
@@ -5633,24 +6096,29 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 16px;
   height: 16px;
   border-radius: 999px;
-  background: #ffffff; /* @token-exempt: theme variant */
+  background: #ffffff;
+  /* @token-exempt: theme variant */
   border: none;
   box-shadow:
-    0 1px 3px rgba(0, 0, 0, 0.28) /* @token-exempt: theme variant */,
-    0 1px 1px rgba(0, 0, 0, 0.12); /* @token-exempt: theme variant */
+    0 1px 3px rgba(0, 0, 0, 0.28)
+    /* @token-exempt: theme variant */
+    ,
+    0 1px 1px rgba(0, 0, 0, 0.12);
+  /* @token-exempt: theme variant */
   transition: transform 0.2s ease;
 }
 
-.glow-switch input:checked + .glow-switch-track {
-  background: #34c759; /* @token-exempt: theme variant */
+.glow-switch input:checked+.glow-switch-track {
+  background: #34c759;
+  /* @token-exempt: theme variant */
   box-shadow: none;
 }
 
-.glow-switch input:checked + .glow-switch-track::after {
+.glow-switch input:checked+.glow-switch-track::after {
   transform: translateX(16px);
 }
 
-.glow-switch input:focus-visible + .glow-switch-track {
+.glow-switch input:focus-visible+.glow-switch-track {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
@@ -5658,19 +6126,12 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .color-swatches {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   width: var(--speaker-control-width);
-  gap: 10px;
-  flex-wrap: nowrap;
-  overflow: visible;
+  gap: 8px;
+  flex-wrap: wrap;
+  overflow: hidden;
   padding: 2px 0;
-  scrollbar-width: none;
-  -ms-overflow-style: none;
-}
-
-
-.color-swatches::-webkit-scrollbar {
-  display: none; /* WebKit/Blink */
 }
 
 .color-swatch {
@@ -5681,10 +6142,9 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   margin: 0;
   border-radius: 999px;
   border: 1.5px solid var(--settings-swatch-border);
-  background-color: var(
-    --glow-color,
-    #888
-  ); /* @token-exempt: var() fallback for runtime --glow-color */
+  background-color: var(--glow-color,
+      #888);
+  /* @token-exempt: var() fallback for runtime --glow-color */
   cursor: pointer;
   box-shadow: none;
   transition:
@@ -5706,10 +6166,17 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .color-swatch-delete-btn {
   position: absolute;
-  top: -6px;
-  right: -6px;
-  width: 18px;
-  height: 18px;
+  /* Inset to the swatch's top-right corner (was top/right: -6px, which spilled
+     outside the swatch box and got cropped by `.color-swatches { overflow: hidden }`
+     — issue #1406). At 0/0 the whole button renders inside the swatch's 24px box,
+     so it is never clipped regardless of which row/cell the swatch lands in.
+     Sized 16px (not the old 18px) so a corner-anchored button leaves more of the
+     24px swatch face visible on hover — the user can still see which color they
+     are deleting. */
+  top: 0;
+  right: 0;
+  width: 16px;
+  height: 16px;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -5759,7 +6226,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   margin-top: 10px;
   padding: 10px 12px;
   background: var(--add-color-popover-bg)
-    /* @token-exempt: custom-color popover bg, themed via token */;
+    /* @token-exempt: custom-color popover bg, themed via token */
+  ;
   border: 1px solid var(--add-color-popover-border);
   border-radius: 10px;
   backdrop-filter: blur(12px);
@@ -5777,10 +6245,9 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   height: 24px;
   border-radius: 999px;
   border: 1px solid var(--add-color-popover-border);
-  background-color: var(
-    --glow-color,
-    #888
-  ); /* @token-exempt: var() fallback for runtime --glow-color */
+  background-color: var(--glow-color,
+      #888);
+  /* @token-exempt: var() fallback for runtime --glow-color */
   flex-shrink: 0;
   transition: background-color 0.16s ease;
 }
@@ -5845,8 +6312,10 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   padding: 24px;
   box-sizing: border-box;
   /* Solid dark scrim with a subtle film-grain noise overlay (no blur). */
-  background-color: rgba(0, 0, 0, 0.78); /* @token-exempt: nested-modal scrim */
-  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.35 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.25'/></svg>"); /* @token-exempt: noise texture */
+  background-color: rgba(0, 0, 0, 0.78);
+  /* @token-exempt: nested-modal scrim */
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.35 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)' opacity='0.25'/></svg>");
+  /* @token-exempt: noise texture */
   background-repeat: repeat;
   background-size: 160px 160px;
 }
@@ -5858,7 +6327,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 100%;
   max-width: min(400px, calc(100vw - 32px));
   padding: 14px 16px 12px;
-  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45); /* @token-exempt: modal elevation */
+  box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
+  /* @token-exempt: modal elevation */
 }
 
 /* Header row: title + subtitle on the left, close button on the right. */
@@ -5913,12 +6383,14 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 .custom-color-modal-close:hover {
-  background: var(--surface-hover, rgba(255, 255, 255, 0.08)); /* @token-exempt: var() fallback */
+  background: var(--surface-hover, rgba(255, 255, 255, 0.08));
+  /* @token-exempt: var() fallback */
   color: var(--text-primary);
 }
 
 .custom-color-modal-close:focus-visible {
-  outline: 2px solid var(--accent-color, #4f8cff); /* @token-exempt: focus ring fallback */
+  outline: 2px solid var(--accent-color, #4f8cff);
+  /* @token-exempt: focus ring fallback */
   outline-offset: 2px;
 }
 
@@ -5960,7 +6432,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 .color-picker-sv-square:focus-visible {
-  outline: 2px solid var(--accent-color, #4f8cff); /* @token-exempt: focus ring fallback */
+  outline: 2px solid var(--accent-color, #4f8cff);
+  /* @token-exempt: focus ring fallback */
   outline-offset: 4px;
 }
 
@@ -5969,10 +6442,13 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 16px;
   height: 16px;
   border-radius: 50%;
-  border: 2px solid #fff; /* @token-exempt: marker chrome, must contrast with any hue */
+  border: 2px solid #fff;
+  /* @token-exempt: marker chrome, must contrast with any hue */
   box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.45), /* @token-exempt: marker chrome */
-    0 2px 6px rgba(0, 0, 0, 0.35); /* @token-exempt: marker chrome */
+    0 0 0 1px rgba(0, 0, 0, 0.45),
+    /* @token-exempt: marker chrome */
+    0 2px 6px rgba(0, 0, 0, 0.35);
+  /* @token-exempt: marker chrome */
   transform: translate(-50%, -50%);
   pointer-events: none;
 }
@@ -5995,12 +6471,14 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   cursor: pointer;
   touch-action: none;
   box-shadow: inset 0 0 0 1px var(--glass-border);
-  background: linear-gradient(to bottom, #f00 0%, #ff0 16.667%, #0f0 33.333%, #0ff 50%, #00f 66.667%, #f0f 83.333%, #f00 100%); /* @token-exempt: full-spectrum hue ramp */
+  background: linear-gradient(to bottom, #f00 0%, #ff0 16.667%, #0f0 33.333%, #0ff 50%, #00f 66.667%, #f0f 83.333%, #f00 100%);
+  /* @token-exempt: full-spectrum hue ramp */
   position: relative;
 }
 
 .color-picker-hue-track:focus-visible {
-  outline: 2px solid var(--accent-color, #4f8cff); /* @token-exempt: focus ring fallback */
+  outline: 2px solid var(--accent-color, #4f8cff);
+  /* @token-exempt: focus ring fallback */
   outline-offset: 4px;
 }
 
@@ -6012,15 +6490,20 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 20px;
   height: 20px;
   border-radius: 50%;
-  background: #fff; /* @token-exempt: thumb chrome */
-  border: 2px solid #fff; /* @token-exempt: thumb chrome */
+  background: #fff;
+  /* @token-exempt: thumb chrome */
+  border: 2px solid #fff;
+  /* @token-exempt: thumb chrome */
   box-shadow:
-    0 0 0 1px rgba(0, 0, 0, 0.45), /* @token-exempt: thumb chrome */
-    0 2px 6px rgba(0, 0, 0, 0.35); /* @token-exempt: thumb chrome */
+    0 0 0 1px rgba(0, 0, 0, 0.45),
+    /* @token-exempt: thumb chrome */
+    0 2px 6px rgba(0, 0, 0, 0.35);
+  /* @token-exempt: thumb chrome */
   transform: translate(-50%, -50%);
   pointer-events: none;
   /* Inner pure-hue dot. */
-  background-image: radial-gradient(circle, var(--hue-pure-color, #f00) 0, var(--hue-pure-color, #f00) 4px, #fff 4px, #fff 100%); /* @token-exempt: thumb chrome */
+  background-image: radial-gradient(circle, var(--hue-pure-color, #f00) 0, var(--hue-pure-color, #f00) 4px, #fff 4px, #fff 100%);
+  /* @token-exempt: thumb chrome */
 }
 
 /* Preview-row card: rounded subtle-glass panel containing the swatch,
@@ -6030,7 +6513,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   align-items: center;
   gap: 10px;
   padding: 8px 10px;
-  background: var(--surface-hover, rgba(255, 255, 255, 0.04)); /* @token-exempt: var() fallback for subtle-glass tint */
+  background: var(--surface-hover, rgba(255, 255, 255, 0.04));
+  /* @token-exempt: var() fallback for subtle-glass tint */
   border: 1px solid var(--glass-border);
   border-radius: 10px;
 }
@@ -6081,13 +6565,15 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 .color-picker-copy-btn:hover {
-  background: var(--surface-hover, rgba(255, 255, 255, 0.08)); /* @token-exempt: var() fallback */
+  background: var(--surface-hover, rgba(255, 255, 255, 0.08));
+  /* @token-exempt: var() fallback */
   color: var(--text-primary);
   border-color: var(--glass-border-hover, var(--glass-border));
 }
 
 .color-picker-copy-btn:focus-visible {
-  outline: 2px solid var(--accent-color, #4f8cff); /* @token-exempt: focus ring fallback */
+  outline: 2px solid var(--accent-color, #4f8cff);
+  /* @token-exempt: focus ring fallback */
   outline-offset: 2px;
 }
 
@@ -6097,9 +6583,11 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: flex;
   align-items: center;
 }
+
 .input-error-slot:not(:empty) {
   min-height: 16px;
 }
+
 .input-error-slot .input-error-message {
   margin: 0;
 }
@@ -6248,6 +6736,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
     grid-template-columns: minmax(0, 1fr);
     row-gap: 16px;
   }
+
   .speaker-highlight-preview {
     width: 100%;
     padding-left: 0;
@@ -6263,9 +6752,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .appearance-control-row {
   display: grid;
   grid-template-columns:
-  var(--speaker-label-width)
-  var(--speaker-control-width)
-  var(--speaker-value-width);
+    var(--speaker-label-width) var(--speaker-control-width) var(--speaker-value-width);
   column-gap: 12px;
   align-items: center;
   margin: 0;
@@ -6313,18 +6800,30 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: var(--speaker-control-width);
   height: 4px;
   border-radius: 999px;
-  background: linear-gradient(
-    to right,
-    rgba(235, 232, 240, 0.72) 0% /* @token-exempt: theme variant */,
-    rgba(255, 238, 234, 0.54) var(--fill, 0%) /* @token-exempt: theme variant */,
-    rgba(170, 175, 190, 0.28) var(--fill, 0%) /* @token-exempt: theme variant */,
-    rgba(170, 175, 190, 0.2) 100% /* @token-exempt: theme variant */
-  );
-  border: 1px solid rgba(255, 255, 255, 0.38); /* @token-exempt: theme variant */
+  background: linear-gradient(to right,
+      rgba(235, 232, 240, 0.72) 0%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(255, 238, 234, 0.54) var(--fill, 0%)
+      /* @token-exempt: theme variant */
+      ,
+      rgba(170, 175, 190, 0.28) var(--fill, 0%)
+      /* @token-exempt: theme variant */
+      ,
+      rgba(170, 175, 190, 0.2) 100%
+      /* @token-exempt: theme variant */
+    );
+  border: 1px solid rgba(255, 255, 255, 0.38);
+  /* @token-exempt: theme variant */
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.7) /* @token-exempt: theme variant */,
-    inset 0 -1px 2px rgba(130, 120, 150, 0.18) /* @token-exempt: theme variant */,
-    0 4px 10px rgba(80, 72, 92, 0.08); /* @token-exempt: theme variant */
+    inset 0 1px 1px rgba(255, 255, 255, 0.7)
+    /* @token-exempt: theme variant */
+    ,
+    inset 0 -1px 2px rgba(130, 120, 150, 0.18)
+    /* @token-exempt: theme variant */
+    ,
+    0 4px 10px rgba(80, 72, 92, 0.08);
+  /* @token-exempt: theme variant */
   backdrop-filter: blur(18px) saturate(130%);
   -webkit-backdrop-filter: blur(18px) saturate(130%);
   outline: none;
@@ -6343,16 +6842,24 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   height: 14px;
   margin-top: -5px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.72); /* @token-exempt: theme variant */
-  background: radial-gradient(
-    120% 120% at 30% 20%,
-    rgba(255, 255, 255, 0.96) /* @token-exempt: theme variant */,
-    rgba(238, 234, 242, 0.72) /* @token-exempt: theme variant */
-  );
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  /* @token-exempt: theme variant */
+  background: radial-gradient(120% 120% at 30% 20%,
+      rgba(255, 255, 255, 0.96)
+      /* @token-exempt: theme variant */
+      ,
+      rgba(238, 234, 242, 0.72)
+      /* @token-exempt: theme variant */
+    );
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.88) /* @token-exempt: theme variant */,
-    0 2px 6px rgba(70, 64, 82, 0.14) /* @token-exempt: theme variant */,
-    0 6px 12px rgba(70, 64, 82, 0.08); /* @token-exempt: theme variant */
+    inset 0 1px 1px rgba(255, 255, 255, 0.88)
+    /* @token-exempt: theme variant */
+    ,
+    0 2px 6px rgba(70, 64, 82, 0.14)
+    /* @token-exempt: theme variant */
+    ,
+    0 6px 12px rgba(70, 64, 82, 0.08);
+  /* @token-exempt: theme variant */
 }
 
 .appearance-slider::-moz-range-track {
@@ -6365,28 +6872,35 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 14px;
   height: 14px;
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.72); /* @token-exempt: theme variant */
-  background: radial-gradient(
-    120% 120% at 30% 20%,
-    rgba(255, 255, 255, 0.96) /* @token-exempt: theme variant */,
-    rgba(238, 234, 242, 0.72) /* @token-exempt: theme variant */
-  );
+  border: 1px solid rgba(255, 255, 255, 0.72);
+  /* @token-exempt: theme variant */
+  background: radial-gradient(120% 120% at 30% 20%,
+      rgba(255, 255, 255, 0.96)
+      /* @token-exempt: theme variant */
+      ,
+      rgba(238, 234, 242, 0.72)
+      /* @token-exempt: theme variant */
+    );
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.88) /* @token-exempt: theme variant */,
-    0 2px 6px rgba(70, 64, 82, 0.14) /* @token-exempt: theme variant */,
-    0 6px 12px rgba(70, 64, 82, 0.08); /* @token-exempt: theme variant */
+    inset 0 1px 1px rgba(255, 255, 255, 0.88)
+    /* @token-exempt: theme variant */
+    ,
+    0 2px 6px rgba(70, 64, 82, 0.14)
+    /* @token-exempt: theme variant */
+    ,
+    0 6px 12px rgba(70, 64, 82, 0.08);
+  /* @token-exempt: theme variant */
 }
 
 /* ── Theme icon toggle ─────────────────────────────────────────────────────── */
 
 .appearance-section-divider {
   height: 1px;
-  background: rgba(
-    120,
-    130,
-    150,
-    0.12
-  ); /* @token-exempt: appearance divider, a barely-there line */
+  background: rgba(120,
+      130,
+      150,
+      0.12);
+  /* @token-exempt: appearance divider, a barely-there line */
   border: none;
   margin: 0;
 }
@@ -6404,11 +6918,14 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .theme-icon-toggle {
   display: inline-flex;
-  gap: 0; /* segments touch — single object */
-  padding: 3px; /* inner inset frame */
+  gap: 0;
+  /* segments touch — single object */
+  padding: 3px;
+  /* inner inset frame */
   background: var(--settings-panel-bg);
   border: 1px solid var(--settings-panel-border);
-  border-radius: 999px; /* full pill */
+  border-radius: 999px;
+  /* full pill */
   box-shadow: var(--settings-panel-shadow);
   width: fit-content;
   margin: 0;
@@ -6419,9 +6936,12 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   -webkit-appearance: none;
   appearance: none;
   background: transparent;
-  border: none; /* no per-button outline */
-  border-radius: 999px; /* matches slab; active pill nests cleanly */
-  color: rgba(255, 255, 255, 0.62); /* @token-exempt: calm secondary */
+  border: none;
+  /* no per-button outline */
+  border-radius: 999px;
+  /* matches slab; active pill nests cleanly */
+  color: rgba(255, 255, 255, 0.62);
+  /* @token-exempt: calm secondary */
   cursor: pointer;
   display: inline-flex;
   align-items: center;
@@ -6444,13 +6964,16 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 .theme-icon-button:hover {
-  background: rgba(255, 255, 255, 0.04); /* @token-exempt: barely-there */
-  color: rgba(255, 255, 255, 0.85); /* @token-exempt: visionOS hover */
+  background: rgba(255, 255, 255, 0.04);
+  /* @token-exempt: barely-there */
+  color: rgba(255, 255, 255, 0.85);
+  /* @token-exempt: visionOS hover */
 }
 
 .theme-icon-button:focus-visible {
   outline: none;
-  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18); /* @token-exempt: gentle inset ring */
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.18);
+  /* @token-exempt: gentle inset ring */
 }
 
 .theme-icon-button:focus:not(:focus-visible) {
@@ -6460,20 +6983,23 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 /* Active = single luminance lift inside the slab; no border, no glow */
 .theme-icon-button--active,
 .theme-icon-button--active:hover {
-  background: rgba(
-    255,
-    255,
-    255,
-    0.1
-  ); /* @token-exempt: visionOS active panel */
-  color: rgba(255, 255, 255, 0.96); /* @token-exempt: visionOS active label */
+  background: rgba(255,
+      255,
+      255,
+      0.1);
+  /* @token-exempt: visionOS active panel */
+  color: rgba(255, 255, 255, 0.96);
+  /* @token-exempt: visionOS active label */
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.08),
-    /* @token-exempt: top edge light */ inset 0 -1px 0 rgba(0, 0, 0, 0.12); /* @token-exempt: bottom shade */
+    /* @token-exempt: top edge light */
+    inset 0 -1px 0 rgba(0, 0, 0, 0.12);
+  /* @token-exempt: bottom shade */
 }
 
 .theme-icon-button:active:not(.theme-icon-button--active) {
-  background: rgba(255, 255, 255, 0.05); /* @token-exempt: press feedback */
+  background: rgba(255, 255, 255, 0.05);
+  /* @token-exempt: press feedback */
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -6484,34 +7010,46 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 html[data-theme="light"] .device-settings-modal-overlay {
   background: var(--device-settings-overlay-bg-image);
-  backdrop-filter: blur(6px) saturate(100%);
-  -webkit-backdrop-filter: blur(6px) saturate(100%);
+  backdrop-filter: blur(3px) saturate(100%);
+  -webkit-backdrop-filter: blur(3px) saturate(100%);
 }
 
 
 html[data-theme="light"] .settings-nav-button {
-  color: rgba(0, 0, 0, 0.68); /* @token-exempt: visionOS nav label (light) */
+  color: rgba(0, 0, 0, 0.68);
+  /* @token-exempt: visionOS nav label (light) */
 }
 
 html[data-theme="light"] .settings-nav-button:hover {
   background: var(--appearance-nav-hover-bg);
-  color: rgba(0, 0, 0, 0.92); /* @token-exempt: visionOS nav hover (light) */
+  color: rgba(0, 0, 0, 0.92);
+  /* @token-exempt: visionOS nav hover (light) */
 }
 
 html[data-theme="light"] .settings-nav-button.active {
-  background: rgba(238, 232, 240, 0.34); /* @token-exempt: theme variant */
-  border-color: rgba(255, 255, 255, 0.34); /* @token-exempt: theme variant */
-  color: rgba(18, 24, 34, 0.9); /* @token-exempt: theme variant */
+  background: rgba(238, 232, 240, 0.34);
+  /* @token-exempt: theme variant */
+  border-color: rgba(255, 255, 255, 0.34);
+  /* @token-exempt: theme variant */
+  color: rgba(18, 24, 34, 0.9);
+  /* @token-exempt: theme variant */
   font-weight: 600;
 
   backdrop-filter: blur(34px) saturate(145%);
   -webkit-backdrop-filter: blur(34px) saturate(145%);
 
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.7) /* @token-exempt: theme variant */,
-    inset 0 -1px 2px rgba(150, 140, 165, 0.22) /* @token-exempt: theme variant */,
-    0 10px 18px rgba(80, 72, 92, 0.16) /* @token-exempt: theme variant */,
-    0 24px 42px rgba(80, 72, 92, 0.1); /* @token-exempt: theme variant */
+    inset 0 1px 1px rgba(255, 255, 255, 0.7)
+    /* @token-exempt: theme variant */
+    ,
+    inset 0 -1px 2px rgba(150, 140, 165, 0.22)
+    /* @token-exempt: theme variant */
+    ,
+    0 10px 18px rgba(80, 72, 92, 0.16)
+    /* @token-exempt: theme variant */
+    ,
+    0 24px 42px rgba(80, 72, 92, 0.1);
+  /* @token-exempt: theme variant */
 }
 
 
@@ -6523,27 +7061,34 @@ html[data-theme="light"] .settings-nav-button.active::before {
   pointer-events: none;
 
   background:
-    radial-gradient(
-      90% 130% at 22% 12%,
-      rgba(255, 255, 255, 0.74) /* @token-exempt: theme variant */,
-      transparent 48%
-    ),
-    radial-gradient(
-      80% 120% at 88% 20%,
-      rgba(255, 215, 205, 0.42) /* @token-exempt: theme variant */,
-      transparent 56%
-    ),
-    radial-gradient(
-      70% 100% at 12% 72%,
-      rgba(185, 190, 215, 0.34) /* @token-exempt: theme variant */,
-      transparent 58%
-    );
+    radial-gradient(90% 130% at 22% 12%,
+      rgba(255, 255, 255, 0.74)
+      /* @token-exempt: theme variant */
+      ,
+      transparent 48%),
+    radial-gradient(80% 120% at 88% 20%,
+      rgba(255, 215, 205, 0.42)
+      /* @token-exempt: theme variant */
+      ,
+      transparent 56%),
+    radial-gradient(70% 100% at 12% 72%,
+      rgba(185, 190, 215, 0.34)
+      /* @token-exempt: theme variant */
+      ,
+      transparent 58%);
 
   box-shadow:
-    inset 0 1px 1px rgba(255, 255, 255, 0.72) /* @token-exempt: theme variant */,
-    inset 0 -1px 2px rgba(150, 140, 165, 0.24) /* @token-exempt: theme variant */,
-    inset 1px 0 1px rgba(210, 218, 240, 0.2) /* @token-exempt: theme variant */,
-    inset -1px 0 1px rgba(255, 205, 196, 0.24); /* @token-exempt: theme variant */
+    inset 0 1px 1px rgba(255, 255, 255, 0.72)
+    /* @token-exempt: theme variant */
+    ,
+    inset 0 -1px 2px rgba(150, 140, 165, 0.24)
+    /* @token-exempt: theme variant */
+    ,
+    inset 1px 0 1px rgba(210, 218, 240, 0.2)
+    /* @token-exempt: theme variant */
+    ,
+    inset -1px 0 1px rgba(255, 205, 196, 0.24);
+  /* @token-exempt: theme variant */
 
   opacity: 0.9;
 }
@@ -6561,31 +7106,39 @@ html[data-theme="light"] .theme-icon-toggle {
 }
 
 html[data-theme="light"] .theme-icon-button {
-  color: rgba(0, 0, 0, 0.55); /* @token-exempt: calm secondary */
+  color: rgba(0, 0, 0, 0.55);
+  /* @token-exempt: calm secondary */
 }
 
 html[data-theme="light"] .theme-icon-button:hover {
-  background: rgba(0, 0, 0, 0.03); /* @token-exempt: barely-there */
-  color: rgba(0, 0, 0, 0.82); /* @token-exempt: hover label */
+  background: rgba(0, 0, 0, 0.03);
+  /* @token-exempt: barely-there */
+  color: rgba(0, 0, 0, 0.82);
+  /* @token-exempt: hover label */
 }
 
 html[data-theme="light"] .theme-icon-button:focus-visible {
-  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.14); /* @token-exempt: gentle inset ring */
+  box-shadow: inset 0 0 0 1px rgba(0, 0, 0, 0.14);
+  /* @token-exempt: gentle inset ring */
 }
 
 html[data-theme="light"] .theme-icon-button--active,
 html[data-theme="light"] .theme-icon-button--active:hover {
-  background: rgba(255, 255, 255, 0.85); /* @token-exempt: lifted panel */
+  background: rgba(255, 255, 255, 0.85);
+  /* @token-exempt: lifted panel */
   border: none;
-  color: rgba(0, 0, 0, 0.92); /* @token-exempt: active label */
+  color: rgba(0, 0, 0, 0.92);
+  /* @token-exempt: active label */
   box-shadow:
     inset 0 1px 0 rgba(255, 255, 255, 0.9),
-    /* @token-exempt: highlight */ 0 1px 2px rgba(0, 0, 0, 0.06); /* @token-exempt: subtle lift */
+    /* @token-exempt: highlight */
+    0 1px 2px rgba(0, 0, 0, 0.06);
+  /* @token-exempt: subtle lift */
 }
 
-html[data-theme="light"]
-  .theme-icon-button:active:not(.theme-icon-button--active) {
-  background: rgba(0, 0, 0, 0.04); /* @token-exempt: press feedback */
+html[data-theme="light"] .theme-icon-button:active:not(.theme-icon-button--active) {
+  background: rgba(0, 0, 0, 0.04);
+  /* @token-exempt: press feedback */
 }
 
 html[data-theme="light"] .settings-section-title,
@@ -6594,10 +7147,7 @@ html[data-theme="light"] .slider-value {
   color: var(--appearance-section-text);
 }
 
-html[data-theme="light"]
-  .glow-switch
-  input:checked
-  + .glow-switch-track::after {
+html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   box-shadow:
     0 1px 6px var(--appearance-glow-switch-shadow-1),
     0 0 10px var(--appearance-glow-switch-checked-shadow-3),
@@ -6631,10 +7181,12 @@ html[data-theme="light"]
 }
 
 @keyframes preview-pulse {
+
   0%,
   100% {
     transform: scale(1);
   }
+
   50% {
     transform: scale(0.985);
   }
@@ -6648,6 +7200,7 @@ html[data-theme="light"]
   .preview-tile {
     transition: none;
   }
+
   .preview-tile-pulsing {
     animation: none;
   }
@@ -6662,23 +7215,20 @@ html[data-theme="light"]
   box-shadow: 0 0 0 0 transparent;
 }
 
-.appearance-settings-panel.glow-disabled
-  .appearance-slider::-webkit-slider-thumb {
+.appearance-settings-panel.glow-disabled .appearance-slider::-webkit-slider-thumb {
   background: var(--glow-switch-thumb-disabled);
   box-shadow:
     0 0 0 0 transparent,
     0 0 0 0 transparent;
 }
 
-.appearance-settings-panel.glow-disabled
-  .appearance-slider::-webkit-slider-thumb:hover {
+.appearance-settings-panel.glow-disabled .appearance-slider::-webkit-slider-thumb:hover {
   box-shadow:
     0 0 0 0 transparent,
     0 0 0 0 transparent;
 }
 
-.appearance-settings-panel.glow-disabled
-  .appearance-slider::-webkit-slider-thumb:active {
+.appearance-settings-panel.glow-disabled .appearance-slider::-webkit-slider-thumb:active {
   box-shadow:
     0 0 0 0 transparent,
     0 0 0 0 transparent;
@@ -6691,15 +7241,13 @@ html[data-theme="light"]
     0 0 0 0 transparent;
 }
 
-.appearance-settings-panel.glow-disabled
-  .appearance-slider::-moz-range-thumb:hover {
+.appearance-settings-panel.glow-disabled .appearance-slider::-moz-range-thumb:hover {
   box-shadow:
     0 0 0 0 transparent,
     0 0 0 0 transparent;
 }
 
-.appearance-settings-panel.glow-disabled
-  .appearance-slider::-moz-range-thumb:active {
+.appearance-settings-panel.glow-disabled .appearance-slider::-moz-range-thumb:active {
   box-shadow:
     0 0 0 0 transparent,
     0 0 0 0 transparent;
@@ -6771,13 +7319,16 @@ html[data-theme="light"]
   appearance: none;
   transition: background-color 0.2s ease;
 }
+
 .signal-indicator:hover {
   background-color: var(--overlay-opaque);
 }
+
 .signal-indicator:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
+
 .signal-indicator svg {
   width: min(18px, calc(var(--tile-h, 240px) * 0.09));
   height: min(18px, calc(var(--tile-h, 240px) * 0.09));
@@ -6789,8 +7340,7 @@ html[data-theme="light"]
      `.signal-quality-popup-portal` (the portal mode that anchors via
      `getBoundingClientRect`) so the popup escapes the tile's
      `overflow: hidden` border-radius clip from PR #923 and dense grids /* @token-exempt: PR ref, not a color */
-     can no longer crop it. */
-  width: min(420px, calc(100vw - 16px));
+  can no longer crop it. */ width: min(420px, calc(100vw - 16px));
   max-height: calc(100vh - 100px);
   overflow-y: auto;
   background: var(--signal-popup-bg);
@@ -6836,16 +7386,19 @@ html[data-theme="light"]
 .split-peer-tile.signal-popup-open {
   overflow: visible;
 }
+
 .signal-quality-popup .popup-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
   margin-bottom: 12px;
 }
+
 .signal-quality-popup .popup-title {
   font-size: 14px;
   font-weight: 600;
 }
+
 /* Right-aligned cluster: transport badge + close button. Splitting them out
  * keeps the title-vs-controls layout intact (title left, controls right)
  * regardless of badge width. */
@@ -6855,6 +7408,7 @@ html[data-theme="light"]
   gap: 8px;
   flex-shrink: 0;
 }
+
 /* Transport badge in the signal-quality popup header.
  * Mirrors the diagnostics popup (`diagnostics_cm_styles.css`) so the WT/WS pill
  * looks identical in both surfaces. The diagnostics popup ships its CSS as an
@@ -6870,16 +7424,19 @@ html[data-theme="light"]
   letter-spacing: 0.02em;
   flex-shrink: 0;
 }
+
 .signal-quality-popup .type-websocket {
   background: var(--transport-badge-bg);
   color: var(--transport-badge-text);
   border: 1px solid var(--transport-badge-border);
 }
+
 .signal-quality-popup .type-webtransport {
   background: var(--transport-badge-bg);
   color: var(--transport-badge-text);
   border: 1px solid var(--transport-badge-border);
 }
+
 .signal-quality-popup .popup-close {
   background: none;
   border: none;
@@ -6897,10 +7454,12 @@ html[data-theme="light"]
     color 0.15s ease;
   padding: 0;
 }
+
 .signal-quality-popup .popup-close:hover {
   background-color: var(--field-bg-hover);
   color: var(--text-primary);
 }
+
 /* HCL bug #9: reanchor button visually mirrors the close button so the
    header's right cluster reads as a uniform row of icon controls. The
    button only renders when the popup is in `Free` mode (the user dragged
@@ -6920,10 +7479,12 @@ html[data-theme="light"]
   transition: background-color 0.15s ease, color 0.15s ease;
   padding: 0;
 }
+
 .signal-quality-popup .popup-reanchor:hover {
   background-color: var(--field-bg-hover);
   color: var(--text-primary);
 }
+
 /* HCL bug #9: header doubles as the drag handle, so the cursor signals
    the affordance to the user. Inputs / buttons inside the header carry
    `data-no-drag` and their default cursors win via CSS specificity. */
@@ -6931,12 +7492,15 @@ html[data-theme="light"]
   cursor: grab;
   user-select: none;
 }
+
 .signal-quality-popup[data-anchor-mode="dragging"] .popup-header[data-drag-handle="true"] {
   cursor: grabbing;
 }
+
 .signal-quality-popup .popup-header [data-no-drag] {
   cursor: pointer;
 }
+
 /* HCL follow-up 952: visual grip affordance at the leading edge of the
    popup header so users discover the popup is draggable. The grip
    inherits `cursor: grab` from the header rule above (it sits inside
@@ -6956,20 +7520,25 @@ html[data-theme="light"]
   flex-shrink: 0;
   cursor: grab;
 }
+
 .signal-quality-popup[data-anchor-mode="dragging"] .signal-popup-drag-handle {
   cursor: grabbing;
 }
+
 .signal-chart-wrapper {
   display: flex;
   align-items: flex-start;
   position: relative;
 }
+
 .signal-chart-y-axis {
   flex-shrink: 0;
 }
+
 .signal-chart-y-axis-right {
   flex-shrink: 0;
 }
+
 .signal-chart-scroll {
   position: relative;
   overflow-x: auto;
@@ -6977,8 +7546,10 @@ html[data-theme="light"]
   flex: 1;
   min-width: 0;
   scrollbar-width: auto;
-  scrollbar-color: rgba(255, 255, 255, 0.35) rgba(255, 255, 255, 0.08); /* @token-exempt: scrollbar custom rendering */
+  scrollbar-color: rgba(255, 255, 255, 0.35) rgba(255, 255, 255, 0.08);
+  /* @token-exempt: scrollbar custom rendering */
 }
+
 /* Custom webkit scrollbar: always visible when content overflows.
    Defining ::-webkit-scrollbar forces classic (non-overlay) scrollbar
    behavior, so the scrollbar stays permanently visible instead of
@@ -6987,14 +7558,17 @@ html[data-theme="light"]
 .signal-chart-scroll::-webkit-scrollbar {
   height: 10px;
 }
+
 .signal-chart-scroll::-webkit-scrollbar-track {
   background: var(--scrollbar-track);
   border-radius: 5px;
 }
+
 .signal-chart-scroll::-webkit-scrollbar-thumb {
   background: var(--scrollbar-thumb-strong);
   border-radius: 5px;
 }
+
 .signal-chart-scroll::-webkit-scrollbar-thumb:hover {
   background: var(--scrollbar-thumb-active);
 }
@@ -7046,6 +7620,14 @@ html[data-theme="light"]
   color: var(--text-tertiary);
 }
 
+/* Unified diagnostics timeline (issue 173 / upstream 712). The chart body reuses
+   the `.neteq-chart-*` scroll/axis layout and the `.signal-chart-legend` checkbox
+   styling verbatim; these rules only add the drawer-local spacing so the legend
+   sits a little tighter under the overlaid timeline. */
+.unified-timeline-chart .unified-timeline-legend {
+  margin-top: 10px;
+}
+
 .signal-chart-legend {
   display: flex;
   flex-wrap: wrap;
@@ -7054,6 +7636,7 @@ html[data-theme="light"]
   font-size: 11px;
   color: var(--text-secondary);
 }
+
 .signal-chart-legend .legend-item {
   display: flex;
   align-items: center;
@@ -7061,6 +7644,7 @@ html[data-theme="light"]
   cursor: pointer;
   user-select: none;
 }
+
 .signal-chart-legend .legend-item input[type="checkbox"] {
   width: 12px;
   height: 12px;
@@ -7068,15 +7652,32 @@ html[data-theme="light"]
   cursor: pointer;
   accent-color: var(--text-tertiary);
 }
+
+/* Keyboard focus ring on the legend checkboxes so keyboard users can see which
+   series toggle is focused (a11y, issue 173). Matches the project's existing
+   `:focus-visible` outline idiom; benefits the shared signal-quality legend too. */
+.signal-chart-legend .legend-item input[type="checkbox"]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
 .signal-chart-legend span {
   display: flex;
   align-items: center;
   gap: 4px;
 }
+
 .signal-chart-legend .dot {
   width: 8px;
   height: 8px;
   border-radius: 50%;
+  display: inline-block;
+}
+
+/* Unified-timeline legend swatch: a short line carrying the SAME stroke + dash
+   pattern as the chart line, so the legend distinguishes series by shape (not
+   hue alone — color-blind safety, issue 173). */
+.signal-chart-legend .legend-swatch {
+  flex-shrink: 0;
   display: inline-block;
 }
 .legend-help-btn {
@@ -7100,10 +7701,12 @@ html[data-theme="light"]
     border-color 0.15s ease,
     color 0.15s ease;
 }
+
 .legend-help-btn:hover {
   border-color: var(--legend-help-border-hover);
   color: var(--text-primary);
 }
+
 .legend-help-text {
   margin-top: 6px;
   padding: 8px 10px;
@@ -7113,13 +7716,16 @@ html[data-theme="light"]
   line-height: 1.3;
   color: var(--text-tertiary);
 }
+
 .legend-help-text strong {
   color: var(--text-secondary);
   font-size: 8pt;
 }
+
 .legend-help-text p {
   margin: 3px 0;
 }
+
 /* ── Per-peer simulcast RECEIVE "Layers" section ──────────────────────────
    Renders the SAME per-peer rows as the Performance dialog (the `.perf-peer-row`
    / `.perf-q-dot` / `.perf-reason-chip` classes are shared verbatim, so the
@@ -7318,7 +7924,8 @@ html[data-theme="light"]
   left: 50%;
   transform: translateX(-50%);
   background: var(--mock-popover-bg)
-    /* @token-exempt: dark near-opaque, themed via token */;
+    /* @token-exempt: dark near-opaque, themed via token */
+  ;
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   padding: 14px 18px;
@@ -7487,14 +8094,18 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
 
 .invite-glass-title {
   margin: 0;
-  color: rgba(255, 255, 255, 0.88); /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.88);
+  /* @token-exempt: theme variant */
   font-size: 30px;
   line-height: 1.08;
   font-weight: 300;
   letter-spacing: -0.045em;
   text-shadow:
-    0 2px 16px rgba(0, 0, 0, 0.18) /* @token-exempt: theme variant */,
-    0 0 1px rgba(255, 255, 255, 0.24); /* @token-exempt: theme variant */
+    0 2px 16px rgba(0, 0, 0, 0.18)
+    /* @token-exempt: theme variant */
+    ,
+    0 0 1px rgba(255, 255, 255, 0.24);
+  /* @token-exempt: theme variant */
   pointer-events: none;
 }
 
@@ -7516,37 +8127,52 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   gap: 12px;
 
   border-radius: 999px;
-  border: 1px solid rgba(255, 255, 255, 0.48); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.48);
+  /* @token-exempt: theme variant */
 
   background:
-    radial-gradient(
-      circle at 24% 0%,
-      rgba(255, 255, 255, 0.46) /* @token-exempt: theme variant */,
-      transparent 34%
-    ),
-    radial-gradient(
-      ellipse at 78% 100%,
-      rgba(0, 120, 150, 0.14) /* @token-exempt: theme variant */,
-      transparent 42%
-    ),
-    linear-gradient(
-      180deg,
-      rgba(255, 255, 255, 0.2) 0% /* @token-exempt: theme variant */,
-      rgba(255, 255, 255, 0.075) 46% /* @token-exempt: theme variant */,
-      rgba(10, 22, 34, 0.18) 100% /* @token-exempt: theme variant */
+    radial-gradient(circle at 24% 0%,
+      rgba(255, 255, 255, 0.46)
+      /* @token-exempt: theme variant */
+      ,
+      transparent 34%),
+    radial-gradient(ellipse at 78% 100%,
+      rgba(0, 120, 150, 0.14)
+      /* @token-exempt: theme variant */
+      ,
+      transparent 42%),
+    linear-gradient(180deg,
+      rgba(255, 255, 255, 0.2) 0%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(255, 255, 255, 0.075) 46%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(10, 22, 34, 0.18) 100%
+      /* @token-exempt: theme variant */
     );
 
   backdrop-filter: blur(30px) saturate(190%) contrast(110%);
   -webkit-backdrop-filter: blur(30px) saturate(190%) contrast(110%);
 
   box-shadow:
-    0 18px 44px rgba(0, 0, 0, 0.18) /* @token-exempt: theme variant */,
-    inset 0 1px 1px rgba(255, 255, 255, 0.95) /* @token-exempt: theme variant */,
-    inset 0 -1px 2px rgba(8, 18, 30, 0.36) /* @token-exempt: theme variant */,
-    inset 10px 0 18px rgba(255, 255, 255, 0.08) /* @token-exempt: theme variant */,
-    inset -10px 0 18px rgba(20, 38, 54, 0.18); /* @token-exempt: theme variant */
+    0 18px 44px rgba(0, 0, 0, 0.18)
+    /* @token-exempt: theme variant */
+    ,
+    inset 0 1px 1px rgba(255, 255, 255, 0.95)
+    /* @token-exempt: theme variant */
+    ,
+    inset 0 -1px 2px rgba(8, 18, 30, 0.36)
+    /* @token-exempt: theme variant */
+    ,
+    inset 10px 0 18px rgba(255, 255, 255, 0.08)
+    /* @token-exempt: theme variant */
+    ,
+    inset -10px 0 18px rgba(20, 38, 54, 0.18);
+  /* @token-exempt: theme variant */
 
-  color: rgba(255, 255, 255, 0.96); /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.96);
+  /* @token-exempt: theme variant */
   font-size: 11px;
   font-weight: 700;
   letter-spacing: 0.18em;
@@ -7554,8 +8180,11 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   cursor: pointer;
 
   text-shadow:
-    0 1px 1px rgba(0, 0, 0, 0.2) /* @token-exempt: theme variant */,
-    0 0 10px rgba(255, 255, 255, 0.22); /* @token-exempt: theme variant */
+    0 1px 1px rgba(0, 0, 0, 0.2)
+    /* @token-exempt: theme variant */
+    ,
+    0 0 10px rgba(255, 255, 255, 0.22);
+  /* @token-exempt: theme variant */
 
   transition:
     transform 180ms ease,
@@ -7573,41 +8202,51 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   z-index: -1;
 
   background:
-    radial-gradient(
-      ellipse at 18% 54%,
-      rgba(0, 160, 190, 0.16) /* @token-exempt: theme variant */,
-      transparent 34%
-    ),
-    radial-gradient(
-      ellipse at 42% 38%,
-      rgba(70, 90, 210, 0.13) /* @token-exempt: theme variant */,
-      transparent 32%
-    ),
-    radial-gradient(
-      ellipse at 68% 58%,
-      rgba(125, 75, 190, 0.11) /* @token-exempt: theme variant */,
-      transparent 34%
-    ),
-    radial-gradient(
-      ellipse at 84% 44%,
-      rgba(40, 190, 170, 0.09) /* @token-exempt: theme variant */,
-      transparent 30%
-    ),
-    linear-gradient(
-      115deg,
+    radial-gradient(ellipse at 18% 54%,
+      rgba(0, 160, 190, 0.16)
+      /* @token-exempt: theme variant */
+      ,
+      transparent 34%),
+    radial-gradient(ellipse at 42% 38%,
+      rgba(70, 90, 210, 0.13)
+      /* @token-exempt: theme variant */
+      ,
+      transparent 32%),
+    radial-gradient(ellipse at 68% 58%,
+      rgba(125, 75, 190, 0.11)
+      /* @token-exempt: theme variant */
+      ,
+      transparent 34%),
+    radial-gradient(ellipse at 84% 44%,
+      rgba(40, 190, 170, 0.09)
+      /* @token-exempt: theme variant */
+      ,
+      transparent 30%),
+    linear-gradient(115deg,
       transparent 0%,
-      rgba(0, 180, 220, 0.1) 24% /* @token-exempt: theme variant */,
-      rgba(70, 90, 220, 0.1) 42% /* @token-exempt: theme variant */,
-      rgba(120, 75, 190, 0.08) 58% /* @token-exempt: theme variant */,
-      rgba(0, 160, 180, 0.08) 76% /* @token-exempt: theme variant */,
-      transparent 100%
-    ),
-    linear-gradient(
-      180deg,
-      rgba(255, 255, 255, 0.3) 0% /* @token-exempt: theme variant */,
-      rgba(255, 255, 255, 0.07) 34% /* @token-exempt: theme variant */,
+      rgba(0, 180, 220, 0.1) 24%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(70, 90, 220, 0.1) 42%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(120, 75, 190, 0.08) 58%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(0, 160, 180, 0.08) 76%
+      /* @token-exempt: theme variant */
+      ,
+      transparent 100%),
+    linear-gradient(180deg,
+      rgba(255, 255, 255, 0.3) 0%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(255, 255, 255, 0.07) 34%
+      /* @token-exempt: theme variant */
+      ,
       transparent 58%,
-      rgba(255, 255, 255, 0.08) 100% /* @token-exempt: theme variant */
+      rgba(255, 255, 255, 0.08) 100%
+      /* @token-exempt: theme variant */
     );
 
   filter: saturate(150%) contrast(106%);
@@ -7615,10 +8254,17 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   mix-blend-mode: screen;
 
   box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.78) /* @token-exempt: theme variant */,
-    inset 0 -1px 0 rgba(255, 255, 255, 0.16) /* @token-exempt: theme variant */,
-    inset 1px 0 0 rgba(0, 210, 220, 0.08) /* @token-exempt: theme variant */,
-    inset -1px 0 0 rgba(105, 80, 190, 0.08); /* @token-exempt: theme variant */
+    inset 0 1px 0 rgba(255, 255, 255, 0.78)
+    /* @token-exempt: theme variant */
+    ,
+    inset 0 -1px 0 rgba(255, 255, 255, 0.16)
+    /* @token-exempt: theme variant */
+    ,
+    inset 1px 0 0 rgba(0, 210, 220, 0.08)
+    /* @token-exempt: theme variant */
+    ,
+    inset -1px 0 0 rgba(105, 80, 190, 0.08);
+  /* @token-exempt: theme variant */
 }
 
 /* Clipped chromatic edge, not external glow */
@@ -7630,15 +8276,21 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   pointer-events: none;
   z-index: 0;
 
-  background: linear-gradient(
-    100deg,
-    transparent 0%,
-    rgba(0, 190, 210, 0.14) 18% /* @token-exempt: theme variant */,
-    rgba(60, 80, 210, 0.13) 36% /* @token-exempt: theme variant */,
-    rgba(120, 75, 190, 0.11) 54% /* @token-exempt: theme variant */,
-    rgba(0, 170, 165, 0.1) 74% /* @token-exempt: theme variant */,
-    transparent 100%
-  );
+  background: linear-gradient(100deg,
+      transparent 0%,
+      rgba(0, 190, 210, 0.14) 18%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(60, 80, 210, 0.13) 36%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(120, 75, 190, 0.11) 54%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(0, 170, 165, 0.1) 74%
+      /* @token-exempt: theme variant */
+      ,
+      transparent 100%);
 
   opacity: 0.36;
   filter: blur(6px) saturate(155%);
@@ -7647,14 +8299,24 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
 
 .invite-share-button:hover {
   transform: translateY(-1px);
-  border-color: rgba(255, 255, 255, 0.6); /* @token-exempt: theme variant */
+  border-color: rgba(255, 255, 255, 0.6);
+  /* @token-exempt: theme variant */
 
   box-shadow:
-    0 22px 52px rgba(0, 0, 0, 0.22) /* @token-exempt: theme variant */,
-    inset 0 1px 1px rgba(255, 255, 255, 1) /* @token-exempt: theme variant */,
-    inset 0 -1px 2px rgba(8, 18, 30, 0.4) /* @token-exempt: theme variant */,
-    inset 12px 0 20px rgba(255, 255, 255, 0.1) /* @token-exempt: theme variant */,
-    inset -12px 0 20px rgba(20, 38, 54, 0.2); /* @token-exempt: theme variant */
+    0 22px 52px rgba(0, 0, 0, 0.22)
+    /* @token-exempt: theme variant */
+    ,
+    inset 0 1px 1px rgba(255, 255, 255, 1)
+    /* @token-exempt: theme variant */
+    ,
+    inset 0 -1px 2px rgba(8, 18, 30, 0.4)
+    /* @token-exempt: theme variant */
+    ,
+    inset 12px 0 20px rgba(255, 255, 255, 0.1)
+    /* @token-exempt: theme variant */
+    ,
+    inset -12px 0 20px rgba(20, 38, 54, 0.2);
+  /* @token-exempt: theme variant */
 }
 
 .invite-share-button:active {
@@ -7678,18 +8340,21 @@ html[data-theme="dark"] .settings-modal {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.045) 0% /* @token-exempt: theme variant */,
-    rgba(255, 255, 255, 0.028) 100% /* @token-exempt: theme variant */
+    rgba(28, 26, 24, 0.92) 0% /* @token-exempt: theme variant */,
+    rgba(22, 21, 19, 0.88) 100% /* @token-exempt: theme variant */
   );
 
-  border: 1px solid rgba(255, 255, 255, 0.085); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.10); /* @token-exempt: theme variant */
 
   box-shadow:
-    0 42px 120px rgba(0, 0, 0, 0.58) /* @token-exempt: theme variant */,
-    0 18px 48px rgba(0, 0, 0, 0.34); /* @token-exempt: theme variant */
+    0 42px 120px rgba(0, 0, 0, 0.58)
+    /* @token-exempt: theme variant */
+    ,
+    0 18px 48px rgba(0, 0, 0, 0.34);
+  /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(26px) saturate(145%) contrast(104%);
-  -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
+  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
 }
 
 .settings-sidebar-title-icon {
@@ -7698,7 +8363,8 @@ html[data-theme="dark"] .settings-modal {
   flex-shrink: 0;
 
   opacity: 0.76;
-  color: rgba(255, 255, 255, 0.88); /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.88);
+  /* @token-exempt: theme variant */
 
   transform: translateY(-1px);
 }
@@ -7714,15 +8380,15 @@ html[data-theme="dark"] .settings-panel {
 
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.055) 0% /* @token-exempt: theme variant */,
-    rgba(255, 255, 255, 0.035) 100% /* @token-exempt: theme variant */
+    rgba(255, 255, 255, 0.08) 0% /* @token-exempt: theme variant */,
+    rgba(255, 255, 255, 0.055) 100% /* @token-exempt: theme variant */
   );
 
   box-shadow:
-    inset 1px 0 0 rgba(255, 255, 255, 0.045) /* @token-exempt: theme variant */,
-    inset 0 1px 0 rgba(255, 255, 255, 0.035); /* @token-exempt: theme variant */
+    inset 1px 0 0 rgba(255, 255, 255, 0.06) /* @token-exempt: theme variant */,
+    inset 0 1px 0 rgba(255, 255, 255, 0.05); /* @token-exempt: theme variant */
 
-  border: 1px solid rgba(255, 255, 255, 0.055); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.08); /* @token-exempt: theme variant */
 }
 
 html:not([data-theme]) .settings-panel::before,
@@ -7744,14 +8410,18 @@ html[data-theme="light"] .settings-nav {
 
 html:not([data-theme]) .settings-nav-button:hover,
 html[data-theme="dark"] .settings-nav-button:hover {
-  background: rgba(255, 255, 255, 0.055); /* @token-exempt: theme variant */
-  color: rgba(255, 255, 255, 0.92); /* @token-exempt: theme variant */
+  background: rgba(255, 255, 255, 0.055);
+  /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.92);
+  /* @token-exempt: theme variant */
 }
 
 html:not([data-theme]) .settings-nav-button.active,
 html[data-theme="dark"] .settings-nav-button.active {
-  background: rgba(255, 255, 255, 0.1); /* @token-exempt: theme variant */
-  color: rgba(255, 255, 255, 0.97); /* @token-exempt: theme variant */
+  background: rgba(255, 255, 255, 0.1);
+  /* @token-exempt: theme variant */
+  color: rgba(255, 255, 255, 0.97);
+  /* @token-exempt: theme variant */
 }
 
 /* DIVIDERS */
@@ -7763,7 +8433,7 @@ html[data-theme="dark"] .settings-nav-button.active {
 
   margin: 8px 0 0;
 
-  background: rgba(255, 255, 255, 0.038); /* @token-exempt: theme variant */
+  background: rgba(255, 255, 255, 0.07); /* @token-exempt: theme variant */
 }
 
 /* INPUTS */
@@ -7772,8 +8442,10 @@ html:not([data-theme]) .settings-select,
 html[data-theme="dark"] .settings-select,
 html:not([data-theme]) .settings-input,
 html[data-theme="dark"] .settings-input {
-  background: rgba(255, 255, 255, 0.03); /* @token-exempt: theme variant */
-  border: 1px solid rgba(255, 255, 255, 0.065); /* @token-exempt: theme variant */
+  background: rgba(255, 255, 255, 0.03);
+  /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.065);
+  /* @token-exempt: theme variant */
   box-shadow: none;
 }
 
@@ -7797,41 +8469,48 @@ html[data-theme="dark"] .settings-input {
 html[data-theme="light"] .settings-modal {
   background: linear-gradient(
     180deg,
-    rgba(255, 255, 255, 0.52) 0% /* @token-exempt: theme variant */,
-    rgba(238, 242, 248, 0.38) 100% /* @token-exempt: theme variant */
+    rgba(255, 255, 255, 0.78) 0% /* @token-exempt: theme variant */,
+    rgba(238, 242, 248, 0.72) 100% /* @token-exempt: theme variant */
   );
 
-  border: 1px solid rgba(255, 255, 255, 0.7); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  /* @token-exempt: theme variant */
 
   box-shadow:
-    0 42px 120px rgba(90, 105, 130, 0.22) /* @token-exempt: theme variant */,
-    0 18px 48px rgba(90, 105, 130, 0.14); /* @token-exempt: theme variant */
+    0 42px 120px rgba(90, 105, 130, 0.22)
+    /* @token-exempt: theme variant */
+    ,
+    0 18px 48px rgba(90, 105, 130, 0.14);
+  /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(26px) saturate(145%) contrast(104%);
-  -webkit-backdrop-filter: blur(26px) saturate(145%) contrast(104%);
+  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
 }
 
 html[data-theme="light"] .settings-layout {
-  background: linear-gradient(
-    180deg,
-    rgba(218, 216, 228, 0.92) 0% /* @token-exempt: theme variant */,
-    rgba(198, 199, 214, 0.88) 100% /* @token-exempt: theme variant */
-  );
+  background: linear-gradient(180deg,
+      rgba(218, 216, 228, 0.92) 0%
+      /* @token-exempt: theme variant */
+      ,
+      rgba(198, 199, 214, 0.88) 100%
+      /* @token-exempt: theme variant */
+    );
 }
 
 /* right panel as inner rounded layer */
 html[data-theme="light"] .settings-panel {
 
-  border: 1px solid rgba(255, 255, 255, 0.58); /* @token-exempt: theme variant */
+  border: 1px solid rgba(255, 255, 255, 0.58);
+  /* @token-exempt: theme variant */
 
   background: linear-gradient(
     180deg,
-    rgba(244, 243, 248, 0.94) 0% /* @token-exempt: theme variant */,
-    rgba(232, 233, 240, 0.92) 100% /* @token-exempt: theme variant */
+    rgba(244, 243, 248, 0.97) 0% /* @token-exempt: theme variant */,
+    rgba(232, 233, 240, 0.95) 100% /* @token-exempt: theme variant */
   );
 
-  backdrop-filter: blur(30px) saturate(130%);
-  -webkit-backdrop-filter: blur(30px) saturate(130%);
+  backdrop-filter: blur(16px) saturate(120%);
+  -webkit-backdrop-filter: blur(16px) saturate(120%);
 }
 
 html[data-theme="light"] .settings-panel::before,
@@ -7842,20 +8521,23 @@ html[data-theme="light"] .settings-panel::after {
 /* readable text in light theme */
 html[data-theme="light"] .settings-panel,
 html[data-theme="light"] .settings-panel * {
-  color: rgba(22, 28, 38, 0.88); /* @token-exempt: theme variant */
+  color: rgba(22, 28, 38, 0.88);
+  /* @token-exempt: theme variant */
 }
 
 html[data-theme="light"] .appearance-section-helper,
 html[data-theme="light"] .settings-section-description,
 html[data-theme="light"] .speaker-highlight-preview-caption {
-  color: rgba(42, 52, 68, 0.58) !important; /* @token-exempt: theme variant */
+  color: rgba(42, 52, 68, 0.58) !important;
+  /* @token-exempt: theme variant */
 }
 
 
 /* Settings title darker */
 html[data-theme="light"] .settings-sidebar-title,
 html[data-theme="light"] .settings-sidebar-title-icon {
-  color: rgba(34, 38, 50, 0.86) !important; /* @token-exempt: theme variant */
+  color: rgba(34, 38, 50, 0.86) !important;
+  /* @token-exempt: theme variant */
 }
 
 /* gray divider under Settings */
@@ -7875,13 +8557,15 @@ html[data-theme="light"] .settings-sidebar-title-wrapper::after {
 
   height: 1px;
 
-  background: rgba(120, 124, 140, 0.22); /* @token-exempt: theme variant */
+  background: rgba(120, 124, 140, 0.22);
+  /* @token-exempt: theme variant */
 }
 
 /* visible section dividers in right panel */
 html[data-theme="light"] .appearance-section-divider,
 html[data-theme="light"] .settings-divider {
-  background: rgba(105, 110, 126, 0.18) !important; /* @token-exempt: theme variant */
+  background: rgba(105, 110, 126, 0.18) !important;
+  /* @token-exempt: theme variant */
   opacity: 1 !important;
 }
 
@@ -8361,13 +9045,18 @@ details.perf-peers[open] .perf-peers__chev {
    on EVERY edge: `#diagnostics-sidebar { overflow-y: auto }` makes the box clip
    both axes (CSS overflow propagation), and an `absolute` popover anchored to a
    wrapper INSIDE that scroll box was clipped at the right border (horizontal) and
-   the bottom fold (vertical). `fixed` anchors to the viewport (no transformed
-   ancestor on desktop), and `use_help_popover_anchor` writes the live `left/top`
-   each open + on scroll(capture)/resize, flipping the popover ABOVE the button
-   when there isn't room below. The inline `left/top` overrides the safe defaults
-   below (off-screen-left until the first reposition tick, so no flash at 0,0).
-   `max-height` + `overflow:auto` keep a tall popover usable on short viewports.
-   (#1131 scroll-clip fix) */
+   the bottom fold (vertical). IMPORTANT: the OPEN drawer carries a non-`none`
+   `transform` (`#diagnostics-sidebar.visible { transform: translateX(0) }`), which
+   makes the DRAWER — not the viewport — the containing block for this fixed
+   popover, AND scrolls it with the drawer. So the popover's inline `left/top` are
+   in the drawer's coordinate space, NOT viewport space. `use_help_popover_anchor`
+   computes the desired VIEWPORT position (clamp + flip ABOVE the button when there
+   isn't room below) and `reposition_help_popover` then maps it into this containing
+   block (subtract the offsetParent rect, add back its scrollTop) before writing
+   `left/top`, each open + on scroll(capture)/resize. The inline `left/top`
+   overrides the safe defaults below (off-screen-left until the first reposition
+   tick, so no flash at 0,0). `max-height` + `overflow:auto` keep a tall popover
+   usable on short viewports. (issue 1131 scroll-clip fix; containing-block mapping) */
 .perf-help-popover {
   position: fixed;
   z-index: 1001;
@@ -8471,7 +9160,8 @@ details.perf-peers[open] .perf-peers__chev {
 .perf-range-track-wrap {
   position: relative;
   flex: 1 1 auto;
-  height: 44px; /* >=44px touch target for the thumbs */
+  height: 44px;
+  /* >=44px touch target for the thumbs */
 }
 
 .perf-range-track {
@@ -8693,6 +9383,17 @@ details.perf-peers[open] .perf-peers__chev {
   color: var(--text-tertiary);
 }
 
+/* On narrow widths stack the needle above the slider instead of beside it. */
+@media (max-width: 540px) {
+  .perf-stream-body {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .perf-vu-gauge {
+    width: 100%;
+  }
+}
 .simulcast-send-ladder {
   display: flex;
   gap: 4px;
@@ -8767,4 +9468,3 @@ details.perf-peers[open] .perf-peers__chev {
   color: var(--text-tertiary);
   padding-left: 8px;
 }
-

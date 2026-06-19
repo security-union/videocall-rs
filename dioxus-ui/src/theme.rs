@@ -10,6 +10,21 @@ pub mod color {
     pub const TEXT_MUTED: &str = "#aaa";
     pub const TEXT_SUBTLE: &str = "#888";
 
+    /// Muted body text on a dark glass surface (translucent white). Mirrors
+    /// --text-on-glass-muted in global.css; used for secondary copy on the
+    /// display-name prompt overlay.
+    pub const TEXT_ON_GLASS_MUTED: &str = "rgba(255,255,255,0.6)";
+
+    /// Stroke color for the "entry denied" rejection icon — vivid error red.
+    /// Mirrors --error-text-vivid in global.css (kept distinct from ERROR_TEXT,
+    /// which is the AA-contrast foreground-text red).
+    pub const ERROR_ICON: &str = "#ff6b6b";
+
+    /// Stroke color for the "unable to join" warning icon — amber. Mirrors
+    /// --connection-warning (dark theme) in global.css. Distinct from
+    /// WARNING_TEXT (#ffc107), which is the NetEQ amber text alias.
+    pub const WARNING_ICON: &str = "#ff9800";
+
     /// Error foreground text — WCAG AA compliant on glass surfaces (≥4.5:1).
     /// Matches --error-text in global.css.
     pub const ERROR_TEXT: &str = "#FF7A6E";

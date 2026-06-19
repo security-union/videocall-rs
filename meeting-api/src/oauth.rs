@@ -18,9 +18,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
+use axum::http::StatusCode;
+use jsonwebtoken::errors::{Error as JwtError, ErrorKind as JwtErrorKind};
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use videocall_meeting_types::APIError;
 
 use crate::error::AppError;
 
@@ -166,6 +169,12 @@ pub struct JwksCache {
     last_refresh: RwLock<Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JwksRefreshOutcome {
+    Fetched,
+    SkippedRateLimit,
+}
+
 impl JwksCache {
     /// Create a test-only JwksCache with pre-loaded keys (no HTTP fetching).
     #[cfg(test)]
@@ -200,20 +209,33 @@ impl JwksCache {
         }
 
         // Key not found — try refreshing (rate-limited).
-        self.refresh().await?;
+        let refresh_outcome = self.refresh().await?;
 
         let keys = self.keys.read().await;
         keys.get(kid)
             .map(|(alg, key)| (*alg, key.clone()))
-            .ok_or_else(|| AppError::internal(&format!("JWKS key not found for kid: {kid}")))
+            .ok_or_else(|| {
+                if refresh_outcome == JwksRefreshOutcome::SkippedRateLimit {
+                    tracing::warn!(
+                        "JWKS get_key: kid not cached and refresh was rate-limited; treating as retryable"
+                    );
+                    AppError::new(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        APIError::internal_error("authentication keys temporarily unavailable"),
+                    )
+                } else {
+                    tracing::warn!("JWKS get_key: kid not in JWKS after refresh — rejecting token");
+                    AppError::unauthorized_msg("invalid or expired token")
+                }
+            })
     }
 
     /// Fetch the JWKS document and update the cache. Rate-limited.
-    async fn refresh(&self) -> Result<(), AppError> {
+    async fn refresh(&self) -> Result<JwksRefreshOutcome, AppError> {
         {
             let last = self.last_refresh.read().await;
             if last.elapsed().as_secs() < JWKS_REFRESH_INTERVAL_SECS {
-                return Ok(());
+                return Ok(JwksRefreshOutcome::SkippedRateLimit);
             }
         }
 
@@ -269,7 +291,7 @@ impl JwksCache {
 
         *self.keys.write().await = new_keys;
         *self.last_refresh.write().await = Instant::now();
-        Ok(())
+        Ok(JwksRefreshOutcome::Fetched)
     }
 }
 
@@ -300,6 +322,45 @@ fn jwk_algorithm(jwk: &JwkEntry) -> Algorithm {
 // JWT verification
 // ---------------------------------------------------------------------------
 
+/// Map a `jsonwebtoken` decode/header error to an HTTP **401** [`AppError`].
+///
+/// Every failure surfaced by `jsonwebtoken`'s `decode`/`decode_header` is a
+/// problem with the *token the client presented* — expired/not-yet-valid,
+/// bad signature, wrong audience/issuer, or a malformed/base64/JSON/UTF-8
+/// payload — not a server fault. Genuine server faults (JWKS unreachable,
+/// JWKS parse errors, missing signing key) are raised separately in
+/// [`JwksCache::get_key`]/[`JwksCache::refresh`] *before* `decode` runs and
+/// keep their 500 status. Therefore decode-time failures map to 401.
+///
+/// SECURITY: the detailed reason is logged server-side only. The returned
+/// `AppError` carries a generic message so no token material or library
+/// internals leak into the HTTP response body (the `engineering_error` field
+/// of `APIError` is serialized to clients).
+fn jwt_error_to_unauthorized(context: &str, err: &JwtError) -> AppError {
+    // Classify for the server-side log line. The kind is library/diagnostic
+    // detail only — it is never placed in the client-facing AppError.
+    let reason = match err.kind() {
+        JwtErrorKind::ExpiredSignature => "expired token",
+        JwtErrorKind::ImmatureSignature => "token not yet valid (nbf in future)",
+        JwtErrorKind::InvalidSignature => "invalid signature",
+        JwtErrorKind::InvalidToken => "malformed token structure",
+        JwtErrorKind::InvalidAudience => "audience mismatch",
+        JwtErrorKind::InvalidIssuer => "issuer mismatch",
+        JwtErrorKind::InvalidSubject => "subject mismatch",
+        JwtErrorKind::InvalidAlgorithm | JwtErrorKind::InvalidAlgorithmName => {
+            "algorithm not accepted"
+        }
+        JwtErrorKind::Base64(_) => "base64 decode failure",
+        JwtErrorKind::Json(_) => "json parse failure",
+        JwtErrorKind::Utf8(_) => "utf8 decode failure",
+        // Any other kind reaching decode() is still a property of the supplied
+        // token, not a server fault, so it is a 401 as well.
+        _ => "invalid token",
+    };
+    tracing::warn!("{context}: rejecting token (401): {reason}");
+    AppError::unauthorized_msg("invalid or expired token")
+}
+
 /// Verify a JWT Bearer token's signature and standard claims, returning the
 /// decoded claims.
 ///
@@ -316,6 +377,10 @@ fn jwk_algorithm(jwk: &JwkEntry) -> Algorithm {
 /// in `aud`, not the `client_id`, so strict `aud` checking would reject them.
 /// Signature + issuer + expiry is still validated; only the audience check is
 /// skipped.
+///
+/// Token-validation failures (decode/header errors, missing kid, nonce
+/// mismatch/absence) are mapped to **401** via [`jwt_error_to_unauthorized`];
+/// genuine server faults from JWKS retrieval keep their 500 status.
 pub async fn verify_and_decode_id_token(
     jwks: &JwksCache,
     id_token: &str,
@@ -323,13 +388,13 @@ pub async fn verify_and_decode_id_token(
     issuer: Option<&str>,
     expected_nonce: Option<&str>,
 ) -> Result<IdTokenClaims, AppError> {
-    let header = decode_header(id_token)
-        .map_err(|e| AppError::internal(&format!("Invalid JWT header: {e}")))?;
+    let header =
+        decode_header(id_token).map_err(|e| jwt_error_to_unauthorized("JWT header decode", &e))?;
 
-    let kid = header
-        .kid
-        .as_deref()
-        .ok_or_else(|| AppError::internal("JWT header missing kid"))?;
+    let kid = header.kid.as_deref().ok_or_else(|| {
+        tracing::warn!("JWT header decode: rejecting token (401): missing kid");
+        AppError::unauthorized_msg("invalid or expired token")
+    })?;
 
     let (alg, key) = jwks.get_key(kid).await?;
 
@@ -355,16 +420,24 @@ pub async fn verify_and_decode_id_token(
     validation.validate_exp = true;
 
     let token_data = decode::<IdTokenClaims>(id_token, &key, &validation)
-        .map_err(|e| AppError::internal(&format!("JWT validation failed: {e}")))?;
+        .map_err(|e| jwt_error_to_unauthorized("JWT validation", &e))?;
 
     let claims = token_data.claims;
 
-    // Validate nonce if expected.
+    // Validate nonce if expected. A nonce mismatch/absence is a property of the
+    // presented token, so it is a 401, not a 500. Log the specifics server-side
+    // only; return a generic message to the client.
     if let Some(expected) = expected_nonce {
         match &claims.nonce {
             Some(n) if n == expected => {}
-            Some(_) => return Err(AppError::internal("JWT nonce mismatch")),
-            None => return Err(AppError::internal("JWT missing expected nonce")),
+            Some(_) => {
+                tracing::warn!("JWT nonce check: rejecting token (401): nonce mismatch");
+                return Err(AppError::unauthorized_msg("invalid or expired token"));
+            }
+            None => {
+                tracing::warn!("JWT nonce check: rejecting token (401): nonce missing");
+                return Err(AppError::unauthorized_msg("invalid or expired token"));
+            }
         }
     }
 
@@ -493,21 +566,30 @@ pub async fn exchange_code_for_claims(
 
 /// Decode the claims from an ID token JWT **without** signature verification.
 /// Used as fallback when JWKS is not configured.
+///
+/// A malformed id_token (bad segment count, base64, or JSON) is a property of
+/// the credential presented at exchange time, not a server fault, so failures
+/// map to **401**. SECURITY: the specific parse reason is logged server-side
+/// only; the client receives a generic message with no token material.
 fn decode_id_token_claims_unverified(id_token: &str) -> Result<IdTokenClaims, AppError> {
     use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use base64::Engine;
 
     let parts: Vec<&str> = id_token.split('.').collect();
-    let claims_b64 = parts
-        .get(1)
-        .ok_or_else(|| AppError::internal("Invalid id_token format"))?;
+    let claims_b64 = parts.get(1).ok_or_else(|| {
+        tracing::warn!("Unverified id_token decode: rejecting token (401): invalid JWT format");
+        AppError::unauthorized_msg("invalid or expired token")
+    })?;
 
-    let claims_bytes = URL_SAFE_NO_PAD
-        .decode(claims_b64)
-        .map_err(|e| AppError::internal(&format!("Failed to base64-decode id_token: {e}")))?;
+    let claims_bytes = URL_SAFE_NO_PAD.decode(claims_b64).map_err(|_| {
+        tracing::warn!("Unverified id_token decode: rejecting token (401): base64 decode failure");
+        AppError::unauthorized_msg("invalid or expired token")
+    })?;
 
-    serde_json::from_slice(&claims_bytes)
-        .map_err(|e| AppError::internal(&format!("Failed to parse id_token claims: {e}")))
+    serde_json::from_slice(&claims_bytes).map_err(|_| {
+        tracing::warn!("Unverified id_token decode: rejecting token (401): json parse failure");
+        AppError::unauthorized_msg("invalid or expired token")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -638,6 +720,22 @@ mod tests {
         let decoded = result.expect("should verify successfully");
         assert_eq!(decoded.email.as_deref(), Some("user@example.com"));
         assert_eq!(decoded.name, "Test User");
+    }
+
+    #[tokio::test]
+    async fn missing_kid_during_rate_limited_refresh_is_retryable() {
+        let jwks = JwksCache::with_keys(HashMap::new());
+
+        let err = match jwks.get_key("new-rotated-kid").await {
+            Ok(_) => panic!("missing kid during a rate-limited refresh must be retryable"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            err.body.engineering_error.as_deref(),
+            Some("authentication keys temporarily unavailable")
+        );
     }
 
     #[tokio::test]
@@ -831,6 +929,167 @@ mod tests {
 
         let decoded = result.expect("should verify even without email");
         assert!(decoded.email.is_none());
+    }
+
+    // --- HCL #1468: token-validation failures map to 401, not 500 ---
+
+    /// An expired token must be rejected with HTTP **401**, not 500. This test
+    /// FAILS if the `decode()` error mapping is reverted to `AppError::internal`.
+    #[tokio::test]
+    async fn expired_token_yields_401() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let jwks = test_jwks(&kid, Algorithm::RS256, dec);
+        let mut claims = base_claims();
+        claims.exp = Some(1_000_000); // long expired
+        let token = sign_token(&enc, &kid, &claims);
+
+        let err = verify_and_decode_id_token(
+            &jwks,
+            &token,
+            Some("my-client-id"),
+            Some("https://accounts.google.com"),
+            Some("test-nonce-123"),
+        )
+        .await
+        .expect_err("expired token must be rejected");
+
+        assert_eq!(
+            err.status,
+            axum::http::StatusCode::UNAUTHORIZED,
+            "expired token must map to 401, not 500"
+        );
+    }
+
+    /// A tampered (bad-signature) token must be a 401.
+    #[tokio::test]
+    async fn tampered_token_yields_401() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let jwks = test_jwks(&kid, Algorithm::RS256, dec);
+        let claims = base_claims();
+        let mut token = sign_token(&enc, &kid, &claims);
+        let len = token.len();
+        let last = token.as_bytes()[len - 1];
+        let replacement = if last == b'A' { b'B' } else { b'A' };
+        unsafe { token.as_bytes_mut()[len - 1] = replacement };
+
+        let err = verify_and_decode_id_token(
+            &jwks,
+            &token,
+            Some("my-client-id"),
+            Some("https://accounts.google.com"),
+            Some("test-nonce-123"),
+        )
+        .await
+        .expect_err("tampered token must be rejected");
+
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// Wrong audience / wrong issuer / nonce mismatch / nonce missing are all
+    /// token-validation failures → 401.
+    #[tokio::test]
+    async fn audience_issuer_nonce_failures_yield_401() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let jwks = test_jwks(&kid, Algorithm::RS256, dec);
+        let token = sign_token(&enc, &kid, &base_claims());
+
+        // Wrong audience.
+        let err = verify_and_decode_id_token(
+            &jwks,
+            &token,
+            Some("wrong-client-id"),
+            Some("https://accounts.google.com"),
+            Some("test-nonce-123"),
+        )
+        .await
+        .expect_err("wrong audience must be rejected");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+
+        // Wrong issuer.
+        let err = verify_and_decode_id_token(
+            &jwks,
+            &token,
+            Some("my-client-id"),
+            Some("https://wrong-issuer.com"),
+            Some("test-nonce-123"),
+        )
+        .await
+        .expect_err("wrong issuer must be rejected");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+
+        // Nonce mismatch.
+        let err = verify_and_decode_id_token(
+            &jwks,
+            &token,
+            Some("my-client-id"),
+            Some("https://accounts.google.com"),
+            Some("wrong-nonce"),
+        )
+        .await
+        .expect_err("nonce mismatch must be rejected");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+
+        // Nonce missing when expected.
+        let mut no_nonce = base_claims();
+        no_nonce.nonce = None;
+        let token_no_nonce = sign_token(&enc, &kid, &no_nonce);
+        let err = verify_and_decode_id_token(
+            &jwks,
+            &token_no_nonce,
+            Some("my-client-id"),
+            Some("https://accounts.google.com"),
+            Some("test-nonce-123"),
+        )
+        .await
+        .expect_err("missing nonce must be rejected");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+    }
+
+    /// The rejection must not leak token material or library internals into the
+    /// client-facing `engineering_error` field of the response body.
+    #[tokio::test]
+    async fn rejection_does_not_leak_token_internals() {
+        let (enc, dec, kid) = test_rsa_keypair();
+        let jwks = test_jwks(&kid, Algorithm::RS256, dec);
+        let mut claims = base_claims();
+        claims.exp = Some(1_000_000);
+        let token = sign_token(&enc, &kid, &claims);
+
+        let err = verify_and_decode_id_token(
+            &jwks,
+            &token,
+            Some("my-client-id"),
+            Some("https://accounts.google.com"),
+            Some("test-nonce-123"),
+        )
+        .await
+        .expect_err("expired token must be rejected");
+
+        // Whatever detail is attached must be generic — no token, no exp,
+        // no jsonwebtoken kind names.
+        let detail = err.body.engineering_error.clone().unwrap_or_default();
+        assert!(
+            !detail.contains(&token) && !detail.contains("ExpiredSignature"),
+            "engineering_error must not leak token internals, got: {detail}"
+        );
+        let serialized = serde_json::to_string(&err.body).unwrap();
+        assert!(
+            !serialized.contains(&token) && !serialized.contains("ExpiredSignature"),
+            "serialized body must not leak token internals, got: {serialized}"
+        );
+    }
+
+    /// Malformed (non-JWT) input fed to the unverified fallback decoder must be
+    /// a 401, not a 500.
+    #[test]
+    fn unverified_decode_malformed_yields_401() {
+        let err = decode_id_token_claims_unverified("not-a-jwt")
+            .expect_err("malformed token must be rejected");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
+
+        let err = decode_id_token_claims_unverified("aaa.!!!invalid-base64!!!.ccc")
+            .expect_err("bad base64 must be rejected");
+        assert_eq!(err.status, axum::http::StatusCode::UNAUTHORIZED);
     }
 
     #[test]

@@ -16,6 +16,7 @@ pub mod density;
 pub mod device_selector;
 pub mod device_settings_modal;
 pub mod diagnostics;
+pub mod freshness_inject;
 pub mod google_sign_in_button;
 pub mod host;
 pub mod host_controls;
@@ -33,6 +34,7 @@ pub mod performance_settings;
 pub mod search_modal;
 pub mod signal_quality;
 pub mod toggle_switch;
+
 pub mod top_bar;
 pub mod update_display_name_modal;
 pub mod video_control_buttons;

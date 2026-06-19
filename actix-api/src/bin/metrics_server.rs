@@ -48,23 +48,26 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
-    AUDIO_CONCEALMENT_PCT, AUDIO_QUALITY_SCORE, CALL_QUALITY_SCORE, CAPABILITY_SCORE,
-    CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO,
-    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
-    CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL,
-    CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE,
-    CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE,
-    DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N,
-    DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS,
-    ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH, ENCODER_TARGET_BITRATE_KBPS,
-    HEALTH_REPORTS_TOTAL, KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL,
-    MEETING_PARTICIPANTS, NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS,
-    NETEQ_EXPAND_OPS_PER_SEC, NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE,
-    NETEQ_PACKETS_PER_SEC, NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN,
-    PEER_CAN_SEE, PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, SCREEN_SHARING_ACTIVE,
-    SCREEN_VIDEO_BITRATE_KBPS, SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
-    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, WEBSOCKET_DROPS,
+    AUDIO_CONCEALMENT_PCT, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, BATTERY_LEVEL,
+    CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
+    CLIENT_AGENT_MEMORY_BYTES, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES,
+    CLIENT_MEMORY_USED_BYTES, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
+    CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
+    CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL,
+    DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
+    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
+    ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH,
+    ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
+    NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
+    NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
+    NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
+    PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RTT_PROBE_DROPPED_TOTAL,
+    RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
+    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
+    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS,
+    VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE,
+    VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -163,6 +166,25 @@ fn cleanup_stale_sessions(session_tracker: &SessionTracker, display_name_map: &D
 ///
 /// The caller must hold the `session_tracker` lock; the locked map is passed in to
 /// avoid re-locking (and the resulting deadlock).
+///
+/// SINGLE-REPLICA ASSUMPTION (issue #1075).
+/// This derivation is only correct when `metrics_server` runs as a **single replica**.
+/// The `session_tracker` is a per-process `Arc<Mutex<HashMap<..>>>` (see `SessionTracker`)
+/// populated from the NATS subscription, which uses the queue group
+/// `metrics-server-health-diagnostics` (see `nats_health_consumer`). A queue group
+/// load-balances each health packet to exactly ONE subscriber, so with N replicas every
+/// replica's tracker holds only the subset of sessions whose packets it happened to
+/// receive. Each replica would then write `videocall_meeting_participants{meeting_id}`
+/// for the SAME meeting with its own partial count; because they share label values,
+/// each scrape target reports a partial count and the dashboard value
+/// undercounts / flaps across replicas.
+///
+/// The production deployment IS single-replica: `helm/metrics-api/values.yaml` pins
+/// `serverStats.replicas: 1` and no per-environment override raises it, so this
+/// assumption holds today. If `metrics_server` is ever scaled to >1 replica, this gauge
+/// must be aggregated across replicas at the recording-rule layer instead (e.g. emit a
+/// per-replica partial count keyed by an instance/replica label and `sum by (meeting_id)`
+/// in a Prometheus recording rule, or move the derivation behind a single aggregator).
 fn recompute_meeting_participants(
     tracker: &HashMap<String, SessionInfo>,
     meetings: &HashSet<String>,
@@ -254,6 +276,10 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     let _ = DATAGRAM_DROPS.remove_label_values(&reporter_labels);
     let _ = WEBSOCKET_DROPS.remove_label_values(&reporter_labels);
     let _ = KEYFRAME_REQUESTS_SENT_TOTAL.remove_label_values(&reporter_labels);
+    // #522 RTT-probe resilience gauges: same per-reporter GC so the high-cardinality
+    // session_id label leaves no residual series on disconnect.
+    let _ = RTT_PROBE_DROPPED_TOTAL.remove_label_values(&reporter_labels);
+    let _ = RTT_PROBE_STALE_SUPPRESSIONS_TOTAL.remove_label_values(&reporter_labels);
     let _ = ENCODER_QUEUE_DEPTH.remove_label_values(&reporter_labels);
     let _ = ADAPTIVE_SCREEN_TIER.remove_label_values(&reporter_labels);
     let _ = SCREEN_SHARING_ACTIVE.remove_label_values(&reporter_labels);
@@ -268,6 +294,7 @@ fn remove_session_metrics(session_info: &SessionInfo) {
     // label leaves no residual series on disconnect.
     let _ = DECODE_ACTIVE_SET_SIZE.remove_label_values(&reporter_labels);
     let _ = CAPABILITY_SCORE.remove_label_values(&reporter_labels);
+    let _ = BATTERY_LEVEL.remove_label_values(&reporter_labels);
     // Layer gauges carry an extra media_kind label; the client only reports the
     // camera encoder, so the single series GC'd is media_kind="camera".
     let layer_labels: [&str; 5] = [
@@ -299,6 +326,19 @@ fn remove_session_metrics(session_info: &SessionInfo) {
             &session_info.session_id,
             result,
         ]);
+    }
+    // #527: encoder restart series (meeting_id, session_id, kind, reason). Remove
+    // the full bounded cartesian (2 kinds × 4 reasons) for this session so the
+    // session_id label leaves no residual series on disconnect.
+    for kind in ["camera", "screen"] {
+        for reason in ["closed_codec", "memory", "configure", "other"] {
+            let _ = ENCODER_RESTART_TOTAL.remove_label_values(&[
+                &session_info.meeting_id,
+                &session_info.session_id,
+                kind,
+                reason,
+            ]);
+        }
     }
     // TELEM-7: remove CLIENT_INFO using stored label values
     if let Some(ref info_labels) = session_info.client_info_labels {
@@ -408,6 +448,7 @@ fn remove_per_peer_metrics(
     let _ = PEER_CAN_LISTEN.remove_label_values(&labels);
     let _ = PEER_CAN_SEE.remove_label_values(&labels);
     let _ = NETEQ_AUDIO_BUFFER_MS.remove_label_values(&labels);
+    let _ = AUDIO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
     let _ = NETEQ_TARGET_DELAY_MS.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_AWAITING_DECODE.remove_label_values(&labels);
     let _ = NETEQ_PACKETS_PER_SEC.remove_label_values(&labels);
@@ -422,6 +463,10 @@ fn remove_per_peer_metrics(
     let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_SEQ_LOSS_PER_SEC.remove_label_values(&labels);
+    let _ = VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
+    let _ = VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
+    let _ = VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
+    let _ = VIDEO_SKIP_TO_LIVE_TOTAL.remove_label_values(&labels);
     let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
     let _ = AUDIO_CONCEALMENT_PCT.remove_label_values(&labels);
@@ -521,9 +566,12 @@ fn process_health_packet_to_metrics_pb(
         let server_url_clean = server_url_clean.as_str();
 
         // For the RTT metric we allow the server_type label to be an empty string when
-        // unknown, because the URL scrub also zeroes active_server_type and dashboards
-        // already treat blank labels as "unknown source". The CLIENT_ACTIVE_SERVER gauge
-        // below keeps its original "unknown" placeholder since it still requires a URL.
+        // unset — dashboards already treat blank labels as "unknown source". Note: the
+        // upstream URL scrub (`client_diagnostics.rs::scrub_client_supplied_urls`) clears
+        // `active_server_url` but does NOT touch `active_server_type`, so this branch
+        // handles the legitimate "client didn't populate type" case. The
+        // CLIENT_ACTIVE_SERVER gauge below keeps its "unknown" placeholder since it still
+        // requires a URL.
         let server_type_for_rtt = health_packet.active_server_type.as_str();
         let server_type_for_active = if health_packet.active_server_type.is_empty() {
             "unknown"
@@ -720,6 +768,60 @@ fn process_health_packet_to_metrics_pb(
             }
         }
 
+        // #527: encoder auto-restart cycles, expanded into a single labeled
+        // gauge videocall_encoder_restart_total{kind, reason}. Same set()-to-
+        // cumulative convention as the re-election counter above. Each field is
+        // absent until the encoder has actually restarted for that reason, so a
+        // series only appears once a restart of that (kind, reason) has occurred.
+        for (kind, reason, value) in [
+            (
+                "camera",
+                "closed_codec",
+                health_packet.camera_encoder_restarts_closed_codec,
+            ),
+            (
+                "camera",
+                "memory",
+                health_packet.camera_encoder_restarts_memory,
+            ),
+            (
+                "camera",
+                "configure",
+                health_packet.camera_encoder_restarts_configure,
+            ),
+            (
+                "camera",
+                "other",
+                health_packet.camera_encoder_restarts_other,
+            ),
+            (
+                "screen",
+                "closed_codec",
+                health_packet.screen_encoder_restarts_closed_codec,
+            ),
+            (
+                "screen",
+                "memory",
+                health_packet.screen_encoder_restarts_memory,
+            ),
+            (
+                "screen",
+                "configure",
+                health_packet.screen_encoder_restarts_configure,
+            ),
+            (
+                "screen",
+                "other",
+                health_packet.screen_encoder_restarts_other,
+            ),
+        ] {
+            if let Some(total) = value {
+                ENCODER_RESTART_TOTAL
+                    .with_label_values(&[meeting_id, session_id, kind, reason])
+                    .set(total as f64);
+            }
+        }
+
         // Communication and browser state metrics
         let reporter_labels: [&str; 4] = [
             meeting_id,
@@ -779,6 +881,22 @@ fn process_health_packet_to_metrics_pb(
             KEYFRAME_REQUESTS_SENT_TOTAL
                 .with_label_values(&reporter_labels)
                 .set(kf_reqs as f64);
+        }
+
+        // RTT-probe resilience signals (#522). Each is a CUMULATIVE total reported by
+        // the client every packet; .set() the gauge to that value keyed by the
+        // reporter labels (NOT .inc(), NOT summed across reporters — that would
+        // multiply/double-count). Absent until the client has seen at least one
+        // event, so the series only appears once there is something to show.
+        if let Some(dropped) = health_packet.rtt_probe_dropped_total {
+            RTT_PROBE_DROPPED_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(dropped as f64);
+        }
+        if let Some(suppressions) = health_packet.rtt_probe_stale_suppressions_total {
+            RTT_PROBE_STALE_SUPPRESSIONS_TOTAL
+                .with_label_values(&reporter_labels)
+                .set(suppressions as f64);
         }
 
         // Encoder decision inputs (P0). NOTE(#1184): encoder_fps_ratio removed
@@ -890,6 +1008,7 @@ fn process_health_packet_to_metrics_pb(
             || health_packet.client_gpu_family.is_some()
             || health_packet.client_network_effective_type.is_some()
             || health_packet.client_capability_score.is_some()
+            || health_packet.client_battery_level.is_some()
         {
             let cores_str = health_packet
                 .client_cores
@@ -966,6 +1085,17 @@ fn process_health_packet_to_metrics_pb(
                 CAPABILITY_SCORE
                     .with_label_values(&reporter_labels)
                     .set(cap as f64);
+            }
+
+            // #1392: also export the battery level as a NUMERIC gauge so it can be
+            // thresholded/averaged/quantiled in PromQL directly, instead of only
+            // gating CLIENT_INFO's publish (PR #1368). Only set when actually
+            // reported, so an absent battery stays absent (not a misleading 0).
+            // Same per-reporter label set as the sibling gauges.
+            if let Some(battery) = health_packet.client_battery_level {
+                BATTERY_LEVEL
+                    .with_label_values(&reporter_labels)
+                    .set(battery);
             }
         }
 
@@ -1131,6 +1261,14 @@ fn process_health_packet_to_metrics_pb(
                         .with_label_values(&peer_labels)
                         .set(neteq_stats.target_delay_ms);
 
+                    // Audio playout latency (#1299): how far behind live this peer's audio is
+                    // (NetEQ filtered playout buffer level). Set UNCONDITIONALLY so the gauge
+                    // recovers to 0 when audio catches back up to live — same rationale as the
+                    // video playout gauge below. Audio sibling of videocall_video_playout_latency_ms.
+                    AUDIO_PLAYOUT_LATENCY_MS
+                        .with_label_values(&peer_labels)
+                        .set(neteq_stats.playout_latency_ms);
+
                     if neteq_stats.packets_awaiting_decode != 0.0 {
                         NETEQ_PACKETS_AWAITING_DECODE
                             .with_label_values(&peer_labels)
@@ -1171,6 +1309,34 @@ fn process_health_packet_to_metrics_pb(
                             .with_label_values(&peer_labels)
                             .set(video_stats.bitrate_kbps as f64);
                     }
+
+                    // Buffered video playout latency (#1252): how far behind live this peer's
+                    // video is (jitter-buffer backlog + decoder queue), plus its stage-1
+                    // attribution. Set UNCONDITIONALLY so the gauges recover to 0 when the receiver
+                    // catches back up to live — the client only reports a nonzero value while the
+                    // tile is actively receiving (fps_received > 0), so a paused/hidden tile reads
+                    // 0 here rather than a stale latch.
+                    VIDEO_PLAYOUT_LATENCY_MS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_latency_ms);
+                    VIDEO_PLAYOUT_STAGE1_SPAN_MS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_stage1_span_ms);
+                    // Stage-3 paint lag (#1252): decoded-but-unpainted backlog in the worker->main
+                    // postMessage + paint queues. Set UNCONDITIONALLY (same rationale as above) so
+                    // the gauge recovers to 0 when the paint path drains; the client reports a
+                    // nonzero value only while fps_received > 0.
+                    VIDEO_PLAYOUT_PAINT_LAG_MS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_paint_lag_ms);
+                    // Resync-to-live governor skips (#1252): cumulative COUNTER value held in a
+                    // gauge. Set UNCONDITIONALLY (same recover-to-0 pattern as the gauges above): the
+                    // client folds this field unconditionally, so an absent/idle stream reports its
+                    // last cumulative total (or the proto default 0 if never set) rather than a stale
+                    // latch. A monotonically-rising value proves the governor fired.
+                    VIDEO_SKIP_TO_LIVE_TOTAL
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.playout_skip_to_live_total as f64);
                 }
 
                 // Screen video metrics (separate from camera)
@@ -1268,7 +1434,16 @@ async fn nats_health_consumer(
     session_tracker: SessionTracker,
     display_name_map: DisplayNameMap,
 ) -> anyhow::Result<()> {
-    // Subscribe to all health diagnostics topics from all regions
+    // Subscribe to all health diagnostics topics from all regions.
+    //
+    // SINGLE-REPLICA ASSUMPTION (issue #1075): this is a NATS *queue group*, so each
+    // health packet is delivered to exactly ONE subscriber in the group. The per-process
+    // `session_tracker` that backs the `videocall_meeting_participants` gauge is therefore
+    // only complete when there is a single `metrics_server` replica subscribed. With >1
+    // replica the packets for one meeting fan out across replicas, each replica counts
+    // only its subset, and the gauge undercounts / flaps. Production runs single-replica
+    // (`helm/metrics-api/values.yaml` pins `serverStats.replicas: 1`). See
+    // `recompute_meeting_participants` for the aggregation strategy required to scale out.
     let queue_group = "metrics-server-health-diagnostics";
     let mut subscription = nats_client
         .queue_subscribe("health.diagnostics.>", queue_group.to_string())
@@ -1487,6 +1662,26 @@ mod tests {
             }
         }
         false
+    }
+
+    fn gauge_value(metric_name: &str, expected_labels: &[(&str, &str)]) -> Option<f64> {
+        let families = prometheus::gather();
+        for family in families {
+            if family.get_name() == metric_name {
+                for metric in family.get_metric() {
+                    let labels_match = expected_labels.iter().all(|(lname, lval)| {
+                        metric
+                            .get_label()
+                            .iter()
+                            .any(|label| label.get_name() == *lname && label.get_value() == *lval)
+                    });
+                    if labels_match {
+                        return Some(metric.get_gauge().get_value());
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Helper function to create test peer stats with NetEQ data (protobuf)
@@ -1862,6 +2057,152 @@ mod tests {
                 ("to_peer", "bob"),
             ],
         ));
+    }
+
+    #[test]
+    fn test_rtt_probe_resilience_metrics_exported_and_gc() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // Build a packet with the two #522 RTT-probe cumulative totals set to
+        // distinct non-zero values. create_test_health_packet leaves display_name
+        // unset, so the exported series' display_name label falls back to the
+        // reporting_user_id ("probeuser") via reporter_display_name (see the
+        // .unwrap_or(reporting_user_id) fallback in process_health_packet_to_metrics_pb).
+        let peer_stats: std::collections::HashMap<String, PbPeerStats> =
+            std::collections::HashMap::new();
+        let mut packet =
+            create_test_health_packet("session_rtt522", "meeting_rtt522", "probeuser", peer_stats);
+        packet.rtt_probe_dropped_total = Some(7);
+        packet.rtt_probe_stale_suppressions_total = Some(3);
+
+        let result = process_health_packet_to_metrics_pb(
+            &packet,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        // Value-checking helper: mirrors series_exists's label-matching loop but
+        // returns the gauge value of the first fully-matching metric. series_exists
+        // only checks existence, so this is the mutation-stronger value assertion.
+        let gauge_value = |metric_name: &str, expected_labels: &[(&str, &str)]| -> Option<f64> {
+            for family in prometheus::gather() {
+                if family.get_name() == metric_name {
+                    for metric in family.get_metric() {
+                        let all_match = expected_labels.iter().all(|(lname, lval)| {
+                            metric.get_label().iter().any(|label| {
+                                label.get_name() == *lname && label.get_value() == *lval
+                            })
+                        });
+                        if all_match {
+                            return Some(metric.get_gauge().get_value());
+                        }
+                    }
+                }
+            }
+            None
+        };
+
+        let dropped_labels = [
+            ("meeting_id", "meeting_rtt522"),
+            ("session_id", "session_rtt522"),
+            ("peer_id", "probeuser"),
+            ("display_name", "probeuser"),
+        ];
+        let suppressions_labels = dropped_labels;
+
+        assert!(series_exists(
+            "videocall_rtt_probe_dropped_total",
+            &dropped_labels
+        ));
+        assert!(series_exists(
+            "videocall_rtt_probe_stale_suppressions_total",
+            &suppressions_labels,
+        ));
+        assert_eq!(
+            gauge_value("videocall_rtt_probe_dropped_total", &dropped_labels),
+            Some(7.0),
+        );
+        assert_eq!(
+            gauge_value(
+                "videocall_rtt_probe_stale_suppressions_total",
+                &suppressions_labels,
+            ),
+            Some(3.0),
+        );
+
+        // GC the session and confirm both series disappear.
+        let session_key = "meeting_rtt522_session_rtt522_probeuser".to_string();
+        let info = {
+            let g = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            g.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(!series_exists(
+            "videocall_rtt_probe_dropped_total",
+            &dropped_labels
+        ));
+        assert!(!series_exists(
+            "videocall_rtt_probe_stale_suppressions_total",
+            &suppressions_labels,
+        ));
+    }
+
+    #[test]
+    fn encoder_restart_metric_expands_cumulative_fields_and_gc_removes_series() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let meeting_id = "meeting_restart_metric";
+        let session_id = "session_restart_metric";
+        let reporting_user_id = "alice";
+        let mut hp =
+            create_test_health_packet(session_id, meeting_id, reporting_user_id, HashMap::new());
+        hp.camera_encoder_restarts_closed_codec = Some(3);
+        hp.screen_encoder_restarts_configure = Some(5);
+
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        let camera_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("kind", "camera"),
+            ("reason", "closed_codec"),
+        ];
+        let screen_labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("kind", "screen"),
+            ("reason", "configure"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_encoder_restart_total", &camera_labels),
+            Some(3.0)
+        );
+        assert_eq!(
+            gauge_value("videocall_encoder_restart_total", &screen_labels),
+            Some(5.0)
+        );
+
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
+        let info = {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(
+            !series_exists("videocall_encoder_restart_total", &camera_labels),
+            "camera restart series must be removed by session GC"
+        );
+        assert!(
+            !series_exists("videocall_encoder_restart_total", &screen_labels),
+            "screen restart series must be removed by session GC"
+        );
     }
 
     #[test]
@@ -2635,6 +2976,85 @@ mod tests {
         assert!(
             after > before,
             "HEALTH_REPORTS_TOTAL should be incremented on each health packet"
+        );
+    }
+
+    #[test]
+    fn test_client_info_published_for_battery_only_metadata() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet("s_battery", "m_battery", "alice", HashMap::new());
+        hp.client_battery_level = Some(0.42);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        assert!(
+            series_exists(
+                "videocall_client_info",
+                &[
+                    ("meeting_id", "m_battery"),
+                    ("session_id", "s_battery"),
+                    ("display_name", "alice"),
+                    ("cores", ""),
+                    ("architecture", ""),
+                    ("gpu_family", ""),
+                    ("network_effective_type", ""),
+                    ("capability_score", ""),
+                ],
+            ),
+            "battery-only client metadata must publish CLIENT_INFO"
+        );
+    }
+
+    #[test]
+    fn test_battery_level_gauge_published_with_reported_value() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut hp = create_test_health_packet("s_batval", "m_batval", "alice", HashMap::new());
+        hp.client_battery_level = Some(0.37);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        // #1392: the battery VALUE must ride on its own numeric gauge (peer_id is
+        // the reporting_user_id; display_name defaults to the reporting_user_id).
+        let labels = [
+            ("meeting_id", "m_batval"),
+            ("session_id", "s_batval"),
+            ("peer_id", "alice"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_client_battery_level", &labels),
+            Some(0.37),
+            "the reported battery level must be published as the gauge value"
+        );
+    }
+
+    #[test]
+    fn test_battery_level_gauge_absent_when_not_reported() {
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+        let dn_map: DisplayNameMap = Arc::new(Mutex::new(HashMap::new()));
+
+        // A packet with OTHER client metadata (so the TELEM-7 block runs) but no
+        // battery level: the gauge must stay absent, not publish a misleading 0.
+        let mut hp = create_test_health_packet("s_nobat", "m_nobat", "carol", HashMap::new());
+        hp.client_cores = Some(8);
+
+        let result = process_health_packet_to_metrics_pb(&hp, &tracker, &dn_map);
+        assert!(result.is_ok());
+
+        let labels = [
+            ("meeting_id", "m_nobat"),
+            ("session_id", "s_nobat"),
+            ("peer_id", "carol"),
+        ];
+        assert_eq!(
+            gauge_value("videocall_client_battery_level", &labels),
+            None,
+            "an absent battery level must leave the gauge absent (not a 0)"
         );
     }
 

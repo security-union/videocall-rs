@@ -52,10 +52,13 @@ fn inject_minimal_config() {
     set("vadThreshold", &wasm_bindgen::JsValue::from(0.02));
     let frozen = js_sys::Object::freeze(&config);
     js_sys::Reflect::set(&gloo_utils::window(), &"__APP_CONFIG".into(), &frozen).unwrap();
+    // Clear the app_config() memo (issue #1492) so this injected config is parsed.
+    dioxus_ui::constants::reset_config_cache_for_test();
 }
 
 fn remove_config() {
     let _ = js_sys::Reflect::delete_property(&gloo_utils::window().into(), &"__APP_CONFIG".into());
+    dioxus_ui::constants::reset_config_cache_for_test();
 }
 
 /// Mock `fetch` so any request to `/api/v1/meetings/feed` returns the given

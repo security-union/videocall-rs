@@ -125,6 +125,7 @@ window.__APP_CONFIG = Object.freeze({
     oauthEnabled: "false",
     e2eeEnabled: "false",
     webTransportEnabled: "true",
+    transportBadgeEnabled: "false",
     firefoxEnabled: "false",
     usersAllowedToStream: "",
     oauthProvider: "",           // "google", "okta", or ""

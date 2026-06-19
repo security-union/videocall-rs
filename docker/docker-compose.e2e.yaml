@@ -275,6 +275,7 @@ services:
       # the regression spec) actually elects WT instead of being clamped
       # back to WS. See issue #777.
       - WEBTRANSPORT_ENABLED=true
+      - TRANSPORT_BADGE_ENABLED=false
       - E2EE_ENABLED=false
       - FIREFOX_ENABLED=false
       # Enable the mock-peers debug feature so layout-driven specs (e.g.

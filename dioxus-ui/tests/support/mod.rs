@@ -145,6 +145,10 @@ fn inject_app_config_with_oauth_enabled(oauth_enabled: bool) {
     let frozen = js_sys::Object::freeze(&config);
     let window = gloo_utils::window();
     js_sys::Reflect::set(&window, &"__APP_CONFIG".into(), &frozen).unwrap();
+    // app_config() memoizes the first successful parse (issue #1492). The wasm
+    // test harness reuses one wasm module across cases, so clear the cache here
+    // to force a re-parse of THIS injected config.
+    dioxus_ui::constants::reset_config_cache_for_test();
     mock_browser_compatibility_features();
 }
 
@@ -200,6 +204,8 @@ pub fn inject_app_config_with_vad_threshold(threshold: f32) {
     let frozen = js_sys::Object::freeze(&config);
     let window = gloo_utils::window();
     js_sys::Reflect::set(&window, &"__APP_CONFIG".into(), &frozen).unwrap();
+    // See inject_app_config_with_oauth_enabled: force a re-parse of this config.
+    dioxus_ui::constants::reset_config_cache_for_test();
     mock_browser_compatibility_features();
 }
 
@@ -207,6 +213,9 @@ pub fn inject_app_config_with_vad_threshold(threshold: f32) {
 pub fn remove_app_config() {
     let window = gloo_utils::window();
     let _ = js_sys::Reflect::delete_property(&window.into(), &"__APP_CONFIG".into());
+    // Also clear the app_config() memo (issue #1492) so a subsequent call sees the
+    // now-absent config (returns Err) instead of a stale cached parse.
+    dioxus_ui::constants::reset_config_cache_for_test();
 }
 
 /// Reset browser-global state that commonly leaks between wasm tests.

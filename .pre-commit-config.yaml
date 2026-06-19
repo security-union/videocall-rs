@@ -1,0 +1,17 @@
+# Pre-commit hooks for videocall.
+#
+# This repo did not previously use the pre-commit framework; it is introduced
+# here solely to run gitleaks locally before a commit lands, as a first line of
+# defense that mirrors the CI Secret Scan gate (.github/workflows/pr-check-gitleaks-hcl.yaml).
+#
+# One-time setup (see CONTRIBUTING.md):
+#   pip install pre-commit   # or: brew install pre-commit
+#   pre-commit install
+#
+# The hook reads .gitleaks.toml automatically (gitleaks looks for it at the repo
+# root), so the same allowlist applies locally and in CI.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks

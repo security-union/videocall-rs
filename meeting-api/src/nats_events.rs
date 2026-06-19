@@ -64,6 +64,19 @@ pub const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host"
 /// `MEETING_BECAME_EMPTY_SUBJECT`).
 pub const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
 
+/// NATS subject for fanning out per-participant host-flag changes to every
+/// `actix-api` chat_server instance. The chat_server caches each member's
+/// `is_host` at JoinRoom time from the JWT, so without this fanout a
+/// mid-meeting transfer-host would not take effect in the in-memory presence
+/// map until the affected user reconnected — and the host-leave→end continuity
+/// check reads that cached flag.
+///
+/// JSON over an internal subject, mirroring
+/// [`MEETING_SETTINGS_UPDATE_SUBJECT`]. The corresponding consumer lives in
+/// `actix-api/src/actors/chat_server.rs` (search for
+/// `MEETING_HOST_CHANGE_SUBJECT`).
+pub const MEETING_HOST_CHANGE_SUBJECT: &str = "internal.meeting_host_changed";
+
 /// Payload published on [`MEETING_SETTINGS_UPDATE_SUBJECT`].
 ///
 /// Carries the four per-meeting policy flags so chat_server can refresh
@@ -98,6 +111,20 @@ pub struct MeetingEndedByHostPayload {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeetingBecameEmptyPayload {
     pub room_id: String,
+}
+
+/// Payload published on [`MEETING_HOST_CHANGE_SUBJECT`].
+///
+/// Carries a single per-user host-flag delta so chat_server can update the
+/// `is_host` field on every `RoomMemberInfo` (across all of that user's
+/// sessions) in the room without a DB round-trip. `is_host` is the
+/// post-change authoritative value (`true` on grant/transfer-target, `false`
+/// on revoke/transfer-source).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct MeetingHostChangePayload {
+    pub room_id: String,
+    pub user_id: String,
+    pub is_host: bool,
 }
 
 /// Build a `PacketWrapper` containing a serialized `MeetingPacket`.
@@ -145,6 +172,30 @@ pub async fn publish_meeting_activated(nats: Option<&async_nats::Client>, room_i
     let bytes = build_meeting_wrapper(&packet);
     publish(nats, room_system_subject(room_id), bytes).await;
     tracing::debug!("Published MEETING_ACTIVATED for room {room_id}");
+}
+
+/// Publish `MEETING_ENDED` to every client in a room so they show the
+/// meeting-ended overlay and disconnect. Used by the REST `/leave` path when
+/// the meeting OWNER (creator, while still host) leaves with
+/// `end_on_host_leave=true`: that path ends the meeting immediately when the
+/// host leaves, so the transport-layer host-leave broadcast (which only
+/// fires when no host remains) would not notify clients. Mirrors the packet the
+/// transport path builds via `SessionManager::build_meeting_ended_packet`.
+pub async fn publish_meeting_ended(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    message: &str,
+) {
+    let Some(nats) = nats else { return };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::MEETING_ENDED.into(),
+        room_id: room_id.to_string(),
+        message: message.to_string(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    publish(nats, room_system_subject(room_id), bytes).await;
+    tracing::debug!("Published MEETING_ENDED for room {room_id}");
 }
 
 /// Publish `PARTICIPANT_ADMITTED` when a participant is admitted from the waiting room.
@@ -314,6 +365,101 @@ pub async fn publish_host_kick(
         .await?;
     tracing::debug!("Published PARTICIPANT_KICKED for room {room_id} target=\"{target_user_id}\"");
     Ok(())
+}
+
+/// Publish `HOST_GRANTED` to tell every client a participant was promoted to
+/// host (the promotion half of a transfer-host).
+pub async fn publish_host_granted(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+    host_user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(nats) = nats else { return Ok(()) };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::HOST_GRANTED.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        creator_id: host_user_id.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    nats.publish(room_system_subject(room_id), bytes.into())
+        .await?;
+    tracing::debug!(
+        "Published HOST_GRANTED for room {room_id} target=\"{target_user_id}\" host=\"{host_user_id}\""
+    );
+    Ok(())
+}
+
+/// Publish `HOST_REVOKED` to tell every client a participant's host privileges
+/// were removed (demote, or the demotion half of a transfer).
+pub async fn publish_host_revoked(
+    nats: Option<&async_nats::Client>,
+    room_id: &str,
+    target_user_id: &str,
+    host_user_id: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let Some(nats) = nats else { return Ok(()) };
+    let packet = MeetingPacket {
+        event_type: MeetingEventType::HOST_REVOKED.into(),
+        room_id: room_id.to_string(),
+        target_user_id: target_user_id.as_bytes().to_vec(),
+        creator_id: host_user_id.as_bytes().to_vec(),
+        ..Default::default()
+    };
+    let bytes = build_meeting_wrapper(&packet);
+    nats.publish(room_system_subject(room_id), bytes.into())
+        .await?;
+    tracing::debug!(
+        "Published HOST_REVOKED for room {room_id} target=\"{target_user_id}\" host=\"{host_user_id}\""
+    );
+    Ok(())
+}
+
+/// Publish a server-internal [`MEETING_HOST_CHANGE_SUBJECT`] event so every
+/// `actix-api` chat_server instance updates the cached `is_host` flag for the
+/// affected user across all of their sessions in the room. No-op when NATS is
+/// not configured.
+///
+/// Distinct from [`publish_host_granted`] / [`publish_host_revoked`]: those
+/// tell **clients** about the change; this one tells **servers** to refresh
+/// their in-memory presence map so the host-leave continuity check stays
+/// correct without a DB lookup.
+pub async fn publish_internal_host_change(
+    nats: Option<&async_nats::Client>,
+    payload: &MeetingHostChangePayload,
+) {
+    let Some(nats) = nats else { return };
+    let bytes = match serde_json::to_vec(payload) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::error!(
+                "Failed to serialize MeetingHostChangePayload for {}: {e}",
+                payload.room_id
+            );
+            return;
+        }
+    };
+    if let Err(e) = nats
+        .publish(MEETING_HOST_CHANGE_SUBJECT, bytes.into())
+        .await
+    {
+        tracing::error!(
+            "Failed to publish {} for {} (user={}): {e}",
+            MEETING_HOST_CHANGE_SUBJECT,
+            payload.room_id,
+            payload.user_id
+        );
+    } else {
+        tracing::debug!(
+            "Published {} for room {} (user={}, is_host={})",
+            MEETING_HOST_CHANGE_SUBJECT,
+            payload.room_id,
+            payload.user_id,
+            payload.is_host
+        );
+    }
 }
 
 /// Publish `MEETING_SETTINGS_UPDATED` when meeting settings change.
@@ -618,6 +764,46 @@ mod tests {
     }
 
     #[test]
+    fn test_build_host_granted_packet() {
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::HOST_GRANTED.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: "eve@example.com".as_bytes().to_vec(),
+            creator_id: "host@example.com".as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(inner.event_type, MeetingEventType::HOST_GRANTED.into());
+        assert_eq!(inner.target_user_id, "eve@example.com".as_bytes().to_vec());
+        // Issuing host rides on creator_id, mirroring the mute/disable events.
+        assert_eq!(inner.creator_id, "host@example.com".as_bytes().to_vec());
+        assert_eq!(inner.room_id, "test-room");
+    }
+
+    #[test]
+    fn test_build_host_revoked_packet() {
+        let packet = MeetingPacket {
+            event_type: MeetingEventType::HOST_REVOKED.into(),
+            room_id: "test-room".to_string(),
+            target_user_id: "frank@example.com".as_bytes().to_vec(),
+            creator_id: "host@example.com".as_bytes().to_vec(),
+            ..Default::default()
+        };
+        let bytes = build_meeting_wrapper(&packet);
+        let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
+        let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();
+        assert_eq!(inner.event_type, MeetingEventType::HOST_REVOKED.into());
+        assert_eq!(
+            inner.target_user_id,
+            "frank@example.com".as_bytes().to_vec()
+        );
+        assert_eq!(inner.creator_id, "host@example.com".as_bytes().to_vec());
+        assert_eq!(inner.room_id, "test-room");
+    }
+
+    #[test]
     fn test_build_meeting_settings_updated_packet() {
         let packet = MeetingPacket {
             event_type: MeetingEventType::MEETING_SETTINGS_UPDATED.into(),
@@ -657,6 +843,7 @@ mod tests {
     async fn test_nats_none_is_noop() {
         // All publish functions should be no-ops when nats is None.
         publish_meeting_activated(None, "room").await;
+        publish_meeting_ended(None, "room", "ended").await;
         publish_participant_admitted(None, "room", "user@test.com").await;
         publish_participant_rejected(None, "room", "user@test.com").await;
         publish_waiting_room_updated(None, "room").await;
@@ -665,5 +852,16 @@ mod tests {
         let _ = publish_host_mute(None, "room", "", "host@test.com").await;
         let _ = publish_host_disable_video(None, "room", "user@test.com", "host@test.com").await;
         let _ = publish_host_disable_video(None, "room", "", "host@test.com").await;
+        let _ = publish_host_granted(None, "room", "user@test.com", "host@test.com").await;
+        let _ = publish_host_revoked(None, "room", "user@test.com", "host@test.com").await;
+        publish_internal_host_change(
+            None,
+            &MeetingHostChangePayload {
+                room_id: "room".to_string(),
+                user_id: "user@test.com".to_string(),
+                is_host: true,
+            },
+        )
+        .await;
     }
 }

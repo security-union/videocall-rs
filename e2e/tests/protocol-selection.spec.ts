@@ -76,6 +76,59 @@ function diagnosticsTransportSelect(page: Page) {
   return section.locator(".peer-selector");
 }
 
+/**
+ * Read the transport storage keys AFTER an "Apply"-triggered page reload.
+ *
+ * Apply persists the keys then calls `location.reload()`. While that reload is
+ * in flight the document is transiently detached from the app origin, so a bare
+ * `page.evaluate(() => sessionStorage.getItem(...))` can throw
+ * `SecurityError: Access is denied for this document` (storage is unreachable
+ * off-origin). We therefore (1) wait for the reload to land back on the meeting
+ * URL with `document.readyState === "complete"`, then (2) read the keys through
+ * an `expect.poll` wrapper so a transient SecurityError during the settle window
+ * is RETRIED rather than fatal.
+ */
+async function readTransportStorageAfterReload(
+  page: Page,
+  meetingId: string,
+): Promise<{ session: string | null; preference: string | null; sticky: string | null }> {
+  // (1) The reload re-navigates to the meeting URL; wait until we are back on it
+  // and the document has fully parsed before touching storage.
+  await page.waitForURL(new RegExp(`/meeting/${meetingId}`), { timeout: 15_000 });
+  await expect
+    .poll(() => page.evaluate(() => document.readyState).catch(() => "loading"), {
+      timeout: 15_000,
+    })
+    .toBe("complete");
+
+  // (2) Read through expect.poll so a transient off-origin SecurityError (the
+  // reload is still settling) is retried instead of failing the test.
+  let storage: { session: string | null; preference: string | null; sticky: string | null } = {
+    session: null,
+    preference: null,
+    sticky: null,
+  };
+  await expect
+    .poll(
+      async () => {
+        try {
+          storage = await page.evaluate(() => ({
+            session: sessionStorage.getItem("vc_transport_session"),
+            preference: localStorage.getItem("vc_transport_preference"),
+            sticky: localStorage.getItem("vc_transport_sticky"),
+          }));
+          return true;
+        } catch {
+          // Transient SecurityError while the reload is mid-settle — retry.
+          return false;
+        }
+      },
+      { timeout: 15_000 },
+    )
+    .toBe(true);
+  return storage;
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -118,8 +171,12 @@ test.describe("Protocol selection (transport preference)", () => {
     // Apply button should not be visible (no pending change)
     await expect(page.locator('[data-testid="transport-apply-button"]')).not.toBeVisible();
 
-    // Sticky toggle row should not be visible while the default is selected
-    await expect(page.locator("#sticky-transport-checkbox")).not.toBeVisible();
+    // Sticky ("Remember protocol choice") toggle is now shown for BOTH protocols
+    // (#1291), including the WebTransport default. It starts unchecked when no
+    // pin is persisted. The full "Remember"-toggle behaviour is exercised in
+    // protocol-switch-override.spec.ts; here we just pin its default visibility.
+    await expect(page.locator("#sticky-transport-checkbox")).toBeVisible();
+    await expect(page.locator("#sticky-transport-checkbox")).not.toBeChecked();
   });
 
   // 2. Selecting WebSocket shows Apply button and sticky toggle
@@ -162,19 +219,13 @@ test.describe("Protocol selection (transport preference)", () => {
     await expect(page.locator('[data-testid="transport-apply-button"]')).not.toBeVisible();
   });
 
-  // 4. Sticky toggle not visible when default (WebTransport) is selected
-  test("sticky toggle not visible when WebTransport (default) is selected", async ({ page }) => {
-    const meetingId = `e2e_proto_sticky_hidden_${Date.now()}`;
-    await joinMeeting(page, meetingId, "proto-user-4");
-
-    await openSettingsModal(page);
-    await switchToNetworkTab(page);
-
-    // WebTransport (default) should already be selected; clicking it again is a no-op.
-    await page.locator('[data-testid="transport-radio-webtransport"]').click();
-
-    await expect(page.locator("#sticky-transport-checkbox")).not.toBeVisible();
-  });
+  // NOTE: A former test "sticky toggle not visible when WebTransport (default)
+  // is selected" was removed here. After #1291/#1307 the Remember toggle is
+  // shown for BOTH protocols (verified in device_settings_modal.rs), so the
+  // old "hidden for default" assertion is obsolete. The toggle's
+  // visible-for-both behaviour is covered by protocol-switch-override.spec.ts
+  // ("Remember toggle is visible for both WebTransport and WebSocket") and by
+  // the default-visibility assertion in test 1 above.
 
   // 5. Apply without sticky writes to sessionStorage, not localStorage
   test("Apply without sticky writes to sessionStorage not localStorage", async ({ page }) => {
@@ -189,15 +240,10 @@ test.describe("Protocol selection (transport preference)", () => {
 
     await page.locator('[data-testid="transport-apply-button"]').click();
 
-    // Apply triggers a reload -- wait for it to settle.
-    await page.waitForLoadState("domcontentloaded", { timeout: 15_000 });
-    await page.waitForTimeout(2000);
-
-    const storage = await page.evaluate(() => ({
-      session: sessionStorage.getItem("vc_transport_session"),
-      preference: localStorage.getItem("vc_transport_preference"),
-      sticky: localStorage.getItem("vc_transport_sticky"),
-    }));
+    // Apply triggers a reload. Read storage only once the reload has settled
+    // back on the meeting URL (readyState complete), retrying past any transient
+    // off-origin SecurityError during the settle window.
+    const storage = await readTransportStorageAfterReload(page, meetingId);
 
     expect(storage.session).toBe("websocket");
     expect(storage.preference).toBeNull();
@@ -209,74 +255,20 @@ test.describe("Protocol selection (transport preference)", () => {
     });
   });
 
-  // 6. Sticky toggle immediately writes to localStorage on check
-  test("sticky toggle immediately writes to localStorage on check", async ({ page }) => {
-    const meetingId = `e2e_proto_sticky_check_${Date.now()}`;
-    await joinMeeting(page, meetingId, "proto-user-6");
-
-    await openSettingsModal(page);
-    await switchToNetworkTab(page);
-
-    await page.locator('[data-testid="transport-radio-websocket"]').click();
-    await expect(page.locator("#sticky-transport-checkbox")).toBeVisible();
-
-    await page.locator("#sticky-transport-checkbox").check({ force: true });
-
-    // Give Dioxus a moment to flush the side-effect to storage.
-    await expect
-      .poll(
-        async () =>
-          await page.evaluate(() => ({
-            preference: localStorage.getItem("vc_transport_preference"),
-            sticky: localStorage.getItem("vc_transport_sticky"),
-          })),
-        { timeout: 5000 },
-      )
-      .toEqual({ preference: "websocket", sticky: "true" });
-
-    // Clean up so subsequent tests start fresh.
-    await page.evaluate(() => {
-      localStorage.removeItem("vc_transport_preference");
-      localStorage.removeItem("vc_transport_sticky");
-    });
-  });
-
-  // 7. Sticky toggle immediately clears localStorage on uncheck
-  test("sticky toggle immediately clears localStorage on uncheck", async ({ page }) => {
-    const meetingId = `e2e_proto_sticky_uncheck_${Date.now()}`;
-
-    // Pre-set sticky preference before joining
-    await page.goto("/");
-    await page.waitForTimeout(1500);
-    await page.evaluate(() => {
-      localStorage.setItem("vc_transport_preference", "websocket");
-      localStorage.setItem("vc_transport_sticky", "true");
-    });
-    await page.reload();
-
-    await joinMeeting(page, meetingId, "proto-user-7");
-
-    await openSettingsModal(page);
-    await switchToNetworkTab(page);
-
-    // Sticky checkbox should be checked because storage flagged it.
-    const stickyCheckbox = page.locator("#sticky-transport-checkbox");
-    await expect(stickyCheckbox).toBeVisible();
-    await expect(stickyCheckbox).toBeChecked();
-
-    await stickyCheckbox.uncheck({ force: true });
-
-    await expect
-      .poll(
-        async () =>
-          await page.evaluate(() => ({
-            preference: localStorage.getItem("vc_transport_preference"),
-            sticky: localStorage.getItem("vc_transport_sticky"),
-          })),
-        { timeout: 5000 },
-      )
-      .toEqual({ preference: null, sticky: null });
-  });
+  // NOTE: Two former tests were removed here —
+  //   "sticky toggle immediately writes to localStorage on check" and
+  //   "sticky toggle immediately clears localStorage on uncheck".
+  // After the #1291/#1307 review-blocker fix the Remember toggle is IN-MEMORY
+  // ONLY: toggling it writes nothing to storage; "Apply" is the sole
+  // storage-commit point (verified in device_settings_modal.rs — the checkbox
+  // onchange only calls `sticky_transport.set(...)`). The eager-write
+  // assertions those tests made are therefore obsolete. The replacement
+  // (no-eager-write + Apply-as-commit) behaviour is fully covered by
+  // protocol-switch-override.spec.ts:
+  //   - "Remember ON for WebTransport is committed via Apply (no eager write)
+  //      and survives reload"
+  //   - "toggling Remember then closing without Apply writes nothing to storage"
+  // and the Apply-commit path here remains covered by tests 8 and 9 below.
 
   // 8. Apply with sticky writes to localStorage and survives reload
   test("Apply with sticky writes to localStorage and survives reload", async ({ page }) => {

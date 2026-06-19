@@ -817,4 +817,56 @@ test.describe("Display name live update", () => {
     const blockedRes = await updateDisplayNameRaw(email, name, meetingId, "BlockedName");
     expect(blockedRes.status).toBe(429);
   });
+
+  /**
+   * Verify that the display name persists as a plain-text string in
+   * localStorage after joining a meeting and returning to the home page.
+   * The stored value must be human-readable (no CBOR/zlib encoding).
+   */
+  test("display name persists as plain text after leaving meeting", async ({ baseURL }) => {
+    test.skip(
+      baseURL === "http://localhost:80" || baseURL === "http://localhost",
+      "Yew UI does not support display name persistence",
+    );
+
+    test.setTimeout(90_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_dn_persist_${Date.now()}`;
+    const displayName = "PersistTestUser";
+
+    const browser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const ctx = await createAuthenticatedContext(
+        browser,
+        "persist-test@videocall.rs",
+        displayName,
+        uiURL,
+      );
+      const page = await ctx.newPage();
+
+      // Join a meeting with a known display name
+      await navigateToMeeting(page, meetingId, displayName);
+      const result = await joinMeetingFromPage(page);
+      expect(result).toBe("in-meeting");
+      await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Verify the display name is stored as plain text in localStorage
+      const storedName = await page.evaluate(() => {
+        return localStorage.getItem("vc_display_name");
+      });
+      expect(storedName).toBe(displayName);
+
+      // Leave the meeting by navigating to home
+      await page.goto("/");
+      await page.waitForTimeout(2000);
+
+      // Verify display name field is pre-populated on the home page
+      const usernameInput = page.locator("#username");
+      await expect(usernameInput).toBeVisible({ timeout: 10_000 });
+      await expect(usernameInput).toHaveValue(displayName, { timeout: 5_000 });
+    } finally {
+      await browser.close();
+    }
+  });
 });

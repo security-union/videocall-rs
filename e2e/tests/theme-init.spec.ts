@@ -12,12 +12,9 @@ import { waitForServices } from "../helpers/wait-for-services";
  * `html[data-theme="light"]`, so the attribute must be applied correctly on
  * every page load for theming to work.
  *
- * IMPORTANT: `localStorage["ui-theme"]` is written by `apply_and_save_theme()`
- * via `dioxus_sdk_storage::LocalStorage::set`, which CBOR+zlib+hex-encodes the
- * value.  Plain strings written directly via `localStorage.setItem()` are NOT
- * recognised by the CBOR-aware `load_theme_from_storage()` decoder and will
- * always fall back to `Theme::Dark`.  Tests that seed plain strings here are
- * therefore intentionally exercising the fallback / unknown-value path.
+ * IMPORTANT: `apply_and_save_theme()` writes `localStorage["ui-theme"]` as a
+ * plain-text string (e.g. "dark", "light", "system").  Tests can seed values
+ * directly via `localStorage.setItem()` and assert `html[data-theme]`.
  */
 test.describe("Theme initialization from localStorage", () => {
   test.beforeAll(async () => {
@@ -49,9 +46,8 @@ test.describe("Theme initialization from localStorage", () => {
     expect(darkBgImage).not.toContain("theme_light_v1.png");
   });
 
-  // 2. Plain non-CBOR string in storage → not decoded by SDK → falls back to "dark".
-  //    Verifies the FOUC guard is not accidentally trusting raw strings.
-  test("falls back to dark theme when ui-theme is a plain non-CBOR string", async ({ page }) => {
+  // 2. Plain "dark" string in storage → parsed by FromStr → Theme::Dark.
+  test("reads dark theme correctly from plain-text localStorage", async ({ page }) => {
     await page.goto("/");
     await page.evaluate(() => localStorage.setItem("ui-theme", "dark"));
     await page.reload();
@@ -63,10 +59,18 @@ test.describe("Theme initialization from localStorage", () => {
       .toBe("dark");
   });
 
-  // (Test 3 removed: "light" cannot be seeded via a plain localStorage.setItem
-  //  because load_theme_from_storage() uses the CBOR-aware SDK decoder and
-  //  will not recognise the raw string.  Light persistence is covered end-to-end
-  //  in theme-toggle.spec.ts via a real UI toggle interaction.)
+  // 3. Plain "light" string in storage → parsed by FromStr → Theme::Light.
+  test("reads light theme correctly from plain-text localStorage", async ({ page }) => {
+    await page.goto("/");
+    await page.evaluate(() => localStorage.setItem("ui-theme", "light"));
+    await page.reload();
+
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
+        timeout: 10_000,
+      })
+      .toBe("light");
+  });
 
   // 4. Empty string stored → falls back to "dark"
   test("falls back to dark theme when ui-theme is an empty string", async ({ page }) => {
@@ -81,12 +85,11 @@ test.describe("Theme initialization from localStorage", () => {
       .toBe("dark");
   });
 
-  // 5. Unknown / non-allowlisted value → falls back to "dark"
-  //    Plain strings are not decoded by the CBOR-aware storage reader.
-  //    This raw "light" value must therefore still resolve to "dark".
+  // 5. Unknown / non-allowlisted value → falls back to "dark" via FromStr
+  //    catch-all arm.
   test("falls back to dark theme when ui-theme is an unknown value", async ({ page }) => {
     await page.goto("/");
-    await page.evaluate(() => localStorage.setItem("ui-theme", "light"));
+    await page.evaluate(() => localStorage.setItem("ui-theme", "retro-wave"));
     await page.reload();
 
     await expect
@@ -96,17 +99,29 @@ test.describe("Theme initialization from localStorage", () => {
       .toBe("dark");
   });
 
-  test("falls back to dark theme when ui-theme is a whitespace-padded unknown value", async ({
-    page,
-  }) => {
+  // 6. Whitespace-padded value → FromStr trims → correct theme.
+  test("trims whitespace in plain-text ui-theme value", async ({ page }) => {
     await page.goto("/");
-    await page.evaluate(() => localStorage.setItem("ui-theme", "  system  "));
+    await page.evaluate(() => localStorage.setItem("ui-theme", "  light  "));
     await page.reload();
 
     await expect
       .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
         timeout: 10_000,
       })
-      .toBe("dark");
+      .toBe("light");
+  });
+
+  // 7. System theme resolves based on prefers-color-scheme media query.
+  //    In headless Chromium without explicit emulation, the resolved value
+  //    is implementation-dependent, so we only assert that data-theme is set.
+  test("reads system theme from plain-text localStorage", async ({ page }) => {
+    await page.goto("/");
+    await page.evaluate(() => localStorage.setItem("ui-theme", "system"));
+    await page.reload();
+
+    const theme = await page.evaluate(() => document.documentElement.getAttribute("data-theme"));
+    expect(theme).toBeTruthy();
+    expect(["light", "dark"]).toContain(theme);
   });
 });

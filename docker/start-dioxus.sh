@@ -23,6 +23,7 @@ if (window.__APP_CONFIG) {
   oauthEnabled: "${ENABLE_OAUTH:-false}",
   e2eeEnabled: "${E2EE_ENABLED:-false}",
   webTransportEnabled: "${WEBTRANSPORT_ENABLED:-false}",
+  transportBadgeEnabled: "${TRANSPORT_BADGE_ENABLED:-false}",
   firefoxEnabled: "${FIREFOX_ENABLED:-false}",
   usersAllowedToStream: "${USERS_ALLOWED_TO_STREAM:-}",
   serverElectionPeriodMs: ${SERVER_ELECTION_PERIOD_MS:-2000},
@@ -38,6 +39,7 @@ if (window.__APP_CONFIG) {
   oauthTokenUrl: "${OAUTH_TOKEN_URL:-}",
   oauthIssuer: "${OAUTH_ISSUER:-}",
   oauthPrompt: "${OAUTH_PROMPT:-}",
+  oauthFlow: "${OAUTH_FLOW:-}",
   searchApiBaseUrl: ${SEARCH_API_BASE_URL_CONFIG},
   mockPeersEnabled: "${MOCK_PEERS_ENABLED:-false}"
   });

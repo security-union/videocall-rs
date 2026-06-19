@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+use std::cell::RefCell;
+
 use serde::Deserialize;
 use serde_wasm_bindgen::from_value as from_js_value;
 use videocall_types::truthy;
@@ -24,6 +26,21 @@ pub struct RuntimeConfig {
     pub e2ee_enabled: String,
     #[serde(rename = "webTransportEnabled")]
     pub web_transport_enabled: String,
+    /// Issue #1483: server-side gate for the per-peer-tile "WT"/"WS" transport
+    /// badge. When truthy (`"true"`/`"1"`/…) each peer tile renders a small
+    /// badge next to its signal meter showing whether that peer's media is
+    /// flowing over WebTransport or WebSocket; when absent/empty/falsey the
+    /// badge is never rendered. **Default OFF.**
+    ///
+    /// CRITICAL (config.js bind-mount trap, see project memory): `#[serde(default)]`
+    /// so a stale bind-mounted `config.js` that predates this key still parses —
+    /// a missing key yields the empty-string default (→ `truthy` returns false →
+    /// badge OFF), never a startup-bricking parse failure. The e2e docker stack
+    /// bind-mounts the host's committed `config.js`, which does NOT contain this
+    /// key, so the UI must (and does) behave identically when it is absent.
+    #[serde(rename = "transportBadgeEnabled")]
+    #[serde(default)]
+    pub transport_badge_enabled: String,
     #[serde(rename = "firefoxEnabled")]
     #[serde(default)]
     pub firefox_enabled: String,
@@ -223,7 +240,23 @@ fn default_experimental_simulcast_max_layers() -> u32 {
     3
 }
 
-pub fn app_config() -> Result<RuntimeConfig, String> {
+thread_local! {
+    /// Memoized parse of `window.__APP_CONFIG` (issue #1492). `__APP_CONFIG` is
+    /// installed by `config.js` before the wasm bundle runs and is immutable for
+    /// the page's lifetime, so the full `RuntimeConfig` deserialization (a 30+-field
+    /// struct, done previously on EVERY one of the ~36 accessor calls — several
+    /// per-tile-per-render) only needs to happen once. We cache the first
+    /// **successful** parse; a failed read (config not yet present, or unparseable)
+    /// is NOT cached, so a transient pre-load miss can still succeed on a later call.
+    ///
+    /// The wasm target is single-threaded, so `thread_local! + RefCell` is the
+    /// correct (and cheapest) cell here — no `Sync` bound is needed.
+    static CONFIG_CACHE: RefCell<Option<RuntimeConfig>> = const { RefCell::new(None) };
+}
+
+/// Parse `window.__APP_CONFIG` into a [`RuntimeConfig`] with no caching.
+/// Split out so the cache wrapper ([`app_config`]) stays a thin memoization layer.
+fn parse_app_config() -> Result<RuntimeConfig, String> {
     let win = window().expect("window");
     let config = js_sys::Reflect::get(&win, &JsValue::from_str("__APP_CONFIG"))
         .unwrap_or(JsValue::UNDEFINED);
@@ -232,6 +265,65 @@ pub fn app_config() -> Result<RuntimeConfig, String> {
     }
     from_js_value::<RuntimeConfig>(config)
         .map_err(|e| format!("Failed to parse __APP_CONFIG: {e:?}"))
+}
+
+/// Return the cached `T`, or compute it via `parse` and cache the result on the
+/// first **success only**. An `Err` from `parse` is propagated WITHOUT being
+/// cached, so a transient failure (e.g. config not yet installed) does not
+/// poison later calls. Pure over the cell + closure so it is host-unit-testable
+/// for the "parse runs at most once" contract (issue #1492); `app_config` is the
+/// only caller and supplies the real `RefCell` + `parse_app_config`.
+fn memoize_ok<T, E, F>(cache: &RefCell<Option<T>>, parse: F) -> Result<T, E>
+where
+    T: Clone,
+    F: FnOnce() -> Result<T, E>,
+{
+    if let Some(value) = cache.borrow().as_ref() {
+        return Ok(value.clone());
+    }
+    let parsed = parse()?;
+    *cache.borrow_mut() = Some(parsed.clone());
+    Ok(parsed)
+}
+
+/// Read the runtime configuration, parsing `window.__APP_CONFIG` at most **once
+/// per page load** (issue #1492). The first successful parse is memoized in a
+/// thread-local cache and subsequent calls return a cheap clone, eliminating the
+/// per-render `serde_wasm_bindgen` deserialization that scaled with tile count on
+/// the low-power devices this project targets.
+///
+/// Cache semantics: only `Ok` is cached (see [`memoize_ok`]). An `Err` (config
+/// absent at first access, or a parse failure) falls through uncached so a later
+/// call — once `config.js` has installed `__APP_CONFIG` — can populate the cache.
+/// In production `config.js` freezes `__APP_CONFIG` before the bundle runs and
+/// nothing rewrites it, so the cached value never goes stale. (Playwright E2E
+/// specs get a fresh page = fresh wasm module per test, so the cache resets
+/// naturally there; only the in-process `wasm-bindgen-test` harness, which reuses
+/// one wasm module across cases, needs the explicit [`reset_config_cache_for_test`]
+/// hook below.)
+pub fn app_config() -> Result<RuntimeConfig, String> {
+    CONFIG_CACHE.with(|cache| memoize_ok(cache, parse_app_config))
+}
+
+/// Clear the memoized [`app_config`] cache. **Test-support only.**
+///
+/// Production `__APP_CONFIG` is frozen at load and never re-written, so the cache
+/// is never invalidated at runtime. But the `wasm-bindgen-test` harness runs every
+/// `#[wasm_bindgen_test]` in a crate against ONE wasm module instance, and the test
+/// helpers inject/remove a different `__APP_CONFIG` per case. Without a reset, the
+/// first successful parse would freeze the config for the rest of the run and break
+/// every later test that expects its own injected (or absent) config. The
+/// `dioxus-ui/tests/support` inject/remove helpers call this so each case re-parses.
+///
+/// `#[doc(hidden)]` + not `#[cfg(test)]`-gated on purpose: integration tests under
+/// `tests/` link the library compiled WITHOUT `cfg(test)`, so a `cfg(test)`-gated
+/// item would be invisible to them. It is a no-op in production code paths.
+/// `#[allow(dead_code)]` because the `dioxus-ui` binary recompiles this module and
+/// has no caller — only the integration-test harness (which links the lib) uses it.
+#[doc(hidden)]
+#[allow(dead_code)]
+pub fn reset_config_cache_for_test() {
+    CONFIG_CACHE.with(|cache| *cache.borrow_mut() = None);
 }
 
 /// Maximum number of **real** peer tiles rendered with full PeerTile treatment
@@ -383,6 +475,14 @@ pub fn webtransport_host_base() -> Result<String, String> {
 
 pub fn webtransport_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.web_transport_enabled.as_str())))
+}
+/// Issue #1483: whether the per-peer-tile "WT"/"WS" transport badge is enabled.
+/// Mirrors [`webtransport_enabled`]: empty / missing / falsey → `false` (badge
+/// OFF, the default), so the badge is gated entirely by the server-provided
+/// `transportBadgeEnabled` flag. Callers gate rendering on
+/// `transport_badge_enabled().unwrap_or(false)`.
+pub fn transport_badge_enabled() -> Result<bool, String> {
+    app_config().map(|c| truthy(Some(c.transport_badge_enabled.as_str())))
 }
 pub fn oauth_enabled() -> Result<bool, String> {
     app_config().map(|c| truthy(Some(c.oauth_enabled.as_str())))
@@ -572,6 +672,64 @@ mod simulcast_default_tests {
             READ_FALLBACK,
             default_experimental_simulcast_max_layers(),
             "the read-fn fallback must equal the serde default (lockstep, issue 1082)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod memoize_ok_tests {
+    use super::memoize_ok;
+    use std::cell::{Cell, RefCell};
+
+    /// Issue #1492: the first successful parse must run exactly once; every later
+    /// call returns the cached clone WITHOUT re-invoking the parser. A mutation
+    /// that dropped the cache-write (`*cache.borrow_mut() = Some(..)`) would make
+    /// `calls` climb to 3 here and fail this assertion.
+    #[test]
+    fn parses_once_then_serves_cache() {
+        let cache: RefCell<Option<String>> = RefCell::new(None);
+        let calls = Cell::new(0);
+        let parse = || {
+            calls.set(calls.get() + 1);
+            Ok::<_, ()>("value".to_string())
+        };
+
+        assert_eq!(memoize_ok(&cache, parse), Ok("value".to_string()));
+        assert_eq!(memoize_ok(&cache, parse), Ok("value".to_string()));
+        assert_eq!(memoize_ok(&cache, parse), Ok("value".to_string()));
+        assert_eq!(
+            calls.get(),
+            1,
+            "parser must run exactly once across 3 reads"
+        );
+    }
+
+    /// An `Err` must NOT be cached: a transient failure (config not yet installed)
+    /// has to fall through so a later call can still succeed and populate the cache.
+    /// A mutation that cached errors would return the stale `Err` on call 2 and the
+    /// final `Ok` assertion (plus the `calls == 2` count) would fail.
+    #[test]
+    fn errors_are_not_cached() {
+        let cache: RefCell<Option<u32>> = RefCell::new(None);
+        let calls = Cell::new(0);
+        let parse = || {
+            calls.set(calls.get() + 1);
+            // Fail on the first call, succeed thereafter.
+            if calls.get() == 1 {
+                Err("not ready")
+            } else {
+                Ok(42u32)
+            }
+        };
+
+        assert_eq!(memoize_ok(&cache, parse), Err("not ready"));
+        assert_eq!(memoize_ok(&cache, parse), Ok(42));
+        // Third call must be served from cache, not re-parsed.
+        assert_eq!(memoize_ok(&cache, parse), Ok(42));
+        assert_eq!(
+            calls.get(),
+            2,
+            "parser runs on the failing call + the first success, then caches"
         );
     }
 }

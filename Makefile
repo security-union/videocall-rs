@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix clippy-ci fmt check check-style-tokens check-token-drift clean clean-docker rebuild rebuild-up e2e e2e-bvt0 e2e-bvt1 e2e-impair e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-up-impair e2e-down e2e-build e2e-cert e2e-doctor e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -42,6 +42,24 @@ connect_to_nats:
 
 clippy-fix:
 		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo clippy --all --fix --allow-dirty --allow-staged"
+
+# Mirror the EXACT clippy command set run by CI's `cargo clippy` job
+# (.github/workflows/pr-check-rust-hcl.yaml). `cargo clippy --all` lints only
+# library/binary targets, NOT `#[test]` code, so deny-by-default lints inside
+# tests slip through a plain `--all` run and fail in CI instead (e.g. PR #1491
+# shipped a `clippy::len_zero` in a neteq `--features web` test). Run this
+# locally before every push; /pre-submit runs it and fails the gate on any error.
+# Keep these lines BYTE-IDENTICAL to the workflow steps — if CI changes, change
+# here. `scripts/check-clippy-ci-sync.sh` (run by the fmt job in
+# pr-check-rust-hcl.yaml) enforces this: editing one list without the other
+# turns CI red, so the byte-identical contract is self-enforcing (issue #1500).
+clippy-ci:
+		cargo clippy --all -- -D warnings
+		cargo clippy --target wasm32-unknown-unknown -p videocall-client --tests -- -D warnings
+		cargo clippy -p videocall-aq --tests -- -D warnings
+		cargo clippy -p videocall-codecs --tests -- -D warnings
+		cargo clippy -p videocall-ui --tests -- -D warnings
+		cargo clippy -p neteq --no-default-features --features web --tests -- -D warnings
 
 fmt:
 		$(COMPOSE) run --rm --no-deps -w /app meeting-api nix develop /app#backend-dev --command bash -c "cargo fmt --all"

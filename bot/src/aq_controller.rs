@@ -42,7 +42,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use videocall_aq::constants::{
     AUDIO_QUALITY_TIERS, DEFAULT_VIDEO_TIER_INDEX, ENCODER_QUEUE_BACKPRESSURE_HIGH,
     SIMULCAST_MAX_LAYERS, VIDEO_QUALITY_TIERS,
@@ -515,7 +515,15 @@ impl BotAq {
             // reader that subsequently does an Acquire load on `tier_epoch`.
             self.tier_epoch.fetch_add(1, Ordering::Release);
 
-            info!(
+            // #654: per-transition log is DEBUG, not INFO. Under a network flap a
+            // large bot fleet flips tiers repeatedly; at INFO each bot emitted one
+            // line per transition, producing a log-storm with no upside —
+            // observability is already covered by the `HealthPacket.tier_transitions`
+            // field (drained in `drain_tier_transitions`, populated by the bot
+            // health reporter) which drives the Prometheus counter
+            // `videocall_tier_transition_total` in the metrics server, independent
+            // of this log level. Keep the line at DEBUG for opt-in local tracing.
+            debug!(
                 "BotAq: tier change -> video='{}' ({}kbps, {}x{}@{}fps, kf={}), audio='{}' ({}kbps, fec={}, dtx={})",
                 video.label,
                 video.ideal_bitrate_kbps,

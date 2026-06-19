@@ -1655,4 +1655,229 @@ mod tests {
             "exchange response must carry Cache-Control: no-store"
         );
     }
+
+    // --- exchange: JWT validation failures map to 401, not 500 (HCL #1468) ---
+
+    /// Generate an RSA keypair and a [`JwksCache`] pre-loaded with the public
+    /// key under `kid`, plus the matching `EncodingKey` for signing test tokens.
+    fn signing_keypair_and_jwks(
+        kid: &str,
+    ) -> (jsonwebtoken::EncodingKey, std::sync::Arc<oauth::JwksCache>) {
+        use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey};
+        use rsa::pkcs8::{EncodePrivateKey, EncodePublicKey};
+        use rsa::RsaPrivateKey;
+
+        let mut rng = rand::thread_rng();
+        let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let priv_pem = private_key
+            .to_pkcs8_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap();
+        let encoding = EncodingKey::from_rsa_pem(priv_pem.as_bytes()).unwrap();
+
+        let pub_pem = private_key
+            .to_public_key()
+            .to_public_key_pem(rsa::pkcs8::LineEnding::LF)
+            .unwrap();
+        let decoding = DecodingKey::from_rsa_pem(pub_pem.as_bytes()).unwrap();
+
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(kid.to_string(), (Algorithm::RS256, decoding));
+        (encoding, oauth::JwksCache::with_keys(keys))
+    }
+
+    /// Sign an RS256 id_token for the given claims under `kid`.
+    fn sign_id_token(
+        encoding: &jsonwebtoken::EncodingKey,
+        kid: &str,
+        claims: &serde_json::Value,
+    ) -> String {
+        use jsonwebtoken::{Algorithm, Header};
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        jsonwebtoken::encode(&header, claims, encoding).unwrap()
+    }
+
+    /// Drive the real `exchange` handler with a verified-JWKS state and an
+    /// **expired** id_token. The provider/exchange itself succeeded, so the
+    /// only failure is token validation — which MUST surface as HTTP 401, not
+    /// 500. Before the #1468 fix this returned 500 (INTERNAL_ERROR).
+    #[tokio::test]
+    async fn exchange_with_expired_id_token_returns_401_not_500() {
+        use http_body_util::BodyExt;
+        use tower::ServiceExt;
+
+        let kid = "exchange-test-kid";
+        let (encoding, jwks) = signing_keypair_and_jwks(kid);
+
+        // Expired token signed with the JWKS-matching key. `aud` must equal the
+        // client_id so the only failing check is `exp`.
+        let expired = serde_json::json!({
+            "sub":   "user@example.com",
+            "email": "user@example.com",
+            "name":  "Test User",
+            "aud":   "test-client",
+            "iss":   "https://provider.example.com",
+            "exp":   1_000_000, // long expired
+            "iat":   900_000,
+        });
+        let id_token = sign_id_token(&encoding, kid, &expired);
+
+        let token_body = serde_json::json!({
+            "access_token": "fake-access-token",
+            "token_type":   "Bearer",
+            "id_token":     id_token,
+        })
+        .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let mock_router = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let body = token_body.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.ok();
+        });
+
+        let mut cfg = minimal_oauth_config(None, None);
+        cfg.token_url = format!("http://{mock_addr}/token");
+        cfg.issuer = Some("https://provider.example.com".to_string());
+        let mut state = make_handler_state(Some(cfg));
+        state.jwks_cache = Some(jwks);
+
+        let app = axum::Router::new()
+            .route("/api/v1/oauth/exchange", axum::routing::post(exchange))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/oauth/exchange")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({"code": "test-code", "code_verifier": "test-verifier"})
+                    .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        // This assertion FAILS (becomes 500) if the decode-error mapping is
+        // reverted to AppError::internal.
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "expired id_token at exchange must yield 401, not 500"
+        );
+
+        // SECURITY: the response body must not leak token material or
+        // jsonwebtoken internals — only a generic auth message.
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        let body_str = String::from_utf8_lossy(&bytes);
+        assert!(
+            body_str.contains("UNAUTHORIZED"),
+            "body should carry the UNAUTHORIZED code, got: {body_str}"
+        );
+        // Note: bare "exp" would false-positive on the generic word
+        // "expired"; assert the JSON claim key `"exp"` and the signed token
+        // itself are absent instead.
+        for leak in [
+            "ExpiredSignature",
+            "\"exp\"",
+            "InvalidSignature",
+            "JWT validation failed",
+            "user@example.com",
+            &id_token[..],
+        ] {
+            assert!(
+                !body_str.contains(leak),
+                "response body must not leak token internals ({leak:?}), got: {body_str}"
+            );
+        }
+    }
+
+    /// A token signed by a key absent from the JWKS (bad signature) must also
+    /// yield 401 at exchange, not 500.
+    #[tokio::test]
+    async fn exchange_with_bad_signature_returns_401_not_500() {
+        use tower::ServiceExt;
+
+        let kid = "sig-test-kid";
+        // JWKS holds key A; token is signed with key B (different keypair) but
+        // claims the same kid → signature verification fails.
+        let (_good_encoding, jwks) = signing_keypair_and_jwks(kid);
+        let (attacker_encoding, _discard) = signing_keypair_and_jwks(kid);
+
+        let claims = serde_json::json!({
+            "sub":   "user@example.com",
+            "email": "user@example.com",
+            "name":  "Test User",
+            "aud":   "test-client",
+            "iss":   "https://provider.example.com",
+            "exp":   chrono::Utc::now().timestamp() + 3600,
+        });
+        let id_token = sign_id_token(&attacker_encoding, kid, &claims);
+
+        let token_body = serde_json::json!({
+            "access_token": "fake-access-token",
+            "token_type":   "Bearer",
+            "id_token":     id_token,
+        })
+        .to_string();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mock_addr = listener.local_addr().unwrap();
+        let mock_router = axum::Router::new().route(
+            "/token",
+            axum::routing::post(move || {
+                let body = token_body.clone();
+                async move {
+                    axum::response::Response::builder()
+                        .status(200)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap()
+                }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, mock_router).await.ok();
+        });
+
+        let mut cfg = minimal_oauth_config(None, None);
+        cfg.token_url = format!("http://{mock_addr}/token");
+        cfg.issuer = Some("https://provider.example.com".to_string());
+        let mut state = make_handler_state(Some(cfg));
+        state.jwks_cache = Some(jwks);
+
+        let app = axum::Router::new()
+            .route("/api/v1/oauth/exchange", axum::routing::post(exchange))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .method("POST")
+            .uri("/api/v1/oauth/exchange")
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(
+                serde_json::json!({"code": "test-code", "code_verifier": "test-verifier"})
+                    .to_string(),
+            ))
+            .unwrap();
+
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "bad-signature id_token at exchange must yield 401, not 500"
+        );
+    }
 }

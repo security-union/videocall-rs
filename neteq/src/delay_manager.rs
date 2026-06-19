@@ -284,7 +284,16 @@ impl DelayManager {
         self.target_level_ms = K_START_DELAY_MS.max(self.config.base_minimum_delay_ms);
         self.resampled_relative_delay = 0;
         self.last_resample_time = None;
-        // Reset to 80ms like WebRTC
+        // Also clear the inter-arrival-delay histogram. Without this, a reset left the histogram's
+        // accumulated (possibly ratcheted-high) distribution intact, so the very next `update()`
+        // re-derived the old high target via the quantile — i.e. the "reset" did not actually
+        // recalibrate the adaptive target. This matters for the #1299 resync-to-live governor
+        // (`flush_to_live` resets here after flushing the backlog so playback can resume against a
+        // live setpoint) and is correct for the other LIVE caller too — `NetEq::reset()`, reached
+        // via either the ~6 s expand safety-valve or `flush()` (the peer audio-off path) — exactly
+        // the discontinuities after which stale jitter history should be abandoned. Resets to ~80ms
+        // like WebRTC.
+        self.histogram.reset();
     }
 
     /// Get the current target delay in milliseconds

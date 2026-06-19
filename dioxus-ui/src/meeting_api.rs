@@ -170,6 +170,25 @@ where
     result
 }
 
+/// Public single-flight provider-refresh entry for callers OUTSIDE the meeting
+/// API path.
+///
+/// Returns `Ok(())` if the refresh produced a token, `Err(())` otherwise.
+///
+/// Routing an external caller through here — rather than calling
+/// `auth::refresh_access_token()` directly — means an external-caller refresh and
+/// a concurrent meeting-driven refresh COALESCE through the same
+/// `REFRESH_INFLIGHT` slot: the underlying PKCE network POST fires exactly once
+/// per wave even if the meeting path 401s and the external caller observes
+/// `token_expired` at the same instant (a likely race, since both auth on the
+/// SAME session token and expire together). Without this, two separate refreshes
+/// could fire, the second using a refresh-token the first already rotated away
+/// (Okta rotates refresh tokens) → a spurious `invalid_grant` that clears the
+/// now-valid token and logs the user out.
+pub async fn refresh_token_single_flight() -> Result<(), ()> {
+    refresh_single_flight().await
+}
+
 /// Reset the single-flight refresh slot. Called on logout so a Shared future
 /// cloned by an in-flight wave cannot linger. Bumping REFRESH_EPOCH ensures any
 /// straggler that resolves later will NOT clear (or be mistaken for) a future
@@ -288,6 +307,11 @@ pub async fn leave_meeting(meeting_id: &str) -> Result<(), JoinError> {
         }
         Err(e) => Err(e),
     }
+}
+
+pub async fn transfer_host(meeting_id: &str, user_id: &str) -> Result<(), JoinError> {
+    log::info!("Transferring host via API: {meeting_id} -> {user_id}");
+    client()?.transfer_host(meeting_id, user_id).await
 }
 
 pub async fn update_display_name(

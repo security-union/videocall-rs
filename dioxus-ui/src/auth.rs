@@ -34,10 +34,10 @@
 //! PKCE — no `client_secret` in the browser) and stores the returned tokens in
 //! `sessionStorage` under `"vc_access_token"` and `"vc_id_token"`.
 //!
-//! Storage is managed through [`dioxus_sdk_storage::SessionStorage`], which
-//! maps to the browser's `sessionStorage` on web (tab-scoped, discarded when
-//! the tab closes) and to an in-memory store on native platforms.  This
-//! ensures tokens never outlive the session and are never persisted to disk.
+//! Storage is managed through plain-text `web_sys` `sessionStorage` helpers
+//! (see [`crate::context`]), which map to the browser's `sessionStorage` on
+//! web (tab-scoped, discarded when the tab closes).  This ensures tokens
+//! never outlive the session and are never persisted to disk.
 //!
 //! Every call to [`meeting_api_client`](crate::constants::meeting_api_client)
 //! reads the stored token and creates a client in `Bearer` mode.
@@ -52,9 +52,9 @@ use crate::constants::{
     login_url, meeting_api_client, oauth_auth_url, oauth_client_id, oauth_prompt,
     oauth_redirect_url, oauth_scopes,
 };
+use crate::context::{read_session_storage, remove_session_storage, write_session_storage};
 use crate::pkce::{self};
 use anyhow::anyhow;
-use dioxus_sdk_storage::{SessionStorage, StorageBacking};
 use gloo_utils::window;
 use videocall_meeting_types::responses::ProfileResponse;
 
@@ -66,9 +66,9 @@ pub type UserProfile = ProfileResponse;
 
 /// Session-storage key for the provider id_token JWT.
 ///
-/// Using session-scoped storage (browser `sessionStorage` on web; in-memory
-/// on native) limits token lifetime to the current session and prevents the
-/// token from persisting after the user closes the tab or the app exits.
+/// Using the browser's `sessionStorage` (tab-scoped, discarded on tab close)
+/// limits token lifetime to the current session and prevents the token from
+/// persisting after the user closes the tab.
 const ID_TOKEN_KEY: &str = "vc_id_token";
 
 /// Session-storage key for the provider access token.
@@ -81,10 +81,10 @@ const ACCESS_TOKEN_KEY: &str = "vc_access_token";
 
 /// Session-storage key for the provider refresh token.
 ///
-/// Like the access/id tokens this is session-scoped (browser `sessionStorage`
-/// on web; in-memory on native) and is **never persisted to disk**. It is only
-/// present on PKCE deployments where the IdP grants `offline_access`; on
-/// server-side-OAuth (cookie) deployments it is never set or read.
+/// Like the access/id tokens this is session-scoped (browser `sessionStorage`,
+/// tab-scoped, discarded on tab close) and is **never persisted to disk**. It
+/// is only present on PKCE deployments where the IdP grants `offline_access`;
+/// on server-side-OAuth (cookie) deployments it is never set or read.
 const REFRESH_TOKEN_KEY: &str = "vc_refresh_token";
 
 /// Session-storage key for the user's canonical identifier extracted from the
@@ -101,19 +101,17 @@ const GUEST_SESSION_ID_KEY: &str = "vc_guest_session_id";
 
 /// Read the stable guest session ID for the current tab, if any.
 pub fn get_guest_session_id() -> Option<String> {
-    SessionStorage::get::<Option<String>>(&GUEST_SESSION_ID_KEY.to_string()).flatten()
+    read_session_storage(GUEST_SESSION_ID_KEY)
 }
 
 /// Persist the guest session ID so re-joins reuse the same participant row.
 pub fn store_guest_session_id(id: &str) {
-    SessionStorage::set(GUEST_SESSION_ID_KEY.to_string(), &Some(id.to_string()));
+    write_session_storage(GUEST_SESSION_ID_KEY, id);
 }
 
 /// Clear the guest session ID.
 pub fn clear_guest_session_id() {
-    if let Ok(Some(storage)) = window().session_storage() {
-        let _ = storage.remove_item(GUEST_SESSION_ID_KEY);
-    }
+    remove_session_storage(GUEST_SESSION_ID_KEY);
 }
 
 // ---------------------------------------------------------------------------
@@ -125,19 +123,17 @@ pub fn clear_guest_session_id() {
 /// On web this reads from the browser's `sessionStorage`.  On native it reads
 /// from the in-memory session store.
 pub fn get_stored_id_token() -> Option<String> {
-    SessionStorage::get::<Option<String>>(&ID_TOKEN_KEY.to_string())
-        .flatten()
-        .filter(|t| !t.is_empty())
+    read_session_storage(ID_TOKEN_KEY)
 }
 
 /// Store the provider id_token in session-scoped storage.
 pub fn store_id_token(token: &str) {
-    SessionStorage::set(ID_TOKEN_KEY.to_string(), &Some(token.to_string()));
+    write_session_storage(ID_TOKEN_KEY, token);
 }
 
 /// Clear the stored id_token from session-scoped storage.
 pub fn clear_id_token() {
-    SessionStorage::set(ID_TOKEN_KEY.to_string(), &None::<String>);
+    remove_session_storage(ID_TOKEN_KEY);
     // Invalidate any in-flight refresh so its result is not written back.
     bump_auth_clear_epoch();
 }
@@ -155,16 +151,14 @@ pub fn clear_id_token() {
 /// through as-is to the meeting-api and never decoded or inspected by the
 /// browser.
 pub fn get_stored_access_token() -> Option<String> {
-    SessionStorage::get::<Option<String>>(&ACCESS_TOKEN_KEY.to_string())
-        .flatten()
-        .filter(|t| !t.is_empty())
+    read_session_storage(ACCESS_TOKEN_KEY)
 }
 
 /// Store the provider access token in session-scoped storage.
 ///
 /// Called by the OAuth callback page after a successful token exchange.
 pub fn store_access_token(token: &str) {
-    SessionStorage::set(ACCESS_TOKEN_KEY.to_string(), &Some(token.to_string()));
+    write_session_storage(ACCESS_TOKEN_KEY, token);
 }
 
 /// Clear the stored access token from session-scoped storage.
@@ -172,7 +166,7 @@ pub fn store_access_token(token: &str) {
 /// Called on logout so subsequent requests are unauthenticated immediately,
 /// even before the browser navigation to the logout endpoint completes.
 pub fn clear_access_token() {
-    SessionStorage::set(ACCESS_TOKEN_KEY.to_string(), &None::<String>);
+    remove_session_storage(ACCESS_TOKEN_KEY);
     // Invalidate any in-flight refresh so its result is not written back.
     bump_auth_clear_epoch();
 }
@@ -212,9 +206,7 @@ pub fn bump_auth_clear_epoch() {
 /// Returns `None` when the IdP did not grant `offline_access`, when no OAuth
 /// exchange has been completed in this session, or when it was cleared.
 pub fn get_stored_refresh_token() -> Option<String> {
-    SessionStorage::get::<Option<String>>(&REFRESH_TOKEN_KEY.to_string())
-        .flatten()
-        .filter(|t| !t.is_empty())
+    read_session_storage(REFRESH_TOKEN_KEY)
 }
 
 /// Store the provider refresh token in session-scoped storage.
@@ -222,12 +214,12 @@ pub fn get_stored_refresh_token() -> Option<String> {
 /// Called by the OAuth callback page after a successful exchange and on each
 /// successful refresh that rotates the token.
 pub fn store_refresh_token(token: &str) {
-    SessionStorage::set(REFRESH_TOKEN_KEY.to_string(), &Some(token.to_string()));
+    write_session_storage(REFRESH_TOKEN_KEY, token);
 }
 
 /// Clear the stored refresh token from session-scoped storage.
 pub fn clear_refresh_token() {
-    SessionStorage::set(REFRESH_TOKEN_KEY.to_string(), &None::<String>);
+    remove_session_storage(REFRESH_TOKEN_KEY);
     // Invalidate any in-flight refresh so its result is not written back.
     bump_auth_clear_epoch();
 }
@@ -337,11 +329,8 @@ pub async fn refresh_access_token() -> Result<String, String> {
 /// `display_name` is the raw display name resolved from the token's `name`,
 /// `given_name`/`family_name`, `email`, or `sub` claims in that order.
 pub fn store_user_profile(user_id: &str, display_name: &str) {
-    SessionStorage::set(PROFILE_USER_ID_KEY.to_string(), &Some(user_id.to_string()));
-    SessionStorage::set(
-        PROFILE_DISPLAY_NAME_KEY.to_string(),
-        &Some(display_name.to_string()),
-    );
+    write_session_storage(PROFILE_USER_ID_KEY, user_id);
+    write_session_storage(PROFILE_DISPLAY_NAME_KEY, display_name);
 }
 
 /// Read the cached user profile from session-scoped storage.
@@ -350,12 +339,8 @@ pub fn store_user_profile(user_id: &str, display_name: &str) {
 /// present (set by the OAuth callback page after a successful token exchange).
 /// Returns `None` when no profile has been cached yet.
 pub fn get_stored_user_profile() -> Option<UserProfile> {
-    let user_id = SessionStorage::get::<Option<String>>(&PROFILE_USER_ID_KEY.to_string())
-        .flatten()
-        .filter(|s| !s.is_empty())?;
-    let name = SessionStorage::get::<Option<String>>(&PROFILE_DISPLAY_NAME_KEY.to_string())
-        .flatten()
-        .unwrap_or_default();
+    let user_id = read_session_storage(PROFILE_USER_ID_KEY)?;
+    let name = read_session_storage(PROFILE_DISPLAY_NAME_KEY).unwrap_or_default();
     Some(UserProfile { user_id, name })
 }
 
@@ -364,8 +349,8 @@ pub fn get_stored_user_profile() -> Option<UserProfile> {
 /// Called on logout so stale profile data cannot be observed after the
 /// user signs out.
 pub fn clear_user_profile() {
-    SessionStorage::set(PROFILE_USER_ID_KEY.to_string(), &None::<String>);
-    SessionStorage::set(PROFILE_DISPLAY_NAME_KEY.to_string(), &None::<String>);
+    remove_session_storage(PROFILE_USER_ID_KEY);
+    remove_session_storage(PROFILE_DISPLAY_NAME_KEY);
 }
 
 // ---------------------------------------------------------------------------
@@ -745,9 +730,7 @@ fn resolve_return_to_for_do_login() -> Option<String> {
     //    value survives for the user's next login attempt.  It is overwritten
     //    by save_pkce_state on a successful redirect and cleared by
     //    clear_pkce_state after a completed exchange.
-    let val = SessionStorage::get::<Option<String>>(&pkce::RETURN_TO_KEY.to_string())
-        .flatten()
-        .filter(|s| !s.is_empty());
+    let val = read_session_storage(pkce::RETURN_TO_KEY);
     if val.is_some() {
         return val;
     }

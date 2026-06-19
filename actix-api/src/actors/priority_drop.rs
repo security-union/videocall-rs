@@ -222,6 +222,11 @@ impl OutboundPriority {
             // from receiver-downlink overflow, but if such a packet exists
             // it must not be shed by the priority policy.
             PacketType::CONGESTION => OutboundPriority::Critical,
+            // DOWNLINK_CONGESTION is the relay-authored receiver-directed
+            // congestion signal (#1219 Half 2). It carries the critical
+            // "your downlink is saturated — step down" instruction; losing
+            // it delays the client's layer-chooser step-down response.
+            PacketType::DOWNLINK_CONGESTION => OutboundPriority::Critical,
             // RSA_PUB_KEY and AES_KEY are both halves of the E2EE
             // handshake — RSA_PUB_KEY initiates the asymmetric step and
             // AES_KEY delivers the symmetric session key encrypted under

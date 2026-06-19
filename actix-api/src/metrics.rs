@@ -57,8 +57,24 @@ pub async fn metrics_responder() -> impl Responder {
 // API requires the FULL label tuple (it hashes every variable label — there is
 // no partial-match removal), so for multi-label counters we must enumerate the
 // cartesian product of the OTHER labels' fixed taxonomies. These consts are
-// that authoritative enumeration; `metrics::tests` cross-checks they cover the
-// labels the code actually emits so the bound cannot silently leak.
+// that authoritative enumeration.
+//
+// `metrics::tests::relay_drop_kinds_covers_all_emitted_drop_labels` cross-checks
+// that `RELAY_DROP_KINDS` covers the labels the code emits, with two tiers of
+// guarantee (issue #1186):
+//   * For the `kind` labels produced by FUNCTIONS — `drop_kind_label`
+//     (ws/wt transports) and `OutboundPriority::priority_drop_label` — the test
+//     ENUMERATES the real emit functions over their full input domains
+//     (`MediaType::VALUES`, all `OutboundPriority` variants). A NEW label
+//     returned by either function is therefore caught automatically, and a new
+//     `MediaType` / `OutboundPriority` variant that changes the output is forced
+//     into the enumeration. This tier cannot silently leak a new kind.
+//   * For the bare string LITERALS emitted with no enumerable source of truth
+//     (`mailbox_full`, `channel_full` at the fan-out / transport drop sites and
+//     `overflow_critical` at the Critical-overflow site) the test keeps a
+//     hand-maintained witness list. That tier guards against DELETIONS from
+//     `RELAY_DROP_KINDS` only — a brand-new literal added at one of those sites
+//     without updating both the const and the witness would NOT be caught.
 
 /// Every `drop_reason`/`kind` label ever passed to a relay drop counter.
 ///
@@ -168,6 +184,9 @@ pub fn forget_room_metrics(room: &str) {
     let _ = RELAY_LAYER_FORWARDED_TOTAL.remove_label_values(&[room]);
     // relay_congestion_filtered_total{room} (#1220).
     let _ = RELAY_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
+    // relay_downlink_congestion_filtered_total{room} (#1219 Half 2) — same
+    // room-keyed unicast-filter sibling; swept alongside its CONGESTION cousin.
+    let _ = RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
 
     // relay_room_bytes_total{room, direction}.
     for direction in ["inbound", "outbound"] {
@@ -248,6 +267,31 @@ pub fn forget_room_metrics(room: &str) {
     let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
 }
 
+/// Remove a single session's `relay_session_drops_total` series across the FULL
+/// drop-kind taxonomy (issue #1090).
+///
+/// `relay_session_drops_total{room, transport, session_id, kind}` carries an
+/// unbounded-over-time `session_id` label, so the series for a disconnected
+/// session must be removed the moment its actor stops or it leaks for the
+/// process lifetime. This is the single source of truth for that sweep: it is
+/// called by `SessionLogic::on_stopping` (the runtime path) AND pinned directly
+/// by `metrics::tests::session_drop_gc_iterates_full_taxonomy_unconditionally`,
+/// so the test exercises the real GC code instead of an inline replica of it.
+/// (That test pins THIS helper's full-taxonomy sweep; it does not exercise the
+/// `on_stopping` call site itself — see #1380.)
+///
+/// LEAK-PROOF: we iterate the entire fixed [`RELAY_DROP_KINDS`] taxonomy
+/// unconditionally rather than a per-session "kinds I emitted" tracking set.
+/// `remove_label_values` on a `(…, kind)` tuple that was never created returns a
+/// benign `Err` (hence each call is `let _ =`-discarded), so a session that only
+/// ever incremented a subset of kinds is still fully cleaned, and there is no
+/// second bookkeeping structure that could silently fall out of sync.
+pub fn forget_session_drops(room: &str, transport: &str, session_id: &str) {
+    for kind in RELAY_DROP_KINDS {
+        let _ = RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[room, transport, session_id, kind]);
+    }
+}
+
 lazy_static! {
     /// Total number of health reports received
     pub static ref HEALTH_REPORTS_TOTAL: Counter = register_counter!(
@@ -279,6 +323,21 @@ lazy_static! {
         &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create neteq_audio_buffer_ms metric");
+
+    /// Per-peer audio playout latency in ms (#1299): how far behind live a receiver's audio
+    /// playout sits — NetEQ's WebRTC-style FILTERED current buffer level (the EWMA-smoothed
+    /// playout buffer the Accelerate gate compares against high_limit). The audio sibling of
+    /// `videocall_video_playout_latency_ms` (#1252). Distinct from `videocall_neteq_audio_buffer_ms`
+    /// (the RAW instantaneous snapshot) and `videocall_neteq_target_delay_ms` (the TARGET, not the
+    /// actual level). 0 = at live; a sustained multi-second value is the #1299 lag. Set
+    /// UNCONDITIONALLY so the gauge recovers to 0 when audio catches back up to live.
+    /// Observability only — no governor/resync attached.
+    pub static ref AUDIO_PLAYOUT_LATENCY_MS: GaugeVec = register_gauge_vec!(
+        "videocall_audio_playout_latency_ms",
+        "Per-peer audio playout latency in ms (how far behind live); NetEQ filtered playout buffer level. Sustained multi-second => #1299 lag",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create audio_playout_latency_ms metric");
 
     /// NetEQ packets waiting for decode
     pub static ref NETEQ_PACKETS_AWAITING_DECODE: GaugeVec = register_gauge_vec!(
@@ -549,6 +608,56 @@ lazy_static! {
     )
     .expect("Failed to create keyframe_requests_per_sec metric");
 
+    /// Per-peer buffered video playout latency in ms (#1252): how far behind live a receiver's
+    /// decoded video is, spanning the jitter-buffer backlog (stage 1) + WebCodecs decoder queue
+    /// (stage 2). Reported only while the tile is actively receiving (fps_received > 0); 0 = at
+    /// live. Sustained > 1800ms is the #1252 audio-ahead-of-video lag.
+    pub static ref VIDEO_PLAYOUT_LATENCY_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_playout_latency_ms",
+        "Per-peer buffered video playout latency in ms (how far behind live); spans jitter-buffer backlog + decoder queue. Sustained >1800ms => #1252 lag",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_playout_latency_ms metric");
+
+    /// Per-peer stage-1 attribution of `videocall_video_playout_latency_ms` (#1252): the
+    /// jitter-buffer backlog span alone. Lets a dashboard tell whether the #1024 release-side gate
+    /// REMOVED the backlog (total drops with this) or merely RELOCATED it into the decoder queue
+    /// (total stays high while this drops).
+    pub static ref VIDEO_PLAYOUT_STAGE1_SPAN_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_playout_stage1_span_ms",
+        "Per-peer jitter-buffer backlog span in ms — stage-1 attribution of videocall_video_playout_latency_ms",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_playout_stage1_span_ms metric");
+
+    /// Per-peer stage-3 paint lag in ms (#1252): decoded-but-unpainted frames living in the
+    /// worker->main `postMessage` queue + main-thread paint task queue — a region the stage-2
+    /// decoder-queue depth cannot observe. Computed in the worker as
+    /// (frames_emitted − frames_painted) × source frame interval. Reported only while the tile is
+    /// actively receiving (fps_received > 0); 0 = at live. Complements
+    /// `videocall_video_playout_latency_ms`: if total lag stays high while latency_ms is low, the
+    /// backlog has relocated downstream into the paint path.
+    pub static ref VIDEO_PLAYOUT_PAINT_LAG_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_playout_paint_lag_ms",
+        "Per-peer stage-3 paint lag in ms — decoded-but-unpainted backlog in the worker->main postMessage + paint queues (#1252)",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_playout_paint_lag_ms metric");
+
+    /// Per-peer cumulative count of resync-to-live governor skips (#1252): how many times the
+    /// decode-side governor jumped this receiver→source stream forward to live to shed accumulated
+    /// lag. A COUNTER value held in a GaugeVec (set to the current cumulative total) so the per-pair
+    /// `remove_label_values` cleanup GCs it with the sibling playout gauges. It rises within a
+    /// decoder-pipeline lifetime but resets to 0 on the client's `reset_pipeline()` (decoder-error
+    /// recovery), so query with `increase()`/`rate()`, which tolerate the reset. Unlike the ms
+    /// gauges it is reported unconditionally (even at fps 0). A rising value proves the governor fired.
+    pub static ref VIDEO_SKIP_TO_LIVE_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_video_skip_to_live_total",
+        "Cumulative resync-to-live governor skips per receiver→source pair (#1252); a rising value proves the governor fired",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_skip_to_live_total metric");
+
     /// Call quality score (0-100, min of audio and video)
     pub static ref CALL_QUALITY_SCORE: GaugeVec = register_gauge_vec!(
         "videocall_call_quality_score",
@@ -649,6 +758,29 @@ lazy_static! {
     )
     .expect("Failed to create keyframe_requests_sent_total metric");
 
+    /// RTT-probe drop backpressure (#522): cumulative count of RTT probes the
+    /// client dropped because the in-flight probe queue was at its cap, as of the
+    /// latest client health snapshot. GaugeVec set() to the client's cumulative
+    /// value (NOT inc()); chart with rate()/increase(). See the CLIENT_REELECTION_TOTAL
+    /// type-decision note.
+    pub static ref RTT_PROBE_DROPPED_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_rtt_probe_dropped_total",
+        "Cumulative RTT probes dropped at the client's in-flight queue cap (#522 backpressure) as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create rtt_probe_dropped_total metric");
+
+    /// RTT-probe stale-suppression count (#522): cumulative count of 1 Hz client
+    /// diagnostics ticks on which the active link's RTT-probe pipeline was stale and
+    /// active_server_rtt was suppressed, as of the latest client health snapshot.
+    /// GaugeVec set() to the client's cumulative value (NOT inc()).
+    pub static ref RTT_PROBE_STALE_SUPPRESSIONS_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_rtt_probe_stale_suppressions_total",
+        "Cumulative client diagnostics ticks where the active link's RTT-probe pipeline was stale and active_server_rtt was suppressed (#522) as of the latest client health snapshot",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create rtt_probe_stale_suppressions_total metric");
+
     /// Cumulative transport re-election outcomes reported by the client
     /// (dashboard audit Tier B #3; discussion #562).
     ///
@@ -676,6 +808,28 @@ lazy_static! {
         &["meeting_id", "session_id", "result"]
     )
     .expect("Failed to create videocall_client_reelection_total metric");
+
+    /// Cumulative encoder auto-restart cycles reported by the client (#527),
+    /// partitioned by encoder `kind` (camera|screen) and `reason`
+    /// (closed_codec|memory|configure|other).
+    ///
+    /// TYPE DECISION — GaugeVec, NOT CounterVec: identical reasoning to
+    /// CLIENT_REELECTION_TOTAL above. The client reports a CUMULATIVE per-reason
+    /// total in every health packet; the expander `.set()`s this gauge to that
+    /// value. `.inc()`-ing a CounterVec per packet would multiply-count the same
+    /// cumulative value once per second. The client value is monotonic within a
+    /// page session, so Grafana charts restart RATE with `rate()`/`increase()`
+    /// exactly as for the sibling `*_total` gauges; a page reload that resets the
+    /// client statics shows as a gauge drop (the same accepted caveat).
+    ///
+    /// CARDINALITY: `meeting_id` × `session_id` × 2 `kind` × 4 `reason` (bounded).
+    /// Per-session series are GC'd by the metrics-server's stale-session cleanup.
+    pub static ref ENCODER_RESTART_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_encoder_restart_total",
+        "Cumulative encoder auto-restart cycles reported by the client, by encoder kind (camera|screen) and reason (closed_codec|memory|configure|other). GaugeVec set() to the client's cumulative value; chart with rate()/increase() (#527)",
+        &["meeting_id", "session_id", "kind", "reason"]
+    )
+    .expect("Failed to create videocall_encoder_restart_total metric");
 
     // ===== ENCODER & SCREEN SHARE METRICS (sender-side, P0/P1) =====
     // NOTE(#1184): videocall_encoder_fps_ratio / videocall_encoder_bitrate_ratio
@@ -791,6 +945,22 @@ lazy_static! {
         &["meeting_id", "session_id", "peer_id", "display_name"]
     )
     .expect("Failed to create capability_score metric");
+
+    /// Client battery level (0.0–1.0) as a NUMERIC gauge (#1392). PR #1368 widened
+    /// the TELEM-7 `CLIENT_INFO` publish gate to admit a battery-only health packet,
+    /// but the battery *value* rode on no metric — `CLIENT_INFO`'s labels are
+    /// cores/architecture/gpu_family/network_effective_type/capability_score only.
+    /// This exposes the reported level as a real measurement so it can be
+    /// thresholded/averaged/quantiled in PromQL (e.g. "fraction of clients under
+    /// 20% battery"). Mirrors `CAPABILITY_SCORE`: same per-reporter label set, set
+    /// only when actually reported so an absent battery stays absent (not a
+    /// misleading 0).
+    pub static ref BATTERY_LEVEL: GaugeVec = register_gauge_vec!(
+        "videocall_client_battery_level",
+        "Client battery level as a numeric value in [0,1] (0.0 = empty, 1.0 = full); absent when the client did not report a battery level",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_battery_level metric");
 
     /// Effective simulcast layer count the publisher is configured to encode/send
     /// (#1143). p90==1 across a meeting is the inert-simulcast signal that the
@@ -1502,6 +1672,92 @@ lazy_static! {
         &["meeting_id", "session_id", "display_name"]
     )
     .expect("Failed to create videocall_client_render_fps metric");
+
+    // ===== RECEIVER DOWNLINK CONGESTION (#1219 Half 2) =====
+
+    /// Per-receiver downlink congestion shedding episodes (entered shedding mode)
+    /// (#1219 Half 2).
+    ///
+    /// Incremented once on the rising edge of each episode — when this receiver's
+    /// REAL downlink backpressure (its bounded per-session outbound channel
+    /// overflowing, observed by the windowed `CongestionTracker`) crosses into
+    /// active congestion and the relay begins shedding non-base layers. This is
+    /// the receiver-directed complement of the existing sender-directed
+    /// CONGESTION signal: it detects when the relay-to-receiver link (not the
+    /// sender-to-relay link) is saturated. (It is NOT keyed off the actor-mailbox
+    /// `Full`, which measures room-wide fan-out burst, not a single receiver's
+    /// downlink — see #1219 Half-2 B1.)
+    ///
+    /// CARDINALITY: bounded — `transport` only (2 values: `websocket`,
+    /// `webtransport`). Safe for indefinite retention.
+    pub static ref RELAY_RECEIVER_DOWNLINK_CONGESTION_TOTAL: CounterVec = register_counter_vec!(
+        "relay_receiver_downlink_congestion_total",
+        "Receivers entering downlink congestion shedding mode (windowed CongestionTracker crossing) (#1219)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_receiver_downlink_congestion_total metric");
+
+    /// Per-receiver downlink congestion recovery (exited shedding mode) (#1219
+    /// Half 2).
+    ///
+    /// Incremented once on the falling edge of each episode — when the receiver's
+    /// downlink-congestion relief window (`RECEIVER_DOWNLINK_RELIEF_WINDOW`)
+    /// elapses with no fresh overflow, so the windowed signal goes inactive and
+    /// the relay resumes full-layer forwarding. Recovery is the natural decay of
+    /// the window, NOT a count of strictly-consecutive successful sends (which
+    /// could be reset forever by an occasional drop and wedge a healthy link —
+    /// #1219 Half-2 B2). The difference `congestion_total - recovered_total`
+    /// gives the current count of receivers still in shedding mode.
+    ///
+    /// CARDINALITY: bounded — `transport` only (2 values). Safe for indefinite
+    /// retention.
+    pub static ref RELAY_RECEIVER_DOWNLINK_RECOVERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_receiver_downlink_recovered_total",
+        "Receivers exiting downlink congestion shedding mode (relief window elapsed) (#1219)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_receiver_downlink_recovered_total metric");
+
+    /// Non-base-layer media packets shed by the downlink congestion pre-filter
+    /// (#1219 Half 2).
+    ///
+    /// Incremented each time a non-base (layer > 0) VIDEO/SCREEN packet is
+    /// discarded for a receiver in shedding mode (its windowed downlink signal is
+    /// active) BEFORE reaching `try_send`. This is the volume of proactive
+    /// shedding the congestion relief performs — distinct from the
+    /// `relay_packet_drops_total{drop_reason=mailbox_full}` counter (which counts
+    /// packets lost at the mailbox itself). Together they tell the story:
+    /// shedding removes volume before the mailbox enqueue, so it should REDUCE
+    /// the downstream mailbox/channel drops a saturated receiver would otherwise
+    /// incur.
+    ///
+    /// CARDINALITY: bounded — `transport` only (2 values). Safe for indefinite
+    /// retention.
+    pub static ref RELAY_DOWNLINK_SHED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_shed_total",
+        "Non-base-layer media packets shed before try_send for receivers in downlink congestion (#1219)",
+        &["transport"]
+    )
+    .expect("Failed to create relay_downlink_shed_total metric");
+
+    /// DOWNLINK_CONGESTION control packets dropped by the relay's unicast filter
+    /// because they did not target the receiving session (#1219 Half 2).
+    ///
+    /// The relay publishes DOWNLINK_CONGESTION on the target receiver's OWN
+    /// per-session subject, but the `room.{room}.*` NATS wildcard fans every
+    /// packet out to every session; this counts the non-target copies dropped
+    /// before they reach a transport. Kept SEPARATE from
+    /// `relay_congestion_filtered_total` (the sender-keyed CONGESTION sibling) so
+    /// the two relay-authored unicast packet classes stay distinguishable on the
+    /// dashboards — they have different root causes and fan-out shapes.
+    ///
+    /// CARDINALITY: bounded — `room` only, same as the CONGESTION sibling.
+    pub static ref RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_downlink_congestion_filtered_total",
+        "DOWNLINK_CONGESTION packets dropped by the unicast filter (not targeting this session) (#1219)",
+        &["room"]
+    )
+    .expect("Failed to create relay_downlink_congestion_filtered_total metric");
 }
 
 // =============================================================================
@@ -1725,42 +1981,120 @@ mod tests {
     // ===== Room-label cardinality bound (issue #996) + drop-kind GC (#1090) =====
 
     /// `RELAY_DROP_KINDS` is the single source of truth for the room-drain GC
-    /// (`forget_room_metrics`) and the per-session GC (`on_stopping`). If it
-    /// stops covering a `kind`/`drop_reason` the emit sites actually use, that
-    /// series would leak forever. This pins it as a SUPERSET of:
-    ///   * the `videocall_outbound_channel_drops_total` / `relay_session_drops_total`
-    ///     `kind` taxonomy (the same literals asserted by
-    ///     `outbound_channel_drops_increments_per_kind`), and
-    ///   * the `relay_packet_drops_total` `drop_reason` literals emitted by the
-    ///     fan-out and transport hops.
+    /// (`forget_room_metrics`) and the per-session GC (`forget_session_drops`).
+    /// If it stops covering a `kind`/`drop_reason` the emit sites actually use,
+    /// that series would leak forever.
     ///
-    /// Mutating `RELAY_DROP_KINDS` to drop any of these fails this test.
+    /// This guard derives its witness from the emit sites themselves wherever
+    /// they are functions, so a NEW emitted kind is caught — not just deletions
+    /// from the const (issue #1186):
+    ///
+    ///   * `drop_kind_label` (ws + wt transports): ENUMERATED over its full input
+    ///     domain — `parsed ∈ {false, true}` × `is_media ∈ {false, true}` ×
+    ///     `media_type ∈ {None} ∪ MediaType::VALUES`. `MediaType::VALUES` is the
+    ///     protobuf-generated variant list, so adding a `MediaType` variant that
+    ///     maps to a new label surfaces here automatically. Both transport copies
+    ///     are enumerated and asserted equal, so drift between them is also caught.
+    ///   * `OutboundPriority::priority_drop_label`: ENUMERATED over every
+    ///     `OutboundPriority` variant. The local `all_priorities` list is pinned
+    ///     to an exhaustive `match` below, so adding a variant fails to COMPILE
+    ///     until the witness is updated.
+    ///   * `mailbox_full` / `channel_full` / `overflow_critical`: bare string
+    ///     literals at their emit sites with no enumerable source of truth, so
+    ///     these remain a hand-maintained witness. This portion guards against
+    ///     DELETIONS from `RELAY_DROP_KINDS` only (see the module-level comment).
+    ///
+    /// Mutating `RELAY_DROP_KINDS` to drop any covered label fails this test, and
+    /// a new `drop_kind_label` / `priority_drop_label` output that is absent from
+    /// `RELAY_DROP_KINDS` also fails it.
     #[test]
     fn relay_drop_kinds_covers_all_emitted_drop_labels() {
-        // Mirror of the literals in `outbound_channel_drops_increments_per_kind`
-        // (kept as an independent copy ON PURPOSE so this test references a
-        // second witness of the taxonomy, not the const under test).
-        let outbound_kinds = [
-            "audio",
-            "video",
-            "screen",
-            "media",
-            "control",
-            "rtt",
-            "unknown",
-            "priority_drop_video",
-            "priority_drop_audio",
-            "overflow_critical",
-        ];
-        // The `drop_reason` literals passed to `relay_packet_drops_total` in
-        // `chat_server::handle_msg` (fan-out) and the WS/WT `Handler<Message>`
-        // hops. `priority_drop_*` overlap with the outbound set above.
-        let packet_drop_reasons = ["mailbox_full", "channel_full"];
+        use crate::actors::priority_drop::OutboundPriority;
+        use crate::actors::transports::{ws_chat_session, wt_chat_session};
+        use protobuf::Enum; // brings `MediaType::VALUES` (trait const) into scope
+        use videocall_types::protos::media_packet::media_packet::MediaType;
 
-        for k in outbound_kinds.iter().chain(packet_drop_reasons.iter()) {
+        // ---- Tier 1a: enumerate the real `drop_kind_label` emit functions. ----
+        // Build the full input domain: media_type is None plus every protobuf
+        // MediaType variant (the generated source of truth for that enum).
+        let media_types: Vec<Option<MediaType>> = std::iter::once(None)
+            .chain(MediaType::VALUES.iter().copied().map(Some))
+            .collect();
+
+        let mut emitted: std::collections::HashSet<&'static str> = std::collections::HashSet::new();
+        for &parsed in &[false, true] {
+            for &is_media in &[false, true] {
+                for &mt in &media_types {
+                    let ws_label = ws_chat_session::drop_kind_label(parsed, is_media, mt);
+                    let wt_label = wt_chat_session::drop_kind_label(parsed, is_media, mt);
+                    // The two transport copies MUST stay in lock-step — a drift
+                    // would silently double the taxonomy the GC must cover.
+                    assert_eq!(
+                        ws_label, wt_label,
+                        "ws/wt drop_kind_label disagree for (parsed={parsed}, \
+                         is_media={is_media}, media_type={mt:?}); the copies must \
+                         stay in lock-step (#1186)"
+                    );
+                    emitted.insert(ws_label);
+                }
+            }
+        }
+
+        // ---- Tier 1b: enumerate the real `priority_drop_label` emit fn. ----
+        // `all_priorities` is pinned to an exhaustive match so a new variant
+        // breaks compilation until this list (and the witness) are updated.
+        let all_priorities = [
+            OutboundPriority::Critical,
+            OutboundPriority::Control,
+            OutboundPriority::Audio,
+            OutboundPriority::Video,
+            OutboundPriority::Screen,
+        ];
+        for p in all_priorities {
+            // Compile-time exhaustiveness guard: adding an OutboundPriority
+            // variant forces this match (and `all_priorities` above) to be
+            // updated, so the enumeration can never silently miss a variant.
+            match p {
+                OutboundPriority::Critical
+                | OutboundPriority::Control
+                | OutboundPriority::Audio
+                | OutboundPriority::Video
+                | OutboundPriority::Screen => {}
+            }
+            if let Some(label) = p.priority_drop_label() {
+                emitted.insert(label);
+            }
+        }
+
+        // Every label produced by the emit FUNCTIONS must be covered.
+        for k in &emitted {
             assert!(
                 RELAY_DROP_KINDS.contains(k),
-                "RELAY_DROP_KINDS must cover emitted drop label {k:?} or the \
+                "RELAY_DROP_KINDS must cover emitted drop label {k:?} produced by \
+                 a drop_kind_label / priority_drop_label emit site, or the \
+                 room-drain / session GC would leak its series (issues #996/#1090)"
+            );
+        }
+
+        // ---- Tier 2: hand-maintained witness for bare string literals. ----
+        // Drop `kind`/`drop_reason` labels emitted as string LITERALS (not via an
+        // enumerable function), so they have no compile-time source of truth and
+        // this list only guards against DELETIONS from `RELAY_DROP_KINDS`:
+        //   * `mailbox_full` / `channel_full` — passed to `relay_packet_drops_total`
+        //     in `chat_server::handle_msg` (fan-out) and the WS/WT
+        //     `Handler<Message>` / channel-full hops.
+        //   * `overflow_critical` — the Critical-overflow `kind` at the
+        //     outbound-channel-full sites.
+        //   * `rtt` — emitted to `videocall_outbound_channel_drops_total` at the
+        //     WT RTT-echo channel-full site (`wt_chat_session`); `drop_kind_label`
+        //     never returns it (a `MediaType::RTT` packet maps to the `media`
+        //     catch-all), so it must be witnessed by hand here.
+        let string_literal_drop_labels =
+            ["mailbox_full", "channel_full", "overflow_critical", "rtt"];
+        for k in &string_literal_drop_labels {
+            assert!(
+                RELAY_DROP_KINDS.contains(k),
+                "RELAY_DROP_KINDS must cover string-literal drop label {k:?} or the \
                  room-drain / session GC would leak its series (issues #996/#1090)"
             );
         }
@@ -1804,6 +2138,9 @@ mod tests {
         RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[room]).inc();
         RELAY_LAYER_FORWARDED_TOTAL.with_label_values(&[room]).inc();
         RELAY_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .inc();
+        RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
             .with_label_values(&[room])
             .inc();
         RELAY_ROOM_BYTES_TOTAL
@@ -1862,6 +2199,13 @@ mod tests {
             5.0,
             "demand-gauge seed must be observable before removal (non-vacuous)"
         );
+        assert_eq!(
+            RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            1.0,
+            "downlink-congestion-filtered seed must be observable before removal (non-vacuous)"
+        );
 
         // Drain the room.
         forget_room_metrics(room);
@@ -1893,6 +2237,14 @@ mod tests {
                 .with_label_values(&[room])
                 .get(),
             0.0
+        );
+        assert_eq!(
+            RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0,
+            "relay_downlink_congestion_filtered_total{{room}} must be swept by \
+             forget_room_metrics (#1219 Half 2)"
         );
         assert_eq!(
             RELAY_ROOM_BYTES_TOTAL
@@ -1965,11 +2317,24 @@ mod tests {
         forget_room_metrics(room);
     }
 
-    /// #1090 leak-proof property: iterating the FULL `RELAY_DROP_KINDS` taxonomy
-    /// on teardown removes a session's `relay_session_drops_total` series EVEN
-    /// for kinds that session never incremented — i.e. the GC does not depend on
-    /// a per-session "kinds I emitted" tracking set. This replicates the exact
-    /// loop `SessionLogic::on_stopping` runs (same const, same label order).
+    /// #1090 leak-proof property: tearing a session down removes its
+    /// `relay_session_drops_total` series EVEN for kinds that session never
+    /// incremented — i.e. the GC does not depend on a per-session "kinds I
+    /// emitted" tracking set.
+    ///
+    /// SCOPE (issue #1186 / #1380): this pins the GC HELPER
+    /// [`forget_session_drops`] — the function `SessionLogic::on_stopping`
+    /// invokes — by calling it directly and asserting it sweeps the FULL
+    /// taxonomy. It seeds a SECOND kind the session never "officially" emitted
+    /// and asserts the sweep removes it too, so shrinking the loop in
+    /// `forget_session_drops` to a subset leaves a residual series and fails
+    /// here. What this test does NOT cover (#1380): the `on_stopping` CALL SITE
+    /// wiring. `on_stopping` needs an `Addr<ChatServer>` + NATS client + tracker
+    /// to drive, so reverting it to an inline per-session-subset loop that
+    /// bypasses this helper (the exact #1090 regression shape) would still pass
+    /// CI — that wiring is guarded only by the one-line call site under the
+    /// LEAK-PROOF comment in `session_logic.rs::on_stopping`, not by this test.
+    /// Do not over-trust this as a guard against re-breaking the call site.
     #[test]
     #[serial(session_drops_gc)]
     fn session_drop_gc_iterates_full_taxonomy_unconditionally() {
@@ -1977,38 +2342,72 @@ mod tests {
         let transport = "websocket";
         let session_id = "999000111";
 
-        // This session only ever dropped ONE kind.
+        // The kind this session "really" dropped, plus a second, DIFFERENT kind
+        // from the taxonomy to prove the sweep is unconditional (not "only kinds
+        // I emitted"). `overflow_critical` is the last entry in RELAY_DROP_KINDS,
+        // so a sweep that stops short of the full taxonomy would leave it behind.
+        let emitted_kind = "video";
+        let unrelated_kind = "overflow_critical";
+        assert_ne!(emitted_kind, unrelated_kind);
+        assert!(
+            RELAY_DROP_KINDS.contains(&emitted_kind) && RELAY_DROP_KINDS.contains(&unrelated_kind),
+            "both seeded kinds must be members of the taxonomy the sweep iterates"
+        );
+
         RELAY_SESSION_DROPS_TOTAL
-            .with_label_values(&[room, transport, session_id, "video"])
+            .with_label_values(&[room, transport, session_id, emitted_kind])
+            .inc();
+        RELAY_SESSION_DROPS_TOTAL
+            .with_label_values(&[room, transport, session_id, unrelated_kind])
             .inc();
         assert_eq!(
             RELAY_SESSION_DROPS_TOTAL
-                .with_label_values(&[room, transport, session_id, "video"])
+                .with_label_values(&[room, transport, session_id, emitted_kind])
                 .get(),
             1.0,
             "seed must be observable before teardown (non-vacuous)"
         );
-
-        // Replicate on_stopping: iterate the FULL taxonomy unconditionally.
-        // `remove_label_values` on a never-created (…, kind) tuple is a benign
-        // Err, so a session that only dropped `video` is still fully cleaned.
-        for kind in RELAY_DROP_KINDS {
-            let _ =
-                RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[room, transport, session_id, kind]);
-        }
-
-        // The seeded `video` series — a member of the taxonomy the session DID
-        // increment — must be gone.
         assert_eq!(
             RELAY_SESSION_DROPS_TOTAL
-                .with_label_values(&[room, transport, session_id, "video"])
+                .with_label_values(&[room, transport, session_id, unrelated_kind])
                 .get(),
-            0.0,
-            "the full-taxonomy sweep must remove the kind the session emitted"
+            1.0,
+            "second seed must be observable before teardown (non-vacuous)"
         );
 
-        // Clean up the fresh zero handle this assert created.
-        let _ =
-            RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[room, transport, session_id, "video"]);
+        // Exercise the REAL GC path that `on_stopping` runs.
+        forget_session_drops(room, transport, session_id);
+
+        // BOTH seeded series must be gone — the one the session "emitted" AND the
+        // unrelated taxonomy member — proving the sweep is full and unconditional.
+        assert_eq!(
+            RELAY_SESSION_DROPS_TOTAL
+                .with_label_values(&[room, transport, session_id, emitted_kind])
+                .get(),
+            0.0,
+            "forget_session_drops must remove the kind the session emitted"
+        );
+        assert_eq!(
+            RELAY_SESSION_DROPS_TOTAL
+                .with_label_values(&[room, transport, session_id, unrelated_kind])
+                .get(),
+            0.0,
+            "forget_session_drops must sweep the FULL taxonomy, not just emitted \
+             kinds — a subset sweep would leave this residual series (#1090/#1186)"
+        );
+
+        // Clean up the fresh zero handles the asserts above created.
+        let _ = RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
+            room,
+            transport,
+            session_id,
+            emitted_kind,
+        ]);
+        let _ = RELAY_SESSION_DROPS_TOTAL.remove_label_values(&[
+            room,
+            transport,
+            session_id,
+            unrelated_kind,
+        ]);
     }
 }

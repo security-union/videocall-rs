@@ -141,8 +141,8 @@ Until this is fixed, any alert or dashboard based on `audio_packet_loss_pct` wil
 **Current**: `videocall_video_quality_score` is a composite score that says "quality is bad" but not why.
 
 **Fix**: Expose the component inputs alongside the composite:
-- `videocall_video_fps_ratio` (new) -- ratio of received FPS to target FPS, the primary degradation trigger
-- `videocall_video_bitrate_ratio` (new) -- ratio of actual to ideal bitrate
+- `videocall_video_fps_ratio` (new) -- ratio of received FPS to target FPS, the primary degradation trigger _(implemented as `videocall_encoder_fps_ratio` in PR #308; removed in #1184 — see #1228)_
+- `videocall_video_bitrate_ratio` (new) -- ratio of actual to ideal bitrate _(implemented as `videocall_encoder_bitrate_ratio` in PR #308; removed in #1184 — see #1228)_
 - Keep the composite score for alerting, but add the components for diagnosis
 
 ### Problem 3: No Screen Share Metrics At All

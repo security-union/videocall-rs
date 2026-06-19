@@ -161,6 +161,101 @@ pub(super) const CPU_OVERLOAD_DRIFT_THRESHOLD_MS: f64 = 500.0;
 /// elevated-RTT detector.
 pub(super) const CPU_OVERLOADED_DURATION_MS: f64 = 5_000.0;
 
+/// Cumulative CPU-stall suppression budget (issue #572). Once the watchdog in
+/// [`ConnectionManager::check_rtt_degradation`] has spent more than this many
+/// milliseconds — summed across every suppression window within a single
+/// session, NOT reset on each falling edge — suppressing re-election, it
+/// escalates to a full fresh-token reconnect instead of staying latched.
+///
+/// **Why 60 s (real-world high-latency / low-power clients, not localhost).**
+/// The suppression guard (PR #571) is correct for transient main-thread
+/// stalls: a low-power phone or a Chromebook on a congested CPU produces
+/// synthetic "RTT" spikes that are local artifacts, not network signal, and
+/// re-electing on them causes the user-visible cascades from discussion #562.
+/// But a client that is BOTH chronically CPU-overloaded AND on a genuinely
+/// degraded link (200 ms+ RTT, packet loss, mobile/satellite) can keep the
+/// latch engaged indefinitely — the guard never releases, so the existing
+/// re-election triggers never fire, and the user's only recovery is a manual
+/// page reload. 60 s is long enough that no realistic burst of scheduling
+/// jitter on a slow device accumulates to it (each suppression window on a
+/// recovering device is seconds, separated by quiet gaps that reset the
+/// accumulator via [`SUPPRESSION_RESET_QUIET_MS`]), yet short enough that a
+/// truly wedged client recovers automatically within ~1 minute rather than
+/// being stranded. The escalation uses the fresh-token reconnect path (a new
+/// `ConnectionManager` with refreshed URLs), so it can recover from causes a
+/// cached-URL re-election cannot — including an expired room token on a link
+/// that has been distressed for a full minute.
+pub(super) const MAX_SUSTAINED_SUPPRESSION_MS: f64 = 60_000.0;
+
+/// Quiet window (issue #572) that must elapse with NO active suppression
+/// before [`ConnectionManager::check_rtt_degradation`] clears the cumulative
+/// [`MAX_SUSTAINED_SUPPRESSION_MS`] accumulator back to zero.
+///
+/// **Why 30 s (real-world clients, not localhost).** The accumulator sums
+/// suppression across multiple windows so that a client flapping in and out of
+/// CPU stall every few seconds — common on a thermally throttled phone or a
+/// background-tab Chromebook — still escalates instead of resetting its budget
+/// on each brief recovery. We only forgive the accumulated budget once the
+/// client has demonstrably been healthy for a sustained stretch. 30 s is half
+/// the panic budget and comfortably longer than the
+/// [`CPU_OVERLOADED_DURATION_MS`] (5 s) post-stall drain window plus a few
+/// re-election sample cycles, so a device that has genuinely recovered (not
+/// merely paused between stall bursts) gets a clean slate, while a device that
+/// keeps relapsing inside the quiet window keeps its accumulated budget and
+/// marches toward escalation. Tying it to wall-time rather than tick count
+/// keeps the behaviour correct across the variable 1 Hz cadence on a stalled
+/// main thread.
+pub(super) const SUPPRESSION_RESET_QUIET_MS: f64 = 30_000.0;
+
+/// RTT-probe pipeline resilience thresholds (issue #522).
+///
+/// Probe cadence is 1 Hz (probe_interval_ms = 1000). With a 5000ms timeout, a
+/// genuinely high-RTT but HEALTHY link (e.g. 1-2s RTT on mobile/satellite)
+/// legitimately has up to ceil(PROBE_TIMEOUT_MS / probe_interval_ms) =
+/// ceil(5000/1000) = 5 probes in flight before the oldest legitimately times
+/// out. We set MAX_INFLIGHT_PROBES = 6 (= 5 + 1 headroom) so a slow-but-healthy
+/// link is never falsely capped/dropped, and STALE_THRESHOLD = 3 consecutive
+/// timeouts so a single transient late response does not flip stale. A
+/// false-positive stale on a slow-but-healthy link is a regression; these
+/// values guard against it. On a 1.5s RTT link, in-flight is about 2 (well
+/// under cap) and probes return before the 5s deadline, so it is NOT flagged
+/// stale.
+///
+/// Dual cadence: during election the probe cadence is faster (~5 Hz / 200ms in
+/// the Testing phase) while prune still runs at 1 Hz, so the in-flight queue
+/// fills faster then and the MAX_INFLIGHT_PROBES cap is the intended safety
+/// valve in that phase (a dropped probe is expendable).
+pub(super) const PROBE_TIMEOUT_MS: f64 = 5000.0; // per-probe deadline
+pub(super) const MAX_INFLIGHT_PROBES: usize = 6; // cap on in-flight probes
+pub(super) const STALE_THRESHOLD: u32 = 3; // consecutive timeouts before stale
+
+/// Pure cap-decision helper extracted so the in-flight cap is unit-testable on
+/// host (a live datagram Connection cannot be constructed off-wasm).
+fn should_drop_probe(in_flight_len: usize) -> bool {
+    in_flight_len >= MAX_INFLIGHT_PROBES
+}
+
+/// Pure decision helper for the CPU-stall suppression panic threshold (issue
+/// #572): returns `true` iff the cumulative suppression budget `total_ms` has
+/// exceeded the configured ceiling `max_ms`, meaning
+/// [`ConnectionManager::check_rtt_degradation`] must escalate to a full
+/// fresh-token reconnect instead of staying latched.
+///
+/// Extracted as a side-effect-free function — mirroring
+/// [`ConnectionManager::decide_post_rebase_retry_action`] — because the
+/// escalation site reads [`monotonic_now_ms`], which is `Instant`-derived and
+/// unmockable on host. Driving this helper with injected values lets a unit
+/// test assert the boundary behaviour (`<` budget vs `>=` budget) precisely
+/// without invoking the wasm-only `ConnectionState::Failed` emission.
+///
+/// Boundary contract: the comparison is strictly greater-than, so a total
+/// exactly equal to `max_ms` does NOT escalate; only a total that has spent
+/// strictly more than the budget does. This matches the doc-stated "exceeds"
+/// wording on [`MAX_SUSTAINED_SUPPRESSION_MS`].
+fn suppression_escalation_action(total_ms: f64, max_ms: f64) -> bool {
+    total_ms > max_ms
+}
+
 /// Returns a monotonic, high-resolution timestamp in milliseconds using
 /// `performance.now()`. This is immune to NTP adjustments, DST changes, and
 /// user clock manipulation — unlike `js_sys::Date::now()` — making it safe
@@ -189,20 +284,119 @@ pub(super) fn monotonic_now_ms() -> f64 {
     epoch.elapsed().as_secs_f64() * 1000.0
 }
 
-/// Cumulative count of connections lost during the handshake phase.
-static CONNECTION_HANDSHAKE_FAILURES: AtomicU64 = AtomicU64::new(0);
+// Connection-loss reason counters, SPLIT BY TRANSPORT (#509 parity audit,
+// item #4). WebTransport is the production-default transport (cc7tp had 8/8
+// participants on WT, 0 on WS), so a global counter cannot answer the audit's
+// core question — "is WT >> WS in handshake failures or session drops?" —
+// because a WS-heavy and a WT-heavy regression are indistinguishable in one
+// number. Splitting the in-memory counters per transport makes that
+// comparison observable LOCALLY (perf panel / console) with zero protobuf or
+// server change.
+//
+// SCOPE BOUNDARY (deliberate): the SPLIT is client-side only. The values
+// reported OVER THE WIRE stay the COMBINED totals via
+// `connection_handshake_failures()` / `connection_session_drops()` below,
+// which feed the EXISTING protobuf fields `connection_handshake_failures_total`
+// / `connection_session_drops_total` unchanged. Emitting the per-transport
+// split to the relay would require NEW protobuf fields + a docker regen, which
+// is explicitly out of scope for this audit (a prior protobuf-regen attempt in
+// this batch caused churn). Wiring the split to telemetry is the documented
+// follow-up.
+//
+// Transport is known statically at counter-increment time: the two
+// `create_connection_lost_callback` call sites (WS at the WebSocket loop, WT
+// at the WebTransport loop) each pass a fixed `is_webtransport`, mirroring the
+// `is_webtransport: false` / `is_webtransport: true` they already set on the
+// `Connected` state — so no runtime transport detection is introduced.
 
-/// Cumulative count of connections lost after the session was established.
-static CONNECTION_SESSION_DROPS: AtomicU64 = AtomicU64::new(0);
+/// Cumulative WebTransport connections lost during the handshake phase.
+static CONNECTION_HANDSHAKE_FAILURES_WT: AtomicU64 = AtomicU64::new(0);
 
-/// Returns the cumulative number of handshake failures since process start.
-pub fn connection_handshake_failures() -> u64 {
-    CONNECTION_HANDSHAKE_FAILURES.load(Ordering::Relaxed)
+/// Cumulative WebSocket connections lost during the handshake phase.
+static CONNECTION_HANDSHAKE_FAILURES_WS: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative WebTransport connections lost after the session was established.
+static CONNECTION_SESSION_DROPS_WT: AtomicU64 = AtomicU64::new(0);
+
+/// Cumulative WebSocket connections lost after the session was established.
+static CONNECTION_SESSION_DROPS_WS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one connection-loss handshake failure against the per-transport
+/// counter selected by `is_webtransport`. Single write path so the increment
+/// is host-testable and the WT/WS split cannot drift from the callback.
+fn record_handshake_failure(is_webtransport: bool) {
+    if is_webtransport {
+        CONNECTION_HANDSHAKE_FAILURES_WT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CONNECTION_HANDSHAKE_FAILURES_WS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
-/// Returns the cumulative number of session drops since process start.
+/// Record one post-handshake session drop against the per-transport counter
+/// selected by `is_webtransport`. Single write path; see
+/// [`record_handshake_failure`].
+fn record_session_drop(is_webtransport: bool) {
+    if is_webtransport {
+        CONNECTION_SESSION_DROPS_WT.fetch_add(1, Ordering::Relaxed);
+    } else {
+        CONNECTION_SESSION_DROPS_WS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Returns the cumulative number of handshake failures since process start,
+/// COMBINED across both transports. This is the value reported over the wire
+/// (the protobuf `connection_handshake_failures_total` field is unchanged), so
+/// the split is purely additive — the sum is byte-identical to the pre-split
+/// single counter.
+pub fn connection_handshake_failures() -> u64 {
+    CONNECTION_HANDSHAKE_FAILURES_WT.load(Ordering::Relaxed)
+        + CONNECTION_HANDSHAKE_FAILURES_WS.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of session drops since process start,
+/// COMBINED across both transports. Reported over the wire unchanged; see
+/// [`connection_handshake_failures`].
 pub fn connection_session_drops() -> u64 {
-    CONNECTION_SESSION_DROPS.load(Ordering::Relaxed)
+    CONNECTION_SESSION_DROPS_WT.load(Ordering::Relaxed)
+        + CONNECTION_SESSION_DROPS_WS.load(Ordering::Relaxed)
+}
+
+// The four per-transport readers below are a PUBLIC observability surface
+// (#509 item #4): they expose the WT/WS split for the perf panel / console and
+// the documented telemetry follow-up. They are exercised by the native unit
+// tests, but no PRODUCTION (wasm) call site consumes them yet — the wire still
+// reports the combined totals (`connection_*` above) to avoid a protobuf change
+// — so the wasm build legitimately sees them as dead. `#[allow(dead_code)]`
+// keeps the public API intact until the follow-up wires them to telemetry,
+// without a blanket crate-level allow.
+
+/// Returns the cumulative number of WebTransport handshake failures since
+/// process start. Client-side observability only (not reported over the wire);
+/// see the scope-boundary note above.
+#[allow(dead_code)]
+pub fn connection_handshake_failures_wt() -> u64 {
+    CONNECTION_HANDSHAKE_FAILURES_WT.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of WebSocket handshake failures since process
+/// start. Client-side observability only.
+#[allow(dead_code)]
+pub fn connection_handshake_failures_ws() -> u64 {
+    CONNECTION_HANDSHAKE_FAILURES_WS.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of WebTransport session drops since process
+/// start. Client-side observability only.
+#[allow(dead_code)]
+pub fn connection_session_drops_wt() -> u64 {
+    CONNECTION_SESSION_DROPS_WT.load(Ordering::Relaxed)
+}
+
+/// Returns the cumulative number of WebSocket session drops since process
+/// start. Client-side observability only.
+#[allow(dead_code)]
+pub fn connection_session_drops_ws() -> u64 {
+    CONNECTION_SESSION_DROPS_WS.load(Ordering::Relaxed)
 }
 
 // Transport re-election outcome counters (dashboard audit Tier B #3;
@@ -295,6 +489,12 @@ pub struct ServerRttMeasurement {
     /// treated as a re-election signal so the user is not silently stuck on
     /// a broken connection (see discussion #539).
     pub consecutive_implausible_discards: u32,
+    /// Monotonic send timestamps (`monotonic_now_ms()`) of probes awaiting a
+    /// response, oldest first.
+    pub in_flight_probes: VecDeque<f64>,
+    /// Count of consecutive probes that hit `PROBE_TIMEOUT_MS` without a
+    /// response; reset to 0 when any response arrives.
+    pub consecutive_probe_timeouts: u32,
 }
 
 #[derive(Debug)]
@@ -474,6 +674,14 @@ pub struct ConnectionManager {
     packets_received: Rc<Cell<u64>>,
     /// Counter for total packets sent (incremented on each outbound packet)
     packets_sent: Rc<Cell<u64>>,
+    /// Monotonic count of RTT probes dropped because the in-flight queue was at
+    /// MAX_INFLIGHT_PROBES (queue cap, issue #522). Read by rtt_probe_dropped_total()
+    /// and surfaced as the rtt_probe_dropped_total diagnostic metric.
+    rtt_probe_dropped_total: Rc<Cell<u64>>,
+    /// Monotonic count of 1 Hz diagnostics ticks on which the active link's
+    /// RTT-probe pipeline was stale and so `active_server_rtt` was suppressed in
+    /// `build_main_diagnostic_metrics`. Observability-only (#522).
+    rtt_probe_stale_suppressions_total: Rc<Cell<u64>>,
     /// Timestamp of last metrics calculation
     last_metrics_timestamp_ms: Rc<RefCell<f64>>,
     /// Last calculated packets received per second
@@ -575,6 +783,27 @@ pub struct ConnectionManager {
     /// the stall lasted. Cleared back to `None` on the falling edge.
     /// Single-threaded access — no atomic needed.
     suppression_started_at_ms: Option<f64>,
+
+    /// Cumulative milliseconds of CPU-stall suppression accumulated across the
+    /// life of the suppression latch within this session (issue #572). Each
+    /// falling edge adds the window that just ended; this is deliberately NOT
+    /// reset on the falling edge, so a client that flaps in and out of stall
+    /// still marches toward the [`MAX_SUSTAINED_SUPPRESSION_MS`] panic
+    /// threshold. It is reset to `0.0` only after a sustained quiet stretch
+    /// (no suppression for [`SUPPRESSION_RESET_QUIET_MS`]) — meaning the client
+    /// has genuinely recovered — or after an escalation fires. When it exceeds
+    /// the budget, `check_rtt_degradation` escalates to a full fresh-token
+    /// reconnect rather than staying latched indefinitely.
+    total_suppression_duration_ms: f64,
+
+    /// Monotonic-millis timestamp of the most recent suppression falling edge
+    /// (issue #572), i.e. the last time suppression released. `None` until the
+    /// first release. Used by the quiet-window reset gate: on a non-suppressed
+    /// tick, if `now - last_suppression_release_at_ms` exceeds
+    /// [`SUPPRESSION_RESET_QUIET_MS`], the cumulative
+    /// [`total_suppression_duration_ms`] accumulator is cleared. Single-threaded
+    /// access — no atomic needed.
+    last_suppression_release_at_ms: Option<f64>,
 }
 
 fn should_filter_self_packet(packet: &PacketWrapper, own_session_id: Option<u64>) -> bool {
@@ -643,6 +872,8 @@ impl ConnectionManager {
             intentionally_disconnected: Rc::new(RefCell::new(false)),
             packets_received: Rc::new(Cell::new(0)),
             packets_sent: Rc::new(Cell::new(0)),
+            rtt_probe_dropped_total: Rc::new(Cell::new(0)),
+            rtt_probe_stale_suppressions_total: Rc::new(Cell::new(0)),
             last_metrics_timestamp_ms: Rc::new(RefCell::new(js_sys::Date::now())),
             packets_received_per_sec: Rc::new(RefCell::new(0.0)),
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
@@ -659,6 +890,8 @@ impl ConnectionManager {
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
             suppression_started_at_ms: None,
+            total_suppression_duration_ms: 0.0,
+            last_suppression_release_at_ms: None,
         };
 
         Ok(manager)
@@ -838,8 +1071,11 @@ impl ConnectionManager {
                 webtransport_url: String::new(), // Not used for WebSocket
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
-                on_connection_lost: self
-                    .create_connection_lost_callback(conn_id.clone(), url.clone()),
+                on_connection_lost: self.create_connection_lost_callback(
+                    conn_id.clone(),
+                    url.clone(),
+                    false, // WebSocket
+                ),
                 peer_monitor: self.options.peer_monitor.clone(),
             };
 
@@ -857,6 +1093,8 @@ impl ConnectionManager {
                             active: false,
                             connected: false,
                             consecutive_implausible_discards: 0,
+                            in_flight_probes: VecDeque::new(),
+                            consecutive_probe_timeouts: 0,
                         },
                     );
                     debug!(
@@ -882,8 +1120,11 @@ impl ConnectionManager {
                 webtransport_url: url.clone(),
                 on_inbound_media: self.create_inbound_media_callback(conn_id.clone()),
                 on_connected: self.create_connected_callback(conn_id.clone()),
-                on_connection_lost: self
-                    .create_connection_lost_callback(conn_id.clone(), url.clone()),
+                on_connection_lost: self.create_connection_lost_callback(
+                    conn_id.clone(),
+                    url.clone(),
+                    true, // WebTransport
+                ),
                 peer_monitor: self.options.peer_monitor.clone(),
             };
 
@@ -901,6 +1142,8 @@ impl ConnectionManager {
                             active: false,
                             connected: false,
                             consecutive_implausible_discards: 0,
+                            in_flight_probes: VecDeque::new(),
+                            consecutive_probe_timeouts: 0,
                         },
                     );
                     debug!(
@@ -1068,6 +1311,7 @@ impl ConnectionManager {
         &self,
         connection_id: String,
         server_url: String,
+        is_webtransport: bool,
     ) -> Callback<ConnectionLostReason> {
         let on_state_changed = self.options.on_state_changed.clone();
         let active_connection_id = self.active_connection_id.clone();
@@ -1093,15 +1337,25 @@ impl ConnectionManager {
                 return;
             }
 
-            // Classify and count the loss reason.
+            // Classify and count the loss reason. The counter is split by
+            // transport (#509 item #4): `is_webtransport` is fixed per call
+            // site (WS vs WT loop), so the increment lands on the matching
+            // per-transport counter. The combined total (what the wire reports)
+            // is unchanged — see the counter-block scope note.
             match &reason {
                 ConnectionLostReason::HandshakeFailed(msg) => {
-                    warn!("Active connection {connection_id} lost [HANDSHAKE FAILED]: {msg}");
-                    CONNECTION_HANDSHAKE_FAILURES.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Active {} connection {connection_id} lost [HANDSHAKE FAILED]: {msg}",
+                        if is_webtransport { "WT" } else { "WS" },
+                    );
+                    record_handshake_failure(is_webtransport);
                 }
                 ConnectionLostReason::SessionDropped(msg) => {
-                    warn!("Active connection {connection_id} lost [SESSION DROPPED]: {msg}");
-                    CONNECTION_SESSION_DROPS.fetch_add(1, Ordering::Relaxed);
+                    warn!(
+                        "Active {} connection {connection_id} lost [SESSION DROPPED]: {msg}",
+                        if is_webtransport { "WT" } else { "WS" },
+                    );
+                    record_session_drop(is_webtransport);
                 }
             }
 
@@ -1163,23 +1417,59 @@ impl ConnectionManager {
     /// RTT probes are periodic and expendable — a missed probe just means we
     /// skip one measurement. They use datagrams for lower overhead.
     fn send_rtt_probe(&mut self, connection_id: &str) -> Result<()> {
+        // Scope the immutable borrow of `connection` so it ends before we mutate
+        // `self.rtt_measurements` / `self.packets_sent` below.
+        {
+            let connection = self
+                .connections
+                .get(connection_id)
+                .ok_or_else(|| anyhow!("Connection {connection_id} not found"))?;
+
+            if !connection.is_connected() {
+                return Ok(()); // Skip non-connected connections
+            }
+        }
+
+        // Compute the send timestamp BEFORE the in-flight push — this is the
+        // value we enqueue and that the matching response will clear.
+        let timestamp = monotonic_now_ms();
+
+        // Update connection status + read the current in-flight depth. End this
+        // borrow before mutating other `self` fields below.
+        let at_cap;
+        let len;
+        if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
+            measurement.connected = true;
+            len = measurement.in_flight_probes.len();
+            at_cap = should_drop_probe(len);
+        } else {
+            // No measurement entry means there is nothing to track; skip.
+            return Ok(());
+        }
+
+        if at_cap {
+            self.rtt_probe_dropped_total
+                .set(self.rtt_probe_dropped_total.get().saturating_add(1));
+            trace!(
+                "dropping RTT probe to {connection_id}: {len} already in flight (cap {MAX_INFLIGHT_PROBES})"
+            );
+            return Ok(());
+        }
+
+        let rtt_packet = self.create_rtt_packet(timestamp)?;
+
+        // Enqueue the in-flight slot only AFTER create_rtt_packet succeeds, so a
+        // packet-build failure can't leave a phantom probe that falsely ages
+        // into a timeout. Record the send timestamp so the prune path can age it
+        // out and the response path can clear it.
+        if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
+            measurement.in_flight_probes.push_back(timestamp);
+        }
+
         let connection = self
             .connections
             .get(connection_id)
             .ok_or_else(|| anyhow!("Connection {connection_id} not found"))?;
-
-        if !connection.is_connected() {
-            return Ok(()); // Skip non-connected connections
-        }
-
-        // Update connection status
-        if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
-            measurement.connected = true;
-        }
-
-        let timestamp = monotonic_now_ms();
-        let rtt_packet = self.create_rtt_packet(timestamp)?;
-
         connection.send_packet_datagram(rtt_packet);
         // Count RTT probes in packets_sent so the sent/received rates are symmetric.
         // packets_received already counts inbound RTT echoes; excluding probes from
@@ -1228,6 +1518,15 @@ impl ConnectionManager {
         let rtt = reception_time - sent_timestamp;
         let plausible = (0.0..=RTT_SANITY_MAX_MS).contains(&rtt);
 
+        // Reset consecutive_probe_timeouts to 0 on ANY received response
+        // (plausible or not): a received response means the loop is no longer
+        // fully starved and the pipeline is draining. The
+        // implausibly-huge-RTT-under-starvation symptom is handled by
+        // SUPPRESSION (rtt_probe_stale), not by counting it as a fake
+        // measurement. A late-but-received response still proves draining and
+        // clears its own in-flight slot (retain removes the matching send
+        // timestamp).
+
         // Discard implausible RTT measurements but bump the per-connection
         // streak counter so a sustained discard pattern becomes actionable
         // (rather than silently starving the RTT-degradation watchdog).
@@ -1240,6 +1539,10 @@ impl ConnectionManager {
                 measurement.consecutive_implausible_discards = measurement
                     .consecutive_implausible_discards
                     .saturating_add(1);
+                measurement.consecutive_probe_timeouts = 0;
+                measurement
+                    .in_flight_probes
+                    .retain(|&ts| ts != sent_timestamp);
             }
             return;
         }
@@ -1247,6 +1550,10 @@ impl ConnectionManager {
         if let Some(measurement) = self.rtt_measurements.get_mut(connection_id) {
             // Reset the discard streak — we just got a usable measurement.
             measurement.consecutive_implausible_discards = 0;
+            measurement.consecutive_probe_timeouts = 0;
+            measurement
+                .in_flight_probes
+                .retain(|&ts| ts != sent_timestamp);
 
             measurement.measurements.push_back(rtt);
 
@@ -1387,6 +1694,8 @@ impl ConnectionManager {
                                             active: true,
                                             connected: true,
                                             consecutive_implausible_discards: 0,
+                                            in_flight_probes: VecDeque::new(),
+                                            consecutive_probe_timeouts: 0,
                                         },
                                     );
                                 }
@@ -1744,6 +2053,8 @@ impl ConnectionManager {
                         active: true,
                         connected: true,
                         consecutive_implausible_discards: 0,
+                        in_flight_probes: VecDeque::new(),
+                        consecutive_probe_timeouts: 0,
                     },
                 );
             }
@@ -2308,6 +2619,34 @@ impl ConnectionManager {
             // artifacts, not network evidence — they must not carry over.
             self.degradation_counter = 0;
             self.was_suppressed_last_check = true;
+
+            // --- Panic-threshold escalation (issue #572) -------------------
+            // A client that is BOTH CPU-stalled AND network-distressed can
+            // stay latched here forever — the falling edge that would
+            // accumulate the window never arrives. So we evaluate the budget
+            // LIVE on every suppressed tick: cumulative budget already banked
+            // from prior windows PLUS the current still-open window
+            // (`now - suppression_started_at_ms`). When that crosses
+            // MAX_SUSTAINED_SUPPRESSION_MS, we escalate to a full fresh-token
+            // reconnect rather than waiting indefinitely for a manual reload.
+            let open_window_ms = self
+                .suppression_started_at_ms
+                .map(|started| now - started)
+                .unwrap_or(0.0);
+            let live_cumulative_ms = self.total_suppression_duration_ms + open_window_ms;
+            if suppression_escalation_action(live_cumulative_ms, MAX_SUSTAINED_SUPPRESSION_MS) {
+                self.escalate_suppression_to_full_reconnect(live_cumulative_ms);
+                // Re-stamp the open window to `now` so the live cumulative
+                // restarts from zero. The latch stays engaged (we have not hit
+                // a falling edge), so without this the NEXT tick would recompute
+                // `open_window_ms` from the original, now-ancient start — still
+                // > MAX_SUSTAINED_SUPPRESSION_MS — and re-escalate every 1 Hz
+                // tick, spamming `Failed`/`on_connection_lost` and triggering
+                // reconnect storms. Re-stamping makes the escalation genuinely
+                // one-shot: a fresh full budget must accumulate before the next
+                // one fires. `escalate_*` already zeroed the banked total.
+                self.suppression_started_at_ms = Some(now);
+            }
             return false;
         }
 
@@ -2325,6 +2664,47 @@ impl ConnectionManager {
                 suppression_duration_ms, active_id,
             );
             self.suppression_started_at_ms = None;
+
+            // Accumulate the window that just ended into the cumulative budget
+            // (issue #572). This is deliberately NOT reset on the falling edge:
+            // a client that flaps in and out of stall keeps banking time so it
+            // still marches toward MAX_SUSTAINED_SUPPRESSION_MS. Stamp the
+            // release time so the quiet-window reset gate below can later
+            // forgive the budget once the client has been healthy long enough.
+            self.total_suppression_duration_ms += suppression_duration_ms;
+            self.last_suppression_release_at_ms = Some(now);
+
+            // Re-check the panic threshold after accumulation: a final window
+            // can be the one that pushes the cumulative total over budget even
+            // though no single suppressed tick did (e.g. the live check used a
+            // slightly earlier `now`). Escalate here too so we never strand a
+            // client that just barely crossed the line on release.
+            if suppression_escalation_action(
+                self.total_suppression_duration_ms,
+                MAX_SUSTAINED_SUPPRESSION_MS,
+            ) {
+                self.escalate_suppression_to_full_reconnect(self.total_suppression_duration_ms);
+            }
+        } else if self.total_suppression_duration_ms > 0.0 {
+            // Not a falling edge and no active suppression: if the client has
+            // been quiet (no suppression) for longer than
+            // SUPPRESSION_RESET_QUIET_MS since the last release, it has
+            // genuinely recovered — forgive the accumulated budget so a brief
+            // future stall does not inherit stale time and escalate spuriously
+            // (issue #572). A client that keeps relapsing inside the quiet
+            // window never reaches this branch and retains its budget.
+            let quiet_for_ms = self
+                .last_suppression_release_at_ms
+                .map(|released| now - released)
+                .unwrap_or(f64::INFINITY);
+            if quiet_for_ms > SUPPRESSION_RESET_QUIET_MS {
+                debug!(
+                    "CPU-stall suppression budget reset: {:.0}ms quiet since last release \
+                     exceeds {:.0}ms — clearing cumulative {:.0}ms accumulator",
+                    quiet_for_ms, SUPPRESSION_RESET_QUIET_MS, self.total_suppression_duration_ms,
+                );
+                self.total_suppression_duration_ms = 0.0;
+            }
         }
         self.was_suppressed_last_check = false;
 
@@ -2431,6 +2811,63 @@ impl ConnectionManager {
         }
 
         false
+    }
+
+    /// Escalate a stuck CPU-stall suppression latch to a full fresh-token
+    /// reconnect (issue #572).
+    ///
+    /// Called from [`Self::check_rtt_degradation`] when the cumulative
+    /// suppression budget has exceeded [`MAX_SUSTAINED_SUPPRESSION_MS`]. A
+    /// client that is BOTH chronically CPU-overloaded AND on a genuinely
+    /// degraded link can otherwise keep the suppression guard engaged forever:
+    /// the existing re-election triggers never fire, and the only recovery is a
+    /// manual page reload. This breaks that deadlock.
+    ///
+    /// **Why a full reconnect, not `start_reelection` / `reset_and_start_election`.**
+    /// An internal re-election reuses the *cached* candidate URLs. After a full
+    /// minute of distress the room token may have expired, and the same
+    /// brokenness that caused the stall is still present — a cached-URL
+    /// re-election would simply re-fail. Instead we emit
+    /// [`ConnectionState::Failed`], which `VideoCallClient` maps to
+    /// `on_connection_lost` and the dioxus-ui `schedule_reconnect` handler then
+    /// drives through `refresh_room_token` — the fresh-token path that builds a
+    /// brand-new `ConnectionManager` with re-issued URLs. (Verified chain:
+    /// `video_call_client.rs` `ConnectionState::Failed` arm → `on_connection_lost`
+    /// → `attendants.rs::schedule_reconnect` → `meeting_api::refresh_room_token`.)
+    ///
+    /// The cumulative accumulator is reset to zero here so the `error!` log and
+    /// the `Failed` emission fire exactly once per exhausted budget rather than
+    /// every subsequent 1 Hz tick while the UI is tearing down and rebuilding
+    /// the connection. The `error!` level is unconditionally enabled under the
+    /// wasm logger's default `Info` ceiling (and any level short of an explicit
+    /// `Off`), so this escalation is always visible in support logs.
+    fn escalate_suppression_to_full_reconnect(&mut self, total_suppression_ms: f64) {
+        error!(
+            "CPU-stall suppression budget exhausted ({:.0}s cumulative) — escalating to full reconnect",
+            total_suppression_ms / 1000.0,
+        );
+
+        // SECURITY: redact the active server URL before it leaves the manager —
+        // `measurement.url` carries the room JWT in its query string. Mirrors
+        // the redaction on the `ElectionState::Failed` arm of
+        // `get_connection_state` and the reconnection-loop `Failed` emissions.
+        let last_known_server = self
+            .active_connection_id
+            .borrow()
+            .as_deref()
+            .and_then(|id| self.rtt_measurements.get(id))
+            .map(|m| url_redact::redact_for_diag(m.url.as_str()));
+
+        self.options.on_state_changed.emit(ConnectionState::Failed {
+            error: "cpu-stall suppression budget exhausted".to_string(),
+            last_known_server,
+        });
+
+        // Reset the accumulator so the escalation is one-shot: the next tick's
+        // live cumulative starts from zero and will not re-fire while the UI
+        // tears down and rebuilds this manager via the fresh-token path.
+        self.total_suppression_duration_ms = 0.0;
+        self.last_suppression_release_at_ms = Some(monotonic_now_ms());
     }
 
     /// Begin a re-election: create fresh candidate connections while keeping
@@ -3037,6 +3474,37 @@ impl ConnectionManager {
         for (connection_id, media_packet, reception_time) in responses_to_process {
             self.handle_rtt_response(&connection_id, &media_packet, reception_time);
         }
+
+        // Age out any probes that never got a response THIS tick. Runs AFTER the
+        // drain loop above so a response that arrived this tick clears its own
+        // in-flight slot before we count it as a timeout.
+        self.prune_stale_probes();
+    }
+
+    /// Age out RTT probes that have exceeded [`PROBE_TIMEOUT_MS`] without a
+    /// response, marking the connection's probe pipeline as increasingly stale.
+    ///
+    /// Increment `consecutive_probe_timeouts` on each expiry; it is reset to 0
+    /// in `handle_rtt_response` on ANY received response. So a healthy link that
+    /// occasionally loses one probe but keeps getting others resets before
+    /// reaching `STALE_THRESHOLD`. Called AFTER draining this tick's responses
+    /// (see `process_queued_rtt_responses`) so this-tick responses clear their
+    /// slots first.
+    fn prune_stale_probes(&mut self) {
+        let now = monotonic_now_ms();
+        for measurement in self.rtt_measurements.values_mut() {
+            // `in_flight_probes` is oldest-first, so once the front entry is
+            // within the deadline every later entry is too — we can stop.
+            while let Some(&front) = measurement.in_flight_probes.front() {
+                if now - front > PROBE_TIMEOUT_MS {
+                    measurement.in_flight_probes.pop_front();
+                    measurement.consecutive_probe_timeouts =
+                        measurement.consecutive_probe_timeouts.saturating_add(1);
+                } else {
+                    break;
+                }
+            }
+        }
     }
 
     /// Trigger diagnostics reporting (to be called externally at 1Hz)
@@ -3074,6 +3542,17 @@ impl ConnectionManager {
     fn build_main_diagnostic_metrics(&self) -> Vec<Metric> {
         let mut metrics = Vec::new();
 
+        // #522: take ONE stale snapshot per tick and reuse it everywhere below
+        // (the Elected-branch `active_server_rtt` suppression and the
+        // `rtt_probe_stale` emit). `rtt_probe_stale()` reads `cpu_overloaded`
+        // via `Ordering::Relaxed`; computing it once removes the drift window
+        // where separate Relaxed loads could disagree within a single tick.
+        // Borrow-safe: `rtt_probe_stale()` takes its OWN immutable borrow of
+        // `rtt_measurements` that ends before it returns, so this snapshot does
+        // not conflict with the later `rtt_measurements.get(..)` re-borrow in
+        // the Elected branch.
+        let rtt_probe_stale = self.rtt_probe_stale();
+
         // Report current election state
         match &self.election_state {
             ElectionState::Testing {
@@ -3098,10 +3577,20 @@ impl ConnectionManager {
                 metrics.push(metric!("active_connection_id", connection_id.as_str()));
                 metrics.push(metric!("elected_at", *elected_at));
 
-                // Report active connection RTT
+                // Report active connection RTT. Reuse the single per-tick
+                // `rtt_probe_stale` snapshot taken at the top of this function
+                // (computed BEFORE borrowing `rtt_measurements`, so its own
+                // immutable borrow has already ended and does not conflict with
+                // the `get(connection_id)` re-borrow below).
                 if let Some(measurement) = self.rtt_measurements.get(connection_id) {
                     if let Some(avg_rtt) = measurement.average_rtt {
-                        metrics.push(metric!("active_server_rtt", avg_rtt));
+                        // When stale, suppress active_server_rtt so the 200s
+                        // value never reaches dashboards (issue #522 option A).
+                        // active_server_url/type still emit so the UI still
+                        // shows which server is active.
+                        if !rtt_probe_stale {
+                            metrics.push(metric!("active_server_rtt", avg_rtt));
+                        }
                         // SECURITY: redact (strip query + fragment) before emitting
                         // to the diagnostic bus. `measurement.url` carries the room
                         // JWT in `?token=<JWT>&instance_id=<UUID>` — see
@@ -3154,6 +3643,17 @@ impl ConnectionManager {
             *self.main_thread_drift_ms.borrow()
         ));
 
+        // RTT probe pipeline health (issue #522). Emitted in EVERY election
+        // state so dashboards always know whether the active link's probe
+        // pipeline is starved (`rtt_probe_stale`) and how many probes have been
+        // shed at the in-flight cap (`rtt_probe_dropped_total`). Bool-as-u64 per
+        // the convention documented above.
+        metrics.push(metric!("rtt_probe_stale", rtt_probe_stale as u64));
+        metrics.push(metric!(
+            "rtt_probe_dropped_total",
+            self.rtt_probe_dropped_total()
+        ));
+
         // Chrome-only: report WASM heap usage for memory pressure diagnosis.
         // Firefox/Safari don't expose performance.memory, so this gracefully
         // produces no metrics on those browsers.
@@ -3200,6 +3700,27 @@ impl ConnectionManager {
             self.active_connection_id.borrow(),
             self.election_state
         );
+
+        // #522: count this tick as a stale-suppression event when the active link's
+        // RTT-probe pipeline is stale (which suppresses active_server_rtt in
+        // build_main_diagnostic_metrics). Observability-only — increments a Cell via a
+        // shared ref, no control-flow or re-election behavior change.
+        //
+        // This guard takes its own `rtt_probe_stale()` snapshot rather than
+        // threading one in (the builder has no-arg unit-test callers, so its
+        // signature stays unchanged). That is exact: on the single-threaded WASM
+        // diagnostics tick, nothing mutates `cpu_overloaded`,
+        // `election_state`, or any `consecutive_probe_timeouts` between this
+        // snapshot and the builder's snapshot taken on the very next line, so
+        // the counted event always matches the suppression decision the builder
+        // makes for the same tick.
+        if self.rtt_probe_stale() {
+            self.rtt_probe_stale_suppressions_total.set(
+                self.rtt_probe_stale_suppressions_total
+                    .get()
+                    .saturating_add(1),
+            );
+        }
 
         let metrics = self.build_main_diagnostic_metrics();
 
@@ -3733,6 +4254,37 @@ impl ConnectionManager {
         *self.packets_sent_per_sec.borrow()
     }
 
+    /// Total number of RTT probes dropped because the in-flight queue was at
+    /// [`MAX_INFLIGHT_PROBES`] (queue cap, issue #522).
+    pub fn rtt_probe_dropped_total(&self) -> u64 {
+        self.rtt_probe_dropped_total.get()
+    }
+
+    /// Monotonic count of stale-suppression ticks (#522). See the field doc.
+    pub fn rtt_probe_stale_suppressions_total(&self) -> u64 {
+        self.rtt_probe_stale_suppressions_total.get()
+    }
+
+    /// Whether the ACTIVE link's RTT probe pipeline is stale (issue #522).
+    ///
+    /// True when the local main thread is CPU-overloaded (probe timing is
+    /// untrustworthy), or when the currently-elected connection has hit
+    /// [`STALE_THRESHOLD`] consecutive probe timeouts.
+    pub fn rtt_probe_stale(&self) -> bool {
+        if self.cpu_overloaded.load(Ordering::Relaxed) {
+            return true;
+        }
+        // Active-only: a backed-up NON-active candidate during election must not
+        // flip the active-link stale signal. Only the Elected connection's probe
+        // pipeline gates active_server_rtt / the stale metric.
+        if let ElectionState::Elected { connection_id, .. } = &self.election_state {
+            if let Some(measurement) = self.rtt_measurements.get(connection_id) {
+                return measurement.consecutive_probe_timeouts >= STALE_THRESHOLD;
+            }
+        }
+        false
+    }
+
     /// Get send queue depth from the active connection (bufferedAmount for WebSocket)
     pub fn get_send_queue_depth(&self) -> Option<u64> {
         if let Some(active_id) = self.active_connection_id.borrow().as_deref() {
@@ -3878,6 +4430,8 @@ mod tests {
             intentionally_disconnected: Rc::new(RefCell::new(false)),
             packets_received: Rc::new(Cell::new(0)),
             packets_sent: Rc::new(Cell::new(0)),
+            rtt_probe_dropped_total: Rc::new(Cell::new(0)),
+            rtt_probe_stale_suppressions_total: Rc::new(Cell::new(0)),
             last_metrics_timestamp_ms: Rc::new(RefCell::new(0.0)),
             packets_received_per_sec: Rc::new(RefCell::new(0.0)),
             packets_sent_per_sec: Rc::new(RefCell::new(0.0)),
@@ -3894,6 +4448,8 @@ mod tests {
             main_thread_drift_ms: Rc::new(RefCell::new(0.0)),
             was_suppressed_last_check: false,
             suppression_started_at_ms: None,
+            total_suppression_duration_ms: 0.0,
+            last_suppression_release_at_ms: None,
         }
     }
 
@@ -3916,6 +4472,8 @@ mod tests {
                 active: false,
                 connected: true,
                 consecutive_implausible_discards: 0,
+                in_flight_probes: VecDeque::new(),
+                consecutive_probe_timeouts: 0,
             },
         );
     }
@@ -4996,6 +5554,177 @@ mod tests {
         assert!((m.average_rtt.unwrap() - 0.0).abs() < 0.01);
     }
 
+    // catches removal of MAX_INFLIGHT_PROBES cap
+    #[test]
+    fn rtt_probe_dropped_at_inflight_cap() {
+        // The pure cap-decision helper: at the cap we drop, one below we send.
+        assert!(should_drop_probe(MAX_INFLIGHT_PROBES));
+        assert!(!should_drop_probe(MAX_INFLIGHT_PROBES - 1));
+
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+
+        let before = mgr.rtt_probe_dropped_total();
+
+        // Fill the in-flight queue exactly to the cap.
+        for _ in 0..MAX_INFLIGHT_PROBES {
+            mgr.rtt_measurements
+                .get_mut("wt_0")
+                .unwrap()
+                .in_flight_probes
+                .push_back(monotonic_now_ms());
+        }
+
+        // Simulate the drop branch exactly as send_rtt_probe does: bump the
+        // counter and DO NOT push another in-flight probe. (We cannot call
+        // send_rtt_probe directly off-wasm — it needs a live Connection.)
+        assert!(should_drop_probe(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .in_flight_probes
+                .len()
+        ));
+        mgr.rtt_probe_dropped_total
+            .set(mgr.rtt_probe_dropped_total.get() + 1);
+
+        assert_eq!(mgr.rtt_probe_dropped_total(), before + 1);
+        // The drop must NOT enqueue another probe; the queue stays at the cap.
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .in_flight_probes
+                .len(),
+            MAX_INFLIGHT_PROBES
+        );
+    }
+
+    // catches disabling the PROBE_TIMEOUT_MS prune
+    #[test]
+    fn probe_marked_stale_after_timeout() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "wt_0".to_string(),
+            elected_at: 0.0,
+        };
+
+        // Push STALE_THRESHOLD probes that are all older than PROBE_TIMEOUT_MS,
+        // i.e. genuinely expired.
+        for _ in 0..STALE_THRESHOLD {
+            mgr.rtt_measurements
+                .get_mut("wt_0")
+                .unwrap()
+                .in_flight_probes
+                .push_back(monotonic_now_ms() - PROBE_TIMEOUT_MS - 1000.0);
+        }
+
+        // Stale must come from the prune path, not from the CPU-overload OR.
+        assert!(!mgr.cpu_overloaded.load(Ordering::Relaxed));
+
+        mgr.prune_stale_probes();
+
+        assert!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_probe_timeouts
+                >= STALE_THRESHOLD
+        );
+        assert!(mgr.rtt_probe_stale());
+    }
+
+    // catches removal of reset-on-response
+    #[test]
+    fn stale_clears_when_responses_arrive() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "wt_0".to_string(),
+            elected_at: 0.0,
+        };
+
+        // Force the link into the stale state with a matching in-flight probe.
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .consecutive_probe_timeouts = STALE_THRESHOLD;
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .in_flight_probes
+            .push_back(1000.0);
+
+        assert!(mgr.rtt_probe_stale());
+
+        // A plausible response (rtt = 1100 - 1000 = 100ms) must clear stale.
+        let pkt = MediaPacket {
+            timestamp: 1000.0,
+            ..Default::default()
+        };
+        mgr.handle_rtt_response("wt_0", &pkt, 1100.0);
+
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_probe_timeouts,
+            0
+        );
+        assert!(!mgr.rtt_probe_stale());
+        assert!(mgr
+            .rtt_measurements
+            .get("wt_0")
+            .unwrap()
+            .average_rtt
+            .is_some());
+        // The matching in-flight slot must have been cleared by retain().
+        assert!(!mgr
+            .rtt_measurements
+            .get("wt_0")
+            .unwrap()
+            .in_flight_probes
+            .contains(&1000.0));
+    }
+
+    // catches a too-small prune timeout (would falsely flag a 1.5s healthy link)
+    #[test]
+    fn healthy_high_rtt_link_not_flagged_stale() {
+        let mut mgr = make_test_manager();
+        insert_measurement(&mut mgr, "wt_0", true, None, vec![]);
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "wt_0".to_string(),
+            elected_at: 0.0,
+        };
+
+        // A healthy-but-slow (1.5s RTT) link: probes aged 1500ms are well under
+        // the 5000ms PROBE_TIMEOUT_MS and must NOT be pruned as timed out.
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .in_flight_probes
+            .push_back(monotonic_now_ms() - 1500.0);
+        mgr.rtt_measurements
+            .get_mut("wt_0")
+            .unwrap()
+            .in_flight_probes
+            .push_back(monotonic_now_ms() - 1500.0);
+
+        mgr.prune_stale_probes();
+
+        assert_eq!(
+            mgr.rtt_measurements
+                .get("wt_0")
+                .unwrap()
+                .consecutive_probe_timeouts,
+            0
+        );
+        assert!(!mgr.rtt_probe_stale());
+        // 2 in-flight is well under the cap of 6.
+        assert!(!should_drop_probe(2));
+    }
+
     // ===================================================================
     // 3b. Sustained-implausible-RTT watchdog (PR-B / discussion #539)
     // ===================================================================
@@ -5406,6 +6135,65 @@ mod tests {
         );
     }
 
+    // #522: the stale-suppression counter must advance by exactly one on every
+    // 1 Hz diagnostics tick on which `rtt_probe_stale()` is true (the same
+    // predicate that suppresses `active_server_rtt`), and must NOT advance when
+    // the link is healthy. We drive the REAL `report_diagnostics` — it is
+    // native-safe: `now_ms()` uses `SystemTime` off-wasm, and on native targets
+    // `global_sender()` has no receiver, so `try_broadcast` returns an Err that
+    // `report_diagnostics` logs and swallows (it never panics or blocks). The
+    // increment runs at the top of `report_diagnostics`, before the broadcast,
+    // so it executes regardless of receiver state. We toggle staleness via
+    // `cpu_overloaded`, the same knob the existing suppression tests use.
+    //
+    // MUTATION: deleting the `if self.rtt_probe_stale() { ...set... }` block in
+    // `report_diagnostics` makes the counter stay 0 forever, so both the `== 1`
+    // and `== 2` assertions below fail. Removing only the guard (always
+    // incrementing) makes the healthy-tick assertion (`still 0`) fail.
+    #[test]
+    fn report_diagnostics_counts_stale_suppression_ticks() {
+        let mgr = make_test_manager();
+        assert_eq!(
+            mgr.rtt_probe_stale_suppressions_total(),
+            0,
+            "counter must start at 0"
+        );
+
+        // Healthy link (cpu_overloaded not set, no Elected stale timeouts):
+        // rtt_probe_stale() == false, so a tick must NOT advance the counter.
+        assert!(
+            !mgr.rtt_probe_stale(),
+            "precondition: a fresh test manager must not be stale"
+        );
+        mgr.report_diagnostics();
+        assert_eq!(
+            mgr.rtt_probe_stale_suppressions_total(),
+            0,
+            "a non-stale tick must NOT advance the suppression counter (proves the guard)"
+        );
+
+        // Force staleness via the CPU-overload signal (same mechanism the
+        // existing suppression tests use). Each subsequent tick must advance the
+        // counter by exactly one.
+        mgr.cpu_overloaded.store(true, Ordering::Relaxed);
+        assert!(
+            mgr.rtt_probe_stale(),
+            "precondition: cpu_overloaded must make rtt_probe_stale() true"
+        );
+        mgr.report_diagnostics();
+        assert_eq!(
+            mgr.rtt_probe_stale_suppressions_total(),
+            1,
+            "first stale tick must advance the counter to 1"
+        );
+        mgr.report_diagnostics();
+        assert_eq!(
+            mgr.rtt_probe_stale_suppressions_total(),
+            2,
+            "second stale tick must advance the counter to 2 (proves +1 per stale tick)"
+        );
+    }
+
     #[test]
     fn cpu_stall_guard_logs_suppression_only_on_transition() {
         // The was_suppressed_last_check field is the proxy for the log
@@ -5578,6 +6366,298 @@ mod tests {
         assert!(
             (1_000.0..=5_000.0).contains(&LAST_INBOUND_LIVENESS_MS),
             "liveness window should be 1-5 s"
+        );
+    }
+
+    // ===================================================================
+    // 5c. CPU-stall suppression panic-threshold escalation (issue #572)
+    //
+    // When a client is BOTH CPU-stalled AND network-distressed, the PR #571
+    // suppression latch can stay engaged indefinitely. These tests cover the
+    // escalation that breaks that deadlock: a cumulative budget
+    // (MAX_SUSTAINED_SUPPRESSION_MS) that, when exhausted, emits
+    // ConnectionState::Failed to drive the dioxus-ui fresh-token reconnect.
+    // ===================================================================
+
+    /// Helper: wire an `on_state_changed` sink onto `mgr` and return the shared
+    /// vec the escalation path will push `ConnectionState` values into. Mirrors
+    /// the `forwarded_packets_for` capture pattern for `on_inbound_media`.
+    fn capture_state_changes(mgr: &mut ConnectionManager) -> Rc<RefCell<Vec<ConnectionState>>> {
+        let sink = Rc::new(RefCell::new(Vec::<ConnectionState>::new()));
+        let sink_for_cb = sink.clone();
+        mgr.options.on_state_changed = Callback::from(move |state: ConnectionState| {
+            sink_for_cb.borrow_mut().push(state);
+        });
+        sink
+    }
+
+    #[test]
+    fn suppression_escalation_action_flips_exactly_at_budget_boundary() {
+        // The pure decision helper is the single source of truth for the panic
+        // threshold. The escalation site reads `monotonic_now_ms()` (Instant-
+        // derived, unmockable on host), so this is where the boundary contract
+        // is actually pinned.
+        let max = MAX_SUSTAINED_SUPPRESSION_MS;
+
+        // Well below budget: never escalate.
+        assert!(
+            !suppression_escalation_action(0.0, max),
+            "zero suppression must not escalate"
+        );
+        assert!(
+            !suppression_escalation_action(max / 2.0, max),
+            "half the budget must not escalate"
+        );
+
+        // Exactly at the budget: the contract is strict greater-than, so a
+        // total exactly equal to the ceiling does NOT escalate. (If someone
+        // weakens `>` to `>=`, this assertion fails.)
+        assert!(
+            !suppression_escalation_action(max, max),
+            "a total exactly equal to MAX_SUSTAINED_SUPPRESSION_MS must NOT escalate"
+        );
+
+        // Just above the budget: escalate. (If someone flips the comparison
+        // direction, this assertion fails.) Use the smallest representable
+        // step above the boundary to prove the flip is exactly at MAX, not at
+        // some larger fudge value.
+        let just_above = max + f64::EPSILON * max;
+        assert!(
+            suppression_escalation_action(just_above, max),
+            "a total strictly above MAX_SUSTAINED_SUPPRESSION_MS must escalate"
+        );
+        assert!(
+            suppression_escalation_action(max + 1.0, max),
+            "a total 1ms over budget must escalate"
+        );
+    }
+
+    #[test]
+    fn sustained_suppression_escalates_with_connection_failed_state() {
+        // Directly seed the cumulative accumulator past budget, then drive ONE
+        // suppressed tick. The live-cumulative check inside the suppressed
+        // branch must fire the escalation, which emits ConnectionState::Failed
+        // with the documented error string — the signal dioxus-ui maps to the
+        // fresh-token reconnect.
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        // Two servers + elevated RTT + recent inbound => the elevated-RTT
+        // trigger "would have fired", so the suppressed branch is entered.
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_inbound_now(&mut mgr, "wt_0");
+
+        // Seed the budget strictly over the ceiling so the escalation fires on
+        // this tick regardless of the (near-zero) open-window duration. This is
+        // the indefinite-latch scenario: the falling edge that would normally
+        // accumulate never arrives, so the live check must carry the decision.
+        mgr.total_suppression_duration_ms = MAX_SUSTAINED_SUPPRESSION_MS + 1.0;
+
+        // The tick still returns false (suppression wins — we do NOT re-elect
+        // on cached URLs), but it must have emitted the escalation state.
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "suppressed tick must not return a re-election trigger"
+        );
+
+        let states = captured.borrow();
+        assert_eq!(
+            states.len(),
+            1,
+            "exactly one ConnectionState must be emitted on escalation"
+        );
+        match &states[0] {
+            ConnectionState::Failed { error, .. } => {
+                assert_eq!(
+                    error, "cpu-stall suppression budget exhausted",
+                    "escalation must emit the documented Failed error string \
+                     (drives on_connection_lost -> schedule_reconnect -> refresh_room_token)"
+                );
+            }
+            other => panic!("expected ConnectionState::Failed on escalation, got {other:?}"),
+        }
+        drop(states);
+
+        // One-shot: the accumulator is reset on escalation so the NEXT tick
+        // does not re-emit Failed every second while the UI rebuilds.
+        assert_eq!(
+            mgr.total_suppression_duration_ms, 0.0,
+            "escalation must reset the cumulative accumulator (one-shot)"
+        );
+        // Drive a second suppressed tick — no new state should be emitted now
+        // that the budget is back at zero.
+        assert!(!mgr.check_rtt_degradation());
+        assert_eq!(
+            captured.borrow().len(),
+            1,
+            "escalation must fire exactly once, not on every subsequent tick"
+        );
+    }
+
+    #[test]
+    fn suppression_budget_resets_after_quiet_window() {
+        // After a sustained quiet stretch (no suppression for longer than
+        // SUPPRESSION_RESET_QUIET_MS), a non-suppressed tick must forgive the
+        // accumulated budget so a brief future stall does not inherit stale
+        // time and escalate spuriously.
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        // RTT BELOW threshold (max(50*3,50)=150) AND stale inbound AND no
+        // cpu_overloaded => this tick is NOT suppressed and does NOT fire.
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+        mark_inbound_stale(&mut mgr, "wt_0");
+
+        // Seed a non-trivial accumulated budget and a release stamp far enough
+        // in the past that the quiet window has elapsed.
+        let now = monotonic_now_ms();
+        mgr.total_suppression_duration_ms = 40_000.0;
+        mgr.last_suppression_release_at_ms = Some(now - (SUPPRESSION_RESET_QUIET_MS + 5_000.0));
+        // Not a falling edge — we were not suppressed last tick.
+        mgr.was_suppressed_last_check = false;
+
+        assert!(
+            !mgr.check_rtt_degradation(),
+            "below-threshold tick must not trigger re-election"
+        );
+        assert_eq!(
+            mgr.total_suppression_duration_ms, 0.0,
+            "a sustained quiet window must clear the cumulative accumulator"
+        );
+        assert!(
+            captured.borrow().is_empty(),
+            "a quiet-window reset must NOT emit any ConnectionState"
+        );
+    }
+
+    #[test]
+    fn suppression_budget_preserved_when_quiet_window_not_elapsed() {
+        // Negative control for the reset gate: if the client has been quiet for
+        // LESS than SUPPRESSION_RESET_QUIET_MS, the accumulated budget must be
+        // preserved (a client that keeps relapsing inside the window must still
+        // march toward escalation rather than getting a free reset every brief
+        // recovery).
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(80.0), vec![80.0]);
+        mark_inbound_stale(&mut mgr, "wt_0");
+
+        let now = monotonic_now_ms();
+        mgr.total_suppression_duration_ms = 40_000.0;
+        // Released only half the quiet window ago — NOT long enough to reset.
+        mgr.last_suppression_release_at_ms = Some(now - (SUPPRESSION_RESET_QUIET_MS / 2.0));
+        mgr.was_suppressed_last_check = false;
+
+        assert!(!mgr.check_rtt_degradation());
+        assert!(
+            (mgr.total_suppression_duration_ms - 40_000.0).abs() < 1.0,
+            "budget must be preserved when the quiet window has not yet elapsed"
+        );
+        assert!(captured.borrow().is_empty());
+    }
+
+    #[test]
+    fn falling_edge_accumulates_window_and_can_escalate() {
+        // The falling-edge accumulation path: a window that ends just below
+        // budget, followed by a second window whose accumulation pushes the
+        // cumulative total over budget, must escalate on the falling edge
+        // (re-checked after accumulation, per the issue's deliverable 5).
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+
+        // Seed prior banked budget just under the ceiling, and open a
+        // suppression window that started a known duration ago so the falling
+        // edge accumulates a deterministic, escalation-pushing increment.
+        let now = monotonic_now_ms();
+        mgr.total_suppression_duration_ms = MAX_SUSTAINED_SUPPRESSION_MS - 100.0;
+        mgr.was_suppressed_last_check = true;
+        // Window started 5s ago: falling-edge accumulation adds ~5000ms, well
+        // over the remaining 100ms of headroom.
+        mgr.suppression_started_at_ms = Some(now - 5_000.0);
+
+        // Make THIS tick a falling edge: stale inbound + no cpu_overloaded +
+        // RTT below threshold so the suppression condition is false.
+        mgr.rtt_measurements.get_mut("wt_0").unwrap().average_rtt = Some(80.0);
+        mark_inbound_stale(&mut mgr, "wt_0");
+
+        assert!(!mgr.check_rtt_degradation());
+
+        let states = captured.borrow();
+        assert_eq!(
+            states.len(),
+            1,
+            "falling-edge accumulation that crosses budget must escalate exactly once"
+        );
+        assert!(
+            matches!(&states[0], ConnectionState::Failed { error, .. }
+                if error == "cpu-stall suppression budget exhausted"),
+            "falling-edge escalation must emit the documented Failed state"
+        );
+    }
+
+    #[test]
+    fn indefinite_latch_escalates_only_once_per_budget() {
+        // Regression guard for the primary target scenario (issue #572): a
+        // client wedged in a single NEVER-ENDING suppression window (no falling
+        // edge ever arrives). The live-tick escalation must be one-shot: after
+        // it fires, it must NOT re-fire on every subsequent 1 Hz tick (which
+        // would spam ConnectionState::Failed -> on_connection_lost and trigger
+        // reconnect storms). The fix re-stamps `suppression_started_at_ms` to
+        // `now` on escalation so the live cumulative restarts from zero.
+        let mut mgr = make_test_manager();
+        let captured = capture_state_changes(&mut mgr);
+
+        mgr.options.websocket_urls = vec!["ws://a".into(), "ws://b".into()];
+        mgr.baseline_rtt = Some(50.0);
+        setup_active_elected(&mut mgr, "wt_0");
+        // Elevated RTT + recent inbound => the latch stays engaged every tick
+        // (would_have_fired && recent_inbound). No falling edge will occur.
+        insert_measurement(&mut mgr, "wt_0", true, Some(500.0), vec![500.0]);
+        mark_inbound_now(&mut mgr, "wt_0");
+
+        // Simulate a window that opened well over the budget ago, with nothing
+        // banked yet — exactly the indefinite-latch shape. The first suppressed
+        // tick's live cumulative (open window alone) exceeds the budget.
+        let now = monotonic_now_ms();
+        mgr.was_suppressed_last_check = true;
+        mgr.suppression_started_at_ms = Some(now - (MAX_SUSTAINED_SUPPRESSION_MS + 5_000.0));
+        mgr.total_suppression_duration_ms = 0.0;
+
+        // Tick 1: escalates once.
+        assert!(!mgr.check_rtt_degradation());
+        assert_eq!(
+            captured.borrow().len(),
+            1,
+            "first over-budget suppressed tick must escalate exactly once"
+        );
+
+        // Ticks 2..N: the latch is still engaged (no falling edge), but the
+        // open window was re-stamped to ~now, so the live cumulative is back
+        // near zero and must NOT re-escalate. Without the re-stamp fix, the
+        // ancient start would make every tick re-escalate.
+        for _ in 0..5 {
+            assert!(!mgr.check_rtt_degradation());
+        }
+        assert_eq!(
+            captured.borrow().len(),
+            1,
+            "a sustained latch must escalate ONCE per budget, not every tick \
+             (re-stamp of suppression_started_at_ms makes it one-shot)"
         );
     }
 
@@ -6553,6 +7633,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         });
         // old_active_connection is None (no real Connection object).
         *mgr.active_connection_id.borrow_mut() = Some("wt_old".to_string());
@@ -6623,6 +7705,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         });
         *mgr.active_connection_id.borrow_mut() = Some("custom_id".to_string());
 
@@ -6649,6 +7733,8 @@ mod tests {
             active: false,
             connected: false,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         });
 
         mgr.reset_and_start_election().unwrap();
@@ -6786,6 +7872,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         });
         *mgr.active_connection_id.borrow_mut() = Some(old_id.to_string());
         // Synthesise the moved-out old connection slot. We cannot build
@@ -7922,6 +9010,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
         mgr.election_state = ElectionState::Elected {
@@ -7984,6 +9074,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
 
@@ -8048,6 +9140,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
         mgr.election_state = ElectionState::Elected {
@@ -8106,6 +9200,8 @@ mod tests {
             active: true,
             connected: true,
             consecutive_implausible_discards: 0,
+            in_flight_probes: VecDeque::new(),
+            consecutive_probe_timeouts: 0,
         };
         mgr.rtt_measurements.insert(conn_id.clone(), measurement);
         // Set the active connection so `last_known_server` is populated from it.
@@ -8144,6 +9240,129 @@ mod tests {
         assert_eq!(
             url, "https://webtransport.example.com:4433/lobby",
             "redacted last_known_server must equal scheme://host:port/path with no query/fragment"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Per-transport connection-loss counter split (#509 parity audit, item #4)
+    //
+    // These pin the two contracts the split must uphold:
+    //   1. The `record_*(is_webtransport)` write path lands on the counter that
+    //      matches the transport — a mutation that swapped the WT/WS branches
+    //      (or that always wrote one transport) is caught.
+    //   2. The COMBINED public reader (what the wire reports, unchanged) equals
+    //      WT + WS exactly, so the split is byte-identical to the pre-split
+    //      single counter from the relay's point of view.
+    //
+    // The counters are process-global `AtomicU64`, so the tests serialize on a
+    // shared lock and assert on the DELTA (load before/after) — robust to any
+    // residual cross-test increment, matching the `REELECTION_TEST_LOCK`
+    // convention above.
+    // -----------------------------------------------------------------------
+    static LOSS_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn handshake_failure_increments_only_the_matching_transport() {
+        let _guard = LOSS_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let wt_before = connection_handshake_failures_wt();
+        let ws_before = connection_handshake_failures_ws();
+        let combined_before = connection_handshake_failures();
+
+        record_handshake_failure(true); // WebTransport
+
+        assert_eq!(
+            connection_handshake_failures_wt() - wt_before,
+            1,
+            "a WT handshake failure must increment the WT counter"
+        );
+        assert_eq!(
+            connection_handshake_failures_ws() - ws_before,
+            0,
+            "a WT handshake failure must NOT increment the WS counter (caught a swapped branch)"
+        );
+        assert_eq!(
+            connection_handshake_failures() - combined_before,
+            1,
+            "the combined reader (wire-reported) must reflect the WT increment"
+        );
+
+        let combined_after_wt = connection_handshake_failures();
+        record_handshake_failure(false); // WebSocket
+
+        assert_eq!(
+            connection_handshake_failures_ws() - ws_before,
+            1,
+            "a WS handshake failure must increment the WS counter"
+        );
+        assert_eq!(
+            connection_handshake_failures_wt() - wt_before,
+            1,
+            "the WS increment must NOT touch the WT counter"
+        );
+        assert_eq!(
+            connection_handshake_failures() - combined_after_wt,
+            1,
+            "the combined reader must also reflect the WS increment"
+        );
+    }
+
+    #[test]
+    fn session_drop_increments_only_the_matching_transport() {
+        let _guard = LOSS_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let wt_before = connection_session_drops_wt();
+        let ws_before = connection_session_drops_ws();
+        let combined_before = connection_session_drops();
+
+        record_session_drop(false); // WebSocket
+
+        assert_eq!(
+            connection_session_drops_ws() - ws_before,
+            1,
+            "a WS session drop must increment the WS counter"
+        );
+        assert_eq!(
+            connection_session_drops_wt() - wt_before,
+            0,
+            "a WS session drop must NOT increment the WT counter (caught a swapped branch)"
+        );
+        assert_eq!(
+            connection_session_drops() - combined_before,
+            1,
+            "the combined reader (wire-reported) must reflect the WS increment"
+        );
+    }
+
+    #[test]
+    fn combined_reader_equals_sum_of_both_transports() {
+        // The wire-reporting invariant: the combined reader the health packet
+        // uses MUST equal WT + WS. A mutation that made the combined reader read
+        // only one transport (re-introducing the original single-counter blind
+        // spot) is caught here. Assert the invariant holds across a mixed burst.
+        let _guard = LOSS_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        record_handshake_failure(true);
+        record_handshake_failure(false);
+        record_handshake_failure(true);
+        record_session_drop(false);
+        record_session_drop(true);
+
+        assert_eq!(
+            connection_handshake_failures(),
+            connection_handshake_failures_wt() + connection_handshake_failures_ws(),
+            "combined handshake-failure reader must equal WT + WS"
+        );
+        assert_eq!(
+            connection_session_drops(),
+            connection_session_drops_wt() + connection_session_drops_ws(),
+            "combined session-drop reader must equal WT + WS"
         );
     }
 }

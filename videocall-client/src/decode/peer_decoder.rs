@@ -72,6 +72,11 @@ struct CanvasRenderer {
     to_peer: Option<String>,
 }
 
+/// Shared slot for the proactive keyframe-request route (issue #1025). `Rc` so the decoder's
+/// worker-message closure and `VideoPeerDecoder` share it; `RefCell<Option<..>>` because the
+/// route is installed after construction (and may be `None` before the transport is wired).
+type KeyframeRequestRoute = Rc<RefCell<Option<Box<dyn Fn()>>>>;
+
 ///
 /// VideoPeerDecoder
 ///
@@ -135,6 +140,19 @@ pub struct VideoPeerDecoder {
     /// Shared (`Rc`) with the paint closure captured in [`Self::new`]; the
     /// `Cell` is sufficient because every access is on the single render thread.
     paint_enabled: Rc<Cell<bool>>,
+    /// Issue #1025: proactive keyframe-request route. The underlying `WasmDecoder`'s
+    /// worker-message closure (captured in [`Self::new`]) holds a clone of this `Rc` and,
+    /// when the worker posts a `RequestKeyframeMessage`, invokes the inner closure if set.
+    /// The owner (`PeerDecodeManager`) installs the closure via
+    /// [`Self::set_keyframe_request_route`] once it has the transport send-packet callback,
+    /// the local user id, and this peer's identity. `None` (the initial state, and after a
+    /// disconnect that clears the route) makes the proactive path a safe no-op.
+    ///
+    /// Shared on the single render thread; `RefCell` because the closure is installed after
+    /// construction. The boxed closure issues a `KEYFRAME_REQUEST` for this decoder's
+    /// peer/stream — it is bound to one (peer, media_type), so the worker message carries no
+    /// identity.
+    keyframe_request_route: KeyframeRequestRoute,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -272,9 +290,22 @@ impl VideoPeerDecoder {
             Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
         };
 
+        // Issue #1025: shared slot for the proactive keyframe-request route. The closure
+        // handed to the decoder reads this slot when the worker signals a keyframe-less
+        // eviction; the manager installs the real route later via
+        // `set_keyframe_request_route`. While `None` the proactive path is a no-op.
+        let keyframe_request_route: KeyframeRequestRoute = Rc::new(RefCell::new(None));
+        let route_for_decoder = keyframe_request_route.clone();
+        let on_request_keyframe = move || {
+            if let Some(route) = route_for_decoder.borrow().as_ref() {
+                route();
+            }
+        };
+
         let wasm_decoder = videocall_codecs::decoder::WasmDecoder::new_with_video_frame_callback(
             videocall_codecs::decoder::VideoCodec::Vp9Profile0Level10Bit8,
             Box::new(on_video_frame),
+            Box::new(on_request_keyframe),
         );
 
         let decoder = Box::new(WasmVideoFrameDecoder {
@@ -289,12 +320,48 @@ impl VideoPeerDecoder {
             stream_context: RefCell::new(None),
             first_render_pending_ack,
             paint_enabled,
+            keyframe_request_route,
         })
     }
 
     /// Set or update the canvas element for rendering. Can be called multiple times.
     /// Preserves existing peer context (from_peer / to_peer) if already set.
+    ///
+    /// issue 508: DEFENSIVE idempotency guard. When the SAME `<canvas>` DOM node
+    /// is re-handed to us (e.g. a peer's canvas-mount effect re-runs without the
+    /// element changing), skip the renderer rebuild: returning `Ok(())` the moment
+    /// the stored canvas `== canvas` (wasm-bindgen `PartialEq` → JS `===` object
+    /// identity) preserves the existing `CanvasRenderer` — its cached
+    /// `last_width`/`last_height`, from/to-peer context, and 2D context — so no
+    /// redundant rebuild and no spurious `Resized canvas to WxH` resize on the next
+    /// frame. This is a cheap correctness backstop, NOT the fix for the issue 508
+    /// FPS collapse.
+    ///
+    /// The actual issue 508 cause was upstream in the UI: on a peer-leave the
+    /// surviving single tile's `full_bleed` prop flipped, which under Dioxus 0.7
+    /// (templates are diffed by template-pointer identity) swapped `generate_for_peer`
+    /// from the regular-grid template to a SEPARATE full-bleed template. A template
+    /// swap tears down and recreates the subtree, so the remaining peer got a FRESH
+    /// `<canvas>` node — a different element, for which THIS guard's `==` is false.
+    /// `set_canvas` then rebuilt the renderer with `last_width:0`, every later frame
+    /// hit the resize branch in `render_to_canvas_cached`, and inbound FPS collapsed
+    /// to 2–3. The load-bearing fix is the single-template unification in
+    /// `canvas_generator.rs` (full-bleed is now a plain CSS class toggle inside the
+    /// one grid template), which keeps Dioxus diffing the tile in place and REUSING
+    /// the same canvas node so this method is never re-entered with a torn-down tile.
     pub fn set_canvas(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
+        // Idempotency guard: borrow is dropped at the end of this block, before
+        // the later `borrow_mut()`, so there is no RefCell conflict.
+        {
+            if let Some(renderer) = self.canvas_renderer.borrow().as_ref() {
+                if renderer.canvas == canvas {
+                    return Ok(());
+                }
+            }
+        }
+
+        // Different element (real remount with a new node) or first-ever wiring:
+        // full rebuild exactly as before.
         let context = canvas
             .get_context("2d")?
             .ok_or_else(|| JsValue::from_str("Failed to get 2d context"))?
@@ -505,6 +572,39 @@ impl VideoPeerDecoder {
         self.decoder.flush()
     }
 
+    /// Install the proactive keyframe-request route (issue #1025).
+    ///
+    /// `route` is invoked on the main thread when the worker signals that it evicted a stale
+    /// keyframe-less backlog for this decoder's stream (no buffered keyframe to resume from).
+    /// The `PeerDecodeManager` supplies a closure that emits a `KEYFRAME_REQUEST` for this
+    /// decoder's peer + media type — it is already bound to one (peer, stream), so the worker
+    /// message carries no identity. Installing it here (rather than at construction) lets the
+    /// manager build it once the transport send-packet callback, the local user id, and the
+    /// peer's identity are all known. Replaces any previously-installed route; pass-through to
+    /// the shared slot the decoder closure reads.
+    pub fn set_keyframe_request_route(&self, route: Box<dyn Fn()>) {
+        *self.keyframe_request_route.borrow_mut() = Some(route);
+    }
+
+    /// Drop any installed keyframe-request route. The route closure captures a
+    /// clone of the transport `send_packet` `Callback` (a strong `Rc` that
+    /// reaches `Inner`), so it must be cleared on teardown alongside
+    /// `send_packet` itself — otherwise it keeps `Inner` alive after the UI scope
+    /// unmounts (the cc7tp/#502 `Rc`-cycle class). See
+    /// [`PeerDecodeManager::clear_send_packet_callback`].
+    pub fn clear_keyframe_request_route(&self) {
+        *self.keyframe_request_route.borrow_mut() = None;
+    }
+
+    /// Test/observability helper: whether a keyframe-request route is currently
+    /// installed. Used by the #1025 teardown regression test to assert that
+    /// `clear_send_packet_callback` actually drops the route (breaking the
+    /// `Rc`-cycle leg).
+    #[doc(hidden)]
+    pub fn has_keyframe_request_route(&self) -> bool {
+        self.keyframe_request_route.borrow().is_some()
+    }
+
     /// No-op decoder for unit tests — avoids requiring WebCodecs / worker link tags.
     #[cfg(test)]
     pub(crate) fn noop() -> Self {
@@ -525,6 +625,7 @@ impl VideoPeerDecoder {
             stream_context: RefCell::new(None),
             first_render_pending_ack: Rc::new(RefCell::new(false)),
             paint_enabled: Rc::new(Cell::new(true)),
+            keyframe_request_route: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -535,6 +636,28 @@ impl VideoPeerDecoder {
     #[cfg(test)]
     pub(crate) fn paint_enabled_for_test(&self) -> bool {
         self.paint_enabled.get()
+    }
+
+    /// issue 508: test seam — overwrite the renderer's cached dimensions so a
+    /// `#[wasm_bindgen_test]` can simulate a frame having sized the canvas
+    /// without needing a real decoded `VideoFrame`. No-op when no renderer is
+    /// wired. Mirrors the `paint_enabled_for_test` pattern.
+    #[cfg(test)]
+    pub(crate) fn set_renderer_dims_for_test(&self, w: u32, h: u32) {
+        if let Some(renderer) = self.canvas_renderer.borrow_mut().as_mut() {
+            renderer.last_width = w;
+            renderer.last_height = h;
+        }
+    }
+
+    /// issue 508: test seam — read back the renderer's cached `(last_width,
+    /// last_height)`. Returns `None` when no renderer is wired.
+    #[cfg(test)]
+    pub(crate) fn renderer_dims_for_test(&self) -> Option<(u32, u32)> {
+        self.canvas_renderer
+            .borrow()
+            .as_ref()
+            .map(|r| (r.last_width, r.last_height))
     }
 }
 
@@ -1180,6 +1303,104 @@ mod tests {
             "reaching decode() means the tile is visible again (the \
              manager's !visible guard returns SKIPPED before us), so the \
              next frame is wanted — painting must be re-enabled"
+        );
+    }
+}
+
+/// issue 508: regression test for the `set_canvas` idempotency guard.
+///
+/// SCOPE: this pins the DEFENSIVE same-node guard only (a redundant rebuild is
+/// skipped when the identical `<canvas>` node is re-handed). It does NOT cover
+/// the load-bearing issue 508 fix — the single-template unification in
+/// `canvas_generator.rs` that keeps Dioxus reusing the same canvas node across a
+/// peer-leave `full_bleed` flip. That node-reuse behaviour is exercised by the
+/// `e2e/tests/peer-leave-canvas-stability.spec.ts` Playwright spec, since it
+/// depends on the real Dioxus template diff and cannot be asserted from a unit
+/// test on `VideoPeerDecoder` alone.
+///
+/// These tests require a real browser `document` (they create `<canvas>`
+/// elements via `document.createElement`) and therefore run only under
+/// `wasm-bindgen-test-runner` / `wasm-pack test --headless`. They compile
+/// under `cargo check --target wasm32-unknown-unknown --tests` but are NOT
+/// executed by `cargo test` on the host.
+///
+/// ONE-LINE MUTATION THAT MAKES THE TEST FAIL:
+///   Delete the `if renderer.canvas == canvas { return Ok(()); }` block in
+///   `set_canvas`. The second `set_canvas(canvas_a)` call will then rebuild
+///   the renderer with `last_width: 0, last_height: 0`, so
+///   `renderer_dims_for_test()` returns `Some((0, 0))` instead of
+///   `Some((640, 480))` and the assertion panics.
+#[cfg(test)]
+mod wasm_canvas_tests {
+    use super::*;
+    use wasm_bindgen::JsCast;
+    use wasm_bindgen_test::wasm_bindgen_test;
+
+    // DOM-touching tests (`document.createElement`) require a real browser
+    // environment; the wasm-bindgen-test runner defaults to Node.js, which has
+    // no `window`/`document`. Mirrors `peer_decode_manager.rs` et al.
+    wasm_bindgen_test::wasm_bindgen_test_configure!(run_in_browser);
+
+    fn make_canvas() -> HtmlCanvasElement {
+        web_sys::window()
+            .expect("no window")
+            .document()
+            .expect("no document")
+            .create_element("canvas")
+            .expect("create_element failed")
+            .dyn_into::<HtmlCanvasElement>()
+            .expect("not an HtmlCanvasElement")
+    }
+
+    /// issue 508: same-node re-hand must be a no-op — cached renderer dims
+    /// (set by the test seam to simulate a sized frame) must survive a second
+    /// `set_canvas` call with the identical `<canvas>` DOM node.
+    #[wasm_bindgen_test]
+    fn set_canvas_same_node_preserves_renderer_dims() {
+        let decoder = VideoPeerDecoder::noop();
+
+        // Wire the canvas for the first time (fresh renderer, dims are 0).
+        let canvas_a = make_canvas();
+        decoder
+            .set_canvas(canvas_a.clone())
+            .expect("initial set_canvas failed");
+        assert_eq!(
+            decoder.renderer_dims_for_test(),
+            Some((0, 0)),
+            "renderer dims start at zero after initial wiring"
+        );
+
+        // Simulate a frame having been decoded and the renderer sized.
+        decoder.set_renderer_dims_for_test(640, 480);
+        assert_eq!(
+            decoder.renderer_dims_for_test(),
+            Some((640, 480)),
+            "test seam must write the sentinel dims"
+        );
+
+        // Re-hand the SAME canvas node (Dioxus re-running the mount effect on
+        // peer-leave). The idempotency guard must short-circuit: dims preserved.
+        decoder
+            .set_canvas(canvas_a.clone())
+            .expect("second set_canvas (same node) failed");
+        assert_eq!(
+            decoder.renderer_dims_for_test(),
+            Some((640, 480)),
+            "issue 508: same-node re-hand must NOT rebuild the renderer — \
+             cached dims must be preserved"
+        );
+
+        // A DIFFERENT canvas node (real remount with a new element) must still
+        // trigger a full rebuild, resetting dims to zero.
+        let canvas_b = make_canvas();
+        decoder
+            .set_canvas(canvas_b)
+            .expect("set_canvas with new node failed");
+        assert_eq!(
+            decoder.renderer_dims_for_test(),
+            Some((0, 0)),
+            "a genuinely new canvas node must rebuild the renderer (dims reset \
+             to zero)"
         );
     }
 }

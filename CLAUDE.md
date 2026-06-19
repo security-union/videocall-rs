@@ -47,6 +47,8 @@ Always delegate work to the specialized roster agents instead of making changes 
 
 Run agents in parallel when tasks are independent. Always run `code-reviewer` after substantive code changes. Always run `e2e-test-sync` after any change that affects user-facing behavior — E2E tests must be updated to cover the change and must pass before the work is considered complete.
 
+**Do not defer an E2E test by assumption.** Before claiming a user-facing change can't be tested ("needs a harness that doesn't exist"), grep `e2e/tests/` for an existing spec that already stands up the needed harness (a 2-peer call, the diagnostics drawer, a camera-on canvas, the screen-share panel, etc.) — a deferral must cite that search, never an assumption. If the harness exists, the test is writable: extend that spec. And "covered" means the spec has actually **run green** (local docker e2e stack or a scoped CI dispatch), not merely written — note that an untagged spec (no `@bvt0`/`@bvt1`) does **not** run in per-PR CI, so it must be validated another way before the work is considered complete.
+
 **Never generate your own general-purpose agents.** Only use the agents listed on this roster. If no roster agent fits the task, stop everything and ask the user for direction.
 
 ## Change Impact Policy
@@ -67,7 +69,7 @@ Run agents in parallel when tasks are independent. Always run `code-reviewer` af
 
 **All code changes MUST pass project linters before being considered complete.** Agents must run the appropriate linter/formatter after editing any file:
 
-- **Rust code:** Run `cargo fmt` on changed crates. Run `cargo clippy` to catch warnings and fix them.
+- **Rust code:** Run `cargo fmt` on changed crates. To catch clippy warnings the way CI does, run **`make clippy-ci`** — a plain `cargo clippy` (or `cargo clippy --all`) lints only library/binary targets and MISSES `#[test]`-target lints and crate-specific feature flags. CI therefore lints each test-bearing crate's `--tests` explicitly (`videocall-client` on wasm, `videocall-aq`, `videocall-codecs`, `videocall-ui`, and `neteq --no-default-features --features web`), and these lints fail CI on an already-pushed PR if missed locally. `make clippy-ci` mirrors that exact command set from `.github/workflows/pr-check-rust-hcl.yaml`; it is the only local command that reproduces the CI clippy job. **If you add a new crate with test code, add a `--tests` clippy step to BOTH the workflow and the `clippy-ci` target** — `scripts/check-clippy-ci-sync.sh` (run by the fmt job in CI, issue #1500) fails the build if the two lists drift, so editing one without the other turns CI red.
 - **TypeScript / JS (e2e/):** Run `cd e2e && npx prettier --write <files> && npx eslint <files> && npx tsc --noEmit` to match the CI `ci:lint` check.
 - **General:** No unused imports, no unused variables, follow existing code style. Respect all project lint configs (`.eslintrc`, `rustfmt.toml`, `.prettierrc`, etc.).
 

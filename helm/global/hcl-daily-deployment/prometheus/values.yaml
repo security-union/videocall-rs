@@ -46,3 +46,59 @@ serverFiles:
             annotations:
               summary: "Relay outbound channel saturating ({{ $labels.transport }} {{ $labels.kind }})"
               description: "Relay is dropping {{ $value | printf \"%.1f\" }} {{ $labels.kind }} packets/sec on {{ $labels.transport }}. Check relay CPU, NATS publish latency, and per-room drops."
+
+      # =====================================================================
+      # videocall_playout_latency_alerts
+      #
+      # Issue #1252 / #1339: per-session buffered playout latency. The gauge
+      # videocall_video_playout_latency_ms (PR #1337) measures how far behind
+      # live a receiver's decoded video is (jitter-buffer backlog + decoder
+      # queue). Sustained >1800ms is the #1252 audio-ahead-of-video lag.
+      # Keyed on session_id; the gauge is reported only while the tile is
+      # actively receiving (fps_received > 0), so a stale/idle tile reports 0
+      # and never trips these alerts.
+      # =====================================================================
+      - name: videocall_playout_latency_alerts
+        rules:
+          # WARN band: 600ms <= latency < 1800ms. Strictly below 1800 so this
+          # never fires concurrently with the critical alert on the same
+          # series (critical owns > 1800). Sustained 600ms is the onset of
+          # perceptible audio-ahead-of-video drift.
+          - alert: VideoPlayoutLatencyElevated
+            expr: videocall_video_playout_latency_ms >= 600 and videocall_video_playout_latency_ms < 1800
+            for: 30s
+            labels:
+              severity: warning
+              component: video-playout
+            annotations:
+              summary: "Video playout latency elevated (600-1800ms)"
+              description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Approaching the #1252 lag threshold."
+
+          # CRITICAL: latency > 1800ms sustained for > 10s. This is the #1252
+          # lag: audio plays live while video is seconds behind.
+          - alert: VideoPlayoutLatencyHigh
+            expr: videocall_video_playout_latency_ms > 1800
+            for: 10s
+            labels:
+              severity: critical
+              component: video-playout
+              page: "true"
+            annotations:
+              summary: "Video playout latency > 1800ms (#1252 lag)"
+              description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) is {{ $value | printf \"%.0f\" }}ms behind live. Audio-ahead-of-video lag (#1252) — video is seconds behind."
+
+          # AUDIO sibling. DEPENDS ON #1360 (videocall_audio_playout_latency_ms)
+          # merging — this rule is inert until that gauge exists. The audio
+          # playout buffer is governed by NetEQ, whose scale differs from the
+          # video jitter buffer, so the 1800ms threshold is inherited from
+          # video as a starting point and LIKELY NEEDS FIELD TUNING against
+          # videocall_neteq_target_delay_ms before it is trusted to page.
+          - alert: AudioPlayoutLatencyHigh
+            expr: videocall_audio_playout_latency_ms > 1800
+            for: 10s
+            labels:
+              severity: warning
+              component: audio-playout
+            annotations:
+              summary: "Audio playout latency > 1800ms (threshold needs NetEQ tuning)"
+              description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} in meeting {{ $labels.meeting_id }} (session {{ $labels.session_id }}) audio is {{ $value | printf \"%.0f\" }}ms behind live. Threshold inherited from video and pending field tuning against NetEQ target delay (#1360)."

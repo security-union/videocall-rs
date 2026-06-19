@@ -1,0 +1,64 @@
+# gitleaks configuration — videocall
+#
+# Purpose: forward-prevention secret-scanning gate. Real high-entropy secrets
+# (OAuth client secrets, API keys, JWT signing keys) must be caught BEFORE they
+# are committed. Placeholder templates and well-known local-dev defaults must
+# NOT trip the gate (false positives erode trust in the gate).
+#
+# `extend.useDefault = true` keeps ALL of gitleaks' built-in detection rules
+# active; the allowlist below only carves out specific, verified non-secrets.
+# Do NOT add real secret values or broadly disable rules here.
+
+title = "videocall gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Placeholders, local-dev defaults, and sample/example files only"
+
+# --- Files that are templates/examples by definition -----------------------
+# These carry placeholders, never real secrets. Real secrets live in .env
+# (gitignored). The .env.example here ships placeholders only.
+paths = [
+  '''(^|/)\.env\.example$''',
+  '''(^|/)\.env-sample$''',
+  '''(^|/)docker/\.env-sample$''',
+  # Public API reference docs use illustrative/truncated tokens, not live ones.
+  '''(^|/)docs/MEETING_API\.md$''',
+  # Public Cloudflare Web-Analytics beacon token (a PUBLIC site tag, not a secret).
+  '''(^|/)engineering-vlog/templates/partials/header\.html$''',
+]
+
+# --- Placeholder / local-dev-default values --------------------------------
+# Matched anywhere; these are documented non-secrets used by docker-compose
+# and dev scripts. Listing the exact strings (not the secret KEY names) keeps
+# the carve-out narrow: a REAL value in OAUTH_CLIENT_SECRET / JWT_SECRET still
+# trips because it won't match any of these.
+regexes = [
+  # OAuth placeholders from .env.example / README / docs
+  '''<your-[a-z0-9-]*client-?(id|secret)>''',
+  '''<your-videocall-client-id>''',
+  '''<your-client-secret>''',
+  '''YOUR_CLIENT_SECRET''',
+  '''your-client-secret''',
+  # Empty placeholder assignments (e.g. OAUTH_CLIENT_SECRET= with no value)
+  '''OAUTH_CLIENT_SECRET=\s*$''',
+  # Local-dev JWT secret defaults used across docker-compose / start_dev.sh
+  '''dev-jwt-secret-change-me(-for-local)?''',
+  '''<set-a-local-dev-jwt-secret>''',
+  '''test-secret-for-integration-tests''',
+  # docker-compose local Postgres / Grafana dev defaults
+  '''POSTGRES_PASSWORD[:=]\s*"?docker"?''',
+  '''PGPASSWORD[:=]\s*"?docker"?''',
+  '''GF_SECURITY_ADMIN_PASSWORD=grafana''',
+]
+
+# --- Stopwords: substrings that mark a match as a non-secret ----------------
+stopwords = [
+  "change-me",
+  "changeme",
+  "your-secret-key-change-in-production",
+  "example",
+  "placeholder",
+]

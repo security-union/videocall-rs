@@ -44,11 +44,15 @@ fn inject_app_config_with_provider(provider: &str) {
     let frozen = js_sys::Object::freeze(&config);
     let window = gloo_utils::window();
     js_sys::Reflect::set(&window, &"__APP_CONFIG".into(), &frozen).unwrap();
+    // app_config() memoizes the first parse (issue #1492); each test injects a
+    // different provider, so clear the cache to re-parse THIS config.
+    dioxus_ui::constants::reset_config_cache_for_test();
 }
 
 fn remove_app_config() {
     let window = gloo_utils::window();
     let _ = js_sys::Reflect::delete_property(&window.into(), &"__APP_CONFIG".into());
+    dioxus_ui::constants::reset_config_cache_for_test();
 }
 
 // ---------------------------------------------------------------------------

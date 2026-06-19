@@ -547,6 +547,7 @@ jobs:
             --set "runtimeConfig.wsUrl=wss://pr${SLOT}-ws.sandbox.videocall.rs" \
             --set "runtimeConfig.webTransportHost=" \
             --set-string "runtimeConfig.webTransportEnabled=false" \
+            --set-string "runtimeConfig.transportBadgeEnabled=false" \
             --set-string "runtimeConfig.oauthEnabled=true" \
             --set-string "runtimeConfig.oauthProvider=google" \
             --set-string "runtimeConfig.e2eeEnabled=false" \

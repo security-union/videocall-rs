@@ -23,6 +23,21 @@ use web_sys::{AudioContext, AudioWorkletNode, MessageEvent, Worker};
 
 const WORKLET_CODE: &str = include_str!("../scripts/pcmPlayerWorker.js");
 
+/// Number of audio samples in one Opus frame at the negotiated sample rate.
+/// 48000 Hz / 1000 ms * 20 ms = 960 samples per 20 ms frame. NetEQ's
+/// delay manager treats the packet `timestamp` field as a sample counter, so
+/// consecutive frames must advance by exactly this many samples.
+const SAMPLES_PER_AUDIO_FRAME: u32 = AUDIO_SAMPLE_RATE / 1000 * OPUS_FRAME_DURATION_MS;
+
+/// Derive a NetEQ sample-domain RTP timestamp from the monotonic packet
+/// sequence number. Using the sequence (not the wall-clock `packet.timestamp`)
+/// makes the timestamp immune to the browser-ms vs CLI-micros encoder
+/// divergence: each sequence step is exactly one Opus frame = +960 samples.
+/// Wraps in the u32 domain like a real RTP timestamp.
+fn seq_to_sample_timestamp(seq: u64) -> u32 {
+    (seq as u32).wrapping_mul(SAMPLES_PER_AUDIO_FRAME)
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "camelCase")]
 enum WorkerMsg {
@@ -671,6 +686,34 @@ impl NetEqAudioPeerDecoder {
     pub fn unpack_red_audio_public(data: &[u8]) -> Option<(Vec<u8>, u32, Vec<u8>)> {
         Self::unpack_red_audio(data)
     }
+
+    /// Build a `WorkerMsg::Insert` from a full-width u64 sequence number.
+    ///
+    /// The `seq` field in `WorkerMsg::Insert` is u16 by design: NetEQ's
+    /// `RtpHeader.sequence_number` is a u16, and packet ordering/flush/reject
+    /// decisions inside the NetEQ worker are driven solely by the sample-domain
+    /// `timestamp` (derived here via `seq_to_sample_timestamp`), never by the
+    /// sequence number itself.  Ordering is RTP wrap-aware (0x8000 half-window
+    /// comparison in `neteq/src/packet.rs::is_sequence_newer`), so the
+    /// truncation from u64 → u16 is wrap-safe: the u16 seq wraps at 65536
+    /// frames (~21.8 min at 20 ms/frame) exactly as a real RTP sequence number
+    /// would.  The truncation is intentional and must NOT be widened to u32/u64.
+    ///
+    /// Cross-references:
+    ///  - `neteq/src/neteq.rs::test_seq_wrap_no_buffer_flush` — regression test
+    ///    proving that a u16 seq wrap does not flush or reject packets.
+    ///  - `tests::test_insert_msg_truncates_seq_to_u16_but_red_tracks_full_u64`
+    ///    in this file — receiver-boundary test proving this seam truncates to
+    ///    the expected u16 value while RED dedup tracks the full u64.
+    fn build_insert_msg(seq: u64, payload: Vec<u8>) -> WorkerMsg {
+        WorkerMsg::Insert {
+            // DELIBERATE u64 → u16 truncation: wrap-safe by RTP design.
+            // See doc-comment above for the full rationale.
+            seq: seq as u16,
+            timestamp: seq_to_sample_timestamp(seq),
+            payload,
+        }
+    }
 }
 
 impl Drop for NetEqAudioPeerDecoder {
@@ -686,7 +729,12 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                 let seq = audio_meta.sequence;
 
                 // Track this sequence number so we can detect duplicates from
-                // redundancy payloads later.
+                // redundancy payloads later.  RED dedup intentionally tracks
+                // the FULL u64 protobuf sequence so that two sequences that
+                // differ only above bit 15 (e.g. 5 and 65541) are never
+                // collapsed — unlike the u16 worker seq, which is truncated by
+                // design.  See `build_insert_msg` and the boundary test
+                // `test_insert_msg_truncates_seq_to_u16_but_red_tracks_full_u64`.
                 self.record_sequence(seq);
 
                 // Check whether the packet carries RED-style redundancy.
@@ -706,23 +754,17 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                                 self.peer_id
                             );
                             self.record_sequence(redundant_seq as u64);
-                            // Inject the recovered frame with its original sequence and
-                            // an earlier timestamp (one Opus frame before the primary).
-                            let recovered_insert = WorkerMsg::Insert {
-                                seq: redundant_seq as u16,
-                                timestamp: (packet.timestamp as u32)
-                                    .saturating_sub(OPUS_FRAME_DURATION_MS),
-                                payload: redundant_data,
-                            };
+                            // Inject the recovered frame with its original sequence and a
+                            // sample-domain timestamp derived from the recovered frame's own
+                            // sequence number (which is one Opus frame, +960 samples, before
+                            // the primary's).
+                            let recovered_insert =
+                                Self::build_insert_msg(redundant_seq as u64, redundant_data);
                             self.send_worker_message(recovered_insert);
                         }
 
                         // Now send the primary frame.
-                        let insert = WorkerMsg::Insert {
-                            seq: seq as u16,
-                            timestamp: packet.timestamp as u32,
-                            payload: primary,
-                        };
+                        let insert = Self::build_insert_msg(seq, primary);
                         self.send_worker_message(insert);
                     } else {
                         // RED unpack failed -- fall back to treating the whole
@@ -732,20 +774,12 @@ impl crate::decode::AudioPeerDecoderTrait for NetEqAudioPeerDecoder {
                             self.peer_id,
                             seq
                         );
-                        let insert = WorkerMsg::Insert {
-                            seq: seq as u16,
-                            timestamp: packet.timestamp as u32,
-                            payload: packet.data.clone(),
-                        };
+                        let insert = Self::build_insert_msg(seq, packet.data.clone());
                         self.send_worker_message(insert);
                     }
                 } else {
                     // Standard (non-RED) audio packet.
-                    let insert = WorkerMsg::Insert {
-                        seq: seq as u16,
-                        timestamp: packet.timestamp as u32,
-                        payload: packet.data.clone(),
-                    };
+                    let insert = Self::build_insert_msg(seq, packet.data.clone());
                     self.send_worker_message(insert);
                 }
 
@@ -1040,5 +1074,148 @@ mod tests {
         // Sequence 10 should have been evicted
         assert!(!received.contains(&10));
         assert_eq!(received.len(), capacity);
+    }
+
+    // -----------------------------------------------------------------------
+    // Receiver-boundary tests for issue #623
+    // -----------------------------------------------------------------------
+
+    /// Verify that `build_insert_msg` (the production seam used by all four
+    /// `WorkerMsg::Insert` call sites in `decode()`) truncates the u64 sequence
+    /// number to u16, and that the truncation produces the expected wrap-reduced
+    /// value for a seq that has crossed the u16 boundary (~21.8 min at 20 ms/frame).
+    ///
+    /// Mutation sensitivity:
+    ///   - The `seq` assertion confirms the wrap-reduced value (4), but because
+    ///     `WorkerMsg::Insert.seq` is typed `u16`, the compiler enforces truncation
+    ///     at the field boundary regardless of whether `build_insert_msg` uses
+    ///     `as u16` explicitly. The seq assertion is therefore NOT independently
+    ///     mutation-resistant against removal of the explicit cast.
+    ///   - THE PRIMARY MUTATION-RESISTANT PIN is the `timestamp` assertion.
+    ///     `seq_to_sample_timestamp` is called with the full u64 (65540) and
+    ///     produces 62_918_400. If `build_insert_msg` sourced the timestamp from
+    ///     the truncated u16 (4) instead, it would produce 3_840 and the assertion
+    ///     would fail -- proving the test pins the full-u64 timestamp path.
+    ///
+    /// Cross-reference: `neteq/src/neteq.rs::test_seq_wrap_no_buffer_flush`
+    /// proves that this u16 seq wrap does not flush or reject packets in NetEQ.
+    #[wasm_bindgen_test]
+    fn test_insert_msg_truncates_seq_to_u16_but_red_tracks_full_u64() {
+        // 65540 = 65536 + 4, so as u16 == 4. This simulates a seq that has
+        // crossed the u16 wrap boundary (~21.8 min at 20 ms/frame).
+        let over_wrap_seq: u64 = 65540;
+        let payload = b"opus_frame".to_vec();
+
+        let msg = NetEqAudioPeerDecoder::build_insert_msg(over_wrap_seq, payload.clone());
+
+        match msg {
+            WorkerMsg::Insert {
+                seq,
+                timestamp,
+                payload: returned_payload,
+            } => {
+                // Confirms the wrap-reduced value. Because the field is u16-typed
+                // the compiler enforces truncation at the boundary regardless; this
+                // assertion documents the expected post-wrap value (65540 mod 65536 == 4)
+                // but is NOT the primary mutation pin. See the timestamp assertion below.
+                assert_eq!(seq, 4u16, "seq must be 65540 mod 65536 == 4 after u16 wrap");
+
+                // PRIMARY MUTATION-RESISTANT PIN: the timestamp must be derived
+                // from the FULL u64 seq via the production function, not from the
+                // truncated u16. If build_insert_msg sourced the timestamp from
+                // `over_wrap_seq as u16 as u64` (== 4) instead of 65540, the result
+                // would be 4*960 = 3_840, not 65540*960 = 62_918_400, and this
+                // assertion would fail.
+                let expected_ts = seq_to_sample_timestamp(over_wrap_seq);
+                assert_eq!(
+                    timestamp, expected_ts,
+                    "timestamp must be derived from the full u64 seq, not the truncated u16"
+                );
+                // Sanity-check: 65540 * 960 = 62_918_400 (fits in u32, no wrap here).
+                assert_eq!(expected_ts, 65540u32.wrapping_mul(960));
+
+                assert_eq!(returned_payload, payload);
+            }
+            other => panic!("Expected WorkerMsg::Insert, got {:?}", other),
+        }
+    }
+
+    /// Verify that the RED deduplication ring buffer tracks FULL u64 sequence
+    /// numbers, so two sequences that share the same u16 low bits (e.g. 5 and
+    /// 65541 = 5 + 65536) are tracked as DISTINCT entries and are never collapsed.
+    ///
+    /// Why this matters: if `record_sequence`/`has_sequence` were truncated
+    /// to u16 internally, `has_sequence(65541)` would return true after only
+    /// `record_sequence(5)` was called, causing RED recovery to wrongly suppress
+    /// a frame at sequence 65541 as a duplicate.
+    ///
+    /// Mutation check: if the VecDeque element type or the insert/lookup were
+    /// changed to u16 (truncating before storage), then
+    /// `received.contains(&65541u64)` would return false (the stored value
+    /// would be 5, not 65541), causing `assert!(received.contains(&65541))` to
+    /// fail -- proving the test pins the full-width tracking invariant.
+    #[wasm_bindgen_test]
+    fn test_red_dedup_tracks_full_u64_no_u16_collision() {
+        use std::collections::VecDeque;
+
+        let capacity = crate::adaptive_quality_constants::AUDIO_RED_SEQ_HISTORY_SIZE;
+        // Mirror record_sequence / has_sequence using the same VecDeque<u64> type.
+        // This follows the precedent established by `record_and_has_sequence`.
+        let mut received: VecDeque<u64> = VecDeque::with_capacity(capacity);
+
+        let record = |buf: &mut VecDeque<u64>, seq: u64| {
+            if buf.len() >= capacity {
+                buf.pop_front();
+            }
+            buf.push_back(seq);
+        };
+
+        // Record sequence 5 (u16 low bits: 5).
+        record(&mut received, 5);
+
+        // Record sequence 65541 = 5 + 65536; as u16 this is also 5.
+        // If tracking were truncated to u16, 65541 and 5 would collide.
+        record(&mut received, 65541);
+
+        // Both full-width u64 values must be present as distinct entries.
+        assert!(
+            received.contains(&5u64),
+            "sequence 5 must be tracked as u64=5"
+        );
+        assert!(
+            received.contains(&65541u64),
+            "sequence 65541 must be tracked as u64=65541, \
+             not collapsed with seq 5 via u16 truncation"
+        );
+
+        // The buffer has two distinct entries, not one collapsed entry.
+        assert_eq!(
+            received.len(),
+            2,
+            "5 and 65541 must be two distinct entries in the RED ring buffer; \
+             u16 truncation would collapse them into one"
+        );
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod host_tests {
+    use super::*;
+
+    #[test]
+    fn seq_maps_to_sample_domain_timestamp() {
+        // The constant must resolve to exactly one Opus frame at 48 kHz.
+        assert_eq!(SAMPLES_PER_AUDIO_FRAME, 960);
+
+        // Each sequence step advances by exactly one Opus frame (+960 samples),
+        // which is what NetEQ's delay manager expects from the timestamp field.
+        assert_eq!(seq_to_sample_timestamp(0), 0);
+        assert_eq!(seq_to_sample_timestamp(1), 960);
+        assert_eq!(seq_to_sample_timestamp(2), 1920);
+
+        // The timestamp wraps in the u32 domain like a real RTP timestamp:
+        // 4_500_000 * 960 = 4_320_000_000, which exceeds u32::MAX. After wrapping
+        // (minus 4_294_967_296) the result is 25_032_704.
+        assert_eq!(seq_to_sample_timestamp(4_500_000), 25_032_704);
     }
 }

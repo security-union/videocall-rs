@@ -63,6 +63,19 @@ pub struct JoinRoom {
     /// `ChatServer::sessions` is transport-erased, so the transport is otherwise
     /// unknown at the mailbox-drop site (dashboard audit Tier B #2 / #1057).
     pub transport: String,
+    /// Shared receiver-downlink-congestion signal for #1219 Half 2.
+    ///
+    /// The transport actor owns this `Arc<AtomicU64>` and writes the monotonic
+    /// epoch of the most recent REAL downlink overflow into it from
+    /// `SessionLogic::on_outbound_drop`. It is handed to the per-receiver NATS
+    /// fan-out closure (`handle_msg`) here — the same reversed-direction handoff
+    /// pattern as the `transport` field above — so the closure can read the
+    /// windowed signal to drive emergency layer shedding + the one-shot
+    /// DOWNLINK_CONGESTION emit. `0` ([`DOWNLINK_EPOCH_NEVER`]) means "never
+    /// congested".
+    ///
+    /// [`DOWNLINK_EPOCH_NEVER`]: crate::actors::session_logic::DOWNLINK_EPOCH_NEVER
+    pub downlink_congested_epoch: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 #[derive(ActixMessage)]

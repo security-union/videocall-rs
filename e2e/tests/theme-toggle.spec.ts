@@ -11,11 +11,9 @@ import { waitForServices } from "../helpers/wait-for-services";
  *   2. Triggers apply_and_save_theme(), which writes localStorage["ui-theme"]
  *      and sets html[data-theme].
  *
- * IMPORTANT: `apply_and_save_theme()` uses `dioxus_sdk_storage::LocalStorage::set`
- * which CBOR+zlib+hex-encodes the stored value.  Do NOT seed or assert
- * localStorage with plain strings like "light" or "dark" — they will not be
- * decoded by the CBOR-aware `load_theme_from_storage()` reader.  Use the UI
- * toggle to write values and assert `html[data-theme]` for correctness.
+ * `apply_and_save_theme()` writes `localStorage["ui-theme"]` as a plain-text
+ * string (e.g. "dark", "light", "system").  Tests CAN seed or assert
+ * localStorage values directly via `localStorage.setItem()`.
  *
  * Tests navigate into a live meeting, open the settings modal, switch to the
  * Appearance tab, and then exercise the theme buttons.
@@ -218,10 +216,9 @@ test.describe("Theme toggle icon buttons in AppearanceSettingsPanel", () => {
       .evaluate((el) => window.getComputedStyle(el).color);
     expect(inviteHeadingColor).toBe("rgb(58, 58, 60)");
 
-    // localStorage must be persisted by apply_and_save_theme.  The value is
-    // CBOR+zlib+hex-encoded by the SDK, so we only verify it is non-null.
+    // localStorage must be persisted by apply_and_save_theme as plain text.
     const stored = await page.evaluate(() => localStorage.getItem("ui-theme"));
-    expect(stored).not.toBeNull();
+    expect(stored).toBe("light");
 
     // The active button has the theme-icon-button--active class.
     const lightClass = await page
@@ -256,9 +253,7 @@ test.describe("Theme toggle icon buttons in AppearanceSettingsPanel", () => {
   }) => {
     const meetingId = `e2e_theme_dark_${Date.now()}`;
 
-    // Do NOT seed localStorage with a plain string — the SDK decoder is
-    // CBOR-aware and will not recognise it.  Instead, click Light via the UI
-    // first so that apply_and_save_theme writes a proper CBOR-encoded value.
+    // Click Light via the UI first so we can then toggle back to Dark.
     await openAppearanceTab(page, meetingId, "theme-dark-user");
 
     await page.getByRole("button", { name: "Light", exact: true }).click();
@@ -284,9 +279,9 @@ test.describe("Theme toggle icon buttons in AppearanceSettingsPanel", () => {
     );
     expect(darkBgImage).not.toContain("theme_light_v1.png");
 
-    // The stored value is CBOR+zlib+hex-encoded; assert non-null only.
+    // localStorage must contain the plain-text value "dark".
     const stored = await page.evaluate(() => localStorage.getItem("ui-theme"));
-    expect(stored).not.toBeNull();
+    expect(stored).toBe("dark");
 
     const darkClass = await page
       .getByRole("button", { name: "Dark", exact: true })
@@ -330,20 +325,18 @@ test.describe("Theme toggle icon buttons in AppearanceSettingsPanel", () => {
 
     await openAppearanceTab(page, meetingId, "theme-persist-user");
 
-    // Switch to light via the UI so that apply_and_save_theme writes a
-    // properly CBOR+zlib+hex-encoded value via the SDK.
+    // Switch to light via the UI.
     await page.getByRole("button", { name: "Light", exact: true }).click();
 
-    // The stored value is CBOR-encoded; assert it is non-null (SDK wrote something).
+    // The stored value is plain text.
     const storedBeforeReload = await page.evaluate(() => localStorage.getItem("ui-theme"));
-    expect(storedBeforeReload).not.toBeNull();
+    expect(storedBeforeReload).toBe("light");
 
     // Reload the same meeting page.
     await page.reload();
 
-    // initialize_document_theme() uses load_theme_from_storage() (CBOR-aware)
-    // and must re-apply the stored preference. The Dioxus app must mount and
-    // run the initializer hook after reload, so poll for the attribute.
+    // initialize_document_theme() reads the plain-text localStorage value
+    // and must re-apply the stored preference after reload.
     await expect
       .poll(async () => page.evaluate(() => document.documentElement.getAttribute("data-theme")), {
         timeout: 5_000,
@@ -370,9 +363,9 @@ test.describe("Theme toggle icon buttons in AppearanceSettingsPanel", () => {
       .evaluate((el) => window.getComputedStyle(el).color);
     expect(luminance(bodyColorAfterReload)).toBeLessThan(90);
 
-    // The CBOR-encoded blob is preserved across reload; confirm still non-null.
+    // The plain-text value is preserved across reload.
     const storedAfterReload = await page.evaluate(() => localStorage.getItem("ui-theme"));
-    expect(storedAfterReload).not.toBeNull();
+    expect(storedAfterReload).toBe("light");
   });
 
   // ── 5. Mobile-only light theme refinements ─────────────────────────────
@@ -430,9 +423,9 @@ test.describe("Theme toggle icon buttons in AppearanceSettingsPanel", () => {
     expect(darkClass).not.toContain("theme-icon-button--active");
     expect(lightClass).not.toContain("theme-icon-button--active");
 
-    // The stored value is CBOR+zlib+hex-encoded "system"; assert non-null only.
+    // The stored value is plain text "system".
     const stored = await page.evaluate(() => localStorage.getItem("ui-theme"));
-    expect(stored).not.toBeNull();
+    expect(stored).toBe("system");
   });
 
   // ── 7. System theme resolves to light when prefers-color-scheme is light ──

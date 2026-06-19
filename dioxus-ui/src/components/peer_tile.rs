@@ -79,6 +79,15 @@ pub fn PeerTile(
     #[props(default = false)]
     force_avatar: bool,
     on_toggle_pin: EventHandler<String>,
+    /// Issue #1466: fired when the user clicks the per-tile PLAY button on a
+    /// decode-budget-PAUSED tile to force-decode this peer. Receives the tile's
+    /// `session_id` (the `peer_id`/`key`), which `attendants.rs` toggles into
+    /// `UserRequestedDecodeCtx`. Defaulted to a no-op `EventHandler` so the many
+    /// call sites that never reach the paused-avatar arm (mock tiles, visible /
+    /// camera-off / SS-decoded tiles) need not pass it; only the off-budget
+    /// avatar real-peer call sites wire a real handler.
+    #[props(default)]
+    on_request_decode: EventHandler<String>,
 ) -> Element {
     let client = use_context::<VideoCallClientCtx>();
 
@@ -367,16 +376,62 @@ pub fn PeerTile(
     };
     drop(sig_history);
 
-    // Only read the transport signal when the popup is visible — avoids
-    // subscribing every PeerTile to transport-change re-renders when no
+    // Only read the transport signal for the POPUP when the popup is visible —
+    // avoids subscribing every PeerTile to transport-change re-renders when no
     // popup is even open. The .set() call is already gated on actual
     // change in handle_diagnostics_event, so this is purely a
-    // re-render-scope optimization.
+    // re-render-scope optimization. (The badge below reads the transport
+    // unconditionally; see `badge_transport`.)
     let sig_transport = if show_signal_popup {
         peer_transport()
     } else {
         None
     };
+
+    // Issue #1483: per-tile "WT"/"WS" transport badge. Computed on EVERY render
+    // (not gated on the popup) so the badge shows whenever the flag is on and
+    // the transport is known. Gating order:
+    //   1. server-side `transportBadgeEnabled` flag (default OFF). Evaluated
+    //      ONCE here per tile render — `transport_badge_enabled()` re-parses the
+    //      `__APP_CONFIG` JSON, so hoisting it out of the three render arms in
+    //      `generate_for_peer` avoids paying that cost per arm.
+    //   2. transport source: map the raw `peer_transport()` signal string,
+    //      which is set from the REMOTE `peer_status` diagnostics metric.
+    //   3. Only `Some(Wt | Ws)` is threaded down — an `Unknown` (or no transport
+    //      yet) collapses to `None`, so the render site never draws a badge for
+    //      an unclassified transport. When the flag is off, `badge_transport`
+    //      is `None` regardless of transport, so nothing renders.
+    //
+    // REMOTE-ONLY (deliberate scope decision): the local user's OWN tile
+    // receives no remote `peer_status` event (only the decode pipeline for
+    // REMOTE peers emits `peer_status` + `peer_transport`, see
+    // `peer_decode_manager.rs`), so its `peer_transport()` signal stays `None`
+    // → `Unknown` → `None`, and the local tile shows NO badge. Sourcing the
+    // local transport would require a public `VideoCallClient` accessor for the
+    // client-wide active transport (the underlying `active_is_webtransport()`
+    // lives only on `ConnectionController`/`ConnectionManager`, not on the
+    // public `VideoCallClient` API), which is a videocall-client change outside
+    // this videocall-ui-only task. Until that accessor is exposed, the badge is
+    // remote-peer-only by design; the local tile simply renders nothing rather
+    // than guessing.
+    let badge_transport: Option<crate::components::canvas_generator::TransportBadge> =
+        if crate::constants::transport_badge_enabled().unwrap_or(false) {
+            use crate::components::canvas_generator::{transport_badge_from_str, TransportBadge};
+            let resolved = match peer_transport() {
+                Some(raw) => transport_badge_from_str(&raw),
+                None => TransportBadge::Unknown,
+            };
+            // Drop Unknown to None so the render site never draws an
+            // unclassified badge (the "Unknown → nothing" half of the gate).
+            match resolved {
+                TransportBadge::Unknown => None,
+                known => Some(known),
+            }
+        } else {
+            // Flag OFF (the default): no badge, no transport read, no extra
+            // re-render subscription.
+            None
+        };
 
     // Per-peer RECEIVE simulcast diagnostics for THIS peer, for the popup's
     // "Layers" section. Sourced from the SAME `per_peer_received_snapshots`
@@ -510,6 +565,36 @@ pub fn PeerTile(
         None
     };
 
+    let peer_is_guest = client.get_peer_is_guest(&peer_id).unwrap_or(false);
+
+    // "Transfer host": hand off and step down. Any admitted non-guest peer.
+    let on_transfer_host: Option<EventHandler<()>> = if is_current_user_host
+        && !is_self_peer
+        && !peer_is_guest
+    {
+        if let Some(ref meeting_id) = room_id {
+            let meeting_id = meeting_id.clone();
+            let peer_uid = peer_uid_for_mute.clone();
+            Some(EventHandler::new(move |_: ()| {
+                let meeting_id = meeting_id.clone();
+                let peer_uid = peer_uid.clone();
+                spawn(async move {
+                    match crate::constants::meeting_api_client() {
+                        Ok(api_client) => {
+                            if let Err(e) = api_client.transfer_host(&meeting_id, &peer_uid).await {
+                                log::warn!("transfer_host failed: {e}");
+                            }
+                        }
+                        Err(e) => log::warn!("meeting_api_client error: {e}"),
+                    }
+                });
+            }))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     generate_for_peer(
         &client,
         &peer_id,
@@ -531,6 +616,7 @@ pub fn PeerTile(
             transport: sig_transport,
             meter_mode,
             receive_diag: sig_receive_diag,
+            badge_transport,
         },
         SignalPopupHandlers {
             show: show_signal_popup,
@@ -544,9 +630,11 @@ pub fn PeerTile(
         on_mute,
         on_disable_video,
         on_kick,
+        on_transfer_host,
         pinned_peer_id.as_deref(),
         on_toggle_pin,
         &appearance,
+        on_request_decode,
         force_avatar,
     )
 }

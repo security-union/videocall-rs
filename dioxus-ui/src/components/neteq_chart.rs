@@ -167,6 +167,136 @@ pub fn neteq_x(ts_ms: u64, first_ts: u64, px_per_sec: f64) -> f64 {
     (ts_ms.saturating_sub(first_ts) as f64 / 1000.0) * px_per_sec
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Unified diagnostics timeline (issue 173 / upstream 712)
+//
+// ONE shared time-axis with multiple OVERLAID metric series and a per-series
+// on/off checkbox legend, mounted in the diagnostics drawer. This reuses the
+// already-proven signal-quality popup chart idiom (scroll-sync, auto-follow,
+// crosshair tooltip, checkbox legend) but for the per-peer NetEq deque the
+// drawer already holds, so it adds NO new top-level signal reads.
+//
+// PERF (issue 173, mandatory): unlike `BaseChart` — which builds the FULL
+// polyline over up to NETEQ_SAMPLE_CAP (7200) samples PER SERIES and explicitly
+// DEFERS clipping (see the N2 note at `BaseChart`) — the unified overlay draws N
+// series at once, so the node count is the dominant low-power-device cost. We
+// therefore CLIP every polyline to the scrolled-visible window (`clip_visible`)
+// so each series emits only the points on screen (plus one anchor each side so
+// the line still enters/exits cleanly), and cap default-ON series so at most
+// `UNIFIED_DEFAULT_ON_CAP` are lit on first open.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Max number of series that may default to ON when the unified timeline first
+/// mounts. Drawing more than a handful of full-history overlays at once is the
+/// low-power-device risk (issue 173), so any extra `default_on` series past this
+/// cap are forced OFF initially; the user can still toggle them on. The cap is a
+/// named const so the seeding logic and its test share one source of truth.
+pub const UNIFIED_DEFAULT_ON_CAP: usize = 4;
+
+/// One overlaid metric line on the unified timeline. Each series carries its OWN
+/// `max_value` so series with DIFFERENT units (buffer ms vs. packet count vs.
+/// expand ‰) can share the one 0..1 plot band — `normalize_series_value` maps
+/// each value against its own ceiling. The points are an `Rc<Vec<…>>` so handing
+/// the same history-derived series down costs a refcount bump, not a deep copy.
+#[derive(Clone, PartialEq)]
+pub struct TimelineSeries {
+    pub label: &'static str,
+    pub color: &'static str,
+    /// Unit suffix shown in the crosshair tooltip (e.g. "ms", "‰", ""). Carried
+    /// per-series because the shared 0..1 band erases the native unit.
+    pub unit: &'static str,
+    /// `(timestamp_ms, raw_value)` pairs, index-free and time-anchored so the
+    /// clip + x math reads the real sample time (not an array index).
+    pub points: Rc<Vec<(f64, f64)>>,
+    /// Per-series Y ceiling for normalization. `>= 1.0` is enforced at use so a
+    /// flat-zero series can't divide by zero.
+    pub max_value: f64,
+    /// Whether this series is lit when the chart first mounts (subject to
+    /// `UNIFIED_DEFAULT_ON_CAP`).
+    pub default_on: bool,
+}
+
+/// Lightweight, owned view of a series used by the crosshair-tooltip closure
+/// (it must move owned data into the `onmousemove` handler). Factored into a
+/// named struct so the closure capture isn't a clippy `type_complexity` tuple.
+#[derive(Clone)]
+struct TooltipSeries {
+    label: &'static str,
+    color: &'static str,
+    unit: &'static str,
+    points: Rc<Vec<(f64, f64)>>,
+}
+
+/// Normalize a raw series value to the shared 0..1 plot band against the series'
+/// OWN ceiling, clamped to `[0,1]`. `max_value` is floored at 1.0 so a series
+/// whose samples are all zero (ceiling 0) maps to the baseline instead of
+/// dividing by zero / producing NaN. Pure + host-testable: the highest-value
+/// normalization seam, so a mutation here (dropping the clamp, the `.max(1.0)`
+/// floor, or inverting the ratio) is caught by `normalize_series_value_*` tests.
+pub fn normalize_series_value(value: f64, max_value: f64) -> f64 {
+    (value.max(0.0) / max_value.max(1.0)).clamp(0.0, 1.0)
+}
+
+/// Visible-range polyline clip (issue 173, PERF). Given a series' time-anchored
+/// points and the current horizontal scroll window, return the contiguous slice
+/// of points whose x falls within the visible viewport — PLUS exactly one anchor
+/// point just outside each edge (when present) so the line segment crossing the
+/// boundary still draws to the viewport edge instead of stopping short.
+///
+/// `first_ts` / `px_per_sec` map each point's `timestamp_ms` to its chart-x; the
+/// visible window is `[scroll_left, scroll_left + viewport_w]`. Returns the
+/// inclusive `(start, end)` index bounds into `points` (end is EXCLUSIVE, like a
+/// slice range) so the caller can build the polyline over just that span and the
+/// off-screen majority is never formatted. Points MUST be ascending in time
+/// (they always are — the deque is append-only at ≤1 Hz).
+///
+/// Pure + host-testable: the perf-critical seam. A mutation that drops the
+/// one-point anchor margin, or that fails to bound the range, is caught by the
+/// `clip_visible_*` tests (node count would jump / the boundary line would clip).
+pub fn clip_visible(
+    points: &[(f64, f64)],
+    first_ts: f64,
+    px_per_sec: f64,
+    scroll_left: f64,
+    viewport_w: f64,
+) -> (usize, usize) {
+    if points.is_empty() {
+        return (0, 0);
+    }
+    // Chart-x for a point's timestamp, relative to the oldest retained sample.
+    let x_of = |ts: f64| ((ts - first_ts) / 1000.0) * px_per_sec;
+    let left = scroll_left;
+    let right = scroll_left + viewport_w;
+
+    // First index whose x is >= left, then step back ONE for the entry anchor
+    // (saturating so an in-window-from-the-start series stays at 0).
+    let start = points
+        .partition_point(|&(ts, _)| x_of(ts) < left)
+        .saturating_sub(1);
+    // First index whose x is > right, then step forward ONE for the exit anchor.
+    let mut end = points.partition_point(|&(ts, _)| x_of(ts) <= right);
+    if end < points.len() {
+        end += 1; // exit anchor so the line reaches the right edge
+    }
+    (start, end.max(start))
+}
+
+/// Color-blind safety (issue 173): a distinct SVG `stroke-dasharray` per series
+/// index so hue is never the only channel distinguishing overlaid lines
+/// (deuteranopia can't separate the green/red pair). Cycles solid → dashed →
+/// dotted → dash-dot. Returns `None` for the solid (index 0) case so the
+/// attribute is omitted entirely (a literal `"none"` is invalid for
+/// `stroke-dasharray`). The SAME value drives the legend swatch so legend and
+/// line match. Pure + host-testable.
+pub fn series_dash(index: usize) -> Option<&'static str> {
+    match index % 4 {
+        0 => None,            // solid
+        1 => Some("6 4"),     // dashed
+        2 => Some("1 4"),     // dotted
+        _ => Some("6 3 1 3"), // dash-dot
+    }
+}
+
 // Chart data series configuration
 #[derive(Clone, PartialEq)]
 pub struct ChartSeries {
@@ -458,6 +588,462 @@ impl AdvancedChartType {
     }
 }
 
+/// Resolve the initial on/off state for a series set, honouring `default_on` but
+/// capping the number of series that may start ON at `UNIFIED_DEFAULT_ON_CAP`
+/// (issue 173). Series are considered in list order; once the cap is reached,
+/// further `default_on` series are forced OFF. Returns the per-label state map.
+/// Pure + host-testable: a mutation that drops the cap (lighting all series) is
+/// caught by `seed_visibility_caps_default_on`.
+fn seed_visibility(series: &[TimelineSeries]) -> std::collections::HashMap<&'static str, bool> {
+    let mut on_count = 0usize;
+    series
+        .iter()
+        .map(|s| {
+            let on = s.default_on && on_count < UNIFIED_DEFAULT_ON_CAP;
+            if on {
+                on_count += 1;
+            }
+            (s.label, on)
+        })
+        .collect()
+}
+
+/// Build the global crosshair tooltip element on `<body>` (created once, reused).
+/// Rendered outside the drawer subtree so it is never clipped by an ancestor's
+/// stacking context — mirrors `signal_quality::get_or_create_tooltip_el`.
+fn get_or_create_unified_tooltip_el() -> web_sys::HtmlElement {
+    use wasm_bindgen::JsCast;
+    let doc = gloo_utils::document();
+    if let Some(el) = doc.get_element_by_id("unified-timeline-tooltip-global") {
+        el.unchecked_into()
+    } else {
+        let el = doc.create_element("div").unwrap();
+        el.set_id("unified-timeline-tooltip-global");
+        // Reuse the existing signal-chart tooltip styling (one source of truth).
+        el.set_class_name("signal-chart-tooltip");
+        let html_el: web_sys::HtmlElement = el.unchecked_into();
+        html_el.style().set_property("display", "none").unwrap();
+        doc.body().unwrap().append_child(&html_el).unwrap();
+        html_el
+    }
+}
+
+fn hide_unified_tooltip() {
+    use wasm_bindgen::JsCast;
+    if let Some(el) = gloo_utils::document().get_element_by_id("unified-timeline-tooltip-global") {
+        let html_el: web_sys::HtmlElement = el.unchecked_into();
+        let _ = html_el.style().set_property("display", "none");
+    }
+}
+
+/// Unified diagnostics timeline (issue 173 / upstream 712): ONE shared, scrollable
+/// time-axis with multiple OVERLAID metric series and a per-series on/off checkbox
+/// legend, plus a devtools-style crosshair tooltip. Reuses the signal-quality
+/// popup idiom (fixed external Y-axis SVG, a growing inner SVG inside a
+/// `.neteq-chart-scroll` box, scroll-sync to the sibling per-type charts, and
+/// auto-follow to the right edge). Each series is normalized against its OWN
+/// `max_value` so series with different units share the one 0..1 band; the
+/// per-series unit is surfaced in the crosshair tooltip.
+///
+/// PERF (issue 173): every series polyline is CLIPPED to the scrolled-visible
+/// window via `clip_visible`, so the node count stays bounded regardless of how
+/// many hours of history are retained — the off-screen majority is never
+/// formatted. `scroll_pos` (a single signal updated by `onscroll` + auto-follow)
+/// drives the re-clip.
+#[component]
+pub fn UnifiedTimelineChart(
+    /// Shared, Rc-wrapped per-peer history — see [`NetEqHistory`]. Passed by the
+    /// drawer with O(1) `Rc::ptr_eq` prop memo (NOT a `Vec<TimelineSeries>` whose
+    /// content-based `PartialEq` would walk all points each render). A
+    /// `ReadSignal` so the `use_memo` below recomputes when the parent hands
+    /// down a NEW history Rc — i.e. only on a kept-sample tick (≤1 Hz), never on
+    /// an unrelated re-render. (issue 173 perf)
+    history: ReadSignal<NetEqHistory>,
+    /// Unique scroll-container id so this chart can scroll-sync with the sibling
+    /// per-type charts (it joins the same `.neteq-chart-scroll` class group).
+    scroll_id: String,
+    /// `true` only at the 2-hour cap → gates the "Showing last 2 hours" caption.
+    capped: bool,
+) -> Element {
+    // Build the overlaid series from the per-peer deque ONCE per history change
+    // (use_memo keyed on the `NetEqHistory` Rc read), not on every render. The
+    // deep-copy into the four point vecs is the cost this memoization removes.
+    // (issue 173 perf)
+    let series_memo = use_memo(move || unified_series_from_samples(&history().0));
+    let series = series_memo();
+
+    // Hide the singleton crosshair tooltip when this chart unmounts (#1452).
+    // The tooltip is a `<body>`-level `<div id="unified-timeline-tooltip-global">`
+    // shown via `display:block` on `onmousemove` and hidden on `onmouseleave`.
+    // If the user closes the drawer / switches to "All Peers" / the peer leaves
+    // while the tooltip is visible — WITHOUT first moving the pointer off the
+    // chart — the overlay unmounts so no `onmouseleave` fires, and the singleton
+    // would otherwise stay `display:block` at its last position until the next
+    // hover repositions it. `use_drop` runs the hide on unmount regardless of
+    // pointer path. Mirrors `meetings_list::hide_meeting_info_tooltip`'s
+    // `use_drop`. MUST precede the empty-data early-return below so the hook is
+    // unconditional (a hook skipped on some render paths breaks Dioxus's hook
+    // ordering).
+    use_drop(hide_unified_tooltip);
+
+    // Per-label visibility, seeded once (honours default_on, capped at
+    // UNIFIED_DEFAULT_ON_CAP). Keyed by &'static label per the issue-173 spec.
+    let seed = series.clone();
+    let mut visible = use_signal(|| seed_visibility(&seed));
+    // Current horizontal scroll offset (px) of THIS chart's scroll box — drives
+    // visible-range clipping. Seeded at 0; updated by onscroll + auto-follow.
+    let mut scroll_pos = use_signal(|| 0.0_f64);
+
+    // Empty → placeholder (never a mega-wide empty SVG). Matches BaseChart.
+    let all_empty = series.iter().all(|s| s.points.is_empty());
+    if series.is_empty() || all_empty {
+        return rsx! {
+            div { class: "neteq-advanced-chart",
+                div { class: "no-data", "No data available" }
+            }
+        };
+    }
+
+    // Drawing geometry — same band as BaseChart so the two read consistently.
+    let chart_height: f64 = 160.0;
+    let padding_top: f64 = 24.0;
+    let padding_bottom: f64 = 22.0;
+    let draw_height = chart_height - padding_top - padding_bottom; // 114
+
+    // Time axis: first_ts = oldest retained point across ALL series; last_ts =
+    // newest. (Series share the per-peer deque's clock, so a single min/max is
+    // correct.)
+    let first_ts = series
+        .iter()
+        .filter_map(|s| s.points.first().map(|(ts, _)| *ts))
+        .fold(f64::INFINITY, f64::min);
+    let first_ts = if first_ts.is_finite() { first_ts } else { 0.0 };
+    let last_ts = series
+        .iter()
+        .filter_map(|s| s.points.last().map(|(ts, _)| *ts))
+        .fold(first_ts, f64::max);
+
+    let first_ts_u = first_ts as u64;
+    let last_ts_u = last_ts as u64;
+    let chart_width = neteq_chart_width(
+        first_ts_u,
+        last_ts_u,
+        NETEQ_PX_PER_SEC,
+        NETEQ_MIN_CHART_WIDTH,
+    );
+    let total_seconds = ((last_ts - first_ts) / 1000.0).max(1.0);
+
+    // Visible viewport width: the scroll box's client width. Before the box is
+    // mounted (or in a headless env) fall back to the min viewport so the first
+    // paint clips to a sane window rather than the whole multi-hour timeline.
+    let viewport_w = gloo_utils::document()
+        .get_element_by_id(&scroll_id)
+        .map(|el| el.client_width() as f64)
+        .filter(|w| *w > 0.0)
+        .unwrap_or(NETEQ_MIN_CHART_WIDTH);
+    let scroll_left = scroll_pos();
+
+    // Build ONE clipped polyline per VISIBLE series. Off-screen points are never
+    // formatted (issue 173 perf). A hidden series is skipped entirely. The dash
+    // pattern is keyed off the ORIGINAL series index (`.enumerate()` BEFORE the
+    // visibility filter) so each line keeps its pattern even when others toggle.
+    let visible_map = visible();
+    let series_elements: Vec<Element> = series
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| *visible_map.get(s.label).unwrap_or(&s.default_on))
+        .map(|(i, s)| {
+            let (start, end) = clip_visible(
+                &s.points,
+                first_ts,
+                NETEQ_PX_PER_SEC,
+                scroll_left,
+                viewport_w,
+            );
+            let max_value = s.max_value;
+            let points: String = s.points[start..end]
+                .iter()
+                .map(|&(ts, value)| {
+                    let x = ((ts - first_ts) / 1000.0) * NETEQ_PX_PER_SEC;
+                    let normalized = normalize_series_value(value, max_value);
+                    let y = padding_top + draw_height * (1.0 - normalized);
+                    format!("{x:.1},{y:.1}")
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let color = s.color;
+            // Distinct dash per index so hue isn't the only differentiator
+            // (color-blind safety, issue 173). Index 0 → None → solid line.
+            let dash = series_dash(i);
+            rsx! {
+                polyline {
+                    points: "{points}",
+                    fill: "none",
+                    stroke: "{color}",
+                    stroke_width: "1.5",
+                    stroke_linejoin: "round",
+                    stroke_dasharray: dash,
+                }
+            }
+        })
+        .collect();
+
+    // X-axis tick labels every 10s (inside the scrolling SVG).
+    let tick_interval = 10.0_f64;
+    let num_ticks = (total_seconds / tick_interval).ceil() as usize + 1;
+
+    // Y-axis: the band is a shared 0..1 normalized scale (series carry their own
+    // units), so label it in % of each series' own ceiling.
+    let y_zero = padding_top + draw_height;
+    let y_mid = padding_top + draw_height * 0.5;
+
+    let chart_width_str = format!("{chart_width:.0}");
+    let chart_width_px = format!("{chart_width:.0}px");
+    let chart_height_str = format!("{chart_height:.0}");
+    let x_axis_y = chart_height - 6.0;
+
+    // Auto-follow + scroll-pos sync: after each render, if the user is within
+    // 20px of the right edge, stick to it; ALSO seed `scroll_pos` from the live
+    // box so the first clip after mount uses the real offset (not the stale 0).
+    // Bare `spawn` (not use_effect) — same rationale as BaseChart: the body
+    // re-runs on each history growth, and a plain-Copy `last_ts` keyed effect
+    // would only fire once. (issue 173)
+    let scroll_id_for_follow = scroll_id.clone();
+    spawn(async move {
+        TimeoutFuture::new(0).await;
+        if let Some(el) = gloo_utils::document().get_element_by_id(&scroll_id_for_follow) {
+            let at_end = el.scroll_left() + el.client_width() >= el.scroll_width() - 20;
+            if at_end {
+                el.set_scroll_left(el.scroll_width());
+            }
+            let live = el.scroll_left() as f64;
+            if (live - scroll_pos.peek().to_owned()).abs() > 0.5 {
+                scroll_pos.set(live);
+            }
+        }
+    });
+
+    // Crosshair-tooltip data: time-anchored series points for the hovered ts.
+    let series_for_move: Vec<TooltipSeries> = series
+        .iter()
+        .map(|s| TooltipSeries {
+            label: s.label,
+            color: s.color,
+            unit: s.unit,
+            points: s.points.clone(),
+        })
+        .collect();
+
+    rsx! {
+        div { class: "neteq-advanced-chart unified-timeline-chart",
+            div { class: "neteq-chart-wrapper",
+                // Fixed Y-axis overlay (outside the scroll box). The band is a
+                // normalized 0..100% of each series' own ceiling.
+                svg {
+                    class: "neteq-chart-y-axis",
+                    width: "48",
+                    height: "{chart_height_str}",
+                    view_box: "0 0 48 {chart_height_str}",
+                    text { x: "44", y: "{y_zero}", fill: "{theme_color::TEXT_MUTED}", font_size: "10", text_anchor: "end", dominant_baseline: "middle", "0%" }
+                    text { x: "44", y: "{y_mid}", fill: "{theme_color::TEXT_MUTED}", font_size: "10", text_anchor: "end", dominant_baseline: "middle", "50%" }
+                    text { x: "44", y: "{padding_top}", fill: "{theme_color::TEXT_MUTED}", font_size: "10", text_anchor: "end", dominant_baseline: "middle", "100%" }
+                    text { x: "10", y: "{y_mid}", fill: "{theme_color::TEXT_MUTED}", font_size: "9", text_anchor: "middle", transform: "rotate(-90, 10, {y_mid})", "% of max" }
+                }
+                // Scrollable chart area (growing inner SVG).
+                div {
+                    class: "neteq-chart-scroll",
+                    id: "{scroll_id}",
+                    onscroll: {
+                        let scroll_id = scroll_id.clone();
+                        move |_| {
+                            let doc = gloo_utils::document();
+                            if let Some(src) = doc.get_element_by_id(&scroll_id) {
+                                let sl = src.scroll_left();
+                                // Re-clip THIS chart to the new window.
+                                scroll_pos.set(sl as f64);
+                                // Scroll-sync the sibling per-type charts (one timeline).
+                                let els = doc.get_elements_by_class_name("neteq-chart-scroll");
+                                for i in 0..els.length() {
+                                    if let Some(el) = els.item(i) {
+                                        if el.id() != scroll_id {
+                                            el.set_scroll_left(sl);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    svg {
+                        xmlns: "http://www.w3.org/2000/svg",
+                        width: "{chart_width_px}",
+                        height: "{chart_height_str}",
+                        view_box: "0 0 {chart_width_str} {chart_height_str}",
+                        // Plot frame baseline.
+                        line { x1: "0", y1: "{y_zero}", x2: "{chart_width_str}", y2: "{y_zero}", stroke: "{theme_color::AXIS}", stroke_width: "0.5" }
+                        // X-axis ticks + time labels (every 10s).
+                        for tick_i in 0..num_ticks {
+                            {
+                                let t = tick_i as f64 * tick_interval;
+                                let x = t * NETEQ_PX_PER_SEC;
+                                let mins = (t / 60.0).floor() as u32;
+                                let secs = (t % 60.0).floor() as u32;
+                                let label = if mins > 0 { format!("{mins}m{secs:02}s") } else { format!("{secs}s") };
+                                rsx! {
+                                    line { x1: "{x}", y1: "{padding_top}", x2: "{x}", y2: "{y_zero}", stroke: "{theme_color::SIGNAL_GRID_MINOR}", stroke_width: "0.5" }
+                                    text { x: "{x}", y: "{x_axis_y}", fill: "{theme_color::TEXT_MUTED}", font_size: "9", text_anchor: "middle", "{label}" }
+                                }
+                            }
+                        }
+                        // One clipped polyline per visible series.
+                        for elem in series_elements { {elem} }
+                    }
+                    // HTML overlay for the crosshair tooltip (more reliable than
+                    // an SVG rect in WASM). Same dimensions as the draw band.
+                    {
+                        let overlay_style = format!(
+                            "position: absolute; top: {padding_top}px; left: 0; \
+                             width: {chart_width:.0}px; height: {draw_height:.0}px; \
+                             cursor: crosshair;"
+                        );
+                        let series_move = series_for_move.clone();
+                        let visible_for_move = visible_map.clone();
+                        rsx! {
+                            div {
+                                // Stable hook for the crosshair-tooltip E2E (#1452): the
+                                // onmousemove handler lives on this absolute HTML overlay, NOT
+                                // the SVG, so tests must hover THIS element to show the tooltip.
+                                "data-testid": "unified-timeline-crosshair",
+                                style: "{overlay_style}",
+                                onmousemove: move |evt: MouseEvent| {
+                                    let client = evt.client_coordinates();
+                                    let elem = evt.element_coordinates();
+                                    let time_offset_sec = elem.x / NETEQ_PX_PER_SEC;
+                                    let target_ts = first_ts + time_offset_sec * 1000.0;
+                                    // For each VISIBLE series, find the nearest sample to target_ts.
+                                    let mut rows: Vec<String> = Vec::new();
+                                    let mut time_str = String::new();
+                                    for ts_series in series_move.iter() {
+                                        let label = ts_series.label;
+                                        let color = ts_series.color;
+                                        let unit = ts_series.unit;
+                                        let points = &ts_series.points;
+                                        if !*visible_for_move.get(label).unwrap_or(&false) {
+                                            continue;
+                                        }
+                                        if points.is_empty() {
+                                            continue;
+                                        }
+                                        let idx = points
+                                            .partition_point(|&(ts, _)| ts < target_ts);
+                                        let cand = [idx.saturating_sub(1), idx.min(points.len() - 1)];
+                                        let best = cand
+                                            .iter()
+                                            .filter_map(|&i| points.get(i))
+                                            .min_by(|a, b| {
+                                                (a.0 - target_ts).abs()
+                                                    .partial_cmp(&(b.0 - target_ts).abs())
+                                                    .unwrap_or(std::cmp::Ordering::Equal)
+                                            });
+                                        if let Some(&(ts, value)) = best {
+                                            if time_str.is_empty() {
+                                                let elapsed = (ts - first_ts) / 1000.0;
+                                                let m = (elapsed / 60.0).floor() as u32;
+                                                let s = (elapsed % 60.0).floor() as u32;
+                                                time_str = format!("{m}m {s:02}s");
+                                            }
+                                            rows.push(format!(
+                                                "<div style='color:{color}'>{label}: {value:.1}{unit}</div>"
+                                            ));
+                                        }
+                                    }
+                                    if rows.is_empty() {
+                                        hide_unified_tooltip();
+                                        return;
+                                    }
+                                    let el = get_or_create_unified_tooltip_el();
+                                    let style = el.style();
+                                    let _ = style.set_property("left", &format!("{:.0}px", client.x + 12.0));
+                                    let _ = style.set_property("top", &format!("{:.0}px", client.y - 10.0));
+                                    let _ = style.set_property("display", "block");
+                                    let header = format!(
+                                        "<div>Time: {time_str}</div><div style='border-bottom:1px solid {};margin:2px 0'></div>",
+                                        theme_color::TOOLTIP_DIVIDER
+                                    );
+                                    el.set_inner_html(&format!("{header}{}", rows.join("")));
+                                },
+                                onmouseleave: move |_| { hide_unified_tooltip(); },
+                            }
+                        }
+                    }
+                }
+            }
+            // Per-series on/off checkbox legend (issue 173). Dynamic over the
+            // series list; reuses the signal-quality `.signal-chart-legend`
+            // styling so the two surfaces match. Each entry shows the series'
+            // own ceiling ("· max N") because the Y axis reads % of EACH series'
+            // own max — without it, two lines at the same height could be very
+            // different magnitudes. Buffer + Target share a ceiling by design, so
+            // showing the same max on both signals they're directly comparable
+            // while the others aren't. The swatch carries the same dash pattern
+            // as the line (color-blind safety) so legend and line match.
+            div { class: "signal-chart-legend unified-timeline-legend",
+                for (i , s) in series.iter().enumerate() {
+                    {
+                        let label = s.label;
+                        let color = s.color;
+                        let dash = series_dash(i);
+                        // "· max N": the series' own normalization ceiling. Whole
+                        // numbers read cleaner; fall back to one decimal for sub-1.
+                        let max_str = if s.max_value >= 1.0 {
+                            format!("{:.0}", s.max_value)
+                        } else {
+                            format!("{:.1}", s.max_value)
+                        };
+                        let checked = *visible_map.get(label).unwrap_or(&s.default_on);
+                        rsx! {
+                            label { class: "legend-item",
+                                input {
+                                    r#type: "checkbox",
+                                    checked,
+                                    onchange: move |_| {
+                                        let mut m = visible();
+                                        let cur = *m.get(label).unwrap_or(&false);
+                                        m.insert(label, !cur);
+                                        visible.set(m);
+                                    },
+                                }
+                                // Line swatch carrying the line's own dash pattern
+                                // (a solid/dashed/dotted/dash-dot stroke) so the
+                                // legend matches the chart by shape, not hue alone.
+                                svg {
+                                    class: "legend-swatch",
+                                    width: "16",
+                                    height: "8",
+                                    view_box: "0 0 16 8",
+                                    "aria-hidden": "true",
+                                    line {
+                                        x1: "0",
+                                        y1: "4",
+                                        x2: "16",
+                                        y2: "4",
+                                        stroke: "{color}",
+                                        stroke_width: "2",
+                                        stroke_dasharray: dash,
+                                    }
+                                }
+                                "{label} \u{00B7} max {max_str}"
+                            }
+                        }
+                    }
+                }
+            }
+            if capped {
+                div { class: "neteq-chart-cap-note", "Showing last 2 hours" }
+            }
+        }
+    }
+}
+
 #[component]
 pub fn NetEqChart(data: Vec<u64>, chart_type: ChartType, width: u32, height: u32) -> Element {
     let chart_width = width as f64;
@@ -699,6 +1285,109 @@ impl ChartConfig {
             ],
         }
     }
+}
+
+/// Seed the unified-timeline series (issue 173) from a per-peer NetEq deque. The
+/// four default-ON metrics — Buffer, Target, Packets awaiting, Expand‰ — are the
+/// most-watched audio-health signals and are exactly `UNIFIED_DEFAULT_ON_CAP`
+/// (4), so all four start lit. Each carries its OWN ceiling (computed over the
+/// retained samples, floored at 1.0) because the units differ (ms vs. count vs.
+/// ‰) and the chart shares one normalized 0..1 band.
+///
+/// RTT is intentionally OMITTED (issue 173): there is no per-peer RTT *history*
+/// threaded to the drawer — `active_server_rtt` is a single connection-manager
+/// aggregate with no time-series — so plotting it here would need new plumbing.
+///
+/// The points are `Rc<Vec<(ts_ms, value)>>` built ONCE here, so the component's
+/// prop memo compares them by pointer and the off-screen majority is never
+/// formatted (it is clipped at render — see [`clip_visible`]).
+pub fn unified_series_from_samples(samples: &[NetEqSample]) -> Vec<TimelineSeries> {
+    // Build each series' (ts, value) point vec from the shared deque.
+    let buffer: Rc<Vec<(f64, f64)>> = Rc::new(
+        samples
+            .iter()
+            .map(|s| (s.timestamp_ms as f64, s.buffer_ms as f64))
+            .collect(),
+    );
+    let target: Rc<Vec<(f64, f64)>> = Rc::new(
+        samples
+            .iter()
+            .map(|s| (s.timestamp_ms as f64, s.target_ms as f64))
+            .collect(),
+    );
+    let packets: Rc<Vec<(f64, f64)>> = Rc::new(
+        samples
+            .iter()
+            .map(|s| (s.timestamp_ms as f64, s.packets_awaiting_decode as f64))
+            .collect(),
+    );
+    let expand: Rc<Vec<(f64, f64)>> = Rc::new(
+        samples
+            .iter()
+            .map(|s| (s.timestamp_ms as f64, s.expand_rate as f64))
+            .collect(),
+    );
+
+    // Per-series ceilings (floored at 1.0 in `normalize_series_value`, but we
+    // also floor here so the tooltip / axis read a sane max).
+    let max_buffer = samples
+        .iter()
+        .map(|s| s.buffer_ms.max(s.target_ms))
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+    let max_packets = samples
+        .iter()
+        .map(|s| s.packets_awaiting_decode)
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+    let max_expand = samples
+        .iter()
+        .map(|s| s.expand_rate)
+        .fold(1.0f32, f32::max)
+        .max(1.0) as f64;
+
+    vec![
+        TimelineSeries {
+            label: "Buffer (ms)",
+            color: theme_color::NETEQ_BLUE,
+            unit: "ms",
+            points: buffer,
+            // Buffer & Target share one ceiling so they're directly comparable.
+            max_value: max_buffer,
+            default_on: true,
+        },
+        TimelineSeries {
+            label: "Target (ms)",
+            color: theme_color::NETEQ_GREEN,
+            unit: "ms",
+            points: target,
+            max_value: max_buffer,
+            default_on: true,
+        },
+        TimelineSeries {
+            label: "Packets awaiting",
+            color: theme_color::NETEQ_PURPLE,
+            unit: "",
+            points: packets,
+            max_value: max_packets,
+            default_on: true,
+        },
+        TimelineSeries {
+            // Color-blind safety (issue 173): Expand is ORANGE, not red — a
+            // red line overlaid on the green Target is a deuteranopia failure.
+            // The palette is now blue / green / orange / purple, and each line
+            // also carries a distinct dash (see `series_dash`) so hue is never
+            // the sole channel.
+            label: "Expand (\u{2030})",
+            color: theme_color::NETEQ_ORANGE,
+            unit: "\u{2030}",
+            points: expand,
+            max_value: max_expand,
+            default_on: true,
+        },
+    ]
 }
 
 #[component]
@@ -961,6 +1650,7 @@ mod tests {
             target_delay_ms: target_ms,
             packets_awaiting_decode: packets_awaiting,
             packets_per_sec: 0,
+            playout_latency_ms: 0, // Issue 1299: not exercised by this sample helper
         };
         raw.network.expand_rate = expand_q14;
         raw.network.reorder_rate_permyriad = reorder_permyriad;
@@ -1054,6 +1744,7 @@ mod tests {
             target_delay_ms: 100,
             packets_awaiting_decode: 5,
             packets_per_sec: 42,
+            playout_latency_ms: 0, // Issue 1299: not exercised by this test
         };
         raw.network.expand_rate = 4096;
         raw.network.reorder_rate_permyriad = 30;
@@ -1336,5 +2027,204 @@ mod tests {
             classify_reorder(201),
             ("is-poor", Some("heavy reordering — path instability"))
         );
+    }
+
+    // ── Unified timeline (issue 173) pure-logic tests ────────────────────────
+
+    /// `normalize_series_value` maps a value against its OWN ceiling to the
+    /// shared 0..1 band, clamped, with the ceiling floored at 1.0. Pins:
+    ///   * mid-scale ratio (50/100 → 0.5) — catches an inverted ratio;
+    ///   * over-ceiling clamps to 1.0 — catches a dropped upper clamp;
+    ///   * negative clamps to 0.0 — catches a dropped lower clamp;
+    ///   * a zero ceiling floors to 1.0 (no divide-by-zero / NaN) — catches a
+    ///     dropped `.max(1.0)`.
+    #[test]
+    fn normalize_series_value_maps_clamps_and_floors() {
+        assert!((normalize_series_value(50.0, 100.0) - 0.5).abs() < 1e-9);
+        assert!((normalize_series_value(0.0, 100.0)).abs() < 1e-9);
+        assert!((normalize_series_value(100.0, 100.0) - 1.0).abs() < 1e-9);
+        // Over the ceiling clamps to the top of the band, not >1.
+        assert!((normalize_series_value(250.0, 100.0) - 1.0).abs() < 1e-9);
+        // Negative clamps to the baseline, not <0.
+        assert!((normalize_series_value(-5.0, 100.0)).abs() < 1e-9);
+        // Zero ceiling is floored to 1.0: a 0-valued sample maps to baseline and
+        // is finite (no NaN). Catches a dropped `.max(1.0)` divide-by-zero.
+        let z = normalize_series_value(0.0, 0.0);
+        assert!(z.is_finite() && z.abs() < 1e-9);
+    }
+
+    /// `clip_visible` (issue 173 perf) returns ONLY the points in the scrolled
+    /// window PLUS one anchor each side, as `(start, end)` index bounds. Build a
+    /// 100-point series at 1 px/s with 1s spacing; a 30px viewport scrolled to
+    /// x=20 should select roughly points at x∈[20,50] plus one anchor each side
+    /// — a small bounded slice, NOT the whole 100. Mutation notes: dropping the
+    /// `start -= 1` entry anchor makes start==21 (no left anchor) and fails;
+    /// dropping `end += 1` clips the right boundary line; returning the full
+    /// range (no bound) makes the slice length == 100 and fails the cap assert.
+    #[test]
+    fn clip_visible_windows_with_anchors() {
+        // ts in ms, value irrelevant here; 1 px/s means x(px) == seconds.
+        // first_ts = 0; point i at ts = i*1000 → x = i px.
+        let pts: Vec<(f64, f64)> = (0..100).map(|i| (i as f64 * 1000.0, i as f64)).collect();
+        let px_per_sec = 1.0;
+        let first_ts = 0.0;
+        let scroll_left = 20.0;
+        let viewport_w = 30.0; // visible x ∈ [20, 50]
+
+        let (start, end) = clip_visible(&pts, first_ts, px_per_sec, scroll_left, viewport_w);
+
+        // Entry anchor: the first in-window point is at x=20 (index 20); the
+        // anchor steps back one to index 19.
+        assert_eq!(
+            start, 19,
+            "entry anchor must include one point left of window"
+        );
+        // Exit anchor: last in-window point is x=50 (index 50); anchor steps
+        // forward one to index 51, so the EXCLUSIVE end is 52.
+        assert_eq!(
+            end, 52,
+            "exit anchor must include one point right of window"
+        );
+
+        // The slice is a small bounded window, NOT the full history.
+        let count = end - start;
+        assert!(
+            count < pts.len() && count <= 40,
+            "clip must bound node count (got {count} of {})",
+            pts.len()
+        );
+        // Sanity: the selected x-range straddles the visible window on both sides.
+        let x_start = pts[start].0 / 1000.0 * px_per_sec;
+        let x_last = pts[end - 1].0 / 1000.0 * px_per_sec;
+        assert!(x_start < scroll_left, "first selected x is the left anchor");
+        assert!(
+            x_last > scroll_left + viewport_w,
+            "last selected x is the right anchor"
+        );
+    }
+
+    /// Empty series clips to an empty `(0,0)` range (no panic, no slice OOB).
+    #[test]
+    fn clip_visible_empty_is_empty() {
+        let pts: Vec<(f64, f64)> = Vec::new();
+        assert_eq!(clip_visible(&pts, 0.0, 1.0, 0.0, 30.0), (0, 0));
+    }
+
+    /// `seed_visibility` lights `default_on` series but never more than
+    /// `UNIFIED_DEFAULT_ON_CAP` at once (issue 173). With CAP+2 default-on series,
+    /// exactly CAP start ON (the first CAP in order) and the rest OFF. Mutation
+    /// note: dropping the `on_count < CAP` guard lights ALL of them and fails the
+    /// count assert.
+    #[test]
+    fn seed_visibility_caps_default_on() {
+        // Build CAP+2 series all default_on. Labels must be distinct &'static.
+        let labels: [&'static str; 6] = ["a", "b", "c", "d", "e", "f"];
+        assert!(
+            labels.len() > UNIFIED_DEFAULT_ON_CAP,
+            "test needs more series than the cap"
+        );
+        let series: Vec<TimelineSeries> = labels
+            .iter()
+            .map(|&label| TimelineSeries {
+                label,
+                color: "#000", // @token-exempt: test fixture, not production color
+                unit: "",
+                points: Rc::new(vec![(0.0, 0.0)]),
+                max_value: 1.0,
+                default_on: true,
+            })
+            .collect();
+        let map = seed_visibility(&series);
+        let on = map.values().filter(|v| **v).count();
+        assert_eq!(
+            on, UNIFIED_DEFAULT_ON_CAP,
+            "at most CAP series may start ON"
+        );
+        // The first CAP labels (in order) are the ones lit.
+        for &l in &labels[..UNIFIED_DEFAULT_ON_CAP] {
+            assert_eq!(map.get(l), Some(&true), "first {UNIFIED_DEFAULT_ON_CAP} on");
+        }
+        for &l in &labels[UNIFIED_DEFAULT_ON_CAP..] {
+            assert_eq!(map.get(l), Some(&false), "overflow series forced off");
+        }
+    }
+
+    /// The drawer-seeded series carry the four default-ON audio-health metrics,
+    /// all within the cap, and RTT is OMITTED (no per-peer RTT history reaches the
+    /// drawer — issue 173). Buffer & Target share one ceiling so they're directly
+    /// comparable; the expand series renders the ‰ unit. Catches a regression that
+    /// adds RTT (would need new plumbing) or drops a core metric.
+    #[test]
+    fn unified_series_seeds_four_metrics_no_rtt() {
+        let stats = vec![
+            sample_with(80, 100, 5, 4096, 0, 0),
+            sample_with(90, 100, 9, 0, 0, 0),
+        ];
+        let series = unified_series_from_samples(&stats);
+        assert_eq!(series.len(), 4, "Buffer, Target, Packets, Expand");
+        let labels: Vec<&str> = series.iter().map(|s| s.label).collect();
+        assert_eq!(
+            labels,
+            [
+                "Buffer (ms)",
+                "Target (ms)",
+                "Packets awaiting",
+                "Expand (\u{2030})"
+            ]
+        );
+        // All four are within the default-on cap, so they all start lit.
+        assert!(series.iter().all(|s| s.default_on));
+        assert!(series.len() <= UNIFIED_DEFAULT_ON_CAP);
+        // RTT must NOT be present (no per-peer RTT history threaded to the drawer).
+        assert!(
+            !labels.iter().any(|l| l.to_ascii_lowercase().contains("rtt")
+                || l.to_ascii_lowercase().contains("latency")),
+            "RTT/latency must be omitted, got {labels:?}"
+        );
+        // Buffer & Target share the same ceiling (comparable on one scale).
+        assert_eq!(series[0].max_value, series[1].max_value);
+        // The Buffer series' points carry the real buffer_ms values in time order.
+        assert_eq!(series[0].points.len(), 2);
+        assert_eq!(series[0].points[0].1, 80.0);
+        assert_eq!(series[0].points[1].1, 90.0);
+        // Color-blind safety (issue 173): Expand must NOT reuse the same red that
+        // sits next to the green Target — it is orange now. Pins the palette so a
+        // revert to NETEQ_RED (the deuteranopia-failing pair) fails this test.
+        assert_eq!(
+            series[3].color,
+            theme_color::NETEQ_ORANGE,
+            "Expand must be orange, not the red that clashes with green Target"
+        );
+        assert_ne!(
+            series[1].color, series[3].color,
+            "Target vs Expand distinct hue"
+        );
+    }
+
+    /// `series_dash` (issue 173 color-blind safety) gives each series index a
+    /// DISTINCT dash pattern, cycling solid → dashed → dotted → dash-dot, so hue
+    /// is never the only channel. Index 0 is solid (`None` → the attribute is
+    /// omitted; a literal "none" is invalid for `stroke-dasharray`). Pins each of
+    /// the four patterns AND their distinctness; a mutation that returns the same
+    /// pattern for two indices (or `Some(...)` for index 0) fails here.
+    #[test]
+    fn series_dash_is_distinct_per_index() {
+        let d0 = series_dash(0);
+        let d1 = series_dash(1);
+        let d2 = series_dash(2);
+        let d3 = series_dash(3);
+        assert_eq!(d0, None, "index 0 is solid (no dasharray attribute)");
+        assert!(d1.is_some() && d2.is_some() && d3.is_some());
+        // All four distinct so no two overlaid lines share BOTH hue-substitute
+        // AND pattern.
+        let all = [d0, d1, d2, d3];
+        for i in 0..all.len() {
+            for j in (i + 1)..all.len() {
+                assert_ne!(all[i], all[j], "patterns {i} and {j} must differ");
+            }
+        }
+        // Cycles with period 4 (index 4 repeats index 0's solid).
+        assert_eq!(series_dash(4), d0, "pattern cycles every 4 series");
+        assert_eq!(series_dash(5), d1);
     }
 }

@@ -26,9 +26,13 @@ use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::encode::{
     camera_encoder_errors_closed_codec, camera_encoder_errors_configure_fatal,
     camera_encoder_errors_generic, camera_encoder_errors_vpx_mem_alloc,
-    camera_encoder_frames_submitted_ok, screen_encoder_errors_closed_codec,
+    camera_encoder_frames_submitted_ok, camera_encoder_restarts_closed_codec,
+    camera_encoder_restarts_configure, camera_encoder_restarts_memory,
+    camera_encoder_restarts_other, screen_encoder_errors_closed_codec,
     screen_encoder_errors_configure_fatal, screen_encoder_errors_generic,
     screen_encoder_errors_vpx_mem_alloc, screen_encoder_frames_submitted_ok,
+    screen_encoder_restarts_closed_codec, screen_encoder_restarts_configure,
+    screen_encoder_restarts_memory, screen_encoder_restarts_other,
 };
 use log::{debug, trace, warn};
 use protobuf::Message;
@@ -189,8 +193,10 @@ pub struct HealthReporter {
     adaptive_video_tier: Rc<RefCell<Rc<AtomicU32>>>,
     /// Adaptive audio tier index from CameraEncoder (0=high, 3=emergency).
     adaptive_audio_tier: Rc<RefCell<Rc<AtomicU32>>>,
-    /// Encoder p75 peer FPS (f32 bits in AtomicU32).
-    encoder_p75_peer_fps: Rc<RefCell<Rc<AtomicU32>>>,
+    /// Sender-side encoder queue-depth report (f32 bits in AtomicU32) — encoder backpressure, NOT
+    /// p75 peer FPS (the value was always queue depth; see #1231/#1263). Serialized to the
+    /// frozen-named proto field `encoder_p75_peer_fps = 67`, whose name predates the correction.
+    encoder_queue_depth_report: Rc<RefCell<Rc<AtomicU32>>>,
     /// Encoder PID target bitrate kbps (f32 bits in AtomicU32).
     encoder_target_bitrate_kbps: Rc<RefCell<Rc<AtomicU32>>>,
     /// Screen share quality tier index.
@@ -402,7 +408,7 @@ impl HealthReporter {
             connection_controller: Rc::new(RefCell::new(None)),
             adaptive_video_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_audio_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
-            encoder_p75_peer_fps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
+            encoder_queue_depth_report: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             encoder_target_bitrate_kbps: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             adaptive_screen_tier: Rc::new(RefCell::new(Rc::new(AtomicU32::new(0)))),
             screen_sharing_active: Rc::new(RefCell::new(Rc::new(AtomicBool::new(false)))),
@@ -513,7 +519,7 @@ impl HealthReporter {
     #[allow(clippy::too_many_arguments)]
     pub fn set_encoder_metric_sources(
         &mut self,
-        p75_peer_fps: Rc<AtomicU32>,
+        queue_depth_report: Rc<AtomicU32>,
         target_bitrate_kbps: Rc<AtomicU32>,
         screen_tier: Rc<AtomicU32>,
         screen_active: Rc<AtomicBool>,
@@ -525,7 +531,7 @@ impl HealthReporter {
         effective_video_layers: Rc<AtomicU32>,
         active_video_layers: Rc<AtomicU32>,
     ) {
-        *self.encoder_p75_peer_fps.borrow_mut() = p75_peer_fps;
+        *self.encoder_queue_depth_report.borrow_mut() = queue_depth_report;
         *self.encoder_target_bitrate_kbps.borrow_mut() = target_bitrate_kbps;
         *self.adaptive_screen_tier.borrow_mut() = screen_tier;
         *self.screen_sharing_active.borrow_mut() = screen_active;
@@ -879,6 +885,37 @@ impl HealthReporter {
                                 video_stats["keyframe_requests_per_sec"] = json!(kf);
                             }
                         }
+                        // Buffered video playout latency (#1252): total across both receive stages
+                        // and its stage-1 attribution. Stored in the camera/screen video_stats
+                        // bucket; folded into the health packet only when fps_received > 0.
+                        "playout_latency_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_latency_ms"] = json!(v);
+                            }
+                        }
+                        "playout_stage1_span_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_stage1_span_ms"] = json!(v);
+                            }
+                        }
+                        // Stage-3 paint lag (#1252): decoded-but-unpainted backlog in the
+                        // worker->main postMessage + paint queues. Same bucket/guard as the two
+                        // latency fields above.
+                        "playout_paint_lag_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["playout_paint_lag_ms"] = json!(v);
+                            }
+                        }
+                        // Resync-to-live governor skips (#1252): lifetime cumulative COUNTER (u64),
+                        // not an ms gauge. Stored in the camera/screen bucket that emitted the
+                        // worker stat. The health packet currently exports this counter from the
+                        // camera video_stats path only; screen-share export can be added when the
+                        // server consumes the sibling screen_video_stats playout fields.
+                        "playout_skip_to_live_total" => {
+                            if let MetricValue::U64(v) = &metric.value {
+                                video_stats["playout_skip_to_live_total"] = json!(v);
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1049,7 +1086,7 @@ impl HealthReporter {
         let connection_controller = Rc::downgrade(&self.connection_controller);
         let adaptive_video_tier = self.adaptive_video_tier.clone();
         let adaptive_audio_tier = self.adaptive_audio_tier.clone();
-        let encoder_p75_peer_fps = self.encoder_p75_peer_fps.clone();
+        let encoder_queue_depth_report = self.encoder_queue_depth_report.clone();
         let encoder_target_bitrate_kbps = self.encoder_target_bitrate_kbps.clone();
         let adaptive_screen_tier = self.adaptive_screen_tier.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
@@ -1112,32 +1149,42 @@ impl HealthReporter {
                         let active_rtt = Weak::upgrade(&active_server_rtt_ms)
                             .and_then(|rc| rc.try_borrow().ok().and_then(|v| *v));
 
-                        // Get communication metrics from connection controller
-                        let (send_queue_bytes, packets_received_per_sec, packets_sent_per_sec) =
-                            if let Some(cc_rc) = Weak::upgrade(&connection_controller) {
-                                if let Ok(cc_opt) = cc_rc.try_borrow() {
-                                    if let Some(cc) = cc_opt.as_ref() {
-                                        // Calculate latest packet rates
-                                        cc.calculate_packet_rates();
-                                        (
-                                            cc.get_send_queue_depth(),
-                                            Some(cc.get_packets_received_per_sec()),
-                                            Some(cc.get_packets_sent_per_sec()),
-                                        )
-                                    } else {
-                                        (None, None, None)
-                                    }
+                        // Get communication metrics from connection controller.
+                        // #522: also read the RTT-probe resilience counters
+                        // (cumulative since process start) so they can be emitted
+                        // on the health packet.
+                        let (
+                            send_queue_bytes,
+                            packets_received_per_sec,
+                            packets_sent_per_sec,
+                            rtt_probe_dropped_total,
+                            rtt_probe_stale_suppressions_total,
+                        ) = if let Some(cc_rc) = Weak::upgrade(&connection_controller) {
+                            if let Ok(cc_opt) = cc_rc.try_borrow() {
+                                if let Some(cc) = cc_opt.as_ref() {
+                                    // Calculate latest packet rates
+                                    cc.calculate_packet_rates();
+                                    (
+                                        cc.get_send_queue_depth(),
+                                        Some(cc.get_packets_received_per_sec()),
+                                        Some(cc.get_packets_sent_per_sec()),
+                                        cc.rtt_probe_dropped_total(),
+                                        cc.rtt_probe_stale_suppressions_total(),
+                                    )
                                 } else {
-                                    (None, None, None)
+                                    (None, None, None, 0, 0)
                                 }
                             } else {
-                                (None, None, None)
-                            };
+                                (None, None, None, 0, 0)
+                            }
+                        } else {
+                            (None, None, None, 0, 0)
+                        };
 
                         // Read encoder decision inputs from shared atomics (f32 bits → f64).
-                        let p75_peer_fps_val =
-                            f32::from_bits(encoder_p75_peer_fps.borrow().load(Ordering::Relaxed))
-                                as f64;
+                        let queue_depth_report_val = f32::from_bits(
+                            encoder_queue_depth_report.borrow().load(Ordering::Relaxed),
+                        ) as f64;
                         let target_bitrate_kbps_val = f32::from_bits(
                             encoder_target_bitrate_kbps.borrow().load(Ordering::Relaxed),
                         ) as f64;
@@ -1223,7 +1270,7 @@ impl HealthReporter {
                             videocall_transport::webtransport::datagram_drop_count(),
                             videocall_transport::websocket::websocket_drop_count(),
                             keyframe_requests_sent_count(),
-                            p75_peer_fps_val,
+                            queue_depth_report_val,
                             target_bitrate_kbps_val,
                             screen_tier_val,
                             screen_active_val,
@@ -1235,6 +1282,8 @@ impl HealthReporter {
                             drained_dwells,
                             connection_handshake_failures(),
                             connection_session_drops(),
+                            rtt_probe_dropped_total,
+                            rtt_probe_stale_suppressions_total,
                             [
                                 reelection_proceeded_total(),
                                 reelection_aborted_total(),
@@ -1287,7 +1336,7 @@ impl HealthReporter {
         datagram_drops_total: u64,
         websocket_drops_total: u64,
         keyframe_requests_sent_total: u64,
-        encoder_p75_peer_fps: f64,
+        encoder_queue_depth_report: f64,
         encoder_target_bitrate_kbps: f64,
         adaptive_screen_tier: u32,
         screen_sharing_active: bool,
@@ -1300,6 +1349,10 @@ impl HealthReporter {
         dwell_samples: Vec<(String, f64)>,
         handshake_failures_total: u64,
         session_drops_total: u64,
+        // RTT-probe resilience signals (#522), read from the ConnectionManager
+        // via the connection controller. Cumulative since process start.
+        rtt_probe_dropped_total: u64,
+        rtt_probe_stale_suppressions_total: u64,
         // Cumulative re-election outcome totals (Tier B #3), in the fixed order
         // [proceeded, aborted, preserved, failed]. Cumulative since process
         // start — the relay maps these onto a GaugeVec it .set()s, so the
@@ -1363,8 +1416,8 @@ impl HealthReporter {
         pb.keyframe_requests_sent_total = Some(keyframe_requests_sent_total);
 
         // Encoder decision inputs (P0)
-        if encoder_p75_peer_fps.is_finite() {
-            pb.encoder_p75_peer_fps = Some(encoder_p75_peer_fps);
+        if encoder_queue_depth_report.is_finite() {
+            pb.encoder_p75_peer_fps = Some(encoder_queue_depth_report);
         }
         pb.adaptive_screen_tier = Some(adaptive_screen_tier);
         pb.screen_sharing_active = Some(screen_sharing_active);
@@ -1470,12 +1523,59 @@ impl HealthReporter {
             pb.screen_encoder_frames_submitted_ok = Some(scr_frames);
         }
 
+        // Encoder auto-restart counters (#527), partitioned by reason. Same
+        // zero-cost-static + non-zero-only convention as the error counters
+        // above. The relay's metrics_server folds these into the single labeled
+        // counter videocall_encoder_restart_total{kind, reason}.
+        let cam_restart_closed = camera_encoder_restarts_closed_codec();
+        let cam_restart_mem = camera_encoder_restarts_memory();
+        let cam_restart_cfg = camera_encoder_restarts_configure();
+        let cam_restart_other = camera_encoder_restarts_other();
+        let scr_restart_closed = screen_encoder_restarts_closed_codec();
+        let scr_restart_mem = screen_encoder_restarts_memory();
+        let scr_restart_cfg = screen_encoder_restarts_configure();
+        let scr_restart_other = screen_encoder_restarts_other();
+
+        if cam_restart_closed > 0 {
+            pb.camera_encoder_restarts_closed_codec = Some(cam_restart_closed);
+        }
+        if cam_restart_mem > 0 {
+            pb.camera_encoder_restarts_memory = Some(cam_restart_mem);
+        }
+        if cam_restart_cfg > 0 {
+            pb.camera_encoder_restarts_configure = Some(cam_restart_cfg);
+        }
+        if cam_restart_other > 0 {
+            pb.camera_encoder_restarts_other = Some(cam_restart_other);
+        }
+        if scr_restart_closed > 0 {
+            pb.screen_encoder_restarts_closed_codec = Some(scr_restart_closed);
+        }
+        if scr_restart_mem > 0 {
+            pb.screen_encoder_restarts_memory = Some(scr_restart_mem);
+        }
+        if scr_restart_cfg > 0 {
+            pb.screen_encoder_restarts_configure = Some(scr_restart_cfg);
+        }
+        if scr_restart_other > 0 {
+            pb.screen_encoder_restarts_other = Some(scr_restart_other);
+        }
+
         // Connection-loss reason counters
         if handshake_failures_total > 0 {
             pb.connection_handshake_failures_total = Some(handshake_failures_total);
         }
         if session_drops_total > 0 {
             pb.connection_session_drops_total = Some(session_drops_total);
+        }
+
+        // RTT-probe resilience signals (#522). Cumulative, gated on > 0 like the
+        // connection-loss counters above.
+        if rtt_probe_dropped_total > 0 {
+            pb.rtt_probe_dropped_total = Some(rtt_probe_dropped_total);
+        }
+        if rtt_probe_stale_suppressions_total > 0 {
+            pb.rtt_probe_stale_suppressions_total = Some(rtt_probe_stale_suppressions_total);
         }
 
         // Re-election outcome counters (Tier B #3). Only attach a field when its
@@ -1655,6 +1755,14 @@ impl HealthReporter {
                     // to absorb observed network jitter. This is the real VoIP jitter metric.
                     ns.target_delay_ms = v;
                 }
+                // Audio playout latency (#1299): NetEQ's filtered current buffer level — how far
+                // behind live this peer's audio playout sits. The audio sibling of
+                // VideoStats.playout_latency_ms (#1252). Surfaced straight from the NetEQ stats
+                // JSON top-level (NetEqStats::playout_latency_ms); when the field is absent (older
+                // NetEQ worker) it stays at the proto 0.0 default = "at live". Observability only.
+                if let Some(v) = neteq.get("playout_latency_ms").and_then(|v| v.as_f64()) {
+                    ns.playout_latency_ms = v;
+                }
 
                 // Calculate audio packet loss percentage from WINDOWED rates (not lifetime)
                 // Use expand_per_sec (concealment events/sec) and packets_per_sec (packets/sec)
@@ -1744,6 +1852,40 @@ impl HealthReporter {
                 if let Some(v) = video.get("bitrate_kbps").and_then(|v| v.as_u64()) {
                     vs.bitrate_kbps = v;
                 }
+
+                // Buffered video playout latency (#1252). Guard #1 (load-bearing): only fold the
+                // span when fps_received > 0. A DecodeBudget-paused or hidden tile keeps a stale
+                // frame buffered but decodes nothing, so its arrival-time span would read as
+                // latency even though the user isn't waiting on it. fps_received > 0 means frames
+                // are actually being received/decoded, so the lag is real. When fps == 0 the proto
+                // field stays at its 0.0 default, which the server publishes as "at live".
+                if vs.fps_received > 0.0 {
+                    if let Some(v) = video.get("playout_latency_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_latency_ms = v;
+                    }
+                    if let Some(v) = video.get("playout_stage1_span_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_stage1_span_ms = v;
+                    }
+                    // Stage-3 paint lag (#1252): same fps_received > 0 guard — a paused/hidden tile
+                    // decodes nothing and paints nothing, so any residual emitted-vs-painted skew
+                    // is not user-perceived latency. When fps == 0 the field stays at its 0.0
+                    // default => "at live".
+                    if let Some(v) = video.get("playout_paint_lag_ms").and_then(|v| v.as_f64()) {
+                        vs.playout_paint_lag_ms = v;
+                    }
+                }
+                // Resync-to-live governor skips (#1252): folded UNCONDITIONALLY for camera video,
+                // OUTSIDE the fps_received > 0 gate above. The ms gauges are gated because a
+                // paused/hidden tile decodes nothing and any residual span isn't user-perceived
+                // latency. This is a cumulative COUNTER, not a gauge — it must keep reporting its
+                // lifetime value even when fps == 0, or a stream that fell idle would appear to
+                // "un-fire" the governor.
+                if let Some(v) = video
+                    .get("playout_skip_to_live_total")
+                    .and_then(|v| v.as_u64())
+                {
+                    vs.playout_skip_to_live_total = v;
+                }
                 ps.video_stats = ::protobuf::MessageField::some(vs);
 
                 // Extract decode_errors_per_sec (windowed rate) from camera video stats
@@ -1768,7 +1910,9 @@ impl HealthReporter {
                 }
             }
 
-            // Screen share video mapping (new field, separate from camera)
+            // Screen share video mapping (new field, separate from camera). This mirrors the
+            // pre-existing screen export surface: fps/buffered/decoded/bitrate only. The camera
+            // playout/governor fields above are not exported for screen share in this pass.
             if let Some(screen) = &health_data.last_screen_stats {
                 let mut svs = PbVideoStats::new();
                 if let Some(v) = screen.get("fps_received").and_then(|v| v.as_f64()) {
@@ -2054,7 +2198,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -2066,6 +2210,8 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -2132,7 +2278,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -2144,6 +2290,8 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
@@ -2157,6 +2305,109 @@ mod tests {
             .expect("HealthPacket payload must be valid protobuf")
     }
 
+    /// #522: build a HealthPacket through the production path with the given
+    /// RTT-probe resilience counters, then round-trip it through protobuf so the
+    /// assertions are on exactly what goes on the wire. The two counters are
+    /// threaded into the `rtt_probe_dropped_total` / `rtt_probe_stale_suppressions_total`
+    /// positional args (immediately after `session_drops_total`, before the
+    /// reelection-totals array) — the same positions the production call site
+    /// fills from the connection controller.
+    fn health_packet_with_rtt_probe_signals(
+        rtt_probe_dropped_total: u64,
+        rtt_probe_stale_suppressions_total: u64,
+    ) -> PbHealthPacket {
+        let mut health_map = HashMap::new();
+        health_map.insert(
+            "peer-1".to_string(),
+            PeerHealthData::new("peer-1".to_string()),
+        );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_queue_depth_report
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0, // handshake_failures_total
+            0, // session_drops_total
+            rtt_probe_dropped_total,
+            rtt_probe_stale_suppressions_total,
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #522: nonzero RTT-probe resilience counters must be emitted on the wire as
+    /// the protobuf optional fields with exactly the values passed in.
+    ///
+    /// MUTATION: deleting either `pb.rtt_probe_dropped_total = Some(...)` or
+    /// `pb.rtt_probe_stale_suppressions_total = Some(...)` assignment in
+    /// `create_health_packet` makes the corresponding field decode as `None`,
+    /// failing the matching `Some(7)` / `Some(3)` assertion below.
+    #[test]
+    fn create_health_packet_emits_nonzero_rtt_probe_signals() {
+        let pb = health_packet_with_rtt_probe_signals(7, 3);
+        assert_eq!(
+            pb.rtt_probe_dropped_total,
+            Some(7),
+            "nonzero rtt_probe_dropped_total must round-trip as Some(7)"
+        );
+        assert_eq!(
+            pb.rtt_probe_stale_suppressions_total,
+            Some(3),
+            "nonzero rtt_probe_stale_suppressions_total must round-trip as Some(3)"
+        );
+    }
+
+    /// #522: zero counters must be omitted (gated on `> 0`), so they decode as
+    /// `None` — keeping the common-case packet small.
+    ///
+    /// MUTATION: removing the `> 0` gate (always assigning `Some`) makes these
+    /// fields decode as `Some(0)`, failing the `None` assertions below.
+    #[test]
+    fn create_health_packet_omits_zero_rtt_probe_signals() {
+        let pb = health_packet_with_rtt_probe_signals(0, 0);
+        assert_eq!(
+            pb.rtt_probe_dropped_total, None,
+            "zero rtt_probe_dropped_total must be omitted (None) per the > 0 gate"
+        );
+        assert_eq!(
+            pb.rtt_probe_stale_suppressions_total, None,
+            "zero rtt_probe_stale_suppressions_total must be omitted (None) per the > 0 gate"
+        );
+    }
+
     /// #1032: build a HealthPacket through the production path with the given
     /// cached agent-memory value, then round-trip it through protobuf so the
     /// assertions are on exactly what goes on the wire.
@@ -2166,6 +2417,65 @@ mod tests {
             "peer-1".to_string(),
             PeerHealthData::new("peer-1".to_string()),
         );
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_queue_depth_report
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            agent_memory_bytes,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    fn health_packet_with_camera_playout_stats(fps_received: f64) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.last_camera_stats = Some(json!({
+            "fps_received": fps_received,
+            "playout_latency_ms": 1500.0,
+            "playout_stage1_span_ms": 1200.0,
+            "playout_paint_lag_ms": 1800.0,
+            "playout_skip_to_live_total": 4u64,
+        }));
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
 
         let wrapper = HealthReporter::create_health_packet(
             "session-id-test",
@@ -2198,17 +2508,223 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,
             ClientMetadata::default(),
             None,
-            agent_memory_bytes,
+            None,
         )
         .expect("create_health_packet must return Some when health_map is non-empty");
 
         PbHealthPacket::parse_from_bytes(&wrapper.data)
             .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    #[test]
+    fn playout_latency_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_latency_ms, 1500.0);
+        assert_eq!(stats.playout_stage1_span_ms, 1200.0);
+    }
+
+    #[test]
+    fn playout_latency_omitted_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        assert_eq!(stats.playout_latency_ms, 0.0);
+        assert_eq!(stats.playout_stage1_span_ms, 0.0);
+    }
+
+    #[test]
+    fn playout_paint_lag_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_paint_lag_ms, 1800.0);
+    }
+
+    #[test]
+    fn playout_paint_lag_omitted_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        assert_eq!(stats.playout_paint_lag_ms, 0.0);
+    }
+
+    /// #1252 resync governor counter folds at fps > 0 — like every other field. The DISTINCT
+    /// behavior (folds even at fps == 0) is pinned by the sibling test below; this one guards the
+    /// ordinary case so a regression that drops the field entirely is also caught.
+    #[test]
+    fn playout_skip_to_live_total_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_skip_to_live_total, 4);
+    }
+
+    /// #1252 resync governor counter folds UNCONDITIONALLY — even at fps == 0. This is the load-
+    /// bearing behavioral difference from the ms gauges (which are gated on fps_received > 0 and so
+    /// read 0 here, asserted in `playout_*_omitted_when_fps_received_zero`). A cumulative counter
+    /// must keep reporting its lifetime value when the stream falls idle, or the governor would
+    /// appear to "un-fire". Mutation check: moving the counter fold inside the `fps_received > 0`
+    /// guard makes this assert read 0 and fail.
+    #[test]
+    fn playout_skip_to_live_total_folds_even_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        // ms gauges are gated to 0 at fps 0; the COUNTER is NOT — it still reports its lifetime value.
+        assert_eq!(stats.playout_paint_lag_ms, 0.0);
+        assert_eq!(stats.playout_skip_to_live_total, 4);
+    }
+
+    /// Build a health packet whose peer carries NetEQ audio stats. `playout_latency_ms` is
+    /// `Some(v)` to include the field in the stats JSON (the shape the NetEQ worker emits at the
+    /// top level of NetEqStats), or `None` to OMIT it entirely (the older-worker / pre-#1299 case).
+    fn health_packet_with_neteq_playout_latency(playout_latency_ms: Option<f64>) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        let mut neteq = json!({
+            "current_buffer_size_ms": 200.0,
+            "target_delay_ms": 80.0,
+            "packets_awaiting_decode": 3.0,
+            "packets_per_sec": 50.0,
+        });
+        if let Some(v) = playout_latency_ms {
+            neteq["playout_latency_ms"] = json!(v);
+        }
+        peer.update_audio_stats(neteq);
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None,
+            None,
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// Audio playout latency (#1299): when NetEQ reports a filtered playout buffer level in the
+    /// stats JSON, it must fold into NetEqStats.playout_latency_ms on the wire. Mirrors the video
+    /// sibling test. Fails if the read in create_health_packet is dropped or reads the wrong key.
+    #[test]
+    fn audio_playout_latency_folds_from_neteq_stats() {
+        let pb = health_packet_with_neteq_playout_latency(Some(1450.0));
+        let neteq = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .neteq_stats
+            .as_ref()
+            .expect("neteq stats must be present");
+
+        assert_eq!(neteq.playout_latency_ms, 1450.0);
+        // Sanity: the metric is distinct from the raw buffer snapshot it travels alongside.
+        assert_eq!(neteq.current_buffer_size_ms, 200.0);
+    }
+
+    /// When the NetEQ stats JSON OMITS playout_latency_ms (older worker / pre-#1299), the proto
+    /// field must stay at its 0.0 default ("at live"), never a stale or fabricated value. Guards
+    /// against the #1338-style false-value trap.
+    #[test]
+    fn audio_playout_latency_defaults_to_zero_when_absent() {
+        let pb = health_packet_with_neteq_playout_latency(None);
+        let neteq = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .neteq_stats
+            .as_ref()
+            .expect("neteq stats must be present");
+
+        assert_eq!(neteq.playout_latency_ms, 0.0);
     }
 
     /// #1032: a cached agent-memory reading rides the HealthPacket on the wire.
@@ -2253,7 +2769,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -2265,6 +2781,8 @@ mod tests {
             Vec::new(),
             0,
             0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
             [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
             Vec::new(),
             None,

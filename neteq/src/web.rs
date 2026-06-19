@@ -23,6 +23,21 @@ use crate::{codec::UnifiedOpusDecoder, AudioPacket, NetEq, NetEqConfig, RtpHeade
 use serde_wasm_bindgen;
 use wasm_bindgen::prelude::*;
 
+/// Upper bound on NetEQ's adaptive jitter-buffer target for the browser/wasm path (issue #1299).
+///
+/// Without this, the wasm config leaves `max_delay_ms = 0`, so the adaptive target is bounded only
+/// by the derived 3000ms cap (`base_maximum_delay_ms = max_packets_in_buffer*20*3/4`). A jitter or
+/// stall episode then ratchets the 97th-percentile target toward 3s and gates Accelerate's catch-up
+/// off — the target re-labels multi-second lag as the "correct" buffer depth (the #1299 mechanism).
+///
+/// Setting `max_delay_ms` here engages `DelayManager::set_maximum_delay` (neteq.rs), capping the
+/// effective maximum target so Accelerate's setpoint stays low. 300ms sits in the issue's
+/// recommended 200–400ms range: high enough to absorb normal mobile/high-latency jitter, low enough
+/// that the steady-state target can never approach the seconds-deep regime. This is necessary but
+/// not sufficient on its own — Accelerate cannot claw back seconds already buffered — which is why
+/// the resync-to-live governor (also #1299, in `NetEq::maybe_resync_to_live`) is the real fix.
+const RESYNC_MAX_DELAY_MS: u32 = 300;
+
 #[wasm_bindgen]
 pub struct WebNetEq {
     neteq: std::cell::RefCell<Option<NetEq>>,
@@ -55,6 +70,10 @@ impl WebNetEq {
             sample_rate: self.sample_rate,
             channels: self.channels,
             additional_delay_ms: self.additional_delay_ms,
+            // Bound the adaptive jitter-buffer target so it can't ratchet to the 3s cap and gate
+            // Accelerate off (issue #1299, part 2). The resync-to-live governor (part 1) is enabled
+            // by the NetEqConfig defaults (resync_ceiling_ms / resync_cooldown_ms).
+            max_delay_ms: RESYNC_MAX_DELAY_MS,
             ..Default::default()
         };
         let mut neteq = NetEq::new(cfg).map_err(Self::map_err)?;
@@ -110,6 +129,21 @@ impl WebNetEq {
         let frame = neteq.get_audio().map_err(Self::map_err)?;
         let out = js_sys::Float32Array::from(frame.samples.as_slice());
         Ok(out)
+    }
+
+    /// Flush the jitter/packet buffer and reset internal state (issue #1402).
+    ///
+    /// Called when a peer's audio stream ends (mic-off / host force-mute) so the
+    /// NetEq buffer stops emitting expand/comfort-noise concealment ("hiss")
+    /// packets for a stream that is no longer producing data. Delegates to
+    /// [`NetEq::flush`], which drains the packet buffer, clears leftover samples,
+    /// and resets the delay/governor state. A no-op (not an error) before
+    /// `init()` — there is nothing buffered to flush.
+    #[wasm_bindgen]
+    pub fn flush(&self) {
+        if let Some(neteq) = self.neteq.borrow_mut().as_mut() {
+            neteq.flush();
+        }
     }
 
     /// Get current NetEq statistics as a JS object.

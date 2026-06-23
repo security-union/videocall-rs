@@ -17,6 +17,59 @@ use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 use sqlx::PgPool;
 
+/// The terminal `state` value. A meeting that has ended stays ended forever
+/// (until soft-deleted) — presence can never resurrect it.
+pub const STATE_ENDED: &str = "ended";
+/// The "someone is currently present" state.
+pub const STATE_ACTIVE: &str = "active";
+/// The "exists but nobody is currently present" state.
+pub const STATE_IDLE: &str = "idle";
+
+/// Derive the *displayed* meeting state from the raw `meetings.state` column and
+/// the live present-participant count (issue #1628).
+///
+/// The raw `state` column is presence-driven but advanced by SEPARATE, partially
+/// asymmetric writers: `activate()` (REST join/admit only), `set_idle()` (the
+/// transport "room became empty" NATS event), and `end_meeting()` (host-leave /
+/// explicit end). Because re-activation historically only fired on a REST join,
+/// the column could be left at `'idle'` while live participants were present —
+/// e.g. a participant whose transport briefly dropped (room→empty→`set_idle`)
+/// then reconnected over the *transport* without re-hitting REST `/join`. The
+/// column also lags during the brief windows between a presence change and the
+/// NATS event that updates it.
+///
+/// This function makes the invariant the issue requires hold *by construction at
+/// read time*, independent of which writer last touched the column and of event
+/// ordering across reconnects, multi-tab, both transports, and multiple replicas:
+///
+/// > **`idle` ⟺ zero present participants (and the meeting has not ended).**
+///
+/// Rules, in priority order:
+/// 1. `ended` is **terminal** and always wins — a participant row that is still
+///    `admitted AND left_at IS NULL` at the instant the meeting ended (an
+///    in-flight roster write racing `end_meeting`) must NOT flip the display back
+///    to `active`. The end-vs-presence race always resolves to `ended`.
+/// 2. Otherwise, `participant_count > 0` ⇒ `active` (someone is present).
+/// 3. Otherwise (no one present) ⇒ `idle`.
+///
+/// `raw_state` is the column value (`None` is treated as the INSERT default
+/// `idle`). `participant_count` is the live present count
+/// (`status='admitted' AND left_at IS NULL`), the same definition the feed/list
+/// `participant_count` field is computed from, so the returned `state` and
+/// `participant_count` can never contradict each other.
+///
+/// Note this derives the DISPLAYED state only; the raw column still drives the
+/// server-side join/auto-activate gating (which must distinguish a never-started
+/// `idle` from an `ended` meeting the host opted to close). We never write the
+/// derived value back to the column.
+pub fn display_state(raw_state: Option<&str>, participant_count: i64) -> String {
+    match raw_state {
+        Some(STATE_ENDED) => STATE_ENDED.to_string(),
+        _ if participant_count > 0 => STATE_ACTIVE.to_string(),
+        _ => STATE_IDLE.to_string(),
+    }
+}
+
 /// Row returned from the `meetings` table.
 #[derive(Debug, Clone, sqlx::FromRow)]
 #[allow(dead_code)]
@@ -497,6 +550,41 @@ pub async fn activate(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error>
     Ok(())
 }
 
+/// Re-activate a meeting `idle -> active` because a participant became present
+/// again (issue #1628) — the presence-driven counterpart to [`set_idle`].
+///
+/// Unlike [`activate`], the `WHERE id = $1 AND state = 'idle'` guard is
+/// **load-bearing for terminal-`ended` safety**:
+///
+/// 1. **Never resurrects `ended`.** `activate` deliberately re-opens an `ended`
+///    meeting (the REST host-restart path: a host clicking "join" on a meeting
+///    they previously ended legitimately reopens it). The presence-driven
+///    `internal.participant_present` consumer must NOT do that — a late
+///    reconnect racing a host-`end` must let `ended` win. Scoping the UPDATE to
+///    `state = 'idle'` makes this ATOMIC: an `ended` (or already-`active`) row
+///    matches zero rows, so the read-then-write race ("snapshot said idle, host
+///    ended in the gap, my activate resurrected it") cannot occur.
+/// 2. **Idempotent.** An already-`active` meeting matches zero rows — a
+///    duplicate present event is a harmless no-op.
+///
+/// Refreshes `started_at = NOW()` / clears `ended_at = NULL` on the
+/// `idle -> active` flip, matching `activate`'s idle-branch timestamp behavior
+/// (`ended_at` is already NULL for an idle row, so the clear is a no-op there;
+/// it is set defensively for shape parity). Returns the number of rows updated
+/// (`1` on a real `idle -> active` flip, `0` when the meeting was `active`,
+/// `ended`, or absent).
+pub async fn reactivate_from_idle(pool: &PgPool, meeting_id: i32) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE meetings \
+         SET state = 'active', started_at = NOW(), ended_at = NULL \
+         WHERE id = $1 AND state = 'idle'",
+    )
+    .bind(meeting_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// End a meeting (set state to 'ended', set ended_at if not already set) and
 /// reset host to the creator for the next activation.
 ///
@@ -654,7 +742,40 @@ pub async fn update_meeting_settings(
 
 #[cfg(test)]
 mod tests {
-    use super::escape_like;
+    use super::{display_state, escape_like};
+
+    // ── display_state: the `idle ⟺ zero present` invariant (issue #1628) ──────
+
+    #[test]
+    fn display_state_idle_iff_zero_present() {
+        // With nobody present, every non-ended raw state displays as idle.
+        assert_eq!(display_state(Some("idle"), 0), "idle");
+        assert_eq!(display_state(Some("active"), 0), "idle");
+        assert_eq!(display_state(None, 0), "idle");
+    }
+
+    #[test]
+    fn display_state_present_participants_never_idle() {
+        // The core fix: a meeting with >=1 present participant is NEVER idle,
+        // even if the raw column lags at 'idle' (stuck after a transport-only
+        // reconnect that re-activated nobody, or a brief column/presence skew).
+        assert_eq!(display_state(Some("idle"), 1), "active");
+        assert_eq!(display_state(Some("idle"), 5), "active");
+        assert_eq!(display_state(Some("active"), 1), "active");
+        // Also covers the ">1 present but shown idle" symptom from the issue.
+        assert_eq!(display_state(Some("idle"), 2), "active");
+        assert_eq!(display_state(None, 3), "active");
+    }
+
+    #[test]
+    fn display_state_ended_is_terminal_even_with_present_rows() {
+        // `ended` always wins, even against an in-flight roster write that still
+        // counts a present participant when end_meeting lands — the end-vs-
+        // presence race must resolve to ended, never resurrect to active.
+        assert_eq!(display_state(Some("ended"), 0), "ended");
+        assert_eq!(display_state(Some("ended"), 1), "ended");
+        assert_eq!(display_state(Some("ended"), 9), "ended");
+    }
 
     #[test]
     fn escape_like_neutralises_percent_and_underscore() {

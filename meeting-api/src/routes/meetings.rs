@@ -200,7 +200,12 @@ pub async fn list_meetings(
         meetings.push(MeetingSummary {
             meeting_id: row.room_id.clone(),
             host: row.creator_id.clone(),
-            state: row.state.clone().unwrap_or_else(|| "idle".to_string()),
+            // Issue #1628: derive the displayed state from live presence so
+            // `idle ⟺ zero present`. The raw column can lag at 'idle' while
+            // participants are present (transport-only reconnect, column/
+            // presence skew); `participant_count` is the same live count shown
+            // below, so state and count can never contradict.
+            state: db_meetings::display_state(row.state.as_deref(), participant_count),
             has_password: row.password_hash.is_some(),
             created_at: row.created_at.timestamp_millis(),
             participant_count,
@@ -255,7 +260,8 @@ pub async fn list_joined_meetings(
     for row in &rows {
         meetings.push(JoinedMeetingSummary {
             meeting_id: row.room_id.clone(),
-            state: row.state.clone().unwrap_or_else(|| "idle".to_string()),
+            // Issue #1628: presence-derived display state (see `list_meetings`).
+            state: db_meetings::display_state(row.state.as_deref(), row.participant_count),
             started_at: row.started_at.timestamp_millis(),
             ended_at: row.ended_at.map(|t| t.timestamp_millis()),
             participant_count: row.participant_count,
@@ -307,13 +313,21 @@ pub async fn list_feed(
     let meetings = rows
         .into_iter()
         .map(|row| {
-            let state_str = row.state.clone().unwrap_or_else(|| "idle".to_string());
+            // Issue #1628: derive the displayed state from live presence so
+            // `idle ⟺ zero present`. The raw column can lag at 'idle' while
+            // participants are present (transport-only reconnect, column/
+            // presence skew); `participant_count` is the same live count
+            // surfaced below, so state and count can never contradict.
+            let state_str = db_meetings::display_state(row.state.as_deref(), row.participant_count);
             // `started_at` is set to NOW() at INSERT even when the meeting is
             // still `idle`, so the raw column is meaningless for never-
             // activated meetings. Surface `Some(started_at)` only when the
-            // meeting has actually been activated at some point — i.e.
-            // state has moved out of idle, or the meeting has ended.
-            // This mirrors the spec: "None if never activated".
+            // meeting has actually been activated at some point — i.e. the
+            // (now presence-derived) display state is not idle, or the meeting
+            // has ended. This mirrors the spec: "None if never activated". A
+            // meeting that is currently active by presence (>=1 present) but
+            // whose raw column lagged at 'idle' is correctly treated as
+            // activated here too.
             let was_activated = state_str != "idle" || row.ended_at.is_some();
             let started_at = if was_activated {
                 Some(row.started_at.timestamp_millis())
@@ -369,7 +383,8 @@ pub async fn get_meeting(
 
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
-        state: row.state.unwrap_or_else(|| "idle".to_string()),
+        // Issue #1628: presence-derived display state (see `list_meetings`).
+        state: db_meetings::display_state(row.state.as_deref(), participant_count),
         host: row.creator_id.clone().unwrap_or_default(),
         host_display_name: row.host_display_name,
         host_user_id: row.creator_id,
@@ -487,7 +502,9 @@ pub async fn end_meeting_handler(
 
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
-        state: row.state.unwrap_or_else(|| "idle".to_string()),
+        // Just transitioned to `ended`; `display_state` returns `ended`
+        // (terminal) regardless of any in-flight roster rows (issue #1628).
+        state: db_meetings::display_state(row.state.as_deref(), participant_count),
         host: row.creator_id.clone().unwrap_or_default(),
         host_display_name: row.host_display_name,
         host_user_id: row.creator_id,
@@ -595,7 +612,10 @@ pub async fn update_meeting(
 
     Ok(Json(APIResponse::ok(MeetingInfoResponse {
         meeting_id: row.room_id,
-        state: row.state.unwrap_or_else(|| "idle".to_string()),
+        // Issue #1628: presence-derived display state (see `list_meetings`).
+        // The settings/edit page reads this field too; keeping the single
+        // derivation here makes the edit page and the list agree.
+        state: db_meetings::display_state(row.state.as_deref(), participant_count),
         host: row.creator_id.clone().unwrap_or_default(),
         host_display_name: row.host_display_name,
         host_user_id: row.creator_id,

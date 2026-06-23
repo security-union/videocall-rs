@@ -643,6 +643,59 @@ pub async fn mark_left_by_disconnect(
     Ok(result.rows_affected())
 }
 
+/// Restore a previously-admitted participant to `status='admitted', left_at=NULL`
+/// in response to a transport (re)connect observed by `actix-api` (the
+/// `PARTICIPANT_PRESENT` NATS event, issue #1628).
+///
+/// This is the symmetric counterpart to [`mark_left_by_disconnect`]: it heals a
+/// participant whose row was marked `left` by an abnormal disconnect (closed tab
+/// / network drop / >grace transport drop) and who then reconnected over the
+/// TRANSPORT without re-hitting the REST `/join` endpoint. Without it, such a
+/// participant stays `status='left'` (and `participant_count == 0`) even though
+/// they are present in the relay's authoritative `room_members`, leaving the
+/// meeting stuck `idle` with people in it.
+///
+/// # Privilege-escalation safety (load-bearing WHERE clause)
+///
+/// The guard is `status = 'left' AND admitted_at IS NOT NULL`:
+///
+/// - `admitted_at IS NOT NULL` means this user was admitted to the meeting at
+///   some prior point. We NEVER promote a `waiting`, `rejected`, or `kicked`
+///   row to `admitted` — those are admission-control / moderation states that
+///   only the host (via the waiting-room admit / REST path) may change. A relay
+///   `PARTICIPANT_PRESENT` event is, by construction, for a session in
+///   `room_members` (waiters connect as observer sessions and are excluded), but
+///   we still guard defensively so a spurious or forged event can never bypass
+///   the waiting room or un-kick a removed participant.
+/// - `status = 'left'` scopes the heal to exactly the disconnect-marked rows.
+///   An already-present `admitted` row (`status='admitted'`) is left untouched —
+///   we do NOT clobber its `admitted_at`/`left_at`, so a duplicate or redelivered
+///   event is a zero-row no-op and the original admission timestamp is preserved.
+///
+/// We deliberately do NOT touch `admitted_at`: the participant's ORIGINAL
+/// admission time is the stable "first admitted" signal the feed ordering and
+/// the `ever_admitted` flag depend on; only `left_at` is cleared.
+///
+/// Returns the number of rows updated (0 when the participant was already
+/// present, never admitted, kicked/rejected, or has no row for this meeting).
+pub async fn mark_present_by_connect(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE meeting_participants \
+         SET status = 'admitted', left_at = NULL \
+         WHERE meeting_id = $1 AND user_id = $2 \
+           AND status = 'left' AND admitted_at IS NOT NULL",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 // -- Conversions to API response types --
 
 impl ParticipantRow {

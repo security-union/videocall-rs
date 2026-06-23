@@ -103,6 +103,32 @@ pub const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
 /// `PARTICIPANT_LEFT_SUBJECT`).
 pub const PARTICIPANT_LEFT_SUBJECT: &str = "internal.participant_left";
 
+/// NATS subject carrying chat_server → meeting-api "a participant became
+/// PRESENT" notifications (issue #1628). The symmetric counterpart to
+/// [`PARTICIPANT_LEFT_SUBJECT`].
+///
+/// Sent by chat_server when a session is elected Testing→Active in a room (a
+/// fresh join or a transport reconnect-after-grace). The `meeting-api` consumer
+/// looks the meeting up by `room_id`, marks `(meeting_id, user_id)` as
+/// `status='admitted', left_at=NULL` via
+/// [`crate::db::participants::mark_present_by_connect`], and re-activates the
+/// meeting (`idle -> active`) via [`crate::db::meetings::reactivate_from_idle`].
+///
+/// This closes the presence asymmetry: before #1628, re-activation only fired
+/// on a REST `/join`, so a transport-only reconnect left the meeting stuck
+/// `idle` with a present participant (and `participant_count == 0`). With this
+/// event the DB roster tracks the relay's authoritative `room_members`
+/// symmetrically with the empty→idle path.
+///
+/// Idempotent and `ended`-safe: `mark_present_by_connect` only flips rows that
+/// are not already present, and `reactivate_from_idle` is an atomic
+/// `UPDATE … WHERE state='idle'`, so an `ended` (terminal) meeting matches zero
+/// rows and is never resurrected — even if a late present event races a
+/// host-end. The corresponding publisher lives in
+/// `actix-api/src/actors/chat_server.rs` (search for
+/// `PARTICIPANT_PRESENT_SUBJECT`).
+pub const PARTICIPANT_PRESENT_SUBJECT: &str = "internal.participant_present";
+
 /// NATS subject for fanning out per-participant host-flag changes to every
 /// `actix-api` chat_server instance. The chat_server caches each member's
 /// `is_host` at JoinRoom time from the JWT, so without this fanout a
@@ -163,6 +189,20 @@ pub struct MeetingBecameEmptyPayload {
 /// [`crate::db::participants::mark_left_by_disconnect`].
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ParticipantLeftPayload {
+    pub room_id: String,
+    pub user_id: String,
+}
+
+/// Payload consumed on [`PARTICIPANT_PRESENT_SUBJECT`] (issue #1628).
+///
+/// Sent by chat_server when a participant's session became present in a room (a
+/// fresh join or a transport reconnect). The `meeting-api` consumer looks the
+/// meeting up by `room_id`, marks `(meeting_id, user_id)` as
+/// `status='admitted', left_at=NULL`, and re-activates the meeting. Mirrors
+/// [`ParticipantLeftPayload`] — carries the `(room_id, user_id)` the
+/// `meeting_participants` rows are keyed by.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ParticipantPresentPayload {
     pub room_id: String,
     pub user_id: String,
 }

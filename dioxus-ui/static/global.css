@@ -80,7 +80,7 @@
 .video-placeholder {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 1rem;
+  border-radius: var(--radius-card);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -1814,7 +1814,7 @@ html[data-theme="light"] #invite-overlay p {
 .modal-content {
   background: #1c1c1e;
   padding: 2rem;
-  border-radius: 16px;
+  border-radius: var(--radius-card);
   text-align: center;
   color: white;
   max-width: 400px;
@@ -2309,7 +2309,7 @@ html[data-theme="light"] #invite-overlay p {
   color: white;
   font-size: var(--fs-3);
   font-weight: 500;
-  border-radius: 0.5rem;
+  border-radius: var(--radius-md);
   white-space: nowrap;
   opacity: 0;
   visibility: hidden;
@@ -2833,7 +2833,7 @@ html[data-theme="light"] #invite-overlay p {
   -webkit-backdrop-filter: blur(20px) saturate(180%);
   backdrop-filter: blur(20px) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   box-shadow:
     0 10px 30px rgba(0, 0, 0, 0.45),
     0 1px 0 rgba(255, 255, 255, 0.04) inset;
@@ -3135,7 +3135,7 @@ html[data-theme="light"] #invite-overlay p {
   backdrop-filter: saturate(180%) blur(20px);
   border: 1px solid rgba(255, 255, 255, 0.18);
   padding: 0.5rem 0.75rem;
-  border-radius: 0.75rem;
+  border-radius: var(--radius-lg);
   display: inline-block;
   overflow: hidden;
   max-height: 0;
@@ -3406,7 +3406,7 @@ html[data-theme="light"] #invite-overlay p {
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
   overflow: hidden;
 }
@@ -3732,7 +3732,7 @@ html[data-theme="light"] #invite-overlay p {
   align-items: center;
   justify-content: center;
   padding: 2px 6px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-size: clamp(9px, calc(var(--tile-h, 240px) * 0.05), 11px);
   font-weight: 600;
   line-height: 1;

@@ -866,15 +866,23 @@ async fn test_non_host_joins_active_wr_off_host_absent_auto_admitted() {
         assert_eq!(resp.status(), StatusCode::OK, "host leave must succeed");
     }
 
-    // Meeting must still be active (end_on_host_leave=false).
+    // Issue #1628: the DISPLAYED state is now presence-derived, so a meeting
+    // with ZERO present participants reads `idle` — even though the host left
+    // with end_on_host_leave=false (so the meeting did NOT end and is still
+    // re-joinable). The OLD behavior reported `active`-with-0-present, which is
+    // exactly the `idle ⟺ zero present` invariant violation #1628 fixes. The
+    // meeting's RAW column is still `active` (not `ended`), which is what keeps
+    // it joinable — verified by the auto-admit below succeeding.
     let info = get_meeting_info(&pool, room_id).await;
-    assert_eq!(
-        info.state, "active",
-        "meeting must remain active after host leaves when end_on_host_leave=false"
-    );
     assert_eq!(
         info.participant_count, 0,
         "no admitted participants after host leaves"
+    );
+    assert_eq!(
+        info.state, "idle",
+        "a host-absent meeting with zero present participants is displayed `idle` \
+         (issue #1628: idle ⟺ zero present); it stays re-joinable because it did \
+         NOT end (end_on_host_leave=false)"
     );
 
     // Authenticated non-host joins the host-less active meeting.

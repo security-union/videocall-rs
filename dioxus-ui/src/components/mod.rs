@@ -26,6 +26,7 @@ pub mod login;
 pub mod meeting_ended_overlay;
 pub mod meeting_format;
 pub mod meeting_info;
+pub mod meeting_options_controls;
 pub mod meetings_filter;
 pub mod meetings_list;
 pub mod neteq_chart;

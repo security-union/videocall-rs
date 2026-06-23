@@ -149,6 +149,16 @@ async fn main() {
         pool.clone(),
         feed_tx.clone(),
     );
+    // Symmetric counterpart (issue #1628): when actix-api reports a participant
+    // became PRESENT (a fresh join or a transport reconnect), restore their
+    // `meeting_participants` row to `admitted` and re-activate the meeting
+    // (`idle -> active`). Without this, a transport-only reconnect — which never
+    // re-hits REST /join — left the meeting stuck `idle` with people in it.
+    let _participant_present_consumer = nats_consumers::spawn_participant_present_consumer(
+        nats.clone(),
+        pool.clone(),
+        feed_tx.clone(),
+    );
 
     // Fan-out subscriber for the local-HTTP-mutation feed changes (create /
     // admit / join-reactivation / end / leave). Those mutation points run on

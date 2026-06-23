@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 
 /**
  * Screen-share right panel layout E2E tests.
@@ -66,19 +67,13 @@ async function createAuthenticatedContext(
 }
 
 async function navigateToMeeting(page: Page, meetingId: string, username: string) {
-  await page.goto("/");
-  await page.waitForTimeout(1500);
-
-  await page.locator("#meeting-id").click();
-  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
-  await page.locator("#username").click();
-  await page.locator("#username").fill("");
-  await page.locator("#username").pressSequentially(username, { delay: 50 });
-  await page.waitForTimeout(500);
-  await page.locator("#username").press("Enter");
-  await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
-    timeout: 10_000,
-  });
+  // Hydration-robust submit (see helpers/join-meeting.ts): gates submission on
+  // the post-hydration submit button and waits for the home form to detach (the
+  // route-changed signal that is robust to the History-API URL lagging the
+  // rendered route under load) instead of a fixed wait + URL poll. Fixes the
+  // bvt join flake where the page rendered the meeting but stayed reported at
+  // "/" so toHaveURL(/meeting/) timed out.
+  await fillAndSubmitJoinForm(page, meetingId, username);
   await page.waitForTimeout(1500);
 }
 

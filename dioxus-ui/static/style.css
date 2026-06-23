@@ -160,7 +160,7 @@ h3 {
   display: flex;
   align-items: center;
   padding: 8px;
-  border-radius: var(--radius-sm, 5px);
+  border-radius: var(--radius-sm);
   transition: background-color 0.2s;
 }
 
@@ -197,7 +197,7 @@ h3 {
   align-items: center;
   justify-content: center;
   padding: 1px 7px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--warning);
   color: #000;
   /* @token-exempt: explicit black text on yellow warning badge for AA contrast */
@@ -223,7 +223,7 @@ h3 {
   bottom: 8px;
   right: 8px;
   padding: 2px 8px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--warning);
   color: #000;
   /* @token-exempt: explicit black text on yellow warning badge for AA contrast */
@@ -384,7 +384,7 @@ h3 {
   right: 0;
   background: var(--surface-elevated, #1e2030);
   border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
   z-index: 100;
   min-width: 130px;
@@ -562,7 +562,7 @@ h3 {
   justify-content: center;
   padding: 0;
   border: none;
-  border-radius: var(--radius-pill, 999px);
+  border-radius: var(--radius-pill);
   background: var(--btn-warning-bg);
   color: var(--warning);
   box-shadow: 0 0 0 1px var(--btn-warning-border);
@@ -626,7 +626,7 @@ h3 {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-md, 10px);
+  border-radius: var(--radius-md);
   font-family: inherit;
   font-size: var(--fs-4);
   font-weight: 600;
@@ -1240,7 +1240,7 @@ html[data-theme="dark"] #diagnostics-sidebar {
 /* Subtle hover affordance on the clickable summary row. */
 .diag-disclosure-summary:hover {
   background: var(--glass-bg-hover);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 /* The explicit chevron points right when closed, rotates to point down when the
    `<details>` is open. Mirrors the `.perf-peers__chev` pattern. */
@@ -1432,7 +1432,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .close-button {
   background: var(--glass-bg-hover);
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   width: 32px;
   height: 32px;
   display: flex;
@@ -1575,7 +1575,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin: 10px 0;
   text-align: center;
   background: var(--surface-elevated);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   padding: 15px;
   box-shadow: var(--shadow-sm);
 }
@@ -1621,7 +1621,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .neteq-status {
   background: var(--surface-elevated);
   padding: 16px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
@@ -1636,7 +1636,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 .neteq-status .status-stat {
   background: var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   padding: 12px 14px;
   display: flex;
   flex-direction: column;
@@ -1770,7 +1770,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .chart-container {
   background: var(--surface-elevated);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
   padding: 10px;
 }
@@ -2004,7 +2004,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .menu-button {
   background: var(--glass-bg-hover);
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   width: 32px;
   height: 32px;
   display: flex;
@@ -2394,7 +2394,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 4px;
   padding: 3px 8px 3px 4px;
   background: var(--overlay-heavy);
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   z-index: 5;
   opacity: 0;
   transform: translateY(4px);
@@ -2667,7 +2667,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background: var(--focus-ring);
   color: #fff
     /* @token-exempt: badge text on accent fill */
@@ -2749,7 +2749,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.5rem;
   background: var(--surface-elevated);
   border: 1px solid var(--glass-border);
-  border-radius: var(--radius-card, 12px);
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
@@ -2822,7 +2822,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-size: var(--fs-4);
   color: var(--text-secondary);
   cursor: pointer;
-  border-radius: var(--radius-button, 8px);
+  border-radius: var(--radius-button);
 }
 
 .meetings-filter-option:hover {
@@ -2854,7 +2854,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.5rem 0.625rem;
   background: transparent;
   border: none;
-  border-radius: var(--radius-button, 8px);
+  border-radius: var(--radius-button);
   color: var(--text-secondary);
   font-size: var(--fs-4);
   cursor: pointer;
@@ -2988,7 +2988,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.125rem 0.4375rem;
   background: var(--field-bg);
   border: 1px solid var(--join-meeting-id-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3067,7 +3067,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-on-glass-quaternary);
   padding: 0.5rem;
   margin-left: 0.5rem;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all 0.2s ease;
   flex-shrink: 0;
@@ -3140,7 +3140,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   -webkit-backdrop-filter: blur(20px) saturate(140%);
   backdrop-filter: blur(20px) saturate(140%);
   border: 1px solid var(--glass-bg-hover);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   padding: 0.3125rem 0.5rem;
   font-size: var(--fs-2);
   color: var(--text-on-glass);
@@ -3476,7 +3476,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .btn-admit-all {
   width: 100%;
   padding: 0.5rem 1rem;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   border: none;
   background: var(--success-bg-soft);
   color: var(--success);
@@ -3797,7 +3797,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: none;
   color: var(--text-on-glass-faint);
   padding: 0.5rem;
-  border-radius: 0.375rem;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all 0.2s ease;
   flex-shrink: 0;
@@ -4271,6 +4271,19 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   white-space: nowrap;
 }
 
+/* Time row may render a "from – to" range; allow it to wrap between the two
+   timestamps (right-aligned) while each timestamp stays an atomic unit.
+   A no-range value has no internal break point, so it stays on one line. */
+.settings-stat-value--range {
+  white-space: normal;
+  text-align: right;
+}
+
+.settings-stat-time-part,
+.settings-stat-separator {
+  white-space: nowrap;
+}
+
 .settings-stat-separator {
   color: var(--text-tertiary);
   font-weight: 400;
@@ -4426,7 +4439,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   top: 6px;
   left: 6px;
   padding: 3px 7px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   gap: 2px;
   font-size: var(--fs-4);
   max-width: calc(100% - 90px);
@@ -4532,7 +4545,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   ;
   backdrop-filter: blur(12px);
   border: 1px solid var(--settings-tooltip-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   padding: 0.5rem 0.75rem;
   font-size: var(--fs-3);
   line-height: 1.4;
@@ -4799,7 +4812,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
        exactly when it hurts most. The fill is near-opaque (was 0.9 + blur), so
        dropping the blur is visually ~indistinguishable. */;
   border: 1px solid var(--btn-warning-border);
-  border-radius: var(--radius-lg, 14px);
+  border-radius: var(--radius-lg);
   box-shadow: 0 8px 32px var(--shadow-card-deep);
   /* @token-exempt: literal light-on-dark; the surface is hardcoded dark in both
      themes, so the theme-flipping --text-on-glass-strong token must NOT be used
@@ -4843,7 +4856,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-md, 10px);
+  border-radius: var(--radius-md);
   cursor: pointer;
   font-family: inherit;
 }
@@ -5166,7 +5179,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   flex-shrink: 0;
   width: 28px;
   height: 28px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -5361,7 +5374,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   .peer-toast .toast-icon {
     width: 24px;
     height: 24px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
   }
 
   .peer-toast .toast-icon svg {
@@ -5474,7 +5487,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   justify-content: center;
   padding: 0;
   border: none;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: var(--settings-modal-close-bg);
   color: var(--settings-modal-close-text);
   cursor: pointer;
@@ -5502,7 +5515,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   margin: 0 14px;
   padding: 0 16px;
 
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
 
   font-size: var(--fs-6);
   font-weight: 560;
@@ -5775,7 +5788,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .glass-select-option {
   padding: 10px 12px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text-primary);
   cursor: pointer;
   font-size: var(--fs-5);
@@ -5953,7 +5966,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   /* inner inset frame */
   background: var(--settings-panel-bg);
   border: 1px solid var(--settings-panel-border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   /* full pill */
   box-shadow: var(--settings-panel-shadow);
   isolation: isolate;
@@ -5965,7 +5978,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   appearance: none;
   background: transparent;
   border: none;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   color: rgba(255, 255, 255, 0.62);
   /* @token-exempt: calm secondary */
   cursor: pointer;
@@ -6090,7 +6103,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   border: 1px solid var(--settings-modal-border);
-  border-radius: var(--radius-button, 9px);
+  border-radius: var(--radius-button);
   color: var(--text-primary);
   cursor: pointer;
   font-family: inherit;
@@ -6309,7 +6322,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: block;
   width: 36px;
   height: 20px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: rgba(90, 90, 96, 0.88);
   /* @token-exempt: theme variant */
   border: none;
@@ -6326,7 +6339,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   left: 2px;
   width: 16px;
   height: 16px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: #ffffff;
   /* @token-exempt: theme variant */
   border: none;
@@ -6371,7 +6384,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   height: 24px;
   flex: 0 0 auto;
   margin: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1.5px solid var(--settings-swatch-border);
   background-color: var(--glow-color,
       #888);
@@ -6413,7 +6426,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   justify-content: center;
   background: var(--error);
   border: none;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   color: var(--text-primary);
   cursor: pointer;
   opacity: 0;
@@ -6474,7 +6487,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .custom-color-preview {
   width: 24px;
   height: 24px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1px solid var(--add-color-popover-border);
   background-color: var(--glow-color,
       #888);
@@ -6492,7 +6505,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   color: var(--text-primary);
   background: var(--settings-input-bg);
   border: 1px solid var(--settings-input-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   outline: none;
   box-shadow: none;
   caret-color: var(--text-primary);
@@ -6517,7 +6530,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   color: var(--text-primary);
   background: var(--glass-bg-hover);
   border: 1px solid var(--add-color-btn-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   white-space: nowrap;
   transition:
@@ -6606,7 +6619,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   justify-content: center;
   padding: 0;
   border: none;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
@@ -6788,7 +6801,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   justify-content: center;
   padding: 0;
   border: 1px solid var(--glass-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
@@ -6850,7 +6863,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   color: var(--text-secondary);
   background: transparent;
   border: 1px solid var(--add-color-btn-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   white-space: nowrap;
   transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
@@ -7030,7 +7043,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   appearance: none;
   width: var(--speaker-control-width);
   height: 4px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: linear-gradient(to right,
       rgba(235, 232, 240, 0.72) 0%
       /* @token-exempt: theme variant */
@@ -7063,7 +7076,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .appearance-slider::-webkit-slider-runnable-track {
   height: 4px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: transparent;
 }
 
@@ -7072,7 +7085,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 14px;
   height: 14px;
   margin-top: -5px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1px solid rgba(255, 255, 255, 0.72);
   /* @token-exempt: theme variant */
   background: radial-gradient(120% 120% at 30% 20%,
@@ -7095,14 +7108,14 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .appearance-slider::-moz-range-track {
   height: 4px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: transparent;
 }
 
 .appearance-slider::-moz-range-thumb {
   width: 14px;
   height: 14px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1px solid rgba(255, 255, 255, 0.72);
   /* @token-exempt: theme variant */
   background: radial-gradient(120% 120% at 30% 20%,
@@ -7155,7 +7168,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   /* inner inset frame */
   background: var(--settings-panel-bg);
   border: 1px solid var(--settings-panel-border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   /* full pill */
   box-shadow: var(--settings-panel-shadow);
   width: fit-content;
@@ -7169,7 +7182,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   background: transparent;
   border: none;
   /* no per-button outline */
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   /* matches slab; active pill nests cleanly */
   color: rgba(255, 255, 255, 0.62);
   /* @token-exempt: calm secondary */
@@ -7277,7 +7290,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   color: rgba(255, 255, 255, 0.72); /* @token-exempt: ghost button text (dark) */
   background: rgba(255, 255, 255, 0.06); /* @token-exempt: ghost pill bg (dark) */
   border: 1px solid rgba(255, 255, 255, 0.12); /* @token-exempt: ghost pill border (dark) */
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   cursor: pointer;
   transition:
     background 200ms ease,
@@ -7505,7 +7518,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   max-height: 120px;
   align-self: stretch;
   aspect-ratio: 16 / 9;
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   border: 1px solid var(--settings-divider-soft);
   background: var(--appearance-preview-tile-bg);
 }
@@ -7626,7 +7639,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
     flex: 0 0 auto;
     white-space: nowrap;
     padding: 8px 12px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
   }
 
 
@@ -8085,7 +8098,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   margin-top: 6px;
   padding: 8px 10px;
   background: var(--glass-bg);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-size: 8pt;
   line-height: 1.3;
   color: var(--text-tertiary);
@@ -8369,7 +8382,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   text-align: center;
   background: var(--mock-input-bg);
   border: 1px solid var(--mock-input-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text-primary);
   padding: 4px;
   font-size: 0.9rem;
@@ -8378,7 +8391,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .mock-peers-step {
   width: 30px;
   height: 30px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--mock-input-border);
   background: var(--mock-input-bg);
   color: var(--text-primary);
@@ -8416,7 +8429,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   align-items: center;
   gap: 4px;
   padding: 8px 12px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
@@ -8523,7 +8536,7 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   justify-content: center;
   gap: 12px;
 
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1px solid rgba(255, 255, 255, 0.48);
   /* @token-exempt: theme variant */
 
@@ -9049,7 +9062,7 @@ html[data-theme="light"] .settings-divider {
   padding: 10px 14px;
   background: var(--surface-elevated);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   /* Enable container queries so the columns collapse based on the card's own
      width (independent of the viewport). */
   container-type: inline-size;
@@ -9285,7 +9298,7 @@ html[data-theme="light"] .settings-divider {
 .perf-peers__summary:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 .perf-peers__chev {
   flex: 0 0 auto;
@@ -9362,7 +9375,7 @@ details.perf-peers[open] .perf-peers__chev {
   line-height: 1.3;
   font-weight: 500;
   padding: 0 6px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   color: var(--text-primary);
   border: 1px solid;
   white-space: nowrap;

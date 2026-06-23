@@ -91,6 +91,21 @@ enum FetchMeetingsError {
     Other(String),
 }
 
+/// Decide whether the low-frequency fallback poll should issue a feed
+/// re-fetch on this tick. We skip while the initial mount fetch is still in
+/// flight (`loading` — the spinner is showing; a silent poll on top would be
+/// wasteful and could double-fetch), while `unauthenticated` (don't hammer
+/// a 401 the user must resolve by signing in; the SSE error-budget already
+/// closed the stream in that case, and the mount/refresh paths re-arm auth),
+/// and while the browser tab is `hidden` (issue #1628 follow-up — a
+/// backgrounded tab is wasting mobile data + radio wakeups on a list the user
+/// isn't looking at; the next foreground tick / SSE nudge re-fetches anyway).
+/// Pure + host-testable so the guard truth table is pinned without a browser;
+/// the live `document.hidden` read happens at the single call site.
+fn should_refetch_on_tick(loading: bool, unauthenticated: bool, hidden: bool) -> bool {
+    !loading && !unauthenticated && !hidden
+}
+
 /// Read the merged section's expand state, falling back to the legacy
 /// "My Meetings" key for migration. Defaults to expanded (`true`).
 fn load_merged_expanded_default() -> bool {
@@ -184,7 +199,16 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
         spawn(async move {
             match do_fetch_feed().await {
                 Ok(response) => {
-                    meetings.set(response.meetings);
+                    // Equality-skip: `Signal::set` does NOT short-circuit on
+                    // equality (dioxus-signals 0.7.3) — it unconditionally
+                    // dirties subscribers. When an SSE nudge re-fetch returns an
+                    // unchanged feed, an unguarded `set` would still force the
+                    // `visible_meetings` memo to recompute `filter_and_sort_meetings`
+                    // over up to 200 rows + 200 `Rc::new` allocations for nothing.
+                    // `.peek()` so the compare creates no reactive subscription.
+                    if *meetings.peek() != response.meetings {
+                        meetings.set(response.meetings);
+                    }
                     error.set(None);
                     unauthenticated.set(false);
                 }
@@ -215,6 +239,93 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
     // paths, and the list degrades gracefully to the first and last of those if
     // SSE never connects (see below).
     install_feed_sse(background_refetch);
+
+    // Low-frequency fallback poll (issue #1628). SSE (above) is the PRIMARY
+    // live-update path; this poll exists ONLY for when SSE never connects or
+    // its consecutive-error budget closes the stream (e.g. a cross-origin
+    // cookie handshake that drops the stream, or a persistent stream 401).
+    // Without it, the list silently stops reflecting idle/active/ended +
+    // participant_count transitions until a manual refresh — the exact parity
+    // gap vs. the edit screen, which already polls (see meeting_settings.rs).
+    //
+    // Lifecycle / cleanup: `use_future` ties this loop to the component scope.
+    // On navigate-away the scope unmounts and Dioxus drops the future, which
+    // stops the loop and clears the pending `TimeoutFuture` timer — so there is
+    // no timer handle to leak (mirrors meeting_settings.rs). Note: a fetch
+    // already in flight at the `do_fetch_feed().await` point is NOT actively
+    // aborted (no `AbortController` is wired to the dropped future); it simply
+    // completes and its result is discarded, since the future is gone.
+    //
+    // Silent + non-stomping: reuses `do_fetch_feed()` (the EXACT endpoint the
+    // render reads) and the `background_refetch` update shape (meetings.set +
+    // clear error/unauthenticated) WITHOUT flipping `loading` — so a fallback
+    // refresh updates rows in place and never blanks the list to the spinner.
+    // It writes ONLY `meetings`/`error`/`unauthenticated`; it never touches the
+    // filter/sort/expanded/popover signals, so a fallback tick cannot stomp an
+    // open filter popover or the user's sort selection.
+    //
+    // Interval: 25s. Rationale: SSE is primary and handles the live case; this
+    // is a backstop, NOT the live path. The edit screen polls one meeting on a
+    // low-traffic settings page every 12s; the homepage list is the high-traffic
+    // landing page and re-fetches the user's ENTIRE feed (server-capped at 200
+    // rows) each tick, so a faster cadence multiplies meeting-api load across
+    // every landing. 25s keeps a degraded (SSE-down) list converging within
+    // half a minute — fast enough that a user rarely sees stale state — while
+    // costing at most ~2.4 feed fetches/minute per open homepage. Guard reads
+    // use `.peek()` so this long-lived poll creates NO reactive subscriptions.
+    use_future(move || async move {
+        const FALLBACK_POLL_INTERVAL_MS: u32 = 25_000;
+        loop {
+            gloo_timers::future::TimeoutFuture::new(FALLBACK_POLL_INTERVAL_MS).await;
+
+            // Skip while the mount fetch is in flight (spinner showing), while
+            // unauthenticated (don't hammer a 401), or while the tab is hidden
+            // (issue #1628: don't burn mobile data/radio on a backgrounded list
+            // — the next foreground tick / SSE nudge re-fetches anyway).
+            // `document.hidden` is read live here (the pure guard stays
+            // host-testable); if the document is unavailable we default to NOT
+            // hidden so a missing API can never permanently wedge updates.
+            // `.peek()` → no reactive subscriptions on this long-lived poll.
+            let hidden = web_sys::window()
+                .and_then(|w| w.document())
+                .map(|d| d.hidden())
+                .unwrap_or(false);
+            if !should_refetch_on_tick(*loading.peek(), *unauthenticated.peek(), hidden) {
+                continue;
+            }
+
+            match do_fetch_feed().await {
+                Ok(response) => {
+                    // Re-check guards AFTER the await: the user may have hit
+                    // refresh (loading flipped) or the session may have expired
+                    // while the request was in flight. Mirror background_refetch:
+                    // silent in-place update, clear transient error/auth.
+                    if *loading.peek() {
+                        continue;
+                    }
+                    // Equality-skip: `Signal::set` does NOT short-circuit on
+                    // equality (dioxus-signals 0.7.3) — it unconditionally
+                    // dirties subscribers. On the no-change tick (the dominant
+                    // case for a backstop poll) an unguarded `set` would force
+                    // the `visible_meetings` memo to recompute
+                    // `filter_and_sort_meetings` over up to 200 rows + 200
+                    // `Rc::new` allocations for nothing. `.peek()` so the
+                    // compare creates no reactive subscription.
+                    if *meetings.peek() != response.meetings {
+                        meetings.set(response.meetings);
+                    }
+                    error.set(None);
+                    unauthenticated.set(false);
+                }
+                Err(FetchMeetingsError::Unauthenticated) => {
+                    unauthenticated.set(true);
+                }
+                Err(FetchMeetingsError::Other(e)) => {
+                    error.set(Some(e));
+                }
+            }
+        }
+    });
 
     let toggle_expanded = {
         let mut fetch_meetings = fetch_meetings;
@@ -1530,9 +1641,9 @@ mod tests {
     // `cargo test --lib`. The EventSource WIRING itself (listener registration,
     // debounce timer, withCredentials, teardown) is inherently `web_sys`-bound
     // and browser-only — there is no host harness for `EventSource`, so it is
-    // not host-tested here (mirrors the browser-only EventSource code in the
-    // chat sidebar). What we CAN pin without a browser is the stream URL the
-    // wiring opens, which is the load-bearing contract against the server route.
+    // not host-tested here. What we CAN pin without a browser is the stream URL
+    // the wiring opens, which is the load-bearing contract against the server
+    // route.
 
     /// The SSE stream URL must be exactly the feed-fetch path plus `/stream`,
     /// matching the server route `GET /api/v1/meetings/feed/stream`. If the
@@ -1560,6 +1671,41 @@ mod tests {
         assert_eq!(
             feed_stream_url("http://localhost:8081"),
             "http://localhost:8081/api/v1/meetings/feed/stream"
+        );
+    }
+
+    /// The fallback poll must re-fetch ONLY when the list is loaded, the user
+    /// is authenticated, AND the tab is visible. It must skip while the mount
+    /// fetch is in flight (spinner showing), while unauthenticated (don't
+    /// hammer a 401), and while the tab is hidden (issue #1628: don't burn
+    /// mobile data on a backgrounded list). This pins the full truth table so
+    /// an inverted/broken guard — including dropping the `!hidden` term —
+    /// fails loudly; the poll calls THIS production fn, so a regression here is
+    /// a real bug.
+    #[test]
+    fn should_refetch_on_tick_only_when_loaded_and_authed() {
+        // loaded + authed + visible → poll
+        assert!(
+            super::should_refetch_on_tick(false, false, false),
+            "loaded + authed + visible → poll"
+        );
+        assert!(
+            !super::should_refetch_on_tick(true, false, false),
+            "still loading → skip"
+        );
+        assert!(
+            !super::should_refetch_on_tick(false, true, false),
+            "unauthenticated → skip"
+        );
+        // hidden tab → skip even when loaded + authed. This row FAILS if the
+        // `!hidden` term is dropped from the guard, pinning Fix B (#1628).
+        assert!(
+            !super::should_refetch_on_tick(false, false, true),
+            "hidden tab → skip"
+        );
+        assert!(
+            !super::should_refetch_on_tick(true, true, true),
+            "loading + unauth + hidden → skip"
         );
     }
 }

@@ -35,6 +35,7 @@ use crate::components::{
     host::Host,
     host_controls::HostControls,
     meeting_ended_overlay::MeetingEndedOverlay,
+    meeting_options_controls::MeetingOptionsControls,
     peer_list::{PeerList, PeerListEntry},
     peer_tile::PeerTile,
     performance_settings::{DiagnosticsReader, PerfControlsHandle},
@@ -42,7 +43,7 @@ use crate::components::{
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
         CameraButton, DensityModeButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
-        MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
+        MeetingOptionsButton, MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
     },
 };
 use crate::console_log_collector::{
@@ -908,6 +909,9 @@ pub fn AttendantsComponent(
     let mut device_settings_open = use_signal(|| false);
     let mut device_settings_initial_section: Signal<Option<String>> = use_signal(|| None);
     let mut device_settings_generation = use_signal(|| 0u32);
+    // In-call Meeting Options panel (host-only). Lets the owner change meeting
+    // options live without leaving the call.
+    let mut meeting_options_open = use_signal(|| false);
     // Host publishes its live diagnostics reader handle here once on mount, so the
     // Diagnostics sidebar (a sibling of Host that can't reach the encoders) can
     // render the "Simulcast layers" section from the live SEND snapshots. (#1095)
@@ -6402,9 +6406,19 @@ pub fn AttendantsComponent(
                                                     density_open.set(false);
                                                     dock_menu_open.set(false);
                                                     mock_peers_open.set(false);
+                                                    meeting_options_open.set(false);
 
                                                 }
                                             },
+                                        }
+                                        // Host-only: edit meeting options live, in-call.
+                                        if is_owner {
+                                            MeetingOptionsButton {
+                                                open: meeting_options_open(),
+                                                onclick: move |_| {
+                                                    meeting_options_open.set(!meeting_options_open());
+                                                },
+                                            }
                                         }
                                     }
                                     {
@@ -6790,6 +6804,50 @@ pub fn AttendantsComponent(
                         meeting_id: id.clone(),
                         is_admitted: true,
                         waiting_room_version,
+                    }
+                }
+
+                // In-call Meeting Options panel (host-only).
+                if meeting_options_open() && is_owner {
+                    div {
+                        class: "glass-backdrop",
+                        onclick: move |_| meeting_options_open.set(false),
+                        onkeydown: move |e: Event<KeyboardData>| {
+                            if e.key().to_string() == "Escape" {
+                                meeting_options_open.set(false);
+                            }
+                        },
+                        div {
+                            class: "card-apple",
+                            style: "width: 380px; max-width: 92vw;",
+                            onclick: move |e| e.stop_propagation(),
+
+                            div {
+                                style: "display:flex; align-items:center; justify-content:space-between; margin-bottom:0.5rem;",
+                                h3 { style: "margin:0;", "Meeting Options" }
+                                button {
+                                    r#type: "button",
+                                    class: "btn-apple btn-secondary btn-sm",
+                                    "aria-label": "Close meeting options",
+                                    onclick: move |_| meeting_options_open.set(false),
+                                    "Done"
+                                }
+                            }
+                            p {
+                                style: "color: var(--text-secondary); margin-top:0; margin-bottom:0.75rem; font-size:0.85rem;",
+                                "Changes apply to everyone immediately."
+                            }
+
+                            MeetingOptionsControls {
+                                meeting_id: id.clone(),
+                                waiting_room_toggle,
+                                admitted_can_admit_toggle,
+                                end_on_host_leave_toggle,
+                                allow_guests_toggle,
+                                saving,
+                                toggle_error,
+                            }
+                        }
                     }
                 }
 

@@ -190,6 +190,47 @@ const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
 /// zero-incremental-cost one; batching is intentionally out of scope here.
 const PARTICIPANT_LEFT_SUBJECT: &str = "internal.participant_left";
 
+/// NATS subject for chat_server -> meeting-api notifications that a SINGLE
+/// participant's session became PRESENT in a room (issue #1628). This is the
+/// symmetric counterpart to [`PARTICIPANT_LEFT_SUBJECT`]: the meeting-api
+/// consumer marks that participant `status='admitted', left_at=NULL` in the
+/// `meeting_participants` table AND re-activates the meeting
+/// (`idle -> active`), so a participant who (re)connected over the TRANSPORT
+/// without re-hitting the REST `/join` endpoint is correctly counted as
+/// present and the meeting is not left stuck `idle` with people in it.
+///
+/// ## Why this is needed (the asymmetry it closes)
+///
+/// Before #1628 the presence model was asymmetric: the transport
+/// disconnect path published [`PARTICIPANT_LEFT_SUBJECT`] (→ DB mark-left +
+/// empty→`set_idle`), but RE-activation only ever happened on a REST
+/// `/join`. After a >grace transport drop the room goes empty
+/// (→ `set_idle` → `idle`) and the participant row is marked `left`; a
+/// transport-only reconnect repopulates the relay's in-memory `room_members`
+/// but writes NOTHING to the DB — so the meeting stayed `idle` with a present
+/// participant and a `participant_count` of 0. This event makes the DB roster
+/// track the relay's authoritative `room_members` SYMMETRICALLY.
+///
+/// Fired from the [`ActivateConnection`] handler — the point a session is
+/// elected Testing→Active and announces itself with `PARTICIPANT_JOINED`. It
+/// fires for genuine first joins AND for reconnections-after-grace (a
+/// reconnection runs `JoinRoom` + `ActivateConnection` under a fresh
+/// `session_id`). Unlike the client-facing `PARTICIPANT_JOINED` broadcast,
+/// which is SUPPRESSED for reconnections, this DB-present mark fires on
+/// reconnection too — that is precisely the stuck-idle case it heals.
+///
+/// Idempotent and race-safe on the consumer side: `mark_present_by_connect`
+/// only flips rows that are not already present, and the re-activation calls
+/// `reactivate_from_idle` (an atomic `UPDATE … SET state='active' WHERE
+/// state='idle'`), NOT `activate()`. `activate()` would re-open an `ended`
+/// meeting; `reactivate_from_idle`'s `WHERE state='idle'` predicate matches
+/// zero rows when the row is `ended`, so a late present event racing a host
+/// `end_meeting` can never resurrect it — `ended` is terminal and wins the
+/// end-vs-present race in either ordering. Like [`PARTICIPANT_LEFT_SUBJECT`]
+/// it is per-user and NOT coalesced; a join wave is an O(N) fan-out, matching
+/// the per-peer `PARTICIPANT_JOINED` volume the relay already sustains.
+const PARTICIPANT_PRESENT_SUBJECT: &str = "internal.participant_present";
+
 /// Payload published to NATS for cross-server stale session eviction.
 /// When a client reconnects (possibly to a different server), the new server
 /// broadcasts this so the old server can clean up silently.
@@ -251,6 +292,20 @@ struct MeetingBecameEmptyPayload {
 /// (which the `meeting_participants` rows are keyed by, alongside `meeting_id`).
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct ParticipantLeftPayload {
+    room_id: String,
+    user_id: String,
+}
+
+/// Payload for [`PARTICIPANT_PRESENT_SUBJECT`] (issue #1628).
+///
+/// Sent from chat_server to meeting-api when a participant's session became
+/// PRESENT in a room (a fresh join or a transport reconnect). The meeting-api
+/// consumer marks `(room_id, user_id)` as `status='admitted', left_at=NULL`
+/// and re-activates the meeting (`idle -> active`). Mirrors
+/// [`ParticipantLeftPayload`] — carries the `(room_id, user_id)` the
+/// `meeting_participants` rows are keyed by.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ParticipantPresentPayload {
     room_id: String,
     user_id: String,
 }
@@ -2537,6 +2592,53 @@ impl Handler<ActivateConnection> for ChatServer {
                         Err(e) => {
                             error!("Failed to serialize EvictInstancePayload: {}", e);
                         }
+                    }
+                }
+            }
+        }
+
+        // Presence-driven DB mark-present + re-activation (issue #1628).
+        // Symmetric counterpart to the PARTICIPANT_LEFT publish in
+        // `leave_rooms`. Tell meeting-api this participant is PRESENT so it can
+        // mark the `meeting_participants` row `status='admitted', left_at=NULL`
+        // and re-activate the meeting (`idle -> active`). We use `room_user`
+        // (resolved above from `room_members` on the Testing→Active transition)
+        // rather than the join-broadcast's `found` lookup so this fires even
+        // when the client-facing PARTICIPANT_JOINED is SUPPRESSED — i.e. on a
+        // RECONNECTION, which is exactly the stuck-`idle`-with-people case this
+        // heals. Observers are never in `room_members`, so `room_user` is
+        // `None` for them and they are correctly excluded (an observer is a
+        // waiting-room watcher, not a present participant). Best-effort: a
+        // publish error is logged and never blocks activation. The consumer's
+        // writes are idempotent and `ended`-safe: it re-activates via an atomic
+        // `UPDATE … WHERE state='idle'` (meeting-api `reactivate_from_idle`), so
+        // a late present event racing a host-end can never resurrect `ended`.
+        if was_testing {
+            if let Some((room_id, user_id)) = &room_user {
+                let payload = ParticipantPresentPayload {
+                    room_id: room_id.clone(),
+                    user_id: user_id.clone(),
+                };
+                match serde_json::to_vec(&payload) {
+                    Ok(json) => {
+                        let nc = self.nats_connection.clone();
+                        let room_id_log = room_id.clone();
+                        let user_id_log = user_id.clone();
+                        let fut = async move {
+                            if let Err(e) =
+                                nc.publish(PARTICIPANT_PRESENT_SUBJECT, json.into()).await
+                            {
+                                error!(
+                                    "Failed to publish {} for room {} user {}: {}",
+                                    PARTICIPANT_PRESENT_SUBJECT, room_id_log, user_id_log, e
+                                );
+                            }
+                        };
+                        let fut = actix::fut::wrap_future::<_, Self>(fut);
+                        ctx.spawn(fut);
+                    }
+                    Err(e) => {
+                        error!("Failed to serialize ParticipantPresentPayload: {}", e);
                     }
                 }
             }

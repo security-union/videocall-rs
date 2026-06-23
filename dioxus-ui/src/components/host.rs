@@ -27,7 +27,7 @@ use crate::components::performance_settings::{
 use crate::constants::*;
 use crate::context::{
     load_preferred_device_ids, restore_device_id, save_preferred_camera_id, save_preferred_mic_id,
-    save_preferred_speaker_id, TransportPreferenceCtx, VideoCallClientCtx,
+    save_preferred_speaker_id, ProtectiveModeCtx, TransportPreferenceCtx, VideoCallClientCtx,
 };
 use crate::types::DeviceInfo;
 use dioxus::prelude::*;
@@ -207,6 +207,10 @@ pub fn Host(
             vad_threshold().ok(),
             Some(camera.shared_audio_tier_bitrate()),
             Some(camera.shared_audio_tier_fec()),
+            // Audio tier INDEX (issue #1567): drives the mic's live Opus FEC
+            // ctl-reconfig so inband FEC actually engages on a mid-call AQ
+            // audio-tier drop (and disengages on recovery).
+            Some(camera.shared_audio_tier_index()),
             // Audio simulcast layer ceiling (issue #989, Phase 3c → #1082):
             // decoupled from the VIDEO CPU ceiling (audio encodes off-main-thread
             // and is cheap), but still gated by the SAME runtime flag so it stays
@@ -265,6 +269,45 @@ pub fn Host(
         // the mic has no AQ loop of its own, so the cut + recovery work even when
         // the camera is off (audio-only).
         microphone.set_congestion_layer_ceiling(client.audio_congestion_layer_ceiling());
+        // Issue #1398: also give the microphone encoder the single-layer audio
+        // BITRATE floor atom. A single-layer publisher has no upper layer to shed,
+        // so the lever is to lower the one running Opus stream's bitrate live
+        // (worklet ctl 4002). The DOWN trigger is NOT a self-targeted CONGESTION:
+        // it is the mic-side WT/WS uplink-distress detector (the congestion-recovery
+        // Interval in microphone_encoder.rs's `start`), GATED to single-layer AND
+        // the camera being OFF (audio-only), which steps THIS floor down one tier on
+        // sustained distress. The client still OWNS the atom for TWO reasons: to
+        // RESET it to the fail-open sentinel on reconnect even when Inner is busy
+        // (so a stale cut does not pin audio low on a fresh session; #1398 FIX D),
+        // and to share it into the mic. The mic's FEC/bitrate reconfig timer READS
+        // the floor (camera-off) and the recovery timer CLIMBS it back, so the cut +
+        // recovery work even when the camera is off.
+        microphone.set_congestion_bitrate_floor(client.audio_congestion_bitrate_floor());
+        // Issue #1398: give the microphone encoder the CAMERA's enabled flag. It
+        // GATES the mic-side uplink-distress detector to camera-off (audio-only)
+        // AND selects the effective single-layer audio bitrate by camera state
+        // (camera-on → camera AQ tier; camera-off → the mic congestion floor). When
+        // the camera is ON, `effective_audio_bitrate` returns the camera AQ tier
+        // and IGNORES the mic floor entirely, so the floor cannot apply regardless;
+        // gating the detector to camera-off just keeps it from cutting a floor that
+        // would never be read (and the camera-on uplink→audio downshift is the
+        // deferred #1611 backstop — the camera AQ's uplink self-shed steps VIDEO,
+        // not audio). When the camera is OFF (this flag reads false) the gate is
+        // satisfied. The screen encoder is NOT a gate term — it writes no
+        // audio-tier atom, so a screen-sharing publisher relies on this detector
+        // for its only audio downshift.
+        microphone.set_camera_active_signal(camera.camera_enabled_flag());
+        // Issue #1398 reconnect P1: give the microphone encoder the client's
+        // RECONNECT-reseed flag. The client sets it on every (re)connect (in its
+        // `Connected` handler, next to the bitrate-floor reset); the mic-side
+        // uplink-distress detector tick consumes it and forces its tumbling windows
+        // to re-anchor to "now". Without this, a plain reconnect (which does NOT
+        // restart the mic) leaves the detector measuring across the reconnect, so
+        // the monotonic transport counters bumped by the teardown/rebuild would
+        // cash a spurious audio cut on the fresh session even though its uplink is
+        // healthy. The client owns the atom (like the floor) so the reset runs even
+        // when Inner is contended.
+        microphone.set_reconnect_reseed_signal(client.audio_detector_reconnect_reseed());
 
         // Wire the relay layer-union hint atoms (issue #1108, Stage 3). Each
         // encoder OWNS its `shared_union_requested_layer` atom (initialized to the
@@ -309,6 +352,12 @@ pub fn Host(
             // #1143: send-side simulcast layer counts (camera encoder atoms).
             camera.shared_effective_layer_count(),
             camera.shared_active_layer_count(),
+            // #1561: screen + audio layer metrics.
+            screen.effective_screen_layer_count(),
+            screen.shared_active_layer_count(),
+            microphone.effective_audio_layers(),
+            microphone.congestion_layer_ceiling(),
+            microphone.shared_user_layer_ceiling(),
         );
 
         // Wire up encoder controls. Issue #1108: the encoder AQ is now a
@@ -763,6 +812,18 @@ pub fn Host(
     // UI's source of truth for the selector positions.
     let performance_preference = use_signal(load_performance_preference);
 
+    // Issue #1558 stage 3 (encoder self-shed): the protective-mode report,
+    // published by the decode-budget loop in `AttendantsComponent`. Read here so
+    // BOTH the live perf-change callback and the reactive effect below compose the
+    // user's send-layer ceiling with protective mode's shed. `try_use_context` so
+    // `Host` mounted outside the attendants subtree (no provider) is a clean
+    // no-op.
+    let protective_mode_ctx = try_use_context::<ProtectiveModeCtx>();
+    // The current protective shed ceiling (a layer COUNT, or `None`), resolved
+    // without subscribing the callback to the signal (callbacks are not reactive).
+    let protective_ceiling_now =
+        move || protective_mode_ctx.and_then(|ctx| ctx.0.peek().encoder_layer_ceiling);
+
     // Apply a changed performance preference: persist it and push the inverted
     // best/worst bounds to the live encoder. The encoder stores them and
     // re-applies on every (re)start, so this works whether or not the camera is
@@ -789,15 +850,61 @@ pub fn Host(
             // the AQ control loop reads each tick (≤1s), composing it as a further
             // `min` with the union hint + ramp — so lowering it sheds the top
             // layer(s) at once and raising it re-earns them. None = Auto.
-            s.camera.set_user_layer_ceiling(pref.video_layers);
-            s.screen.set_user_layer_ceiling(pref.screen_layers);
+            // #1558: compose with the current protective shed so dragging the perf
+            // thumb while protective mode is active does NOT lift the shed (the
+            // more restrictive of the two binds). The reactive effect below also
+            // re-composes on the resulting `performance_preference` change.
+            let shed = protective_ceiling_now();
+            s.camera.set_user_layer_ceiling(
+                crate::components::decode_budget::compose_encoder_ceiling(pref.video_layers, shed),
+            );
+            s.screen.set_user_layer_ceiling(
+                crate::components::decode_budget::compose_encoder_ceiling(pref.screen_layers, shed),
+            );
             // Audio layer ceiling applies LIVE too: the mic encoder's per-layer
             // publish handlers read the shared atomic at publish time, so lowering
             // it stops sending the top audio layer(s) on the next frame and raising
-            // it resumes them — no mic restart, no audio interruption.
+            // it resumes them — no mic restart, no audio interruption. #1558: audio
+            // is NEVER degraded by protective mode, so the mic ceiling is the user's
+            // preference UNCOMPOSED.
             s.microphone.set_user_layer_ceiling(pref.audio_layers);
         })
     };
+
+    // Issue #1558 stage 3 (encoder self-shed): apply protective mode's LOCAL
+    // encoder send-layer ceiling to the camera + screen encoders, composed with
+    // the user's persisted "layers published" preference. The composition
+    // (`compose_encoder_ceiling`) takes the MORE restrictive of {user pref,
+    // protective shed} so neither clobbers the other, and reverts to the user's
+    // preference alone when protective mode releases (`encoder_layer_ceiling ==
+    // None`) — full reversibility. We do NOT touch the MICROPHONE encoder: audio
+    // is never degraded by protective mode (issue #1558 item 3). The actuator
+    // (`set_user_layer_ceiling`) feeds the AQ's top-side `min`, which cannot fight
+    // the encoder's own backpressure controller — so this never competes with the
+    // encoder's congestion control.
+    {
+        let state = state.clone();
+        use_effect(move || {
+            let Some(ProtectiveModeCtx(report_sig)) = protective_mode_ctx else {
+                return;
+            };
+            let report = report_sig();
+            let pref = performance_preference();
+            // VIDEO and SCREEN share the protective shed (both compete for the same
+            // encode CPU); each composes against its OWN user preference.
+            let video_ceiling = crate::components::decode_budget::compose_encoder_ceiling(
+                pref.video_layers,
+                report.encoder_layer_ceiling,
+            );
+            let screen_ceiling = crate::components::decode_budget::compose_encoder_ceiling(
+                pref.screen_layers,
+                report.encoder_layer_ceiling,
+            );
+            let s = state.borrow();
+            s.camera.set_user_layer_ceiling(video_ceiling);
+            s.screen.set_user_layer_ceiling(screen_ceiling);
+        });
+    }
 
     // Live snapshot reader for the VU meters. Returns `None` while the camera is
     // off so the meters show placeholders rather than a stale pinned tier.
@@ -913,6 +1020,10 @@ pub fn Host(
             };
             let state_v = state.clone();
             let state_s = state.clone();
+            // #1482: a second client handle for the per-peer device-info reader;
+            // the `per_peer_receive` closure below moves the first one.
+            let client_dev = client.clone();
+            let client_dev_all = client.clone();
             DiagnosticsReader {
                 summary,
                 // Gate the camera snapshot on the camera being enabled, mirroring
@@ -931,6 +1042,15 @@ pub fn Host(
                 }),
                 send_screen: Rc::new(move || state_s.borrow().screen.live_simulcast_snapshot()),
                 per_peer_receive: Rc::new(move || client.per_peer_received_snapshots()),
+                // #1482: live per-peer device-info lookup, keyed by session_id.
+                // Reads through to the client on every call (no captured value),
+                // so the diagnostics panel always renders the current metrics.
+                per_peer_device_info: Rc::new(move |sid| client_dev.peer_device_info(sid)),
+                // issue 1482: live ALL-peers device-info reader for the
+                // diagnostics "Device (per peer)" section. Independent of the
+                // receive list, so a camera-off peer with HEALTH-reported device
+                // metrics still renders.
+                per_peer_device_all: Rc::new(move || client_dev_all.all_peer_device_info()),
             }
         })
     };

@@ -411,20 +411,16 @@ async function setupTwoUserMeetingWithTransport(
  *   - `#grid-container > div:nth-child(3)` is the right panel and
  *     declares an explicit CSS grid distinct from the default layout.
  *
- * Accepted shapes for `grid-template-columns` on the right panel:
- *   - Legacy split-mode form: `1fr` or `1fr 1fr` (older builds).
- *   - Current 3:2-footprint form (PR-staging): `repeat(N, Npx)` —
- *     the right panel left-justifies peer tiles with a fixed pixel
- *     footprint per tile. See the sibling test
- *     `screen-share-panel.spec.ts:539` ("right panel left-justifies
- *     tiles with 3:2 footprint on wide viewport (HCL #3+#4) @bvt1")
- *     which exercises and pins the new layout intentionally.
+ * The right panel uses the `.ss-peer-panel` CSS class which sets
+ * `display: grid` with `grid-template-columns: repeat(auto-fill,
+ * minmax(160px, 1fr))`. The grid properties are in the stylesheet,
+ * not inline styles, so we verify via computed styles and class name.
  *
  * What matters for issue #942 is that the right panel is in an
- * explicit grid layout (display: grid) with a grid-template-columns
- * declaration matching one of those shapes — i.e. it is the split-mode
- * panel, not the default single-column / list rendering that the
- * viewer would fall back to if `screen_enabled` were clobbered.
+ * explicit grid layout (display: grid) with the `.ss-peer-panel`
+ * class applied — i.e. it is the split-mode panel, not the default
+ * single-column / list rendering that the viewer would fall back to
+ * if `screen_enabled` were clobbered.
  *
  * Bug #1 manifestation: the WT viewer's grid would NOT contain a
  * `.split-screen-tile` because the stale heartbeat cleared
@@ -437,18 +433,16 @@ async function assertSplitLayoutActive(viewerPage: Page): Promise<void> {
   // 2. Resize handle is present.
   await expect(viewerPage.locator(".screen-share-resize-handle")).toHaveCount(1);
 
-  // 3. Right panel is an explicit CSS grid distinct from the default
-  // layout. Accept either the legacy `1fr`/`1fr 1fr` form or the
-  // current `repeat(N, Npx)` 3:2-footprint form. A failure here means
-  // the right panel reverted to a non-grid (single-column / list)
-  // layout, which is the user-visible signature of the bug #942 fix
-  // regressing.
+  // 3. Right panel uses CSS grid layout. The grid properties are now
+  // defined via the `.ss-peer-panel` CSS class (not inline styles), so
+  // we verify using computed styles rather than the style attribute.
+  // A failure here means the right panel is not rendering as a grid,
+  // which is the user-visible signature of the bug #942 fix regressing.
   const rightPanel = viewerPage.locator("#grid-container > div:nth-child(3)");
   await expect(rightPanel).toBeVisible({ timeout: 10_000 });
-  const rightPanelStyle = await rightPanel.getAttribute("style");
-  expect(rightPanelStyle).toBeTruthy();
-  expect(rightPanelStyle).toMatch(/display:\s*grid/);
-  expect(rightPanelStyle).toMatch(/grid-template-columns:\s*(1fr(\s+1fr)?|repeat\(\d+,\s*\d+px\))/);
+  await expect(rightPanel).toHaveClass(/ss-peer-panel/);
+  const computedDisplay = await rightPanel.evaluate((el) => getComputedStyle(el).display);
+  expect(computedDisplay).toBe("grid");
 
   // 4. Left panel has explicit pixel width > 0 (issue #942 acceptance).
   const leftPanel = viewerPage.locator("#grid-container > div:nth-child(1)");

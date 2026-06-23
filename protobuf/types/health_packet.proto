@@ -328,6 +328,75 @@ message HealthPacket {
   // active_server_rtt was suppressed (observability-only; does NOT change the
   // suppression/re-election behavior, only counts it).
   optional uint64 rtt_probe_stale_suppressions_total = 86; // (#522)
+
+  // ---- #1482: per-peer device / hardware metrics ("if available") ----------
+  // Every field below is OPTIONAL and OMITTED (proto3 absent / Rust `None`)
+  // when the sending browser does not expose the source API — never a bogus
+  // default. STATIC fields (os/device_type/device_memory_gb) are read once per
+  // tick from JS globals; the dynamic load gauge is computed per interval.
+  //
+  // Human OS + version, e.g. "macOS 14.5", "Windows 11". Source:
+  // navigator.userAgentData.getHighEntropyValues() platform+platformVersion
+  // (Chromium), else a navigator.userAgent heuristic. Absent when neither is
+  // available (e.g. Firefox/Safari lack userAgentData high-entropy values).
+  optional string client_os = 87; // (#1482)
+  // Device form factor: "desktop" | "mobile" | "tablet". Source:
+  // navigator.userAgentData.mobile + model (Chromium), else a UA heuristic.
+  // Absent when the form factor cannot be determined.
+  optional string client_device_type = 88; // (#1482)
+  // 0.0-1.0 MAIN-THREAD busy fraction over the last health interval
+  // (sum of 'longtask' durations / interval_ms). This is a CPU PROXY for the
+  // sender's main thread, explicitly NOT system-wide CPU usage. Source:
+  // PerformanceObserver('longtask') (Chromium). Absent (None) when the
+  // 'longtask' entry type is unsupported (Firefox/Safari) — distinct from a
+  // genuine 0.0 (idle main thread on a browser that DOES support longtask).
+  optional double client_main_thread_load = 89; // (#1482)
+  // navigator.deviceMemory: total device RAM tier in GIGABYTES. Coarse and
+  // privacy-quantized by the browser (one of 0.25/0.5/1/2/4/8, capped at 8).
+  // Chromium only; absent on Firefox/Safari (which do not implement the API).
+  optional double client_device_memory_gb = 90; // (#1482)
+
+  // ---- #1561: Send-side simulcast layer counts (SCREEN + AUDIO) -----------
+  // Mirrors effective_video_layers/active_video_layers (fields 75-76) for the
+  // screen and audio encoders. Enables "is the adaptive system actually
+  // shedding layers?" observability that was camera-only prior to this.
+  optional uint32 effective_screen_layers = 91; // (#1561)
+  optional uint32 active_screen_layers = 92; // (#1561)
+  optional uint32 effective_audio_layers = 93; // (#1561)
+  // Audio congestion ceiling: the congestion-driven layer cap (1-3 or
+  // MAX=uncapped). Distinct from effective: effective is the configured
+  // maximum, ceiling is the congestion-driven dynamic cap.
+  optional uint32 audio_congestion_ceiling = 94; // (#1561)
+
+  // ---- #1561: Receiver-side layer selection per-peer per-kind ---------------
+  // Maps peer session_id (string) → currently-chosen layer index (0-based).
+  // Only populated for peers where the chooser is CONSTRAINING below the top
+  // layer (same rule as LAYER_PREFERENCE emission: no entry when receiving the
+  // top layer, which is the common unconstrained case). Keyed by session_id as
+  // decimal string (matching peer_stats).
+  map<string, uint32> received_video_layer = 95; // (#1561)
+  map<string, uint32> received_screen_layer = 96; // (#1561)
+  map<string, uint32> received_audio_layer = 97; // (#1561)
+
+  // ---- #1556: Connection medium and power state diagnostics ----------------
+  // navigator.connection.type: "wifi"|"ethernet"|"cellular"|"bluetooth"|
+  // "none"|"unknown". The actual MEDIUM, not the throughput estimate that
+  // effectiveType provides. Chrome/Edge only; absent on Firefox/Safari.
+  optional string client_network_type = 98; // (#1556)
+  // navigator.connection.downlinkMax: max downlink speed of the connection
+  // medium in Mbps (e.g. wifi=54, ethernet=1000). 0 or absent when unknown.
+  optional double client_network_downlink_max = 99; // (#1556)
+  // Computed throttle flag: true when capability_score / hardware_concurrency
+  // is anomalously low (< 150), indicating CPU throttle, thermal throttle, or
+  // a restrictive Windows power plan. Derived client-side from two existing
+  // metrics (no new browser API). Absent when either input is unavailable.
+  optional bool client_cpu_throttled = 100; // (#1556)
+
+  // Actual number of audio simulcast layers currently published after applying
+  // both the congestion ceiling and the user-selected send ceiling. Kept
+  // separate from audio_congestion_ceiling so a manual user cap is never
+  // attributed to congestion in telemetry.
+  optional uint32 active_audio_layers = 101; // (#1561)
 }
 
 // Receiver-side adaptive decode-budget state (#987). Mirrors the

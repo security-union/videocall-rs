@@ -36,6 +36,7 @@ use videocall_meeting_types::{
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
+use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
 use crate::state::AppState;
 
@@ -140,6 +141,16 @@ pub async fn create_meeting(
     // meeting row, loads the participant roster).
     search::spawn_repush(&state, row.id, row.room_id.clone());
 
+    // Live homepage-feed nudge (issue #1081): a new meeting appears in the
+    // owner's feed. Published AFTER the successful INSERT; cross-instance via
+    // NATS `internal.feed_changed` (or the local broadcast when NATS is absent).
+    feed_events::publish_feed_change(
+        state.nats.as_ref(),
+        &state.feed_tx,
+        FeedChange::new(row.room_id.clone(), FeedChangeReason::Created),
+    )
+    .await;
+
     let response = CreateMeetingResponse {
         meeting_id: row.room_id,
         host: user_id,
@@ -238,20 +249,17 @@ pub async fn list_joined_meetings(
     let rows = db_meetings::list_joined_by_user(&state.db, &user_id, limit).await?;
 
     let mut meetings = Vec::with_capacity(rows.len());
-    // Note: participant_count / waiting_count are read after the main SELECT
-    // in separate queries, so they may reflect a slightly newer DB snapshot
-    // than `last_joined_at`. Acceptable for this advisory home-page surface.
+    // participant_count / waiting_count are folded into the same SELECT
+    // (LEFT JOIN LATERAL) in `list_joined_by_user`, so the whole list is a
+    // single round-trip regardless of length.
     for row in &rows {
-        let participant_count = db_participants::count_admitted(&state.db, row.id).await?;
-        let waiting_count = db_participants::count_waiting(&state.db, row.id).await?;
-
         meetings.push(JoinedMeetingSummary {
             meeting_id: row.room_id.clone(),
             state: row.state.clone().unwrap_or_else(|| "idle".to_string()),
             started_at: row.started_at.timestamp_millis(),
             ended_at: row.ended_at.map(|t| t.timestamp_millis()),
-            participant_count,
-            waiting_count,
+            participant_count: row.participant_count,
+            waiting_count: row.waiting_count,
             has_password: row.password_hash.is_some(),
             is_owner: row.creator_id.as_deref() == Some(user_id.as_str()),
             created_at: row.created_at.timestamp_millis(),
@@ -460,6 +468,17 @@ pub async fn end_meeting_handler(
     // meeting as completed promptly.
     search::spawn_repush(&state, row.id, row.room_id.clone());
 
+    // Live homepage-feed nudge (issue #1081): the meeting's state flipped to
+    // `ended`, which the feed shows. Only reached on a real end (the idempotent
+    // already-`ended` branch returns earlier without mutating, so it does not
+    // nudge — no change, no nudge).
+    feed_events::publish_feed_change(
+        state.nats.as_ref(),
+        &state.feed_tx,
+        FeedChange::new(row.room_id.clone(), FeedChangeReason::Ended),
+    )
+    .await;
+
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;
     let your_status = your_status.map(|p| p.into_participant_status(None));
 
@@ -557,6 +576,15 @@ pub async fn update_meeting(
             &internal_payload,
         )
         .await;
+
+        // NOTE (issue #1081): we intentionally do NOT emit a homepage-feed nudge
+        // for a settings PATCH. The live homepage list tracks meeting
+        // presence/state/counts (created, joined, idle, ended, left); the
+        // host-only policy flags carried on the feed row are already propagated
+        // by the dedicated `MEETING_SETTINGS_UPDATED` event above, and the owner
+        // who issued the PATCH is the one who triggered the change, so their own
+        // client already has the new values. Adding a nudge here would be an
+        // inaccurately-labelled, host-only signal outside the live-list scope.
     }
 
     let your_status = db_participants::get_status(&state.db, row.id, &user_id).await?;

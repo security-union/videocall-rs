@@ -6,12 +6,17 @@
 use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BORDER_COLOR};
 use crate::components::density::{DensityMode, DENSITY_MODES};
 use crate::context::{
-    load_custom_colors_from_storage, save_custom_colors_to_storage, save_decode_budget_override,
-    save_density_mode, save_dock_autohide, save_dock_position, AppearanceSettings,
-    AppearanceSettingsCtx, AutohideCtx, DecodeBudgetCtx, DecodeBudgetOverride, DensityModeCtx,
-    DockPosition, DockPositionCtx, GlowColor, Theme, ThemePreferenceCtx, MAX_CUSTOM_COLORS,
+    apply_theme_to_dom, load_custom_colors_from_storage, save_custom_colors_to_storage,
+    save_decode_budget_override, save_density_mode, save_dock_autohide, save_dock_position,
+    AppearanceSettings, AppearanceSettingsCtx, AutohideCtx, CustomThemeCtx, DecodeBudgetCtx,
+    DecodeBudgetOverride, DensityModeCtx, DockPosition, DockPositionCtx, GlowColor, Theme,
+    ThemePreferenceCtx, MAX_CUSTOM_COLORS,
 };
 use crate::theme::color as theme_color;
+use crate::theme_file::{
+    clear_custom_theme, custom_theme_display_name, persist_custom_theme_json, ThemeFileError,
+    MAX_THEME_JSON_BYTES,
+};
 use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -53,6 +58,12 @@ pub fn AppearanceSettingsPanel() -> Element {
     let mut show_picker = use_signal(|| false);
     let mut color_input = use_signal(String::new);
     let mut input_error = use_signal(|| false);
+
+    // Custom theme (single-slot) state
+    let fallback_custom_theme = use_signal(|| None::<String>);
+    let mut custom_theme_ctx =
+        try_use_context::<CustomThemeCtx>().unwrap_or(CustomThemeCtx(fallback_custom_theme));
+    let mut import_error: Signal<Option<String>> = use_signal(|| None);
 
     let preset_colors = [
         GlowColor::White,
@@ -266,6 +277,104 @@ pub fn AppearanceSettingsPanel() -> Element {
                                 }
                             }
                         }
+                }
+
+                p { class: "appearance-section-helper", "Imported themes follow the mode above." }
+
+                // ── Theme Source sub-row ─────────────────────────────────────
+                div { class: "theme-source-row",
+                    span { class: "appearance-control-label", "Source" }
+                    div { class: "theme-source-controls",
+                        if let Some(name) = (custom_theme_ctx.0)() {
+                            span {
+                                class: "theme-source-active",
+                                "data-testid": "theme-source-active",
+                                "\u{2713} {name}"
+                            }
+                            button {
+                                r#type: "button",
+                                class: "theme-reset-btn",
+                                "data-testid": "theme-reset-btn",
+                                "aria-label": "Switch back to the built-in default theme",
+                                onclick: move |_| {
+                                    clear_custom_theme();
+                                    custom_theme_ctx.0.set(None);
+                                    import_error.set(None);
+                                    apply_theme_to_dom(theme_ctx.0());
+                                },
+                                "Reset to default"
+                            }
+                        } else {
+                            span {
+                                class: "theme-source-active",
+                                "data-testid": "theme-source-active",
+                                "\u{2713} Default"
+                            }
+                            label {
+                                class: "theme-import-btn",
+                                "Import\u{2026}"
+                                input {
+                                    r#type: "file",
+                                    accept: ".json,application/json",
+                                    "aria-label": "Import theme file (.json)",
+                                    "data-testid": "theme-import-input",
+                                    class: "visually-hidden",
+                                    onchange: move |evt: Event<FormData>| {
+                                        let theme_mode = theme_ctx.0();
+                                        let mut custom_sig = custom_theme_ctx.0;
+                                        let mut err_sig = import_error;
+                                        let file_data = evt.files();
+                                        let Some(file) = file_data.into_iter().next() else { return };
+                                        spawn(async move {
+                                            let contents = match file.read_string().await {
+                                                Ok(s) => s,
+                                                Err(_) => {
+                                                    err_sig.set(Some("Could not read the file.".to_string()));
+                                                    return;
+                                                }
+                                            };
+                                            if contents.len() > MAX_THEME_JSON_BYTES {
+                                                err_sig.set(Some("File is too large. Theme files must be under 64 KB.".to_string()));
+                                                return;
+                                            }
+                                            match persist_custom_theme_json(&contents) {
+                                                Ok(()) => {
+                                                    let name = custom_theme_display_name().unwrap_or_else(|| "Custom Theme".to_string());
+                                                    custom_sig.set(Some(name));
+                                                    err_sig.set(None);
+                                                    apply_theme_to_dom(theme_mode);
+                                                }
+                                                Err(ThemeFileError::UnsupportedVersion(v)) => {
+                                                    err_sig.set(Some(format!("This theme uses version {v}, which isn't supported. Version 1 is required.")));
+                                                }
+                                                Err(ThemeFileError::Json(_)) => {
+                                                    err_sig.set(Some("This file isn't valid JSON or has the wrong shape.".to_string()));
+                                                }
+                                                Err(ThemeFileError::InvalidValue) => {
+                                                    err_sig.set(Some("This theme contains an unsupported color value.".to_string()));
+                                                }
+                                                Err(ThemeFileError::TooLarge) => {
+                                                    err_sig.set(Some("File is too large. Theme files must be under 64 KB.".to_string()));
+                                                }
+                                                Err(ThemeFileError::StorageFull) => {
+                                                    err_sig.set(Some("Storage is full \u{2014} couldn't save the theme.".to_string()));
+                                                }
+                                            }
+                                        });
+                                    },
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if let Some(msg) = import_error() {
+                    div {
+                        class: "input-error-message",
+                        role: "alert",
+                        "data-testid": "theme-import-error",
+                        "{msg}"
+                    }
                 }
 
                 hr { class: "appearance-section-divider" }

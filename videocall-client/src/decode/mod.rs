@@ -30,7 +30,7 @@ pub use layer_chooser::{
     max_layers_for_kind, quality_state, DegradeReason, KindLayerBounds, PrefMediaKind,
     QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot,
 };
-pub use peer_decode_manager::{PeerDecodeManager, PeerReceiveDiag, PeerStatus};
+pub use peer_decode_manager::{PeerDecodeManager, PeerDeviceInfo, PeerReceiveDiag, PeerStatus};
 pub use peer_decoder::VideoPeerDecoder;
 
 use neteq_audio_decoder::NetEqAudioPeerDecoder;

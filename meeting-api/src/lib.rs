@@ -23,6 +23,7 @@ pub mod console_log_purge;
 pub mod cors;
 pub mod db;
 pub mod error;
+pub mod feed_events;
 pub mod nats_consumers;
 pub mod nats_events;
 pub mod oauth;

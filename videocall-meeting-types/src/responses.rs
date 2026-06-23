@@ -243,13 +243,21 @@ pub struct MeetingFeedSummary {
     /// must use to decide whether to render owner-only affordances
     /// (Owner pill, edit, delete, end-meeting). Do not infer ownership from
     /// any other field.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub is_owner: bool,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub participant_count: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub waiting_count: i64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub has_password: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_guests: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub waiting_room_enabled: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub admitted_can_admit: bool,
+    #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub end_on_host_leave: bool,
     /// Unix timestamp in milliseconds of the **authenticated user's** most
     /// recent admission to this meeting — the MAX `admitted_at` across the
@@ -348,6 +356,19 @@ fn default_true() -> bool {
     true
 }
 
+/// Returns `true` when the value is `true`; paired with `default_true` as the
+/// `skip_serializing_if` predicate so default-valued (true) fields are omitted
+/// on the wire.
+fn is_true(v: &bool) -> bool {
+    *v
+}
+
+/// Returns `true` when the count is zero; the `skip_serializing_if` predicate
+/// paired with `#[serde(default)]` so zero counts are omitted on the wire.
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
 /// Response payload for `GET /api/v1/meetings/{meeting_id}/waiting`.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct WaitingRoomResponse {
@@ -441,4 +462,102 @@ pub struct OAuthExchangeResponse {
     /// server-side PKCE flow; `None` in the new client-side PKCE flow (the UI
     /// reads `return_to` from `sessionStorage["vc_oauth_return_to"]` instead).
     pub return_to: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guards the skip-iff-equals-default invariant on [`MeetingFeedSummary`]:
+    /// every scalar field that carries `#[serde(default = D, skip_serializing_if = P)]`
+    /// must use a predicate `P` that is true EXACTLY when the value equals `D`,
+    /// so `absent <=> value == D` and serialization round-trips losslessly.
+    ///
+    /// It specifically exercises the default-true trap: `waiting_room_enabled`
+    /// and `end_on_host_leave` default to `true`, so they MUST be skipped only
+    /// when `true` (`is_true`) and emitted when `false`. Pairing `default_true`
+    /// with a skip-when-false predicate would silently resurrect a genuine
+    /// `false` as `true` on the wire — this test would catch that.
+    #[test]
+    fn meeting_feed_summary_round_trips_both_polarities() {
+        // MUTATION-MEANINGFUL property: if someone changed
+        // `waiting_room_enabled` to `skip_serializing_if = "std::ops::Not::not"`
+        // (skip-when-false) while keeping `default = "default_true"`, then the
+        // all-non-default instance below (which sets `waiting_room_enabled =
+        // false`) would serialize WITHOUT the field. On deserialize the missing
+        // field would fall back to `default_true` (i.e. `true`), so the
+        // round-trip `from_str(to_string(original)) == original` assertion in
+        // step 3 would FAIL (false != true). The same reasoning applies to
+        // `end_on_host_leave`. This is what pins the predicate to the default.
+
+        // 1. All-default instance: every scalar holds its schema default,
+        // including the two default-TRUE policy flags. Option fields are a mix.
+        let all_default = MeetingFeedSummary {
+            meeting_id: "meeting-default".to_string(),
+            state: "idle".to_string(),
+            last_active_at: 1_000,
+            created_at: 900,
+            started_at: None,
+            ended_at: None,
+            host: Some("host@example.com".to_string()),
+            host_display_name: None,
+            host_user_id: Some("host@example.com".to_string()),
+            is_owner: false,
+            participant_count: 0,
+            waiting_count: 0,
+            has_password: false,
+            allow_guests: false,
+            waiting_room_enabled: true, // default-true!
+            admitted_can_admit: false,
+            end_on_host_leave: true, // default-true!
+            user_last_attended_at: None,
+        };
+
+        // 2. All-non-default instance: every bool flipped from its default,
+        // counts non-zero, every Option populated.
+        let all_non_default = MeetingFeedSummary {
+            meeting_id: "meeting-non-default".to_string(),
+            state: "active".to_string(),
+            last_active_at: 2_000,
+            created_at: 1_500,
+            started_at: Some(1_600),
+            ended_at: Some(1_900),
+            host: Some("owner@example.com".to_string()),
+            host_display_name: Some("Owner Name".to_string()),
+            host_user_id: Some("owner@example.com".to_string()),
+            is_owner: true,
+            participant_count: 5,
+            waiting_count: 3,
+            has_password: true,
+            allow_guests: true,
+            waiting_room_enabled: false, // flipped from default-true
+            admitted_can_admit: true,
+            end_on_host_leave: false, // flipped from default-true
+            user_last_attended_at: Some(1_950),
+        };
+
+        // 3. Both instances must round-trip losslessly through JSON.
+        let json_default = serde_json::to_string(&all_default).unwrap();
+        let round_default: MeetingFeedSummary = serde_json::from_str(&json_default).unwrap();
+        assert_eq!(round_default, all_default);
+
+        let json_non_default = serde_json::to_string(&all_non_default).unwrap();
+        let round_non_default: MeetingFeedSummary =
+            serde_json::from_str(&json_non_default).unwrap();
+        assert_eq!(round_non_default, all_non_default);
+
+        // 4. For the all-default instance, the default-valued scalar fields
+        // must be OMITTED from the wire (bandwidth win for the home feed).
+        assert!(!json_default.contains("\"is_owner\""));
+        assert!(!json_default.contains("\"participant_count\""));
+        assert!(!json_default.contains("\"waiting_room_enabled\""));
+        assert!(!json_default.contains("\"end_on_host_leave\""));
+        assert!(!json_default.contains("\"has_password\""));
+
+        // 5. For the all-non-default instance, the now-non-default fields must
+        // be PRESENT. `waiting_room_enabled` is `false` (non-default for a
+        // default-true field) so it MUST be emitted; `is_owner` is `true`.
+        assert!(json_non_default.contains("\"waiting_room_enabled\""));
+        assert!(json_non_default.contains("\"is_owner\""));
+    }
 }

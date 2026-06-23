@@ -18,7 +18,7 @@
 
 use crate::auth::{
     check_session, clear_access_token, clear_id_token, clear_refresh_token, clear_user_profile,
-    get_user_profile, UserProfile,
+    get_stored_id_token, get_user_profile, UserProfile,
 };
 use crate::components::about_modal::AboutModal;
 use crate::components::browser_compatibility::BrowserCompatibility;
@@ -174,6 +174,12 @@ pub fn Home() -> Element {
     // itself doesn't pay for a network round-trip on every load.
     let mut show_about = use_signal(|| false);
 
+    // Issue #1480: build date shows on ALL builds (not github info). Omit the
+    // "· built …" suffix entirely when the timestamp is the build.rs sentinel.
+    let about_built_suffix = crate::constants::build_date(env!("BUILD_TIMESTAMP"))
+        .map(|d| format!(" · built {d}"))
+        .unwrap_or_default();
+
     // Tracks which (if any) info-icon tooltip the user has explicitly
     // parked open via click / Enter / Space.  CSS still handles the
     // hover and keyboard-focus reveal; this signal exists so we can
@@ -272,35 +278,21 @@ pub fn Home() -> Element {
         }
     });
 
-    // Logout handler: clear all local auth state (tokens, profile, display name)
-    // and reset the UI to the unauthenticated home state.
+    // Logout handler: clear all local auth state, then navigate the browser to
+    // the backend /logout endpoint as a top-level navigation (not fetch).
     //
-    // DESIGN NOTE — why we do NOT navigate the browser to the backend /logout URL:
+    // The top-level navigation is required because the backend 303-redirects to
+    // the IdP's end_session_endpoint, and SameSite=Lax cookies are only sent on
+    // navigations (sec-fetch-mode: navigate), not on fetch() requests (CORS mode).
+    // Without the cookies the IdP session survives and auto-re-authenticates.
     //
-    // The previous approach called `logout()` which redirected the browser to the
-    // backend /logout endpoint.  That endpoint in turn kicked off an OIDC
-    // end_session_endpoint redirect chain (RP-initiated logout), which is meant to
-    // clear the OAuth provider's own session.  In practice this was the root cause
-    // of the "can't re-sign-in after logout" regression: the redirect chain either
-    // navigated away before local state was cleaned up, or the provider's post-logout
-    // redirect landed the user in a broken intermediate state.
-    //
-    // Instead we now:
-    //   1. Clear all client-side auth state synchronously (tokens, profile, display
-    //      name signal, in-memory signals).
-    //   2. Navigate to Route::Home so the UI immediately shows the sign-in button.
-    //   3. Fire a background fetch (fire-and-forget) to the backend /logout endpoint
-    //      so the server-side session cookie is invalidated.
-    //
-    // Trade-off: the OAuth provider session (IdP side) may stay alive after this
-    // sign-out.  The next "Sign In" click could silently re-authenticate the same
-    // user without re-prompting for credentials, depending on how the IdP handles
-    // an active session with no active RP session.  If that becomes an issue, the
-    // long-term fix is to have the backend /logout endpoint perform the
-    // end_session_endpoint redirect *after* the client has already navigated away
-    // (e.g. via a post-logout redirect back to the SPA), rather than driving the
-    // full redirect chain from the client side.
+    // We clear client-side state synchronously BEFORE navigating so that if the
+    // post_logout_redirect_uri lands back on this SPA, it sees no tokens and
+    // shows the sign-in page (avoiding the prior "can't re-sign-in" regression).
     let on_logout = move |_| {
+        // Grab id_token BEFORE clearing — needed as id_token_hint for the IdP.
+        let id_token_hint = get_stored_id_token();
+
         // Clear all client-side auth state
         clear_access_token();
         clear_refresh_token();
@@ -317,16 +309,17 @@ pub fn Home() -> Element {
         display_name_ctx.0.set(None);
         username_value.set(String::new());
 
-        // Navigate to home route (unauthenticated state)
-        navigator.push(Route::Home {});
-
-        // Background fetch to invalidate the server-side session cookie.
-        // We deliberately do NOT await this or navigate to the URL — see the
-        // design note above for why we avoid the browser-redirect approach.
-        if let Ok(url) = logout_url() {
-            wasm_bindgen_futures::spawn_local(async move {
-                let _ = reqwest::get(&url).await;
-            });
+        // Navigate to backend /logout as a top-level navigation so the redirect
+        // chain to the IdP carries SameSite=Lax cookies.
+        if let Ok(mut url) = logout_url() {
+            if let Some(hint) = id_token_hint {
+                let encoded = js_sys::encode_uri_component(&hint);
+                url.push_str("?id_token_hint=");
+                url.push_str(&encoded.as_string().unwrap_or_default());
+            }
+            if let Some(window) = web_sys::window() {
+                let _ = window.location().set_href(&url);
+            }
         }
     };
 
@@ -769,6 +762,7 @@ pub fn Home() -> Element {
                         onclick: move |_| show_about.set(true),
                         "About videocall-ui v"
                         "{env!(\"CARGO_PKG_VERSION\")}"
+                        "{about_built_suffix}"
                     }
                 }
 

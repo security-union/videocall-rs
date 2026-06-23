@@ -578,6 +578,48 @@ async fn test_participant_count_matches_legacy() {
     assert_eq!(m.participant_count, 2);
     assert_eq!(m.waiting_count, 1);
 
+    // ── Present-only semantics (issue #1551) ──────────────────────────────
+    // Simulate the disconnect-without-/leave backstop directly at the DB layer
+    // (the path the `internal.participant_left` consumer drives): mark the
+    // admitted_user `status='left', left_at=NOW()`. Both the folded feed count
+    // AND the legacy helper must now exclude them — pinning that a departed
+    // participant drops out of BOTH counts and that the two paths stay in
+    // lockstep.
+    //
+    // NOTE: this marks `status='left'` AND `left_at=NOW()` together, so the row
+    // is already excluded by the `status='admitted'` predicate alone — it does
+    // NOT, by itself, pin the defense-in-depth `AND left_at IS NULL` guard. That
+    // guard (which defends the pathological `status='admitted' AND left_at IS NOT
+    // NULL` row) is pinned separately by
+    // `participant_left_consumer_tests::admitted_with_left_at_is_excluded_from_count`,
+    // which would fail if `AND left_at IS NULL` were reverted.
+    db_participants::mark_left_by_disconnect(&pool, pk, admitted_user)
+        .await
+        .expect("mark_left_by_disconnect must succeed");
+
+    let body = list_feed(&pool, host, None).await;
+    let m = body
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("meeting must still appear in the feed");
+    let legacy_admitted_after = db_participants::count_admitted(&pool, pk).await.unwrap();
+    assert_eq!(
+        m.participant_count, legacy_admitted_after,
+        "folded participant_count must still match the legacy helper after a disconnect"
+    );
+    assert_eq!(
+        m.participant_count, 1,
+        "a disconnected (left) participant must drop out of participant_count — \
+         only the still-present host remains"
+    );
+    // The waiting user was untouched and is still present.
+    assert_eq!(
+        m.waiting_count, 1,
+        "waiting count is unaffected by the admitted leave"
+    );
+
     cleanup_test_data(&pool, room_id).await;
 }
 

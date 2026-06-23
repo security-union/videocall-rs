@@ -255,34 +255,46 @@ impl SessionManager {
         Some((subject, bytes))
     }
 
-    /// Resolve the `(subject, bytes)` a peer should publish in reply to a
-    /// PARTICIPANT_LIST_REQUEST, or `None` when no reply should be sent.
+    /// Resolve the `(subject, bytes)` for a coalesced presence re-announce, or
+    /// `None` when the responder is not yet `Active` (only elected connections
+    /// announce themselves). The packet is built with
+    /// [`Self::build_peer_joined_packet`], identical to the activation-time
+    /// announcement.
     ///
-    /// The reply is a PARTICIPANT_JOINED for the responding peer, addressed to
-    /// the requester's per-session subject (`room.{room}.{requester}`) so the
-    /// `handle_msg` unicast filter delivers it only to that requester.
+    /// `target` selects the addressing, decided per responder by how many distinct
+    /// joiners asked during the coalescing window:
     ///
-    /// Returns `None` when:
-    /// * the responder is not yet `Active` (`responder_is_active == false`) —
-    ///   only elected connections announce themselves; or
-    /// * the requester is on THIS server instance (`requester_is_local`) — the
-    ///   in-memory existing-member replay in JoinRoom already delivered the
-    ///   PARTICIPANT_JOINED directly, so a NATS reply would duplicate it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rebroadcast_reply_publication(
+    /// * `Some(requester)` — unicast to that requester's subject
+    ///   (`room.{room}.{requester}`) when exactly one distinct requester asked (an
+    ///   ordinary single join). The `handle_msg` unicast filter forwards it only to
+    ///   that requester, so a single join stays at O(N) relay→client forwards and
+    ///   the presence info-leak boundary holds.
+    /// * `None` — broadcast to `room.{room}.system` (the subject activation uses)
+    ///   when ≥2 distinct requesters asked (a wave). One broadcast answers every
+    ///   joiner. Recipients already saw this peer at activation, so already-present
+    ///   peers dedup it and no presence leaks beyond what activation published.
+    ///
+    /// The decision of whether to re-announce at all (responder Active; requester
+    /// on another instance) lives in `Handler<RebroadcastPresence>`; this builder
+    /// only re-checks `responder_is_active`, since the peer may have left `Active`
+    /// during the window.
+    pub fn rebroadcast_publication(
         room_id: &str,
         user_id: &str,
         display_name: &str,
         responder_session: u64,
-        requester_session: u64,
         is_guest: bool,
         responder_is_active: bool,
-        requester_is_local: bool,
+        target: Option<u64>,
     ) -> Option<(String, Vec<u8>)> {
-        if !responder_is_active || requester_is_local {
+        if !responder_is_active {
             return None;
         }
-        let subject = format!("room.{}.{}", room_id.replace(' ', "_"), requester_session);
+        let room = room_id.replace(' ', "_");
+        let subject = match target {
+            Some(requester) => format!("room.{room}.{requester}"),
+            None => format!("room.{room}.system"),
+        };
         let bytes = Self::build_peer_joined_packet(
             room_id,
             user_id,
@@ -487,60 +499,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rebroadcast_reply_publication() {
+    async fn test_rebroadcast_publication() {
         use videocall_types::protos::meeting_packet::MeetingPacket;
         use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-        // Not-yet-Active responder → no reply (only elected connections announce).
+        // Not-yet-Active responder → no re-announce (only elected connections
+        // announce themselves), regardless of target.
         assert!(
-            SessionManager::rebroadcast_reply_publication(
+            SessionManager::rebroadcast_publication(
                 "my-room",
                 "alice@x.com",
                 "Alice",
                 10,
-                20,
                 false,
                 /*active*/ false,
-                /*requester_local*/ false,
+                None,
             )
             .is_none(),
-            "a non-Active responder must not reply"
+            "a non-Active responder must not re-announce"
         );
 
-        // Local requester → no reply (the in-memory replay already delivered it;
-        // a NATS reply would duplicate on the client). This is the short-circuit.
-        assert!(
-            SessionManager::rebroadcast_reply_publication(
-                "my-room",
-                "alice@x.com",
-                "Alice",
-                10,
-                20,
-                false,
-                /*active*/ true,
-                /*requester_local*/ true,
-            )
-            .is_none(),
-            "a local requester must be served by the in-memory replay, not a NATS reply"
-        );
-
-        // Active responder + remote requester → reply addressed to the
-        // requester's per-session subject, carrying the responder's
-        // PARTICIPANT_JOINED.
-        let (subject, bytes) = SessionManager::rebroadcast_reply_publication(
+        // Wave branch: target None → broadcast to the room system subject (room
+        // id sanitized). One broadcast answers every joiner that asked.
+        let (subject, _) = SessionManager::rebroadcast_publication(
             "my room",
             "alice@x.com",
             "Alice",
             10,
-            20,
             true,
             /*active*/ true,
-            /*requester_local*/ false,
+            None,
         )
-        .expect("Active responder + remote requester must produce a reply");
-        // Subject targets the REQUESTER (20), not the responder (10), with the
-        // room id sanitized.
-        assert_eq!(subject, "room.my_room.20");
+        .expect("Active responder must produce a broadcast re-announce");
+        assert_eq!(
+            subject, "room.my_room.system",
+            "≥2 distinct requesters must broadcast to the system subject"
+        );
+
+        // Single-join branch: target Some(requester) → unicast to that
+        // requester's subject, so a single join stays O(N) relay→client forwards
+        // and the info-leak boundary holds. Reverting to broadcast-only fails here.
+        let (subject, bytes) = SessionManager::rebroadcast_publication(
+            "my room",
+            "alice@x.com",
+            "Alice",
+            10,
+            true,
+            /*active*/ true,
+            Some(20),
+        )
+        .expect("Active responder must produce a unicast re-announce");
+        assert_eq!(
+            subject, "room.my_room.20",
+            "exactly one distinct requester must unicast to that requester"
+        );
 
         let wrapper = PacketWrapper::parse_from_bytes(&bytes).unwrap();
         let inner = MeetingPacket::parse_from_bytes(&wrapper.data).unwrap();

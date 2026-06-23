@@ -1,0 +1,4 @@
+interface:
+  display_name: "Videocall Adversarial Review"
+  short_description: "Review videocall changes before PR or merge"
+  default_prompt: "Use $videocall-adversarial-review to perform the mandatory adversarial review of this change."

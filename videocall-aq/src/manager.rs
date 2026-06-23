@@ -1228,8 +1228,16 @@ impl AdaptiveQualityManager {
     /// publisher emits a single, legacy-equivalent stream at startup and the
     /// `videocall-aq` headroom-probe ramp (see the controller's `tick`) adds
     /// layers up to the ceiling only when observed backpressure + uplink budget
-    /// allow. Used by the CAMERA encoder path; screen share keeps the
-    /// all-layers-active semantics of `set_simulcast_layers`.
+    /// allow.
+    ///
+    /// Used by the CAMERA encoder path. The SCREEN path does NOT use this: it
+    /// seeds an OPTIMISTIC baseline via
+    /// [`set_simulcast_ceiling_start_optimistic`](Self::set_simulcast_ceiling_start_optimistic)
+    /// (issue #1553) because the 6 s-clear ramp never climbs on a busy share in
+    /// a large meeting, leaving the screen permanently fuzzy at the base rung.
+    /// (Screen has never used `set_simulcast_layers`' all-rungs-hot seed — #1200
+    /// removed that — so the start-at-base camera seed and the optimistic screen
+    /// seed are the only two seeds in use.)
     ///
     /// `n` is clamped to `[1, SIMULCAST_MAX_LAYERS]`. A ceiling of `1` (or `0`)
     /// leaves the manager in single-stream mode (active is already 1), inert.
@@ -1241,6 +1249,49 @@ impl AdaptiveQualityManager {
         // rest. `min(clamped)` guards the degenerate ceiling==0→1 clamp case so
         // active can never exceed the ceiling.
         self.active_layer_count = 1.min(clamped);
+    }
+
+    /// Configure the simulcast ladder CEILING to `n` and seed the active count
+    /// at an OPTIMISTIC baseline (issue #1553) — the SCREEN encoder path.
+    ///
+    /// # Why screen does NOT start at base (issue #1553)
+    /// [`set_simulcast_ceiling_start_at_base`](Self::set_simulcast_ceiling_start_at_base)
+    /// seeds active == 1 and depends on the headroom-probe ramp
+    /// ([`LAYER_PROBE_CLEAR_WINDOW_MS`](crate::constants::LAYER_PROBE_CLEAR_WINDOW_MS)
+    /// = 6 s uninterrupted-clear per rung) to climb. On a busy share in a large
+    /// (~15-peer) meeting the encoder queue is never clear that long, so the ramp
+    /// never earns an upper rung and the screen stays pinned at the base
+    /// rung → permanently FUZZY.
+    ///
+    /// # Option B: start optimistic, shed down on real backpressure
+    /// This seeds `active_layer_count = min(initial_active, n)` so a clear share
+    /// gets a solid baseline immediately, without waiting on the 6 s ramp. At the
+    /// default seed of
+    /// [`SCREEN_INITIAL_ACTIVE_LAYERS`](crate::constants::SCREEN_INITIAL_ACTIVE_LAYERS)
+    /// = 2 the screen ladder is `[low, high]` (see
+    /// [`simulcast_screen_layers`](crate::constants::simulcast_screen_layers):
+    /// `n == 2 => [low, high]`), so the publisher emits the base `low` (720p/500)
+    /// AND the top `high` (1080p/2500) rung from frame one — publishing the sharp
+    /// 1080p rung immediately is what de-fuzzes the content. The existing
+    /// shed-down machinery (`drop_top_layer` under sustained encoder
+    /// backpressure / congestion) still reduces active back toward the floor (1)
+    /// under genuine congestion, and the ramp can still earn the deferred MIDDLE
+    /// `medium` rung up to the full 3-rung ceiling when uplink allows.
+    ///
+    /// `initial_active` is the requested optimistic seed (callers pass
+    /// `SCREEN_INITIAL_ACTIVE_LAYERS`); it is clamped to `[1, clamped_n]` so it
+    /// can never exceed the ladder ceiling. `n` is clamped to
+    /// `[1, SIMULCAST_MAX_LAYERS]`. A ceiling of `1` (or `0`) leaves the manager
+    /// in single-stream mode (active forced to 1), byte-identical to start-at-base
+    /// in that degenerate case. Call once after construction / on each (re)share
+    /// rising edge, before the first tick.
+    pub fn set_simulcast_ceiling_start_optimistic(&mut self, n: usize, initial_active: usize) {
+        let clamped = n.clamp(1, crate::constants::SIMULCAST_MAX_LAYERS);
+        self.simulcast_layer_count = clamped;
+        // Seed at the optimistic baseline, clamped to `[1, clamped]` so active is
+        // never below the always-published base rung nor above the ceiling. In
+        // single-stream mode (clamped == 1) this collapses to 1.
+        self.active_layer_count = initial_active.clamp(1, clamped);
     }
 
     /// Number of simulcast layers in this session's ladder (the ceiling for
@@ -3101,6 +3152,90 @@ mod tests {
         mgr.set_simulcast_ceiling_start_at_base(0);
         assert!(!mgr.is_simulcast(), "0 clamps to 1 (single-stream)");
         assert_eq!(mgr.active_layer_count(), 1);
+    }
+
+    #[test]
+    fn test_set_simulcast_ceiling_start_optimistic_seeds_min_initial_and_n() {
+        // Issue #1553: the SCREEN path seeds the ceiling to `n` and the active
+        // count to `min(SCREEN_INITIAL_ACTIVE_LAYERS, n)` — by default 2 (the
+        // `[low, high]` ladder: base + the 1080p top rung, middle rung deferred)
+        // — so a clear share is not stuck on the base rung waiting for the 6 s
+        // ramp. References the real constant (not a literal) so a retune moves
+        // this pin in lockstep.
+        use crate::constants::{SCREEN_INITIAL_ACTIVE_LAYERS, SIMULCAST_MAX_LAYERS};
+        let seed = SCREEN_INITIAL_ACTIVE_LAYERS;
+
+        // Full ladder: ceiling == n, active == min(seed, n).
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.set_simulcast_ceiling_start_optimistic(SIMULCAST_MAX_LAYERS, seed);
+        assert_eq!(
+            mgr.simulcast_layer_count(),
+            SIMULCAST_MAX_LAYERS,
+            "ceiling must be the requested ladder size"
+        );
+        assert_eq!(
+            mgr.active_layer_count(),
+            seed.min(SIMULCAST_MAX_LAYERS),
+            "active must seed at min(SCREEN_INITIAL_ACTIVE_LAYERS, n) — the \
+             optimistic baseline, NOT the base rung (1) and NOT the full ladder"
+        );
+        assert!(mgr.is_simulcast());
+
+        // The seed must clamp to the ceiling: a 2-rung ladder cannot exceed 2.
+        let mut mgr2 = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr2.set_simulcast_ceiling_start_optimistic(2, seed);
+        assert_eq!(mgr2.simulcast_layer_count(), 2);
+        assert_eq!(
+            mgr2.active_layer_count(),
+            seed.min(2),
+            "the seed must be clamped to the ladder ceiling"
+        );
+
+        // Single-stream ceiling (1 / 0) forces active to 1 regardless of the seed.
+        let mut mgr3 = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr3.set_simulcast_ceiling_start_optimistic(1, seed);
+        assert!(!mgr3.is_simulcast());
+        assert_eq!(mgr3.active_layer_count(), 1, "ceiling 1 → single-stream");
+        mgr3.set_simulcast_ceiling_start_optimistic(0, seed);
+        assert!(!mgr3.is_simulcast(), "0 clamps to single-stream");
+        assert_eq!(mgr3.active_layer_count(), 1);
+    }
+
+    #[test]
+    fn test_optimistic_seed_can_shed_down_to_floor() {
+        // Issue #1553 shed-down: from the OPTIMISTIC seed the existing
+        // `drop_top_layer` shed machinery must still reduce active to the floor
+        // (1) under sustained backpressure. Pins that the higher seed does not
+        // block the down direction.
+        use crate::constants::{SCREEN_INITIAL_ACTIVE_LAYERS, SIMULCAST_MAX_LAYERS};
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.set_simulcast_ceiling_start_optimistic(
+            SIMULCAST_MAX_LAYERS,
+            SCREEN_INITIAL_ACTIVE_LAYERS,
+        );
+        let seeded = mgr.active_layer_count();
+        assert!(
+            seeded >= 2,
+            "precondition: optimistic seed must start above the floor for this \
+             shed-down test to be meaningful"
+        );
+
+        // Shed repeatedly: must reach the floor of 1, then no-op.
+        while mgr.active_layer_count() > 1 {
+            assert!(
+                mgr.drop_top_layer(),
+                "shed must succeed while above the floor"
+            );
+        }
+        assert_eq!(
+            mgr.active_layer_count(),
+            1,
+            "shed reaches the floor (base rung)"
+        );
+        assert!(
+            !mgr.drop_top_layer(),
+            "at the floor, further shed is a no-op (base rung always published)"
+        );
     }
 
     #[test]

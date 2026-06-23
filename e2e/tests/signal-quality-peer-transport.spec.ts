@@ -300,11 +300,38 @@ test.describe("Signal-quality popup — per-peer transport badge", () => {
 
         // When the row is below the full-ladder top a tinted reason chip appears,
         // again reusing the perf-dialog chip classes. The chip is optional (an
-        // optimal stream has none), so assert the class shape only when present.
+        // optimal stream has none), so assert it only when present.
+        //
+        // #1553: the chip's DISPLAY text comes from `reason_chip_text`
+        // (Network → "Your network", Setting → "Your setting", Sender →
+        // "Sender") and its modifier class from `reason_chip_modifier`
+        // (network/setting/sender). We don't drive a SPECIFIC reason here (the
+        // organic state on a healthy 2-peer call is not deterministic — see the
+        // dedicated "Your setting" driver in simulcast-per-receiver.spec.ts and
+        // the host unit tests for the full mapping incl. the un-drivable "Your
+        // network" congestion state), but whatever reason DOES render, its text
+        // and its class must AGREE per the source mapping. Pinning that agreement
+        // catches a mislabel like Sender → "Your network" (the exact #1553 bug
+        // class) reaching this shared popup render path.
         const reasonChip = videoRow.locator(".perf-reason-chip");
         if ((await reasonChip.count()) > 0) {
-          const chipClass = (await reasonChip.first().getAttribute("class")) || "";
+          const chip = reasonChip.first();
+          const chipClass = (await chip.getAttribute("class")) || "";
           expect(chipClass).toMatch(/\bperf-reason-chip--(network|setting|sender)\b/);
+          const chipText = ((await chip.textContent()) || "").trim();
+          // The DISPLAY text must be one of the three canonical reason_chip_text
+          // strings — never an empty/raw enum/stale string.
+          expect(chipText).toMatch(/^(Your network|Your setting|Sender)$/);
+          // text ↔ class agreement, per reason_chip_text / reason_chip_modifier.
+          const expectedTextForClass: Record<string, string> = {
+            network: "Your network",
+            setting: "Your setting",
+            sender: "Sender",
+          };
+          const modifier = (chipClass.match(/perf-reason-chip--(network|setting|sender)/) || [])[1];
+          expect(chipText, `reason chip text must match its --${modifier} modifier`).toBe(
+            expectedTextForClass[modifier!],
+          );
         }
       }
     } finally {

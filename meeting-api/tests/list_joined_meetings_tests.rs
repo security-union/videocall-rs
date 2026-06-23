@@ -30,6 +30,7 @@ mod test_helpers;
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
+use meeting_api::db::participants as db_participants;
 use serial_test::serial;
 use sqlx::PgPool;
 use test_helpers::*;
@@ -151,6 +152,18 @@ async fn list_joined(
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "list joined must return 200");
     response_json(resp).await
+}
+
+/// Look up the internal `meetings.id` for a given `room_id`. Used to drive
+/// the legacy `db_participants::count_*` helpers when comparing against the
+/// folded counts in `list_joined_by_user`.
+async fn lookup_meeting_pk(pool: &PgPool, room_id: &str) -> i32 {
+    let (id,): (i32,) = sqlx::query_as("SELECT id FROM meetings WHERE room_id = $1")
+        .bind(room_id)
+        .fetch_one(pool)
+        .await
+        .expect("meeting row must exist for participant_count comparison");
+    id
 }
 
 // ── Scenario 1: empty list ────────────────────────────────────────────────────
@@ -594,4 +607,80 @@ async fn test_list_joined_rejects_negative_limit() {
     let body: APIResponse<APIError> = response_json(resp).await;
     assert!(!body.success);
     assert_eq!(body.result.code, "INVALID_INPUT");
+}
+
+// ── Scenario: folded counts match legacy per-row helpers ─────────────────
+
+/// Issue #467: the `/joined` handler previously issued two per-row
+/// `count_admitted` / `count_waiting` queries (an N+1). They are now folded
+/// into `list_joined_by_user`'s SELECT via LEFT JOIN LATERAL. This pins the
+/// folded values byte-for-byte to the legacy helpers AND to absolute floors
+/// (2 admitted + 1 waiting) so a swapped status filter is caught.
+#[tokio::test]
+#[serial]
+async fn test_list_joined_participant_and_waiting_counts_match_legacy() {
+    let pool = get_test_pool().await;
+    let host = "joined-counts-host@example.com";
+    let admitted_user = "joined-counts-admitted@example.com";
+    let waiting_user = "joined-counts-waiting@example.com";
+    let room_id = "joined-test-counts-match";
+
+    // WR enabled so we can have admitted users (host + one more) and a waiting
+    // user sharing one meeting, exercising both lateral subqueries.
+    create_meeting_wr_on(&pool, host, room_id).await;
+    join_meeting(&pool, room_id, host).await;
+
+    // Flip WR off so the second user auto-admits (host stays admitted).
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("PATCH", &format!("/api/v1/meetings/{room_id}"), host)
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"waiting_room_enabled":false}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "WR toggle must succeed");
+
+    join_meeting(&pool, room_id, admitted_user).await;
+
+    // Re-enable WR so the next joiner ends up in waiting.
+    let app = build_app(pool.clone());
+    let req = request_with_cookie("PATCH", &format!("/api/v1/meetings/{room_id}"), host)
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"waiting_room_enabled":true}"#))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "WR toggle must succeed");
+
+    join_meeting(&pool, room_id, waiting_user).await;
+
+    // Request /joined as the HOST (admitted, so the meeting appears in their
+    // joined list) and compare folded counts against the legacy helpers.
+    let body = list_joined(&pool, host, None).await;
+    assert!(body.success);
+    let m = body
+        .result
+        .meetings
+        .iter()
+        .find(|m| m.meeting_id == room_id)
+        .expect("meeting must appear in the host's joined list");
+
+    let pk = lookup_meeting_pk(&pool, room_id).await;
+    let legacy_admitted = db_participants::count_admitted(&pool, pk).await.unwrap();
+    let legacy_waiting = db_participants::count_waiting(&pool, pk).await.unwrap();
+
+    assert_eq!(
+        m.participant_count, legacy_admitted,
+        "folded participant_count ({}) must match legacy count_admitted ({})",
+        m.participant_count, legacy_admitted
+    );
+    assert_eq!(
+        m.waiting_count, legacy_waiting,
+        "folded waiting_count ({}) must match legacy count_waiting ({})",
+        m.waiting_count, legacy_waiting
+    );
+    // Absolute floor — 2 admitted (host + admitted_user) + 1 waiting. Fails if
+    // waiting got counted as admitted or vice-versa.
+    assert_eq!(m.participant_count, 2);
+    assert_eq!(m.waiting_count, 1);
+
+    cleanup_test_data(&pool, room_id).await;
 }

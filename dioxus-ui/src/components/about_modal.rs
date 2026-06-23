@@ -52,16 +52,6 @@ enum FetchState {
     Error(String),
 }
 
-/// Truncate a git SHA to its first 7 characters (the canonical short
-/// form).  Returns `"unknown"` when empty and the input unchanged when
-/// already shorter than 7 chars (or non-ASCII).
-fn short_sha(sha: &str) -> String {
-    if sha.is_empty() {
-        return "unknown".to_string();
-    }
-    sha.chars().take(7).collect()
-}
-
 fn dash_if_empty(value: &str) -> &str {
     if value.is_empty() {
         "-"
@@ -113,10 +103,18 @@ pub fn AboutModal(mut open: Signal<bool>) -> Element {
         return rsx! {};
     }
 
+    // Issue #1480: github info (commit + branch) is gated; version + built are not.
+    let show_git = crate::constants::show_build_git_info();
     let client_version = env!("CARGO_PKG_VERSION");
-    let client_sha = short_sha(env!("GIT_SHA"));
+    let client_sha = crate::constants::short_sha(env!("GIT_SHA"));
     let client_branch = env!("GIT_BRANCH");
     let client_ts = env!("BUILD_TIMESTAMP");
+    // Issue #1480: render the full `YYYY-MM-DD HH:MM:SSZ` Built value (matches the
+    // diagnostics build-info table — date + full time incl. seconds and trailing
+    // zone); fall back to the raw ts only if `build_datetime` returns None
+    // (sentinel/empty).
+    let client_built =
+        crate::constants::build_datetime(client_ts).unwrap_or_else(|| client_ts.to_string());
 
     let server_section = match state() {
         FetchState::Loading => rsx! {
@@ -130,32 +128,51 @@ pub fn AboutModal(mut open: Signal<bool>) -> Element {
         FetchState::Ready(components) if components.is_empty() => rsx! {
             div { class: "about-modal-status", "No server components reported." }
         },
-        FetchState::Ready(components) => rsx! {
-            div { class: "about-modal-table",
-                div { class: "about-modal-row about-modal-row--header",
-                    span { class: "about-modal-label", "Service" }
-                    span { class: "about-modal-value", "Version" }
-                    span { class: "about-modal-value", "Commit" }
-                    span { class: "about-modal-value", "Built" }
-                }
-                for comp in components.iter() {
-                    div { class: "about-modal-row",
-                        span { class: "about-modal-value about-modal-value--strong",
-                            "{comp.service}"
+        FetchState::Ready(components) => {
+            // Issue #1480: drop the Commit column entirely in production (github
+            // info hidden) so the server table is Service/Version/Built (3 cols);
+            // the --server-nogit modifier collapses the grid to match the spans.
+            let row_class = if show_git {
+                "about-modal-row"
+            } else {
+                "about-modal-row about-modal-row--server-nogit"
+            };
+            let header_class = if show_git {
+                "about-modal-row about-modal-row--header"
+            } else {
+                "about-modal-row about-modal-row--header about-modal-row--server-nogit"
+            };
+            rsx! {
+                div { class: "about-modal-table",
+                    div { class: "{header_class}",
+                        span { class: "about-modal-label", "Service" }
+                        span { class: "about-modal-value", "Version" }
+                        if show_git {
+                            span { class: "about-modal-value", "Commit" }
                         }
-                        span { class: "about-modal-value about-modal-value--mono",
-                            "{dash_if_empty(&comp.version)}"
-                        }
-                        span { class: "about-modal-value about-modal-value--mono",
-                            "{short_sha(&comp.git_sha)}"
-                        }
-                        span { class: "about-modal-value about-modal-value--mono",
-                            "{dash_if_empty(&comp.build_timestamp)}"
+                        span { class: "about-modal-value", "Built" }
+                    }
+                    for comp in components.iter() {
+                        div { class: "{row_class}",
+                            span { class: "about-modal-value about-modal-value--strong",
+                                "{comp.service}"
+                            }
+                            span { class: "about-modal-value about-modal-value--mono",
+                                "{dash_if_empty(&comp.version)}"
+                            }
+                            if show_git {
+                                span { class: "about-modal-value about-modal-value--mono",
+                                    "{crate::constants::short_sha(&comp.git_sha)}"
+                                }
+                            }
+                            span { class: "about-modal-value about-modal-value--mono",
+                                "{crate::constants::build_datetime(&comp.build_timestamp).unwrap_or_else(|| dash_if_empty(&comp.build_timestamp).to_string())}"
+                            }
                         }
                     }
                 }
             }
-        },
+        }
     };
 
     rsx! {
@@ -227,22 +244,24 @@ pub fn AboutModal(mut open: Signal<bool>) -> Element {
                                 "v{client_version}"
                             }
                         }
-                        div { class: "about-modal-row",
-                            span { class: "about-modal-label", "Commit" }
-                            span { class: "about-modal-value about-modal-value--mono",
-                                "{client_sha}"
+                        if show_git {
+                            div { class: "about-modal-row",
+                                span { class: "about-modal-label", "Commit" }
+                                span { class: "about-modal-value about-modal-value--mono",
+                                    "{client_sha}"
+                                }
                             }
-                        }
-                        div { class: "about-modal-row",
-                            span { class: "about-modal-label", "Branch" }
-                            span { class: "about-modal-value about-modal-value--mono",
-                                "{client_branch}"
+                            div { class: "about-modal-row",
+                                span { class: "about-modal-label", "Branch" }
+                                span { class: "about-modal-value about-modal-value--mono",
+                                    "{client_branch}"
+                                }
                             }
                         }
                         div { class: "about-modal-row",
                             span { class: "about-modal-label", "Built" }
                             span { class: "about-modal-value about-modal-value--mono",
-                                "{client_ts}"
+                                "{client_built}"
                             }
                         }
                     }
@@ -266,30 +285,7 @@ pub fn AboutModal(mut open: Signal<bool>) -> Element {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
-    #[test]
-    fn short_sha_truncates_long_sha() {
-        assert_eq!(short_sha("abcdef1234567890"), "abcdef1");
-    }
-
-    #[test]
-    fn short_sha_keeps_short_input() {
-        assert_eq!(short_sha("abc"), "abc");
-    }
-
-    #[test]
-    fn short_sha_handles_empty() {
-        assert_eq!(short_sha(""), "unknown");
-    }
-
-    #[test]
-    fn short_sha_handles_unicode_safely() {
-        // chars().take(7) operates on Unicode scalar values, so a string of
-        // four 4-byte chars is shorter than 7 chars and stays intact.
-        let emoji = "abc\u{1F600}\u{1F601}";
-        assert_eq!(short_sha(emoji), emoji);
-    }
+    use super::dash_if_empty;
 
     #[test]
     fn dash_if_empty_returns_dash_for_empty() {

@@ -7,7 +7,7 @@ import { waitForServices } from "../helpers/wait-for-services";
  *
  * When a participant shares their screen the meeting switches to a split
  * layout: the shared screen fills the left 2/3 of #grid-container while
- * peer video tiles are arranged in a flex-wrap panel (.ss-peer-panel)
+ * peer video tiles are arranged in a CSS grid panel (.ss-peer-panel)
  * on the right 1/3. All participants are rendered (no cap); the panel
  * scrolls vertically when tiles overflow. Off-budget peers render as
  * avatar-tier tiles (no video decode) per the decode-budget system
@@ -343,11 +343,10 @@ test.describe("Screen share right panel layout", () => {
       const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
-      // Layout is now CSS-class-driven (.ss-peer-panel) using flexbox.
+      // Layout is CSS-class-driven (.ss-peer-panel) using CSS grid.
       // Verify the panel has the expected class and computed layout.
       await expect(rightPanel).toHaveClass(/ss-peer-panel/);
-      expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("flex");
-      expect(await rightPanel.evaluate((el) => getComputedStyle(el).flexWrap)).toBe("wrap");
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("grid");
 
       // Verify peer tiles (.split-peer-tile) are rendered in the right panel
       const peerTiles = hostPage.locator(".split-peer-tile");
@@ -641,8 +640,8 @@ test.describe("Screen share right panel layout", () => {
   //    on a wide viewport.
   //
   // Bug #3+#4: the right panel now uses CSS class `.ss-peer-panel`
-  // with flexbox layout. Tiles pack to the left edge via flex-start
-  // alignment, and each tile preserves its 3:2 aspect ratio.
+  // with CSS grid layout. Tiles pack to the left edge via
+  // align-content: start, and each tile preserves its 3:2 aspect ratio.
   //
   // The test runs on a deliberately WIDE viewport (1600x900) to verify
   // tiles stay left-justified and maintain proper aspect ratio.
@@ -679,11 +678,10 @@ test.describe("Screen share right panel layout", () => {
       const rightPanel = hostPage.locator("#grid-container > div:nth-child(3)");
       await expect(rightPanel).toBeVisible({ timeout: 10_000 });
 
-      // ── Layout is CSS-class-driven (.ss-peer-panel) using flexbox.
-      // Verify the panel has the right class and computed flex layout.
+      // ── Layout is CSS-class-driven (.ss-peer-panel) using CSS grid.
+      // Verify the panel has the right class and computed grid layout.
       await expect(rightPanel).toHaveClass(/ss-peer-panel/);
-      expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("flex");
-      expect(await rightPanel.evaluate((el) => getComputedStyle(el).flexWrap)).toBe("wrap");
+      expect(await rightPanel.evaluate((el) => getComputedStyle(el).display)).toBe("grid");
 
       // ── Bug #3 GEOMETRIC: the first tile's LEFT edge must sit at the
       // panel's left edge plus its padding (~6px), not centered.
@@ -794,6 +792,333 @@ test.describe("Screen share right panel layout", () => {
       expect(containerStyle).toBeTruthy();
       expect(containerStyle).toContain("grid-template-columns");
       expect(containerStyle).toContain("grid-template-rows");
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 6. All tiles same size (CSS grid uniformity)
+  //
+  // The CSS grid layout uses `repeat(auto-fill, minmax(160px, 1fr))`
+  // which guarantees all grid cells are the same width, and
+  // `aspect-ratio: 3/2` on each tile guarantees uniform height.
+  // With mock peers we verify that all visible `.split-peer-tile`
+  // elements have the same width and height within 1px tolerance.
+  // ──────────────────────────────────────────────────────────────────────
+  test("all split-peer-tiles have uniform dimensions during screen share", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_uniform_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSUniformHost",
+      "SSUniformGuest",
+    );
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const mockButton = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
+      });
+      const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
+      if (!mockPeersAvailable) {
+        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
+        return;
+      }
+
+      // Add 6 mock peers — enough for 2+ rows in a 2-column grid.
+      await addMockPeers(hostPage, 6);
+      await hostPage.waitForTimeout(2000);
+
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+      await hostPage.waitForTimeout(3000);
+
+      const tiles = hostPage.locator(".split-peer-tile");
+      const tileCount = await tiles.count();
+      expect(tileCount).toBeGreaterThanOrEqual(6);
+
+      // Collect bounding box dimensions for all visible tiles.
+      const dimensions: { w: number; h: number }[] = [];
+      for (let i = 0; i < tileCount; i++) {
+        const box = await tiles.nth(i).boundingBox();
+        if (box && box.width > 0 && box.height > 0) {
+          dimensions.push({ w: box.width, h: box.height });
+        }
+      }
+      expect(dimensions.length).toBeGreaterThanOrEqual(4);
+
+      // All tiles must have the same width and height within 1px.
+      const refW = dimensions[0].w;
+      const refH = dimensions[0].h;
+      for (let i = 1; i < dimensions.length; i++) {
+        expect(Math.abs(dimensions[i].w - refW)).toBeLessThanOrEqual(1);
+        expect(Math.abs(dimensions[i].h - refH)).toBeLessThanOrEqual(1);
+      }
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 7. Gaps between adjacent tiles
+  //
+  // The `.ss-peer-panel` CSS grid has `gap: 10px`. Adjacent tiles in the
+  // same row must have at least 8px of horizontal space between them
+  // (allowing for sub-pixel rounding). This ensures tiles never visually
+  // touch each other.
+  // ──────────────────────────────────────────────────────────────────────
+  test("adjacent tiles have gaps between them during screen share", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_gaps_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSGapsHost",
+      "SSGapsGuest",
+    );
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const mockButton = hostPage.locator("button.video-control-button", {
+        has: hostPage.locator(".tooltip", { hasText: /Mock Peers/i }),
+      });
+      const mockPeersAvailable = await mockButton.isVisible().catch(() => false);
+      if (!mockPeersAvailable) {
+        test.skip(true, 'Mock peers not enabled. Set mockPeersEnabled: "true" in config.js.');
+        return;
+      }
+
+      // Add 6 mock peers to get multiple columns.
+      await addMockPeers(hostPage, 6);
+      await hostPage.waitForTimeout(2000);
+
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+      await hostPage.waitForTimeout(3000);
+
+      // Collect bounding boxes of all visible tiles.
+      const tiles = hostPage.locator(".split-peer-tile");
+      const tileCount = await tiles.count();
+      expect(tileCount).toBeGreaterThanOrEqual(4);
+
+      const boxes: { left: number; right: number; top: number; bottom: number }[] = [];
+      for (let i = 0; i < tileCount; i++) {
+        const box = await tiles.nth(i).boundingBox();
+        if (box && box.width > 0) {
+          boxes.push({
+            left: box.x,
+            right: box.x + box.width,
+            top: box.y,
+            bottom: box.y + box.height,
+          });
+        }
+      }
+
+      // Find pairs of tiles in the same row (overlapping Y ranges) and
+      // verify horizontal gap >= 8px. The CSS gap is 10px; 8px allows
+      // for sub-pixel rounding.
+      let horizontalPairsChecked = 0;
+      for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i];
+          const b = boxes[j];
+          // Same row: vertical overlap > 50% of tile height.
+          const overlapY = Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top);
+          const tileH = a.bottom - a.top;
+          if (overlapY > tileH * 0.5) {
+            // These tiles are in the same row — check horizontal gap.
+            const gap = Math.abs(a.left > b.right ? a.left - b.right : b.left - a.right);
+            expect(gap).toBeGreaterThanOrEqual(8);
+            horizontalPairsChecked++;
+          }
+        }
+      }
+
+      // Find pairs of tiles in the same column (overlapping X ranges) and
+      // verify vertical gap >= 8px.
+      let verticalPairsChecked = 0;
+      for (let i = 0; i < boxes.length; i++) {
+        for (let j = i + 1; j < boxes.length; j++) {
+          const a = boxes[i];
+          const b = boxes[j];
+          const overlapX = Math.min(a.right, b.right) - Math.max(a.left, b.left);
+          const tileW = a.right - a.left;
+          if (overlapX > tileW * 0.5) {
+            // Same column — check vertical gap only for adjacent rows.
+            const vGap = Math.abs(a.top > b.bottom ? a.top - b.bottom : b.top - a.bottom);
+            if (vGap < 50) {
+              // Adjacent rows (gap < 50px means they are neighbors).
+              expect(vGap).toBeGreaterThanOrEqual(8);
+              verticalPairsChecked++;
+            }
+          }
+        }
+      }
+
+      // We must have found at least one pair in a multi-column/multi-row
+      // grid to make the gap assertion meaningful.
+      expect(horizontalPairsChecked + verticalPairsChecked).toBeGreaterThan(0);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 8. Tile width fills the grid cell
+  //
+  // Each `.split-peer-tile` has `width: 100%` so it fills the full grid
+  // cell width. The tile width should be approximately
+  // (panel_content_width - gaps) / columns. This test verifies tiles
+  // consume the available panel width minus padding and gaps.
+  // ──────────────────────────────────────────────────────────────────────
+  test("tiles fill the available grid cell width during screen share", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_fill_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSFillHost",
+      "SSFillGuest",
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+      await hostPage.waitForTimeout(2000);
+
+      const panel = hostPage.locator(".ss-peer-panel");
+      await expect(panel).toBeVisible({ timeout: 10_000 });
+
+      const tiles = hostPage.locator(".split-peer-tile");
+      const tileCount = await tiles.count();
+      expect(tileCount).toBeGreaterThan(0);
+
+      // Get the panel content width and tile width.
+      const metrics = await panel.evaluate((el) => {
+        const cs = getComputedStyle(el);
+        const paddingLeft = parseFloat(cs.paddingLeft) || 0;
+        const paddingRight = parseFloat(cs.paddingRight) || 0;
+        const gap = parseFloat(cs.columnGap) || parseFloat(cs.gap) || 0;
+        const contentWidth = el.clientWidth - paddingLeft - paddingRight;
+        // Count resolved grid columns from computed style.
+        const cols = cs.gridTemplateColumns.split(/\s+/).filter((s) => s.length > 0).length;
+        return { contentWidth, gap, cols };
+      });
+
+      const firstTile = tiles.first();
+      const tileBox = await firstTile.boundingBox();
+      expect(tileBox).not.toBeNull();
+
+      // Expected tile width: (contentWidth - (cols-1)*gap) / cols
+      const expectedTileWidth =
+        (metrics.contentWidth - (metrics.cols - 1) * metrics.gap) / metrics.cols;
+
+      // Allow 2px tolerance for sub-pixel rounding.
+      expect(Math.abs(tileBox!.width - expectedTileWidth)).toBeLessThanOrEqual(2);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 9. Name truncation: long usernames do not overflow into icon area
+  //
+  // The `.floating-name` label uses `max-width: calc(100% - 90px)` with
+  // `white-space: nowrap; text-overflow: ellipsis; overflow: hidden` to
+  // prevent long names from overflowing into the mute/signal icon area
+  // on the right side of the tile.
+  // ──────────────────────────────────────────────────────────────────────
+  test("long usernames are truncated and do not overflow tile icons", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_panel_trunc_${Date.now()}`;
+
+    // Use a very long guest name to test truncation.
+    const longName = "AVeryLongDisplayNameThatShouldDefinitelyBeTruncatedByCSS";
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSTruncHost",
+      longName,
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      await hostPage.waitForTimeout(3000);
+
+      const shareActivated = await startScreenShare(guestPage, hostPage);
+      if (!shareActivated) {
+        test.skip(true, "Screen share could not be auto-accepted.");
+        return;
+      }
+      await hostPage.waitForTimeout(2000);
+
+      // Find the .floating-name element within a split-peer-tile.
+      const floatingNames = hostPage.locator(".split-peer-tile .floating-name");
+      const nameCount = await floatingNames.count();
+      expect(nameCount).toBeGreaterThan(0);
+
+      for (let i = 0; i < nameCount; i++) {
+        const nameEl = floatingNames.nth(i);
+        const isVisible = await nameEl.isVisible();
+        if (!isVisible) continue;
+
+        // Verify overflow is hidden (the real truncation contract).
+        // Note: text-overflow:ellipsis is declared but has no visual
+        // effect on display:inline-flex elements — the geometric check
+        // below is the authoritative truncation assertion.
+        const styles = await nameEl.evaluate((el) => {
+          const cs = getComputedStyle(el);
+          return { overflow: cs.overflow };
+        });
+        expect(styles.overflow).toBe("hidden");
+
+        // Verify the floating-name does not extend beyond the tile's
+        // right edge minus icon area (~90px). The name's right edge must
+        // not reach the tile's right edge.
+        const overflow = await nameEl.evaluate((el) => {
+          const tile = el.closest(".split-peer-tile") as HTMLElement;
+          if (!tile) return { nameRight: 0, tileRight: 0 };
+          const nr = el.getBoundingClientRect();
+          const tr = tile.getBoundingClientRect();
+          return { nameRight: nr.right, tileRight: tr.right };
+        });
+
+        // The name's right edge should leave room for icons (~90px area).
+        // Allow some tolerance but the name must not reach the tile edge.
+        if (overflow.tileRight > 0) {
+          const rightMargin = overflow.tileRight - overflow.nameRight;
+          // There should be at least 40px of space for icons (the CSS
+          // reserves 90px, but the actual icon width varies).
+          expect(rightMargin).toBeGreaterThanOrEqual(40);
+        }
+      }
     } finally {
       await browser1.close();
       await browser2.close();

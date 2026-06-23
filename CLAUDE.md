@@ -61,6 +61,23 @@ Run agents in parallel when tasks are independent. Always run `code-reviewer` af
 - **Consider scale.** Meetings may have many participants. Events that fire per-connection (not per-user) can cause O(n) storms during reconnection waves. Session management, NATS publishing, and UI re-renders must all be evaluated for fan-out cost.
 - **Consider the server as part of the system.** Client-side fixes that rely on server behavior (e.g., session lifecycle, event broadcasting) must verify the server actually upholds those assumptions, and vice versa. Cross-cutting changes require both frontend and backend agents.
 
+## Change Acceptance Criteria
+
+Every change must satisfy the applicable rules below. These are derived from recurring review findings — each rule exists because its absence caused a shipped defect or a review round-trip.
+
+| If your change... | You MUST... |
+|---|---|
+| **Fixes a bug or changes runtime behavior** | Include a regression test that **FAILS on the un-fixed code**. Reverting the production change must break the test. A test that passes on both the fixed and unfixed code proves nothing. |
+| **Changes user-facing behavior** (click flow, rendered state, toast, control, overlay, route) | Include a Playwright E2E spec in `e2e/tests/` covering the new flow. "Covered" means the spec has **run green** (local docker e2e stack or scoped CI dispatch) — written-but-never-run does not count. An untagged spec (no `@bvt`) does not run in per-PR CI; validate it another way. |
+| **Includes a new or modified test** | The test must call or import the **production function/path** it claims to guard — not re-implement the logic inline. A test that computes the expected value the same way the production code does is testing its own copy, not the production code. |
+| **Adds or modifies a comment/doc-comment making a behavioral claim** | The claim must be **traceable to code that delivers it**. "Fires regardless of X" requires a code path that provably fires regardless of X. If the claim doesn't match the code, either fix the code or fix the comment — never ship the contradiction. |
+| **Touches state in encoder, connection, session, or transport code** | Trace ALL lifecycle paths for that state: cold start, reconnect (#1311 path), re-election, fatal restart, graceful disconnect, tab-background/resume. A fix for one path must not break another. `None` after cold-start and `None` after reconnect are different runtime states. |
+| **Reuses a constant/threshold/interval across camera↔screen or WT↔WS** | Verify the existing values are the same across those contexts. If they DIFFER, the difference is deliberate (e.g., screen's 3s GOP for text readability vs camera's 5s). Unifying without justification is a regression. |
+| **Keys off a "congestion," "pressure," "full," or "backpressure" signal** | Trace the signal to the actual queue/buffer where real backpressure surfaces. Actix mailbox `Full` is a burst absorber, NOT a receiver's downlink. Verify both transports (WS + WT). |
+| **Adds recovery/exit hysteresis (consecutive-success counters, cooldown timers)** | Verify it cannot **wedge** under the condition that triggers it. Strictly-consecutive success counters reset under ongoing contention and can pin a healthy entity indefinitely. Prefer windowed/decaying/time-bounded exits. |
+| **Is a test-reliability or de-flake change** | Demonstrate the spec **actually runs green** after the fix (local docker or CI dispatch). A de-flake PR that hasn't been run proves nothing about reliability. |
+| **Has a merge conflict with the base branch** | Rebase clean before requesting review. Red CI from a merge conflict is a blocker regardless of code quality. |
+
 ## Source Code Rules
 
 - **No symlinks or hardlinks for source files.** Each crate/UI must own its files independently. Do not use symlinks between source directories.

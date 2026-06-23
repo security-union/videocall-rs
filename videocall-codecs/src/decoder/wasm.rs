@@ -25,7 +25,7 @@ use crate::messages::{
     WorkerMessage, FRESHNESS_SKIP_KIND, REQUEST_KEYFRAME_KIND, WORKER_LOG_KIND,
 };
 #[cfg(feature = "wasm")]
-use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
 use web_sys::{console, window, VideoFrame, Worker};
@@ -454,7 +454,11 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                     stream_id: None,
                     ts_ms: now_ms(),
                     metrics: vec![
-                        metric!("event", "freshness_skip"),
+                        // Static literal → zero-alloc borrow (#1421).
+                        Metric {
+                            name: "event",
+                            value: MetricValue::text_static("freshness_skip"),
+                        },
                         metric!("from_peer", skip_msg.from_peer.unwrap_or_default()),
                         metric!("to_peer", skip_msg.to_peer.unwrap_or_default()),
                         metric!("head_age_ms", skip_msg.head_age_ms),
@@ -517,7 +521,11 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                     stream_id: None,
                     ts_ms: now_ms(),
                     metrics: vec![
-                        metric!("event", "worker_log"),
+                        // Static literal → zero-alloc borrow (#1421).
+                        Metric {
+                            name: "event",
+                            value: MetricValue::text_static("worker_log"),
+                        },
                         metric!("level", log_msg.level),
                         metric!("target", log_msg.target),
                         metric!("message", log_msg.message),

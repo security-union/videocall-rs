@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 use std::error::Error;
-use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -185,10 +184,9 @@ pub struct DiagnosticManager {
     ///
     /// Backed by a Worker (when available) so that background-tab throttling
     /// on the main thread does not starve adaptive-quality feedback or
-    /// diagnostics reporting. Dropping the manager terminates the worker.
-    /// Wrapped in `Rc` to be cheap to clone and to keep the existing field
-    /// shape; the inner `HeartbeatTimer`'s `Drop` impl handles teardown.
-    timer: Option<Rc<HeartbeatTimer>>,
+    /// diagnostics reporting. Dropping the manager terminates the worker: the
+    /// inner `HeartbeatTimer`'s `Drop` impl handles teardown.
+    timer: Option<HeartbeatTimer>,
 }
 
 unsafe impl Sync for DiagnosticManager {}
@@ -254,7 +252,7 @@ impl DiagnosticManager {
                 log::debug!("Failed to enqueue heartbeat event: {e:?}");
             }
         });
-        self.timer = Some(Rc::new(timer));
+        self.timer = Some(timer);
     }
 
     // Set the callback for UI updates
@@ -363,13 +361,6 @@ impl DiagnosticManager {
     pub fn get_stats(&self) -> Result<JsValue, Box<dyn Error>> {
         // Will be implemented when we need it
         Ok(JsValue::null())
-    }
-}
-
-impl Drop for DiagnosticManager {
-    fn drop(&mut self) {
-        // Simply drop the timer, its own Drop impl will handle cleanup
-        self.timer = None;
     }
 }
 
@@ -663,12 +654,12 @@ impl StreamStats {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SenderDiagnosticManager {
     sender: Sender<SenderDiagnosticEvent>,
     /// See [`DiagnosticManager::timer`] for the rationale behind the
     /// worker-backed heartbeat.
-    timer: Option<Rc<HeartbeatTimer>>,
+    timer: Option<HeartbeatTimer>,
     _report_interval_ms: u64,
 }
 
@@ -720,7 +711,7 @@ impl SenderDiagnosticManager {
                 log::debug!("Failed to enqueue sender heartbeat event: {e:?}");
             }
         });
-        self.timer = Some(Rc::new(timer));
+        self.timer = Some(timer);
     }
 
     pub fn set_stats_callback(&self, callback: Callback<String>) {
@@ -764,12 +755,6 @@ impl SenderDiagnosticManager {
         {
             error!("Failed to handle diagnostic packet: {e}");
         }
-    }
-}
-
-impl Drop for SenderDiagnosticManager {
-    fn drop(&mut self) {
-        self.timer = None;
     }
 }
 

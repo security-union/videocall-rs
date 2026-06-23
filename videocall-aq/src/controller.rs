@@ -384,10 +384,17 @@ impl EncoderBitrateController {
     /// Legacy semantics (issue #989): all `n` layers start ACTIVE — the manager's
     /// `set_simulcast_layers` seeds `active_layer_count == n`. The earned ceiling
     /// is therefore the full active count, so behavior is byte-identical to the
-    /// pre-ramp path. The CAMERA encoder now uses
+    /// pre-ramp path.
+    ///
+    /// NO production path uses this all-rungs-hot seed anymore — it is LEGACY /
+    /// TEST-ONLY (kept for the controller tests that need a known full-ladder
+    /// starting state). The CAMERA encoder uses
     /// [`set_simulcast_ceiling_start_at_base`](Self::set_simulcast_ceiling_start_at_base)
-    /// instead (start at the base, earn up); screen share keeps these all-active
-    /// semantics.
+    /// (start at the base, earn up); the SCREEN encoder uses
+    /// [`set_simulcast_ceiling_start_optimistic`](Self::set_simulcast_ceiling_start_optimistic)
+    /// (seed the `[low, high]` optimistic baseline, issue #1553). Screen has never
+    /// used this all-active seed in production — #1200 moved it to start-at-base,
+    /// and #1553 moved it to the optimistic seed.
     pub fn set_simulcast_layers(&mut self, n: usize) {
         // Clamp + configure the manager (single source of truth for the count).
         self.quality_manager.set_simulcast_layers(n);
@@ -417,6 +424,40 @@ impl EncoderBitrateController {
         self.build_layer_tiers_for_ceiling();
         // Start entitled only to the base layer (== active count, which the
         // manager seeded to 1); the ramp earns the rest.
+        self.earned_active_ceiling = self.quality_manager.active_layer_count();
+    }
+
+    /// Configure the simulcast ladder CEILING to `n` and seed the ACTIVE count at
+    /// an OPTIMISTIC baseline `initial_active` (issue #1553) — the SCREEN path.
+    ///
+    /// Unlike [`set_simulcast_ceiling_start_at_base`](Self::set_simulcast_ceiling_start_at_base)
+    /// (active == 1, earn every rung), this delegates to
+    /// [`AdaptiveQualityManager::set_simulcast_ceiling_start_optimistic`] so the
+    /// screen publisher emits `min(initial_active, n)` rungs from frame one. At
+    /// the default seed of 2 that ladder is `[low, high]` (base 720p/500 + the
+    /// top 1080p/2500 rung), so the sharp 1080p stream is published immediately —
+    /// this exists because the 6 s-clear headroom ramp never climbs on a busy
+    /// share in a large meeting, so start-at-base left the screen permanently
+    /// fuzzy (issue #1553). The shed-down machinery still floors active back to 1
+    /// under sustained backpressure, and the ramp can still earn the deferred
+    /// MIDDLE `medium` rung up to the full ceiling.
+    ///
+    /// `earned_active_ceiling` is set to the seeded active count, NOT 1 — this is
+    /// load-bearing: the backpressure union/cap-restore path in
+    /// [`tick`](Self::tick) clamps recovery to `earned_active_ceiling`, so if a
+    /// transient congestion blip sheds the optimistic rung, the controller is
+    /// entitled to restore back UP to the seeded baseline without re-earning it
+    /// through a fresh 6 s probe. (Down-side shedding via `drop_top_layer` floors
+    /// at 1 and does not consult this ceiling, so shed-to-floor still works.) The
+    /// per-layer tier table is built for the FULL ceiling. Call once after
+    /// construction / on each (re)share rising edge, before the first tick.
+    pub fn set_simulcast_ceiling_start_optimistic(&mut self, n: usize, initial_active: usize) {
+        self.quality_manager
+            .set_simulcast_ceiling_start_optimistic(n, initial_active);
+        self.build_layer_tiers_for_ceiling();
+        // Entitle recovery back up to the optimistic seed (the manager already
+        // clamped active to `[1, ceiling]`), so a transient shed of the seeded
+        // rung can be restored without re-earning it via the headroom probe.
         self.earned_active_ceiling = self.quality_manager.active_layer_count();
     }
 
@@ -1725,6 +1766,49 @@ mod tests {
         );
     }
 
+    /// Issue #1553 shed-down (controller end-to-end): a SCREEN controller seeded
+    /// at the OPTIMISTIC baseline must, under SUSTAINED encoder backpressure,
+    /// shed all the way DOWN to the floor (1) through the REAL `tick` /
+    /// backpressure path — NOT just via a direct `drop_top_layer` call. This
+    /// proves the higher seed does not block the shed direction (the down side of
+    /// Option B): a genuinely congested device still reaches the single base rung.
+    #[test]
+    fn test_screen_optimistic_seed_sheds_down_to_floor_under_backpressure() {
+        use crate::constants::SCREEN_INITIAL_ACTIVE_LAYERS;
+        let base_ms: u64 = 100_000;
+        let clock = Arc::new(TestClock::new(base_ms));
+        let mut controller = screen_controller_with_clock(&clock);
+        controller.set_simulcast_ceiling_start_optimistic(3, SCREEN_INITIAL_ACTIVE_LAYERS);
+        let seeded = controller.active_layer_count();
+        assert!(
+            seeded >= 2,
+            "precondition: optimistic seed must start above the floor (got {seeded}) \
+             so the shed-down has somewhere to fall from"
+        );
+
+        // Warm up with zero backpressure (clears the screen warmup window).
+        let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 9000.0, 4, 1000.0);
+
+        // Feed sustained HIGH backpressure across spaced ticks; each advances past
+        // the sustain + min-transition guard so a shed can fire each eligible tick.
+        let step =
+            (ENCODER_BACKPRESSURE_SUSTAIN_MS.max(MIN_TIER_TRANSITION_INTERVAL_MS as f64)) + 500.0;
+        for _ in 0..20 {
+            if controller.active_layer_count() == 1 {
+                break;
+            }
+            t += step;
+            tick_at(&mut controller, &clock, t, ENCODER_QUEUE_BACKPRESSURE_HIGH);
+        }
+        assert_eq!(
+            controller.active_layer_count(),
+            1,
+            "sustained backpressure from the optimistic seed must shed all the way \
+             to the floor (base rung) — the shed-down path is not gated by the \
+             higher seed (#1553)"
+        );
+    }
+
     /// A brief backpressure spike that does NOT persist for the sustain window
     /// must not shed a layer (the sustain timer protects against single-frame
     /// hiccups / GC pauses).
@@ -2551,18 +2635,30 @@ mod tests {
         (controller, t)
     }
 
-    /// #1200: a SCREEN controller configured via
-    /// `set_simulcast_ceiling_start_at_base` must COLD-START at exactly one
-    /// active layer (base rung), even though the ceiling permits 3 — the earn-up
-    /// ramp, NOT the all-active `set_simulcast_layers` the screen path used
-    /// before. Mirrors `test_camera_cold_start_is_one_active_layer`.
+    /// #1553: a SCREEN controller configured via
+    /// `set_simulcast_ceiling_start_optimistic` must seed the OPTIMISTIC baseline
+    /// (`SCREEN_INITIAL_ACTIVE_LAYERS` = 2 → the `[low, high]` ladder: base `low`
+    /// plus the top `high`/1080p rung; the middle `medium` rung is deferred), NOT
+    /// the base rung (1, the start-at-base camera path the screen path used before
+    /// #1553 and which left it permanently fuzzy) and NOT the full 3-rung ladder
+    /// (the all-rungs-hot slam #1200 removed). Pins the seed against the real
+    /// constant. Contrast with `test_camera_cold_start_is_one_active_layer`, which
+    /// asserts the CAMERA path still cold-starts at 1.
     #[test]
-    fn test_screen_cold_start_is_one_active_layer() {
+    fn test_screen_cold_start_is_optimistic_baseline() {
+        use crate::constants::SCREEN_INITIAL_ACTIVE_LAYERS;
         let base_ms: u64 = 100_000;
         let clock = Arc::new(TestClock::new(base_ms));
         let mut controller = screen_controller_with_clock(&clock);
-        controller.set_simulcast_ceiling_start_at_base(3);
+        controller.set_simulcast_ceiling_start_optimistic(3, SCREEN_INITIAL_ACTIVE_LAYERS);
 
+        let expected = SCREEN_INITIAL_ACTIVE_LAYERS.min(3);
+        assert!(
+            (2..3).contains(&expected),
+            "for this 3-rung screen ladder the optimistic seed must sit strictly \
+             between base (1) and the full ladder (3) so the test exercises the \
+             intended middle ground"
+        );
         assert!(
             controller.is_simulcast(),
             "ceiling > 1 must put the screen controller in simulcast mode so the ramp runs"
@@ -2574,61 +2670,75 @@ mod tests {
         );
         assert_eq!(
             controller.active_layer_count(),
-            1,
-            "screen cold start must be a single active (base) rung, not the ceiling \
-             (regression guard: a revert to set_simulcast_layers would seed 3 here)"
+            expected,
+            "screen cold start must seed the optimistic baseline ([low, high]: \
+             base + the 1080p top rung, middle deferred), not the base rung \
+             (#1553) and not the full ladder (#1200)"
         );
     }
 
-    /// Issue #1229: the screen AQ loop is spawned ONCE and outlives individual
-    /// share sessions; while idle it keeps ticking a CLEAR queue, so the headroom
-    /// probe drifts `active_layer_count` UP toward the ceiling. On the next
-    /// (re)share the loop re-arms cold start by calling
-    /// `set_simulcast_ceiling_start_at_base` again — which MUST reset the active
-    /// count back to the base rung so the re-share starts at base (the #1200
-    /// first-frame contract), not at the drifted-up count.
+    /// Issue #1229 + #1553: the screen AQ loop is spawned ONCE and outlives
+    /// individual share sessions; while idle it keeps ticking a CLEAR queue, so
+    /// the headroom probe drifts `active_layer_count` UP toward the ceiling. On
+    /// the next (re)share the loop re-seeds by calling
+    /// `set_simulcast_ceiling_start_optimistic` again — which MUST reset the
+    /// active count back to the OPTIMISTIC baseline (`SCREEN_INITIAL_ACTIVE_LAYERS`
+    /// = 2), undoing a prior session's drift in EITHER direction (here: drifted UP
+    /// to the full ladder 3 → pulled back to 2). Post-#1553 the re-arm seeds the
+    /// optimistic baseline, NOT the base rung — that is the whole fix: a re-share
+    /// must not be stuck fuzzy at base waiting for the 6 s ramp.
     ///
     /// This test drives the REAL drift (clean ticks ramp the active count up via
-    /// the probe), asserts it actually climbed (so the test is meaningful, not
-    /// X==X), then re-arms and asserts it dropped back to exactly 1. Mutation
-    /// check: if the re-arm reset is removed (i.e. the second
-    /// `set_simulcast_ceiling_start_at_base` call is deleted), the final assert
-    /// fails because the active count is still the drifted-up value.
+    /// the probe to the FULL ceiling 3), asserts it actually climbed ABOVE the
+    /// optimistic baseline (so the reset is a genuine DOWN move, not a no-op),
+    /// then re-seeds and asserts it dropped back to exactly the baseline. Mutation
+    /// check: if the re-seed call is removed, the final assert fails because the
+    /// active count is still the drifted-up value (3).
     #[test]
-    fn test_screen_reshare_rearm_resets_drifted_active_count_to_base() {
+    fn test_screen_reshare_rearm_resets_drifted_active_count_to_optimistic_baseline() {
+        use crate::constants::SCREEN_INITIAL_ACTIVE_LAYERS;
         let base_ms: u64 = 100_000;
         let clock = Arc::new(TestClock::new(base_ms));
         let mut controller = screen_controller_with_clock(&clock);
+        let baseline = SCREEN_INITIAL_ACTIVE_LAYERS.min(3);
 
-        // First share: arm cold start, then let the probe ramp drift the active
-        // count UP under a sustained-clear encoder queue (idle/clean ticks).
-        controller.set_simulcast_ceiling_start_at_base(3);
-        assert_eq!(controller.active_layer_count(), 1, "cold start at base");
+        // First share: seed the optimistic baseline, then let the probe ramp drift
+        // the active count UP to the full ceiling (3) under a sustained-clear
+        // encoder queue (idle/clean ticks).
+        controller.set_simulcast_ceiling_start_optimistic(3, SCREEN_INITIAL_ACTIVE_LAYERS);
+        assert_eq!(
+            controller.active_layer_count(),
+            baseline,
+            "first share seeds the optimistic baseline"
+        );
 
         let mut t = warm_up(&mut controller, &clock, base_ms as f64 + 6000.0, 4, 1000.0);
         for _ in 0..12 {
             t += probe_step_ms();
             tick_at(&mut controller, &clock, t, 0);
-            if controller.active_layer_count() > 1 {
+            if controller.active_layer_count() == 3 {
                 break;
             }
         }
-        // The drift MUST actually happen, or the reset below proves nothing.
+        // The drift MUST actually climb ABOVE the baseline, or the reset below
+        // proves nothing (it would be a no-op rather than a genuine DOWN move).
         assert!(
-            controller.active_layer_count() > 1,
-            "precondition: clean ticks must drift the active count above base \
-             (got {}) so the re-arm reset is genuinely exercised",
+            controller.active_layer_count() > baseline,
+            "precondition: clean ticks must drift the active count above the \
+             optimistic baseline (got {}) so the re-seed reset is genuinely \
+             exercised as a down move",
             controller.active_layer_count()
         );
 
-        // Next (re)share: the AQ loop re-arms cold start. This MUST reset the
-        // active count back to the base rung. (Remove this call → final assert
-        // fails: mutation guard.)
-        controller.set_simulcast_ceiling_start_at_base(3);
+        // Next (re)share: the AQ loop re-seeds the optimistic baseline. This MUST
+        // reset the drifted-up active count back DOWN to the baseline. (Remove
+        // this call → final assert fails: mutation guard.)
+        controller.set_simulcast_ceiling_start_optimistic(3, SCREEN_INITIAL_ACTIVE_LAYERS);
         assert_eq!(
             controller.active_layer_count(),
-            1,
-            "a re-share re-arm must reset the drifted active count back to the base rung (#1229)"
+            baseline,
+            "a re-share re-seed must reset the drifted active count back to the \
+             optimistic baseline (#1553)"
         );
     }
 

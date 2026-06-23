@@ -152,11 +152,14 @@ use super::super::client::VideoCallClient;
 use super::classify_encode_error::{
     classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
 };
-use super::encoder_state::{keyframe_tick_decision, EncoderState, KeyframeTickInput};
+use super::encoder_state::{
+    keyframe_tick_decision, periodic_keyframe_due, EncoderState, KeyframeTickInput,
+};
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    simulcast_layers, AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
+    simulcast_layers, AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD,
+    PERIODIC_KEYFRAME_MAX_INTERVAL_MS, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -1725,6 +1728,29 @@ impl CameraEncoder {
     /// The camera encoder's diagnostics loop reads it to coordinate bandwidth.
     pub fn screen_sharing_flag(&self) -> Rc<AtomicBool> {
         self.screen_sharing_active.clone()
+    }
+
+    /// Returns the camera ENABLED flag (`Arc<AtomicBool>`): the camera-on/off
+    /// signal (issue #1398).
+    ///
+    /// This is the SAME `EncoderState::enabled` atom that [`Self::set_enabled`]
+    /// writes (`set_enabled(true)` → camera ON, `set_enabled(false)` / `stop()`
+    /// → camera OFF). The `Host` toggles it directly: it calls
+    /// `camera.set_enabled(true)` when video is on and `camera.set_enabled(false)`
+    /// (plus `stop()`) when video is off (audio-only). So `false` is an
+    /// UNAMBIGUOUS, always-current "camera off / audio-only" indication — unlike
+    /// the shared audio-tier atoms, whose values (top-tier 50 kbps / index 0) are
+    /// indistinguishable between "camera off" and "camera on and healthy".
+    ///
+    /// Shared into the [`MicrophoneEncoder`] (via
+    /// [`MicrophoneEncoder::set_camera_active_signal`]) so the mic-side
+    /// single-layer uplink-distress detector (#1398) can GATE itself to
+    /// camera-off: the mic bitrate-floor lever and the camera AQ loop's audio
+    /// downshift are then mutually exclusive (no compounding). `Arc` (not `Rc`)
+    /// because the atom is `EncoderState`'s `Arc<AtomicBool>` and it crosses into
+    /// the mic encoder, matching the congestion-flag wiring.
+    pub fn camera_enabled_flag(&self) -> Arc<AtomicBool> {
+        self.state.enabled.clone()
     }
 
     /// Returns the current video quality tier index (0 = best, 7 = minimal).
@@ -3317,13 +3343,13 @@ impl CameraEncoder {
                             // never lost; added recovery latency is bounded by the
                             // cooldown. The periodic GOP keyframe is never gated.
                             let now_ms = window().performance().unwrap().now();
-                            // Use tier-controlled keyframe interval instead of the
-                            // static constant, allowing adaptive quality to adjust it.
-                            // Using `%` instead of `.is_multiple_of()` for compatibility
-                            // with Rust toolchains older than 1.87.
-                            #[allow(clippy::manual_is_multiple_of)]
-                            let is_periodic_keyframe = local_keyframe_interval > 0
-                                && video_frame_counter % local_keyframe_interval == 0;
+                            let is_periodic_keyframe = periodic_keyframe_due(
+                                video_frame_counter,
+                                local_keyframe_interval,
+                                now_ms,
+                                last_keyframe_emit_ms,
+                                PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                            );
                             // Resolve the keyframe decision via the shared single
                             // source of truth (issue #1347 item 2: the camera AND
                             // screen loops call the same pure `keyframe_tick_decision`,
@@ -3707,11 +3733,12 @@ mod tests {
         camera_encoder_restarts_other, clamp_layer_count, encoders_to_build,
         format_layer_transition, frame_is_healthy, initial_active_layer_count,
         is_fatal_encoder_error_message, keyframe_tick_decision, layer_ceiling_to_count,
-        loop_is_superseded, next_single_layer_pin, record_camera_restart, shed_reason,
-        should_pin_single_layer_low, should_teardown_shed_layer, wt_drop_step_down_decision,
-        wt_saturation_step_down_decision, KeyframeTickInput, LayerView, SimulcastLayerInfo,
-        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
-        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        loop_is_superseded, next_single_layer_pin, periodic_keyframe_due, record_camera_restart,
+        shed_reason, should_pin_single_layer_low, should_teardown_shed_layer,
+        wt_drop_step_down_decision, wt_saturation_step_down_decision, KeyframeTickInput, LayerView,
+        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
+        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
+        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use crate::adaptive_quality_constants::{
         WS_SELF_CONGESTION_DROP_THRESHOLD, WS_SELF_CONGESTION_WINDOW_MS,
@@ -4595,6 +4622,119 @@ mod tests {
         assert!(
             !decision.step_down,
             "a flat-at-0 saturation counter must never step down (WS users / healthy WT)"
+        );
+    }
+
+    /// Issue #1510: the wall-clock periodic keyframe ceiling fires when elapsed
+    /// time since the last keyframe exceeds the cap, even when the frame-count
+    /// modulo has not triggered. Calls the PRODUCTION `periodic_keyframe_due`
+    /// function (the same one the camera/screen encode loops call).
+    ///
+    /// Mutation guards:
+    /// - Removing the `wallclock_periodic` disjunction from `periodic_keyframe_due`
+    ///   prevents the wall-clock trigger → `periodic_at[1]` would be 50 → FAILS.
+    /// - Setting `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` too high makes the wall-clock
+    ///   check never fire within the simulated window → FAILS.
+    #[test]
+    fn wallclock_periodic_keyframe_fires_at_low_fps() {
+        use crate::adaptive_quality_constants::PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+
+        let keyframe_interval_frames: u32 = 50; // "minimal" tier
+        let actual_fps = 7.0_f64; // CPU-bound, well below nominal 10fps
+        let frame_interval_ms = 1000.0 / actual_fps;
+        let cd = FORCED_KEYFRAME_COOLDOWN_MS;
+
+        let mut last_keyframe_emit_ms: Option<f64> = None;
+        let mut now = 0.0_f64;
+        let mut periodic_at: Vec<u32> = Vec::new();
+
+        for frame in 0u32..60 {
+            let is_periodic = periodic_keyframe_due(
+                frame,
+                keyframe_interval_frames,
+                now,
+                last_keyframe_emit_ms,
+                PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+            );
+
+            let decision = keyframe_tick_decision(KeyframeTickInput {
+                now_ms: now,
+                pli_pending: false,
+                is_periodic,
+                cooldown_reset: false,
+                last_keyframe_emit_ms,
+                cooldown_ms: cd,
+            });
+
+            if decision.want_keyframe {
+                periodic_at.push(frame);
+            }
+            last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
+            now += frame_interval_ms;
+        }
+
+        assert_eq!(periodic_at[0], 0, "frame 0 must emit a periodic keyframe");
+        assert!(
+            periodic_at.len() >= 2,
+            "the wall-clock ceiling must trigger at least one extra periodic keyframe \
+             before the frame-counted boundary at frame 50"
+        );
+        let wallclock_fire = periodic_at[1];
+        assert!(
+            wallclock_fire < 50,
+            "wall-clock periodic must fire before the frame-counted boundary (frame 50), \
+             but fired at frame {wallclock_fire}"
+        );
+        let fire_time_ms = wallclock_fire as f64 * frame_interval_ms;
+        assert!(
+            fire_time_ms >= PERIODIC_KEYFRAME_MAX_INTERVAL_MS
+                && fire_time_ms < PERIODIC_KEYFRAME_MAX_INTERVAL_MS + frame_interval_ms * 2.0,
+            "wall-clock periodic should fire within two frames of {PERIODIC_KEYFRAME_MAX_INTERVAL_MS}ms, \
+             but fired at {fire_time_ms:.1}ms (frame {wallclock_fire})"
+        );
+    }
+
+    /// Issue #1510 / Blocker 2: after a reconnect clears `last_keyframe_emit_ms`
+    /// to `None` mid-session (frame_counter > 0), the wall-clock ceiling must
+    /// still emit a keyframe immediately — not wait for the next frame-count modulo.
+    ///
+    /// Mutation guard: removing the `None => frame_counter > 0` arm from
+    /// `periodic_keyframe_due` makes it return `false` here → FAILS.
+    #[test]
+    fn wallclock_periodic_fires_immediately_after_reconnect_clears_clock() {
+        use crate::adaptive_quality_constants::PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+
+        let keyframe_interval_frames: u32 = 150; // full_hd tier
+                                                 // Mid-session: frame counter is well past 0 but nowhere near the next modulo.
+        let frame_counter: u32 = 73;
+        let now_ms = 10_000.0; // 10s into the session
+
+        // Reconnect cleared last_keyframe_emit_ms to None.
+        let result = periodic_keyframe_due(
+            frame_counter,
+            keyframe_interval_frames,
+            now_ms,
+            None, // reconnect cleared this
+            PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+        );
+        assert!(
+            result,
+            "after a reconnect clears the keyframe clock (None) mid-session \
+             (frame {frame_counter} > 0), periodic_keyframe_due must return true \
+             to re-arm the wall-clock ceiling immediately"
+        );
+
+        // Verify frame 0 also fires (first-ever frame, not a reconnect).
+        let first_frame = periodic_keyframe_due(
+            0,
+            keyframe_interval_frames,
+            0.0,
+            None,
+            PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+        );
+        assert!(
+            first_frame,
+            "frame 0 must fire via the frame-count modulo (0 % 150 == 0)"
         );
     }
 }

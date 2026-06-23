@@ -210,6 +210,39 @@ pub struct DecodeBudgetCtx(pub Signal<DecodeBudgetOverride>);
 #[derive(Clone, Copy)]
 pub struct UserRequestedDecodeCtx(pub Signal<std::collections::HashSet<String>>);
 
+/// Issue #1558: the live protective-mode report, published by the decode-budget
+/// control loop in `AttendantsComponent` and consumed by `Host` to actuate the
+/// LOCAL encoder send-layer self-shed (stage 3).
+///
+/// Protective mode is a thin layer ON TOP of the #1557 decode cascade: when the
+/// client is in sustained distress (low FPS / saturated main thread / audio
+/// buffer backing up / low-cap + crowded), the loop latches `active` true and —
+/// once the cascade reaches floor — requests `encoder_layer_ceiling` (a layer
+/// COUNT, 2 then 1) to shed the LOCAL encoder's send ladder and free CPU for
+/// decode + audio. `Host` composes this ceiling with the user's persisted "layers
+/// published" preference via `min` (so neither clobbers the other) and applies it
+/// through the existing `set_user_layer_ceiling` actuator. When protective mode
+/// exits, `encoder_layer_ceiling` reverts to `None` and `Host` restores the
+/// user's preference alone — full reversibility.
+///
+/// The decode-side stages (cascade layers→pause, emergency non-speaker pause) are
+/// actuated by the loop itself via `decode_budget_cap`; only the ENCODER stage
+/// crosses the component boundary, hence this is the sole field that needs the
+/// context.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ProtectiveModeReport {
+    /// True while protective mode is latched on.
+    pub active: bool,
+    /// The LOCAL encoder send-layer ceiling protective mode requests (a layer
+    /// COUNT, floored at 1 = base-only), or `None` when no encoder shed is
+    /// requested (inactive, or active but the cascade has not reached floor).
+    pub encoder_layer_ceiling: Option<u32>,
+}
+
+/// Context wrapper for [`ProtectiveModeReport`] (issue #1558).
+#[derive(Clone, Copy)]
+pub struct ProtectiveModeCtx(pub Signal<ProtectiveModeReport>);
+
 const DECODE_BUDGET_OVERRIDE_KEY: &str = "vc_decode_budget_override";
 
 /// Parse a persisted decode-budget override string. Mirrors the density-mode
@@ -1404,6 +1437,13 @@ impl std::str::FromStr for Theme {
 /// Context providing the active theme signal to the component tree.
 #[derive(Clone, Copy)]
 pub struct ThemePreferenceCtx(pub Signal<Theme>);
+
+/// Context for the user-imported custom theme (single slot).
+///
+/// `Some(name)` = custom theme active (name for display).
+/// `None` = bundled default active.
+#[derive(Clone, Copy)]
+pub struct CustomThemeCtx(pub Signal<Option<String>>);
 
 const THEME_STORAGE_KEY: &str = "ui-theme";
 

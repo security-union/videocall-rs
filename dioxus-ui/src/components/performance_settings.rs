@@ -49,8 +49,8 @@
 use dioxus::prelude::*;
 use std::rc::Rc;
 use videocall_client::{
-    DegradeReason, LiveQualitySnapshot, PeerReceiveDiag, PrefMediaKind, QualityState,
-    ReceivedLayerSnapshot, ScreenQualitySnapshot, SimulcastSendSnapshot,
+    DegradeReason, LiveQualitySnapshot, PeerDeviceInfo, PeerReceiveDiag, PrefMediaKind,
+    QualityState, ReceivedLayerSnapshot, ScreenQualitySnapshot, SimulcastSendSnapshot,
 };
 use wasm_bindgen::JsCast;
 
@@ -177,7 +177,7 @@ pub fn format_send_layer(
 }
 
 /// Format the SEND simulcast header for a kind, e.g.
-/// `"3 of 3 layers active"` (active vs effective). For single-stream it reads
+/// `"Currently 3 of 3 layers active"` (active vs effective). For single-stream it reads
 /// `"Single layer"` (capitalized to match the footer's display copy). Pure /
 /// host-tested.
 pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
@@ -185,7 +185,7 @@ pub fn format_send_header(snap: &SimulcastSendSnapshot) -> String {
         "Single layer".to_string()
     } else {
         format!(
-            "{} of {} layers active",
+            "Currently {} of {} layers active",
             snap.active_layers, snap.effective_layers
         )
     }
@@ -213,6 +213,85 @@ pub fn format_peer_kind_line(
     ))
 }
 
+/// Format a coarse device-memory tier (GB) trimming a trailing `.0` so the
+/// browser's quantized whole-number tiers (1/2/4/8) read as `8 GB`, not
+/// `8.0 GB`, while a fractional tier (`0.5`) keeps its decimal (`0.5 GB`).
+/// (#1482 device display helper.)
+fn format_device_memory_gb(gb: f64) -> String {
+    // `{}` on an f64 already drops a trailing `.0` for whole values in Rust
+    // (8.0 → "8", 0.5 → "0.5"), which is exactly the trim we want. Guard NaN/
+    // negative defensively even though the client-side ingest already filtered
+    // them; a stray value here must never render a broken label.
+    if !gb.is_finite() || gb <= 0.0 {
+        return "0 GB".to_string();
+    }
+    format!("{gb} GB")
+}
+
+/// Build the ordered `(label, value)` device-info rows for a peer (#1482).
+///
+/// Only fields that are `Some` produce a pair; a `None` field is OMITTED
+/// entirely (never an empty value). The fixed order is:
+/// OS, Device, Cores, Architecture, Memory.
+/// Returns an empty `Vec` when the peer has reported nothing ("if available").
+///
+/// The `client_main_thread_load` field is deliberately NOT surfaced here
+/// (issue 1606): in the browser it is `sum(longtask_ms) / interval_ms`, which
+/// is a genuine `0.0` whenever the main thread is idle (the common case), so it
+/// read `0% load` for nearly everyone. True process/CPU % is not obtainable in
+/// browser JS, so the user-facing device line drops the segment entirely. The
+/// field still flows to the proto + health reporter + Prometheus/Grafana, where
+/// the 0-vs-None distinction is meaningful for analysis.
+///
+/// Pure + host-testable: the diagnostics panel and the signal-quality popup
+/// both render from this single source of truth, so the labels/format live in
+/// one place.
+pub fn format_peer_device_lines(info: &PeerDeviceInfo) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    if let Some(os) = &info.client_os {
+        rows.push(("OS".to_string(), os.clone()));
+    }
+    if let Some(device) = &info.client_device_type {
+        rows.push(("Device".to_string(), device.clone()));
+    }
+    if let Some(cores) = info.client_cores {
+        rows.push(("Cores".to_string(), cores.to_string()));
+    }
+    if let Some(arch) = &info.client_architecture {
+        rows.push(("Architecture".to_string(), arch.clone()));
+    }
+    if let Some(mem) = info.client_device_memory_gb {
+        rows.push(("Memory".to_string(), format_device_memory_gb(mem)));
+    }
+    rows
+}
+
+/// Render the per-peer device rows as a single COMPACT dot-separated line for
+/// the small signal-quality popup, e.g.
+/// `"macOS 14.5 · desktop · 8 cores · arm · 8 GB"`. Returns `None` when
+/// there is nothing to show so the caller can omit the block. (#1482.)
+///
+/// Built on the same `format_peer_device_lines` source of truth: it relabels
+/// the verbose panel rows into compact tokens (Cores → "N cores",
+/// OS/Device/Architecture/Memory as-is) so the panel and the popup can never
+/// drift apart on which fields are present. The always-`0%` main-thread "load"
+/// segment was dropped from the user-facing line in issue 1606.
+pub fn format_peer_device_compact(info: &PeerDeviceInfo) -> Option<String> {
+    let rows = format_peer_device_lines(info);
+    if rows.is_empty() {
+        return None;
+    }
+    let tokens: Vec<String> = rows
+        .into_iter()
+        .map(|(label, value)| match label.as_str() {
+            "Cores" => format!("{value} cores"),
+            // OS / Device / Architecture / Memory render as the bare value.
+            _ => value,
+        })
+        .collect();
+    Some(tokens.join(" · "))
+}
+
 /// A cloneable, `PartialEq`-able handle around the live diagnostics readers
 /// (issue #1095). Mirrors [`SnapshotReader`]: compared by `Rc` pointer identity,
 /// built once per `Host` mount, so it never spuriously re-renders the panel.
@@ -233,6 +312,23 @@ pub struct DiagnosticsReader {
     pub send_screen: Rc<dyn Fn() -> Option<SimulcastSendSnapshot>>,
     /// Reads the per-peer RECEIVE diagnostics.
     pub per_peer_receive: Rc<dyn Fn() -> Vec<PeerReceiveDiag>>,
+    /// #1482: reads a peer's self-reported device/hardware metrics by relay
+    /// `session_id`, or `None` when unknown / nothing reported. Reads LIVE
+    /// through to the client on every call. The diagnostics panel resolves this
+    /// per peer that appears in `per_peer_received_snapshots`; an AUDIO-ONLY
+    /// sender (e.g. Firefox with no video) is included there because audio
+    /// counts as flowing media, but a peer with NO media flowing at all is
+    /// omitted from the panel's Device section (the panel iterates the receive
+    /// list). The signal-quality popup resolves device info per open tile, so it
+    /// is not subject to that limitation.
+    pub per_peer_device_info: Rc<dyn Fn(u64) -> Option<PeerDeviceInfo>>,
+    /// issue 1482: reads EVERY known peer's self-reported device info as
+    /// `(session_id, label, info)`, independent of whether media is flowing.
+    /// The diagnostics "Device (per peer)" section iterates this (NOT the
+    /// receive list) so a camera-off peer that reports device metrics still
+    /// renders. The label mirrors the receive-list label so a receiving peer's
+    /// label is unchanged. Reads LIVE through to the client on every call.
+    pub per_peer_device_all: Rc<dyn Fn() -> Vec<(u64, String, PeerDeviceInfo)>>,
 }
 
 impl DiagnosticsReader {
@@ -244,6 +340,8 @@ impl DiagnosticsReader {
             send_video: Rc::new(|| None),
             send_screen: Rc::new(|| None),
             per_peer_receive: Rc::new(Vec::new),
+            per_peer_device_info: Rc::new(|_| None),
+            per_peer_device_all: Rc::new(Vec::new),
         }
     }
 }
@@ -256,6 +354,8 @@ impl PartialEq for DiagnosticsReader {
             && Rc::ptr_eq(&self.send_video, &other.send_video)
             && Rc::ptr_eq(&self.send_screen, &other.send_screen)
             && Rc::ptr_eq(&self.per_peer_receive, &other.per_peer_receive)
+            && Rc::ptr_eq(&self.per_peer_device_info, &other.per_peer_device_info)
+            && Rc::ptr_eq(&self.per_peer_device_all, &other.per_peer_device_all)
     }
 }
 
@@ -416,6 +516,34 @@ pub fn layer_quality_label(index: u32, count: u32, compact: bool) -> &'static st
     }
 }
 
+/// SEND-side simulcast LED predicate (issue #1607): is layer `layer_id` currently
+/// being ENCODED + SENT? A layer is lit (ON) when it is below the shed-aware
+/// active boundary (`layer_id < active_layers`) and dark (OFF) otherwise.
+///
+/// `active_layers` is the live, shed-aware active-layer count carried on
+/// [`SimulcastSendSnapshot`](videocall_client::SimulcastSendSnapshot) — for a
+/// 3-rung ladder with 2 active, layers 0 and 1 are ON and layer 2 (shed under
+/// congestion) is OFF. This is the same `layer_id < active_layers` boundary the
+/// SEND ladder already used to pick the `is-active`/`is-shed` rung class; pulling
+/// it into a named pure fn makes the LED on/off decision host-testable and
+/// mutation-meaningful. Pure / host-tested.
+pub fn layer_led_on(layer_id: u32, active_layers: u32) -> bool {
+    layer_id < active_layers
+}
+
+/// RECEIVE-side simulcast LED predicate (issue #1607): is layer `layer_id` the
+/// one this receiver is CURRENTLY decoding for a kind from a peer?
+///
+/// Unlike the SEND side (where every layer at or below the active boundary is
+/// simultaneously encoded), a receiver decodes EXACTLY ONE simulcast layer per
+/// kind at a time — the post-clamp selected `layer_index` on
+/// [`ReceivedLayerSnapshot`]. So the LED is lit (ON) only for the exact received
+/// index and dark (OFF) for every other rung — an equality, NOT a `<=` threshold.
+/// Pure / host-tested.
+pub fn received_layer_led_on(layer_id: u32, received_index: u32) -> bool {
+    layer_id == received_index
+}
+
 /// Format the RECEIVE per-kind layer spread across peers by quality LETTER, e.g.
 /// `"L–H"`, or a single letter `"H"` when every peer is on the same layer.
 /// `layers` is the list of 0-based `layer_index` values; `count` is the ladder
@@ -448,7 +576,7 @@ pub fn format_mbps(kbps: u32) -> String {
 // the spec's literal phrasings; live numbers are filled from the snapshots. Pure
 // so the copy is a host-tested source of truth (a wording change breaks a test).
 
-/// VIDEO SEND summary, e.g. `"Sending 3 of 3 layers · 540p–720p"`. Camera off
+/// VIDEO SEND summary, e.g. `"Currently sending 3 of 3 layers · 540p–720p"`. Camera off
 /// (`snap` is `None`) → `"Camera — off"`. Single-stream → `"Sending single
 /// layer · {res}"` (the one adaptive layer's short res, when known). The res
 /// span uses the SEND snapshot's per-layer short resolutions across the EFFECTIVE
@@ -469,12 +597,12 @@ pub fn format_video_send_summary(snap: Option<&SimulcastSendSnapshot>) -> String
     let span = send_layer_res_span(s);
     if span.is_empty() {
         format!(
-            "Sending {} of {} layers",
+            "Currently sending {} of {} layers",
             s.active_layers, s.effective_layers
         )
     } else {
         format!(
-            "Sending {} of {} layers · {span}",
+            "Currently sending {} of {} layers · {span}",
             s.active_layers, s.effective_layers
         )
     }
@@ -670,9 +798,9 @@ fn source_on_phrase(kind: PrefMediaKind) -> &'static str {
 /// The SEND layer count caption ("range value" line) — STATE-AWARE about whether
 /// the source is actually capturing.
 ///
-/// - Source ACTIVE (camera on / sharing / mic on): the present-tense
-///   "Sending {active} of {total} layers" (or "Sending 1 layer" for a 1-rung
-///   ladder) — the live count.
+/// - Source ACTIVE (camera on / sharing / mic on): a capacity ceiling form
+///   "Up to {active} of {total} layers" (or "Up to 1 layer" for a 1-rung
+///   ladder) — the CONFIGURED ceiling the user picked, not live throughput.
 /// - Source OFF: a future/conditional form using the CONFIGURED count so we never
 ///   claim to be "sending" when nothing is captured, e.g.
 ///   "Will send {active} layers when the camera is on" (the configured ceiling is
@@ -690,9 +818,9 @@ pub fn format_send_layer_caption(
     let layers_word = if active == 1 { "layer" } else { "layers" };
     if source_active {
         if total <= 1 {
-            "Sending 1 layer".to_string()
+            "Up to 1 layer".to_string()
         } else {
-            format!("Sending {active} of {total} layers")
+            format!("Up to {active} of {total} layers")
         }
     } else {
         let phrase = source_on_phrase(kind);
@@ -2516,7 +2644,7 @@ fn SendLayerCell(
     let rungs = layer_send_rungs(&labels, ceiling_pos);
     let rungs_aria = send_rungs_aria(&rungs);
     let active_count = ceiling_pos + 1;
-    // Human caption: present-tense "Sending N of M layers" when the source is
+    // Human caption: capacity "Up to N of M layers" when the source is
     // capturing, else the future "Will send N layers {when …}" using the
     // configured count (source-aware, pure / host-tested).
     let count_caption = format_send_layer_caption(kind, active_count, labels.len(), source_active);
@@ -3038,6 +3166,10 @@ pub mod receive {
         PeerKindSnap,
     };
     use dioxus::prelude::*;
+    // issue 1164: `WebEventExt::as_web_event` lets the <details> ontoggle handler
+    // read the native open-state back off the event target. Same import path used
+    // elsewhere in this crate (diagnostics.rs, attendants.rs, home.rs).
+    use dioxus::web::WebEventExt;
     use std::rc::Rc;
     use videocall_client::{
         max_layers_for_kind, quality_state, PrefMediaKind, ReceivedLayerSnapshot,
@@ -3664,6 +3796,11 @@ pub mod receive {
         };
         let id_prefix = meta.id_prefix;
 
+        // issue 1164: track the <details> open state so the per-peer rows are
+        // built lazily — only while the disclosure is expanded. Default CLOSED, so a
+        // large meeting pays nothing (no PeerRow build/diff) until the user expands.
+        let mut peers_open = use_signal(|| false);
+
         rsx! {
             div { class: "perf-side perf-side--recv",
                 div { class: "perf-side__head",
@@ -3761,6 +3898,28 @@ pub mod receive {
                     details {
                         class: "perf-peers",
                         "data-testid": "{id_prefix}-peers",
+                        // issue 1164: a fresh <details> always mounts collapsed
+                        // (we add no `open:` attr), so re-seed the mirror to match
+                        // and avoid building rows for a collapsed remounted cell
+                        // after a peers-empty -> peers-return re-entry.
+                        onmounted: move |_| {
+                            peers_open.set(false);
+                        },
+                        // issue 1164: mirror the native open state into the signal so
+                        // the per-peer rows below render lazily. The native <details>
+                        // toggles itself (click + keyboard) and reflects open-ness to
+                        // the `open` content attribute; we just read it back here.
+                        // ontoggle fires ONLY on an actual open/close transition, so
+                        // writing the signal here cannot cause a render loop.
+                        ontoggle: move |evt| {
+                            let native = evt.as_web_event();
+                            let is_open = native
+                                .target()
+                                .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+                                .map(|el| el.has_attribute("open"))
+                                .unwrap_or(false);
+                            peers_open.set(is_open);
+                        },
                         summary {
                             class: "perf-peers__summary",
                             "data-testid": "{id_prefix}-peers-summary",
@@ -3775,15 +3934,17 @@ pub mod receive {
                             }
                             span { class: "perf-peers__agg", "{agg}" }
                         }
-                        ul { class: "perf-peers__list", role: "list",
-                            for p in peers.iter() {
-                                PeerRow {
-                                    key: "{p.session_id}",
-                                    id_prefix,
-                                    kind,
-                                    stream_noun,
-                                    full_ladder_len,
-                                    peer: p.clone(),
+                        if peers_open() {
+                            ul { class: "perf-peers__list", role: "list",
+                                for p in peers.iter() {
+                                    PeerRow {
+                                        key: "{p.session_id}",
+                                        id_prefix,
+                                        kind,
+                                        stream_noun,
+                                        full_ladder_len,
+                                        peer: p.clone(),
+                                    }
                                 }
                             }
                         }
@@ -4318,6 +4479,47 @@ mod tests {
         assert_eq!(layer_quality_label(3, 4, false), "High");
     }
 
+    /// SEND LED predicate (issue #1607): ON for layers BELOW the shed-aware active
+    /// boundary, OFF at/above it. This is the source of truth for the per-rung LED
+    /// dot — for a 3-rung ladder with 2 active, L0/L1 light and L2 (shed) is dark.
+    /// Mutating the predicate to `<=` would light the first shed rung → the
+    /// `!layer_led_on(2, 2)` assertion fails; mutating to `>` flips every case.
+    #[test]
+    fn send_led_on_only_below_active_boundary() {
+        // 3-rung ladder, 2 active: L0, L1 ON; L2 (shed) OFF.
+        assert!(layer_led_on(0, 2), "base layer is sent → ON");
+        assert!(layer_led_on(1, 2), "second active layer → ON");
+        assert!(!layer_led_on(2, 2), "shed top layer → OFF");
+        // Full ladder (all active): every rung ON.
+        assert!(layer_led_on(0, 3));
+        assert!(layer_led_on(1, 3));
+        assert!(layer_led_on(2, 3));
+        // Base-only (active == 1): only L0 ON, the rest OFF.
+        assert!(layer_led_on(0, 1));
+        assert!(!layer_led_on(1, 1));
+        assert!(!layer_led_on(2, 1));
+    }
+
+    /// RECEIVE LED predicate (issue #1607): a receiver decodes EXACTLY ONE layer
+    /// per kind, so the LED is ON only for the exact received index and OFF for
+    /// every other rung — an equality, not a `<=` threshold. Mutating to `<=`
+    /// would light L0 while receiving L1 → `!received_layer_led_on(0, 1)` fails;
+    /// mutating to `<` would dark the received rung → `received_layer_led_on(1, 1)`
+    /// fails.
+    #[test]
+    fn receive_led_on_only_for_exact_received_index() {
+        // Receiving L1 of a 3-rung ladder: ONLY L1 lit.
+        assert!(!received_layer_led_on(0, 1), "below received index → OFF");
+        assert!(received_layer_led_on(1, 1), "received index → ON");
+        assert!(!received_layer_led_on(2, 1), "above received index → OFF");
+        // Receiving the base (L0): only L0 lit.
+        assert!(received_layer_led_on(0, 0));
+        assert!(!received_layer_led_on(1, 0));
+        // Receiving the top (L2): only L2 lit.
+        assert!(!received_layer_led_on(1, 2));
+        assert!(received_layer_led_on(2, 2));
+    }
+
     #[test]
     fn send_layer_and_header_formatting() {
         // DISPLAY by quality name: in a 3-layer ladder, internal layer_id 0 (the
@@ -4338,7 +4540,7 @@ mod tests {
             active_layers: 2,
             layers: Vec::new(),
         };
-        assert_eq!(format_send_header(&multi), "2 of 3 layers active");
+        assert_eq!(format_send_header(&multi), "Currently 2 of 3 layers active");
         let single = SimulcastSendSnapshot {
             simulcast_active: false,
             effective_layers: 1,
@@ -4578,11 +4780,11 @@ mod tests {
     fn video_send_summary_camera_off_and_active() {
         // Camera off (None) → the spec's off line.
         assert_eq!(format_video_send_summary(None), "Camera — off");
-        // Active simulcast → "Sending A of E layers · lo–hi".
+        // Active simulcast → "Currently sending A of E layers · lo–hi".
         let s = send_snap_3layer();
         assert_eq!(
             format_video_send_summary(Some(&s)),
-            "Sending 3 of 3 layers · 360p–720p"
+            "Currently sending 3 of 3 layers · 360p–720p"
         );
         // Single-layer → "Sending single layer · {res}".
         let single = SimulcastSendSnapshot {
@@ -5545,15 +5747,15 @@ mod tests {
     #[test]
     fn send_layer_caption_is_source_aware() {
         use PrefMediaKind::{Audio, Screen, Video};
-        // SOURCE ON: present-tense "Sending N of M layers".
+        // SOURCE ON: capacity "Up to N of M layers".
         assert_eq!(
             format_send_layer_caption(Video, 2, 3, true),
-            "Sending 2 of 3 layers"
+            "Up to 2 of 3 layers"
         );
-        // Single-layer ladder, on → "Sending 1 layer".
+        // Single-layer ladder, on → "Up to 1 layer".
         assert_eq!(
             format_send_layer_caption(Video, 1, 1, true),
-            "Sending 1 layer"
+            "Up to 1 layer"
         );
         // SOURCE OFF: future form using the CONFIGURED count + per-kind phrase;
         // never claims to be "sending". Each kind names its own trigger.
@@ -5745,5 +5947,160 @@ mod tests {
         // Out-of-range index falls back to best tier (panic-safe).
         let oob = audio_send_rung(Some(999));
         assert_eq!(oob.res_label, AUDIO_TIER_LABELS[0]);
+    }
+
+    // ── #1482 per-peer device formatter ────────────────────────────────
+    // These pin the EXACT label + value strings the diagnostics panel and
+    // the signal popup render, so mutating any format string (e.g. "{} GB"
+    // → "{} G", or the "%" suffix) fails the assertion against a real literal
+    // (not X==X). Issue 1606 removed the always-0% "Main-thread load" row from
+    // the user-facing line; the absence is pinned below.
+
+    /// (a) Every field present → every expected pair, in the fixed order
+    /// OS, Device, Cores, Architecture, Memory, with the exact formatted value
+    /// strings. The `client_main_thread_load` field is set here but MUST NOT
+    /// appear in the user-facing rows (issue 1606).
+    #[test]
+    fn format_peer_device_lines_all_fields_in_order() {
+        let info = PeerDeviceInfo {
+            client_cores: Some(8),
+            client_architecture: Some("arm".to_string()),
+            client_os: Some("macOS 14.5".to_string()),
+            client_device_type: Some("desktop".to_string()),
+            client_main_thread_load: Some(0.42),
+            client_memory_used_mb: Some(123.0),
+            client_device_memory_gb: Some(8.0),
+        };
+        let rows = format_peer_device_lines(&info);
+        assert_eq!(
+            rows,
+            vec![
+                ("OS".to_string(), "macOS 14.5".to_string()),
+                ("Device".to_string(), "desktop".to_string()),
+                ("Cores".to_string(), "8".to_string()),
+                ("Architecture".to_string(), "arm".to_string()),
+                ("Memory".to_string(), "8 GB".to_string()),
+            ]
+        );
+    }
+
+    /// (b) All fields None → empty Vec (so the caller renders NOTHING).
+    #[test]
+    fn format_peer_device_lines_all_none_is_empty() {
+        let info = PeerDeviceInfo::default();
+        assert!(format_peer_device_lines(&info).is_empty());
+    }
+
+    /// (c) Partial (only OS + Cores) → exactly those two pairs, in order;
+    /// every None field is OMITTED (no empty-value pair).
+    #[test]
+    fn format_peer_device_lines_partial_omits_none() {
+        let info = PeerDeviceInfo {
+            client_os: Some("Windows 11".to_string()),
+            client_cores: Some(4),
+            ..Default::default()
+        };
+        let rows = format_peer_device_lines(&info);
+        assert_eq!(
+            rows,
+            vec![
+                ("OS".to_string(), "Windows 11".to_string()),
+                ("Cores".to_string(), "4".to_string()),
+            ]
+        );
+    }
+
+    /// (d) Issue 1606: a reported main-thread load is NOT surfaced on the
+    /// user-facing device line. With ONLY `client_main_thread_load` set the
+    /// row list is empty, and even alongside other fields no "load" row/value
+    /// appears. Mutation-meaningful: re-adding the `Main-thread load` push to
+    /// `format_peer_device_lines` fails this test.
+    #[test]
+    fn format_peer_device_lines_omits_main_thread_load() {
+        // Load alone → nothing to render (no load-only block).
+        let load_only = PeerDeviceInfo {
+            client_main_thread_load: Some(0.42),
+            ..Default::default()
+        };
+        assert!(
+            format_peer_device_lines(&load_only).is_empty(),
+            "main-thread load must not produce a user-facing row (issue 1606)"
+        );
+
+        // Load alongside real fields → only the real fields, no load row.
+        let with_others = PeerDeviceInfo {
+            client_os: Some("macOS 14.5".to_string()),
+            client_cores: Some(8),
+            client_main_thread_load: Some(0.42),
+            ..Default::default()
+        };
+        let rows = format_peer_device_lines(&with_others);
+        assert!(
+            !rows.iter().any(|(label, value)| label.contains("load")
+                || label.contains("Load")
+                || value.contains("load")
+                || value == "42%"),
+            "no load label/value may appear in the device rows (issue 1606): {rows:?}"
+        );
+        assert_eq!(
+            rows,
+            vec![
+                ("OS".to_string(), "macOS 14.5".to_string()),
+                ("Cores".to_string(), "8".to_string()),
+            ]
+        );
+    }
+
+    /// (e) device_memory 8.0 → "8 GB" (trailing .0 trimmed); a fractional
+    /// tier keeps its decimal.
+    #[test]
+    fn format_peer_device_lines_memory_gb_trim() {
+        let info = PeerDeviceInfo {
+            client_device_memory_gb: Some(8.0),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_peer_device_lines(&info),
+            vec![("Memory".to_string(), "8 GB".to_string())]
+        );
+        let half = PeerDeviceInfo {
+            client_device_memory_gb: Some(0.5),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_peer_device_lines(&half),
+            vec![("Memory".to_string(), "0.5 GB".to_string())]
+        );
+    }
+
+    /// Compact popup form: dot-separated, with the "N cores" relabel. Pins the
+    /// exact compact string the small popup renders. Issue 1606: even though
+    /// `client_main_thread_load` is set, NO `% load` segment (and no dangling
+    /// trailing ` · `) appears.
+    #[test]
+    fn format_peer_device_compact_full_line() {
+        let info = PeerDeviceInfo {
+            client_cores: Some(8),
+            client_architecture: Some("arm".to_string()),
+            client_os: Some("macOS 14.5".to_string()),
+            client_device_type: Some("desktop".to_string()),
+            client_main_thread_load: Some(0.42),
+            client_memory_used_mb: None,
+            client_device_memory_gb: Some(8.0),
+        };
+        let line = format_peer_device_compact(&info)
+            .expect("a fully-populated peer must produce a compact device line");
+        assert_eq!(line, "macOS 14.5 · desktop · 8 cores · arm · 8 GB");
+        // No load token, no dangling separator from the removed segment.
+        assert!(
+            !line.contains("load"),
+            "compact line must not contain a load segment (issue 1606): {line}"
+        );
+        assert!(
+            !line.ends_with(" · "),
+            "compact line must not end with a dangling separator: {line}"
+        );
+        // Nothing reported → None so the popup omits the block.
+        assert_eq!(format_peer_device_compact(&PeerDeviceInfo::default()), None);
     }
 }

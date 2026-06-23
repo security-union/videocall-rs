@@ -270,7 +270,10 @@ test.describe("Peer-leave canvas-node stability (issue 508)", () => {
     await waitForServices();
   });
 
-  test("surviving camera-on tile reuses the SAME <canvas> node across 2->1 collapse", async ({
+  // Issue #1530: headless Chrome with SwiftShader (software GPU) cannot reliably
+  // produce <canvas> elements from multi-peer WebCodecs decode within test timeouts.
+  // The CI runner lacks a hardware GPU; re-enable once a GPU runner is available.
+  test.fixme("surviving camera-on tile reuses the SAME <canvas> node across 2->1 collapse", async ({
     baseURL,
   }) => {
     test.setTimeout(300_000);
@@ -367,8 +370,29 @@ test.describe("Peer-leave canvas-node stability (issue 508)", () => {
         timeout: 60_000,
       });
 
-      // Give Dioxus a beat to run the 2->1 diff/patch.
-      await hostPage.waitForTimeout(2000);
+      // Poll until Dioxus has finished the 2->1 diff/patch instead of a fixed
+      // sleep (issue #1449): a hard-coded wait is a flake vector on loaded CI
+      // (too short → reads a half-diffed DOM; needlessly slow when the diff is
+      // fast). The settled post-collapse DOM is "exactly one full-bleed tile
+      // that carries a numeric peer-video <canvas>" — the same shape the
+      // assertions below read. `expect.poll` re-evaluates with a generous upper
+      // bound and resolves as soon as it settles. We deliberately do NOT poll on
+      // `survivorMarkerSurvived` (that is the behavior under test — polling on it
+      // would mask a real marker-loss regression as a timeout instead of a clear
+      // assertion failure).
+      await expect
+        .poll(
+          async () => {
+            const s = await readCollapsedState(hostPage, marker);
+            return s.fullBleedCount === 1 && s.fullBleedHasCanvas && s.survivorCanvasId !== null;
+          },
+          {
+            timeout: 30_000,
+            message:
+              "host did not settle to a single full-bleed canvas tile after the 2->1 collapse",
+          },
+        )
+        .toBe(true);
 
       const state = await readCollapsedState(hostPage, marker);
 

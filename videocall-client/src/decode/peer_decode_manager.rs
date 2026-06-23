@@ -36,7 +36,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::{fmt::Display, sync::Arc};
-use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, TransportType};
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
@@ -503,6 +503,33 @@ pub struct PeerReceiveDiag {
     pub audio: Option<crate::decode::layer_chooser::ReceivedLayerSnapshot>,
 }
 
+/// Per-peer self-reported device/hardware metrics (#1482). Populated from the
+/// sender's HealthPacket (cores/arch/OS/device-type are STATIC; main-thread
+/// load + used memory change each health tick, ~0.2 Hz at the 5 s default
+/// interval). Every field is OPTIONAL and is `None` when the sending browser's
+/// API is unavailable ("if available"). This is the UI contract surfaced by
+/// [`PeerDecodeManager::peer_device_info`].
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct PeerDeviceInfo {
+    /// navigator.hardwareConcurrency (logical CPU cores).
+    pub client_cores: Option<u32>,
+    /// CPU/chip architecture, e.g. "arm" | "x86".
+    pub client_architecture: Option<String>,
+    /// Human OS + version, e.g. "macOS 14.5" | "Windows 11".
+    pub client_os: Option<String>,
+    /// "desktop" | "mobile" | "tablet".
+    pub client_device_type: Option<String>,
+    /// 0.0-1.0 main-thread busy fraction over the last health interval
+    /// (longtask sum / interval) — a CPU proxy, not system CPU.
+    pub client_main_thread_load: Option<f64>,
+    /// JS-heap used memory: HealthPacket.memory_used_bytes (bytes) divided by
+    /// 1 MiB (1024 * 1024). The `_mb` suffix follows the codebase's existing
+    /// heap-size labels; the unit is mebibytes (MiB), not decimal megabytes.
+    pub client_memory_used_mb: Option<f64>,
+    /// navigator.deviceMemory total-RAM tier in GB (coarse, browser-capped at 8).
+    pub client_device_memory_gb: Option<f64>,
+}
+
 /// Last in-place simulcast layer switch for this peer, stamped by Marker 1
 /// (issue #1460 observability). `ms == 0` is the never-switched sentinel.
 ///
@@ -543,6 +570,9 @@ pub struct Peer {
     /// does not populate the field.
     pub transport_type: TransportType,
     pub display_name: Option<String>,
+    /// #1482: this peer's self-reported device/hardware metrics, refreshed each
+    /// time a HealthPacket arrives. Every field is optional ("if available").
+    pub device_info: PeerDeviceInfo,
     /// Server-vouched guest indicator, sourced from the authenticated JWT
     /// `is_guest` claim and broadcast on `PARTICIPANT_JOINED`.
     pub is_guest: bool,
@@ -896,6 +926,7 @@ impl Peer {
             audio_level: 0.0,
             transport_type: TransportType::TRANSPORT_UNKNOWN,
             display_name: None,
+            device_info: PeerDeviceInfo::default(),
             is_guest,
             visible: false,
             context_initialized: false,
@@ -1166,6 +1197,17 @@ impl Peer {
             .audio_layer_chooser
             .choose(self.last_video_downlink, highest, now_ms);
         let desired = bounds.clamp(raw);
+        // #1561: log audio layer transitions (mirrors video/screen LAYER_SWITCH).
+        if desired != self.selected_audio_layer {
+            log::info!(
+                "LAYER_SWITCH session_id={} kind=audio from={} to={} site=tick constrained={} highest_available={}",
+                self.session_id,
+                self.selected_audio_layer,
+                desired,
+                self.audio_layer_chooser.is_constrained(),
+                highest
+            );
+        }
         self.selected_audio_layer = desired;
         desired
     }
@@ -1533,7 +1575,14 @@ impl Peer {
                 ),
                 metric!("is_speaking", if self.is_speaking { 1u64 } else { 0u64 }),
                 metric!("audio_level", self.audio_level as f64),
-                metric!("peer_transport", transport_str.to_string()),
+                // Zero-alloc per emit: `transport_str` is a `&'static str` from
+                // a literal match, so route it through the borrowing path
+                // (`Cow::Borrowed`) instead of the allocating `From<&str>`.
+                // This is the ~2 Hz/peer hot path from issue #1421.
+                Metric {
+                    name: "peer_transport",
+                    value: MetricValue::text_static(transport_str),
+                },
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -2293,6 +2342,11 @@ pub struct PeerDecodeManager {
     /// creates a peer later (after the first media packet arrives), the display
     /// name is immediately available and does not fall back to user_id/email.
     display_name_cache: HashMap<u64, String>,
+    /// #1482: Cache of session_id -> self-reported device info, populated from
+    /// HealthPackets. Mirrors `display_name_cache` so device info arriving
+    /// before the peer entry is created (via `ensure_peer()`) is not lost and is
+    /// applied once the peer is created; also survives transient peer churn.
+    device_info_cache: HashMap<u64, PeerDeviceInfo>,
     /// Cache of session_id -> is_guest, populated from PARTICIPANT_JOINED events.
     /// Mirrors `display_name_cache` so a guest flag arriving before the peer
     /// entry is created (via `ensure_peer()`) is still applied once the first
@@ -2364,6 +2418,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            device_info_cache: HashMap::new(),
             is_guest_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
@@ -2386,6 +2441,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            device_info_cache: HashMap::new(),
             is_guest_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
@@ -2402,6 +2458,22 @@ impl PeerDecodeManager {
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
+    }
+
+    /// TEST-ONLY: insert a connected peer that has learned a 3-layer ladder
+    /// (`highest_available == 2`) and reports a ZERO-LOSS real downlink sample,
+    /// i.e. the WebSocket / reliable-WT case where per-peer telemetry can never
+    /// observe congestion. This is the minimal seam the HOST `#[test]`s in
+    /// `video_call_client.rs` need to drive `seed_local_congestion_and_publish`
+    /// against a real connected peer without touching any browser/JS API.
+    ///
+    /// `#[cfg(test)]`-gated so it never appears in production builds. It is a thin
+    /// wrapper over the existing host-safe `make_zero_loss_top_peer` test helper so
+    /// the 50-field `Peer` literal stays single-sourced (no duplication / drift).
+    #[cfg(test)]
+    pub(crate) fn insert_zero_loss_top_peer_for_test(&mut self, session_id: u64) {
+        self.connected_peers
+            .insert(session_id, make_zero_loss_top_peer(session_id));
     }
 
     /// Set the callback used to send packets back through the connection.
@@ -2765,10 +2837,38 @@ impl PeerDecodeManager {
         &mut self,
         now_ms: u64,
         bounds: &crate::decode::layer_chooser::ReceiveLayerBounds,
+        exempt_speakers: bool,
     ) -> bool {
         let mut seeded = false;
         for session_id in self.connected_peers.ordered_keys().clone() {
             if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+                // Issue #1557: the active speaker(s) are EXEMPT from receiver-side
+                // layer-drop ONLY for the LOCAL-CPU-pressure cascade — and only
+                // when the caller passes `exempt_speakers == true`. That keeps the
+                // person talking sharp while the LOCAL decoder is the bottleneck.
+                // This mirrors the PAUSE-side exemption in `promote_speakers`
+                // (attendants_layout.rs) — both protect the active speaker — and like
+                // it we exempt EVERY `is_speaking` peer to honor the multi-speaker
+                // case. The protection predicate differs, though: `promote_speakers`
+                // uses a TIME WINDOW (`now - speech_ts < active_ms`), so a peer who
+                // just stopped stays PAUSE-protected for `active_ms`, whereas this
+                // seed uses the INSTANTANEOUS `is_speaking` VAD bool, so a peer who
+                // just stopped is immediately eligible for layer-drop again.
+                //
+                // The relay DOWNLINK_CONGESTION arm (#1219 Half 2) calls this with
+                // `exempt_speakers == false`: under REAL downlink saturation the
+                // largest inbound stream (often the speaker's video) is exactly what
+                // must be shed, and in the degenerate 1-on-1 the only remote peer IS
+                // the speaker — exempting it would shed ZERO bitrate. So on that path
+                // the speaker's VIDEO is stepped down like any other peer's.
+                //
+                // Audio is never touched on EITHER path (`seed_downlink_congestion`
+                // never touches the audio chooser); screen for a non-speaking sharer
+                // is still dropped. A skipped speaker contributes `false` to `seeded`
+                // (its chooser did not move).
+                if exempt_speakers && peer.is_speaking {
+                    continue;
+                }
                 if peer.seed_downlink_congestion(now_ms, bounds) {
                     seeded = true;
                 }
@@ -3283,6 +3383,11 @@ impl PeerDecodeManager {
             );
             peer.display_name = Some(cached_name.clone());
         }
+        // #1482: apply cached device info if a HealthPacket arrived before the
+        // first media packet created this peer entry.
+        if let Some(cached) = self.device_info_cache.get(&session_id) {
+            peer.device_info = cached.clone();
+        }
         self.connected_peers.insert(session_id, peer);
         // Phase 6: invalidate the sorted-keys cache so the next
         // `sorted_string_keys()` call rebuilds with the new peer.
@@ -3396,6 +3501,7 @@ impl PeerDecodeManager {
                 diag.remove_peer(&peer.sid_str);
             }
             self.display_name_cache.remove(&session_id);
+            self.device_info_cache.remove(&session_id);
             self.is_guest_cache.remove(&session_id);
             // Phase 6: invalidate the sorted-keys cache before notifying
             // observers so any read in the callback sees a fresh list.
@@ -3461,6 +3567,7 @@ impl PeerDecodeManager {
         // Clear the display name cache so stale names don't persist
         // across reconnections.
         self.display_name_cache.clear();
+        self.device_info_cache.clear();
         self.is_guest_cache.clear();
         // Phase 6: invalidate the sorted-keys cache and emit a single
         // batched event so observers can coalesce the bulk-clear into
@@ -3542,6 +3649,40 @@ impl PeerDecodeManager {
         // Also update the existing peer entry if it exists.
         if let Some(peer) = self.connected_peers.get_mut(&session_id) {
             peer.display_name = Some(display_name);
+        }
+    }
+
+    /// Store/merge a peer's self-reported device info (#1482), keyed by session_id.
+    /// Mirrors `set_peer_display_name`: writes the cache so info arriving before
+    /// the peer entry exists is not lost, and updates the live peer if present.
+    ///
+    /// MERGE POLICY: STATIC fields (cores, architecture, os, device_type,
+    /// device_memory_gb) use `incoming.or(existing)` so a tick where the browser
+    /// momentarily omits a field does NOT erase previously-known good data.
+    /// DYNAMIC fields (main_thread_load, memory_used_mb) ALWAYS take the latest
+    /// incoming value (including None -> None) since they are live gauges.
+    pub fn set_peer_device_info(&mut self, session_id: u64, incoming: PeerDeviceInfo) {
+        let existing = self
+            .device_info_cache
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default();
+        let merged = PeerDeviceInfo {
+            client_cores: incoming.client_cores.or(existing.client_cores),
+            client_architecture: incoming
+                .client_architecture
+                .or(existing.client_architecture),
+            client_os: incoming.client_os.or(existing.client_os),
+            client_device_type: incoming.client_device_type.or(existing.client_device_type),
+            client_device_memory_gb: incoming
+                .client_device_memory_gb
+                .or(existing.client_device_memory_gb),
+            client_main_thread_load: incoming.client_main_thread_load,
+            client_memory_used_mb: incoming.client_memory_used_mb,
+        };
+        self.device_info_cache.insert(session_id, merged.clone());
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            peer.device_info = merged;
         }
     }
 
@@ -3688,6 +3829,81 @@ impl PeerDecodeManager {
         self.display_name_cache.get(&sid).cloned()
     }
 
+    /// Get a peer's self-reported device info (#1482) by relay session_id.
+    /// THE UI CONTRACT: returns the live peer's `device_info` if the peer exists
+    /// and has at least one populated field, else falls back to the cache (info
+    /// may arrive before the peer entry is created), else `None`. The returned
+    /// struct is a clone; reading it does NOT mutate state or trigger a render.
+    pub fn peer_device_info(&self, session_id: u64) -> Option<PeerDeviceInfo> {
+        if let Some(peer) = self.connected_peers.get(&session_id) {
+            if peer.device_info != PeerDeviceInfo::default() {
+                return Some(peer.device_info.clone());
+            }
+        }
+        self.device_info_cache.get(&session_id).cloned()
+    }
+
+    /// issue 1482: every known peer's self-reported device info, for the
+    /// diagnostics "Device (per peer)" section which must render independent of
+    /// whether media is currently flowing (a camera-off peer still reports device
+    /// metrics via HEALTH). Returns `(session_id, label, info)` for each peer that
+    /// has at least one populated device field. The label mirrors
+    /// `per_peer_received_snapshots` (display name → user id → session id) so a
+    /// receiving peer's label does not regress; a cache-only peer (info arrived
+    /// before its `Peer` entry) falls back to the display-name cache then the sid
+    /// string. The peer set is the UNION of live peers and the device-info cache,
+    /// each resolved through the same live-then-cache rule as `peer_device_info`,
+    /// deduplicated by session_id. Read-only; does not mutate or trigger a render.
+    pub fn all_peer_device_info(&self) -> Vec<(u64, String, PeerDeviceInfo)> {
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut out: Vec<(u64, String, PeerDeviceInfo)> = Vec::new();
+        // Live peers first, in their stable ordered-key order, so a receiving
+        // peer keeps the same label/order it had under the old receive-list path.
+        for &sid in self.connected_peers.ordered_keys() {
+            if !seen.insert(sid) {
+                continue;
+            }
+            if let Some(info) = self.peer_device_info(sid) {
+                if info == PeerDeviceInfo::default() {
+                    continue;
+                }
+                let label = self
+                    .connected_peers
+                    .get(&sid)
+                    .map(|peer| {
+                        peer.display_name.clone().unwrap_or_else(|| {
+                            if peer.user_id.is_empty() {
+                                sid.to_string()
+                            } else {
+                                peer.user_id.clone()
+                            }
+                        })
+                    })
+                    .or_else(|| self.display_name_cache.get(&sid).cloned())
+                    .unwrap_or_else(|| sid.to_string());
+                out.push((sid, label, info));
+            }
+        }
+        // Cache-only peers (device info arrived before the `Peer` entry exists).
+        for sid in self.device_info_cache.keys().copied() {
+            if !seen.insert(sid) {
+                continue;
+            }
+            if let Some(info) = self.peer_device_info(sid) {
+                if info == PeerDeviceInfo::default() {
+                    continue;
+                }
+                let label = self
+                    .display_name_cache
+                    .get(&sid)
+                    .cloned()
+                    .unwrap_or_else(|| sid.to_string());
+                out.push((sid, label, info));
+            }
+        }
+        out
+    }
+
     /// Get the server-vouched guest status for a peer by session_id string.
     pub fn get_peer_is_guest(&self, session_id_str: &str) -> Option<bool> {
         let sid: u64 = session_id_str.parse().ok()?;
@@ -3730,6 +3946,135 @@ impl PeerDecodeManager {
 }
 
 // ---------------------------------------------------------------------------
+// Shared test fixtures (parent-module scope, still `#[cfg(test)]`)
+// ---------------------------------------------------------------------------
+// These were hoisted out of `mod tests` so the production-only test seam
+// `PeerDecodeManager::insert_zero_loss_top_peer_for_test` (a `#[cfg(test)]`
+// method on the main impl) can build the same host-safe peer without
+// duplicating the 50-field `Peer` literal. They never compile into a non-test
+// build. `mod tests` re-imports them via its `use super::*;`, so every existing
+// bare-name call site there keeps working unchanged.
+
+/// No-op audio decoder for unit tests.
+/// Muted state is stored in an `Rc<Cell<bool>>` so tests can inspect it
+/// after handing ownership to `Peer`.
+#[cfg(test)]
+struct MockAudioDecoder {
+    muted: Rc<std::cell::Cell<bool>>,
+}
+
+#[cfg(test)]
+impl MockAudioDecoder {
+    fn new() -> (Self, Rc<std::cell::Cell<bool>>) {
+        let muted = Rc::new(std::cell::Cell::new(true));
+        (
+            Self {
+                muted: muted.clone(),
+            },
+            muted,
+        )
+    }
+}
+
+#[cfg(test)]
+impl AudioPeerDecoderTrait for MockAudioDecoder {
+    fn decode(&mut self, _packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
+        Ok(DecodeStatus::SKIPPED)
+    }
+    fn flush(&mut self) {}
+    fn set_muted(&mut self, muted: bool) {
+        self.muted.set(muted);
+    }
+}
+
+/// Create a `Peer` with no-op decoders (no browser APIs required).
+/// Returns the peer and an `Rc<Cell<bool>>` handle to the mock audio
+/// decoder's muted state for test assertions.
+#[cfg(test)]
+fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
+    let sid_str = session_id.to_string();
+    let (mock_audio, muted_handle) = MockAudioDecoder::new();
+    let peer = Peer {
+        audio: Box::new(mock_audio),
+        video: VideoPeerDecoder::noop(),
+        screen: VideoPeerDecoder::noop(),
+        session_id,
+        sid_str,
+        user_id: "test@test.com".into(),
+        video_canvas_id: format!("video-{session_id}"),
+        screen_canvas_id: format!("screen-{session_id}"),
+        aes: None,
+        activity_count: 1,
+        missed_heartbeat_checks: 0,
+        video_enabled: false,
+        audio_enabled: false,
+        screen_enabled: false,
+        display_name: None,
+        device_info: PeerDeviceInfo::default(),
+        is_guest: false,
+        visible: false,
+        context_initialized: false,
+        has_received_heartbeat: false,
+        is_speaking: false,
+        audio_level: 0.0,
+        transport_type: TransportType::TRANSPORT_UNKNOWN,
+        vad_threshold: None,
+        selected_video_layer: 0,
+        video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+        video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+        last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
+        },
+        selected_screen_layer: 0,
+        screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+        screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+        last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
+            loss_per_sec: 0.0,
+            kf_per_sec: 0.0,
+        },
+        selected_audio_layer: 0,
+        audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
+        audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
+        video_seq_tracker: SequenceTracker::new(),
+        screen_seq_tracker: SequenceTracker::new(),
+        last_screen_frame_ms: 0,
+        last_video_frame_ms: 0,
+        last_audio_frame_ms: 0,
+        last_video_switch: LastLayerSwitch::default(),
+        last_screen_switch: LastLayerSwitch::default(),
+    };
+    (peer, muted_handle)
+}
+
+/// Build a connected peer with a learned 3-layer ladder (highest_available
+/// == 2) and a ZERO-LOSS real downlink sample (`{0.0, 0.0}`) — the WebSocket /
+/// reliable-WT case where the per-peer telemetry can never see congestion.
+/// This is the #1219 Half 2 precondition: unlike `make_congested_top_peer`,
+/// the real sample is NOT congested, so the early-seed path is a no-op here and
+/// only the synthetic DOWNLINK_CONGESTION seed can step the chooser down.
+#[cfg(test)]
+fn make_zero_loss_top_peer(session_id: u64) -> Peer {
+    let (mut peer, _muted) = make_test_peer(session_id);
+    // Learn layers 0,1,2 so highest_available == 2 (room to drop to 1).
+    for layer in 0..3u32 {
+        peer.video_layer_availability.observe(layer, 1000);
+        peer.screen_layer_availability.observe(layer, 1000);
+        peer.audio_layer_availability.observe(layer, 1000);
+    }
+    // Zero-loss real telemetry — the lossless-transport blindness (#1219).
+    peer.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
+        loss_per_sec: 0.0,
+        kf_per_sec: 0.0,
+    };
+    peer.last_screen_downlink = crate::decode::layer_chooser::DownlinkSample {
+        loss_per_sec: 0.0,
+        kf_per_sec: 0.0,
+    };
+    peer
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 #[cfg(test)]
@@ -3745,36 +4090,11 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    // -- mock audio decoder -----------------------------------------------
-
-    /// No-op audio decoder for unit tests.
-    /// Muted state is stored in an `Rc<Cell<bool>>` so tests can inspect it
-    /// after handing ownership to `Peer`.
-    struct MockAudioDecoder {
-        muted: Rc<Cell<bool>>,
-    }
-
-    impl MockAudioDecoder {
-        fn new() -> (Self, Rc<Cell<bool>>) {
-            let muted = Rc::new(Cell::new(true));
-            (
-                Self {
-                    muted: muted.clone(),
-                },
-                muted,
-            )
-        }
-    }
-
-    impl AudioPeerDecoderTrait for MockAudioDecoder {
-        fn decode(&mut self, _packet: &Arc<MediaPacket>) -> anyhow::Result<DecodeStatus> {
-            Ok(DecodeStatus::SKIPPED)
-        }
-        fn flush(&mut self) {}
-        fn set_muted(&mut self, muted: bool) {
-            self.muted.set(muted);
-        }
-    }
+    // `MockAudioDecoder`, `make_test_peer`, and `make_zero_loss_top_peer` were
+    // hoisted to the parent module (still `#[cfg(test)]`) so the production-only
+    // test seam `PeerDecodeManager::insert_zero_loss_top_peer_for_test` can build
+    // the same host-safe peer without duplicating the 50-field `Peer` literal.
+    // They remain reachable here unchanged via the `use super::*;` above.
 
     // -- helpers ----------------------------------------------------------
 
@@ -3865,64 +4185,6 @@ mod tests {
         let mut wrapper = packet_wrapper(&media, session_id);
         wrapper.simulcast_layer_id = layer;
         Arc::new(wrapper)
-    }
-
-    /// Create a `Peer` with no-op decoders (no browser APIs required).
-    /// Returns the peer and an `Rc<Cell<bool>>` handle to the mock audio
-    /// decoder's muted state for test assertions.
-    fn make_test_peer(session_id: u64) -> (Peer, Rc<Cell<bool>>) {
-        let sid_str = session_id.to_string();
-        let (mock_audio, muted_handle) = MockAudioDecoder::new();
-        let peer = Peer {
-            audio: Box::new(mock_audio),
-            video: VideoPeerDecoder::noop(),
-            screen: VideoPeerDecoder::noop(),
-            session_id,
-            sid_str,
-            user_id: "test@test.com".into(),
-            video_canvas_id: format!("video-{session_id}"),
-            screen_canvas_id: format!("screen-{session_id}"),
-            aes: None,
-            activity_count: 1,
-            missed_heartbeat_checks: 0,
-            video_enabled: false,
-            audio_enabled: false,
-            screen_enabled: false,
-            display_name: None,
-            is_guest: false,
-            visible: false,
-            context_initialized: false,
-            has_received_heartbeat: false,
-            is_speaking: false,
-            audio_level: 0.0,
-            transport_type: TransportType::TRANSPORT_UNKNOWN,
-            vad_threshold: None,
-            selected_video_layer: 0,
-            video_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
-            video_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
-            last_video_downlink: crate::decode::layer_chooser::DownlinkSample {
-                loss_per_sec: 0.0,
-                kf_per_sec: 0.0,
-            },
-            selected_screen_layer: 0,
-            screen_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
-            screen_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
-            last_screen_downlink: crate::decode::layer_chooser::DownlinkSample {
-                loss_per_sec: 0.0,
-                kf_per_sec: 0.0,
-            },
-            selected_audio_layer: 0,
-            audio_layer_chooser: crate::decode::layer_chooser::LayerChooser::new(0),
-            audio_layer_availability: crate::decode::layer_chooser::LayerAvailability::new(),
-            video_seq_tracker: SequenceTracker::new(),
-            screen_seq_tracker: SequenceTracker::new(),
-            last_screen_frame_ms: 0,
-            last_video_frame_ms: 0,
-            last_audio_frame_ms: 0,
-            last_video_switch: LastLayerSwitch::default(),
-            last_screen_switch: LastLayerSwitch::default(),
-        };
-        (peer, muted_handle)
     }
 
     /// #1025 leak guard: `clear_send_packet_callback` (disconnect teardown) must
@@ -6354,32 +6616,6 @@ mod tests {
         );
     }
 
-    /// Build a connected peer with a learned 3-layer ladder (highest_available
-    /// == 2) and a ZERO-LOSS real downlink sample (`{0.0, 0.0}`) — the WebSocket /
-    /// reliable-WT case where the per-peer telemetry can never see congestion.
-    /// This is the #1219 Half 2 precondition: unlike `make_congested_top_peer`,
-    /// the real sample is NOT congested, so the early-seed path is a no-op here and
-    /// only the synthetic DOWNLINK_CONGESTION seed can step the chooser down.
-    fn make_zero_loss_top_peer(session_id: u64) -> Peer {
-        let (mut peer, _muted) = make_test_peer(session_id);
-        // Learn layers 0,1,2 so highest_available == 2 (room to drop to 1).
-        for layer in 0..3u32 {
-            peer.video_layer_availability.observe(layer, 1000);
-            peer.screen_layer_availability.observe(layer, 1000);
-            peer.audio_layer_availability.observe(layer, 1000);
-        }
-        // Zero-loss real telemetry — the lossless-transport blindness (#1219).
-        peer.last_video_downlink = crate::decode::layer_chooser::DownlinkSample {
-            loss_per_sec: 0.0,
-            kf_per_sec: 0.0,
-        };
-        peer.last_screen_downlink = crate::decode::layer_chooser::DownlinkSample {
-            loss_per_sec: 0.0,
-            kf_per_sec: 0.0,
-        };
-        peer
-    }
-
     /// CORE REGRESSION (#1219 Half 2): a relay-authored DOWNLINK_CONGESTION must
     /// step a peer's RECEIVER-side chooser down EVEN WHEN the per-peer real
     /// downlink sample shows ZERO loss (the WebSocket / reliable-WT case). This is
@@ -6460,7 +6696,7 @@ mod tests {
         );
 
         // The relay-authored signal: synthetic congestion steps the chooser down.
-        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open);
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open, false);
         assert!(
             seeded,
             "DOWNLINK_CONGESTION must step the chooser down despite zero real loss"
@@ -6547,7 +6783,7 @@ mod tests {
         let mut bounds = ReceiveLayerBounds::default();
         bounds.set_kind(PrefMediaKind::Video, None, Some(0));
 
-        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &bounds);
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &bounds, false);
         assert!(
             seeded,
             "the synthetic congested sample must still step a constrain (clamp is a \
@@ -6609,7 +6845,7 @@ mod tests {
 
         // Seed steps the RECEIVER chooser down. There is no publisher-encoder field
         // reachable from here to inspect — the manager owns only receive-side state.
-        assert!(manager.seed_downlink_congestion_for_connected_peers(2000, &open));
+        assert!(manager.seed_downlink_congestion_for_connected_peers(2000, &open, false));
         let after = manager
             .connected_peers
             .get(&702)
@@ -6623,6 +6859,236 @@ mod tests {
         // And it advertises a receive-layer request, never an encoder action.
         let desired = manager.current_desired_preferences(2000, &open);
         assert_eq!(desired.get(&(702, PrefMediaKind::Video)).copied(), Some(1));
+    }
+
+    /// SPEAKER EXEMPTION (#1557): an active speaker is NOT stepped down by the
+    /// receiver-side layer-drop seed — the person talking stays sharp — while a
+    /// non-speaking peer in the same room IS stepped down.
+    ///
+    /// MUTATION CHECK: flip this call's `exempt_speakers` arg to `false` and this
+    /// fails — the speaker (710) drops to 1 alongside the non-speaker (711). (The
+    /// `exempt_speakers &&` guard itself is pinned by the sibling relay test
+    /// `speaker_video_layer_stepped_on_relay_downlink_seed`, whose `false` arg would
+    /// let the bare `is_speaking` skip resurface and break ITS 710 -> 1 assertion.)
+    #[test]
+    fn speaker_video_layer_exempt_from_downlink_seed() {
+        use crate::decode::layer_chooser::ReceiveLayerBounds;
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(710, make_zero_loss_top_peer(710));
+        manager
+            .connected_peers
+            .insert(711, make_zero_loss_top_peer(711));
+
+        let open = ReceiveLayerBounds::default();
+
+        // Mark peer 710 as the active speaker; 711 stays silent.
+        manager.connected_peers.get_mut(&710).unwrap().is_speaking = true;
+
+        // Bring BOTH choosers to the top (current == 2) via one clean tick.
+        let _ = manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&710)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "speaking peer climbed to the top before the seed"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&711)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "non-speaking peer climbed to the top before the seed"
+        );
+
+        // Seed receiver-side congestion with `exempt_speakers == true` (the LOCAL
+        // CPU-pressure policy). The speaker must be skipped (not stepped), so
+        // `seeded` reflects ONLY the non-speaker's move.
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open, true);
+        assert!(
+            seeded,
+            "the non-speaking peer was stepped, so the seed reports movement"
+        );
+
+        // Speaker (710) is EXEMPT — its video layer is byte-identical (still 2).
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&710)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "active speaker keeps its current video layer (exempt from layer-drop)"
+        );
+        // Non-speaker (711) WAS stepped down 2 -> 1.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&711)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "non-speaking peer is stepped down by the seed (2 -> 1)"
+        );
+    }
+
+    /// RELAY DOWNLINK NON-EXEMPTION (#1557 / #1219 Half 2): on the relay
+    /// DOWNLINK_CONGESTION path the seed is called with `exempt_speakers == false`,
+    /// so the active speaker's VIDEO IS stepped down alongside everyone else's.
+    /// Under REAL downlink saturation the speaker's stream is the largest inbound
+    /// and must be shed; in the degenerate 1-on-1 the only remote peer IS the
+    /// speaker, so exempting it would shed zero bitrate. This pins that the
+    /// relay path does NOT honor the speaker exemption.
+    ///
+    /// MUTATION CHECK: flip this call's `exempt_speakers` arg to `true` and this
+    /// fails — the speaker (710) stays at 2 and the "both stepped 2 -> 1"
+    /// assertion on 710 breaks.
+    #[test]
+    fn speaker_video_layer_stepped_on_relay_downlink_seed() {
+        use crate::decode::layer_chooser::ReceiveLayerBounds;
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(710, make_zero_loss_top_peer(710));
+        manager
+            .connected_peers
+            .insert(711, make_zero_loss_top_peer(711));
+
+        let open = ReceiveLayerBounds::default();
+
+        // Mark peer 710 as the active speaker; 711 stays silent.
+        manager.connected_peers.get_mut(&710).unwrap().is_speaking = true;
+
+        // Bring BOTH choosers to the top (current == 2) via one clean tick.
+        let _ = manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&710)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "speaking peer climbed to the top before the seed"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&711)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "non-speaking peer climbed to the top before the seed"
+        );
+
+        // Relay path: `exempt_speakers == false` — the speaker is NOT skipped.
+        let seeded = manager.seed_downlink_congestion_for_connected_peers(2000, &open, false);
+        assert!(
+            seeded,
+            "both peers were stepped, so the seed reports movement"
+        );
+
+        // Speaker (710) IS stepped down 2 -> 1 on the relay path (NOT exempt).
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&710)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "active speaker's video IS stepped down on the relay path (2 -> 1)"
+        );
+        // Non-speaker (711) WAS stepped down 2 -> 1.
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&711)
+                .unwrap()
+                .selected_video_layer(),
+            1,
+            "non-speaking peer is stepped down by the seed (2 -> 1)"
+        );
+    }
+
+    /// AUDIO EXEMPTION (#1557 / pre-existing #1219 Half 2): the receiver-side
+    /// layer-drop seed NEVER steps any peer's audio chooser — audio is
+    /// priority-protected. Pins that the speaker exemption did not regress the
+    /// audio protection for either a speaking or a non-speaking peer. The audio
+    /// exemption holds for BOTH `exempt_speakers` values (true = local CPU policy,
+    /// false = relay downlink policy): neither path ever touches the audio chooser.
+    ///
+    /// MUTATION CHECK: add an audio branch to `Peer::seed_downlink_congestion` and
+    /// this fails — a peer's audio drops below 2.
+    #[test]
+    fn audio_never_stepped_by_downlink_seed() {
+        use crate::decode::layer_chooser::ReceiveLayerBounds;
+
+        let mut manager = PeerDecodeManager::new();
+        manager
+            .connected_peers
+            .insert(712, make_zero_loss_top_peer(712));
+        manager
+            .connected_peers
+            .insert(713, make_zero_loss_top_peer(713));
+
+        let open = ReceiveLayerBounds::default();
+        // 712 speaks, 713 does not — exercise both exemption paths for audio.
+        manager.connected_peers.get_mut(&712).unwrap().is_speaking = true;
+
+        // Climb both choosers to the top (audio chooser reaches 2 as well).
+        let _ = manager.tick_layer_choosers(1500, &open);
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&712)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "speaker audio at the top before the seed"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&713)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "non-speaker audio at the top before the seed"
+        );
+
+        // Drive BOTH policies: exempt_speakers true (local CPU) then false (relay).
+        // Neither must touch the audio chooser for either peer.
+        let _ = manager.seed_downlink_congestion_for_connected_peers(2000, &open, true);
+        let _ = manager.seed_downlink_congestion_for_connected_peers(2100, &open, false);
+
+        // Observed: NEITHER peer's audio layer moved — the seed only ever steps
+        // VIDEO/SCREEN, never AUDIO (the speaker is fully skipped; the non-speaker
+        // is stepped on video but its audio chooser is left at the top).
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&712)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "speaker audio untouched by the downlink seed"
+        );
+        assert_eq!(
+            manager
+                .connected_peers
+                .get(&713)
+                .unwrap()
+                .selected_audio_layer(),
+            2,
+            "non-speaker audio untouched by the downlink seed (video-only step)"
+        );
     }
 
     /// NIT 1 (PR #1192 review): a source whose ONLY learned layer is the base
@@ -7529,6 +7995,7 @@ mod tests {
                 audio_enabled: false,
                 screen_enabled: false,
                 display_name: None,
+                device_info: PeerDeviceInfo::default(),
                 is_guest: false,
                 visible: false,
                 context_initialized: false,
@@ -7636,6 +8103,7 @@ mod tests {
             audio_enabled: false,
             screen_enabled: false,
             display_name: None,
+            device_info: PeerDeviceInfo::default(),
             is_guest: false,
             visible: false,
             context_initialized: false,
@@ -7714,6 +8182,7 @@ mod tests {
             audio_enabled: false,
             screen_enabled: false,
             display_name: None,
+            device_info: PeerDeviceInfo::default(),
             is_guest: false,
             visible: false,
             context_initialized: false,
@@ -7837,6 +8306,232 @@ mod tests {
         let manager = PeerDecodeManager::new();
         let name = manager.get_peer_display_name("999");
         assert_eq!(name, None, "should return None for unknown session_id");
+    }
+
+    // -- #1482: peer device_info store + getter + merge tests -----------------
+    //
+    // NATIVE/HOST `#[test]`s (NOT `#[wasm_bindgen_test]`) so they actually run
+    // in CI's native test job and can be run + mutation-tested locally. They
+    // exercise the cache path only (set_peer_device_info / peer_device_info),
+    // which needs no browser APIs.
+
+    /// Round-trip: store device info via `set_peer_device_info`, read it back via
+    /// the `peer_device_info` getter (cache fallback, no peer entry). Asserts
+    /// every populated field round-trips exactly. Mutation coverage: breaking the
+    /// getter (e.g. `return None;`) makes every assert below fail.
+    #[test]
+    fn device_info_round_trips_through_cache() {
+        let mut manager = PeerDecodeManager::new();
+        let info = PeerDeviceInfo {
+            client_cores: Some(8),
+            client_architecture: Some("arm".to_string()),
+            client_os: Some("macOS 14.5".to_string()),
+            client_device_type: Some("desktop".to_string()),
+            client_main_thread_load: Some(0.42),
+            client_memory_used_mb: Some(128.0),
+            client_device_memory_gb: Some(8.0),
+        };
+        manager.set_peer_device_info(42, info);
+
+        let got = manager
+            .peer_device_info(42)
+            .expect("device info should be stored and retrievable");
+        assert_eq!(got.client_cores, Some(8));
+        assert_eq!(got.client_architecture.as_deref(), Some("arm"));
+        assert_eq!(got.client_os.as_deref(), Some("macOS 14.5"));
+        assert_eq!(got.client_device_type.as_deref(), Some("desktop"));
+        assert_eq!(got.client_main_thread_load, Some(0.42));
+        assert_eq!(got.client_memory_used_mb, Some(128.0));
+        assert_eq!(got.client_device_memory_gb, Some(8.0));
+    }
+
+    /// Merge policy: STATIC fields survive a later tick that omits them;
+    /// DYNAMIC fields always take the latest value, including `None`.
+    /// Mutation coverage: changing the static merge to `incoming.client_os`
+    /// (dropping `.or(existing)`) makes the "os survives" assert fail; changing
+    /// the dynamic field to `.or(existing)` makes the "main_thread_load -> None"
+    /// assert fail.
+    #[test]
+    fn device_info_merge_preserves_static_and_updates_dynamic() {
+        let mut manager = PeerDecodeManager::new();
+
+        // First tick: static fields present, dynamic absent.
+        manager.set_peer_device_info(
+            7,
+            PeerDeviceInfo {
+                client_os: Some("macOS 14.5".to_string()),
+                client_cores: Some(8),
+                ..Default::default()
+            },
+        );
+
+        // Second tick: static fields ABSENT, dynamic present. Static must
+        // survive; dynamic must update.
+        manager.set_peer_device_info(
+            7,
+            PeerDeviceInfo {
+                client_main_thread_load: Some(0.3),
+                ..Default::default()
+            },
+        );
+        let got = manager.peer_device_info(7).expect("entry should exist");
+        assert_eq!(
+            got.client_os.as_deref(),
+            Some("macOS 14.5"),
+            "static os must survive a tick that omits it"
+        );
+        assert_eq!(
+            got.client_cores,
+            Some(8),
+            "static cores must survive a tick that omits it"
+        );
+        assert_eq!(
+            got.client_main_thread_load,
+            Some(0.3),
+            "dynamic load must take the latest incoming value"
+        );
+
+        // Third tick: dynamic field explicitly None. It must become None
+        // (dynamic gauges take the latest, including None).
+        manager.set_peer_device_info(
+            7,
+            PeerDeviceInfo {
+                client_main_thread_load: None,
+                ..Default::default()
+            },
+        );
+        let got = manager.peer_device_info(7).expect("entry should exist");
+        assert_eq!(
+            got.client_main_thread_load, None,
+            "dynamic load must take latest None (live gauge), not retain old value"
+        );
+        assert_eq!(
+            got.client_os.as_deref(),
+            Some("macOS 14.5"),
+            "static os must still survive across the third tick"
+        );
+    }
+
+    /// Unknown session_id → getter returns None.
+    #[test]
+    fn device_info_returns_none_for_unknown_session() {
+        let manager = PeerDecodeManager::new();
+        assert_eq!(
+            manager.peer_device_info(999),
+            None,
+            "should return None for an unknown session_id"
+        );
+    }
+
+    /// LIVE-PEER getter branch: when a peer entry exists and its `device_info`
+    /// is non-default, `peer_device_info` returns the LIVE peer's struct, NOT
+    /// the cache. Uses the same construction idiom as the display_name live-peer
+    /// tests (`make_test_peer` + `connected_peers.insert`), which uses no-op
+    /// decoders and links natively.
+    ///
+    /// To make the branch choice OBSERVABLE (the setter normally writes the
+    /// cache and the live peer identically, which would make both paths return
+    /// equal values), this test deliberately DIVERGES them: the cache holds one
+    /// value, the live peer holds a different one, written directly. The getter
+    /// must return the LIVE value. Mutation coverage: changing the getter's
+    /// live-peer branch to `return None;` (or deleting it so it falls through to
+    /// the cache) makes the getter return the CACHE value (cores=99) and the
+    /// assertions below fail.
+    #[test]
+    fn device_info_live_peer_branch_is_read() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 55;
+
+        // Seed the cache with a DISTINCT value (cores=99) via the public setter.
+        manager.set_peer_device_info(
+            session_id,
+            PeerDeviceInfo {
+                client_cores: Some(99),
+                client_os: Some("cache-only".to_string()),
+                ..Default::default()
+            },
+        );
+
+        // Create a live peer entry and write a DIFFERENT device_info directly on
+        // it (bypassing the setter so the cache and the live peer diverge).
+        let (mut peer, _muted) = make_test_peer(session_id);
+        let live_info = PeerDeviceInfo {
+            client_cores: Some(12),
+            client_os: Some("Windows 11".to_string()),
+            client_main_thread_load: Some(0.17),
+            ..Default::default()
+        };
+        peer.device_info = live_info.clone();
+        manager.connected_peers.insert(session_id, peer);
+
+        // The getter MUST return the LIVE peer's value (cores=12), not the
+        // cache value (cores=99). If the live-peer branch is removed, the
+        // getter falls through to the cache and these fail.
+        let got = manager
+            .peer_device_info(session_id)
+            .expect("live peer device_info should be returned");
+        assert_eq!(
+            got.client_cores,
+            Some(12),
+            "getter must read the LIVE peer (cores=12), not the cache (cores=99)"
+        );
+        assert_eq!(got.client_os.as_deref(), Some("Windows 11"));
+        assert_eq!(got.client_main_thread_load, Some(0.17));
+        assert_eq!(
+            got, live_info,
+            "getter must return exactly the LIVE peer's device_info"
+        );
+    }
+
+    /// HYDRATE-ON-CREATION: when `set_peer_device_info` seeds the cache BEFORE
+    /// the peer entry exists, `add_peer` (the real media-packet path) must
+    /// hydrate the new peer's `device_info` from the cache.
+    ///
+    /// WASM-ONLY: this exercises the REAL hydration block inside `add_peer`,
+    /// which calls `Peer::new` -> `Self::new_decoders` (WebCodecs / canvas).
+    /// Those browser APIs cannot link/run under a native `cargo test`, so this
+    /// is a `#[wasm_bindgen_test]` like the existing `add_peer` test
+    /// (`sorted_string_keys_invalidates_on_add_peer`). It does NOT run in the
+    /// native test job. Mutation coverage: commenting out the hydration line
+    /// `peer.device_info = cached.clone();` in `add_peer` makes the final
+    /// assertion fail (the live peer would keep the default empty device_info).
+    #[wasm_bindgen_test]
+    fn device_info_hydrates_live_peer_from_cache_on_add_peer() {
+        let mut manager = PeerDecodeManager::new();
+        let session_id: u64 = 56;
+
+        // Seed the cache BEFORE any peer entry exists (HealthPacket arriving
+        // before the first media packet).
+        let info = PeerDeviceInfo {
+            client_cores: Some(4),
+            client_architecture: Some("arm".to_string()),
+            client_device_type: Some("mobile".to_string()),
+            ..Default::default()
+        };
+        manager.set_peer_device_info(session_id, info.clone());
+        assert!(
+            !manager.connected_peers.contains_key(&session_id),
+            "no peer entry should exist yet (cache-only)"
+        );
+
+        // Create the peer via the real path so the hydration block runs.
+        manager
+            .add_peer("user56@test.com", session_id, None)
+            .expect("add_peer should succeed");
+
+        // The newly-created LIVE peer must have been hydrated from the cache.
+        let live = manager
+            .connected_peers
+            .get(&session_id)
+            .map(|p| p.device_info.clone())
+            .expect("peer should exist after add_peer");
+        assert_eq!(live.client_cores, Some(4));
+        assert_eq!(live.client_architecture.as_deref(), Some("arm"));
+        assert_eq!(live.client_device_type.as_deref(), Some("mobile"));
+        assert_eq!(
+            live, info,
+            "add_peer must hydrate the live peer's device_info from the cache"
+        );
     }
 
     // -- Phase 6: sorted_string_keys memoisation tests --------------------

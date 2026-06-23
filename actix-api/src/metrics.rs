@@ -180,10 +180,15 @@ pub fn forget_room_metrics(room: &str) {
     // Single-label room counters: one tuple each.
     let _ = RELAY_VIEWPORT_FILTERED_TOTAL.remove_label_values(&[room]);
     let _ = RELAY_VIEWPORT_FORWARDED_TOTAL.remove_label_values(&[room]);
+    // relay_viewport_nonvideo_at_drop_branch_total{room} (#1437): single-label
+    // `room`, one tuple — GC'd like its FILTERED/FORWARDED siblings.
+    let _ = RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL.remove_label_values(&[room]);
     let _ = RELAY_LAYER_FILTERED_TOTAL.remove_label_values(&[room]);
     let _ = RELAY_LAYER_FORWARDED_TOTAL.remove_label_values(&[room]);
     // relay_congestion_filtered_total{room} (#1220).
     let _ = RELAY_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
+    // relay_inner_session_self_filtered_total{room} (#618, #629).
+    let _ = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL.remove_label_values(&[room]);
     // relay_downlink_congestion_filtered_total{room} (#1219 Half 2) — same
     // room-keyed unicast-filter sibling; swept alongside its CONGESTION cousin.
     let _ = RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL.remove_label_values(&[room]);
@@ -985,6 +990,59 @@ lazy_static! {
     )
     .expect("Failed to create encoder_active_layers metric");
 
+    /// Audio congestion ceiling: the congestion-driven dynamic layer cap (#1561).
+    /// Distinct from active layers: this is only the runtime cap applied under
+    /// congestion. In the uncapped state the exporter reports the effective
+    /// ladder depth so dashboards can compare the two without a sentinel value.
+    pub static ref AUDIO_CONGESTION_CEILING: GaugeVec = register_gauge_vec!(
+        "videocall_audio_congestion_ceiling",
+        "Audio congestion-driven layer ceiling; equals effective audio layers when uncapped and is lower while congestion shedding is active",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create audio_congestion_ceiling metric");
+
+    /// Receiver-side layer selection: which simulcast layer THIS receiver is
+    /// subscribing to from a given peer for a given media kind (#1561).
+    pub static ref RECEIVED_LAYER: GaugeVec = register_gauge_vec!(
+        "videocall_received_layer",
+        "Simulcast layer index (0=base) this receiver has chosen for a given peer and media kind; absent when receiving the top layer (unconstrained)",
+        &["meeting_id", "session_id", "peer_id", "display_name", "from_peer", "media_kind"]
+    )
+    .expect("Failed to create received_layer metric");
+
+    /// Battery charging state (#1556): 1.0 = charging, 0.0 = discharging.
+    pub static ref BATTERY_CHARGING: GaugeVec = register_gauge_vec!(
+        "videocall_client_battery_charging",
+        "Battery charging state (1=charging, 0=discharging); absent when battery API unavailable",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_battery_charging metric");
+
+    /// Connection medium type (#1556): exposed as a dedicated gauge with value=1
+    /// and the type as a label, since CLIENT_INFO already has many labels.
+    pub static ref CLIENT_NETWORK_TYPE: GaugeVec = register_gauge_vec!(
+        "videocall_client_network_type",
+        "Connection medium indicator (value=1); network_type label carries the medium (wifi/ethernet/cellular)",
+        &["meeting_id", "session_id", "peer_id", "display_name", "network_type"]
+    )
+    .expect("Failed to create client_network_type metric");
+
+    /// Max downlink speed of the connection medium in Mbps (#1556).
+    pub static ref CLIENT_NETWORK_DOWNLINK_MAX: GaugeVec = register_gauge_vec!(
+        "videocall_client_network_downlink_max",
+        "Max downlink speed of the connection medium in Mbps (e.g. wifi=54, ethernet=1000)",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_network_downlink_max metric");
+
+    /// CPU throttle indicator (#1556): 1.0 when capability_score/cores < 150.
+    pub static ref CLIENT_CPU_THROTTLED: GaugeVec = register_gauge_vec!(
+        "videocall_client_cpu_throttled",
+        "CPU throttle indicator (1=throttled, 0=normal); based on capability_score/cores ratio < 150",
+        &["meeting_id", "session_id", "peer_id", "display_name"]
+    )
+    .expect("Failed to create client_cpu_throttled metric");
+
     // ===== PER-PEER QUALITY METRICS (new/transition) =====
 
     /// Audio concealment percentage from NetEQ expand events (0.0-100.0)
@@ -1124,6 +1182,30 @@ lazy_static! {
     )
     .expect("Failed to create relay_viewport_forwarded_total metric");
 
+    /// #1437 invariant tripwire — MUST ALWAYS BE 0 in production.
+    ///
+    /// Counts the IMPOSSIBLE case: a NON-VIDEO packet reaching the viewport
+    /// drop-decision site. The viewport filter is VIDEO-only and is guarded by
+    /// the `is_video` check at `chat_server.rs` (~line 4903, HCL #988); by
+    /// construction nothing but `MediaKind::VIDEO` can reach the drop branch, so
+    /// this counter can only increment if a FUTURE REFACTOR bypasses or widens
+    /// that `is_video` guard and lets AUDIO/SCREEN/unknown reach the viewport
+    /// drop-decision site. A NONZERO value is therefore a STRUCTURAL-INVARIANT
+    /// BREACH, not a normal viewport drop — it means the #988 guard regressed,
+    /// and should page (see the #1437 alert in alert_rules.yml). It is wired
+    /// purely as observability (a `debug_assert!` + this counter); it never
+    /// changes forwarding behavior. See #1437, #988.
+    ///
+    /// CARDINALITY: `room` only (user-provided, unbounded over time) — same
+    /// caveat as the other room-labeled counters above. Swept by
+    /// `forget_room_metrics` when the room drains.
+    pub static ref RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL: CounterVec = register_counter_vec!(
+        "relay_viewport_nonvideo_at_drop_branch_total",
+        "INVARIANT TRIPWIRE (must always be 0): non-VIDEO packets that reached the viewport drop-decision site — only possible if the #988 is_video guard regresses (HCL #1437)",
+        &["room"]
+    )
+    .expect("Failed to create relay_viewport_nonvideo_at_drop_branch_total metric");
+
     /// Current viewport (desired-streams) set size, per room (HCL #988).
     ///
     /// Updated on every ACCEPTED VIEWPORT inside `try_intercept_viewport`. A
@@ -1218,6 +1300,47 @@ lazy_static! {
         &["room"]
     )
     .expect("Failed to create relay_congestion_filtered_total metric");
+
+    /// Packets dropped at the relay because the embedded inner `session_id`
+    /// matched the receiver's OWN current session even though the NATS subject
+    /// pointed at a STALE (post-reconnect) session — the #618 leak (#629 — this
+    /// metric).
+    ///
+    /// On 2026-05-08 a production meeting leaked self-DIAGNOSTICS: a stale
+    /// subscription survived a reconnect and delivered a packet whose subject
+    /// differed from the receiver's CURRENT session but whose embedded
+    /// `session_id` (stamped by `Handler<ClientMessage>`) still belonged to this
+    /// connection. The subject-only self-skip missed it; #618 added the
+    /// inner-`session_id` self-skip (`inner_session_self` in
+    /// `chat_server.rs::handle_msg`) to close the leak. This counter records each
+    /// packet dropped where the inner `session_id` matched our own session BUT
+    /// the subject did NOT (`inner_session_self && !subject_self`) — i.e. the
+    /// subject pointed at a stale/different session: the post-reconnect leak
+    /// shape and nothing else.
+    ///
+    /// It does NOT count ordinary `subject_self` self-echoes. Those are normal
+    /// and uninteresting, and — critically — they ALSO have `inner_session_self`
+    /// true: the relay stamps `session_id = session` on publish (the publish
+    /// path in `chat_server.rs`), so a routine echo arrives with BOTH
+    /// `subject_self` AND `inner_session_self` true. The `!subject_self` arm in
+    /// the increment guard is what excludes them, so the leak signal is not
+    /// drowned by routine self-echo volume. It is an EXPECTED,
+    /// fan-out-/reconnect-correctness drop — like
+    /// [`RELAY_CONGESTION_FILTERED_TOTAL`] / [`RELAY_VIEWPORT_FILTERED_TOTAL`] /
+    /// [`RELAY_LAYER_FILTERED_TOTAL`] it is deliberately kept OFF
+    /// `relay_packet_drops_total` (which is backpressure loss). #629 wants
+    /// operators to see the rate of THIS specific filter so a recurrence of the
+    /// stale-subscription leak is observable.
+    ///
+    /// CARDINALITY: `room` only (user-provided, unbounded over time; bounded to
+    /// live rooms by the room-drain GC `forget_room_metrics`), same caveats as
+    /// the other room-labeled counters above.
+    pub static ref RELAY_INNER_SESSION_SELF_FILTERED_TOTAL: CounterVec = register_counter_vec!(
+        "relay_inner_session_self_filtered_total",
+        "Total packets dropped at the relay where the inner session_id matched the receiver's own session but the subject did NOT (stale post-reconnect subject); excludes routine subject-matched self-echoes (#618 leak; #629 metric)",
+        &["room"]
+    )
+    .expect("Failed to create relay_inner_session_self_filtered_total metric");
 
     /// Simulcast media packets that ENTERED the per-receiver layer filter and
     /// were forwarded — the denominator complement of `relay_layer_filtered_total`
@@ -1908,6 +2031,38 @@ mod tests {
     }
 
     #[test]
+    #[serial(viewport_nonvideo_guard_metric)]
+    fn viewport_nonvideo_guard_is_labeled_by_room_and_independent_of_filtered_and_forwarded() {
+        // The #1437 invariant tripwire must be its own series — bumping it must
+        // not leak into the FILTERED or FORWARDED counters (the "% filtered"
+        // panel and the blackout alert both depend on those two being clean).
+        let room = "wiretest_room_nonvideo_guard";
+        let guard_before = snapshot(&RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL, &[room]);
+        let filt_before = snapshot(&RELAY_VIEWPORT_FILTERED_TOTAL, &[room]);
+        let fwd_before = snapshot(&RELAY_VIEWPORT_FORWARDED_TOTAL, &[room]);
+
+        RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+            .with_label_values(&[room])
+            .inc();
+
+        assert_eq!(
+            snapshot(&RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL, &[room]) - guard_before,
+            1.0,
+            "guard bump must land on the nonvideo-guard series for this room"
+        );
+        assert_eq!(
+            snapshot(&RELAY_VIEWPORT_FILTERED_TOTAL, &[room]) - filt_before,
+            0.0,
+            "guard bump must NOT leak into the filtered series"
+        );
+        assert_eq!(
+            snapshot(&RELAY_VIEWPORT_FORWARDED_TOTAL, &[room]) - fwd_before,
+            0.0,
+            "guard bump must NOT leak into the forwarded series"
+        );
+    }
+
+    #[test]
     #[serial(viewport_updates_metric)]
     fn viewport_updates_increments_per_outcome() {
         // Cardinality contract: exactly four outcomes are valid labels. This
@@ -2135,9 +2290,15 @@ mod tests {
         RELAY_VIEWPORT_FORWARDED_TOTAL
             .with_label_values(&[room])
             .inc();
+        RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+            .with_label_values(&[room])
+            .inc();
         RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[room]).inc();
         RELAY_LAYER_FORWARDED_TOTAL.with_label_values(&[room]).inc();
         RELAY_CONGESTION_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .inc();
+        RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
             .with_label_values(&[room])
             .inc();
         RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL
@@ -2206,6 +2367,13 @@ mod tests {
             1.0,
             "downlink-congestion-filtered seed must be observable before removal (non-vacuous)"
         );
+        assert_eq!(
+            RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            1.0,
+            "nonvideo-guard seed must be observable before removal (non-vacuous)"
+        );
 
         // Drain the room.
         forget_room_metrics(room);
@@ -2225,6 +2393,14 @@ mod tests {
             0.0
         );
         assert_eq!(
+            RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0,
+            "relay_viewport_nonvideo_at_drop_branch_total{{room}} must be swept by \
+             forget_room_metrics (#1437)"
+        );
+        assert_eq!(
             RELAY_LAYER_FILTERED_TOTAL.with_label_values(&[room]).get(),
             0.0
         );
@@ -2234,6 +2410,12 @@ mod tests {
         );
         assert_eq!(
             RELAY_CONGESTION_FILTERED_TOTAL
+                .with_label_values(&[room])
+                .get(),
+            0.0
+        );
+        assert_eq!(
+            RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
                 .with_label_values(&[room])
                 .get(),
             0.0

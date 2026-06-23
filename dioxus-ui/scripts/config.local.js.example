@@ -36,7 +36,15 @@ if (window.__APP_CONFIG) {
     // Enable verbose log upload to a local collector.
     // consoleLogUploadEnabled: "false",
 
+    // Disable health-packet hardware/network/battery telemetry independently
+    // from console-log upload. Defaults to enabled when omitted.
+    // hardwareMetricsEnabled: "false",
+
     // Mock remote participants without a full stack.
     // mockPeersEnabled: "false",
+
+    // Hide git commit/branch in the About modal + diagnostics build info
+    // (production behavior). Omit or set "false" to hide; "true" shows them.
+    // showBuildGitInfo: "false",
   });
 }

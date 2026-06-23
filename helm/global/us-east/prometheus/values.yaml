@@ -256,14 +256,75 @@ prometheus:
                 summary: "NATS publish latency p99 > 50ms"
                 description: "NATS publish p99 latency is {{ $value | printf \"%.1f\" }}ms"
 
-            - alert: RelayQueueNearFull
-              expr: relay_outbound_queue_depth > 100
+            # RelayQueueNearFull is split per transport because the single
+            # relay_outbound_queue_depth gauge carries an 8x-different max per
+            # transport, so one scalar threshold cannot express "near full" for
+            # both: WS max = WS_OUTBOUND_CHANNEL_CAPACITY (128); WT max = the SUM
+            # of the unistream (WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT, 512) and
+            # datagram (WT_DATAGRAM_CHANNEL_CAPACITY, 512) channels = 1024. The
+            # gauge has only room+transport labels (no per-primitive label yet),
+            # so the WT rule anchors on 410 (~80% of the 512 unistream queue),
+            # not 80% of the 1024 sum: under congestion the reliable unistream
+            # backs up first (it blocks on QUIC flow control) while the datagram
+            # path drops rather than queues, so a ~410-deep unistream backlog —
+            # the source of the freeze symptom — would otherwise hide under the
+            # summed gauge whenever datagrams are near-empty. Exporting a
+            # per-primitive depth label so the WT rule can target the unistream
+            # queue directly is a source-side follow-up (issue #710).
+            - alert: RelayQueueNearFullWS
+              expr: relay_outbound_queue_depth{transport="websocket"} > 102
               for: 30s
               labels:
                 severity: warning
               annotations:
-                summary: "Relay outbound queue near capacity ({{ $labels.transport }})"
-                description: "Room {{ $labels.room }} ({{ $labels.transport }}) queue depth: {{ $value }} (WS cap=128, WT cap=256)"
+                summary: "Relay WS outbound queue near capacity"
+                description: "Room {{ $labels.room }} (websocket) queue depth: {{ $value }} of 128 (WS cap=128)"
+
+            - alert: RelayQueueNearFullWT
+              expr: relay_outbound_queue_depth{transport="webtransport"} > 410
+              for: 30s
+              labels:
+                severity: warning
+              annotations:
+                summary: "Relay WT outbound queue near capacity"
+                description: "Room {{ $labels.room }} (webtransport) queue depth: {{ $value }} (WT cap=1024: unistream 512 + datagram 512; alert anchors on the 512 unistream queue)"
+
+            # =====================================================================
+            # relay viewport alerts (#1437)
+            #
+            # These derive the camera-blackout signature from the
+            # filtered-vs-forwarded ratio rather than from the
+            # relay_viewport_set_size gauge. That gauge is per-room
+            # LAST-WRITER-WINS across receivers and cannot distinguish a
+            # legitimately idle room from a collapsed one. The ratio of the two
+            # per-room counters is unambiguous: relay_viewport_filtered_total
+            # (intentional off-screen VIDEO drops) and
+            # relay_viewport_forwarded_total (VIDEO that passed the filter). A
+            # room dropping VIDEO while forwarding ~none is a total blackout.
+            # relay_viewport_nonvideo_at_drop_branch_total is the #1437 invariant
+            # tripwire — it must ALWAYS be 0; any increase means the #988 is_video
+            # guard regressed. All three metrics are scraped from the relay pods
+            # via the kubernetes-pods prometheus.io/scrape annotation job above.
+            # =====================================================================
+            - alert: ViewportBlackout
+              expr: rate(relay_viewport_filtered_total[5m]) > 0 and rate(relay_viewport_forwarded_total[5m]) < 0.1
+              for: 5m
+              labels:
+                severity: critical
+                component: relay-viewport
+              annotations:
+                summary: "Viewport blackout in room {{ $labels.room }}"
+                description: "Room {{ $labels.room }} is dropping VIDEO via the viewport filter ({{ $value }}/s filtered) while forwarding effectively none — total camera blackout for the room (#988/#1437)."
+
+            - alert: ViewportNonVideoInvariantBreach
+              expr: increase(relay_viewport_nonvideo_at_drop_branch_total[5m]) > 0
+              for: 1m
+              labels:
+                severity: critical
+                component: relay-viewport-invariant
+              annotations:
+                summary: "Viewport non-VIDEO invariant breach in room {{ $labels.room }}"
+                description: "A non-VIDEO packet reached the viewport drop branch in room {{ $labels.room }} — the #988 is_video guard regressed (#1437). This counter must ALWAYS be 0; observed increase {{ $value }}."
 
         - name: videocall_quality_alerts
           rules:

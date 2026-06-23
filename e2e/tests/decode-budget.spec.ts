@@ -37,7 +37,13 @@ const BUDGET = {
   LONGTASK_SEVERE_MS_PER_SEC: 700, // sustained long-task ms/s for a MULTI-tile drop (review FIX 4)
   SUSTAIN_SAMPLES: 3, // consecutive 1 Hz samples required before a step
   RECOVERY_HOLD: 5, // consecutive recovery-qualifying samples before a step UP
-  STEP_DOWN_COOLDOWN_MS: 2000, // min ms between two DOWN steps (review FIX 5)
+  // min ms between two DOWN steps (review FIX 5). Issue #1557 REUSES this exact
+  // constant as the cascade SETTLE WINDOW: after received layers reach floor, the
+  // loop waits STEP_DOWN_COOLDOWN_MS since the last REAL layer drop before
+  // escalating from lowering layers to PAUSING (capping) tiles. One constant,
+  // two roles — `settle_window_elapsed(now, last_layer_drop_ms)` in
+  // decode_budget.rs compares against this same 2000 ms.
+  STEP_DOWN_COOLDOWN_MS: 2000,
   STEP_UP_COOLDOWN_MS: 4000, // min ms between two UP steps (review FIX 5)
   WINDOW: 5, // rolling sample window owned by the control loop (attendants.rs)
 } as const;
@@ -69,6 +75,42 @@ const MAX_DOWN_SAMPLES = BUDGET.SUSTAIN_SAMPLES + 3 * COOLDOWN_DOWN_SAMPLES;
 // One visible up-step proves recovery: RECOVERY_HOLD + a couple of up-cooldown
 // windows of headroom.
 const MAX_UP_SAMPLES = BUDGET.RECOVERY_HOLD + 3 * COOLDOWN_UP_SAMPLES;
+
+// --- Issue #1557 console-log witnesses (tier-before-pause ordering) ---
+// The wasm control loop emits these `log::info!` lines (surfaced to the browser
+// console via `console_log`; the e2e config sets logLevel:"info" so they are
+// captured). They are the NATIVE-INTERLEAVING-PROOF distinguisher between the
+// new tiered ordering and the old concurrent-drop: a healthy native rAF FPS
+// sample emits NO DecodeBudget log at all, so only real down-pressure ticks add
+// lines, and their ORDER is what the #1557 guard pins.
+//   - LOWER_LAYER_LATCH_LOG: emitted on the FIRST Down edge (the pressured-latch
+//     tick) while the cap is UNTOUCHED — this log did NOT EXIST before #1557, and
+//     under the old code the cap dropped on this same tick.
+//   - CAP_DOWN_LOG: emitted only when a tile is actually PAUSED (cap N->M). Under
+//     #1557 this must come AFTER the lower-layer latch log, never on the same tick.
+const LOWER_LAYER_LATCH_LOG = "DecodeBudget: cascade=lower_layer pressured_latch=true";
+const CAP_DOWN_LOG_PREFIX = "DecodeBudget: cap ";
+const CAP_DOWN_LOG_SUFFIX = "dir=down";
+
+// Attach a console collector BEFORE the page's first navigation so the cascade
+// logs emitted by the control loop are captured in order. Returns the live array.
+function collectConsole(page: Page): string[] {
+  const lines: string[] = [];
+  page.on("console", (msg) => {
+    lines.push(msg.text());
+  });
+  return lines;
+}
+
+// Index of the first captured line that is a real cap-drop ("cap N->M ... dir=down").
+// Returns -1 if none yet. The substring match tolerates the variable N->M and the
+// trailing telemetry fields.
+const firstCapDownIndex = (lines: string[]): number =>
+  lines.findIndex((l) => l.includes(CAP_DOWN_LOG_PREFIX) && l.includes(CAP_DOWN_LOG_SUFFIX));
+
+// Index of the first lower-layer pressured-latch line. Returns -1 if none yet.
+const firstLowerLayerLatchIndex = (lines: string[]): number =>
+  lines.findIndex((l) => l.includes(LOWER_LAYER_LATCH_LOG));
 
 test.describe("Adaptive decode budget (#987)", () => {
   test.beforeAll(async () => {
@@ -290,6 +332,18 @@ test.describe("Adaptive decode budget (#987)", () => {
   // sustained-low-FPS down-step then produces an off-budget tile within
   // ~SUSTAIN + one down-cooldown (a few seconds). The sample budgets are sized
   // accordingly.
+  //
+  // Issue #1557 (tier-before-pause): the cap now drops ONE control-loop sample
+  // LATER than it used to. The FIRST qualifying Down edge only lowers RECEIVED
+  // simulcast layers (the cap is UNCHANGED → zero off-budget tiles on that tick);
+  // the cap drops on the NEXT Down tick, once layers are at floor and the settle
+  // window has elapsed. This test is intentionally written as a loop-until-shed
+  // with MAX_DOWN_SAMPLES headroom, so the +1-tick shift is absorbed and the test
+  // still proves the down→up round trip. It does NOT, however, DISTINGUISH
+  // tier-before-pause from the old concurrent-drop ordering — it would pass under
+  // both. The dedicated ordering guard is the test
+  // "first Down edge lowers received layers before pausing any tile (#1557)"
+  // below, which keys on the cascade=lower_layer log preceding the cap-drop.
   // ──────────────────────────────────────────────────────────────────────
   test("auto loop steps the decoded-tile count down under load and back up on recovery", async ({
     page,
@@ -357,6 +411,152 @@ test.describe("Adaptive decode budget (#987)", () => {
       (d) => d > decodedAfterDown,
     );
     expect(decodedAfterUp).toBeGreaterThan(decodedAfterDown);
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test 2b (#1557 ORDERING GUARD) — the first Down edge LOWERS RECEIVED
+  // LAYERS before PAUSING any tile (tier-before-pause).
+  //
+  // WHAT CHANGED: previously, the first qualifying Down edge under sustained low
+  // FPS dropped the tile cap IMMEDIATELY — an off-budget avatar appeared on the
+  // very tick the pressure latch fired (layer-drop and cap-shed were CONCURRENT).
+  // Now the loop is TIERED: the first Down edge drops only RECEIVED simulcast
+  // layers (the cap is UNCHANGED → ZERO off-budget tiles on that tick), and the
+  // cap is lowered (off-budget tiles appear) only on the NEXT Down tick, once
+  // received layers are at floor AND the settle window (STEP_DOWN_COOLDOWN_MS
+  // since the last real layer drop) has elapsed.
+  //
+  // HARNESS LIMITATION (investigated, documented): the mock-peer harness has NO
+  // real connected peers — `mock-N` tiles are pure UI-layer placeholders
+  // (attendants.rs builds them into the tile list; they never enter the client's
+  // `PeerDecodeManager::connected_peers`). So the loop's layer-drop actuator,
+  // `apply_local_cpu_pressure_congestion()` →
+  // `seed_downlink_congestion_for_connected_peers`, iterates an EMPTY peer set
+  // and returns false on the first call. That means there is NO real received
+  // layer to drop here: `layers_at_floor` flips true on the first LowerLayer tick
+  // and the settle clock is frozen at the loop-init `last_layer_drop_ms = 0.0`
+  // (so `settle_window_elapsed(now, 0.0)` is already true against wall-clock
+  // `now`). The NET observable in THIS harness is therefore exactly: the cap drop
+  // is delayed by ~one control-loop sample versus pre-#1557 — the first Down edge
+  // pauses NOTHING. We assert that observable two ways, the second being immune to
+  // native rAF FPS interleaving:
+  //
+  //   (1) DOM invariant: at the tick the pressure latch fires (lower-layer stage),
+  //       off-budget count is STILL 0 — no tile paused yet.
+  //   (2) Console-log ordering (AUTHORITATIVE, native-interleaving-proof): the
+  //       `cascade=lower_layer pressured_latch=true` log MUST appear, and MUST
+  //       precede the first `cap N->M ... dir=down` log. Under the OLD
+  //       concurrent-drop code the lower_layer log did not exist AND the cap
+  //       dropped on the latch tick, so this ordering is UNSATISFIABLE under the
+  //       old behavior — the test fails if tier-before-pause is reverted.
+  //
+  // This test is deliberately NOT written so it could pass under both orderings:
+  // requiring the lower-layer latch log to EXIST and STRICTLY PRECEDE the cap-drop
+  // log distinguishes tier-before-pause from concurrent-drop.
+  // ──────────────────────────────────────────────────────────────────────
+  test("first Down edge lowers received layers before pausing any tile (#1557)", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    // Attach the console collector BEFORE the first navigation so the latch-tick
+    // cascade log is captured in emission order.
+    const consoleLines = collectConsole(page);
+
+    await joinMeeting(page, "tier_before_pause");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+    if (!(await hasInjectHook(page))) {
+      test.skip(true, "window.__videocall_inject_render_fps not registered");
+      return;
+    }
+
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await expect(page.locator('[data-testid="decode-budget-auto"]')).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    await closeSettingsModal(page);
+
+    // Baseline: all tiles decode, none off-budget, and no cascade log yet.
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0);
+    expect(firstLowerLayerLatchIndex(consoleLines)).toBe(-1);
+    expect(firstCapDownIndex(consoleLines)).toBe(-1);
+
+    // --- Drive sustained LOW_FPS one sample at a time. We watch for the
+    // lower-layer LATCH log to appear. The moment it does (the first Down edge),
+    // assert the cap has NOT yet dropped: off-budget is STILL 0 and NO cap-drop
+    // log has been emitted. This is the tier-before-pause invariant (1)+(2-part-a).
+    //
+    // The loop is robust to native rAF FPS interleaving: a healthy native sample
+    // only delays the latch (it cannot manufacture an early cap drop), so the
+    // assertions below remain valid however the native samples land. We keep
+    // injecting up to MAX_DOWN_SAMPLES — the same headroom the AUTO test uses.
+    let latchSeen = false;
+    let offBudgetAtLatch = -1;
+    let capDownIndexAtLatch = -1;
+    for (let i = 0; i < MAX_DOWN_SAMPLES && !latchSeen; i++) {
+      await injectFps(page, LOW_FPS);
+      await page.waitForTimeout(INJECT_INTERVAL_MS);
+      if (firstLowerLayerLatchIndex(consoleLines) !== -1) {
+        latchSeen = true;
+        // Read the cap-drop log index and the off-budget count AT the latch tick,
+        // BEFORE injecting any further samples — so we observe the lower-layer
+        // stage in isolation.
+        capDownIndexAtLatch = firstCapDownIndex(consoleLines);
+        offBudgetAtLatch = await offBudgetTiles(page).count();
+      }
+    }
+
+    expect(
+      latchSeen,
+      "the lower-layer pressured-latch log must appear under sustained LOW_FPS",
+    ).toBe(true);
+    // INVARIANT (1): no tile paused on the latch (lower-layer) tick.
+    expect(
+      offBudgetAtLatch,
+      "no off-budget tile may appear on the first Down edge — layers drop first, not the cap",
+    ).toBe(0);
+    // INVARIANT (2-part-a): the cap-drop log has NOT been emitted yet at the latch
+    // tick. Under the old concurrent-drop code the cap dropped on this tick, so a
+    // cap-drop log would already be present here.
+    expect(
+      capDownIndexAtLatch,
+      "the cap must NOT have dropped on the first Down edge (no cap N->M dir=down log yet)",
+    ).toBe(-1);
+
+    // --- Continue injecting: the cap must drop on a SUBSEQUENT Down tick and
+    // off-budget tiles must appear. We use the same loop-until-shed pattern as the
+    // AUTO test, which is headroom-safe against native interleaving.
+    const decodedAfterDown = await injectUntilDecoded(
+      page,
+      LOW_FPS,
+      MAX_DOWN_SAMPLES,
+      (d) => d < MOCK_PEERS,
+    );
+    await expect(offBudgetTiles(page)).not.toHaveCount(0, { timeout: 15_000 });
+    expect(decodedAfterDown).toBeLessThan(MOCK_PEERS);
+    expect(decodedAfterDown).toBeGreaterThanOrEqual(1); // MIN_CAP floor
+
+    // INVARIANT (2-part-b, AUTHORITATIVE ORDERING): the cap-drop log now exists,
+    // and the lower-layer latch log STRICTLY PRECEDES it. This is impossible under
+    // concurrent-drop (no lower-layer log; cap dropped on the latch tick) — the
+    // single strongest distinguisher, immune to native FPS interleaving.
+    const latchIdx = firstLowerLayerLatchIndex(consoleLines);
+    const capIdx = firstCapDownIndex(consoleLines);
+    expect(latchIdx, "lower-layer latch log must be present").toBeGreaterThanOrEqual(0);
+    expect(capIdx, "cap-drop log must be present once a tile is paused").toBeGreaterThanOrEqual(0);
+    expect(
+      latchIdx,
+      "received layers must be lowered (cascade=lower_layer) BEFORE the cap drops (cap N->M dir=down)",
+    ).toBeLessThan(capIdx);
   });
 
   test("pressured auto shows the paused-tiles banner and Show all videos reveals every tile", async ({
@@ -434,6 +634,177 @@ test.describe("Adaptive decode budget (#987)", () => {
 
     await page.locator('[data-testid="decode-budget-dismiss"]').click();
     await expect(banner).not.toBeVisible({ timeout: 5_000 });
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test A (#1142 FINAL DESIGN) — THE GAP-1 REGRESSION GUARD.
+  //
+  // The persistent "N videos paused" pill
+  // (`data-testid="decode-paused-pill"`, see
+  // dioxus-ui/src/components/decode_paused_pill.rs) and the onset BANNER
+  // (`decode-budget-banner`) are MUTUALLY EXCLUSIVE: the pill suppresses while
+  // the banner is on screen and TAKES OVER the instant the banner hides —
+  // including when the banner is DISMISSED by the user. This pins issue #1142
+  // Gap 1: dismissing the alert banner must NOT leave the user in a silent
+  // paused state. The pill is the always-available signpost that survives the
+  // dismiss; it has NO back-off and NO dismiss button.
+  //
+  // WHY this is the high-value guard: if the pill used the OLD shadow-damper
+  // (an approximation that could not see the banner's dismiss), after dismiss
+  // the pill would stay suppressed and the paused state would go silent — the
+  // very Gap-1 defect. The fix wires the banner's TRUE on-screen visibility
+  // into a shared `banner_on_screen` signal the pill reads; the eligibility
+  // streak runs purely on `avatar_count` and is NOT disturbed by the banner, so
+  // when the banner hides an already-eligible pill appears immediately. The
+  // assertions below are ORDERED so that exact contract is what's pinned:
+  //   banner visible + pill suppressed → banner dismissed + tiles STILL paused
+  //   → pill now visible. Revert the Gap-1 fix and step 4 fails.
+  //
+  // Timing: the pill needs PILL_APPEAR_MS (2 s) of sustained off-budget tiles
+  // before it is eligible, then a 1 Hz poll publishes its output. By the time
+  // `enterPressuredAutoState` has the banner up, tiles have been paused well
+  // past 2 s, so the pill is already eligible-but-suppressed; after dismiss it
+  // surfaces on the next poll. We keep injecting LOW_FPS across the dismiss +
+  // poll window so the control loop does not let pressure decay and unpause the
+  // tiles before the pill assertion (no pass-by-timing-luck).
+  // ──────────────────────────────────────────────────────────────────────
+  test("dismissing the banner under sustained pressure surfaces the persistent paused pill", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "pill_after_dismiss");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+    if (!(await hasInjectHook(page))) {
+      test.skip(true, "window.__videocall_inject_render_fps not registered");
+      return;
+    }
+
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await closeSettingsModal(page);
+
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0);
+
+    await enterPressuredAutoState(page);
+
+    const banner = page.locator('[data-testid="decode-budget-banner"]');
+    const pill = page.locator('[data-testid="decode-paused-pill"]');
+
+    // The banner fires on onset; while it is on screen the pill is SUPPRESSED
+    // (the two are mutually exclusive).
+    await expect(banner).toBeVisible({ timeout: 10_000 });
+    await expect(pill).toBeHidden();
+
+    // Dismiss the banner. The banner hides; the pill's eligibility streak is
+    // untouched by the dismiss (it ran purely on avatar_count), so it should
+    // now take over.
+    await page.locator('[data-testid="decode-budget-dismiss"]').click();
+    await expect(banner).not.toBeVisible({ timeout: 5_000 });
+
+    // KEY ASSERTION (Gap-1 fix). Keep injecting LOW_FPS so tiles stay paused
+    // across the ~1 Hz poll window, then prove tiles are STILL paused and the
+    // pill has surfaced. Generous timeout covers the poll cadence; the
+    // interleaved injections stop pressure decaying out from under the assert.
+    const pillAppeared = expect(pill).toBeVisible({ timeout: 15_000 });
+    for (let i = 0; i < 8; i++) {
+      await injectFps(page, LOW_FPS);
+      await page.waitForTimeout(INJECT_INTERVAL_MS);
+    }
+    await pillAppeared;
+
+    // Tiles must STILL be paused at the moment the pill is up — the pill is the
+    // signpost for the live paused state, not a stale artifact of the dismiss.
+    await expect(offBudgetTiles(page)).not.toHaveCount(0);
+
+    // The pill names the paused count ("N videos paused" on this desktop width).
+    await expect(pill).toContainText("paused");
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // Test B (#1142 FINAL DESIGN) — the paused pill's "Show all" reveals every
+  // tile and persists the `All` override.
+  //
+  // The pill's action button (`decode-paused-pill-show-all`, visible text
+  // "Show all") takes the SAME escape-hatch path as the banner's Show-all and
+  // the appearance panel: it sets the decode-budget override to `All` (issue
+  // #1466) and persists the literal "all" to localStorage
+  // (`vc_decode_budget_override`). `All` tracks the live natural count, so every
+  // present peer decodes and stays decoded as peers join. Once avatar_count hits
+  // 0 the pill settles back to Hidden on its own — it has no dismiss.
+  //
+  // We reach the pill via the deterministic dismiss-then-pill route proven in
+  // Test A (banner up → dismiss → pill takes over), then click the pill's
+  // action and assert: all tiles decode, the pill auto-hides, and the override
+  // persisted as "all" (mirrors the banner Show-all test's assertion exactly).
+  // ──────────────────────────────────────────────────────────────────────
+  test("the paused pill Show all reveals every tile and persists the All override", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    await page.setViewportSize({ width: 1920, height: 1080 });
+
+    await joinMeeting(page, "pill_show_all");
+
+    const hasMockPeers = await setMockPeers(page, MOCK_PEERS);
+    if (!hasMockPeers) {
+      test.skip(true, "MOCK_PEERS_ENABLED is off; cannot synthesize peer tiles");
+      return;
+    }
+    if (!(await hasInjectHook(page))) {
+      test.skip(true, "window.__videocall_inject_render_fps not registered");
+      return;
+    }
+
+    await openAppearancePanel(page);
+    await page.locator('[data-testid="decode-budget-auto"]').click();
+    await closeSettingsModal(page);
+
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0);
+
+    await enterPressuredAutoState(page);
+
+    const banner = page.locator('[data-testid="decode-budget-banner"]');
+    const pill = page.locator('[data-testid="decode-paused-pill"]');
+
+    // Deterministic route to the pill: surface the banner, dismiss it, let the
+    // pill take over (the path Test A pins). Keep injecting LOW_FPS so tiles
+    // stay paused across the dismiss + poll window.
+    await expect(banner).toBeVisible({ timeout: 10_000 });
+    await page.locator('[data-testid="decode-budget-dismiss"]').click();
+    await expect(banner).not.toBeVisible({ timeout: 5_000 });
+
+    const pillAppeared = expect(pill).toBeVisible({ timeout: 15_000 });
+    for (let i = 0; i < 8; i++) {
+      await injectFps(page, LOW_FPS);
+      await page.waitForTimeout(INJECT_INTERVAL_MS);
+    }
+    await pillAppeared;
+
+    // Click the pill's "Show all" — override → All.
+    await page.locator('[data-testid="decode-paused-pill-show-all"]').click();
+
+    // Every tile decodes again; no off-budget avatars remain. `All` tracks the
+    // live natural count, so this holds even though we never stopped the
+    // (now-ignored) low-FPS pressure injected above.
+    await expect(decodedTiles(page)).toHaveCount(MOCK_PEERS, { timeout: 15_000 });
+    await expect(offBudgetTiles(page)).toHaveCount(0, { timeout: 15_000 });
+
+    // avatar_count → 0, so the pill settles to Hidden on its own (no dismiss).
+    await expect(pill).not.toBeVisible({ timeout: 10_000 });
+
+    // Persistence: the override is pinned to the `All` variant, persisted as the
+    // literal "all" (mirror of the banner Show-all test's assertion).
+    const stored = await page.evaluate(() => localStorage.getItem("vc_decode_budget_override"));
+    expect(stored).toBe("all");
   });
 
   // ──────────────────────────────────────────────────────────────────────

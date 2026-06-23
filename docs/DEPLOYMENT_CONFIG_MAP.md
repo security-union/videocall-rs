@@ -20,7 +20,8 @@ Charts in the repo:
 | `rustlemania-webtransport` | WT relay |
 | `rustlemania-websocket` | WS relay |
 | `videocall-ui` | Dioxus frontend |
-| `videocall-website` / `website` | Marketing / homepage |
+| `videocall-website` | Marketing / homepage — **canonical chart**. This is the one the deploy pipeline ships: `scripts/deploy-global-infrastructure.sh` deploys `global/us-east/videocall-website` (the only website overlay that exists), image tag `latest`, service `videocall-website`, with HPA support. |
+| `website` | Marketing / homepage — **legacy, not deployed**. Separate chart targeting the same hosts (`videocall.rs` / `www.videocall.rs`) and image as `videocall-website`, but referenced by no deploy script or overlay; its templates still use stale `webtransport-rs.*` helpers (a copy of the WT relay chart). Use `videocall-website`; this one is a cleanup candidate. |
 | `metrics-api` | Metrics ingestion endpoint |
 | `postgres` | Database |
 | `grafana` | Dashboards |

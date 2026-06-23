@@ -12,7 +12,8 @@ use std::collections::VecDeque;
 use dioxus::prelude::*;
 use gloo_timers::future::TimeoutFuture;
 use videocall_client::{
-    max_layers_for_kind, quality_state, PeerReceiveDiag, PrefMediaKind, ReceivedLayerSnapshot,
+    max_layers_for_kind, quality_state, PeerDeviceInfo, PeerReceiveDiag, PrefMediaKind,
+    ReceivedLayerSnapshot,
 };
 use wasm_bindgen::JsCast;
 
@@ -23,8 +24,9 @@ use wasm_bindgen::JsCast;
 // surfaces render identical quality dots / metric text / reason chips for the
 // same peer snapshot.
 use crate::components::performance_settings::{
-    format_send_layer_short, peer_row_aria_label, peer_row_metric, quality_state_glyph,
-    quality_state_modifier, reason_chip_modifier, reason_chip_text, reason_chip_title,
+    format_peer_device_compact, format_send_layer_short, peer_row_aria_label, peer_row_metric,
+    quality_state_glyph, quality_state_modifier, reason_chip_modifier, reason_chip_text,
+    reason_chip_title,
 };
 use crate::theme::color as theme_color;
 
@@ -710,6 +712,11 @@ pub struct SignalInfo {
     /// reason chip the perf dialog's per-peer row shows for the same peer at the
     /// same moment.
     pub receive_diag: Option<PeerReceiveDiag>,
+    /// #1482: this peer's self-reported device/hardware metrics, sourced from
+    /// `VideoCallClient::peer_device_info(session_id)`. `Some` only while the
+    /// popup is open and the peer reported at least one metric; `None`
+    /// otherwise. Drives the popup's compact "Device" line.
+    pub device_info: Option<PeerDeviceInfo>,
     /// Issue #1483: the per-tile "WT"/"WS" transport badge to render next to
     /// the signal meter. Already gated UPSTREAM in `peer_tile` by BOTH the
     /// server-side `transportBadgeEnabled` flag AND the transport being known:
@@ -766,6 +773,12 @@ pub struct SignalQualityPopupProps {
     /// section is omitted (mirrors the perf dialog's empty state).
     #[props(default)]
     receive_diag: Option<PeerReceiveDiag>,
+    /// #1482: this peer's self-reported device/hardware metrics, resolved
+    /// UPSTREAM in `peer_tile` (same `session_id == peer_id` lookup as
+    /// `receive_diag`, so the client-polling closure isn't re-run per popup).
+    /// `None` → the compact Device line is omitted ("if available").
+    #[props(default)]
+    device_info: Option<PeerDeviceInfo>,
     /// HCL bug #9: when `Some`, position the popup at fixed viewport
     /// coordinates instead of anchoring to the tile. `None` re-engages
     /// the anchored-follow behaviour. Owned by the popup-state context
@@ -2110,6 +2123,14 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
     // `session_id == peer_id` in `peer_tile`). Owned (cloned out of props) so
     // it can move into the rsx! layer-rows loop without borrowing `props`.
     let receive_diag = props.receive_diag.clone();
+    // #1482: compact one-line device/hardware summary for THIS peer (already
+    // resolved upstream in `peer_tile`). `None` (nothing reported / unknown) →
+    // the Device line is omitted entirely.
+    let device_line = props
+        .device_info
+        .as_ref()
+        .and_then(format_peer_device_compact);
+    let device_testid = format!("signal-popup-device-{}", props.peer_id);
     let popup_title = match meter_mode {
         SignalMeterMode::ScreenOnly => format!("Screen Share Quality - {}", props.peer_name),
         _ => format!("Signal Quality - {}", props.peer_name),
@@ -2913,6 +2934,20 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                             }
                         }
                     }
+                }
+            }
+            // ── Device section (#1482, per-peer hardware "if available") ────
+            // A single COMPACT dot-separated line (OS · device · N cores · arch
+            // · N GB). The always-0% main-thread "load" segment was dropped from
+            // this user-facing line in issue 1606. Rendered only when the peer
+            // reported something; omitted entirely otherwise (no empty-labeled
+            // placeholder).
+            if let Some(device_line) = device_line {
+                div {
+                    class: "signal-popup-device",
+                    "data-testid": "{device_testid}",
+                    span { class: "signal-popup-device__head", "Device" }
+                    span { class: "signal-popup-device__line", "{device_line}" }
                 }
             }
         }

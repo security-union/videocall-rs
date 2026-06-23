@@ -800,9 +800,10 @@ test.describe("Performance settings panel (#961)", () => {
     expect(pref?.screen_layers ?? null).toBeNull();
 
     // Capture the visible count caption to compare after reload. The SEND layer
-    // range-value caption is SOURCE-AWARE: with the camera ON it reads
-    // "Sending {N} of {M} layers"; with the camera OFF (this test doesn't drive
-    // the camera) it reads "Will send {N} layers when the camera is on". Either
+    // range-value caption is SOURCE-AWARE: with the camera ON it reads the
+    // capacity form "Up to {N} of {M} layers"; with the camera OFF (this test
+    // doesn't drive the camera) it reads "Will send {N} layers when the camera
+    // is on". Either
     // way it must (a) name the configured count N, (b) never read "Auto", and
     // (c) survive the reload unchanged. We assert on the COUNT (the persistence
     // contract), not the present/future verb.
@@ -969,7 +970,7 @@ test.describe("Performance settings panel (#961)", () => {
       .poll(async () => (await readPerfPref(page))?.audio_layers, { timeout: 10_000 })
       .toBe(1); // position 0 → 1 layer (base only)
     // The caption reflects the new count of 1. It is SOURCE-AWARE: mic on →
-    // "Sending 1 layer"; mic off (this single-page test) → "Will send 1 layer when
+    // "Up to 1 layer"; mic off (this single-page test) → "Will send 1 layer when
     // the mic is on". Assert on the COUNT (the wiring contract), not the verb.
     await expect(panel.locator('[data-testid="perf-audio-range-value"]')).toContainText(
       /\b1 layer/,
@@ -1016,10 +1017,10 @@ test.describe("Performance settings panel (#961)", () => {
     // `cameraOff` the default seed (`vc_prejoin_camera_on=true`) + the #1304
     // pre-join auto-getUserMedia + the Chromium fake-UI auto-grant + #959
     // (camera carries into the meeting) would leave the in-meeting camera LIVE,
-    // making the VIDEO caption read "Sending N of M layers" and breaking the
-    // OFF-state premise. The caption must NOT falsely claim to be "Sending" — it
-    // reads the future "Will send {N} … when {…}" form using the configured
-    // count, and names each kind's trigger.
+    // making the VIDEO caption read "Currently sending N of M layers" and
+    // breaking the OFF-state premise. The caption must NOT falsely claim to be
+    // "Sending" — it reads the future "Will send {N} … when {…}" form using the
+    // configured count, and names each kind's trigger.
     await enableSimulcastFlag(page.context(), 3);
     await joinMeeting(page, "caption_source_aware", { cameraOff: true });
     await openPerformanceDrawer(page);
@@ -1476,8 +1477,8 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     // Join with the camera GENUINELY off (`cameraOff` seeds
     // `vc_prejoin_camera_on=false`), so send_video is gated to None. The default
     // seed would instead leave the camera LIVE (#1304 auto-getUserMedia + fake-UI
-    // auto-grant + #959 carry-into-meeting), making this line read "N of M layers
-    // active" and defeating the off-state regression guard.
+    // auto-grant + #959 carry-into-meeting), making this line read "Currently N
+    // of M layers active" and defeating the off-state regression guard.
     await joinMeeting(page, "diag_cam_off", { cameraOff: true });
     await openPerformanceDrawer(page);
 
@@ -1544,6 +1545,32 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(baseRung.locator(".simulcast-rung-id")).toHaveText("L");
     await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L0$/ })).toHaveCount(0);
     await expect(ladder.locator(".simulcast-rung-id", { hasText: /^L1$/ })).toHaveCount(0);
+
+    // SEND LED on/off (issue #1607): every rung carries exactly one LED dot
+    // (`diag-simulcast-led-video-{layer_id}`), and the LEDs are NOT all-on — the
+    // count of LIT (`is-on`) LEDs equals the number of layers actually being sent
+    // (the active count parsed from the "<a> of <b> layers active" header), which
+    // is < the rung count whenever the AQ has shed the top layer(s). The base
+    // rung's LED is ALWAYS lit (the base layer is always published). This is the
+    // core fix: shed layers read as OFF (hollow), not lit.
+    const rungCount = await ladder.locator('[data-testid^="diag-simulcast-rung-"]').count();
+    const ledCount = await ladder.locator('[data-testid^="diag-simulcast-led-video-"]').count();
+    expect(ledCount, "one LED dot per rung").toBe(rungCount);
+    // Base layer LED is on.
+    await expect(baseRung.locator('[data-testid="diag-simulcast-led-video-0"]')).toHaveClass(
+      /is-on/,
+    );
+    // The number of lit LEDs equals the active count from the header (never all-on
+    // unless the encoder genuinely has every rung active).
+    const sendText = await simulcastSendText(page, "Video (sending)");
+    const activeMatch = sendText.match(/(\d+) of (\d+) layers active/);
+    expect(activeMatch, `header carries the active count: ${sendText}`).not.toBeNull();
+    const activeCount = Number(activeMatch![1]);
+    await expect
+      .poll(async () => ladder.locator(".simulcast-led.is-on").count(), { timeout: 10_000 })
+      .toBe(activeCount);
+    // The shed rungs (rungCount - activeCount of them) render an OFF LED.
+    await expect(ladder.locator(".simulcast-led.is-off")).toHaveCount(rungCount - activeCount);
   });
 
   // ── Drawer help popovers + position:fixed viewport-clip regression (#1131) ──
@@ -1846,6 +1873,15 @@ test.describe("Unified Performance + Diagnostics drawer (#1131) + Simulcast laye
     await expect(buildTable).toBeHidden();
     await buildSummary.click();
     await expect(buildTable).toBeVisible();
+
+    // Issue #1480 — Build info columns. The `Built` column is now ALWAYS present
+    // (it was not before #1480). The Commit/Branch columns are gated on
+    // showBuildGitInfo: the committed e2e config.js ships it "true", so this
+    // solo-runner stack renders the 4-col `--git` variant. The header cells
+    // (`.build-info-cell` inside `.build-info-header`) pin the exact columns.
+    const buildHeaderCells = buildTable.locator(".build-info-header .build-info-cell");
+    await expect(buildTable).toHaveClass(/build-info-table--git/);
+    await expect(buildHeaderCells).toHaveText(["Component", "Commit", "Branch", "Built"]);
   });
 
   // ── ITERATION 3/4 — All-Peers placeholder vs single-peer NetEq charts (#1131 / #1222) ─

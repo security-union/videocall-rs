@@ -25,15 +25,18 @@ syntax = "proto3";
 //     from that source.
 //
 // Security: like ViewportPacket this signal is SUBTRACT-ONLY and consumed
-// purely for VIDEO layer-drop decisions. It can only reduce what an
+// purely for simulcast layer-drop decisions. It can only reduce what an
 // already-authorized session receives; it never grants access. No recorded
 // preference (or no LAYER_PREFERENCE packet at all) means "no layer signal"
 // and the relay forwards every layer (fail-open to pre-#989 behaviour). The
 // relay does NOT validate that the requested layer is actually being produced
 // by the source: a client requesting an absent layer black-tiles ITSELF; the
 // client-side clamp (only request observed-arriving layers) is the mitigation
-// and is a separate frontend increment. AUDIO/SCREEN are NEVER filtered by
-// this signal. This packet is consumed by the relay and never re-broadcast.
+// and is a separate frontend increment. As of Phase 3 the relay filters ALL
+// filterable kinds — VIDEO, SCREEN, AND AUDIO — per (source, media_kind) (see
+// EntryMediaKind and the per-kind notes on Entry below); the base layer
+// (layer 0) is always forwarded regardless of kind. This packet is consumed by
+// the relay and never re-broadcast.
 message LayerPreferencePacket {
   // The media kind an Entry applies to (issue #989, Phase 3). Mirrors
   // `PacketWrapper.MediaKind` so camera VIDEO, AUDIO, and SCREEN of the SAME

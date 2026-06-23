@@ -118,21 +118,55 @@ async fn main() {
         );
     }
 
+    // Live homepage-feed change stream (issue #1081). `feed_tx` is this
+    // process's broadcast that the SSE handler subscribes to. It is created
+    // BEFORE the NATS consumers so they can push feed-change nudges into it: the
+    // three room-state consumers below run on EVERY instance (fan-out, no queue
+    // group), so each instance feeds its OWN local broadcast after the DB write
+    // — nudging its own SSE clients exactly once without an echo loop. See
+    // `meeting_api::feed_events` for the full multi-instance rationale.
+    let (feed_tx, _feed_rx) = meeting_api::feed_events::new_feed_channel();
+
     // Spawn the cross-service NATS consumers BEFORE constructing the AppState
     // (so AppState retains its own clone of `nats`). Each consumer is a
     // long-lived task that re-subscribes on disconnect; we hold the JoinHandle
     // implicitly by leaking it (the task survives until process exit).
-    let _ended_consumer =
-        nats_consumers::spawn_meeting_ended_by_host_consumer(nats.clone(), pool.clone());
-    let _empty_consumer =
-        nats_consumers::spawn_meeting_became_empty_consumer(nats.clone(), pool.clone());
+    let _ended_consumer = nats_consumers::spawn_meeting_ended_by_host_consumer(
+        nats.clone(),
+        pool.clone(),
+        feed_tx.clone(),
+    );
+    let _empty_consumer = nats_consumers::spawn_meeting_became_empty_consumer(
+        nats.clone(),
+        pool.clone(),
+        feed_tx.clone(),
+    );
+    // Marks a participant `status='left', left_at=NOW()` when actix-api reports
+    // their session left a room (issue #1551), so an abnormal disconnect (no
+    // REST /leave) stops being counted as a present participant.
+    let _participant_left_consumer = nats_consumers::spawn_participant_left_consumer(
+        nats.clone(),
+        pool.clone(),
+        feed_tx.clone(),
+    );
+
+    // Fan-out subscriber for the local-HTTP-mutation feed changes (create /
+    // admit / join-reactivation / end / leave). Those mutation points run on
+    // only ONE instance, so they publish a `FeedChange` to the dedicated NATS
+    // subject `internal.feed_changed`; this subscriber (NO queue group → every
+    // instance receives it) mirrors that subject into `feed_tx` so SSE clients
+    // on ALL instances observe the change. Returns `None` (no-op) when NATS is
+    // not configured; in that single-instance mode the mutation points feed
+    // `feed_tx` directly. See `meeting_api::feed_events`.
+    let _feed_change_consumer =
+        meeting_api::feed_events::spawn_feed_change_consumer(nats.clone(), feed_tx.clone(), None);
 
     // Spawn the in-process console-log retention task. Returns `None` (no-op)
     // when `CONSOLE_LOG_UPLOAD_ENABLED` is not `"true"`. The handle is leaked
     // for the life of the process, mirroring the NATS consumer above.
     let _purge_handle = meeting_api::console_log_purge::spawn_purge_task();
 
-    let state = AppState::new(pool, &config, nats);
+    let state = AppState::new(pool, &config, nats, feed_tx);
     let app = routes::router().layer(cors).with_state(state);
 
     let listener = tokio::net::TcpListener::bind(&config.listen_addr)

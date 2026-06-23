@@ -543,10 +543,22 @@ pub async fn list_for_search(
         .collect())
 }
 
-/// Count admitted participants in a meeting.
+/// Count admitted participants who are CURRENTLY present in a meeting.
+///
+/// "Present" is `status = 'admitted' AND left_at IS NULL` — the same predicate
+/// the presence-driven idle transition uses (`db::meetings::set_idle`). The
+/// `left_at IS NULL` guard is what makes the meeting-settings "Activity"
+/// participant count reflect who is currently in the meeting rather than every
+/// participant who was ever admitted (issue #1551): an explicit REST `/leave`
+/// sets `left_at=NOW()` and a transport disconnect is marked left by the
+/// `PARTICIPANT_LEFT` NATS consumer ([`mark_left_by_disconnect`]), so both kinds
+/// of departure drop out of the count. The guard is also defense-in-depth — a
+/// row whose `left_at` was set but whose `status` somehow lagged at `'admitted'`
+/// is still excluded.
 pub async fn count_admitted(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1 AND status = 'admitted'",
+        "SELECT COUNT(*) FROM meeting_participants \
+         WHERE meeting_id = $1 AND status = 'admitted' AND left_at IS NULL",
     )
     .bind(meeting_id)
     .fetch_one(pool)
@@ -554,15 +566,81 @@ pub async fn count_admitted(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx:
     Ok(row.0)
 }
 
-/// Count waiting participants in a meeting.
+/// Count participants still in the waiting room.
+///
+/// Mirrors [`count_admitted`]'s SQL shape: `status = 'waiting' AND left_at IS
+/// NULL`, so a waiter who EXPLICITLY left (REST `/leave`, which sets
+/// `left_at=NOW()`) is no longer counted as waiting. Unlike the admitted count,
+/// the `left_at IS NULL` guard does NOT heal a waiter who merely *transport-*
+/// disconnected: a waiting-room participant connects to the relay as an
+/// `observer` session, and the relay's observer-disconnect path returns BEFORE
+/// the [`PARTICIPANT_LEFT_SUBJECT`](crate::nats_events::PARTICIPANT_LEFT_SUBJECT)
+/// publish — so [`mark_left_by_disconnect`] never fires for a dropped waiter,
+/// who therefore keeps `status='waiting', left_at IS NULL` until they explicitly
+/// leave or are admitted/rejected. This is an accepted known limitation: issue
+/// #1551 is about the admitted participant count, where the relay publishes the
+/// disconnect event; the waiting count is left as the explicit-leave-only
+/// behavior it had before.
 pub async fn count_waiting(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
     let row: (i64,) = sqlx::query_as(
-        "SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1 AND status = 'waiting'",
+        "SELECT COUNT(*) FROM meeting_participants \
+         WHERE meeting_id = $1 AND status = 'waiting' AND left_at IS NULL",
     )
     .bind(meeting_id)
     .fetch_one(pool)
     .await?;
     Ok(row.0)
+}
+
+/// Mark a participant `status='left', left_at=NOW()` in response to a transport
+/// disconnect observed by `actix-api` (the `PARTICIPANT_LEFT` NATS event).
+///
+/// This is the backstop for ABNORMAL disconnects — a participant who closed
+/// their tab, dropped their network, or crashed WITHOUT calling the REST
+/// `/leave` endpoint. Normal navigation still goes through REST `/leave`
+/// (`leave`); this keeps the DB roster correct when that beacon never fires.
+///
+/// # Idempotency / reconnect-safety
+///
+/// The `WHERE … status IN ('admitted', 'waiting')` guard makes this a safe
+/// no-op when the participant is already `'left'` / `'kicked'` / `'rejected'`,
+/// or has no row at all (e.g. they only ever observed the waiting room). A
+/// duplicate event (NATS redelivery, multi-replica fan-out) therefore matches
+/// zero rows and does not overwrite the original `left_at`.
+///
+/// The dangerous case is the reconnect race: this UPDATE is keyed by `user_id`,
+/// and a rejoined participant is back at `status='admitted', left_at=NULL` — so
+/// the `status IN (...)` guard alone does NOT stop a late event from re-marking
+/// a now-present participant left. That race is closed UPSTREAM, on the relay,
+/// not here. The relay only publishes `PARTICIPANT_LEFT` after the
+/// `RECONNECT_GRACE_PERIOD` (a timely transport reconnect cancels the pending
+/// departure before `leave_rooms` runs), AND it suppresses the publish entirely
+/// when the departing user still has any live session in the room
+/// (`user_has_remaining_session` / `user_still_present` in
+/// `chat_server.rs::leave_rooms`) — including a different tab that rejoined after
+/// the grace expired. So by the time this UPDATE runs, the relay has confirmed
+/// the user has no present session. This function deliberately does NOT add a
+/// `left_at IS NULL` predicate: a freshly-rejoined row has `left_at IS NULL` and
+/// would still match, so such a predicate would give false safety; the real
+/// guarantee is the relay-side presence check above.
+///
+/// Returns the number of rows updated (0 when the participant was already left,
+/// already kicked/rejected, or has no row for this meeting).
+pub async fn mark_left_by_disconnect(
+    pool: &PgPool,
+    meeting_id: i32,
+    user_id: &str,
+) -> Result<u64, sqlx::Error> {
+    let result = sqlx::query(
+        "UPDATE meeting_participants \
+         SET status = 'left', left_at = NOW() \
+         WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')",
+    )
+    .bind(meeting_id)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
 
 // -- Conversions to API response types --

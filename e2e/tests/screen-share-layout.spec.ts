@@ -10,22 +10,21 @@ import { waitForServices } from "../helpers/wait-for-services";
  *  - Resize handle: `.screen-share-resize-handle`
  *  - Right panel: a CSS-grid of compact peer tiles
  *
- * Key behaviors introduced in the layout update:
+ * Key behaviors of the current layout:
  *
- *  1. FIXED TILE HEIGHT: Tiles in the right panel always have a height
- *     computed to fit exactly 4 tiles per column, regardless of how far
- *     the resize handle has been dragged. The grid row size is encoded as
- *     `grid-auto-rows: <N>px` (a fixed pixel value, never `auto` or `%`).
+ *  1. CSS GRID WITH AUTO-FILL: The right panel uses
+ *     `grid-template-columns: repeat(auto-fill, minmax(160px, 1fr))` so
+ *     the browser automatically determines the column count based on the
+ *     available panel width. All tiles are always the same size (uniform
+ *     grid cells).
  *
- *  2. SINGLE-COLUMN SWITCH: When the participant panel width is 25% or
- *     less of the total screen (`right_ratio <= 0.25`), the right panel
- *     switches to `grid-template-columns: 1fr` (single column). Above
- *     that threshold it uses `grid-template-columns: 1fr 1fr`.
+ *  2. SINGLE-COLUMN COLLAPSE: When the panel narrows below ~340px (i.e.
+ *     when the resize handle is dragged far right), the auto-fill grid
+ *     cannot fit two 160px columns and collapses to a single column.
  *
- *  3. TILE HEIGHT STYLE: Each tile inside the right panel uses
- *     `height: 100%` (filling the grid row) instead of `aspect-ratio:
- *     16/9` — so tile height is determined by the fixed grid row, not by
- *     the column width.
+ *  3. ASPECT-RATIO-DRIVEN HEIGHT: Each `.split-peer-tile` uses
+ *     `aspect-ratio: 3/2` with `width: 100%`, so tile height is derived
+ *     from tile width and stays proportional regardless of panel size.
  *
  * AUTOMATION LIMITATION
  * ─────────────────────
@@ -317,45 +316,17 @@ test.describe("Screen-share split-layout", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 2. Fixed tile height in the participant panel (right side)
+  // 2. Tile aspect ratio consistency across resize handle positions
   //
-  // LIMITATION: Cannot be fully automated. Triggering screen share
-  // requires getDisplayMedia(), which opens a native OS-level picker that
-  // Playwright cannot drive. The `--use-fake-device-for-media-stream` and
-  // `--use-fake-ui-for-media-stream` Chrome flags do not stub the display
-  // capture path.
+  // The right panel uses CSS grid with `grid-auto-rows: min-content` and
+  // tiles use `aspect-ratio: 3/2`. This means tile height is always
+  // derived from tile width. When the resize handle is dragged, tile
+  // width changes but the 3:2 aspect ratio must be preserved.
   //
-  // WHAT THIS TEST WOULD VERIFY (once screen-share automation is available):
-  //   - After a peer starts sharing their screen, the right panel
-  //     (`.screen-share-resize-handle` + sibling div) is rendered.
-  //   - The right panel's `grid-auto-rows` style is a fixed pixel value
-  //     (e.g. "grid-auto-rows: 148px"), not "auto" or a percentage.
-  //   - Dragging the `.screen-share-resize-handle` left or right does NOT
-  //     change the `grid-auto-rows` value, confirming tile height is
-  //     independent of the resize position.
-  //
-  // IMPLEMENTATION NOTE (from attendants.rs):
-  //   const SS_BOTTOM_PAD: f64 = 80.0;
-  //   const SS_VERT_PAD:   f64 = 28.0;
-  //   let ss_avail_h = vh - SS_BOTTOM_PAD - SS_VERT_PAD;
-  //   let ss_tile_h  = ((ss_avail_h - 3.0 * SS_GRID_GAP) / 4.0).max(40.0);
-  //   // Right panel: grid-auto-rows: {ss_tile_h:.0}px
-  //
-  // To assert in a future automated test:
-  //   const rightPanel = page.locator("#grid-container > div").nth(2);
-  //   const rightStyle = await rightPanel.getAttribute("style");
-  //   expect(rightStyle).toMatch(/grid-auto-rows:\s*\d+px/);
-  //   // Verify the value stays constant before and after dragging the handle:
-  //   const rowsBefore = extractGridAutoRows(rightStyle);
-  //   await dragResizeHandle(page, deltaX);
-  //   const rightStyleAfter = await rightPanel.getAttribute("style");
-  //   expect(extractGridAutoRows(rightStyleAfter)).toBe(rowsBefore);
+  // The synthetic `MOCK_GET_DISPLAY_MEDIA_SCRIPT` allows driving the
+  // screen share flow programmatically without the OS-level picker.
   // ──────────────────────────────────────────────────────────────────────
-  // HCL follow-up #944: this test is no longer skipped — the synthetic
-  // `MOCK_GET_DISPLAY_MEDIA_SCRIPT` defined above (and the
-  // `setupTwoUserMeeting({ mockDisplayMedia: true })` opt-in) lets us
-  // trigger a screen share programmatically without the OS-level picker.
-  test("right panel tiles have fixed height independent of resize handle position", async ({
+  test("right panel tiles maintain consistent aspect ratio after resize handle drag", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);
@@ -387,18 +358,26 @@ test.describe("Screen-share split-layout", () => {
       // Host sees the split-screen tile appear.
       await expect(hostPage.locator(".split-screen-tile")).toBeVisible({ timeout: 15_000 });
 
-      // The right panel is the 3rd direct child of #grid-container
-      // (left split-screen + handle + right grid). It carries the
-      // `grid-auto-rows: <N>px` inline style we want to lock in.
+      // The right panel now uses CSS grid with `grid-auto-rows: min-content`
+      // and tiles use `aspect-ratio: 3/2`. Tile height is derived from tile
+      // width, so the aspect ratio stays constant regardless of the resize
+      // handle position.
       const rightPanel = hostPage.locator("#grid-container > div").nth(2);
-      const styleBefore = await rightPanel.getAttribute("style");
-      expect(styleBefore).toMatch(/grid-auto-rows:\s*\d+px/);
-      const rowsBefore = (styleBefore?.match(/grid-auto-rows:\s*(\d+)px/) ?? [])[1];
+      await expect(rightPanel).toHaveClass(/ss-peer-panel/);
 
-      // Drag the resize handle ~100px to the right so screen_share_ratio
-      // changes. The split layout reflows but grid-auto-rows must NOT
-      // change — tile height is sized to fit 4-per-column on the
-      // available viewport, independent of the resize position.
+      // Measure tile dimensions before the drag.
+      const firstTile = hostPage.locator(".split-peer-tile").first();
+      await expect(firstTile).toBeVisible({ timeout: 5_000 });
+      const dimsBefore = await firstTile.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        return { w: r.width, h: r.height };
+      });
+      const aspectBefore = dimsBefore.w / dimsBefore.h;
+      // Aspect ratio should be ~3:2 = 1.5
+      expect(aspectBefore).toBeGreaterThan(1.5 * 0.9);
+      expect(aspectBefore).toBeLessThan(1.5 * 1.1);
+
+      // Drag the resize handle ~100px to the right so the panel narrows.
       const handle = hostPage.locator(".screen-share-resize-handle");
       await expect(handle).toBeVisible({ timeout: 5_000 });
       const handleBox = await handle.boundingBox();
@@ -411,11 +390,18 @@ test.describe("Screen-share split-layout", () => {
       await hostPage.mouse.down();
       await hostPage.mouse.move(startX + 100, startY, { steps: 10 });
       await hostPage.mouse.up();
-      await hostPage.waitForTimeout(300);
+      await hostPage.waitForTimeout(500);
 
-      const styleAfter = await rightPanel.getAttribute("style");
-      const rowsAfter = (styleAfter?.match(/grid-auto-rows:\s*(\d+)px/) ?? [])[1];
-      expect(rowsAfter).toBe(rowsBefore);
+      // Measure tile dimensions after the drag. Width may change as the
+      // panel narrows, but the aspect ratio must remain ~3:2 because
+      // `aspect-ratio: 3/2` in CSS derives height from width.
+      const dimsAfter = await firstTile.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        return { w: r.width, h: r.height };
+      });
+      const aspectAfter = dimsAfter.w / dimsAfter.h;
+      expect(aspectAfter).toBeGreaterThan(1.5 * 0.9);
+      expect(aspectAfter).toBeLessThan(1.5 * 1.1);
     } finally {
       await browser1.close();
       await browser2.close();
@@ -423,52 +409,15 @@ test.describe("Screen-share split-layout", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
-  // 3. Single-column switch when screen share occupies ≥ 75% of screen
+  // 3. Single-column collapse when the right panel is narrow
   //
-  // LIMITATION: Same as test 2 — requires an active screen-share session.
-  //
-  // WHAT THIS TEST WOULD VERIFY (once screen-share automation is available):
-  //   - Default split (screen_share_ratio = 0.667 → right_ratio = 0.333):
-  //     right panel `grid-template-columns` is "repeat(2, <ss_tile_w>px)"
-  //     (two fixed-width tile-sized columns, HCL #3/#4 fix).
-  //   - After dragging the resize handle so screen share occupies ≥ 75%
-  //     (right_ratio ≤ 0.25):
-  //     right panel `grid-template-columns` is "<ss_tile_w>px" (single column).
-  //   - Dragging back below the threshold restores the 2-column form.
-  //
-  // IMPLEMENTATION NOTE (from attendants.rs):
-  //   let right_ratio = 1.0 - screen_share_ratio();
-  //   let ss_cols = if right_ratio <= 0.25 || ss_panel_width < 180.0 {
-  //       1.0   // single column
-  //   } else {
-  //       2.0   // two columns
-  //   };
-  //   let ss_tile_w = (ss_tile_h * TILE_AR).round(); // 3:2 footprint
-  //   // Right panel: grid-template-columns:
-  //   //   ss_cols > 1.0 → format!("repeat(2, {ss_tile_w:.0}px)")
-  //   //   else          → format!("{ss_tile_w:.0}px")
-  //   // Plus `justify-content: start` so tiles pack to the left edge.
-  //
-  // The resize handle is constrained to [0.3, 0.85] (screen_share_ratio),
-  // so right_ratio spans [0.15, 0.70]. The single-column threshold at 0.25
-  // is reachable by dragging screen share to cover ≥ 75% of the container.
-  //
-  // To assert in a future automated test:
-  //   // Default: two fixed-width columns
-  //   const rightPanel = page.locator("#grid-container > div").nth(2);
-  //   let style = await rightPanel.getAttribute("style");
-  //   expect(style).toMatch(/grid-template-columns:\s*repeat\(2,\s*\d+px\)/);
-  //   expect(style).toContain("justify-content: start");
-  //   // Drag handle far left (screen share ratio → 0.85, right_ratio → 0.15)
-  //   await dragResizeHandle(page, -largeOffset);
-  //   style = await rightPanel.getAttribute("style");
-  //   expect(style).toMatch(/grid-template-columns:\s*\d+px\b/);
+  // The CSS grid uses `repeat(auto-fill, minmax(160px, 1fr))`. At default
+  // split (~33% right), the panel is wide enough for 2+ columns. When the
+  // resize handle is dragged far right (narrowing the panel below ~340px),
+  // the auto-fill algorithm can only fit one 160px column, collapsing the
+  // grid to a single column.
   // ──────────────────────────────────────────────────────────────────────
-  // HCL follow-up #944: no longer skipped, same rationale as the
-  // fixed-height test above.
-  test("right panel switches to single column when screen share occupies >= 75%", async ({
-    baseURL,
-  }) => {
+  test("right panel collapses to single column when panel is narrow", async ({ baseURL }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || "http://localhost:80";
     const meetingId = `e2e_ss_layout_single_col_${Date.now()}`;
@@ -499,16 +448,23 @@ test.describe("Screen-share split-layout", () => {
       await expect(hostPage.locator(".split-screen-tile")).toBeVisible({ timeout: 15_000 });
 
       const rightPanel = hostPage.locator("#grid-container > div").nth(2);
+      await expect(rightPanel).toHaveClass(/ss-peer-panel/);
 
-      // Default split (screen_share_ratio = 0.667 → right_ratio = 0.333):
-      // grid-template-columns is `repeat(2, <px>px)` (two fixed-width
-      // tile-sized columns from the PR #940 HCL #3/#4 fix).
-      const styleDefault = await rightPanel.getAttribute("style");
-      expect(styleDefault).toMatch(/grid-template-columns:\s*repeat\(2,\s*\d+px\)/);
+      // The CSS grid uses `repeat(auto-fill, minmax(160px, 1fr))`.
+      // At default split (~33% right), the panel is wide enough for 2+
+      // columns. Count the resolved columns via computed grid style.
+      const colCountDefault = await rightPanel.evaluate((el) => {
+        const cols = getComputedStyle(el).gridTemplateColumns;
+        // gridTemplateColumns resolves to space-separated pixel values
+        return cols.split(/\s+/).filter((s) => s.length > 0).length;
+      });
+      // On a standard viewport (1280px+), right panel at ~33% width
+      // (~420px) should fit at least 2 columns with minmax(160px, 1fr).
+      expect(colCountDefault).toBeGreaterThanOrEqual(2);
 
-      // Drag the resize handle toward the right edge so screen_share_ratio
-      // approaches 0.85 (right_ratio → 0.15). At right_ratio <= 0.25 the
-      // layout collapses to a single column.
+      // Drag the resize handle toward the right edge so the right panel
+      // becomes very narrow (< 340px), which should collapse to 1 column
+      // because minmax(160px, 1fr) cannot fit 2 columns.
       const handle = hostPage.locator(".screen-share-resize-handle");
       const handleBox = await handle.boundingBox();
       const viewport = hostPage.viewportSize();
@@ -524,11 +480,13 @@ test.describe("Screen-share split-layout", () => {
       await hostPage.mouse.up();
       await hostPage.waitForTimeout(500);
 
-      // Single-column form: grid-template-columns is a single `<px>px`
-      // entry, NOT `repeat(2, ...)`.
-      const styleNarrow = await rightPanel.getAttribute("style");
-      expect(styleNarrow).toMatch(/grid-template-columns:\s*\d+px/);
-      expect(styleNarrow).not.toMatch(/grid-template-columns:\s*repeat\(2,/);
+      // After narrowing, the CSS grid should resolve to a single column
+      // because the available width is below 2 * 160px + gap.
+      const colCountNarrow = await rightPanel.evaluate((el) => {
+        const cols = getComputedStyle(el).gridTemplateColumns;
+        return cols.split(/\s+/).filter((s) => s.length > 0).length;
+      });
+      expect(colCountNarrow).toBe(1);
     } finally {
       await browser1.close();
       await browser2.close();

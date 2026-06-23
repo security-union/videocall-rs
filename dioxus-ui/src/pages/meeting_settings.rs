@@ -3,6 +3,7 @@
 //! Dedicated meeting settings page — the full management hub for a meeting.
 
 use crate::auth::{check_session, redirect_to_login};
+use crate::components::meeting_format::format_datetime_zoned;
 use crate::components::toggle_switch::ToggleSwitch;
 use crate::constants::oauth_enabled;
 use crate::meeting_api::{
@@ -87,6 +88,90 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         });
     }
 
+    // Periodic refresh of the live read-only stats (participant_count,
+    // waiting_count, state, duration). The backend now reports the ACTUAL
+    // currently-present participant count, but the page would otherwise show
+    // whatever it was at load time. A `use_future` poll keeps it current.
+    //
+    // Lifecycle / cleanup: `use_future` ties this loop to the component scope.
+    // When the user navigates away the scope unmounts, Dioxus drops the future,
+    // and the in-flight `TimeoutFuture::new(...).await` is cancelled — so the
+    // loop self-terminates. No manual timer handle to leak (mirrors the
+    // self-cancelling poll in `decode_budget_banner.rs`).
+    //
+    // Interval: 12s. This is a low-traffic settings page, not the media hot
+    // path; 12s keeps the count fresh without hammering the meeting-api.
+    //
+    // Stomping safety: we ONLY rewrite the read-only stat fields onto a clone
+    // of the current `meeting`. We deliberately do NOT touch the toggle-backed
+    // signals (waiting_room_toggle / admitted_can_admit_toggle /
+    // end_on_host_leave_toggle / allow_guests_toggle) — those are the live
+    // source of truth for the optimistic toggle UI, and re-syncing them here
+    // would clobber an in-flight edit. We also skip the refresh entirely while
+    // a toggle save is in flight (`saving()`), and stop polling once the
+    // meeting has ended (its count is final).
+    {
+        let meeting_id = id.clone();
+        use_future(move || {
+            let meeting_id = meeting_id.clone();
+            async move {
+                // 12s cadence — sensible for a low-traffic settings page.
+                const REFRESH_INTERVAL_MS: u32 = 12_000;
+                loop {
+                    gloo_timers::future::TimeoutFuture::new(REFRESH_INTERVAL_MS).await;
+
+                    // Don't poll before the first load resolves, while an error
+                    // is showing, or while a toggle save is in flight (avoid
+                    // racing the optimistic toggle UI). Use `.peek()` so these
+                    // reads inside the long-lived poll don't create reactive
+                    // subscriptions (mirrors `decode_budget_banner.rs`).
+                    if *loading.peek() || error.peek().is_some() || *saving.peek() {
+                        continue;
+                    }
+
+                    // Stop polling once the meeting has ended — its stats are
+                    // final and won't change.
+                    if meeting.peek().as_ref().map(|m| m.state == "ended") == Some(true) {
+                        break;
+                    }
+
+                    match get_meeting_info(&meeting_id).await {
+                        Ok(fresh) => {
+                            // Re-check guards after the await: a save may have
+                            // started, or the user may have ended the meeting,
+                            // while the request was in flight.
+                            if *saving.peek() {
+                                continue;
+                            }
+                            // Update ONLY the read-only stat fields on a clone
+                            // of the current meeting. This leaves the
+                            // toggle-backed booleans (and their signals)
+                            // untouched, so an in-flight optimistic toggle is
+                            // never stomped by a stale server snapshot.
+                            let current = meeting.peek().clone();
+                            if let Some(mut current) = current {
+                                current.state = fresh.state;
+                                current.participant_count = fresh.participant_count;
+                                current.waiting_count = fresh.waiting_count;
+                                current.started_at = fresh.started_at;
+                                current.ended_at = fresh.ended_at;
+                                current.host_display_name = fresh.host_display_name;
+                                meeting.set(Some(current));
+                            }
+                        }
+                        Err(e) => {
+                            // A transient refresh failure is non-fatal: keep the
+                            // last-known stats on screen and try again next tick.
+                            // Do NOT surface it as a page error (that would hide
+                            // the whole settings UI behind the error state).
+                            log::warn!("meeting stats refresh failed: {e}");
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     // Auth loading
     if !auth_checked() && oauth_enabled().unwrap_or(false) {
         return page_shell(rsx! {
@@ -156,8 +241,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let duration_str = info
         .ended_at
         .map(|ended| format_duration(ended - info.started_at));
-    let started_str = format_time(info.started_at);
-    let ended_str = info.ended_at.map(format_time);
+    let started_str = format_datetime_zoned(info.started_at);
+    let ended_str = info.ended_at.map(format_datetime_zoned);
     let participant_count = info.participant_count;
     let waiting_count = info.waiting_count;
 
@@ -566,8 +651,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                             .unwrap_or_default();
                         rsx! {
                             span {
-                                class: "settings-field-value settings-field-mono",
-                                style: "font-size: 0.75rem; word-break: break-all; user-select: all;",
+                                class: "settings-field-value settings-field-mono settings-guest-link",
+                                style: "user-select: all;",
                                 "{guest_link}"
                             }
                         }
@@ -684,19 +769,4 @@ fn format_duration(duration_ms: i64) -> String {
     } else {
         format!("{seconds}s")
     }
-}
-
-fn format_time(timestamp_ms: i64) -> String {
-    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(timestamp_ms as f64));
-    let hours = date.get_hours();
-    let minutes = date.get_minutes();
-    let am_pm = if hours >= 12 { "PM" } else { "AM" };
-    let hours_12 = if hours == 0 {
-        12
-    } else if hours > 12 {
-        hours - 12
-    } else {
-        hours
-    };
-    format!("{hours_12}:{minutes:02} {am_pm}")
 }

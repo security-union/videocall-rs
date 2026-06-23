@@ -48,6 +48,11 @@ runtimeConfig:
   e2eeEnabled: "false"
   webTransportEnabled: "true"
   transportBadgeEnabled: "false"
+  # Issue #1480: gate git commit SHA + branch in About modal / diagnostics
+  # build-info. FAIL-CLOSED: "false" (or omitting the key) HIDES git info, so
+  # production never leaks commit/branch. Dev/e2e (dioxus-ui/scripts/config.js)
+  # sets "true".
+  showBuildGitInfo: "false"
   firefoxEnabled: "false"
   usersAllowedToStream: ""
   serverElectionPeriodMs: 2000
@@ -56,6 +61,8 @@ runtimeConfig:
   screenBitrateKbps: 1000
   vadThreshold: 0.02
   consoleLogUploadEnabled: "false"
+  # Independent operator control for client hardware/network/battery telemetry.
+  hardwareMetricsEnabled: "true"
   imageTag: "latest"
 
 ingress:

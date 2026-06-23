@@ -70,10 +70,11 @@ const PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS: f64 = 1000.0;
 /// the proactive-PLI cadence at `1000 * 2^3 = 8000ms` — i.e. once recovery is clearly not
 /// arriving, this receiver pokes the speaker at most ~1/8s instead of ~1/s, damping the
 /// self-sustaining PLI storm. Going quiet is safe: the binding lower bound on freeze recovery is
-/// the *publisher's periodic GOP keyframe* (~5s camera / ~3s screen — the encoder's own
-/// `keyframe_interval_frames` cadence, NOT gated by the PLI cooldown; see `videocall-aq`'s tier
-/// `keyframe_interval_frames` and `camera_encoder`'s emit coalescer, which exempts the periodic
-/// keyframe). The reactive gap-driven path (`peer_decode_manager::should_request_keyframe`) is an
+/// the *publisher's periodic GOP keyframe* (wall-clock-bounded at 5s camera / 3s screen via
+/// `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` / `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`, NOT gated
+/// by the PLI cooldown; see `videocall-aq` and the camera/screen encoder's `periodic_keyframe_due`,
+/// which exempts the periodic keyframe from the coalescer). The reactive gap-driven path
+/// (`peer_decode_manager::should_request_keyframe`) is an
 /// additional accelerator but does NOT fire on a contiguous-delta *lossless* (WS) keyframe-less
 /// stall — the exact #1479 shape — because it gates on `lost_count > 0`. So this proactive path is
 /// one accelerator above the periodic-keyframe floor, and the whole point of #1479 is to stop it
@@ -95,6 +96,12 @@ const PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP: u32 = 3;
 /// `PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP`) so a stall firing at the capped cadence never
 /// self-resets mid-storm.
 const PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS: f64 = 12_000.0;
+/// Hard ceiling (ms) on how long the keyframe-arrival gate can suppress proactive PLIs (issue
+/// #1479). On a lossless WS path the keyframe always arrives within ~1-2s, but if the relay
+/// suppresses it (rate-limiter) or the publisher crashes, this timeout ensures we eventually
+/// retry. Set well above the publisher's periodic keyframe cadence (~5s camera) so the gate
+/// almost never times out under normal operation.
+const PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS: f64 = 15_000.0;
 
 /// Compile-time guard on the load-bearing backoff invariant (issue #1499):
 /// `PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS` must stay STRICTLY ABOVE the
@@ -111,6 +118,13 @@ const _: () = assert!(
         * (2u32.pow(PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP) as f64)
         < PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS
 );
+/// Compile-time guard: the arrival-gate timeout must exceed the backoff-reset quiet interval.
+/// When the gate times out, the backoff exponent has already been zeroed (since the quiet
+/// interval elapsed), so the retry fires at the base cadence. If a future re-tune inverted
+/// this, the retry would fire with a stale high exponent (up to 8s delay on top of the 15s
+/// wait — 23s total freeze, far worse than the pre-fix storm).
+const _: () =
+    assert!(PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS > PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS);
 /// A multiplier applied to the jitter estimate to provide a safety margin.
 /// A value of 3.0 means we buffer enough to handle jitter up to 3x the running average.
 const JITTER_MULTIPLIER: f64 = 3.0;
@@ -376,6 +390,16 @@ pub struct JitterBuffer<T> {
     /// proactive requests.
     consecutive_proactive_keyframe_requests: u32,
 
+    /// Keyframe-arrival gate (issue #1479): `true` when a proactive PLI has been fired and we
+    /// are waiting for the resulting keyframe to arrive (be inserted into the buffer). While
+    /// this is `true`, NO further proactive PLIs fire — each freeze episode produces exactly 1
+    /// PLI per receiver. Cleared when a keyframe is inserted (`insert_frame`) or when
+    /// `PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS` expires since the last fire (backstop against
+    /// publisher crash or relay suppression). This is the primary #1479 loop-breaker: it
+    /// decouples the freshness-deadline eviction cadence (~10ms) from PLI emission cadence,
+    /// which was the 1:1 coupling that created the storm.
+    awaiting_proactive_keyframe: bool,
+
     /// Most recent freshness-deadline skip this poll produced (issue #1045), set by
     /// `enforce_freshness_deadline` and consumed by the worker via
     /// [`JitterBuffer::take_freshness_skip`] after each poll to forward it to the
@@ -451,6 +475,7 @@ impl<T> JitterBuffer<T> {
             request_keyframe,
             last_keyframe_request_ms: None,
             consecutive_proactive_keyframe_requests: 0,
+            awaiting_proactive_keyframe: false,
             last_freshness_skip: None,
             last_freshness_skip_emit_ms: None,
             pending_freshness_skip: None,
@@ -511,6 +536,14 @@ impl<T> JitterBuffer<T> {
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
         log::trace!("[JITTER_BUFFER] Inserting frame: {seq}");
+
+        // Issue #1479: ANY keyframe arrival (even an old/duplicate one) clears the proactive-PLI
+        // gate. Placed before old-frame rejection because the gate is about "did the publisher
+        // respond to our PLI" — even a retransmitted keyframe proves it did. On a lossless WS
+        // path the PLI-triggered keyframe always arrives; on WT the timeout backstop handles loss.
+        if frame.frame_type == FrameType::KeyFrame && self.awaiting_proactive_keyframe {
+            self.awaiting_proactive_keyframe = false;
+        }
 
         // --- Pre-insertion checks ---
         // 1. Ignore frames that are too old.
@@ -976,21 +1009,36 @@ impl<T> JitterBuffer<T> {
                     }
                 }
 
+                // Issue #1479 keyframe-arrival gate: once a proactive PLI fires, suppress
+                // ALL further proactive PLIs until a keyframe arrives or the hard timeout
+                // expires. This breaks the 1:1 freshness_skip→PLI coupling that created the
+                // meeting-wide storm. The timeout backstop ensures we eventually retry if the
+                // keyframe is lost (relay suppression, publisher crash).
+                let gate_timed_out = self.awaiting_proactive_keyframe
+                    && self.last_keyframe_request_ms.is_some_and(|last| {
+                        (current_time_ms.saturating_sub(last)) as f64
+                            >= PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS
+                    });
+                if gate_timed_out {
+                    self.awaiting_proactive_keyframe = false;
+                    log::debug!(
+                        "[JITTER_BUFFER] Proactive-PLI arrival gate timed out ({}ms); re-arming (#1479).",
+                        PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS
+                    );
+                }
+
+                if self.awaiting_proactive_keyframe {
+                    // Gate closed: a PLI is already in flight; suppress until keyframe arrives.
+                    return false;
+                }
+
                 // The FIRST request fires after PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS
                 // (≈ the relay window). Each subsequent request within the backoff window then
                 // doubles the interval — exponential backoff capped at
-                // PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP (issue #1479). A fixed ~1/s cadence
-                // across a meeting-long sequence of freezes is precisely the receiver-side
-                // amplifier of the PLI keyframe storm: every receiver pokes the active speaker
-                // every second. The relay's KEYFRAME_REQUEST limiter became delivery-aware in
-                // #1297 (a ~200ms still-waiting retry under a global cap — see actix-api's
-                // packet_handler `KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS` / `observe_delivery`),
-                // so it coalesces these pokes rather than forwarding each one; but a meeting-wide
-                // ~1/s spray from every receiver still wastes the speaker's uplink and the relay's
-                // limiter budget on requests for a keyframe already in flight. Backing off decays
-                // the cadence
-                // toward ~1/8s while the stall persists, then the quiet-interval reset above
-                // restores full speed once the stream genuinely recovers.
+                // PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP (issue #1479). Backing off decays
+                // the cadence toward ~1/8s while the stall persists; the keyframe-arrival gate
+                // above is the primary storm-breaker, and backoff is the secondary layer for
+                // the timeout-retry case.
                 let backoff_exp = self
                     .consecutive_proactive_keyframe_requests
                     .min(PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP);
@@ -1007,6 +1055,7 @@ impl<T> JitterBuffer<T> {
                     self.consecutive_proactive_keyframe_requests = self
                         .consecutive_proactive_keyframe_requests
                         .saturating_add(1);
+                    self.awaiting_proactive_keyframe = true;
                     (self.request_keyframe)();
                 }
             }
@@ -1186,6 +1235,7 @@ impl<T> JitterBuffer<T> {
         // post-flush stream is not handicapped by a prior stall's accumulated backoff.
         self.last_keyframe_request_ms = None;
         self.consecutive_proactive_keyframe_requests = 0;
+        self.awaiting_proactive_keyframe = false;
         // Reset freshness-skip diagnostic throttling too: a post-flush stream should not inherit
         // stale diagnostic cooldown or coalesced skip details from before the stream reset.
         self.last_freshness_skip = None;
@@ -2057,11 +2107,15 @@ mod tests {
             "sustained eviction within one throttle window must fire exactly once"
         );
 
-        // After the first fire the backoff exponent is 1, so the next interval is
-        // 1000 * 2^1 = 2000ms. An eviction only 1050ms after the first must STILL be
-        // throttled — proving the interval grew (issue #1479). Without backoff (fixed
-        // 1000ms) this would fire and bump the count to 2.
-        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1400);
+        // Issue #1479: the keyframe-arrival gate now suppresses all further PLIs until a
+        // keyframe arrives. Insert an OLD keyframe (seq 1 <= last_decoded=1) to clear the gate
+        // without disturbing the buffer (rejected by old-frame check after gate clear).
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 2200);
+
+        // After the gate clears and the first fire the backoff exponent is 1, so the next
+        // interval is 1000 * 2^1 = 2000ms. An eviction only 1050ms after the first must STILL
+        // be throttled — proving the interval grew (issue #1479).
+        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 2250);
         jb.find_and_move_continuous_frames(3200); // 3200 - 2150 = 1050ms < 2000ms → throttled
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -2070,12 +2124,119 @@ mod tests {
         );
 
         // Past the backed-off window (>= 2000ms after the first fire) it fires again.
-        jb.insert_frame(create_test_frame(6, FrameType::DeltaFrame), 1450);
+        jb.insert_frame(create_test_frame(6, FrameType::DeltaFrame), 2300);
         jb.find_and_move_continuous_frames(4200); // 4200 - 2150 = 2050ms >= 2000ms → fires (#2)
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,
             "an eviction past the backed-off window fires a fresh request"
+        );
+    }
+
+    /// Issue #1479 — PRIMARY LOOP-BREAKER: after a proactive PLI fires, the arrival gate
+    /// suppresses ALL further proactive PLIs until a keyframe arrives. This decouples the
+    /// freshness-deadline eviction cadence (~10ms) from PLI emission, breaking the 1:1
+    /// freshness_skip→PLI coupling that created the meeting-wide storm.
+    ///
+    /// Mutation coverage: deleting `self.awaiting_proactive_keyframe = true` on fire allows
+    /// a second PLI to fire at the backoff interval (count goes to 2); deleting the gate
+    /// check (`if self.awaiting_proactive_keyframe { return false }`) has the same effect.
+    /// Deleting the keyframe-arrival clear means the gate never opens and the timeout test
+    /// at the end fails.
+    #[test]
+    fn proactive_pli_arrival_gate_suppresses_until_keyframe() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // last-good = seq 1.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+
+        // Keyframe-less backlog.
+        for s in 2u64..=10 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 300);
+        }
+
+        // First eviction fires the proactive PLI.
+        jb.find_and_move_continuous_frames(5000);
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "first PLI fires");
+
+        // Subsequent evictions past the backoff window are SUPPRESSED by the arrival gate —
+        // no keyframe has arrived yet.
+        jb.find_and_move_continuous_frames(7100); // 2100ms > 2000ms (backoff exp=1) — would fire without gate
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "gate suppresses second PLI even past backoff interval"
+        );
+        jb.find_and_move_continuous_frames(15000); // 10000ms — would definitely fire without gate
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "gate suppresses indefinitely until keyframe arrives"
+        );
+
+        // A keyframe arrives (old seq to not disturb buffer) — clears the gate.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 15100);
+        assert!(!jb.awaiting_proactive_keyframe, "gate cleared by keyframe");
+
+        // Next eviction past backoff window fires again.
+        jb.find_and_move_continuous_frames(16100); // 16100 - 5000 = 11100ms > 8000ms (capped) → fires
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "after keyframe arrival gate clears, next eligible eviction fires"
+        );
+    }
+
+    /// Issue #1479 — TIMEOUT BACKSTOP: if no keyframe arrives within
+    /// `PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS`, the gate clears so a retry can fire.
+    #[test]
+    fn proactive_pli_arrival_gate_times_out() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move || {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        for s in 2u64..=20 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 300);
+        }
+
+        // First PLI fires.
+        let fire_time = 5000u128;
+        jb.find_and_move_continuous_frames(fire_time);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        // Just before timeout — still gated.
+        let just_before = fire_time + (PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS as u128) - 100;
+        jb.find_and_move_continuous_frames(just_before);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "gate holds just before timeout"
+        );
+
+        // Past timeout — gate expires, next eligible eviction fires.
+        let past_timeout = fire_time + (PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS as u128) + 100;
+        jb.find_and_move_continuous_frames(past_timeout);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "gate times out and a retry PLI fires"
         );
     }
 
@@ -2132,8 +2293,15 @@ mod tests {
         );
 
         // Sustained stall: the interval after each fire doubles — 2s, 4s, 8s, then capped at 8s.
+        // Each cycle: fire → insert an OLD keyframe (clears the #1479 arrival gate without
+        // disturbing the buffer — seq 1 is <= last_decoded so it's rejected after the gate
+        // clear) → wait for backoff → fire.
         let expected_gaps_ms = [2 * base, 4 * base, 8 * base, 8 * base];
         for (i, gap) in expected_gaps_ms.iter().enumerate() {
+            // An old keyframe arrives: clears the arrival gate (placed before old-frame check)
+            // but is rejected by the old-frame filter (seq 1 <= last_decoded_sequence_number=1).
+            jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), last_fire + 200);
+
             // Just BEFORE the backed-off interval → still throttled.
             jb.find_and_move_continuous_frames(last_fire + gap - 100);
             assert_eq!(
@@ -2161,13 +2329,10 @@ mod tests {
 
         // QUIET INTERVAL (genuine recovery): no proactive request fires for longer than
         // PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS. The next keyframe-less eviction after
-        // that gap must reset the exponent to 0 and fire at the BASE interval again. We poll
-        // once, `RESET_MS + a bit` after the last fire: that single poll is >= base (so it is
-        // eligible) and, because it crossed the reset threshold, the exponent is cleared FIRST,
-        // so it fires. With the reset deleted the exponent stays at the cap and the required
-        // interval is 8s — but RESET_MS (12s) > 8s, so to prove the *reset* (not just elapsed
-        // time) we follow with a second poll exactly base+ after this fire: that only fires if
-        // the exponent is now back at 0.
+        // that gap must reset the exponent to 0 and fire at the BASE interval again.
+        // First, insert an old keyframe to clear the #1479 arrival gate from the last fire.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), last_fire + 200);
+
         let reset_ms = PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS as u128;
         let quiet_fire = last_fire + reset_ms + 100;
         jb.find_and_move_continuous_frames(quiet_fire);
@@ -2177,14 +2342,12 @@ mod tests {
             "after a quiet interval the next eviction fires"
         );
 
-        // The DISCRIMINATING assert: a follow-up eviction only `2*base` after `quiet_fire` must
-        // FIRE — proving the exponent was reset to 0 (interval back to base), not still at the
-        // cap (which would require 8s). 2*base = 2000ms is >= base(1000, after the now-1 exponent
-        // doubles to 2s) … so we instead poll base+50 after, before the post-reset exponent's
-        // own 2s step. Precisely: after the reset-fire the exponent is 1, so the next interval is
-        // 2s; a poll at base+50 (1050ms) is < 2s and must be THROTTLED, and a poll at 2*base+50
-        // must FIRE. We assert the throttle first (distinguishes reset-to-0 from no-reset, since
-        // no-reset would also be throttled here — so this alone is not enough), then the fire.
+        // Clear the arrival gate again for the discriminating asserts.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), quiet_fire + 100);
+
+        // The DISCRIMINATING assert: after the reset-fire the exponent is 1, so the next
+        // interval is 2s; a poll at base+50 (1050ms) is < 2s and must be THROTTLED, and a poll
+        // at 2*base+50 must FIRE.
         jb.find_and_move_continuous_frames(quiet_fire + base + 50); // 1050ms < 2000ms post-reset step
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -2264,6 +2427,8 @@ mod tests {
 
         // Drive the exponent to the cap: last-good = seq 1, then a keyframe-less backlog polled
         // past each backed-off window so several requests fire (exponent climbs to >= cap).
+        // Between each fire we insert an OLD keyframe (seq 1, <= last_decoded) to clear the
+        // #1479 arrival gate without disturbing the buffer.
         jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
         jb.find_and_move_continuous_frames(200);
         for s in 2u64..=12 {
@@ -2272,6 +2437,8 @@ mod tests {
         let mut last_fire = 5000u128;
         jb.find_and_move_continuous_frames(last_fire); // fire #1 (exp→1)
         for gap in [2 * base, 4 * base, 8 * base, 8 * base] {
+            // Clear the arrival gate with an old keyframe (rejected but gate clears first).
+            jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), last_fire + 200);
             last_fire += gap + 50;
             jb.find_and_move_continuous_frames(last_fire); // fires; exponent climbs to the cap
         }
@@ -2283,8 +2450,8 @@ mod tests {
 
         jb.flush();
 
-        // Post-flush stall. First eviction fires immediately (last_keyframe_request_ms is None).
-        // After it, the exponent is 1 ONLY IF flush reset it (else it is cap+1, still cap).
+        // Post-flush stall. First eviction fires immediately (last_keyframe_request_ms is None,
+        // awaiting_proactive_keyframe is false after flush).
         jb.last_decoded_sequence_number = Some(100);
         for s in 101u64..=104 {
             jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 20_000);
@@ -2296,6 +2463,9 @@ mod tests {
             pre_flush + 1,
             "first post-flush eviction fires"
         );
+
+        // Clear the arrival gate with an old keyframe (seq 100 == last_decoded, so rejected).
+        jb.insert_frame(create_test_frame(100, FrameType::KeyFrame), t0 + 100);
 
         // Discriminator: with the exponent reset to 0 → now 1, the next interval is 2s. A poll
         // base+50 (1050ms) after the post-flush fire must be THROTTLED, and a poll 2*base+50 must

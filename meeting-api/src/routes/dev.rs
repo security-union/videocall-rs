@@ -117,6 +117,7 @@ mod tests {
             cookie_name: "session".to_string(),
             cookie_secure: false,
             nats: None,
+            feed_tx: crate::feed_events::new_feed_channel().0,
             service_version_urls: Vec::new(),
             http_client: reqwest::Client::new(),
             display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(

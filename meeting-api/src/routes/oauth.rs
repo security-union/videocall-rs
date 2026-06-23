@@ -666,33 +666,81 @@ pub async fn get_profile(
     Json(APIResponse::ok(ProfileResponse { user_id, name }))
 }
 
-/// GET /logout -- clears the legacy session cookie and optionally initiates
-/// RP-initiated logout at the provider's `end_session_endpoint`.
+/// Query parameters accepted by the logout endpoint.
+#[derive(Debug, Deserialize)]
+pub struct LogoutQuery {
+    /// OIDC id_token_hint — forwarded to the IdP's end_session_endpoint so it
+    /// can identify the session to terminate without prompting the user.
+    pub id_token_hint: Option<String>,
+}
+
+/// GET /logout -- clears the session cookie and initiates RP-initiated logout
+/// at the provider's `end_session_endpoint` via a top-level redirect.
 ///
-/// When OAuth/JWKS is configured there is no server-side session to terminate
-/// (the id_token lives in the browser's `sessionStorage`).  The client should
-/// discard the stored id_token before navigating to this endpoint.  If an
-/// `end_session_endpoint` is configured the browser is redirected there so
-/// that the provider's session is also terminated.
-pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError> {
+/// The client must navigate to this endpoint (top-level navigation, not fetch)
+/// so that the browser sends `SameSite=Lax` cookies to the IdP during the
+/// redirect chain.  The client should clear its own auth state (tokens,
+/// profile) before navigating here.
+///
+/// Accepts an optional `?id_token_hint=<token>` parameter which is forwarded
+/// to the IdP for session identification.
+///
+/// Redirects to the IdP when a session cookie is present OR an `id_token_hint`
+/// is provided (browser-PKCE clients carry no server cookie but pass the hint).
+/// If NEITHER is present, returns 200 with the clear-cookie header but does NOT
+/// redirect (mitigates logout CSRF from unauthenticated requests).
+pub async fn logout(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Query(query): Query<LogoutQuery>,
+) -> Result<Response, AppError> {
     let clear = build_clear_session_cookie(
         &state.cookie_name,
         state.cookie_domain.as_deref(),
         state.cookie_secure,
     );
 
-    let mut response = if let Some(end_session_url) = state
-        .oauth
-        .as_ref()
-        .and_then(|o| o.end_session_endpoint.as_deref())
-    {
-        let oauth_cfg = state.oauth.as_ref().expect("oauth is Some");
-        let redirect_url = build_end_session_url(end_session_url, oauth_cfg)?;
-        tracing::info!(
-            end_session_url = %redirect_url,
-            "Initiating RP-initiated logout via provider end-session endpoint",
-        );
-        Redirect::to(&redirect_url).into_response()
+    let cookie_prefix = format!("{}=", state.cookie_name);
+    let has_session = headers
+        .get(header::COOKIE)
+        .and_then(|c| c.to_str().ok())
+        .map(|c| {
+            c.split(';')
+                .any(|pair| pair.trim().starts_with(&cookie_prefix))
+        })
+        .unwrap_or(false);
+
+    // Redirect to IdP if the user has an active session OR provides an
+    // id_token_hint (browser-PKCE mode has no server cookie but the hint alone
+    // is sufficient for the IdP to identify the session per OIDC spec §2).
+    let should_redirect = has_session || query.id_token_hint.is_some();
+
+    let mut response = if should_redirect {
+        if let Some(end_session_url) = state
+            .oauth
+            .as_ref()
+            .and_then(|o| o.end_session_endpoint.as_deref())
+        {
+            let oauth_cfg = state.oauth.as_ref().expect("oauth is Some");
+            let redirect_url =
+                build_end_session_url(end_session_url, oauth_cfg, query.id_token_hint.as_deref())?;
+            tracing::info!(
+                end_session_base = %end_session_url,
+                id_token_hint_present = query.id_token_hint.is_some(),
+                "Initiating RP-initiated logout via provider end-session endpoint",
+            );
+            Redirect::to(&redirect_url).into_response()
+        } else {
+            // No end_session_endpoint configured — redirect back to the app so
+            // the user doesn't land on a blank page after the top-level navigation.
+            let fallback = state
+                .oauth
+                .as_ref()
+                .and_then(|o| o.after_logout_url.as_deref())
+                .or_else(|| state.oauth.as_ref().map(|o| o.after_login_url.as_str()))
+                .unwrap_or("/");
+            Redirect::to(fallback).into_response()
+        }
     } else {
         StatusCode::OK.into_response()
     };
@@ -709,6 +757,7 @@ pub async fn logout(State(state): State<AppState>) -> Result<Response, AppError>
 fn build_end_session_url(
     end_session_url: &str,
     oauth_cfg: &crate::config::OAuthConfig,
+    id_token_hint: Option<&str>,
 ) -> Result<String, AppError> {
     let mut url = Url::parse(end_session_url)
         .map_err(|e| AppError::internal(&format!("Invalid end_session_endpoint URL: {e}")))?;
@@ -717,6 +766,9 @@ fn build_end_session_url(
         params.append_pair("client_id", &oauth_cfg.client_id);
         if let Some(ref after_logout_url) = oauth_cfg.after_logout_url {
             params.append_pair("post_logout_redirect_uri", after_logout_url);
+        }
+        if let Some(hint) = id_token_hint {
+            params.append_pair("id_token_hint", hint);
         }
     }
     Ok(url.to_string())
@@ -1138,7 +1190,7 @@ mod tests {
     #[test]
     fn build_end_session_url_includes_client_id() {
         let cfg = minimal_oauth_config(None, None);
-        let url = build_end_session_url("https://provider.example.com/logout", &cfg).unwrap();
+        let url = build_end_session_url("https://provider.example.com/logout", &cfg, None).unwrap();
         assert!(
             url.contains("client_id=test-client"),
             "expected client_id in URL, got: {url}"
@@ -1151,7 +1203,7 @@ mod tests {
             Some("https://provider.example.com/logout".to_string()),
             Some("https://app.example.com/after-logout".to_string()),
         );
-        let url = build_end_session_url("https://provider.example.com/logout", &cfg).unwrap();
+        let url = build_end_session_url("https://provider.example.com/logout", &cfg, None).unwrap();
         assert!(
             url.contains("post_logout_redirect_uri="),
             "expected post_logout_redirect_uri in URL, got: {url}"
@@ -1165,7 +1217,8 @@ mod tests {
     #[test]
     fn build_end_session_url_omits_post_logout_redirect_uri_when_unset() {
         let cfg = minimal_oauth_config(None, None);
-        let url = build_end_session_url("https://provider.example.com/end_session", &cfg).unwrap();
+        let url =
+            build_end_session_url("https://provider.example.com/end_session", &cfg, None).unwrap();
         assert!(
             !url.contains("post_logout_redirect_uri"),
             "should not contain post_logout_redirect_uri, got: {url}"
@@ -1175,8 +1228,12 @@ mod tests {
     #[test]
     fn build_end_session_url_preserves_existing_query_params() {
         let cfg = minimal_oauth_config(None, None);
-        let url = build_end_session_url("https://provider.example.com/logout?realm=master", &cfg)
-            .unwrap();
+        let url = build_end_session_url(
+            "https://provider.example.com/logout?realm=master",
+            &cfg,
+            None,
+        )
+        .unwrap();
         assert!(
             url.contains("realm=master"),
             "existing query param should be preserved, got: {url}"
@@ -1190,8 +1247,33 @@ mod tests {
     #[test]
     fn build_end_session_url_rejects_invalid_base_url() {
         let cfg = minimal_oauth_config(None, None);
-        let result = build_end_session_url("not-a-valid-url", &cfg);
+        let result = build_end_session_url("not-a-valid-url", &cfg, None);
         assert!(result.is_err(), "invalid base URL should produce an error");
+    }
+
+    #[test]
+    fn build_end_session_url_includes_id_token_hint_when_provided() {
+        let cfg = minimal_oauth_config(None, None);
+        let url = build_end_session_url(
+            "https://provider.example.com/logout",
+            &cfg,
+            Some("eyJhbGciOiJSUzI1NiJ9.test"),
+        )
+        .unwrap();
+        assert!(
+            url.contains("id_token_hint="),
+            "expected id_token_hint in URL, got: {url}"
+        );
+    }
+
+    #[test]
+    fn build_end_session_url_omits_id_token_hint_when_none() {
+        let cfg = minimal_oauth_config(None, None);
+        let url = build_end_session_url("https://provider.example.com/logout", &cfg, None).unwrap();
+        assert!(
+            !url.contains("id_token_hint"),
+            "should not contain id_token_hint, got: {url}"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1218,6 +1300,7 @@ mod tests {
             cookie_name: "session".to_string(),
             cookie_secure: false,
             nats: None,
+            feed_tx: crate::feed_events::new_feed_channel().0,
             service_version_urls: vec![],
             http_client: reqwest::Client::new(),
             display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
@@ -1243,9 +1326,52 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn logout_returns_200_when_no_end_session_endpoint() {
+    async fn logout_redirects_to_app_root_when_no_end_session_endpoint() {
         use tower::ServiceExt;
         let state = make_handler_state(None);
+        let app = axum::Router::new()
+            .route("/logout", axum::routing::get(logout))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout")
+            .header(header::COOKIE, "session=some-token")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "should redirect to app when no end_session_endpoint"
+        );
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("Location header must be present")
+            .to_str()
+            .unwrap();
+        assert_eq!(location, "/", "should redirect to app root as fallback");
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "should clear cookie, got: {set_cookie}"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_returns_200_without_redirect_when_no_cookie_and_no_hint() {
+        use tower::ServiceExt;
+        let cfg = oauth_cfg_with_end_session(
+            "https://provider.example.com/logout",
+            Some("https://app.example.com/after-logout"),
+        );
+        let state = make_handler_state(Some(cfg));
         let app = axum::Router::new()
             .route("/logout", axum::routing::get(logout))
             .with_state(state);
@@ -1256,16 +1382,49 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
 
-        assert_eq!(resp.status(), StatusCode::OK);
-        let set_cookie = resp
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "no session cookie and no id_token_hint → should not redirect to IdP"
+        );
+        assert!(
+            resp.headers().get(header::LOCATION).is_none(),
+            "no redirect when neither session cookie nor hint is present"
+        );
+    }
+
+    #[tokio::test]
+    async fn logout_redirects_with_id_token_hint_even_without_session_cookie() {
+        use tower::ServiceExt;
+        let cfg = oauth_cfg_with_end_session(
+            "https://provider.example.com/logout",
+            Some("https://app.example.com/after-logout"),
+        );
+        let state = make_handler_state(Some(cfg));
+        let app = axum::Router::new()
+            .route("/logout", axum::routing::get(logout))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout?id_token_hint=eyJtest")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "id_token_hint alone should trigger redirect (browser-PKCE mode)"
+        );
+        let location = resp
             .headers()
-            .get(header::SET_COOKIE)
-            .unwrap()
+            .get(header::LOCATION)
+            .expect("Location header must be present for PKCE logout")
             .to_str()
             .unwrap();
         assert!(
-            set_cookie.contains("Max-Age=0"),
-            "should clear cookie, got: {set_cookie}"
+            location.contains("id_token_hint=eyJtest"),
+            "id_token_hint should be forwarded: {location}"
         );
     }
 
@@ -1283,6 +1442,7 @@ mod tests {
 
         let req = axum::http::Request::builder()
             .uri("/logout")
+            .header(header::COOKIE, "session=some-token")
             .body(AxumBody::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
@@ -1319,6 +1479,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn logout_forwards_id_token_hint_to_end_session_url() {
+        use tower::ServiceExt;
+        let cfg = oauth_cfg_with_end_session("https://provider.example.com/logout", None);
+        let state = make_handler_state(Some(cfg));
+        let app = axum::Router::new()
+            .route("/logout", axum::routing::get(logout))
+            .with_state(state);
+
+        let req = axum::http::Request::builder()
+            .uri("/logout?id_token_hint=eyJtest")
+            .header(header::COOKIE, "session=some-token")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(
+            location.contains("id_token_hint=eyJtest"),
+            "id_token_hint should be forwarded: {location}"
+        );
+    }
+
+    #[tokio::test]
     async fn logout_redirect_omits_post_logout_redirect_uri_when_not_configured() {
         use tower::ServiceExt;
         let cfg = oauth_cfg_with_end_session("https://provider.example.com/logout", None);
@@ -1329,6 +1518,7 @@ mod tests {
 
         let req = axum::http::Request::builder()
             .uri("/logout")
+            .header(header::COOKIE, "session=some-token")
             .body(AxumBody::empty())
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();

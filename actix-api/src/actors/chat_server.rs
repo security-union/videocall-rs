@@ -21,8 +21,8 @@ use crate::{
         LAYER_HINT_MAX_RECEIVERS_SCANNED, LAYER_HINT_RECOMPUTE_COALESCE_MS,
         LAYER_HINT_SUPPRESS_DEBOUNCE_MS, LAYER_PREFERENCE_MAX_ENTRIES,
         LAYER_PREFERENCE_MAX_LAYER_ID, LAYER_PREFERENCE_MIN_UPDATE_INTERVAL,
-        LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS,
-        VIEWPORT_MIN_UPDATE_INTERVAL,
+        LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL, PARTICIPANT_REBROADCAST_COALESCE_MS,
+        RECONNECT_GRACE_PERIOD, VIEWPORT_MAX_SESSION_IDS, VIEWPORT_MIN_UPDATE_INTERVAL,
     },
     messages::{
         server::{
@@ -54,11 +54,12 @@ use tracing::{debug, error, info, trace, warn};
 use crate::actors::priority_drop::OutboundPriority;
 use crate::metrics::{
     RELAY_CONGESTION_FILTERED_TOTAL, RELAY_DOWNLINK_CONGESTION_FILTERED_TOTAL,
-    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_LAYER_FILTERED_TOTAL,
-    RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
+    RELAY_INBOUND_MAILBOX_DROPS_TOTAL, RELAY_INNER_SESSION_SELF_FILTERED_TOTAL,
+    RELAY_LAYER_FILTERED_TOTAL, RELAY_LAYER_FORWARDED_BY_LAYER_TOTAL, RELAY_LAYER_FORWARDED_TOTAL,
     RELAY_LAYER_HINT_EMITTED_TOTAL, RELAY_LAYER_ID_BUCKETS, RELAY_LAYER_PREFERENCE_SESSIONS,
     RELAY_LAYER_PREFERENCE_UPDATES_TOTAL, RELAY_NATS_PUBLISH_LATENCY_MS, RELAY_PACKET_DROPS_TOTAL,
-    RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL, RELAY_VIEWPORT_SET_SIZE,
+    RELAY_VIEWPORT_FILTERED_TOTAL, RELAY_VIEWPORT_FORWARDED_TOTAL,
+    RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL, RELAY_VIEWPORT_SET_SIZE,
     RELAY_VIEWPORT_UPDATES_TOTAL,
 };
 use videocall_types::protos::downlink_congestion_packet::DownlinkCongestionPacket;
@@ -153,6 +154,42 @@ const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host";
 /// races a host-leave END is harmless in either ordering.
 const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
 
+/// NATS subject for chat_server -> meeting-api notifications that a SINGLE
+/// participant's session left a room. The meeting-api consumer marks that
+/// participant `status='left', left_at=NOW()` in the `meeting_participants`
+/// table so a participant who disconnected WITHOUT calling the REST `/leave`
+/// endpoint (closed tab / network drop / crash) stops being counted as present
+/// by the meeting-settings "Activity" participant count (issue #1551).
+///
+/// Fired from the per-peer departure point inside [`ChatServer::leave_rooms`] —
+/// the same place that broadcasts the client-facing `PARTICIPANT_LEFT` packet —
+/// so it inherits that path's lifecycle guarantees:
+///   - It runs ONLY after the [`RECONNECT_GRACE_PERIOD`] (via
+///     `ExecutePendingDeparture`, which a timely reconnect cancels) or on an
+///     explicit `Leave`, so a brief disconnect+reconnect never reaches it.
+///   - It is suppressed when the departing user still has ANOTHER live session
+///     in the room (multi-tab, or a different tab that reconnected after the
+///     grace expired): we publish only when `room_members` for the room — the
+///     actor-synchronous authoritative presence map — has NO remaining session
+///     for that `user_id`. This closes the late-event race where a per-user
+///     mark-left could otherwise stomp a still-present session, because the DB
+///     row is keyed by `user_id`, not session.
+///
+/// Scale / fan-out cost. Unlike [`MEETING_BECAME_EMPTY_SUBJECT`] — which is
+/// COALESCED to fire exactly once per room-drain — this is per departing user
+/// and is NOT coalesced. A mass disconnect of N participants is therefore an
+/// O(N) fan-out: N publishes on this subject (matching the per-peer
+/// `PARTICIPANT_LEFT` client broadcast volume the relay already sustains) PLUS,
+/// on the meeting-api side, N additional DB round-trips the client broadcast
+/// does NOT incur — one `get_by_room_id` SELECT and one single-row UPDATE per
+/// event, processed serially by the single-subscriber consumer. This is bounded
+/// and acceptable at realistic room sizes (the per-event work is two indexed
+/// queries), and per-event delivery is required because each row is keyed by a
+/// distinct `user_id` — a single coalesced room event could not carry which
+/// users to mark left. It is a deliberate, defensible design choice, not a
+/// zero-incremental-cost one; batching is intentionally out of scope here.
+const PARTICIPANT_LEFT_SUBJECT: &str = "internal.participant_left";
+
 /// Payload published to NATS for cross-server stale session eviction.
 /// When a client reconnects (possibly to a different server), the new server
 /// broadcasts this so the old server can clean up silently.
@@ -203,6 +240,19 @@ struct MeetingEndedByHostPayload {
 #[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
 struct MeetingBecameEmptyPayload {
     room_id: String,
+}
+
+/// Payload for [`PARTICIPANT_LEFT_SUBJECT`].
+///
+/// Sent from chat_server to meeting-api when a single participant's session left
+/// a room and that participant has no other live session in the room. The
+/// meeting-api consumer marks `(room_id, user_id)` as `status='left',
+/// left_at=NOW()` so the DB roster reflects live presence. Carries `user_id`
+/// (which the `meeting_participants` rows are keyed by, alongside `meeting_id`).
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+struct ParticipantLeftPayload {
+    room_id: String,
+    user_id: String,
 }
 
 /// Payload for [`MEETING_HOST_CHANGE_SUBJECT`]: one per-user host-flag delta
@@ -313,6 +363,17 @@ fn apply_member_host_flag(members: &mut [RoomMemberInfo], user_id: &str, is_host
 /// [`ChatServer::leave_rooms`] for unit tests.
 fn was_last_present_host(remaining_members: &[RoomMemberInfo], was_host: bool) -> bool {
     was_host && !remaining_members.iter().any(|m| m.is_host)
+}
+
+/// Whether `user_id` still has at least one live session in the room AFTER the
+/// departing session was removed from `remaining_members`. Used to SUPPRESS the
+/// per-participant `PARTICIPANT_LEFT` DB mark-left (issue #1551) when a user has
+/// another tab/session present: the `meeting_participants` row is keyed by
+/// `user_id`, so marking it left while another session is live would wrongly
+/// drop a still-present user from the participant count. Factored out of
+/// [`ChatServer::leave_rooms`] for unit tests.
+fn user_has_remaining_session(remaining_members: &[RoomMemberInfo], user_id: &str) -> bool {
+    remaining_members.iter().any(|m| m.user_id == user_id)
 }
 
 /// Cached per-room policy flags. Populated at first JoinRoom for the room and
@@ -609,17 +670,41 @@ struct RecomputeLayerHints {
     source: Option<SessionId>,
 }
 
-/// Trailing-debounce flush for coalesced DEPARTURE-driven recomputes (#1203).
+/// Trailing-debounce flush for coalesced join/departure recomputes (#1203, #1288).
 ///
 /// Self-sent via `notify_later` exactly [`LAYER_HINT_RECOMPUTE_COALESCE_MS`]
-/// after the FIRST departure of a burst arms the timer (see
+/// after the FIRST join or departure of a burst arms the timer (see
 /// [`ChatServer::schedule_coalesced_recompute`]). The handler drains
 /// [`ChatServer::pending_recompute_rooms`] and runs ONE room-wide recompute per
-/// distinct room that saw a departure during the window, collapsing an O(n)
-/// per-connection storm into O(distinct rooms) work over settled membership.
+/// distinct room that saw membership change during the window, collapsing an
+/// O(n) per-connection storm into O(distinct rooms) work over settled membership.
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 struct FlushPendingRecomputes;
+
+/// Trailing-debounce flush for coalesced cross-server presence re-announces.
+///
+/// Self-sent via `notify_later` [`PARTICIPANT_REBROADCAST_COALESCE_MS`] after the
+/// first `RebroadcastPresence` of a wave arms the timer. The handler drains
+/// [`ChatServer::pending_rebroadcasts`] and re-announces one PARTICIPANT_JOINED
+/// per distinct responder — broadcast for a wave (≥2 distinct requesters), unicast
+/// to the lone requester otherwise — collapsing the wave's M·N publishes to N.
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct FlushRebroadcasts;
+
+/// Per-responder coalescing state. Tracks just enough to answer "did this
+/// responder see one distinct requester or ≥2 during the window?" — the threshold
+/// that selects unicast (single join) vs broadcast (wave) at flush, without
+/// storing the full requester set.
+struct RebroadcastPending {
+    /// The first requester that armed this responder; the unicast target when it
+    /// stays the only distinct requester.
+    first_requester: SessionId,
+    /// Set once a requester different from `first_requester` arrives — a wave,
+    /// which flips the flush to a broadcast.
+    saw_other_requester: bool,
+}
 
 /// Periodic self-tick that refreshes the DEMAND-side simulcast gauge
 /// `relay_layer_preference_sessions{room, kind, layer_id}` (#1170 item 2).
@@ -952,20 +1037,20 @@ pub struct ChatServer {
     /// lock needed). Entries are reaped when the publisher leaves (its
     /// `(room, source, _)` keys are dropped in `leave_rooms` / `forget_session`).
     layer_hint_state: HashMap<(String, SessionId, i32), LayerHintEmitState>,
-    /// Rooms with a DEPARTURE-driven (leave/evict) room-wide LAYER_HINT recompute
-    /// pending behind the coalescing debounce window (#1203).
+    /// Rooms with a membership-driven (join/leave/evict) room-wide LAYER_HINT
+    /// recompute pending behind the coalescing debounce window (#1203, #1288).
     ///
-    /// Departures fire one room-wide recompute per disconnecting connection
-    /// (`leave_rooms` / `forget_session`). A reconnection wave or a meeting
-    /// ending disconnects many sessions in a burst → an O(n) recompute storm in
-    /// the single-threaded actor (each recompute is itself O(publishers ×
-    /// receivers)). Instead of `do_send`-ing a recompute per departure, we record
+    /// Joins and departures each fire one room-wide recompute per event. A join
+    /// wave or reconnection burst → an O(n) recompute storm in the
+    /// single-threaded actor (each recompute is itself O(publishers ×
+    /// receivers)). Instead of `do_send`-ing a recompute per event, we record
     /// the affected room HERE and arm a single trailing
     /// [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] timer ([`recompute_coalesce_handle`]);
     /// when it fires, [`Handler<FlushPendingRecomputes>`] drains this set and runs
     /// exactly ONE room-wide recompute per affected room over the FINAL settled
-    /// membership. JOIN and per-LAYER_PREFERENCE recomputes intentionally bypass
-    /// this set (they are restore-eager / latency-sensitive — see the constant).
+    /// membership. Joins also route through this set (#1288) — same trailing
+    /// coalescing. Per-LAYER_PREFERENCE recomputes bypass it (they are per-source
+    /// and already rate-limited upstream).
     pending_recompute_rooms: std::collections::HashSet<String>,
     /// Single in-flight coalescing timer handle for [`pending_recompute_rooms`]
     /// (#1203). `Some` while a trailing flush is armed; `None` otherwise. Only one
@@ -991,6 +1076,33 @@ pub struct ChatServer {
     /// `!is_member`/`SkipClearPending` no-op — but wasteful). Cancelled wholesale
     /// in [`Actor::stopping`] so a stopped actor leaks no `SpawnHandle`.
     layer_hint_recheck_handles: HashMap<(String, SessionId, i32), SpawnHandle>,
+    /// Responder sessions with a coalesced presence re-announce pending behind the
+    /// [`PARTICIPANT_REBROADCAST_COALESCE_MS`] trailing debounce, each mapped to
+    /// the distinct-requester tracking that picks unicast vs broadcast at flush.
+    ///
+    /// A reconnection wave of M joiners delivers M `PARTICIPANT_LIST_REQUEST`s to
+    /// each of N peers. Rather than publish once per request, the peer is recorded
+    /// here once and a single trailing [`FlushRebroadcasts`] timer
+    /// ([`rebroadcast_coalesce_handle`]) is armed; on fire the flush re-announces
+    /// each pending responder once, dropping publishes from M·N to N. (The M·N
+    /// inbound request messages still arrive; only the arm path runs per message,
+    /// and it is cheap O(1).)
+    ///
+    /// The per-responder [`RebroadcastPending`] tracks the first requester and
+    /// whether a second distinct one arrived, so the flush unicasts to the lone
+    /// requester for a single join (no N² fan-out) and broadcasts only for a wave.
+    /// A responder that left or dropped out of `Active` during the window
+    /// self-clears (the flush re-resolves and skips it), like
+    /// [`pending_recompute_rooms`] tolerates a drained room.
+    ///
+    /// [`rebroadcast_coalesce_handle`]: ChatServer::rebroadcast_coalesce_handle
+    pending_rebroadcasts: HashMap<SessionId, RebroadcastPending>,
+    /// Single in-flight coalescing timer handle for [`pending_rebroadcasts`].
+    /// `Some` while a trailing flush is armed; `None` otherwise. Re-arming while
+    /// pending is a no-op (the existing deadline still fires), which makes the
+    /// debounce trailing — it dedups the whole wave rather than firing per
+    /// request. Cancelled in [`Actor::stopping`] so no `SpawnHandle` leaks.
+    rebroadcast_coalesce_handle: Option<SpawnHandle>,
 }
 
 impl ChatServer {
@@ -1015,6 +1127,8 @@ impl ChatServer {
             pending_recompute_rooms: std::collections::HashSet::new(),
             recompute_coalesce_handle: None,
             layer_hint_recheck_handles: HashMap::new(),
+            pending_rebroadcasts: HashMap::new(),
+            rebroadcast_coalesce_handle: None,
         }
     }
 
@@ -1104,11 +1218,26 @@ impl ChatServer {
         // single-threaded, so exactly one departure sees the host count hit zero
         // and the end-meeting broadcast fires once.
         let mut was_last_host = false;
+        // Whether the departing user STILL has another live session in this room
+        // AFTER removing the departing session. Computed from the same
+        // post-removal `room_members` slice as `was_last_host`. When true, the
+        // user is still present (another tab / multi-session) and the
+        // per-participant `PARTICIPANT_LEFT` DB mark-left (issue #1551) MUST be
+        // suppressed — the DB row is keyed by `user_id`, so marking it left
+        // would wrongly drop a still-present user from the participant count.
+        // `true` is the SAFE default (suppress) when we can't read membership;
+        // we only ever publish mark-left when we positively observe no remaining
+        // session for this user. Defaults `false` here and is set to `true` only
+        // when a remaining same-user session is found.
+        let mut user_still_present = false;
         if let Some(room_id) = room {
             if let Some(members) = self.room_members.get_mut(room_id) {
                 members.retain(|m| m.session != *session_id);
                 room_became_empty = members.is_empty();
                 was_last_host = was_last_present_host(members, is_host);
+                if let Some(departing_uid) = user_id {
+                    user_still_present = user_has_remaining_session(members, departing_uid);
+                }
             } else {
                 was_last_host = is_host;
             }
@@ -1134,8 +1263,8 @@ impl ChatServer {
             //      RAISES a remaining publisher's fail-open union (restore) and
             //      nobody is actively waiting on it, so collapsing a reconnection
             //      / meeting-end disconnect burst into ONE recompute over settled
-            //      membership avoids the O(n) per-connection storm. (JOINs stay
-            //      immediate — a real viewer waits on their tile.)
+            //      membership avoids the O(n) per-connection storm. (Joins also
+            //      coalesce — #1288; encoder reaction time dominates.)
             self.forget_layer_hint_state_for_source(room_id, *session_id, actor_ctx);
             if !room_became_empty {
                 let room_owned = room_id.to_string();
@@ -1179,6 +1308,50 @@ impl ChatServer {
             }
 
             tokio::spawn(async move {
+                // Per-participant DB mark-left backstop (issue #1551). Tell
+                // meeting-api to set this participant `status='left',
+                // left_at=NOW()` so a disconnect that did NOT go through the
+                // REST `/leave` endpoint (closed tab / network drop / crash)
+                // stops being counted as present by the meeting-settings
+                // "Activity" participant count. Fired here — at the same
+                // post-grace, active-session departure point as the
+                // client-facing PARTICIPANT_LEFT broadcast below — so it
+                // inherits the reconnect-grace debounce. SUPPRESSED when the
+                // user still has another live session in the room
+                // (`user_still_present`), because the DB row is keyed by
+                // user_id and marking it left would drop a still-present user.
+                // Fires on every real departure branch (including the
+                // host-leave-ends-meeting path, where the host must also be
+                // recorded as no longer present). Best-effort: a publish error
+                // is logged and does not block the rest of the teardown. The
+                // consumer's UPDATE is idempotent and reconnect-safe (see
+                // db::participants::mark_left_by_disconnect).
+                if !user_still_present {
+                    let payload = ParticipantLeftPayload {
+                        room_id: room_id.clone(),
+                        user_id: user_id.clone(),
+                    };
+                    match serde_json::to_vec(&payload) {
+                        Ok(json) => {
+                            if let Err(e) = nc.publish(PARTICIPANT_LEFT_SUBJECT, json.into()).await
+                            {
+                                error!(
+                                    "Failed to publish {} for room {} user {}: {}",
+                                    PARTICIPANT_LEFT_SUBJECT, room_id, user_id, e
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            error!("Failed to serialize ParticipantLeftPayload: {}", e);
+                        }
+                    }
+                } else {
+                    info!(
+                        "Suppressing {} for user {} in room {} - another live session remains",
+                        PARTICIPANT_LEFT_SUBJECT, user_id, room_id
+                    );
+                }
+
                 // If the LAST present host is leaving and end_on_host_leave is
                 // set, end the meeting for all. `was_last_host` was computed
                 // above from the post-removal roster, so multi-session hosts
@@ -1805,22 +1978,23 @@ impl ChatServer {
             });
     }
 
-    /// Coalesce a DEPARTURE-driven (leave/evict) room-wide LAYER_HINT recompute
-    /// for `room` behind the [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] trailing
-    /// debounce (#1203), instead of `do_send`-ing a recompute immediately.
+    /// Coalesce a membership-driven (join/leave/evict) room-wide LAYER_HINT
+    /// recompute for `room` behind the [`LAYER_HINT_RECOMPUTE_COALESCE_MS`]
+    /// trailing debounce (#1203, #1288).
     ///
     /// Records `room` in [`pending_recompute_rooms`] and arms ONE
     /// [`FlushPendingRecomputes`] timer if none is already in flight. A re-arm
     /// while a timer is pending is a deliberate NO-OP: the existing trailing
     /// deadline still fires and will drain whatever rooms accumulated, so a burst
-    /// of N departures across the window produces exactly ONE flush (and one
-    /// recompute per distinct affected room) — TRAILING coalescing, not
-    /// per-event. This is the correct direction for departures: a departure can
-    /// only RAISE a remaining publisher's fail-open union (restore), and nobody is
-    /// actively waiting on it, so computing the FINAL union once the burst settles
-    /// is both cheaper and more correct than recomputing over transient
-    /// intermediate membership. See [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] for why
-    /// JOIN / per-LAYER_PREFERENCE recomputes intentionally bypass this path.
+    /// of N joins or departures across the window produces exactly ONE flush (and
+    /// one recompute per distinct affected room) — TRAILING coalescing, not
+    /// per-event. Both joins (#1288) and departures (#1203) route through this
+    /// path: a join can only RAISE a publisher's union (restore) and nobody is
+    /// actively waiting on it (the first frame takes 1-2s anyway), so computing
+    /// the FINAL union once the burst settles is both cheaper and more correct
+    /// than recomputing over transient intermediate membership.
+    /// Per-LAYER_PREFERENCE recomputes intentionally bypass this path (they are
+    /// already per-source, not room-wide).
     fn schedule_coalesced_recompute(&mut self, room: &str, ctx: &mut Context<Self>) {
         self.pending_recompute_rooms.insert(room.to_string());
         if self.recompute_coalesce_handle.is_none() {
@@ -2050,6 +2224,12 @@ impl Actor for ChatServer {
         for (_key, handle) in self.layer_hint_recheck_handles.drain() {
             ctx.cancel_future(handle);
         }
+        // Cancel the single in-flight presence re-announce coalescing timer.
+        // A stopping relay has no joiners left to inform.
+        if let Some(handle) = self.rebroadcast_coalesce_handle.take() {
+            ctx.cancel_future(handle);
+        }
+        self.pending_rebroadcasts.clear();
         actix::Running::Stop
     }
 }
@@ -2428,61 +2608,226 @@ impl Handler<RebroadcastPresence> for ChatServer {
     type Result = ();
 
     fn handle(&mut self, msg: RebroadcastPresence, ctx: &mut Self::Context) -> Self::Result {
-        let found = self
-            .session_room
-            .get(&msg.session)
-            .and_then(|room_id| self.room_members.get(room_id).map(|m| (room_id.clone(), m)))
-            .and_then(|(room_id, members)| {
-                members
-                    .iter()
-                    .find(|m| m.session == msg.session)
-                    .map(|m| (room_id, m.user_id.clone(), m.display_name.clone()))
-            });
+        // Arm only; the re-announce happens in `FlushRebroadcasts` so a wave of M
+        // requests for this peer collapses into one publish.
+        let responder_is_active =
+            self.connection_states.get(&msg.session).copied() == Some(ConnectionState::Active);
+        // A "local" requester (tracked on this instance) was already served by the
+        // in-memory replay in JoinRoom, so re-announcing would only duplicate.
+        // Skipping keeps single-server zero-cost (every requester is local).
+        let requester_is_local = self.connection_states.contains_key(&msg.requester_session);
+        if !responder_is_active || requester_is_local {
+            debug!(
+                "RebroadcastPresence: not arming for session {} (active={}, requester {} local={})",
+                msg.session, responder_is_active, msg.requester_session, requester_is_local
+            );
+            return;
+        }
 
-        if let Some((room_id, user_id, display_name)) = found {
+        // Record this responder once and track distinct requesters: the flush
+        // unicasts for a single join and broadcasts only once a second distinct
+        // requester proves a wave. Identity is re-resolved at flush, so don't
+        // snapshot room/name here.
+        self.pending_rebroadcasts
+            .entry(msg.session)
+            .and_modify(|p| {
+                if msg.requester_session != p.first_requester {
+                    p.saw_other_requester = true;
+                }
+            })
+            .or_insert(RebroadcastPending {
+                first_requester: msg.requester_session,
+                saw_other_requester: false,
+            });
+        if self.rebroadcast_coalesce_handle.is_none() {
+            let handle = ctx.notify_later(
+                FlushRebroadcasts,
+                std::time::Duration::from_millis(PARTICIPANT_REBROADCAST_COALESCE_MS),
+            );
+            self.rebroadcast_coalesce_handle = Some(handle);
+        }
+    }
+}
+
+/// Trailing-debounce flush for coalesced cross-server presence re-announces.
+///
+/// Drains [`ChatServer::pending_rebroadcasts`] and re-announces each still-present,
+/// still-`Active` responder once, then clears the timer handle so the next wave
+/// arms fresh. Addressing is the threshold hybrid: a responder that saw a second
+/// distinct requester (a wave) broadcasts to `room.{room}.system`; one that saw a
+/// single requester unicasts to it, avoiding the N² relay→client fan-out a
+/// broadcast would cost on the common single-join path.
+///
+/// Identity is re-resolved here (not snapshotted at arm time), so a peer that
+/// left, was evicted, or dropped out of `Active` during the window self-clears —
+/// like [`FlushPendingRecomputes`] tolerates a room that drained to empty.
+impl Handler<FlushRebroadcasts> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, _msg: FlushRebroadcasts, ctx: &mut Self::Context) -> Self::Result {
+        // Clear the in-flight handle first so a re-arm during the drain schedules
+        // a fresh timer rather than no-op against the handle we're consuming.
+        self.rebroadcast_coalesce_handle = None;
+        let responders: Vec<(SessionId, RebroadcastPending)> =
+            self.pending_rebroadcasts.drain().collect();
+        for (session, pending) in responders {
+            let resolved = self
+                .session_room
+                .get(&session)
+                .and_then(|room_id| self.room_members.get(room_id).map(|m| (room_id.clone(), m)))
+                .and_then(|(room_id, members)| {
+                    members
+                        .iter()
+                        .find(|m| m.session == session)
+                        .map(|m| (room_id, m.user_id.clone(), m.display_name.clone()))
+                });
+            let Some((room_id, user_id, display_name)) = resolved else {
+                continue;
+            };
             let responder_is_active =
-                self.connection_states.get(&msg.session).copied() == Some(ConnectionState::Active);
-            // The requester is "local" if this instance tracks its connection;
-            // then the in-memory existing-member replay already delivered the
-            // PARTICIPANT_JOINED, so a NATS reply would duplicate it.
-            let requester_is_local = self.connection_states.contains_key(&msg.requester_session);
+                self.connection_states.get(&session).copied() == Some(ConnectionState::Active);
             let is_guest = self
                 .session_is_guest
-                .get(&msg.session)
+                .get(&session)
                 .copied()
                 .unwrap_or(false);
 
-            if let Some((subject, bytes)) = SessionManager::rebroadcast_reply_publication(
+            // Threshold hybrid: broadcast only for a genuine wave (≥2 distinct
+            // requesters); otherwise unicast to the lone requester.
+            let target = if pending.saw_other_requester {
+                None
+            } else {
+                Some(pending.first_requester)
+            };
+
+            if let Some((subject, bytes)) = SessionManager::rebroadcast_publication(
                 &room_id,
                 &user_id,
                 &display_name,
-                msg.session,
-                msg.requester_session,
+                session,
                 is_guest,
                 responder_is_active,
-                requester_is_local,
+                target,
             ) {
+                #[cfg(test)]
+                {
+                    REBROADCAST_PUBLISH_INVOCATIONS
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if target.is_none() {
+                        REBROADCAST_BROADCAST_INVOCATIONS
+                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
                 info!(
-                    "RebroadcastPresence: re-publishing PARTICIPANT_JOINED for {} (session={}) to requester {} via {}",
-                    user_id, msg.session, msg.requester_session, subject
+                    "FlushRebroadcasts: re-announcing PARTICIPANT_JOINED for {} (session={}) to {}",
+                    user_id, session, subject
                 );
                 let nc = self.nats_connection.clone();
                 let fut = async move {
                     if let Err(e) = nc.publish(subject, bytes.into()).await {
                         error!(
-                            "RebroadcastPresence: failed to publish PARTICIPANT_JOINED: {}",
+                            "FlushRebroadcasts: failed to publish PARTICIPANT_JOINED: {}",
                             e
                         );
                     }
                 };
                 ctx.spawn(actix::fut::wrap_future::<_, Self>(fut));
-            } else {
-                debug!(
-                    "RebroadcastPresence: no reply for session {} (active={}, requester {} local={})",
-                    msg.session, responder_is_active, msg.requester_session, requester_is_local
-                );
             }
         }
+    }
+}
+
+/// Counts all `FlushRebroadcasts`-driven re-announce publishes (unicast +
+/// broadcast) so the tests can assert "M requests for a peer → one publish" by
+/// counting real handler invocations. `cfg(test)` only, zero production cost.
+#[cfg(test)]
+pub(crate) static REBROADCAST_PUBLISH_INVOCATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts only the broadcast re-announces (the wave branch). Lets the tests prove
+/// the hybrid: a single join stays at 0 (unicast); a wave increments it.
+/// `cfg(test)` only.
+#[cfg(test)]
+pub(crate) static REBROADCAST_BROADCAST_INVOCATIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Test-only: seed one `Active` room member so the real `RebroadcastPresence` /
+/// `FlushRebroadcasts` path can be driven on a started actor without the full
+/// JoinRoom + ActivateConnection flow. Populates the maps those handlers read.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct TestSeedActiveMember {
+    session: SessionId,
+    room: String,
+    user_id: String,
+    display_name: String,
+}
+
+#[cfg(test)]
+impl Handler<TestSeedActiveMember> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: TestSeedActiveMember, _ctx: &mut Self::Context) -> Self::Result {
+        self.session_room.insert(msg.session, msg.room.clone());
+        self.room_members
+            .entry(msg.room)
+            .or_default()
+            .push(RoomMemberInfo {
+                session: msg.session,
+                user_id: msg.user_id,
+                display_name: msg.display_name,
+                is_host: false,
+                end_on_host_leave: false,
+            });
+        self.connection_states
+            .insert(msg.session, ConnectionState::Active);
+        self.session_is_guest.insert(msg.session, false);
+    }
+}
+
+/// Test-only: drop all state for a session (as `leave_rooms`/`forget_session`
+/// would) so a test can prove the `FlushRebroadcasts` self-clear — a responder
+/// that left during the window produces no re-announce.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "()")]
+struct TestForgetMember {
+    session: SessionId,
+}
+
+#[cfg(test)]
+impl Handler<TestForgetMember> for ChatServer {
+    type Result = ();
+
+    fn handle(&mut self, msg: TestForgetMember, _ctx: &mut Self::Context) -> Self::Result {
+        if let Some(room) = self.session_room.remove(&msg.session) {
+            if let Some(members) = self.room_members.get_mut(&room) {
+                members.retain(|m| m.session != msg.session);
+            }
+        }
+        self.connection_states.remove(&msg.session);
+        self.session_is_guest.remove(&msg.session);
+    }
+}
+
+/// Test-only: report the coalescing state (`pending_rebroadcasts.len()`,
+/// `rebroadcast_coalesce_handle.is_some()`) so a test can assert dedup and that
+/// the flush drained everything, without reaching into private fields.
+#[cfg(test)]
+#[derive(ActixMessage)]
+#[rtype(result = "(usize, bool)")]
+struct TestRebroadcastState;
+
+#[cfg(test)]
+impl Handler<TestRebroadcastState> for ChatServer {
+    type Result = MessageResult<TestRebroadcastState>;
+
+    fn handle(&mut self, _msg: TestRebroadcastState, _ctx: &mut Self::Context) -> Self::Result {
+        MessageResult((
+            self.pending_rebroadcasts.len(),
+            self.rebroadcast_coalesce_handle.is_some(),
+        ))
     }
 }
 
@@ -2598,14 +2943,14 @@ impl Handler<RecomputeLayerHints> for ChatServer {
     }
 }
 
-/// Trailing-debounce flush for coalesced DEPARTURE-driven recomputes (#1203).
+/// Trailing-debounce flush for coalesced join/departure recomputes (#1203, #1288).
 ///
 /// Drains [`ChatServer::pending_recompute_rooms`] and runs ONE room-wide
-/// recompute per distinct room that saw a departure during the coalesce window,
-/// then clears the in-flight timer handle so the NEXT departure burst arms a
+/// recompute per distinct room that saw membership change during the coalesce
+/// window, then clears the in-flight timer handle so the NEXT burst arms a
 /// fresh trailing timer. Reusing the existing `RecomputeLayerHints { source:
 /// None }` room-wide branch keeps the union computation in one place; the only
-/// thing #1203 changes is WHEN/HOW OFTEN that branch runs for departures.
+/// thing the coalescer changes is WHEN/HOW OFTEN that branch runs.
 ///
 /// A room whose membership drained to empty during the window self-clears: the
 /// room-wide branch returns early when `room_members` has no entry, so a stale
@@ -3355,18 +3700,13 @@ impl Handler<JoinRoom> for ChatServer {
             // publisher. That can RAISE one or more sources' per-source unions
             // (e.g. a publisher previously suppressed to base because its only
             // receiver wanted base must now restore full for the new viewer).
-            // Recompute room-wide so each publisher gets a restore-eager hint.
-            // Routed through the actor (`do_send`) rather than computed inline to
-            // avoid borrowing `room_members` while the recompute mutates
-            // `layer_hint_state`; the new joiner is already in `room_members`
-            // above, so the recompute sees its (fail-open) demand. The joiner's
-            // own session has no debounce state yet, and it is a publisher of
-            // nothing until it sends media, so a `None` (room-wide) recompute is
-            // correct and idempotent.
-            ctx.address().do_send(RecomputeLayerHints {
-                room: room.clone(),
-                source: None,
-            });
+            // Issue #1288: coalesce join-driven recomputes through the same 300ms
+            // trailing window departures use (#1203). A burst of K joins within
+            // the window collapses into one room-wide recompute instead of K
+            // separate O(publishers × receivers) passes serialized on the actor.
+            // The joiner is already in `room_members` above, so when the timer
+            // fires the union includes its fail-open demand.
+            self.schedule_coalesced_recompute(&room, ctx);
         }
 
         // Clone the recipient so we can send existing member info directly to the new joiner
@@ -4077,10 +4417,12 @@ fn try_intercept_layer_preference(
 }
 
 /// Checks whether `msg` is a `PARTICIPANT_LIST_REQUEST` system event.
-/// If so, asks the local ChatServer (via `RebroadcastPresence`) to re-publish
-/// this session's own PARTICIPANT_JOINED addressed to the requesting joiner, so
-/// a cross-server joiner — whose NATS subscription was established after the
+/// If so, asks the local ChatServer (via `RebroadcastPresence`) to arm a
+/// coalesced re-announce of this session's own PARTICIPANT_JOINED, so a
+/// cross-server joiner — whose NATS subscription was established after the
 /// original deferred PARTICIPANT_JOINED was published — learns about this peer.
+/// The ChatServer re-announces once per coalescing window — unicast to the lone
+/// joiner, or broadcast for a wave — not once per request.
 ///
 /// `parsed` is the `PacketWrapper` decoded once per packet in the NATS loop.
 /// Returns `true` when intercepted (caller must `continue`); `false` otherwise.
@@ -4444,14 +4786,6 @@ fn handle_msg(
     // exclusively on this receiver's single NATS subscription task.
     let relay_state: Cell<DownlinkRelayState> = Cell::new(DownlinkRelayState::new());
 
-    // TEMPORARY instrumentation (#1486) — verifies the #1481 root cause on a live
-    // high-RTT WT receiver before we code the fix. Holds the epoch-now at which we
-    // last emitted the relief-staleness line for THIS session, so the log is
-    // rate-limited to ~once/sec/session and cannot flood the relay log. `0` (==
-    // never-logged) is safe: real epoch-now values are always `>= 1`. Remove this
-    // Cell together with the log block once #1481 is settled.
-    let last_relief_log_epoch: Cell<u64> = Cell::new(0);
-
     // --- #1219 Half 2: emit-DOWNLINK_CONGESTION handoff ---
     //
     // The forwarding closure is SYNCHRONOUS and runs on the relay's hottest path
@@ -4471,6 +4805,10 @@ fn handle_msg(
     // (moved into it); the loop keeps the other.
     let emit_downlink_congestion: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
     let emit_flag = Arc::clone(&emit_downlink_congestion);
+
+    // issue #630: room + session are stable for the forwarder's lifetime, so the
+    // self-subject is precomputed once here instead of re-allocating it per packet.
+    let self_subject = format!("room.{room}.{session}").replace(' ', "_");
 
     let forward = move |msg: async_nats::Message,
                         parsed: Option<&PacketWrapper>|
@@ -4543,7 +4881,7 @@ fn handle_msg(
         // client-sent CONGESTION/LAYER_HINT (anti-reflection) is a separate,
         // still-open concern tracked in #1119 and is orthogonal to delivery —
         // do not conflate the two here.
-        let subject_self = msg.subject == format!("room.{room}.{session}").replace(' ', "_").into();
+        let subject_self = msg.subject.as_str() == self_subject;
         // N.B. `session_id` inside the packet is partially attacker-controlled;
         // this field is only safe for self-echo suppression, not for identity verification.
         let inner_session_self = parsed
@@ -4563,16 +4901,32 @@ fn handle_msg(
             subject_self || inner_session_self
         };
         if drop_self_echo && !is_congestion && !is_layer_hint && !is_downlink_congestion {
+            // Count ONLY the #618 post-reconnect leak shape: the embedded inner
+            // session_id matched our OWN session, but the NATS subject did NOT
+            // (it pointed at a STALE/different session). A routine self-echo is
+            // EXCLUDED here because the relay stamps the inner session_id on
+            // publish (`session_id = session` at the publish path above), so an
+            // ordinary echo arrives with BOTH subject_self AND inner_session_self
+            // true — the `!subject_self` arm filters it out so the leak signal is
+            // not drowned by routine self-echo volume (#629).
+            if inner_session_self && !subject_self {
+                RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+                    .with_label_values(&[&room])
+                    .inc();
+            }
             return Ok(());
         }
 
-        // Unicast MEETING reply filter (see `RebroadcastPresence`): a
-        // PARTICIPANT_JOINED sent in reply to a PARTICIPANT_LIST_REQUEST is
-        // addressed to a single requester by publishing on that requester's
-        // per-session subject (`room.{room}.{N}`). Every session receives it via
-        // the room wildcard, so drop it unless it targets us. Broadcast MEETING
-        // events (PARTICIPANT_JOINED at activation, PARTICIPANT_LEFT, etc.) use
-        // the `room.{room}.system` subject and are left untouched.
+        // Unicast MEETING reply filter (presence info-leak boundary): a MEETING
+        // packet addressed to a single session via a per-session subject
+        // (`room.{room}.{N}`) — which every session receives via the room wildcard
+        // — is dropped unless it targets us, so only the addressed requester
+        // forwards it to its client. The single-join presence re-announce uses
+        // this per-session addressing (the flush unicasts when only one joiner
+        // asked), so this filter is on the live path — it keeps a single join at
+        // O(N) relay→client forwards instead of O(N²). Broadcast MEETING events
+        // (PARTICIPANT_JOINED at activation, the wave re-announce, PARTICIPANT_LEFT)
+        // use `room.{room}.system` and are left untouched so they reach everyone.
         if is_meeting && !subject_self {
             let targets_other_session = msg
                 .subject
@@ -4777,50 +5131,96 @@ fn handle_msg(
             };
 
             if is_video {
-                // ----- Viewport filter (#988): "is this SENDER wanted?" -----
+                // ----- #1436 kill switch for the #988 viewport filter -----
                 //
-                // Read the viewport set ONCE: derive both the drop decision and
-                // the current set size from a single guard so the debug log on
-                // the drop path costs no extra RwLock read (the drop path runs
-                // at near-full inbound VIDEO rate per receiver during a viewport
-                // collapse — exactly when this log matters most). A poisoned
-                // lock fails OPEN (forward); an unparseable source (`None`) also
-                // fails OPEN.
-                let (drop_video, viewport_len) = match source {
-                    Some(src) => desired_streams
-                        .read()
-                        .map(|st| (!st.ids.is_empty() && !st.ids.contains(&src), st.ids.len()))
-                        .unwrap_or((false, 0)),
-                    None => (false, 0),
-                };
-                if drop_video {
-                    // Intentional, viewport-driven drop — accounted on a
-                    // DEDICATED counter so it never pollutes the backpressure
-                    // (mailbox-full) drop metric / its dashboards & alerts.
-                    RELAY_VIEWPORT_FILTERED_TOTAL
+                // Read the kill-switch flag ONCE via the memoized OnceLock
+                // accessor (cheap atomic load on this hot path). When the
+                // filter is DISABLED, the entire viewport decision AND its
+                // accounting (the FILTERED / FORWARDED counters) are skipped —
+                // the counters intentionally do not run because the filter is
+                // off — and VIDEO falls straight through to the #989 layer
+                // filter below, dropping nothing on the viewport.
+                let viewport_enabled = crate::constants::viewport_filter_enabled();
+                if viewport_enabled {
+                    // #1437 invariant tripwire (defense-in-depth for the #988
+                    // is_video guard at line ~4903). We are inside `if is_video`,
+                    // so by construction `wire_media_kind == Ok(MediaKind::VIDEO)`
+                    // here and the branch below is DEAD on every real packet. It
+                    // exists only so that if a future refactor widens/moves the
+                    // `if is_video` guard and lets a non-VIDEO packet reach the
+                    // viewport drop-decision site, the counter trips (and
+                    // `debug_assert!` panics in debug builds) WITHOUT changing
+                    // forwarding behavior — observability only, no `return`, no
+                    // control-flow change. Cost on the happy path: one
+                    // already-known boolean re-check (`enum_value()` was computed
+                    // at line ~4879); no new lock, no allocation, no second
+                    // viewport-set read.
+                    let nonvideo_reached_drop_branch =
+                        crate::constants::nonvideo_reached_viewport_drop_branch(wire_media_kind);
+                    debug_assert!(
+                        !nonvideo_reached_drop_branch,
+                        "#1437: non-VIDEO packet reached viewport drop branch — #988 is_video guard regressed"
+                    );
+                    if nonvideo_reached_drop_branch {
+                        RELAY_VIEWPORT_NONVIDEO_AT_DROP_BRANCH_TOTAL
+                            .with_label_values(&[&room])
+                            .inc();
+                    }
+                    // ----- Viewport filter (#988): "is this SENDER wanted?" -----
+                    //
+                    // Read the viewport set ONCE: derive both the drop decision and
+                    // the current set size from a single guard so the debug log on
+                    // the drop path costs no extra RwLock read (the drop path runs
+                    // at near-full inbound VIDEO rate per receiver during a viewport
+                    // collapse — exactly when this log matters most). A poisoned
+                    // lock fails OPEN (forward); an unparseable source (`None`) also
+                    // fails OPEN.
+                    let (drop_video, viewport_len) = match source {
+                        // `viewport_should_drop`'s first arg is `true` ON PURPOSE: the
+                        // enclosing `if viewport_enabled` is the live #1436 kill switch,
+                        // so the filter is already known-enabled here. The helper's
+                        // `enabled` flag is exercised by its unit tests (forward-all when
+                        // false); the hot path never reaches it disabled.
+                        Some(_) => desired_streams
+                            .read()
+                            .map(|st| {
+                                (
+                                    crate::constants::viewport_should_drop(true, &st.ids, source),
+                                    st.ids.len(),
+                                )
+                            })
+                            .unwrap_or((false, 0)),
+                        None => (false, 0),
+                    };
+                    if drop_video {
+                        // Intentional, viewport-driven drop — accounted on a
+                        // DEDICATED counter so it never pollutes the backpressure
+                        // (mailbox-full) drop metric / its dashboards & alerts.
+                        RELAY_VIEWPORT_FILTERED_TOTAL
+                            .with_label_values(&[&room])
+                            .inc();
+                        // DEBUG (not trace) so a SCOPED `RUST_LOG=...chat_server=debug`
+                        // — not global trace — can reconstruct who-dropped-what-from-whom
+                        // for one room: receiver session, the SUBJECT-derived source
+                        // (#994: derived from the NATS subject, not the forgeable payload
+                        // session_id), and the current viewport set size (a collapse
+                        // toward 0/1 is the wrongly-dropping signature). Per-source
+                        // forensics live HERE, never in metric labels (cardinality).
+                        // `viewport_len` was captured from the single decision read
+                        // above — no second lock on the hot drop path.
+                        debug!(
+                            "Viewport drop: off-screen VIDEO from subject-derived source {:?} for receiver session {} in room {} (viewport set size {})",
+                            source, session, room, viewport_len
+                        );
+                        return Ok(());
+                    }
+                    // Forwarded VIDEO — the denominator complement of the filtered
+                    // counter (HCL #988). Mutually exclusive with the drop branch
+                    // above; together they cover every VIDEO packet at the filter.
+                    RELAY_VIEWPORT_FORWARDED_TOTAL
                         .with_label_values(&[&room])
                         .inc();
-                    // DEBUG (not trace) so a SCOPED `RUST_LOG=...chat_server=debug`
-                    // — not global trace — can reconstruct who-dropped-what-from-whom
-                    // for one room: receiver session, the SUBJECT-derived source
-                    // (#994: derived from the NATS subject, not the forgeable payload
-                    // session_id), and the current viewport set size (a collapse
-                    // toward 0/1 is the wrongly-dropping signature). Per-source
-                    // forensics live HERE, never in metric labels (cardinality).
-                    // `viewport_len` was captured from the single decision read
-                    // above — no second lock on the hot drop path.
-                    debug!(
-                        "Viewport drop: off-screen VIDEO from subject-derived source {:?} for receiver session {} in room {} (viewport set size {})",
-                        source, session, room, viewport_len
-                    );
-                    return Ok(());
                 }
-                // Forwarded VIDEO — the denominator complement of the filtered
-                // counter (HCL #988). Mutually exclusive with the drop branch
-                // above; together they cover every VIDEO packet at the filter.
-                RELAY_VIEWPORT_FORWARDED_TOTAL
-                    .with_label_values(&[&room])
-                    .inc();
             }
 
             // ----- Layer filter (#989): "which LAYER of a wanted sender?" -----
@@ -4939,45 +5339,6 @@ fn handle_msg(
         // at base-layer-only video indefinitely).
         let relief_epoch = downlink_congested_epoch.load(AtomicOrdering::Relaxed);
         let congested_now = downlink_epoch_is_active(relief_epoch, RECEIVER_DOWNLINK_RELIEF_WINDOW);
-
-        // --- TEMPORARY instrumentation (#1486) — REMOVE once #1481 is settled ---
-        //
-        // Confirms the #1481 root cause on a live high-RTT WT receiver: is the
-        // relief read seeing a STALE epoch (the relief-stamp window decaying
-        // between WT's clustered drop bursts → `now - epoch` routinely 2-10s while
-        // `Receiver-downlink overflow` warns still fire), or is the epoch never
-        // stamped at all (`relief_epoch == DOWNLINK_EPOCH_NEVER` despite overflows
-        // → a `stamp_downlink_epoch_if_congested` gating bug, not the freshness
-        // story)? We can't prove the runtime drop time-distribution from a static
-        // code trace, so we read it here.
-        //
-        // Only logged for receivers that have crossed congestion at least once
-        // (`relief_epoch != DOWNLINK_EPOCH_NEVER`) — a never-congested receiver
-        // would emit nothing useful and just flood the log. Rate-limited to
-        // ~once/sec/session via `last_relief_log_epoch`.
-        {
-            use crate::actors::session_logic::{
-                downlink_congested_epoch_now, DOWNLINK_EPOCH_NEVER,
-            };
-            if relief_epoch != DOWNLINK_EPOCH_NEVER {
-                let now = downlink_congested_epoch_now();
-                let last_logged = last_relief_log_epoch.get();
-                if last_logged == 0 || now.saturating_sub(last_logged) >= 1000 {
-                    last_relief_log_epoch.set(now);
-                    info!(
-                        "[#1486] downlink-relief read: session={} transport={} room={} \
-                         epoch={} now={} staleness_ms={} congested_now={}",
-                        session,
-                        transport,
-                        room,
-                        relief_epoch,
-                        now,
-                        now.saturating_sub(relief_epoch),
-                        congested_now,
-                    );
-                }
-            }
-        }
 
         // Edge-detect the episode so the metrics + the one-shot DOWNLINK_CONGESTION
         // emit each fire exactly once per congested episode. Running this on every
@@ -7407,6 +7768,223 @@ mod tests {
             1.0,
             "#1220: dropping a non-target CONGESTION must increment \
              relay_congestion_filtered_total exactly once"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    /// #618 (the leak) / #629 (this metric): a DIAGNOSTICS packet that arrives on
+    /// a STALE post-reconnect subject (subject session != our current session)
+    /// but carries our OWN session_id embedded must be dropped by the
+    /// inner-`session_id` self-skip (`inner_session_self`), and that drop must
+    /// increment `relay_inner_session_self_filtered_total{room}` exactly once.
+    /// This reproduces the 2026-05-08 production leak where a stale subscription
+    /// survived a reconnect and delivered self-DIAGNOSTICS back to the reporter.
+    ///
+    /// MUTATION PROOF: removing the `inner_session_self` operand from
+    /// `drop_self_echo` (so a non-self subject no longer triggers the self-skip)
+    /// forwards the DIAGNOSTICS packet -> `count` becomes 1, failing assert (a);
+    /// removing the `.inc()` inside the `if inner_session_self` guard makes the
+    /// metric delta 0.0, failing assert (b).
+    #[actix_rt::test]
+    async fn test_handle_msg_self_diagnostics_inner_session_dropped_and_metric_incremented() {
+        let room = "self-diag-inner-629";
+        let before = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver's CURRENT session is 8888. The packet arrives on a STALE
+        // subject keyed to an old session (1234) — what a subscription that
+        // survived a reconnect would deliver — but its embedded session_id is
+        // still 8888 (our own), exactly the #618 leak shape.
+        let (handler, _emit_downlink_congestion) = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            8888,
+            false,
+            "reporter-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            never_epoch(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.1234"),
+            make_packet_bytes_with_session(PacketType::DIAGNOSTICS, 8888),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "#618: self-DIAGNOSTICS on a STALE post-reconnect subject whose \
+             embedded session_id still equals our current session (8888) must \
+             be dropped by the inner-session self-skip, NOT forwarded"
+        );
+
+        let after = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            1.0,
+            "#629: the inner-session self-skip drop must increment \
+             relay_inner_session_self_filtered_total exactly once"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    /// #629: a PLAIN self-echo — a packet on the receiver's OWN subject with no
+    /// embedded session_id (inner session_id 0) — is dropped via `subject_self`,
+    /// NOT via the inner-`session_id` arm. The
+    /// `relay_inner_session_self_filtered_total` counter MUST NOT fire for it,
+    /// because #629 specifically wants to surface the post-reconnect inner-id
+    /// leak rate, not ordinary (expected, uninteresting) subject self-echoes.
+    ///
+    /// MUTATION PROOF: moving the `.inc()` OUTSIDE the `if inner_session_self`
+    /// guard (so it increments on every self-echo drop, including plain
+    /// `subject_self` echoes) makes this delta 1.0, failing assert (b).
+    #[actix_rt::test]
+    async fn test_handle_msg_inner_session_self_metric_not_incremented_for_plain_subject_echo() {
+        let room = "plain-echo-629";
+        let before = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver's session is 5555 and the packet arrives on its OWN subject
+        // (`room.{room}.5555`). The inner session_id stays 0, so
+        // `inner_session_self` is false and `subject_self` is true: the drop
+        // happens via the plain subject self-echo path, which must NOT touch the
+        // inner-session metric.
+        let (handler, _emit_downlink_congestion) = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            5555,
+            false,
+            "self-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            never_epoch(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.5555"),
+            make_packet_bytes(PacketType::MEDIA),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "a MEDIA packet on the receiver's own subject must be dropped as a \
+             plain subject_self echo"
+        );
+
+        let after = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            0.0,
+            "#629: a plain subject_self echo (inner session_id 0) must NOT \
+             increment relay_inner_session_self_filtered_total"
+        );
+
+        // Leave no residual series for the #996 GC guard / other tests.
+        crate::metrics::forget_room_metrics(room);
+    }
+
+    /// #629 over-count regression guard: an ORDINARY relay-stamped self-echo —
+    /// subject == our OWN subject AND inner session_id == our session — must NOT
+    /// increment `relay_inner_session_self_filtered_total`. The relay stamps
+    /// `session_id = session` on publish (the publish path stamps id when the
+    /// client sent 0), so a routine self-echo arrives with BOTH `subject_self`
+    /// and `inner_session_self` true. The increment guard's `!subject_self` arm
+    /// excludes it; only the #618 leak shape (inner-id match WITHOUT subject
+    /// match) is counted. Without this exclusion the leak signal would be
+    /// drowned by routine self-echo volume.
+    ///
+    /// MUTATION PROOF: reverting the guard from `if inner_session_self &&
+    /// !subject_self` back to `if inner_session_self` makes this stamped own-
+    /// subject echo increment the metric -> delta becomes 1.0 -> assert (b)
+    /// FAILS. That is exactly the over-count bug this guard closes.
+    #[actix_rt::test]
+    async fn test_handle_msg_inner_session_self_metric_not_incremented_for_stamped_own_subject_echo(
+    ) {
+        let room = "stamped-echo-629";
+        let before = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let actor = RecordingSession {
+            count: count.clone(),
+        }
+        .start();
+
+        // Receiver session 4242. This is the RELAY-STAMPED routine echo shape:
+        // the packet arrives on the receiver's OWN subject (`room.{room}.4242`)
+        // AND carries inner session_id 4242 (non-zero, as the publish stamp
+        // sets it). subject_self TRUE and inner_session_self TRUE — the routine
+        // echo the OLD `if inner_session_self` guard wrongly counted.
+        let (handler, _emit_downlink_congestion) = handle_msg(
+            actor.recipient(),
+            room.to_string(),
+            4242,
+            false,
+            "self-user".to_string(),
+            DesiredStreams::default(),
+            empty_layer_prefs(),
+            "websocket".to_string(),
+            never_epoch(),
+        );
+
+        let nats_msg = make_nats_message(
+            &format!("room.{room}.4242"),
+            make_packet_bytes_with_session(PacketType::MEDIA, 4242),
+        );
+        let parsed = parse_pw(&nats_msg);
+        handler(nats_msg, parsed.as_ref()).expect("handler should not return Err");
+
+        tokio::task::yield_now().await;
+        assert_eq!(
+            count.load(Ordering::Relaxed),
+            0,
+            "a relay-stamped own-subject self-echo must be dropped \
+             (subject_self || inner_session_self), NOT forwarded"
+        );
+
+        let after = RELAY_INNER_SESSION_SELF_FILTERED_TOTAL
+            .with_label_values(&[room])
+            .get();
+        assert_eq!(
+            after - before,
+            0.0,
+            "#629: an ordinary relay-stamped own-subject echo (subject_self AND \
+             inner_session_self both true) must NOT increment \
+             relay_inner_session_self_filtered_total — the `!subject_self` arm \
+             excludes it"
         );
 
         // Leave no residual series for the #996 GC guard / other tests.
@@ -14710,18 +15288,13 @@ mod tests {
         );
     }
 
-    /// #1203: a JOIN-style recompute (`RecomputeLayerHints { source: None }`
-    /// sent directly, exactly as the join site does) runs IMMEDIATELY — it is
-    /// NOT subject to the departure coalesce window. Contrast: a coalesced
-    /// departure schedule does NOT bump the recompute counter immediately.
-    ///
-    /// MUTATION PROOF: if someone routed the JOIN path through
-    /// `schedule_coalesced_recompute` (the thing #1203 deliberately does NOT do
-    /// for joins), the immediate-after-yield count would be 0, failing the
-    /// `== 1` assert.
+    /// A direct `RecomputeLayerHints` message (e.g. from a per-LAYER_PREFERENCE
+    /// recompute) runs IMMEDIATELY — it is NOT subject to the coalesce window.
+    /// Contrast: a coalesced schedule (used by joins #1288 and departures #1203)
+    /// does NOT bump the recompute counter immediately.
     #[actix_rt::test]
     #[serial]
-    async fn test_1203_join_recompute_is_immediate_not_coalesced() {
+    async fn test_1203_direct_recompute_is_immediate_not_coalesced() {
         use std::sync::atomic::Ordering as AtomicOrdering;
 
         let Some(nats_client) = connect_nats_or_skip().await else {
@@ -14750,11 +15323,10 @@ mod tests {
             "a coalesced departure must NOT recompute synchronously"
         );
 
-        // Now: a JOIN-style direct recompute. The join site uses
-        // `do_send(RecomputeLayerHints { room, source: None })`; we replicate
-        // that exact message. It must run immediately (no debounce wait).
+        // Now: a direct RecomputeLayerHints message (used by per-LAYER_PREFERENCE
+        // recomputes). It must run immediately (no debounce wait).
         chat.send(RecomputeLayerHints {
-            room: "join-immediate-room".to_string(),
+            room: "direct-recompute-room".to_string(),
             source: None,
         })
         .await
@@ -14763,9 +15335,302 @@ mod tests {
         assert_eq!(
             RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst),
             1,
-            "a JOIN-style recompute must run IMMEDIATELY (one invocation), not be \
-             held behind the departure coalesce window"
+            "a direct RecomputeLayerHints must run IMMEDIATELY, not be \
+             held behind the coalesce window"
         );
+    }
+
+    // These tests start a real `ChatServer` (NATS-backed) and drive the real
+    // `RebroadcastPresence` arm + `notify_later` timer + `FlushRebroadcasts`
+    // path. They count actual re-announce publishes via the test-only
+    // `REBROADCAST_PUBLISH_INVOCATIONS` (total) and `REBROADCAST_BROADCAST_INVOCATIONS`
+    // (broadcast branch only) counters. State is seeded with `TestSeedActiveMember`.
+
+    /// M PARTICIPANT_LIST_REQUESTs targeting the SAME peer collapse into one
+    /// re-announce, and a second peer adds exactly one more — one publish per
+    /// distinct responder, not per request. Also proves the hybrid: peer 8001 saw
+    /// ≥2 distinct requesters (a wave) → broadcast; peer 8002 saw one → unicast.
+    ///
+    /// MUTATION PROOF:
+    /// * Revert the coalescing (publish per request) → `(pending_len, armed)` is
+    ///   no longer `(1, true)` after 8001's 5 requests, and total publishes go 2→6.
+    /// * Revert the hybrid to broadcast-only → 8002 broadcasts too, so
+    ///   `REBROADCAST_BROADCAST_INVOCATIONS` is 2, not 1.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_rebroadcasts_coalesce_per_responder() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        REBROADCAST_BROADCAST_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-reannounce-coalesce";
+        // Two existing ACTIVE peers in the room (the responders).
+        for (session, name) in [(8001u64, "alice@x.com"), (8002u64, "bob@x.com")] {
+            chat.send(TestSeedActiveMember {
+                session,
+                room: room.to_string(),
+                user_id: name.to_string(),
+                display_name: name.to_string(),
+            })
+            .await
+            .expect("seed should succeed");
+        }
+
+        // A reconnection wave: 5 REMOTE joiners (sessions 9001..=9005, none tracked
+        // locally → `requester_is_local == false`) each ask peer 8001 to
+        // re-announce. All 5 arrive within the coalescing window → 8001 sees ≥2
+        // distinct requesters (a wave).
+        for requester in 9001u64..=9005 {
+            chat.send(RebroadcastPresence {
+                session: 8001,
+                requester_session: requester,
+            })
+            .await
+            .expect("message delivery should succeed");
+            let (pending_len, armed) = chat
+                .send(TestRebroadcastState)
+                .await
+                .expect("state probe should succeed");
+            assert_eq!(
+                pending_len, 1,
+                "requester {requester}: M requests for the SAME peer must dedup to ONE pending responder"
+            );
+            assert!(
+                armed,
+                "requester {requester}: the single trailing timer must be armed"
+            );
+        }
+
+        // A different peer (8002) is asked by exactly ONE remote joiner (an
+        // ordinary single join) → pending grows to 2, still ONE timer.
+        chat.send(RebroadcastPresence {
+            session: 8002,
+            requester_session: 9006,
+        })
+        .await
+        .expect("message delivery should succeed");
+        let (pending_len, armed) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            pending_len, 2,
+            "a distinct responder adds a second pending entry"
+        );
+        assert!(armed, "still exactly one trailing timer for the whole wave");
+
+        // Before the window elapses, NOTHING has gone out (debounced).
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "re-announces must be DEFERRED until the coalesce window elapses"
+        );
+
+        // Wait out the window + slack for the flush to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        // Exactly ONE publish per distinct responder (2), NOT one per request (6).
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            2,
+            "the 6 coalesced requests must yield exactly 2 publishes (one per peer)"
+        );
+        // Hybrid: only 8001 (≥2 distinct requesters) broadcast; 8002 (one
+        // requester) unicast → exactly ONE broadcast.
+        assert_eq!(
+            REBROADCAST_BROADCAST_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "only the wave responder (8001) may broadcast; the single-join \
+             responder (8002) must unicast"
+        );
+
+        // The flush drained the set and cleared the timer handle.
+        let (pending_after, armed_after) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(pending_after, 0, "flush must drain the pending set");
+        assert!(
+            !armed_after,
+            "flush must clear the in-flight timer so the next wave re-arms fresh"
+        );
+    }
+
+    /// An ordinary single join — one remote requester asks one existing peer —
+    /// must unicast the re-announce, not broadcast it (broadcasting fans a single
+    /// join out to ~N² relay→client forwards). The requester asks twice to prove a
+    /// repeat from the SAME requester does not count as a second distinct one.
+    ///
+    /// MUTATION PROOF: revert the hybrid (always broadcast) →
+    /// `REBROADCAST_BROADCAST_INVOCATIONS` becomes 1, failing the `== 0` assert.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_single_join_unicasts_not_broadcasts() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+        REBROADCAST_BROADCAST_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-reannounce-single";
+        chat.send(TestSeedActiveMember {
+            session: 8301,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        // One remote joiner asks — TWICE, to prove a repeat from the SAME
+        // requester does not count as a second distinct requester.
+        for _ in 0..2 {
+            chat.send(RebroadcastPresence {
+                session: 8301,
+                requester_session: 9301,
+            })
+            .await
+            .expect("message delivery should succeed");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            1,
+            "a single join must produce exactly one re-announce publish"
+        );
+        assert_eq!(
+            REBROADCAST_BROADCAST_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "a single-requester re-announce must UNICAST, never broadcast"
+        );
+    }
+
+    /// A request from a local requester (one this instance tracks) must NOT arm a
+    /// re-announce — the in-memory replay in JoinRoom already served it, so
+    /// single-server deployments stay zero-cost.
+    ///
+    /// MUTATION PROOF: drop the `requester_is_local` short-circuit → the pending
+    /// set arms (pending == 1, armed == true), failing both asserts.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_local_requester_does_not_arm() {
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "test-reannounce-local";
+        // Responder 8101 is active; requester 9101 is ALSO a tracked local session.
+        chat.send(TestSeedActiveMember {
+            session: 8101,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+        chat.send(TestSeedActiveMember {
+            session: 9101,
+            room: room.to_string(),
+            user_id: "carol@x.com".to_string(),
+            display_name: "carol@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        chat.send(RebroadcastPresence {
+            session: 8101,
+            requester_session: 9101, // local (tracked in connection_states)
+        })
+        .await
+        .expect("message delivery should succeed");
+
+        let (pending, armed) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(pending, 0, "a local requester must NOT arm a re-announce");
+        assert!(
+            !armed,
+            "no trailing timer should be armed for a local requester"
+        );
+    }
+
+    /// A responder that leaves during the coalescing window produces no
+    /// re-announce — the flush re-resolves identity at fire time and self-clears a
+    /// departed peer.
+    ///
+    /// MUTATION PROOF: snapshot identity at arm time instead of re-resolving →
+    /// this would publish for a left peer (count == 1), failing.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_responder_left_during_window_no_broadcast() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        REBROADCAST_PUBLISH_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        let room = "test-reannounce-left";
+        chat.send(TestSeedActiveMember {
+            session: 8201,
+            room: room.to_string(),
+            user_id: "alice@x.com".to_string(),
+            display_name: "alice@x.com".to_string(),
+        })
+        .await
+        .expect("seed should succeed");
+
+        // A remote joiner arms the re-announce…
+        chat.send(RebroadcastPresence {
+            session: 8201,
+            requester_session: 9201,
+        })
+        .await
+        .expect("message delivery should succeed");
+
+        // …but the responder leaves before the window fires.
+        chat.send(TestForgetMember { session: 8201 })
+            .await
+            .expect("forget should succeed");
+
+        tokio::time::sleep(std::time::Duration::from_millis(
+            PARTICIPANT_REBROADCAST_COALESCE_MS + 250,
+        ))
+        .await;
+
+        assert_eq!(
+            REBROADCAST_PUBLISH_INVOCATIONS.load(AtomicOrdering::SeqCst),
+            0,
+            "a responder that left during the window must NOT be broadcast"
+        );
+        let (pending_after, armed_after) = chat
+            .send(TestRebroadcastState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(pending_after, 0, "flush must still drain the pending set");
+        assert!(!armed_after, "flush must clear the in-flight timer");
     }
 
     // --- Transfer-host: in-memory presence-map logic -----------------
@@ -14845,6 +15710,41 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_user_has_remaining_session_gates_participant_left_mark() {
+        // The per-participant PARTICIPANT_LEFT DB mark-left (issue #1551) is
+        // suppressed when the departing user still has another live session in
+        // the room. This pins the `user_still_present` decision in
+        // `leave_rooms`: with the departing session already removed from the
+        // slice, the predicate answers "is this user still here?".
+
+        // alice has a second tab still present after one of her sessions leaves
+        // → still present → SUPPRESS the mark-left (don't drop her from count).
+        let after_alice_tab_leaves = vec![
+            member(2, "alice@example.com", false), // alice's remaining tab
+            member(3, "bob@example.com", false),
+        ];
+        assert!(
+            user_has_remaining_session(&after_alice_tab_leaves, "alice@example.com"),
+            "a user with another live session must be treated as still present"
+        );
+
+        // alice's LAST session leaves → no alice session remains → PUBLISH the
+        // mark-left (she really is gone now).
+        let after_alice_last_leaves = vec![member(3, "bob@example.com", false)];
+        assert!(
+            !user_has_remaining_session(&after_alice_last_leaves, "alice@example.com"),
+            "a user with no remaining session must be eligible for mark-left"
+        );
+
+        // An empty room (the last member left) → nobody remains → eligible.
+        let empty: Vec<RoomMemberInfo> = vec![];
+        assert!(
+            !user_has_remaining_session(&empty, "alice@example.com"),
+            "an empty room leaves no remaining session for the departing user"
+        );
+    }
+
     /// #1235: the #1203 departure coalescing is exercised through the REAL
     /// departure handlers, not just the `schedule_coalesced_recompute` primitive.
     ///
@@ -14869,12 +15769,12 @@ mod tests {
     ///   => 2 distinct affected rooms => exactly 2 recomputes total, NOT one per
     ///      departure (which would be 3).
     ///
-    /// The counter is reset AFTER all joins/activations complete. This is load-
-    /// bearing: the JoinRoom handler's synchronous body does
-    /// `do_send(RecomputeLayerHints { source: None })` (the #1108 Stage-3 join
-    /// restore), so each join bumps the counter; resetting after a drain probe
-    /// isolates the count to the departures under test. `ActivateConnection` on a
-    /// session with a fresh, unshared instance_id is an eviction no-op
+    /// The counter is reset AFTER all joins/activations complete and the join-
+    /// driven coalesce timer has flushed. This is load-bearing: the JoinRoom
+    /// handler schedules a coalesced recompute (#1288), so the flush fires the
+    /// counter; waiting past the window + resetting after a drain probe isolates
+    /// the count to the departures under test. `ActivateConnection` on a session
+    /// with a fresh, unshared instance_id is an eviction no-op
     /// (`instance_index.get(iid)` is None on first activation) so it schedules no
     /// recompute of its own.
     ///
@@ -14972,30 +15872,27 @@ mod tests {
             .await
             .expect("ActivateConnection should succeed");
 
-        // Drain every queued JoinRoom-restore recompute (one per non-observer
-        // join) and the ActivateConnection work by round-tripping a state probe,
-        // THEN reset the counter so it reflects ONLY the departures under test.
-        let _ = chat
-            .send(TestCoalesceState)
-            .await
-            .expect("state probe should succeed");
-        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
-
-        // Sanity: no departure has happened yet, and nothing should be pending /
-        // armed from the join phase (joins use immediate do_send, not the
-        // coalesce timer).
+        // After the join phase, the coalesce set contains the rooms that were
+        // joined (#1288: joins now route through the coalescer too). Flush the
+        // pending join-driven recomputes before testing the departure burst so
+        // the departure assertions start from a clean baseline.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 50,
+        ))
+        .await;
         let (pending_pre, armed_pre) = chat
             .send(TestCoalesceState)
             .await
             .expect("state probe should succeed");
         assert_eq!(
             pending_pre, 0,
-            "joins must not leave anything in the departure coalesce set"
+            "join-driven coalesce timer should have flushed by now"
         );
-        assert!(
-            !armed_pre,
-            "joins must not arm the departure coalesce timer"
-        );
+        assert!(!armed_pre, "coalesce timer should not be armed after flush");
+
+        // Reset the counter AFTER the join-driven flush has fired (it increments
+        // the counter). This ensures the count reflects ONLY departures under test.
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
 
         // --- Drive the departure burst through the REAL handlers. ---
         // Room A, departure 1: explicit Leave -> leave_rooms. A2 + A3 remain, so
@@ -15090,6 +15987,138 @@ mod tests {
         );
     }
 
+    /// #1288: a burst of K joins into one room produces exactly ONE coalesced
+    /// recompute (not K immediate recomputes). This is the acceptance criterion
+    /// for issue #1288.
+    ///
+    /// MUTATION PROOF: revert the join site in `handle(JoinRoom)` from
+    /// `self.schedule_coalesced_recompute(&room, ctx)` back to the old
+    /// `ctx.address().do_send(RecomputeLayerHints { source: None, room })`
+    /// and this test FAILS: `invocations_before_window` becomes 5 (not 0)
+    /// because each join fires an immediate recompute instead of deferring.
+    #[actix_rt::test]
+    #[serial]
+    async fn test_1288_join_burst_coalesces_recomputes() {
+        use std::sync::atomic::Ordering as AtomicOrdering;
+
+        let Some(nats_client) = connect_nats_or_skip().await else {
+            return;
+        };
+        let chat = ChatServer::new(nats_client).await.start();
+
+        let room = "i1288-join-coalesce-room".to_string();
+
+        let j1 = (1_288_001u64, "i1288-j1");
+        let j2 = (1_288_002u64, "i1288-j2");
+        let j3 = (1_288_003u64, "i1288-j3");
+        let j4 = (1_288_004u64, "i1288-j4");
+        let j5 = (1_288_005u64, "i1288-j5");
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        async fn join_member(
+            chat: &Addr<ChatServer>,
+            session: SessionId,
+            instance_id: &str,
+            room: &str,
+        ) {
+            let dummy = DummySession.start();
+            chat.send(Connect {
+                id: session,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+            chat.send(JoinRoom {
+                session,
+                room: room.to_string(),
+                user_id: format!("{instance_id}@example.com"),
+                display_name: instance_id.to_string(),
+                is_guest: false,
+                observer: false,
+                instance_id: Some(instance_id.to_string()),
+                is_host: false,
+                end_on_host_leave: false,
+                transport: "websocket".to_string(),
+                downlink_congested_epoch: never_epoch(),
+            })
+            .await
+            .expect("JoinRoom delivery should succeed")
+            .expect("JoinRoom should return Ok");
+        }
+
+        // Reset the global counter before the join burst.
+        RECOMPUTE_LAYER_HINTS_INVOCATIONS.store(0, AtomicOrdering::SeqCst);
+
+        // --- Drive a burst of 5 joins into the same room. ---
+        join_member(&chat, j1.0, j1.1, &room).await;
+        join_member(&chat, j2.0, j2.1, &room).await;
+        join_member(&chat, j3.0, j3.1, &room).await;
+        join_member(&chat, j4.0, j4.1, &room).await;
+        join_member(&chat, j5.0, j5.1, &room).await;
+
+        // Round-trip a state probe to drain all queued JoinRoom messages.
+        let (pending_after_burst, armed_after_burst) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+
+        // BEFORE the coalesce window elapses: NO recompute has run yet.
+        // This is the assertion that FAILS if the join site is reverted to
+        // an immediate `do_send(RecomputeLayerHints { ... })`.
+        let invocations_before_window =
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            invocations_before_window, 0,
+            "join-driven recomputes must be DEFERRED behind the coalesce window — \
+             a non-zero count means a join fired an immediate recompute (revert of #1288)"
+        );
+
+        // The room is pending and the timer is armed.
+        assert_eq!(
+            pending_after_burst, 1,
+            "five joins into one room => exactly one pending room in the coalesce set"
+        );
+        assert!(
+            armed_after_burst,
+            "the join burst must arm exactly one trailing coalesce timer"
+        );
+
+        // Wait out the coalesce window + slack for the flush to fire.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 250,
+        ))
+        .await;
+
+        // Exactly ONE recompute fires (not 5). This directly asserts #1288's
+        // acceptance criterion: "a burst of K joins produces ≤ a small constant
+        // number of recomputes, not K."
+        let invocations_after_window =
+            RECOMPUTE_LAYER_HINTS_INVOCATIONS.load(AtomicOrdering::SeqCst);
+        assert_eq!(
+            invocations_after_window, 1,
+            "five joins into one room must yield exactly ONE coalesced recompute, not five"
+        );
+
+        // The flush drained the pending set and cleared the timer.
+        let (pending_final, armed_final) = chat
+            .send(TestCoalesceState)
+            .await
+            .expect("state probe should succeed");
+        assert_eq!(
+            pending_final, 0,
+            "the flush must drain the join coalesce set"
+        );
+        assert!(!armed_final, "the flush must clear the timer handle");
+    }
+
     /// #1118 N1: a downgrade arms exactly ONE suppress-lazy re-check timer per
     /// `(source, kind)`, and restoring demand CANCELS it — so rapid
     /// drop→restore→drop churn cannot accumulate orphaned timers.
@@ -15173,7 +16202,14 @@ mod tests {
         join_member(&chat, publisher, "i1118n1-pub", &room).await;
         join_member(&chat, receiver, "i1118n1-rcv", &room).await;
 
-        // Drain the JoinRoom-restore recomputes (fail-open, no timers armed).
+        // Wait out the join-driven coalesce window (#1288) so the join recomputes
+        // fire before the churn phase begins. Without this, the coalesced join flush
+        // fires mid-churn and increments RECOMPUTE_LAYER_HINTS_INVOCATIONS, causing
+        // the "no orphan" assertion at the end to see a non-zero count.
+        tokio::time::sleep(std::time::Duration::from_millis(
+            LAYER_HINT_RECOMPUTE_COALESCE_MS + 50,
+        ))
+        .await;
         let _ = chat
             .send(TestCoalesceState)
             .await

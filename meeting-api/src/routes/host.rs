@@ -31,6 +31,7 @@ use videocall_meeting_types::{
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
+use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
 use crate::state::AppState;
 
@@ -247,6 +248,16 @@ pub async fn kick_participant(
             tracing::error!("NATS publish failed for PARTICIPANT_KICKED in room {meeting_id}: {e}");
             AppError::internal("failed to broadcast kick event")
         })?;
+
+    // Live homepage-feed nudge (issue #1081): a kick removes a present
+    // participant (status='kicked'), dropping the count the feed shows.
+    feed_events::publish_feed_change(
+        state.nats.as_ref(),
+        &state.feed_tx,
+        FeedChange::new(meeting_id.clone(), FeedChangeReason::ParticipantLeft),
+    )
+    .await;
+
     Ok(Json(APIResponse::ok(())))
 }
 

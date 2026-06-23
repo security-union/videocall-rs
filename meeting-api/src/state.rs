@@ -47,6 +47,13 @@ pub struct AppState {
     pub cookie_secure: bool,
     /// NATS client for publishing meeting events. `None` when `NATS_URL` is not configured.
     pub nats: Option<async_nats::Client>,
+    /// Per-process broadcast sender for live homepage-feed change nudges
+    /// (issue #1081). Mutation points publish a [`crate::feed_events::FeedChange`]
+    /// (cross-instance via NATS [`crate::feed_events::FEED_CHANGED_SUBJECT`], or
+    /// directly into this sender when NATS is absent); the SSE handler
+    /// [`crate::routes::feed_stream`] subscribes per connection. See
+    /// [`crate::feed_events`] for the full multi-instance fan-out design.
+    pub feed_tx: tokio::sync::broadcast::Sender<crate::feed_events::FeedChange>,
     /// Internal URLs for fetching version info from peer services.
     pub service_version_urls: Vec<String>,
     /// Shared HTTP client for outbound requests (e.g. version fan-out, SearchV2 push).
@@ -71,7 +78,12 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(db: PgPool, config: &Config, nats: Option<async_nats::Client>) -> Self {
+    pub fn new(
+        db: PgPool,
+        config: &Config,
+        nats: Option<async_nats::Client>,
+        feed_tx: tokio::sync::broadcast::Sender<crate::feed_events::FeedChange>,
+    ) -> Self {
         let jwks_cache = config
             .oauth
             .as_ref()
@@ -100,6 +112,7 @@ impl AppState {
             cookie_name: config.cookie_name.clone(),
             cookie_secure: config.cookie_secure,
             nats,
+            feed_tx,
             service_version_urls: config.service_version_urls.clone(),
             http_client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(3))

@@ -12,6 +12,7 @@ pub mod connection_quality_indicator;
 pub mod decode_budget;
 pub mod decode_budget_banner;
 pub mod decode_budget_inject;
+pub mod decode_paused_pill;
 pub mod density;
 pub mod device_selector;
 pub mod device_settings_modal;

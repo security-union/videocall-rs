@@ -19,10 +19,12 @@
 use crate::components::decode_budget::{
     decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
     is_sole_real_tile, merge_pinned_decode, merge_user_requested_decode, partition_camera_tiles,
-    promote_pinned_into_decoded, promote_requested_into_decoded, BudgetSample, BudgetState,
-    BudgetStep, MIN_CAP,
+    presenter_cap_ceiling, presenter_extra_shed_pressure, promote_pinned_into_decoded,
+    promote_requested_into_decoded, should_clear_force_decode_on_override_change, BudgetSample,
+    BudgetState, BudgetStep, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
+use crate::components::decode_paused_pill::DecodePausedPill;
 use crate::components::pre_join_preview::PreviewEngine;
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
@@ -90,8 +92,11 @@ use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
 
 /// Minimum width (px) a drawer can be dragged to. Below this the panel chrome
-/// (headers, controls) stops being usable.
-const DRAWER_MIN_WIDTH: f64 = 240.0;
+/// (headers, controls) stops being usable. The floor is driven by the
+/// connection-manager section's Progress `.status-item` row (a `.progress-container`
+/// with min-width 120px plus its "Progress:" label) — see issue 1482; 300px keeps
+/// that row from overflowing inside the section/sidebar padding chrome.
+const DRAWER_MIN_WIDTH: f64 = 300.0;
 /// Absolute maximum drawer width (px). The per-side cap is the smaller of this
 /// and 50% of the viewport (see `max_for_side` in the render body).
 const DRAWER_MAX_ABS: f64 = 720.0;
@@ -513,6 +518,26 @@ pub(crate) fn classify_settings_deep_link(section: Option<&str>) -> SettingsDeep
     }
 }
 
+/// Read the device capability score the console-log preamble already benchmarked
+/// and stashed on `window.__videocall_capability_score` (issue #1558).
+///
+/// This is a cheap JS property read — it does NOT re-run the 100 ms capability
+/// benchmark (`videocall_capability_score()` does, and must never be called on
+/// the ~1 Hz budget loop). Returns `None` when the value is absent or not a
+/// finite non-negative number, in which case the protective-mode low-cap trigger
+/// stays conservatively off.
+fn read_cached_capability_score() -> Option<u32> {
+    let window = web_sys::window()?;
+    let val =
+        js_sys::Reflect::get(&window, &JsValue::from_str("__videocall_capability_score")).ok()?;
+    let score = val.as_f64()?;
+    if score.is_finite() && score >= 0.0 {
+        Some(score as u32)
+    } else {
+        None
+    }
+}
+
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
@@ -679,6 +704,21 @@ pub fn AttendantsComponent(
     // it with the live `total_tiles` on the first frame, after which the loop
     // seeds/tracks the cap up to it.
     let mut decode_budget_natural = use_signal(|| MIN_CAP);
+    // Issue #1558: protective-mode report. The decode-budget control loop is the
+    // sole WRITER (it latches protective mode and computes the encoder send-layer
+    // self-shed ceiling); `Host` is the consumer (it applies the ceiling to the
+    // local encoders, composed with the user's persisted preference). Provided as
+    // a context below so the child `Host` can read it.
+    let mut protective_mode_report = use_signal(crate::context::ProtectiveModeReport::default);
+    // Shared "is the decode-budget banner ACTUALLY on screen right now" flag,
+    // owned here so the banner (writer) and the persistent paused pill (reader)
+    // — sibling children below — agree on a single source of truth. The banner
+    // publishes its TRUE effective visibility (`damper_visible && !dismissed &&
+    // avatar_count > 0`) into this; the pill reads it to stay exactly mutually
+    // exclusive with the banner, including after the user DISMISSES the banner
+    // while tiles are still paused (#1142 Gap 1) — a case the old shadow-damper
+    // proxy could not observe.
+    let banner_on_screen = use_signal(|| false);
     // Device-class decode-tile ceiling (issue #1286 / #1289). Computed ONCE per
     // mount (it depends only on the platform + core count, neither of which
     // changes within a session) and reused by BOTH `effective_cap` call sites
@@ -2335,6 +2375,9 @@ pub fn AttendantsComponent(
 
     // Provide contexts for child components
     use_context_provider(|| client.clone());
+    // Issue #1558: publish the protective-mode report so `Host` can actuate the
+    // LOCAL encoder send-layer self-shed (stage 3).
+    use_context_provider(|| crate::context::ProtectiveModeCtx(protective_mode_report));
     // Provide the host set so peer-list rows and video tiles render a host
     // indicator for the current host.
     use_context_provider(|| HostSetCtx(host_set_signal));
@@ -2606,12 +2649,21 @@ pub fn AttendantsComponent(
     //     session (a machine that demonstrated it can struggle stays in
     //     conservative adaptive mode). It is reset on a Fixed -> Auto transition.
     let mut decode_budget_task: Signal<Option<dioxus_core::Task>> = use_signal(|| None);
+    let client_for_budget = client.clone();
     use_effect(move || {
+        let client_for_budget = client_for_budget.clone();
         let task = spawn(async move {
+            let client_for_budget = client_for_budget.clone();
             use crate::components::decode_budget::{
-                median_render_fps, non_distress_growth_qualifying, recovery_qualifying,
-                severe_label, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
+                cascade_action, decide_step_with_median, in_distress, lower_layer_cap,
+                median_render_fps, next_layer_drop_ms, non_distress_growth_allowed,
+                non_distress_growth_qualifying, protective_emergency_cap,
+                protective_encoder_layer_ceiling, re_arm_cascade_after_recovery,
+                recovery_qualifying, settle_window_elapsed, severe_label, suppress_growth_step,
+                tick_protective_mode, CascadeAction, DistressSignals, ProtectiveModeState,
+                ProtectiveTransition, STEP_UP_COOLDOWN_MS, SUSTAIN_SAMPLES,
             };
+            use crate::context::ProtectiveModeReport;
             use videocall_diagnostics::{now_ms, MetricValue};
 
             /// Rolling window length (~5 s at 1 Hz). Must be >= SUSTAIN_SAMPLES so
@@ -2623,6 +2675,30 @@ pub fn AttendantsComponent(
             let mut samples: Vec<BudgetSample> = Vec::with_capacity(WINDOW);
             // Sum of long-task durations observed in the *current* (open) bucket.
             let mut longtask_bucket_ms: f64 = 0.0;
+            // Issue #1558: MAX per-peer `audio_buffer_ms` observed in the current
+            // (open) bucket, from "neteq" bus events. `None` until the first
+            // reading arrives; reset on each fps tick (bucket close). Feeds the
+            // protective-mode audio-distress + emergency triggers.
+            let mut audio_buffer_bucket_ms_max: Option<f64> = None;
+            // Issue #1558: the most recent closed-bucket audio-buffer max, carried
+            // across ticks so the per-tick distress predicate has a value even on
+            // ticks where no fresh neteq event arrived this second.
+            let mut last_audio_buffer_ms_max: Option<f64> = None;
+            // Issue #1558: latched protective-mode state, owned by THIS loop across
+            // ticks (mirrors how the loop owns `BudgetState`). Drives the encoder
+            // self-shed + emergency stages on top of the #1557 cascade.
+            let mut protective = ProtectiveModeState::default();
+            // Issue #1558: device capability score, read ONCE from the cached value
+            // the console-log preamble stashed on `window.__videocall_capability_score`
+            // (a benchmark already run at page load). We do NOT re-run the 100 ms
+            // benchmark on this hot loop. `None` if the value is absent/unreadable —
+            // the low-cap+crowded trigger then never fires (conservative).
+            let cap_score: Option<u32> = read_cached_capability_score();
+            // Issue #1558: escalating protective severity counter — how many
+            // consecutive ticks protective mode has been active AND still at the
+            // cascade floor. Drives the encoder self-shed from 2→1 layers. Reset to
+            // 0 whenever protective mode is inactive or the cascade leaves floor.
+            let mut protective_severity: u32 = 0;
             // #1286: is the Long Tasks API available on THIS browser at all?
             // Computed ONCE — it cannot change within a session. On WebKit
             // (desktop Safari + ALL iOS browsers) the `"longtask"`
@@ -2652,12 +2728,57 @@ pub fn AttendantsComponent(
                 cap: *decode_budget_cap.peek(),
                 last_step_ms: 0.0,
                 direction_hold: 0,
+                // #1557: cascade state starts clean on loop init. NOTE: this loop is
+                // built ONCE (use_effect) and persists across reconnects — it is NOT
+                // rebuilt per call session, and an in-place `client.connect()` reconnect
+                // does not remount this component. So this initializer alone does NOT
+                // protect against settle/at-floor leaking across a reconnect; that is
+                // handled by the SESSION-RESET re-arm below (peer count collapsing to
+                // MIN_CAP on `clear_all_peers`), which fires on BOTH WT and WS.
+                last_layer_drop_ms: 0.0,
+                layers_at_floor: false,
             };
             // Tracks the last override we acted on so we can detect a transition
             // back to Auto and cleanly re-seed `state` from the live cap.
             let mut last_override = *decode_budget_override.peek();
+            // #1557: tracks the previous live tile count so the loop can detect a
+            // SESSION-RESET edge (peer count collapsing to the MIN_CAP floor). On a
+            // reconnect the client clears all peers (`clear_all_peers` runs on
+            // ConnectionState::Failed, transport-agnostic), so `decode_budget_natural`
+            // collapses to MIN_CAP and peers re-join FRESH at top layer; we re-arm the
+            // cascade on that edge so stale at-floor/settle timing cannot leak across
+            // the reconnect. Seeded from the live count so a session that starts with
+            // peers already present does not spuriously fire on the first tick.
+            let mut prev_natural = *decode_budget_natural.peek();
 
             while let Ok(evt) = rx.recv().await {
+                // Issue #1558: the protective-mode predicate needs a per-peer
+                // audio-buffer signal. The NetEQ audio decoder broadcasts
+                // `audio_buffer_ms` on the SAME diagnostics bus, under subsystem
+                // "neteq" (see neteq_audio_decoder::emit_buffer_metrics). We
+                // observe it here WITHOUT a new control loop or refactor: track
+                // the MAX buffer seen across peers in the current open bucket
+                // (reset on each fps tick, exactly like the longtask bucket). A
+                // "neteq" event never closes a bucket — only a render-fps event
+                // does — so this just feeds the audio sub-signal.
+                if evt.subsystem == "neteq" {
+                    for m in &evt.metrics {
+                        if m.name == "audio_buffer_ms" {
+                            // The decoder emits this as a u64 ms value.
+                            let buf = match &m.value {
+                                MetricValue::U64(v) => Some(*v as f64),
+                                MetricValue::F64(v) => Some(*v),
+                                _ => None,
+                            };
+                            if let Some(buf) = buf {
+                                audio_buffer_bucket_ms_max = Some(
+                                    audio_buffer_bucket_ms_max.map_or(buf, |m: f64| m.max(buf)),
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if evt.subsystem != "client_perf" {
                     continue;
                 }
@@ -2706,6 +2827,14 @@ pub fn AttendantsComponent(
                     let overflow = samples.len() - WINDOW;
                     samples.drain(0..overflow);
                 }
+                // Issue #1558: close the audio-buffer bucket. Carry the last-seen
+                // max forward when this second produced no fresh neteq reading, so
+                // the distress predicate has a value on every tick. Reset the open
+                // bucket for the next second.
+                if audio_buffer_bucket_ms_max.is_some() {
+                    last_audio_buffer_ms_max = audio_buffer_bucket_ms_max;
+                }
+                audio_buffer_bucket_ms_max = None;
 
                 // ---- Override handling (DECISION: hard override) ----
                 let current_override = *decode_budget_override.peek();
@@ -2769,6 +2898,12 @@ pub fn AttendantsComponent(
                             cap: *decode_budget_cap.peek(),
                             last_step_ms: now_ms() as f64,
                             direction_hold: 0,
+                            // #1557: reset cascade state on the Fixed->Auto resume
+                            // so settle timing does not leak across the override
+                            // transition (no phantom escalation to PauseTiles on
+                            // the first re-pressured tick after resuming Auto).
+                            last_layer_drop_ms: 0.0,
+                            layers_at_floor: false,
                         };
                         // Loop-local hygiene: re-seed BudgetState so the loop
                         // resumes cleanly without a phantom step. The pressured
@@ -2813,7 +2948,219 @@ pub fn AttendantsComponent(
 
                 // ---- Auto path ----
                 let now = now_ms() as f64;
+
+                // #1557 reconnect re-arm: the budget loop is built ONCE (use_effect)
+                // and lives across reconnects — it is NOT rebuilt per call session, and
+                // the in-place `client.connect()` reconnect does NOT remount this
+                // component. So `state` (incl. `layers_at_floor` / `last_layer_drop_ms`)
+                // would otherwise PERSIST across a reconnect. On a reconnect the client
+                // clears all peers, so `natural` collapses to the MIN_CAP floor and the
+                // peers re-join fresh at top layer. Re-arm the cascade on that collapse
+                // edge — `re_arm_cascade_after_recovery` clears `layers_at_floor` and
+                // re-anchors `last_layer_drop_ms = now` (the SAME reset used by the Up
+                // recovery arm) — so the next Down edge after re-join re-enters at
+                // LowerLayer instead of routing straight to PauseTiles on stale at-floor
+                // state. This is transport-agnostic: `clear_all_peers` runs on
+                // ConnectionState::Failed for BOTH WebTransport and WebSocket. The same
+                // edge also fires when the LAST peer legitimately leaves — which is
+                // equally a correct moment to re-arm (no peers => nothing pressured =>
+                // the cascade should be clean for the next arrival).
+                if natural <= MIN_CAP && prev_natural > MIN_CAP {
+                    re_arm_cascade_after_recovery(&mut state, now);
+                    // Issue #1558: reset protective mode on the SAME session-reset
+                    // edge as the #1557 cascade re-arm (transport-agnostic — fires
+                    // on both WT and WS reconnect, and when the last peer leaves).
+                    // Clear the latch, severity, and the carried audio reading so a
+                    // fresh session starts un-protected with no stale encoder shed,
+                    // and publish the cleared report so `Host` restores the user's
+                    // encoder ceiling immediately.
+                    protective = ProtectiveModeState::default();
+                    protective_severity = 0;
+                    last_audio_buffer_ms_max = None;
+                    audio_buffer_bucket_ms_max = None;
+                    let cleared = ProtectiveModeReport::default();
+                    if *protective_mode_report.peek() != cleared {
+                        protective_mode_report.set(cleared);
+                    }
+                }
+                prev_natural = natural;
+
                 let pressured = *decode_budget_pressured.peek();
+                // Presenter-aware shedding (issue #1559): is the LOCAL user
+                // screen-sharing right now? Read every tick so the bias appears
+                // on share-start and vanishes on share-stop with no leaked state.
+                // `is_sharing()` is true only for StreamReady/Active (the same
+                // states that drive the screen ENCODER), so the extra shedding is
+                // active exactly while the encoder is competing for CPU.
+                let sharing = screen_share_state.peek().is_sharing();
+
+                // ---- Issue #1558: protective mode (audio-first, speaker-priority) ----
+                //
+                // A THIN layer composed on top of the #1557 cascade, driven off
+                // this SAME 1 Hz Auto tick (NOT a second loop). Each tick we build
+                // the broader distress predicate, advance the latched protective
+                // state with asymmetric hysteresis, and — when active — publish the
+                // LOCAL encoder send-layer self-shed ceiling (stage 3, applied by
+                // `Host`) and prime the emergency decode-cap clamp (stage 4, applied
+                // at the end of this tick). The cascade (stages 1-2: layers→pause)
+                // is UNCHANGED below; protective mode never reimplements it.
+                let median_for_distress = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                let longtask_for_distress = if samples.len() >= SUSTAIN_SAMPLES {
+                    // Sustained-window longtask: the MIN across the window (every
+                    // sample must be heavy for sustained saturation). A `None`
+                    // (WebKit/iOS) in the window ⇒ `None` (cannot confirm), exactly
+                    // like `decide_step`'s conservative handling.
+                    let window = &samples[samples.len() - SUSTAIN_SAMPLES..];
+                    window
+                        .iter()
+                        .map(|s| s.longtask)
+                        .try_fold(f64::INFINITY, |acc, lt| lt.map(|v| acc.min(v)))
+                } else {
+                    None
+                };
+                let participant_count = client_for_budget.peer_count().unwrap_or(0);
+                let distress_signals = DistressSignals {
+                    median_fps: median_for_distress,
+                    longtask_ms_per_sec: longtask_for_distress,
+                    max_peer_audio_buffer_ms: last_audio_buffer_ms_max,
+                    // Deferred bus signal — see PROTECTIVE_NETEQ_ACCELERATE_DISTRESS_PER_SEC.
+                    neteq_accelerate_per_sec: None,
+                    cap_score,
+                    participant_count,
+                };
+                let distressed = in_distress(distress_signals);
+                let transition = tick_protective_mode(&mut protective, distressed);
+
+                // Severity escalation: once protective mode is active AND the
+                // cascade has reached floor (received layers at base + tiles
+                // pausing), each consecutive such tick escalates the encoder shed
+                // (2 layers → 1). Reset to 0 when inactive or off-floor so the next
+                // episode re-enters at the gentler 2-layer shed.
+                if protective.active && state.layers_at_floor {
+                    protective_severity = protective_severity.saturating_add(1);
+                } else {
+                    protective_severity = 0;
+                }
+                // Stage 3 lever: the LOCAL encoder send-layer ceiling. `None` until
+                // active AND at floor (ordered after stages 1-2). `Host` composes
+                // this with the user's persisted "layers published" preference.
+                let encoder_ceiling = protective_encoder_layer_ceiling(
+                    protective.active,
+                    state.layers_at_floor,
+                    protective_severity.saturating_sub(1),
+                );
+
+                // Publish the report (change-gated so a child re-render only fires
+                // on a real change — dioxus-signals 0.7.3 does not dedupe writes).
+                let report = ProtectiveModeReport {
+                    active: protective.active,
+                    encoder_layer_ceiling: encoder_ceiling,
+                };
+                if *protective_mode_report.peek() != report {
+                    protective_mode_report.set(report);
+                }
+
+                // Metric + log on the entry/exit edge (issue #1558 item 6),
+                // following the #1566 diagnostics-bus pattern. The gauge is 1 while
+                // active (0 on exit), with the naming the analysis tooling reads.
+                match transition {
+                    ProtectiveTransition::Entered => {
+                        // Name the dominant trigger for triage. Order mirrors the
+                        // severity intent: audio first (the thing being protected),
+                        // then renderer/main-thread, then the structural low-cap case.
+                        let trigger = if last_audio_buffer_ms_max
+                            .map(|b| b > crate::components::decode_budget::PROTECTIVE_AUDIO_BUFFER_DISTRESS_MS)
+                            .unwrap_or(false)
+                        {
+                            "audio_buffer"
+                        } else if median_for_distress
+                            .map(|m| m < crate::components::decode_budget::PROTECTIVE_FPS_DISTRESS)
+                            .unwrap_or(false)
+                        {
+                            "fps"
+                        } else if longtask_for_distress
+                            .map(|lt| lt >= crate::components::decode_budget::PROTECTIVE_LONGTASK_DISTRESS_MS_PER_SEC)
+                            .unwrap_or(false)
+                        {
+                            "longtask"
+                        } else {
+                            "low_cap_crowded"
+                        };
+                        log::warn!(
+                            "ProtectiveMode: ENTERED trigger={trigger} median_fps={} longtask_ms_per_sec={} audio_buffer_ms={} cap_score={} participants={}",
+                            median_for_distress.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                            longtask_for_distress.map(|l| format!("{l:.0}")).unwrap_or_else(|| "none".into()),
+                            last_audio_buffer_ms_max.map(|b| format!("{b:.0}")).unwrap_or_else(|| "none".into()),
+                            cap_score.map(|c| c.to_string()).unwrap_or_else(|| "none".into()),
+                            participant_count,
+                        );
+                        videocall_diagnostics::global_sender()
+                            .try_broadcast(videocall_diagnostics::DiagEvent {
+                                subsystem: "protective_mode",
+                                stream_id: None,
+                                ts_ms: videocall_diagnostics::now_ms(),
+                                metrics: vec![
+                                    videocall_diagnostics::metric!("protective_mode_active", 1u64),
+                                    videocall_diagnostics::metric!(
+                                        "protective_mode_participants",
+                                        participant_count as u64
+                                    ),
+                                ],
+                            })
+                            .ok();
+                    }
+                    ProtectiveTransition::Exited => {
+                        log::info!(
+                            "ProtectiveMode: EXITED median_fps={} audio_buffer_ms={} participants={}",
+                            median_for_distress.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                            last_audio_buffer_ms_max.map(|b| format!("{b:.0}")).unwrap_or_else(|| "none".into()),
+                            participant_count,
+                        );
+                        videocall_diagnostics::global_sender()
+                            .try_broadcast(videocall_diagnostics::DiagEvent {
+                                subsystem: "protective_mode",
+                                stream_id: None,
+                                ts_ms: videocall_diagnostics::now_ms(),
+                                metrics: vec![videocall_diagnostics::metric!(
+                                    "protective_mode_active",
+                                    0u64
+                                )],
+                            })
+                            .ok();
+                    }
+                    ProtectiveTransition::None => {}
+                }
+
+                // Issue #1558: audio-driven ownership latch. Protective mode can be
+                // triggered by AUDIO alone (a backed-up jitter buffer) with the
+                // renderer still healthy — so `decide_step` never returns Down and
+                // the loop never latches `pressured` on its own. But the emergency
+                // decode-pause (stage 4) can only ACTUATE while pressured (the
+                // render-side `effective_cap` reads the loop cap only then). So when
+                // protective mode is active AND audio is past the EMERGENCY mark,
+                // latch the controller into cap ownership here, exactly as a
+                // measured down-step would. This is the audio-first principle: a
+                // healthy renderer with starving audio MUST still shed video to
+                // protect audio. Mirrors the #1557 latch contract (the loop owns the
+                // cap once latched); reset on the same session-reset edge.
+                let emergency_now = protective.active
+                    && last_audio_buffer_ms_max
+                        .map(|b| {
+                            b > crate::components::decode_budget::PROTECTIVE_AUDIO_BUFFER_EMERGENCY_MS
+                        })
+                        .unwrap_or(false);
+                let pressured = if !pressured && emergency_now {
+                    decode_budget_pressured.set(true);
+                    log::warn!(
+                        "ProtectiveMode: audio-driven pressured latch (renderer healthy, audio starving) audio_buffer_ms={}",
+                        last_audio_buffer_ms_max
+                            .map(|b| format!("{b:.0}"))
+                            .unwrap_or_else(|| "none".into()),
+                    );
+                    true
+                } else {
+                    pressured
+                };
 
                 if !pressured {
                     // NOT-pressured path (HCL #987 review FIX 1 + FIX 2). The
@@ -2845,73 +3192,242 @@ pub fn AttendantsComponent(
                     // the controller into ownership of the cap. Up/Hold are
                     // irrelevant here because the un-pressured cap already equals
                     // natural (the maximum the loop would ever grow to).
-                    if let BudgetStep::Down(magnitude) = decide_step(&samples, &state, natural, now)
-                    {
-                        // Telemetry for the decision logs below. Computed once on
-                        // this one-time pressured-latch edge (NOT per tick), so the
-                        // `median_render_fps` recompute cost is irrelevant here
-                        // (contrast the per-tick Auto path, #1001). #1286: render a
-                        // `None` longtask (signal unavailable on WebKit/iOS) as
-                        // "none", mirroring how `median`/`cur_fps` render their
-                        // missing case, so the log never implies a healthy 0.0
-                        // where there is simply no telemetry.
-                        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                    //
+                    // Presenter-aware "step down sooner" (issue #1559): the normal
+                    // latch fires on `decide_step -> Down` (median FPS < 24, the
+                    // distress floor). While SHARING, a presenter also latches on
+                    // the milder 24-30 band via `presenter_extra_shed_pressure` —
+                    // synthesised as a single-tile `Down(1)` so the existing
+                    // latch/log path is reused unchanged. The normal trigger is
+                    // never weakened (it is OR-ed in, taking priority and keeping
+                    // its proportional magnitude); the presenter branch only ADDS
+                    // the milder band, and ONLY while sharing — when sharing stops
+                    // `presenter_extra_shed_pressure` returns false and the normal
+                    // trigger is the sole latch path again. Pressure-gated: a
+                    // presenter at a healthy >= 30 fps satisfies neither trigger.
+                    // One-time pressured-latch EDGE (not per tick): use the plain
+                    // `decide_step` wrapper here — its internal median recompute is
+                    // irrelevant on this rare edge (contrast the per-tick pressured
+                    // path below, which threads the hoisted `median_for_distress`
+                    // into `decide_step_with_median`, issue #1558 / #1001).
+                    let latch_step = match decide_step(&samples, &state, natural, now) {
+                        BudgetStep::Down(magnitude) => Some(magnitude),
+                        _ if presenter_extra_shed_pressure(&samples, sharing)
+                            && state.cap > MIN_CAP =>
+                        {
+                            Some(1)
+                        }
+                        _ => None,
+                    };
+                    if let Some(magnitude) = latch_step {
+                        // Telemetry for the decision logs below. Reuses the
+                        // single per-tick `median_for_distress` (issue #1558 perf
+                        // hoist — same value, no second `median_render_fps`
+                        // alloc+sort here). #1286: render a `None` longtask (signal
+                        // unavailable on WebKit/iOS) as "none", mirroring how
+                        // `median`/`cur_fps` render their missing case, so the log
+                        // never implies a healthy 0.0 where there is simply no
+                        // telemetry. All three are used in BOTH cascade arms' logs
+                        // below, so none is ever unused.
+                        let median = median_for_distress;
                         let cur_fps = samples.last().and_then(|s| s.render_fps);
                         let longtask = samples.last().and_then(|s| s.longtask);
-                        let prev_cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
 
+                        // Issue #1557: latch the controller on the FIRST measured
+                        // down-pressure REGARDLESS of cascade stage. The latch means
+                        // the controller now owns the cap; it MUST latch the moment
+                        // pressure is first measured — even on a LowerLayer tick that
+                        // does not touch the cap — otherwise the loop never re-enters
+                        // this pressured arm to keep cascading (it would fall back to
+                        // the un-pressured branch and re-reveal natural tiles).
                         decode_budget_pressured.set(true);
-                        state.cap = natural.saturating_sub(magnitude).max(MIN_CAP);
-                        state.last_step_ms = now;
-                        state.direction_hold = 0;
-                        decode_budget_cap.set(state.cap);
 
-                        // Pressured-latch edge (false->true): the controller now
-                        // owns the cap. Trigger is the first measured down-step.
-                        log::info!(
-                            "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={} natural={} cap={}",
-                            median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                            cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                            longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                            natural,
-                            state.cap,
-                        );
-                        // Severe-tier entry: a multi-tile down-step. The label
-                        // reproduces `decide_step`'s catastrophic test exactly
-                        // (median FPS + SUSTAINED long-task window), NOT a single
-                        // closing-sample inference. WITHOUT changing decide_step's
-                        // signature.
-                        if magnitude > 1 {
-                            log::info!(
-                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
-                                magnitude,
-                                severe_label(&samples, median),
-                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                            );
-                        }
-                        // First cap transition (un-pressured -> pressured down-step).
-                        // #1001: gate on an actual change (mirroring the steady
-                        // Auto arm) so a clamp-collapsed `prev_cap` can never log a
-                        // no-op `cap N->N`; the log always reflects real movement.
-                        if state.cap != prev_cap {
-                            log::info!(
-                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
-                                prev_cap,
-                                state.cap,
-                                magnitude,
-                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                                natural,
-                            );
+                        // Issue #1557 — tier-before-pause cascade. A Down edge first
+                        // lowers RECEIVED simulcast layers (resolution) and only
+                        // escalates to PAUSING (capping) tiles once those layers are
+                        // at floor AND a settle window has elapsed.
+                        let down_pressure = true;
+                        let settle_elapsed = settle_window_elapsed(now, state.last_layer_drop_ms);
+                        let action =
+                            cascade_action(down_pressure, state.layers_at_floor, settle_elapsed);
+                        match action {
+                            CascadeAction::LowerLayer => {
+                                // Stage 1: drop received layers ONLY — NO tile is
+                                // paused on this edge.
+                                //
+                                // #1557 BLOCKER FIX: the un-pressured phase keeps only
+                                // the LOCAL `state.cap` synced to natural and never
+                                // writes the `decode_budget_cap` SIGNAL (see the
+                                // `!pressured` block above), so the signal still holds
+                                // the Auto seed `MIN_CAP` (1) at this first Down edge.
+                                // The render reads the SIGNAL: `effective_cap` would
+                                // return MIN_CAP and pause N-1 of N tiles — inverting
+                                // #1557. So on a LowerLayer outcome we PIN the cap to
+                                // the displayed (natural) value and WRITE the signal,
+                                // using the SAME device-ceiling clamp the un-pressured
+                                // sync uses (NOT `presenter_cap_ceiling`, which belongs
+                                // to the PauseTiles arm and sheds tiles). Result:
+                                // `effective_cap` returns natural — no tile paused —
+                                // while only received layers drop.
+                                // #1557 perf: dioxus-signals 0.7.3 does NOT dedupe
+                                // equal writes, so an unconditional `.set` every ~1s
+                                // forces an AttendantsComponent re-render each tick.
+                                // Change-gate the write. On the FIRST LowerLayer tick
+                                // the signal still holds the Auto-seed MIN_CAP while
+                                // `new_cap == natural > MIN_CAP`, so the guard is true
+                                // and the write still fires.
+                                let new_cap = lower_layer_cap(natural, device_decode_ceiling);
+                                if new_cap != *decode_budget_cap.peek() {
+                                    decode_budget_cap.set(new_cap);
+                                }
+                                state.cap = new_cap;
+                                // The chooser steps each peer down a rung; when it
+                                // reports nothing moved (`!stepped`) every received
+                                // layer is at base, so the next Down edge can escalate.
+                                let stepped = match client_for_budget
+                                    .apply_local_cpu_pressure_congestion()
+                                {
+                                    Some(s) => {
+                                        state.layers_at_floor = !s;
+                                        // #1557 CRITICAL: advance the settle clock ONLY
+                                        // when a layer ACTUALLY moved (see the steady
+                                        // Down arm for the full rationale): freezing the
+                                        // timestamp at floor lets STEP_DOWN_COOLDOWN_MS
+                                        // accumulate so the cascade can escalate to
+                                        // PauseTiles instead of looping LowerLayer.
+                                        state.last_layer_drop_ms =
+                                            next_layer_drop_ms(state.last_layer_drop_ms, now, s);
+                                        s
+                                    }
+                                    None => {
+                                        // borrow contended: skip this tick, do NOT advance the
+                                        // cascade (layers_at_floor + settle clock frozen). `stepped`
+                                        // logs false but layers_at_floor was NOT set true — that is
+                                        // the intended "no movement" behavior, not an inconsistency.
+                                        false
+                                    }
+                                };
+                                log::info!(
+                                    "DecodeBudget: cascade=lower_layer pressured_latch=true stepped={} layers_at_floor={} natural={} cap={} median_fps={} current_fps={} longtask_ms_per_sec={}",
+                                    stepped,
+                                    state.layers_at_floor,
+                                    natural,
+                                    state.cap,
+                                    median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                    cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                    longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                );
+                            }
+                            CascadeAction::PauseTiles => {
+                                // Stage 2: received layers are at floor and the settle
+                                // window elapsed — NOW pause (cap) a tile. This is the
+                                // ORIGINAL latch-edge down-step logic, unchanged.
+                                let prev_cap = natural.clamp(MIN_CAP, CANVAS_LIMIT);
+                                state.cap = natural.saturating_sub(magnitude).max(MIN_CAP);
+                                // Presenter-aware "lower floor" (issue #1559): while
+                                // sharing, clamp the just-latched cap to the presenter
+                                // ceiling (the fraction `ceil(natural * PRESENTER_SHED_FACTOR)`
+                                // bounded above by the absolute `PRESENTER_RESIDUAL_FLOOR`,
+                                // so a large meeting sheds to a small fixed residual) — the
+                                // first shed already frees substantial peer-decode CPU for
+                                // the screen encoder. `None` while not sharing leaves the
+                                // cap exactly as the normal down-step produced it.
+                                if let Some(ceiling) = presenter_cap_ceiling(natural, sharing) {
+                                    state.cap = state.cap.min(ceiling.max(MIN_CAP));
+                                }
+                                state.last_step_ms = now;
+                                state.direction_hold = 0;
+                                decode_budget_cap.set(state.cap);
+
+                                // Pressured-latch edge (false->true): the controller now
+                                // owns the cap. Trigger is the first measured down-step.
+                                log::info!(
+                                    "DecodeBudget: pressured_latch=true trigger=down median_fps={} current_fps={} longtask_ms_per_sec={} natural={} cap={}",
+                                    median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                    cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                    longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                    natural,
+                                    state.cap,
+                                );
+                                // Severe-tier entry: a multi-tile down-step. The label
+                                // reproduces `decide_step`'s catastrophic test exactly
+                                // (median FPS + SUSTAINED long-task window), NOT a single
+                                // closing-sample inference. WITHOUT changing decide_step's
+                                // signature.
+                                if magnitude > 1 {
+                                    log::info!(
+                                        "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
+                                        magnitude,
+                                        severe_label(&samples, median),
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                    );
+                                }
+                                // First cap transition (un-pressured -> pressured down-step).
+                                // #1001: gate on an actual change (mirroring the steady
+                                // Auto arm) so a clamp-collapsed `prev_cap` can never log a
+                                // no-op `cap N->N`; the log always reflects real movement.
+                                if state.cap != prev_cap {
+                                    log::info!(
+                                        "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
+                                        prev_cap,
+                                        state.cap,
+                                        magnitude,
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                        natural,
+                                    );
+                                }
+                                // At-floor nudge: re-issue the layer-drop seed. Harmless
+                                // and idempotent — every received chooser is already at
+                                // base so `apply` returns false (`layers_at_floor`
+                                // stays true), but it keeps the published preference
+                                // re-advertised. Advance the settle clock ONLY if a
+                                // layer actually moved (at floor it does not, so the
+                                // timestamp stays frozen — keeping settle_elapsed true
+                                // so sustained pressure keeps shedding tiles).
+                                if let Some(stepped) =
+                                    client_for_budget.apply_local_cpu_pressure_congestion()
+                                {
+                                    state.layers_at_floor = !stepped;
+                                    state.last_layer_drop_ms =
+                                        next_layer_drop_ms(state.last_layer_drop_ms, now, stepped);
+                                }
+                                // None (borrow contended): leave layers_at_floor + settle clock unchanged
+                            }
+                            CascadeAction::None => {
+                                // unreachable: down_pressure is true here
+                            }
                         }
                     }
                     continue;
                 }
 
                 // ---- Pressured Auto path: the loop is the sole cap owner ----
-                let step = decide_step(&samples, &state, natural, now);
+                // Reuse the single per-tick `median_for_distress` (issue #1558
+                // perf hoist): the protective distress predicate already computed
+                // `median_render_fps(&samples, SUSTAIN_SAMPLES)` at the top of this
+                // tick, so threading it in here avoids `decide_step` re-running the
+                // same `Vec`-alloc+sort a second time on the hot steady-state path
+                // (restores the #1001 "one median per tick" contract).
+                // Issue #1558 emergency-growth gate (Up arm): coerce a recovery
+                // `Up` to `Hold` while the protective EMERGENCY is active this tick
+                // (`emergency_now`). `decide_step`'s Up gate is blind to audio, so a
+                // healthy renderer with a starving jitter buffer would otherwise
+                // raise the cap + call `re_arm_cascade_after_recovery` (clearing
+                // `layers_at_floor`), and the emergency clamp below would re-slam the
+                // cap to MIN_CAP WITHOUT restoring the floor flag — flipping the
+                // stage-3 encoder ceiling to None for a tick (the ~4s flap). The
+                // coerced `Hold` then has its own growth vetoed by
+                // `non_distress_growth_allowed(.., emergency_now)`, so neither growth
+                // path fights the emergency. `suppress_growth_step` is the single
+                // source of truth for this Up suppression (shared with the
+                // `sim_tick_protective` test model).
+                let step = suppress_growth_step(
+                    decide_step_with_median(&samples, &state, natural, now, median_for_distress),
+                    emergency_now,
+                );
 
                 // Controller owns direction_hold: increment per consecutive
                 // recovery-qualifying sample, reset to 0 when recovery breaks.
@@ -2937,54 +3453,211 @@ pub fn AttendantsComponent(
                 // `Option<f64>` reads; they ride along for locality.)
                 match step {
                     BudgetStep::Down(magnitude) => {
-                        // Proportional/multi-tile down-step (HCL #987 review
-                        // FIX 4): `magnitude` is 1 under mild pressure, larger
-                        // under catastrophic pressure. Floor at MIN_CAP.
-                        // #1001: telemetry computed here in the consuming branch.
-                        // A Down only fires when `cap > MIN_CAP` (decide_step
-                        // guard), so it always strictly lowers the cap and the cap
-                        // log below always fires — these are never unused.
-                        let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
-                        let cur_fps = samples.last().and_then(|s| s.render_fps);
-                        let longtask = samples.last().and_then(|s| s.longtask);
-                        let prev_cap = state.cap;
-                        state.cap = state.cap.saturating_sub(magnitude).max(MIN_CAP);
-                        state.last_step_ms = now;
-                        // A down-step ends the recovery streak. Because the
-                        // last_step_ms is updated here, the non-distress growth
-                        // gate below is held off by the up-cooldown, so a machine
-                        // that just dropped a tile under pressure cannot
-                        // instantly re-add it (anti-oscillation).
-                        state.direction_hold = 0;
-                        decode_budget_cap.set(state.cap);
-                        // Severe-tier entry: multi-tile down-step. The label
-                        // reproduces `decide_step`'s catastrophic test exactly
-                        // (median FPS + SUSTAINED long-task window), NOT a single
-                        // closing-sample inference. No `decide_step` signature
-                        // change.
-                        if magnitude > 1 {
-                            log::info!(
-                                "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
-                                magnitude,
-                                severe_label(&samples, median),
-                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                            );
-                        }
-                        if state.cap != prev_cap {
-                            log::info!(
-                                "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
-                                prev_cap,
-                                state.cap,
-                                magnitude,
-                                median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
-                                cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
-                                longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
-                                natural,
-                            );
+                        // Issue #1557 — tier-before-pause cascade on the steady
+                        // pressured Down arm. Drop RECEIVED layers first; pause
+                        // (cap) tiles only once layers are at floor AND the settle
+                        // window has elapsed. `magnitude` is consumed in the
+                        // PauseTiles arm (proportional tile-shed); LowerLayer leaves
+                        // the cap untouched.
+                        let settle_elapsed = settle_window_elapsed(now, state.last_layer_drop_ms);
+                        let action = cascade_action(true, state.layers_at_floor, settle_elapsed);
+                        match action {
+                            CascadeAction::LowerLayer => {
+                                // Stage 1: drop received layers ONLY — no tile is
+                                // paused on this tick.
+                                //
+                                // #1557 BLOCKER FIX (mirrors the latch-site arm): PIN
+                                // the cap to natural and WRITE `decode_budget_cap` so
+                                // `effective_cap` shows ALL natural tiles. The cap may
+                                // currently hold a PAUSED value (a prior PauseTiles
+                                // dropped it, then recovery cleared `layers_at_floor`
+                                // and a fresh Down re-entered LowerLayer); re-pinning
+                                // natural here guarantees a LowerLayer tick never leaves
+                                // a stale paused cap visible. Same device-ceiling clamp
+                                // as the un-pressured sync; NOT `presenter_cap_ceiling`
+                                // (that sheds tiles and belongs to the PauseTiles arm).
+                                // #1557 perf: dioxus-signals 0.7.3 does NOT dedupe
+                                // equal writes, so an unconditional `.set` every ~1s
+                                // forces an AttendantsComponent re-render each tick.
+                                // Change-gate the write. On the FIRST LowerLayer tick
+                                // the signal still holds the Auto-seed MIN_CAP while
+                                // `new_cap == natural > MIN_CAP`, so the guard is true
+                                // and the write still fires.
+                                let new_cap = lower_layer_cap(natural, device_decode_ceiling);
+                                if new_cap != *decode_budget_cap.peek() {
+                                    decode_budget_cap.set(new_cap);
+                                }
+                                state.cap = new_cap;
+                                let prev_layers_at_floor = state.layers_at_floor;
+                                let stepped = match client_for_budget
+                                    .apply_local_cpu_pressure_congestion()
+                                {
+                                    Some(s) => {
+                                        state.layers_at_floor = !s;
+                                        // #1557 CRITICAL: advance the settle clock ONLY
+                                        // when a layer ACTUALLY moved (`s`). Once at
+                                        // floor the apply is a no-op every tick; if we
+                                        // reset the clock on those no-op ticks the
+                                        // `now - last_layer_drop_ms` delta is pinned at
+                                        // one tick-gap and STEP_DOWN_COOLDOWN_MS never
+                                        // elapses, so PauseTiles would be unreachable.
+                                        // By freezing the timestamp at floor, the settle
+                                        // window accumulates from the moment the floor
+                                        // was first reached and the cascade can escalate
+                                        // to pausing tiles.
+                                        state.last_layer_drop_ms =
+                                            next_layer_drop_ms(state.last_layer_drop_ms, now, s);
+                                        s
+                                    }
+                                    None => {
+                                        // borrow contended: skip this tick, do NOT advance the
+                                        // cascade (layers_at_floor + settle clock frozen). `stepped`
+                                        // logs false but layers_at_floor was NOT set true — that is
+                                        // the intended "no movement" behavior, not an inconsistency.
+                                        false
+                                    }
+                                };
+                                // A Down edge ends the recovery streak even when only
+                                // layers dropped (anti-oscillation): the next up-step
+                                // must re-earn RECOVERY_HOLD samples.
+                                state.direction_hold = 0;
+                                // Refresh last_step_ms so the non-distress growth gate
+                                // below is held off by the up-cooldown — a layer-drop
+                                // tick must not let the cap re-grow on the same window.
+                                state.last_step_ms = now;
+                                // #1557 perf: gate the log (and its `median_render_fps`
+                                // Vec-alloc + sort, plus the three `format!`s) on a
+                                // TRANSITION — a real layer move (`stepped`) or the
+                                // floor flip — instead of emitting it every second
+                                // under sustained at-floor pressure. This mirrors the
+                                // movement-gate discipline of the `cap N->N` logs and
+                                // keeps the support-triage signal (each real drop + the
+                                // floor transition) without per-tick log/alloc churn.
+                                let floor_flipped = state.layers_at_floor != prev_layers_at_floor;
+                                if stepped || floor_flipped {
+                                    let median = median_for_distress;
+                                    let cur_fps = samples.last().and_then(|s| s.render_fps);
+                                    let longtask = samples.last().and_then(|s| s.longtask);
+                                    log::info!(
+                                        "DecodeBudget: cascade=lower_layer pressured_latch=false stepped={} layers_at_floor={} natural={} cap={} median_fps={} current_fps={} longtask_ms_per_sec={}",
+                                        stepped,
+                                        state.layers_at_floor,
+                                        natural,
+                                        state.cap,
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                    );
+                                }
+                            }
+                            CascadeAction::PauseTiles => {
+                                // Stage 2: received layers at floor + settle elapsed —
+                                // NOW pause (cap) a tile. This is the ORIGINAL steady
+                                // down-step body, unchanged.
+                                // Proportional/multi-tile down-step (HCL #987 review
+                                // FIX 4): `magnitude` is 1 under mild pressure, larger
+                                // under catastrophic pressure. Floor at MIN_CAP.
+                                // #1558 perf hoist: reuse the single per-tick
+                                // `median_for_distress` (same value) instead of a
+                                // second alloc+sort. A Down only fires when
+                                // `cap > MIN_CAP` (decide_step guard), so it always
+                                // strictly lowers the cap and the cap log below always
+                                // fires — these are never unused.
+                                let median = median_for_distress;
+                                let cur_fps = samples.last().and_then(|s| s.render_fps);
+                                let longtask = samples.last().and_then(|s| s.longtask);
+                                let prev_cap = state.cap;
+                                state.cap = state.cap.saturating_sub(magnitude).max(MIN_CAP);
+                                state.last_step_ms = now;
+                                // A down-step ends the recovery streak. Because the
+                                // last_step_ms is updated here, the non-distress growth
+                                // gate below is held off by the up-cooldown, so a machine
+                                // that just dropped a tile under pressure cannot
+                                // instantly re-add it (anti-oscillation).
+                                state.direction_hold = 0;
+                                decode_budget_cap.set(state.cap);
+                                // Severe-tier entry: multi-tile down-step. The label
+                                // reproduces `decide_step`'s catastrophic test exactly
+                                // (median FPS + SUSTAINED long-task window), NOT a single
+                                // closing-sample inference. No `decide_step` signature
+                                // change.
+                                if magnitude > 1 {
+                                    log::info!(
+                                        "DecodeBudget: severe_step magnitude={} threshold={} median_fps={} longtask_ms_per_sec={}",
+                                        magnitude,
+                                        severe_label(&samples, median),
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                    );
+                                }
+                                if state.cap != prev_cap {
+                                    log::info!(
+                                        "DecodeBudget: cap {}->{} dir=down magnitude={} pressured=true median_fps={} current_fps={} longtask_ms_per_sec={} natural={}",
+                                        prev_cap,
+                                        state.cap,
+                                        magnitude,
+                                        median.map(|m| format!("{m:.1}")).unwrap_or_else(|| "none".into()),
+                                        cur_fps.map(|f| format!("{f:.1}")).unwrap_or_else(|| "none".into()),
+                                        longtask.map(|lt| format!("{lt:.0}")).unwrap_or_else(|| "none".into()),
+                                        natural,
+                                    );
+                                }
+                                // At-floor nudge: re-issue the layer-drop seed. Harmless
+                                // and idempotent (all received choosers already at base),
+                                // keeps the published preference fresh. As in the
+                                // LowerLayer arm, advance the settle clock ONLY if a
+                                // layer actually moved — at floor this is a no-op so the
+                                // timestamp stays frozen, which is correct: once we are
+                                // pausing tiles we want settle_elapsed to STAY true so
+                                // subsequent ticks keep shedding tiles under sustained
+                                // pressure rather than dropping back to LowerLayer.
+                                if let Some(stepped) =
+                                    client_for_budget.apply_local_cpu_pressure_congestion()
+                                {
+                                    state.layers_at_floor = !stepped;
+                                    state.last_layer_drop_ms =
+                                        next_layer_drop_ms(state.last_layer_drop_ms, now, stepped);
+                                }
+                                // None (borrow contended): leave layers_at_floor + settle clock unchanged
+                            }
+                            CascadeAction::None => {
+                                // unreachable: down_pressure is true here
+                            }
                         }
                     }
+                    // Issue #1558: this Up arm is never reached during an active
+                    // protective emergency — `suppress_growth_step` (above) has
+                    // already coerced `Up` to `Hold` when `emergency_now`, so the
+                    // cap-raise + `re_arm_cascade_after_recovery` here cannot clear
+                    // `layers_at_floor` while audio is starving (the encoder-ceiling
+                    // flap). On a normal (non-emergency) tick it runs unchanged.
                     BudgetStep::Up => {
+                        // Issue #1557: recovery reverses the cascade order. Tiles
+                        // un-pause HERE (the cap raise below); RECEIVED layers
+                        // re-grow via the choosers' existing clean-window recovery on
+                        // the monitor tick (layer_chooser.rs `choose` clean-window /
+                        // sticky cautious recovery) — no explicit layer-raise call is
+                        // needed here.
+                        //
+                        // Recovery RE-ARMS the cascade: clearing `layers_at_floor` and
+                        // re-anchoring `last_layer_drop_ms = now` means the NEXT Down
+                        // edge starts at the LowerLayer stage and must re-earn the
+                        // settle window before pausing a tile — so the re-grown
+                        // received layers are dropped FIRST on the next pressure
+                        // episode (not paused). Without this re-arm the controller
+                        // stays pressured through recovery (the latch is only cleared
+                        // on the Fixed/All->Auto override, never here), so the next
+                        // Down edge would see a STALE `layers_at_floor == true` plus a
+                        // stale `last_layer_drop_ms` and `cascade_action` would route
+                        // straight to PauseTiles — inverting the feature on every
+                        // cycle after the first. These two resets are UNGATED (run on
+                        // every Up-arm execution, NOT behind the `cap != prev_cap` log
+                        // gate below): reaching this arm means decide_step chose an
+                        // up-step, i.e. recovery is in progress, even on the rare tick
+                        // where the cap was already at natural and did not move.
+                        // `re_arm_cascade_after_recovery` is the single source of
+                        // truth for this reset (shared with the Hold-growth path).
+                        re_arm_cascade_after_recovery(&mut state, now);
                         let prev_cap = state.cap;
                         state.cap = (state.cap + 1).min(natural.max(MIN_CAP));
                         // #1286 belt-and-suspenders: never grow past the
@@ -3001,9 +3674,10 @@ pub fn AttendantsComponent(
                         state.direction_hold = 0;
                         decode_budget_cap.set(state.cap);
                         if state.cap != prev_cap {
-                            // #1001: telemetry computed only when the up-step
-                            // actually moves the cap (and thus logs).
-                            let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                            // #1558 perf hoist: reuse the single per-tick
+                            // `median_for_distress` (same value), logged only when
+                            // the up-step actually moves the cap.
+                            let median = median_for_distress;
                             let cur_fps = samples.last().and_then(|s| s.render_fps);
                             let longtask = samples.last().and_then(|s| s.longtask);
                             log::info!(
@@ -3068,22 +3742,66 @@ pub fn AttendantsComponent(
                         // `non_distress_growth_qualifying` already returns false
                         // for the blind longtask, so this arm rarely runs there;
                         // capping the target is the guarantee regardless.)
-                        let target = match device_decode_ceiling {
+                        let mut target = match device_decode_ceiling {
                             Some(ceiling) => natural.max(MIN_CAP).min(ceiling.max(MIN_CAP)),
                             None => natural.max(MIN_CAP),
                         };
+                        // Presenter-aware "lower floor" (issue #1559): while
+                        // sharing, cap the non-distress GROWTH target at the
+                        // presenter ceiling so the budget does not re-grow peer
+                        // tiles back into the CPU the screen encoder needs. When
+                        // sharing stops, `presenter_cap_ceiling` returns `None` and
+                        // the target reverts to natural (∩ device ceiling), so the
+                        // existing growth path re-grows tiles — recovery on stop.
+                        if let Some(ceiling) = presenter_cap_ceiling(natural, sharing) {
+                            target = target.min(ceiling.max(MIN_CAP));
+                        }
                         let up_cooldown_elapsed = (now - state.last_step_ms) >= STEP_UP_COOLDOWN_MS;
                         let not_distressed =
                             non_distress_growth_qualifying(&samples, SUSTAIN_SAMPLES);
-                        if state.cap < target && up_cooldown_elapsed && not_distressed {
+                        // Issue #1558 emergency-growth gate: `non_distress_growth_allowed`
+                        // is the single source of truth combining the three pre-existing
+                        // growth conditions with the `!emergency_now` veto. The growth
+                        // gate is blind to audio, so during a SUSTAINED audio-only
+                        // emergency it would otherwise raise the cap (1→2) and call
+                        // `re_arm_cascade_after_recovery` here — clearing
+                        // `layers_at_floor` — only for the emergency clamp below to
+                        // re-slam the cap to MIN_CAP WITHOUT restoring the floor flag,
+                        // flipping the stage-3 encoder ceiling to None for a tick and
+                        // un-shedding the local send-ladder on a ~4s cycle. Vetoing
+                        // growth while `emergency_now` holds keeps `layers_at_floor`
+                        // stable so the encoder ceiling stays applied; when audio
+                        // recovers the veto lifts and growth resumes unchanged.
+                        if non_distress_growth_allowed(
+                            state.cap < target,
+                            up_cooldown_elapsed,
+                            not_distressed,
+                            emergency_now,
+                        ) {
                             let prev_cap = state.cap;
                             state.cap += 1;
                             state.last_step_ms = now;
+                            // Issue #1557: non-distress growth is also a recovery
+                            // signal (the cap climbs back toward natural while still
+                            // latched-pressured), so RE-ARM the cascade exactly as the
+                            // BudgetStep::Up arm does — clear `layers_at_floor` and
+                            // re-anchor `last_layer_drop_ms = now`. This is reachable
+                            // to a later Down edge with a stale flag: the pressured
+                            // latch persists through recovery, decide_step can return
+                            // Down on a subsequent bad window, and nothing else clears
+                            // the flag — so without this the next Down edge would route
+                            // straight to PauseTiles. Gated INSIDE this block (an
+                            // ACTUAL upward cap move): a steady-state Hold tick that
+                            // does NOT grow must NOT re-arm, or it would perpetually
+                            // reset the settle clock and mask a real at-floor state.
+                            // Shared source of truth with the Up arm.
+                            re_arm_cascade_after_recovery(&mut state, now);
                             decode_budget_cap.set(state.cap);
-                            // #1001: telemetry computed only on an actual growth
-                            // step; a steady-state Hold tick never reaches here, so
-                            // `median_render_fps` does not run when nothing changes.
-                            let median = median_render_fps(&samples, SUSTAIN_SAMPLES);
+                            // #1558 perf hoist: reuse the single per-tick
+                            // `median_for_distress` (same value), logged only on an
+                            // actual growth step; a steady-state Hold tick never
+                            // reaches here.
+                            let median = median_for_distress;
                             let cur_fps = samples.last().and_then(|s| s.render_fps);
                             let longtask = samples.last().and_then(|s| s.longtask);
                             // Non-distress growth: cap re-grows toward natural while
@@ -3099,6 +3817,89 @@ pub fn AttendantsComponent(
                                 natural,
                             );
                         }
+                    }
+                }
+
+                // Presenter-aware "lower floor" — post-step clamp (issue #1559).
+                //
+                // Issue #1557: this clamp COMPOSES with the tier-before-pause
+                // cascade and is UNCHANGED. On a LowerLayer tick the cap was not
+                // lowered, so this clamp may still shed tiles if sharing AND the cap
+                // is above the presenter ceiling — that is pre-existing,
+                // independent presenter behaviour (it bounds the cap regardless of
+                // the cascade stage) and is intentionally left intact.
+                //
+                // The growth-target cap above prevents the pressured loop from
+                // GROWING past the presenter ceiling, but it does not lower a cap
+                // that is ALREADY above the ceiling when sharing begins. A user
+                // who starts sharing while already pressured (e.g. the loop had
+                // settled at cap == natural - 2) must shed down to the presenter
+                // ceiling promptly, not wait for FPS to dip further. This clamp
+                // lowers `state.cap` to the presenter ceiling whenever sharing and
+                // pressured, on EVERY arm (Down/Up/Hold), and republishes so the
+                // render-side `effective_cap` (pressured Auto == loop cap) sheds
+                // the extra tiles. While NOT sharing it is a no-op (`None`), so the
+                // cap recovers via the normal growth path — no leaked state. The
+                // active-speaker exemption is preserved downstream: `promote_speakers`
+                // runs against the resulting lower `visible_tile_count` and swaps
+                // active speakers INTO the decoded window, shedding non-speakers
+                // first.
+                if let Some(ceiling) = presenter_cap_ceiling(natural, sharing) {
+                    let clamped = state.cap.min(ceiling.max(MIN_CAP));
+                    if clamped != state.cap {
+                        let prev_cap = state.cap;
+                        state.cap = clamped;
+                        state.last_step_ms = now;
+                        // A presenter shed ends any recovery streak so the cap does
+                        // not immediately try to re-grow toward natural.
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                        log::info!(
+                            "DecodeBudget: cap {}->{} dir=presenter_shed magnitude={} pressured=true sharing=true natural={} ceiling={}",
+                            prev_cap,
+                            state.cap,
+                            prev_cap - state.cap,
+                            natural,
+                            ceiling,
+                        );
+                    }
+                }
+
+                // ---- Issue #1558 stage 4: EMERGENCY non-speaker pause ----
+                //
+                // Applied LAST, after the cascade + presenter clamps, on the
+                // pressured path only (it is only reachable once the cascade has
+                // latched and reached floor — the cheaper stages run first). When
+                // protective mode is active AND audio is STILL growing past the
+                // EMERGENCY water mark, force the decode cap to MIN_CAP: exactly ONE
+                // decoded tile, which `promote_speakers` fills with the active
+                // speaker downstream. Every other non-speaker tile pauses, freeing
+                // decode CPU to protect audio. Returns `None` (no clamp) once audio
+                // drains, so the cap recovers via the normal cascade/growth path —
+                // the stage reverses on recovery. Audio decode is NEVER touched; this
+                // sheds VIDEO precisely to protect audio.
+                if let Some(emergency_cap) =
+                    protective_emergency_cap(protective.active, last_audio_buffer_ms_max)
+                {
+                    let clamped = state.cap.min(emergency_cap.max(MIN_CAP));
+                    if clamped != state.cap {
+                        let prev_cap = state.cap;
+                        state.cap = clamped;
+                        state.last_step_ms = now;
+                        // The emergency shed ends any recovery streak so the cap does
+                        // not immediately try to re-grow while audio is still in
+                        // distress.
+                        state.direction_hold = 0;
+                        decode_budget_cap.set(state.cap);
+                        log::warn!(
+                            "ProtectiveMode: EMERGENCY cap {}->{} (speaker-only) audio_buffer_ms={} natural={}",
+                            prev_cap,
+                            state.cap,
+                            last_audio_buffer_ms_max
+                                .map(|b| format!("{b:.0}"))
+                                .unwrap_or_else(|| "none".into()),
+                            natural,
+                        );
                     }
                 }
             }
@@ -3243,20 +4044,24 @@ pub fn AttendantsComponent(
             // Pressured-latch edge (true->false): leaving a Fixed override for Auto
             // clears the latch render-side so all natural tiles re-reveal at once.
             log::info!("DecodeBudget: pressured_latch=false trigger=override_resume_auto");
-            // Issue #1466: returning to Auto from ANY non-Auto state (Fixed/All)
-            // discards the per-tile force-decode requests. Auto is "let the
-            // adaptive loop decide", so stale PLAY requests must not keep peers
-            // pinned-decoded across the mode switch. This same edge fires for BOTH
-            // entry points that write `decode_budget_override` — the Settings
-            // picker AND the persistent "Back to automatic" toggle (both call
-            // `decode_budget_ctx.0.set`) — so a single clear here covers both.
-            // Guarded on non-empty so we don't trigger a needless write-driven
-            // re-render when there was nothing to clear. We do NOT clear on a
-            // transition to All or Fixed(n): those are explicit manual modes where
-            // an existing PLAY request is still meaningful.
-            if !user_requested_decode.peek().is_empty() {
-                user_requested_decode.write().clear();
-            }
+        }
+        // Issue #1466/#1471: returning to Auto from ANY non-Auto state (Fixed/All)
+        // discards the per-tile force-decode requests. Auto is "let the adaptive
+        // loop decide", so stale PLAY requests must not keep peers pinned-decoded
+        // across the mode switch. This same edge fires for BOTH entry points that
+        // write `decode_budget_override` — the Settings picker AND the persistent
+        // "Back to automatic" toggle (both call `decode_budget_ctx.0.set`) — so a
+        // single clear here covers both. The decision lives in the pure
+        // `should_clear_force_decode_on_override_change` helper so it is
+        // host-testable (an inline `.clear()` was mutation-invisible, #1471). We do
+        // NOT clear on a transition to All or Fixed(n): those are explicit manual
+        // modes where an existing PLAY request is still meaningful. Guarded on
+        // non-empty so we don't trigger a needless write-driven re-render when
+        // there was nothing to clear.
+        if should_clear_force_decode_on_override_change(previous, current)
+            && !user_requested_decode.peek().is_empty()
+        {
+            user_requested_decode.write().clear();
         }
         if previous != current {
             prev_override.set(current);
@@ -3898,7 +4703,7 @@ pub fn AttendantsComponent(
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     //
-    // Screen-share right panel: compact tiles via CSS flex-wrap layout.
+    // Screen-share right panel: compact tiles via CSS grid layout.
     // All visual sizing is handled purely by CSS (.ss-peer-panel).
     //
     // ALL participants are rendered in the DOM (vertical scroll handles
@@ -4103,7 +4908,7 @@ pub fn AttendantsComponent(
         "position: absolute; left: 0; right: 0; top: 0; bottom: 0; height: 100%; \
          display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
          padding: 16px 16px 80px 16px; \
-         align-items: center; box-sizing: border-box; \
+         align-items: stretch; box-sizing: border-box; \
          grid-template-columns: none; grid-template-rows: none;"
             .to_string()
     } else {
@@ -4160,7 +4965,17 @@ pub fn AttendantsComponent(
     // meeting so it fills the viewport. 2+ tiles keep the cap and the tile
     // size is driven by `--tile-w` / `--tile-h` (set above) — see the
     // `tile_count == 1` branch in `container_style`.
-    let container_class = format!("participants-{tile_count}");
+    // Append `has-screen-share` so CSS can re-anchor the decode-paused pill
+    // (issue 1142): in SS mode the controls dock is not the bottom anchor, so
+    // the pill moves to top:12px via `#grid-container.has-screen-share
+    // .decode-paused-pill`. `container_class` is consumed only at the
+    // `#grid-container` `class:` binding below — nothing keys off the exact
+    // string — so appending the modifier is safe.
+    let container_class = if has_screen_share {
+        format!("participants-{tile_count} has-screen-share")
+    } else {
+        format!("participants-{tile_count}")
+    };
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
@@ -4816,6 +5631,33 @@ pub fn AttendantsComponent(
                             avatar_tiles.len()
                         },
                         natural: total_tiles,
+                        on_screen: banner_on_screen,
+                    }
+
+                    // Persistent "N videos paused" pill (#1142 FINAL DESIGN).
+                    // Sibling of the banner. The banner is the onset alert
+                    // (heavily anti-flapped, backs off); the pill is the
+                    // persistent level signpost that holds the affordance for as
+                    // long as tiles are paused. The two never co-exist on screen:
+                    // the pill reads the banner's PUBLISHED on-screen state
+                    // (dismiss-aware) via the shared `banner_on_screen` signal and
+                    // suppresses itself while the banner is actually on screen — so
+                    // when the banner backs off, hides naturally, OR is dismissed
+                    // by the user, the pill takes over the signpost. No shadow
+                    // approximation of the damper. Co-existence is prevented
+                    // immediately (the pill's render gate reads the banner's
+                    // published state reactively, so a banner appearance
+                    // suppresses the pill on the same frame); the reverse takeover
+                    // when the banner hides has up to ~1 s latency from the pill's
+                    // 1 Hz poll — a brief gap, never an overlap.
+                    DecodePausedPill {
+                        avatar_count: if has_screen_share {
+                            ss_avatar_tiles.len()
+                        } else {
+                            avatar_tiles.len()
+                        },
+                        natural: total_tiles,
+                        banner_on_screen: banner_on_screen,
                     }
 
                     if has_screen_share {
@@ -4823,6 +5665,7 @@ pub fn AttendantsComponent(
                         {
                             let left_pct = screen_share_ratio() * 100.0;
                             let right_pct = (1.0 - screen_share_ratio()) * 100.0 - 0.4; // account for handle
+
                             let handle_class = if ss_resizing() {
                                 "screen-share-resize-handle dragging"
                             } else {
@@ -4856,7 +5699,7 @@ pub fn AttendantsComponent(
                                         ss_resizing.set(true);
                                     },
                                 }
-                                // Right panel — CSS flex-wrap panel.
+                                // Right panel — CSS grid via auto-fill (see .ss-peer-panel in style.css).
                                 div {
                                     class: "ss-peer-panel",
                                     style: "width: {right_pct:.2}%;",
@@ -6261,7 +7104,7 @@ fn parse_peer_status_event(
     let mut screen = false;
     for m in &evt.metrics {
         match (m.name, &m.value) {
-            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
             ("audio_enabled", MetricValue::U64(v)) => audio = *v != 0,
             ("video_enabled", MetricValue::U64(v)) => video = *v != 0,
             ("screen_enabled", MetricValue::U64(v)) => screen = *v != 0,
@@ -6291,7 +7134,7 @@ fn parse_speaking_peer(evt: &videocall_diagnostics::DiagEvent) -> Option<String>
     let mut speaking: Option<bool> = None;
     for m in &evt.metrics {
         match (m.name, &m.value) {
-            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+            ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
             ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v),
             ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
             _ => {}

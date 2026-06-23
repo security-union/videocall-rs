@@ -130,6 +130,19 @@ pub fn unistream_ready_stall_count() -> u64 {
     UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed)
 }
 
+/// NETSIM-ONLY: synthetically bump the WT uplink-saturation counter by `n`
+/// (issue #1398). The real increment happens deep inside the `.await`-blocking
+/// media send path on a slow `writer.ready()`, which an e2e test cannot reliably
+/// induce on a localhost loopback. This feature-gated bumper lets the netsim e2e
+/// harness drive the SAME counter the encoders consult, so the mic-side
+/// single-layer audio uplink-distress detector can be exercised deterministically.
+/// Zero production cost: compiled out unless the `netsim` feature is on (the
+/// dioxus-ui e2e build enables it; the production build does not).
+#[cfg(feature = "netsim")]
+pub fn force_unistream_ready_stall(n: u64) {
+    UNISTREAM_READY_STALL_COUNT.fetch_add(n, Ordering::Relaxed);
+}
+
 /// Wall-clock threshold (ms) above which a single `writer.ready().await` on an
 /// established media unistream is counted as a saturation ("slow-ready") event.
 ///

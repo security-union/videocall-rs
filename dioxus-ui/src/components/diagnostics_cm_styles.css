@@ -53,9 +53,9 @@
 .detail-value { font-weight: 600; }
 .server-url { font-family: Menlo, Monaco, 'SF Mono', 'Courier New', monospace; font-size: 11px; background: #1C1C1E; padding: 2px 6px; border-radius: 3px; max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
-.connection-type { padding: 2px 8px; border-radius: 4px; font-size: 11px; }
-.type-websocket { background: #1C1C1E; color: #0A84FF; border: 1px solid #38383A; }
-.type-webtransport { background: #1C1C1E; color: #0A84FF; border: 1px solid #38383A; }
+/* `.connection-type` / `.type-websocket` / `.type-webtransport` lifted to global
+ * scope in static/style.css (issue 551 / issue 552). Defined once there now;
+ * removed from this inline block to drop the duplicate, document-leaking copy. */
 
 .rtt-value { padding: 2px 6px; border-radius: 3px; font-size: 11px; font-weight: 600; }
 /* @token-exempt: pre-existing CM dark-surface chip chrome (same literals as the

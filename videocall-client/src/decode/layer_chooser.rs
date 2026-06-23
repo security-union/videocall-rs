@@ -809,11 +809,26 @@ pub fn quality_state(layer_index: u32, full_ladder_len: u32) -> QualityState {
 /// informative attribution, then your network, then the sender). Concretely:
 ///   * **Setting** — `user_max == Some(m)`, `m < full_ladder_top`, and `sel == m`
 ///     (your own cap is what's holding you down).
-///   * **Network** — `constrained` AND `sel < avail_top` (downlink is holding you
-///     below what the sender offers).
-///   * **Sender** — `avail_top < full_ladder_top` AND `sel == avail_top` (you're
-///     taking everything offered; the sender just isn't publishing higher). A
-///     non-simulcast peer (`avail_top == 0`) decoded at base lands here.
+///   * **Network** — `constrained` AND `sel < full_ladder_top` (the chooser is
+///     ACTIVELY holding `sel` below the achievable top because of observed
+///     downlink congestion, so YOUR network is the proximate cause). We test
+///     against `full_ladder_top`, NOT `avail_top`, on purpose (issue #1553): when
+///     the receiver is constrained it stops PULLING the higher layers, the relay
+///     stops forwarding them to this receiver, and so `avail_top`
+///     (`highest_available` = highest layer OBSERVED arriving recently) decays
+///     toward `sel`. The old `sel < avail_top` test therefore went FALSE the
+///     moment `avail_top` collapsed to `sel` and fell through to **Sender**,
+///     falsely blaming the publisher for the receiver's OWN downlink constraint.
+///     `avail_top` is not a trustworthy proxy for "what the sender publishes"
+///     precisely WHEN the receiver is constrained. The `constrained` flag is the
+///     reliable disambiguator: it is held true only while the chooser is actively
+///     downlink-limited and is cleared the moment `current` reaches the offered
+///     ceiling (`choose`), so a genuine sender limit never reads `constrained`.
+///   * **Sender** — `constrained == false`, `avail_top < full_ladder_top`, AND
+///     `sel == avail_top` (you're NOT downlink-limited, you're taking everything
+///     offered, and the sender just isn't publishing higher). A non-simulcast
+///     peer (`avail_top == 0`, `sel == 0`, `constrained == false`) decoded at
+///     base lands here.
 pub fn degrade_reason(
     sel: u32,
     avail_top: u32,
@@ -834,13 +849,24 @@ pub fn degrade_reason(
         return Some(DegradeReason::Setting);
     }
 
-    // Network: the chooser is actively holding below what the sender offers.
-    if constrained && sel < avail_top {
+    // Network: the chooser is ACTIVELY holding `sel` below the achievable top
+    // because of observed downlink congestion (issue #1553). We test against
+    // `full_ladder_top`, NOT `avail_top`: when this receiver is constrained it
+    // stops pulling the higher layers, so `avail_top` (= highest layer recently
+    // OBSERVED) decays toward `sel`. The old `sel < avail_top` went false the
+    // instant `avail_top` collapsed to `sel` and mis-attributed to Sender —
+    // falsely blaming the publisher for the receiver's OWN downlink limit. The
+    // `constrained` flag (cleared the moment we reach the offered ceiling) is the
+    // reliable signal that the receiver's network is the proximate cause.
+    if constrained && sel < full_ladder_top {
         return Some(DegradeReason::Network);
     }
 
-    // Sender: you're taking everything offered and the sender isn't publishing
-    // higher (covers non-simulcast peers where avail_top == 0 and sel == 0).
+    // Sender: you are NOT downlink-constrained, you're taking everything offered,
+    // and the sender isn't publishing higher (covers non-simulcast peers where
+    // avail_top == 0 and sel == 0). The `constrained` check above already owns the
+    // receiver-limited case, so reaching here means avail_top is a trustworthy
+    // proxy for the sender's actual top.
     if avail_top < full_ladder_top && sel == avail_top {
         return Some(DegradeReason::Sender);
     }
@@ -1998,6 +2024,65 @@ mod tests {
             degrade_reason(0, 0, 2, Some(1), false),
             Some(DegradeReason::Sender),
             "sel below the user cap with a base-only sender must attribute Sender, not Setting"
+        );
+    }
+
+    #[test]
+    fn degrade_reason_collapsed_avail_top_while_constrained_is_network_not_sender() {
+        // PINS the issue #1553 fix. The exact field-reported misattribution: a
+        // receiver in a busy meeting congests on its OWN downlink, so its chooser
+        // holds at base (sel == 0) AND marks itself `constrained`. Because it stops
+        // pulling the higher layers, the relay stops forwarding them to this
+        // receiver and `avail_top` (= highest layer OBSERVED arriving recently)
+        // decays all the way down to 0 — collapsing to equal `sel`.
+        //
+        // Under the OLD `constrained && sel < avail_top` test this went false
+        // (0 < 0 is false) and fell through to the Sender branch
+        // (avail_top 0 < full_top 2 && sel 0 == avail_top 0 → true), FALSELY
+        // blaming the publisher for the receiver's own downlink limit. The fix
+        // tests `constrained && sel < full_ladder_top` (0 < 2 → true), so this is
+        // correctly attributed to the receiver's network.
+        //
+        // This test FAILS (reverts to Sender) if the Network branch is changed back
+        // to `sel < avail_top`.
+        assert_eq!(
+            degrade_reason(0, 0, 2, None, true),
+            Some(DegradeReason::Network),
+            "constrained receiver pinned to base with a collapsed avail_top is Network, not Sender"
+        );
+
+        // The same shape one rung up: held at sel == 1 by congestion with avail_top
+        // also collapsed to 1, below the full top 2 → still the receiver's network.
+        assert_eq!(
+            degrade_reason(1, 1, 2, None, true),
+            Some(DegradeReason::Network),
+            "constrained hold at sel==avail_top below the full top is Network, not Sender"
+        );
+    }
+
+    #[test]
+    fn degrade_reason_genuine_sender_limit_at_sel_eq_avail_top_unconstrained_is_sender() {
+        // The COUNTERWEIGHT to the #1553 fix: a genuinely sender-limited stream
+        // must stay Sender so the fix does not over-attribute to Network. The
+        // receiver is NOT downlink-limited (`constrained == false`), it is taking
+        // everything the sender offers (`sel == avail_top`), and the sender simply
+        // isn't publishing higher (`avail_top < full_ladder_top`). Per the chooser
+        // lifecycle, `constrained` is cleared the moment `current` reaches the
+        // offered ceiling, so a genuine sender limit always presents as
+        // `constrained == false` here — the new Network branch never fires for it.
+        //
+        // This test FAILS if the Network branch is made to ignore `constrained`
+        // (e.g. firing on `sel < full_ladder_top` alone): it would steal this case.
+        assert_eq!(
+            degrade_reason(1, 1, 2, None, false),
+            Some(DegradeReason::Sender),
+            "unconstrained receiver at sel==avail_top below the full top is Sender, not Network"
+        );
+        // Base-only (non-simulcast) variant of the same: still Sender.
+        assert_eq!(
+            degrade_reason(0, 0, 2, None, false),
+            Some(DegradeReason::Sender),
+            "unconstrained base-only reception is Sender, not Network"
         );
     }
 

@@ -506,15 +506,20 @@ impl NetEq {
 
     fn get_decision(&mut self) -> Result<Operation> {
         // Update buffer level filter first
-        let current_buffer_samples = self.current_buffer_size_samples();
+        let current_buffer_samples = self.current_buffer_size_samples_per_channel();
         let target_delay_ms: u32 = self.delay_manager.target_delay_ms();
 
         // Filter buffer level like WebRTC's FilterBufferLevel method
         self.buffer_level_filter
             .set_target_buffer_level(target_delay_ms);
 
-        self.buffer_level_filter
-            .update(current_buffer_samples, -self.timestretch_added_samples);
+        if self.buffer_level_filter.filtered_current_level() == 0 && current_buffer_samples > 0 {
+            self.buffer_level_filter
+                .set_filtered_buffer_level(current_buffer_samples);
+        } else {
+            self.buffer_level_filter
+                .update(current_buffer_samples, -self.timestretch_added_samples);
+        }
 
         // Reset for next frame (matches WebRTC decision_logic.cc:245-246)
         self.timestretch_added_samples = 0;
@@ -541,8 +546,11 @@ impl NetEq {
             return Ok(Operation::Expand);
         }
 
-        if current_buffer_samples < self.output_frame_size_samples * 3 / 2
-            && current_buffer_samples >= self.output_frame_size_samples / 2
+        let output_frame_size_samples_per_channel =
+            self.output_frame_size_samples / self.config.channels as usize;
+
+        if current_buffer_samples < output_frame_size_samples_per_channel * 3 / 2
+            && current_buffer_samples >= output_frame_size_samples_per_channel / 2
             && self.consecutive_expands == 0
         {
             self.consecutive_expands = self.consecutive_expands.saturating_add(1);
@@ -550,7 +558,7 @@ impl NetEq {
         }
 
         // Check if we have packets
-        if current_buffer_samples < self.output_frame_size_samples {
+        if current_buffer_samples < output_frame_size_samples_per_channel {
             self.consecutive_expands = self.consecutive_expands.saturating_add(1);
             return Ok(Operation::Expand);
         }
@@ -569,18 +577,18 @@ impl NetEq {
         let buffer_level_samples = self.buffer_level_filter.filtered_current_level();
 
         // Fast accelerate: 4x high limit (aggressive acceleration for large buffers)
-        if buffer_level_samples >= (high_limit << 2) as usize {
+        if buffer_level_samples > (high_limit << 2) as usize {
             return Ok(Operation::FastAccelerate);
         }
 
         // Normal accelerate: at high limit
-        if buffer_level_samples >= high_limit as usize {
+        if buffer_level_samples > high_limit as usize {
             return Ok(Operation::Accelerate);
         }
 
         // Preemptive expand: below low limit (requires ~30ms of audio)
         if buffer_level_samples < low_limit as usize
-            && current_buffer_samples >= self.output_frame_size_samples * 3
+            && current_buffer_samples >= output_frame_size_samples_per_channel * 3
         {
             return Ok(Operation::PreemptiveExpand);
         }
@@ -701,14 +709,17 @@ impl NetEq {
             let mut extended_frame = AudioFrame::new(
                 self.config.sample_rate,
                 self.config.channels,
-                required_samples,
+                required_samples / self.config.channels as usize,
             );
 
             self.decode_normal(&mut extended_frame)?;
 
             // Will output up to 30ms output
-            let mut output =
-                AudioFrame::new(self.config.sample_rate, self.config.channels, output_len);
+            let mut output = AudioFrame::new(
+                self.config.sample_rate,
+                self.config.channels,
+                output_len / self.config.channels as usize,
+            );
 
             // Apply accelerate algorithm
             let _result =
@@ -897,7 +908,7 @@ impl NetEq {
     pub fn current_buffer_size_ms(&self) -> u32 {
         // Use total content duration instead of timestamp span
         // This handles cases where packets have close/identical timestamps
-        self.current_buffer_size_samples() as u32 * 1000 / self.config.sample_rate
+        self.current_buffer_size_samples_per_channel() as u32 * 1000 / self.config.sample_rate
     }
 
     /// Get current buffer size in samples
@@ -905,6 +916,11 @@ impl NetEq {
         self.packet_buffer.num_samples_in_buffer()
             + self.leftover_samples.len()
             + self.leftover_time_stretched_samples.len()
+    }
+
+    /// Get current buffer size in samples per channel.
+    fn current_buffer_size_samples_per_channel(&self) -> usize {
+        self.current_buffer_size_samples() / self.config.channels as usize
     }
 
     /// Register a decoder for a given RTP payload type.
@@ -949,6 +965,20 @@ mod tests {
         AudioPacket::new(header, payload, 16000, 1, duration_ms)
     }
 
+    fn create_stereo_test_packet(seq: u16, ts: u32, duration_ms: u32) -> AudioPacket {
+        let header = RtpHeader::new(seq, ts, 12345, 96, false);
+        let samples_per_channel = (16000 * duration_ms / 1000) as usize;
+        let mut payload = Vec::new();
+        for i in 0..samples_per_channel {
+            let t = i as f32 / 16000.0;
+            let left = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.1;
+            let right = (2.0 * std::f32::consts::PI * 660.0 * t).sin() * 0.1;
+            payload.extend_from_slice(&left.to_le_bytes());
+            payload.extend_from_slice(&right.to_le_bytes());
+        }
+        AudioPacket::new(header, payload, 16000, 2, duration_ms)
+    }
+
     #[test]
     fn test_neteq_creation() {
         let config = NetEqConfig::default();
@@ -967,6 +997,38 @@ mod tests {
         neteq.insert_packet(packet).unwrap();
 
         assert!(!neteq.is_empty());
+    }
+
+    #[test]
+    fn test_stereo_buffer_duration_uses_samples_per_channel() {
+        let config = NetEqConfig {
+            channels: 2,
+            ..Default::default()
+        };
+        let mut neteq = NetEq::new(config).unwrap();
+
+        neteq
+            .insert_packet(create_stereo_test_packet(1, 0, 20))
+            .unwrap();
+
+        assert_eq!(neteq.current_buffer_size_samples(), 640);
+        assert_eq!(neteq.current_buffer_size_ms(), 20);
+    }
+
+    #[test]
+    fn test_first_decision_with_target_buffer_is_normal() {
+        let config = NetEqConfig::default();
+        let mut neteq = NetEq::new(config).unwrap();
+
+        for i in 0..4 {
+            neteq
+                .insert_packet(create_test_packet(i, i as u32 * 320, 20))
+                .unwrap();
+        }
+
+        let _ = neteq.get_audio().unwrap();
+
+        assert_eq!(neteq.last_operation, Operation::Normal);
     }
 
     #[test]
@@ -1131,12 +1193,16 @@ mod tests {
 
         // With the fix, buffer should stay reasonable (around 12 packets = ~240ms)
         // Allow some margin but ensure it's nowhere near the old 60 packets (~1200ms)
-        assert!(buffer_after_late_join <= 500,
-                "Buffer should not accumulate excessively after late peer join. Got {buffer_after_late_join}ms, expected ≤500ms");
+        assert!(
+            buffer_after_late_join <= 500,
+            "Buffer should not accumulate excessively after late peer join. Got {buffer_after_late_join}ms, expected ≤500ms"
+        );
 
         // More importantly, ensure it's significantly better than the old behavior (60 packets = 1200ms)
-        assert!(buffer_after_late_join <= 600,
-                "REGRESSION DETECTION: Buffer accumulated {buffer_after_late_join}ms, this exceeds acceptable threshold and may indicate the old 60-packet bug has returned");
+        assert!(
+            buffer_after_late_join <= 600,
+            "REGRESSION DETECTION: Buffer accumulated {buffer_after_late_join}ms, this exceeds acceptable threshold and may indicate the old 60-packet bug has returned"
+        );
 
         // Pull several audio frames and verify NetEQ handles the situation gracefully
         let mut total_operations = std::collections::HashMap::new();
@@ -1172,8 +1238,10 @@ mod tests {
         // Verify that NetEQ used acceleration to handle the large buffer
         // This confirms the fix is working - old code wouldn't accelerate enough
         let accelerate_count = total_operations.get("Accelerate").copied().unwrap_or(0);
-        assert!(accelerate_count > 0,
-                "NetEQ should have used acceleration to handle late-joining peer scenario. Operations: {total_operations:?}");
+        assert!(
+            accelerate_count > 0,
+            "NetEQ should have used acceleration to handle late-joining peer scenario. Operations: {total_operations:?}"
+        );
 
         // Final buffer should be reasonable
         let final_buffer = neteq.current_buffer_size_ms();

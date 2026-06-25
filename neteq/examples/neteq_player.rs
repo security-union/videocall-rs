@@ -188,12 +188,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n.register_decoder(111, Box::new(OpusDecoder::new(sample_rate, channels)?));
     }
 
-    // ── Warm-start NetEq with a few packets before audio begins ─────────────
-    let warmup_packets = 25; // 25 × 20 ms = 500 ms - increased for better stability
-
     // Packet parameters
     let samples_per_channel_20ms = (sample_rate as f32 * 0.02) as usize;
     let packet_samples = samples_per_channel_20ms * channels as usize;
+    let packet_duration_ms = 20_u32;
+
+    // ── Warm-start NetEq to its initial target before audio begins ──────────
+    //
+    // NetEq starts with an 80 ms target delay unless a larger minimum delay is
+    // requested. Prebuffering much more than that makes the first playout
+    // decisions immediately time-compress a large queue, which is audible as a
+    // short startup bounce.
+    let warmup_delay_ms = args.min_delay_ms.max(80);
+    let warmup_packets = warmup_delay_ms.div_ceil(packet_duration_ms) as usize;
+    log::info!(
+        "Warm-starting NetEq with {warmup_packets} packets ({} ms)",
+        warmup_packets as u32 * packet_duration_ms
+    );
 
     let mut seq_no: u16 = 0;
     let mut timestamp: u32 = 0;
@@ -217,7 +228,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             encoded.truncate(bytes_written as usize);
             let payload = encoded;
             let hdr = RtpHeader::new(seq_no, timestamp, ssrc, 111, false);
-            let packet = AudioPacket::new(hdr, payload, sample_rate, channels, 20);
+            let packet = AudioPacket::new(hdr, payload, sample_rate, channels, packet_duration_ms);
             if let Ok(mut n) = neteq.lock() {
                 let _ = n.insert_packet(packet);
             }
@@ -380,7 +391,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         loop {
             let loop_start = Instant::now();
             for idx in 0..total_remaining_chunks {
-                let packet_start_time = loop_start + Duration::from_millis(idx as u64 * 20);
+                let packet_start_time =
+                    loop_start + Duration::from_millis(idx as u64 * packet_duration_ms as u64);
 
                 let start = idx * packet_samples;
                 let chunk = &remaining_samples[start..start + packet_samples];
@@ -390,7 +402,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .expect("Opus encode");
                 encoded.truncate(bytes_written as usize);
                 let hdr = RtpHeader::new(loc_seq_no, loc_timestamp, ssrc, 111, false);
-                let packet = AudioPacket::new(hdr, encoded, sample_rate, channels, 20);
+                let packet =
+                    AudioPacket::new(hdr, encoded, sample_rate, channels, packet_duration_ms);
 
                 // More precise timing - sleep until the exact time this packet should be sent
                 let now = Instant::now();
@@ -456,7 +469,7 @@ fn start_audio_playback(
     // Request a fixed 10 ms buffer size per callback, based on chosen rate.
     let frames_per_buffer = cfg.sample_rate.0 / 100; // 10 ms worth
     cfg.buffer_size = BufferSize::Fixed(frames_per_buffer);
-    cfg.channels = 1; // mono output
+    cfg.channels = channels as u16;
 
     log::info!(
         "Final stream config - sample_rate={} buffer_size={:?}",

@@ -58,15 +58,24 @@ impl Accelerate {
             _sample_rate: sample_rate,
             _channels: channels,
             used_input_samples: 0,
-            overlap_length: Self::calculate_overlap_length(sample_rate),
+            overlap_length: Self::calculate_overlap_length(sample_rate, channels),
             _max_change_rate: 0.25, // Maximum 25% reduction
             low_energy_threshold: 0.0001,
         }
     }
 
-    fn calculate_overlap_length(sample_rate: u32) -> usize {
+    fn calculate_overlap_length(sample_rate: u32, channels: u8) -> usize {
         // Calculate overlap length based on sample rate (typically 4-6ms)
-        ((sample_rate as f32 * 0.003) as usize).max(32) // Minimum 32 samples
+        let channel_count = channels as usize;
+        ((sample_rate as f32 * 0.003) as usize).max(32) * channel_count
+    }
+
+    fn channel_count(&self) -> usize {
+        self._channels as usize
+    }
+
+    fn align_to_channel_frame(&self, samples: usize) -> usize {
+        samples - samples % self.channel_count()
     }
 
     /// Accelerate the audio by removing samples
@@ -125,6 +134,14 @@ impl Accelerate {
             );
         }
 
+        best_pos = self.align_to_channel_frame(best_pos);
+        samples_to_remove = self.align_to_channel_frame(samples_to_remove);
+        if samples_to_remove < self.overlap_length {
+            output.copy_from_slice(&input[..output.len()]);
+            self.used_input_samples = output.len();
+            return TimeStretchResult::NoStretch;
+        }
+
         let usable_input = &input[..output.len() + samples_to_remove];
 
         // original samples: 12346789
@@ -170,7 +187,12 @@ impl Accelerate {
         let max_remove = (output.len() as f32 * acceleration_factor) as usize;
         let max_remove = max_remove.min(output.len() / 2); // Don't remove more than 1/3 of input (= 1/2 of output)
         let max_remove = max_remove.min(input.len() - output.len());
-        max_remove.max(self.overlap_length)
+        let max_remove = self.align_to_channel_frame(max_remove);
+        if max_remove < self.overlap_length {
+            0
+        } else {
+            max_remove
+        }
     }
 
     fn find_low_energy_to_remove(
@@ -203,7 +225,10 @@ impl Accelerate {
             return (0, 0);
         }
 
-        (best_pos, samples_to_remove)
+        (
+            self.align_to_channel_frame(best_pos),
+            self.align_to_channel_frame(samples_to_remove),
+        )
     }
 
     fn calculate_energy(&self, samples: &[f32]) -> f32 {
@@ -333,14 +358,23 @@ impl PreemptiveExpand {
             _sample_rate: sample_rate,
             _channels: channels,
             used_input_samples: 0,
-            overlap_length: Self::calculate_overlap_length(sample_rate),
+            overlap_length: Self::calculate_overlap_length(sample_rate, channels),
             corr_threshold: 0.99,
         }
     }
 
-    fn calculate_overlap_length(sample_rate: u32) -> usize {
+    fn calculate_overlap_length(sample_rate: u32, channels: u8) -> usize {
         // Calculate overlap length based on sample rate (typically 4-6ms)
-        ((sample_rate as f32 * 0.003) as usize).max(32) // Minimum 32 samples
+        let channel_count = channels as usize;
+        ((sample_rate as f32 * 0.003) as usize).max(32) * channel_count
+    }
+
+    fn channel_count(&self) -> usize {
+        self._channels as usize
+    }
+
+    fn align_to_channel_frame(&self, samples: usize) -> usize {
+        samples - samples % self.channel_count()
     }
 
     /// Expand the audio by duplicating/stretching samples
@@ -376,7 +410,7 @@ impl PreemptiveExpand {
         let mut best_corr = -1.0f32;
         let mut best_pos = 0;
         let mut best_add_len = 0;
-        for add_len in self.overlap_length..max_add {
+        for add_len in (self.overlap_length..max_add).step_by(self.channel_count()) {
             let correlation_len = output.len() - add_len * 2;
             let (pos, corr) = crate::signal::best_normalized_correlation(
                 &input[add_len..correlation_len + add_len],
@@ -385,7 +419,7 @@ impl PreemptiveExpand {
             );
             if corr > best_corr {
                 best_corr = corr;
-                best_pos = pos;
+                best_pos = self.align_to_channel_frame(pos);
                 best_add_len = add_len;
             }
         }
@@ -505,6 +539,26 @@ mod tests {
         assert!(accelerate.get_used_input_samples() > 0);
         // Output should be shorter than used samples
         assert!(output.len() < accelerate.get_used_input_samples());
+    }
+
+    #[test]
+    fn test_stereo_accelerate_preserves_channel_frame_alignment() {
+        let mut accelerate = Accelerate::new(48000, 2);
+        let mut input = Vec::new();
+        for i in 0..4800 {
+            let t = i as f32 / 48000.0;
+            input.push((2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5);
+            input.push((2.0 * std::f32::consts::PI * 660.0 * t).sin() * 0.5);
+        }
+        let mut output = vec![0.0; 2880];
+
+        let result = accelerate.process(&input, &mut output, true);
+
+        assert!(matches!(
+            result,
+            TimeStretchResult::Success | TimeStretchResult::SuccessLowEnergy
+        ));
+        assert_eq!(accelerate.get_used_input_samples() % 2, 0);
     }
 
     #[test]

@@ -359,3 +359,102 @@ pub async fn transfer_host(
 
     Ok(Json(APIResponse::ok(())))
 }
+
+/// Max accepted `user_id` length on host endpoints.
+const MAX_USER_ID_LEN: usize = 254;
+
+/// `POST /api/v1/meetings/{meeting_id}/transfer-host`.
+///
+/// Atomically promotes the target and demotes the issuing host in a single DB
+/// transaction — the only sanctioned self-demotion. If the target is not an
+/// admitted participant the transaction rolls back and the caller keeps host
+/// (so the meeting is never left without a successor).
+///
+/// Event ordering: `HOST_GRANTED(target)` is published BEFORE
+/// `HOST_REVOKED(caller)` so no client ever observes a transient hostless gap.
+pub async fn transfer_host(
+    State(state): State<AppState>,
+    AuthUser { user_id, .. }: AuthUser,
+    Path(meeting_id): Path<String>,
+    Json(body): Json<TransferHostRequest>,
+) -> Result<Json<APIResponse<()>>, AppError> {
+    let meeting = db_meetings::get_by_room_id(&state.db, &meeting_id)
+        .await?
+        .ok_or_else(|| AppError::meeting_not_found(&meeting_id))?;
+    if meeting.state.as_deref() == Some("ended") {
+        return Err(AppError::meeting_not_found(&meeting_id));
+    }
+    require_host(&state, meeting.id, &user_id).await?;
+
+    if body.user_id.is_empty() {
+        return Err(AppError::bad_request("user_id must not be empty"));
+    }
+    if body.user_id.len() > MAX_USER_ID_LEN {
+        return Err(AppError::bad_request("user_id too long"));
+    }
+    if body.user_id == user_id {
+        return Err(AppError::bad_request("cannot transfer host to yourself"));
+    }
+    if body.user_id.starts_with(GUEST_USER_ID_PREFIX) {
+        return Err(AppError::bad_request(
+            "cannot transfer host to a guest participant",
+        ));
+    }
+
+    let transferred =
+        db_participants::transfer_host(&state.db, meeting.id, &user_id, &body.user_id)
+            .await
+            .map_err(|e| {
+                tracing::error!(
+                    "DB transfer_host failed from {user_id} to {} in room {meeting_id}: {e}",
+                    body.user_id
+                );
+                AppError::internal("failed to transfer host")
+            })?;
+    if transferred.is_none() {
+        return Err(AppError::bad_request(
+            "target is not an admitted participant",
+        ));
+    }
+
+    // Promotion event first so no client observes a transient hostless gap.
+    if let Err(e) =
+        nats_events::publish_host_granted(state.nats.as_ref(), &meeting_id, &body.user_id, &user_id)
+            .await
+    {
+        tracing::error!(
+            "NATS publish failed for HOST_GRANTED (transfer) in room {meeting_id}: {e}"
+        );
+    }
+    if let Err(e) =
+        nats_events::publish_host_revoked(state.nats.as_ref(), &meeting_id, &user_id, &user_id)
+            .await
+    {
+        tracing::error!(
+            "NATS publish failed for HOST_REVOKED (transfer) in room {meeting_id}: {e}"
+        );
+    }
+
+    // Two internal fanout events so chat_server updates both users' cached
+    // is_host flags across all sessions: target true, caller false.
+    nats_events::publish_internal_host_change(
+        state.nats.as_ref(),
+        &nats_events::MeetingHostChangePayload {
+            room_id: meeting_id.clone(),
+            user_id: body.user_id.clone(),
+            is_host: true,
+        },
+    )
+    .await;
+    nats_events::publish_internal_host_change(
+        state.nats.as_ref(),
+        &nats_events::MeetingHostChangePayload {
+            room_id: meeting_id.clone(),
+            user_id: user_id.clone(),
+            is_host: false,
+        },
+    )
+    .await;
+
+    Ok(Json(APIResponse::ok(())))
+}

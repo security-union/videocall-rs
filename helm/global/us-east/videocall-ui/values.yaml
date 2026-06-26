@@ -29,9 +29,6 @@ videocall-ui:
     e2eeEnabled: "false"
     webTransportEnabled: "true"
     transportBadgeEnabled: "false"
-    # Issue #1480: FAIL-CLOSED git-info gate. "false" HIDES commit SHA + branch
-    # in production (us-east). See base chart values.yaml for details.
-    showBuildGitInfo: "false"
     usersAllowedToStream: ""
     serverElectionPeriodMs: 2000
     audioBitrateKbps: 16

@@ -71,9 +71,9 @@ use sec_api::metrics::{
     PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER, RTT_PROBE_DROPPED_TOTAL,
     RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
     SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
-    VIDEO_BITRATE_KBPS, VIDEO_FPS, VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS,
-    VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE,
-    VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
+    VIDEO_BITRATE_KBPS, VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
+    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
+    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -504,6 +504,7 @@ fn remove_per_peer_metrics(
     let _ = VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
+    let _ = VIDEO_CONTENT_STALENESS_MS.remove_label_values(&labels);
     let _ = VIDEO_SKIP_TO_LIVE_TOTAL.remove_label_values(&labels);
     let _ = KEYFRAME_REQUESTS_PER_SEC.remove_label_values(&labels);
     let _ = CALL_QUALITY_SCORE.remove_label_values(&labels);
@@ -1594,6 +1595,16 @@ fn process_health_packet_to_metrics_pb(
                     VIDEO_PLAYOUT_PAINT_LAG_MS
                         .with_label_values(&peer_labels)
                         .set(video_stats.playout_paint_lag_ms);
+                    // Content staleness (#1641): the AGE of the video content being painted, as
+                    // distinct from the queue-DEPTH gauges above. Set UNCONDITIONALLY (same
+                    // recover-to-0 rationale as the playout gauges): the client reports a nonzero
+                    // value only while fps_received > 0, so a paused/hidden tile reads 0 here rather
+                    // than a stale latch. UNBOUNDED (unlike playout_latency_ms's 1800ms cap) — this
+                    // is the gauge that exposes the #1631 M2 minutes-of-lag a draining-stale stream
+                    // hides from paint_lag.
+                    VIDEO_CONTENT_STALENESS_MS
+                        .with_label_values(&peer_labels)
+                        .set(video_stats.content_staleness_ms);
                     // Resync-to-live governor skips (#1252): cumulative COUNTER value held in a
                     // gauge. Set UNCONDITIONALLY (same recover-to-0 pattern as the gauges above): the
                     // client folds this field unconditionally, so an absent/idle stream reports its
@@ -2362,6 +2373,60 @@ mod tests {
                 ("to_peer", "bob")
             ]
         ));
+    }
+
+    #[test]
+    fn test_content_staleness_metric_export_is_unbounded() {
+        // Regression test for #1641 (epic #1636 Phase 2). The producer reports
+        // VideoStats.content_staleness_ms — the AGE of the painted video content — and the metrics
+        // server must export it as videocall_video_content_staleness_ms. This is the gauge that
+        // exposes the #1631 M2 failure mode (video lagged by minutes while playout_latency_ms read
+        // ~0): it is UNBOUNDED, unlike the 1800ms-capped playout_latency_ms. Reverting the
+        // VIDEO_CONTENT_STALENESS_MS `.set(...)` export line makes gauge_value() return None and
+        // breaks this test — that is the mutation sensitivity CLAUDE.md requires.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // Active tile (fps_received > 0) painting content that is 5000ms (5s) stale — a value well
+        // above playout_latency_ms's 1800ms client-side cap, proving this gauge is UNBOUNDED.
+        let mut vs = PbVideoStats::new();
+        vs.fps_received = 24.0;
+        vs.content_staleness_ms = 5000.0;
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.video_stats = ::protobuf::MessageField::some(vs);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_cs_1641".to_string(), ps);
+
+        let hp =
+            create_test_health_packet("sess_cs_1641", "meet_cs_1641", "alice_cs_1641", peer_stats);
+
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        // from_peer = reporter (the health-packet's reporting_user_id);
+        // to_peer = the peer being reported on (the peer_stats map key). Mirrors
+        // test_peer_enabled_and_video_buffered_metrics_export's alice(reporter)/bob(peer) mapping.
+        assert_eq!(
+            gauge_value(
+                "videocall_video_content_staleness_ms",
+                &[
+                    ("meeting_id", "meet_cs_1641"),
+                    ("session_id", "sess_cs_1641"),
+                    ("from_peer", "alice_cs_1641"),
+                    ("to_peer", "bob_cs_1641"),
+                ],
+            ),
+            Some(5000.0),
+            "the VIDEO_CONTENT_STALENESS_MS export path must run and set the unbounded (>1800ms) \
+             content age; None here means the .set(video_stats.content_staleness_ms) line is missing"
+        );
     }
 
     #[test]

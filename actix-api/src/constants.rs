@@ -270,6 +270,146 @@ pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 /// it to an env-resolved getter mirroring [`wt_outbound_channel_capacity`].
 pub const WT_DATAGRAM_CHANNEL_CAPACITY: usize = 512;
 
+/// Grace period a write onto the persistent server→client WebTransport uni
+/// stream may stay parked **while the outbound channel is backed up** before the
+/// writer sheds the wedged stream (issue #1638 — "#979 part 2": bound the
+/// WRITER, but ONLY when real backpressure is present).
+///
+/// ## The defect the shed bounds — and the defect the v1 shed CAUSED
+///
+/// `spawn_unistream_writer` (`webtransport/bridge.rs`) owns the single
+/// persistent uni stream and drains the 512-deep `unistream_tx` channel with
+/// back-to-back `stream.write_all().await` calls. Those writes are subject to
+/// QUIC per-stream flow control: when a slow receiver stops granting credits
+/// (a downlink stall), `write_all` PARKS. The writer task is the channel's only
+/// consumer, so while it is parked the 512-slot channel fills and `try_send`
+/// starts returning `Full` (`wt_chat_session.rs`) — and at that point media
+/// drops for EVERY publisher targeting that one receiver. #979 deliberately
+/// keeps the channel SHALLOW (512) so a stall fails fast rather than hoarding
+/// stale frames; the shed is the matching bound on the WRITER so a single wedged
+/// receiver sheds (via stream reset+reopen) instead of holding the channel full
+/// indefinitely.
+///
+/// The FIRST cut of this fix bounded each write with a bare per-frame
+/// `tokio::time::timeout(.., write_all)` on WALL-CLOCK. That conflated two
+/// distinct causes of "this write did not finish in N ms": (1) the receiver's
+/// downlink is flow-control-stalled (the thing to shed), and (2) the relay's
+/// single-threaded runtime simply did not POLL the write future in time because
+/// the one thread was CPU/scheduling-starved.
+///
+/// Cause (2) is NOT congestion — credits may be available; the executor was just
+/// busy. Resetting on cause (2) sheds a perfectly HEALTHY low-traffic stream and
+/// drops its in-flight frame. That regression is observable: it failed
+/// `webtransport::tests::test_lobby_isolation` (a few-frames-of-traffic stream)
+/// under the test runner's CPU starvation. So the shed must be gated on the
+/// GENUINE congestion signal — the outbound channel actually backing up — NOT on
+/// wall-clock elapsed on a single write.
+///
+/// ## How this grace is now used (see `spawn_unistream_writer`)
+///
+/// The writer polls each `write_all` against a periodic tick
+/// ([`WT_UNISTREAM_BACKPRESSURE_POLL`]). It maintains a "stalled-while-backed-up"
+/// accumulator that advances ONLY on ticks where the outbound channel is at or
+/// above [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] full (real backpressure: the
+/// parked writer is starving publishers). The stream is sheds only once that
+/// accumulator reaches THIS grace. On any tick where the channel is below the
+/// ratio (healthy / draining) the accumulator RESETS — so a write that is merely
+/// slow to be polled, on a stream whose channel is not backing up, can NEVER
+/// trip the shed no matter how long the executor starves it. The shed fires iff
+/// the channel is genuinely wedging because the receiver isn't draining.
+///
+/// ## Why 1000 ms
+///
+/// The grace must straddle two requirements:
+///
+/// * **Long enough not to falsely reset a bursty-but-recovering link.** On a
+///   200 ms+ high-latency path, a single `write_all` for a large keyframe can
+///   legitimately take several RTTs while the receiver drains a transient
+///   backlog and re-grants credits. At 30 fps the frame cadence is ~33 ms, so
+///   1000 ms is ~30 frame intervals of slack — comfortably more than a healthy
+///   high-RTT link needs to clear a normal jitter burst, so we do NOT reset a
+///   stream that is merely slow-and-recovering (a needless reset throws away an
+///   in-flight frame and costs a fresh-stream round trip).
+/// * **Short enough that a genuinely stalled receiver cannot pin the channel
+///   full for multiple seconds.** Under a 4-publisher fan-in the channel can
+///   refill in ~4 s once the single writer parks; a grace of 1 s of
+///   continuous backpressure caps the head-of-line stall to ~1 s (plus at most
+///   one poll interval) before the writer sheds and resumes draining the next
+///   frame onto a fresh stream, well under that floor.
+///
+/// We deliberately pin it to [`CONGESTION_WINDOW`] (1000 ms) — the same window
+/// the relay already uses to decide a receiver is congested. A write that has
+/// not completed within one congestion window WHILE THE CHANNEL IS BACKED UP is,
+/// by the relay's own existing definition of congestion, a stalled (not merely
+/// jittery) stream, so resetting it is consistent with the rest of the
+/// congestion machinery. It sits below [`KEYFRAME_CONGESTION_RELAX_WINDOW`] (2 s)
+/// and well below [`RECEIVER_DOWNLINK_RELIEF_WINDOW`] (8 s), so the writer sheds
+/// a wedged stream before those longer recovery windows would even arm.
+pub const WT_UNISTREAM_WRITE_DEADLINE: Duration = Duration::from_millis(1000);
+
+/// Fill ratio of the 512-deep `unistream_tx` channel at or above which the
+/// outbound stream is considered to be under REAL backpressure, arming the
+/// [`WT_UNISTREAM_WRITE_DEADLINE`] shed grace (issue #1638).
+///
+/// This is the gate that prevents the v1 spurious-reset regression. The shed's
+/// stalled-while-backed-up accumulator advances ONLY while the channel depth is
+/// at or above `ceil(max_capacity * this)`; below it the accumulator resets and
+/// a parked write is left to park (executor starvation only delays it, never
+/// resets it). The number that matters is therefore: "is the writer being parked
+/// actually starving publishers?" — answered by the channel filling, the genuine
+/// per-receiver downlink-backpressure surface (#1219's B1 note: the per-session
+/// outbound channel overflow is the real per-receiver signal, NOT a wall-clock
+/// or a mailbox `Full`).
+///
+/// ## Why 0.5
+///
+/// The channel only climbs to and stays near half-full (256+ of 512 frames
+/// queued) when its single consumer — this writer — is parked on a stalled
+/// stream and publishers keep enqueuing faster than it drains. A healthy stream
+/// drains every frame essentially immediately, so its depth hovers at 0–1 and
+/// never approaches this ratio; thus a healthy stream's shed never arms even
+/// under heavy executor starvation. 0.5 is deliberately well ABOVE the noise
+/// floor of a transient burst (a join-fan-out spike spills a few dozen frames
+/// and clears within one drain) yet well BELOW the
+/// [`crate::actors::priority_drop::PRIORITY_DROP_VIDEO_FILL_RATIO`] (0.8) at
+/// which the producer-side policy
+/// begins shedding video — so by the time the channel reaches the priority-drop
+/// zone the writer-shed accumulator is already armed and counting, and the two
+/// backpressure responses compose rather than fight. A sustained ≥50%-full
+/// channel is, unambiguously, a writer that cannot keep up — exactly the
+/// receiver-not-draining condition the shed targets.
+pub const WT_UNISTREAM_BACKPRESSURE_SHED_RATIO: f64 = 0.5;
+
+/// Interval at which `spawn_unistream_writer` re-evaluates whether a parked write
+/// is stalled-while-backed-up (issue #1638).
+///
+/// On each tick the writer samples the outbound channel depth: a tick spent at or
+/// above [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] advances the shed accumulator;
+/// a tick below it resets the accumulator. The poll only runs while a write is
+/// actually parked (it is one arm of a `select!` against the write future).
+///
+/// The interval timer itself is constructed ONCE per writer task — in
+/// `spawn_unistream_writer`, before the drain loop — and the per-frame shed
+/// helper borrows it and `reset()`s it at the start of each call rather than
+/// rebuilding it. So on the fast path (a write that completes promptly) this poll
+/// touches no timer allocation at all: the shared interval's next tick is reset
+/// one period into the future and the write returns before that tick ever arms.
+/// A timer only does work while a write is actually parked.
+///
+/// ## Why 50 ms
+///
+/// 50 ms is fine-grained relative to the 1000 ms shed grace (≈20 samples across
+/// the grace), so the worst-case shed latency overshoot from sampling
+/// granularity is one tick (≤50 ms on top of the 1000 ms grace) — negligible
+/// against the multi-second floor a genuinely wedged channel would otherwise sit
+/// at. It is also coarse enough that the periodic wakeups add no meaningful load:
+/// they only fire while a write is parked, and a parked write means the thread is
+/// otherwise idle on this task anyway. Critically, because the accumulator only
+/// advances on backed-up ticks, a slow/starved poll cadence on a HEALTHY stream
+/// (ticks arriving late, or the channel near-empty) cannot manufacture a false
+/// shed — late ticks on a non-backed-up channel simply reset the accumulator.
+pub const WT_UNISTREAM_BACKPRESSURE_POLL: Duration = Duration::from_millis(50);
+
 // ---------------------------------------------------------------------------
 // Inbound fan-out mailbox headroom (issues #1144 / #1145)
 // ---------------------------------------------------------------------------

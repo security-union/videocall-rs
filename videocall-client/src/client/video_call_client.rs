@@ -853,12 +853,13 @@ fn freshness_skip_within_switch_window(now_ms: u64, last_switch_ms: u64) -> bool
 /// looks up the peer, and if the skip lands within [`POST_SWITCH_WINDOW_MS`] of
 /// that peer's last VIDEO layer switch (Marker 1 stamp), emits a single WARN.
 ///
-/// Identity note (load-bearing): the worker's freshness_skip carries
-/// `from_peer` = the LOCAL reporting user id (passed as `userid` into
-/// `PeerDecodeManager::decode`) and `to_peer` = the REMOTE source peer's
-/// `session_id` string (`Peer::sid_str`, set via `set_stream_context`).
-/// `connected_peers` is keyed by that remote source `session_id`, so `to_peer`
-/// is the correct lookup key — NOT `from_peer`.
+/// Identity note (load-bearing, issue #1640): the worker's freshness_skip
+/// carries `from_peer` = the LOCAL receiver's **session_id** string (set via
+/// `PeerDecodeManager::set_local_session_id` on SESSION_ASSIGNED) and
+/// `to_peer` = the REMOTE source peer's **session_id** string (`Peer::sid_str`,
+/// set via `set_stream_context`). Both fields are u64 session_id strings for
+/// consistent log parsing. `connected_peers` is keyed by that remote source
+/// `session_id`, so `to_peer` is the correct lookup key — NOT `from_peer`.
 ///
 /// Clock note: the delta uses the event's own `ts_ms` (the skip's timestamp,
 /// stamped by the worker via `videocall_diagnostics::now_ms()`), which on wasm
@@ -3559,6 +3560,12 @@ impl Inner {
                         }
                     }
                 }
+
+                // Issue #1640: inform PeerDecodeManager of the local session_id so
+                // worker diagnostics context uses session_id (not email) as `from_peer`.
+                // Also backfills any peer workers that were already created.
+                self.peer_decode_manager
+                    .set_local_session_id(response.session_id);
 
                 // Update health reporter with the server-assigned session_id so that
                 // HealthPacket.session_id matches PacketWrapper.session_id for room traffic.

@@ -196,6 +196,13 @@ import {
   impairDownlinkNetsim,
   healDownlinkNetsim,
 } from "../helpers/downlink-impair";
+import {
+  readDownlinkCongestionTotal,
+  readDownlinkRecoveredTotal,
+  readDownlinkShedTotal,
+  readLayerFilteredTotal,
+  snapshotDownlinkCongestionMetrics,
+} from "../helpers/relay-metrics";
 import { waitForServices } from "../helpers/wait-for-services";
 
 // ---------------------------------------------------------------------------
@@ -2220,6 +2227,579 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       await pubBrowser.close();
       await healthyBrowser.close();
       await degradedBrowser.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1219 Half 2 — RELAY-SIDE downlink-congestion signal path validation (#1434)
+//
+// The per-receiver layer DIVERGENCE tests above (WS @impair + WT netsim) prove
+// the UI-side outcome: a congested receiver drops to a lower layer while the
+// healthy peer holds. But they do NOT prove the RELAY's Half 2 signal path
+// actually fired — the congestion COULD be detected purely client-side by the
+// layer chooser reacting to loss (which is the legacy #1080 path). Issue #1434
+// requires asserting the RELAY METRICS that prove the Half 2 relay-side
+// congestion detection + proactive shedding + LAYER_PREFERENCE durable path
+// fired end-to-end:
+//
+//   1. relay_receiver_downlink_congestion_total RISES (relay detected congestion)
+//   2. relay_downlink_shed_total RISES (relay proactively shed non-base packets)
+//   3. relay_layer_filtered_total RISES (receiver published LAYER_PREFERENCE
+//      stepping down → relay layer filter engaged the durable path)
+//   4. ISOLATION: healthy receiver metrics UNCHANGED
+//   5. AUDIO PROTECTION: audio NOT shed (audio always passes the pre-filter)
+//   6. RECOVERY: relay_receiver_downlink_recovered_total RISES after heal
+//
+// These tests EXTEND the existing impair harness (same 3-browser topology) but
+// add relay-metric assertions alongside the UI-layer assertions. They are
+// intentionally SEPARATE tests so a relay-metric regression does not mask a UI
+// regression (and vice versa).
+//
+// BOTH transports are covered: WS via toxiproxy (@impair), WT via netsim
+// (default suite). This is mandatory per #1434's stretch goal and the standing
+// fact that "both transports shed at 80%."
+// ---------------------------------------------------------------------------
+test.describe("#1219 Half 2 relay-side congestion validation (#1434)", () => {
+  test.describe.configure({ mode: "serial", timeout: 240_000 });
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  // -------------------------------------------------------------------------
+  // WS path: toxiproxy bandwidth clamp → relay detects congestion → sheds →
+  // receiver publishes LAYER_PREFERENCE → relay layer-filters. Tagged @impair.
+  // -------------------------------------------------------------------------
+  test("relay enters downlink congestion and sheds for WS receiver, healthy peer unaffected (#1434) @impair", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1434_ws_${Date.now()}`;
+
+    await assertProxyUp();
+    await healDownlink();
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1434-pub-ws@videocall.rs",
+        "Sim1434PubWS",
+        uiURL,
+      );
+      const healthyCtx = await createAuthenticatedContext(
+        healthyBrowser,
+        "sim-1434-healthy-ws@videocall.rs",
+        "Sim1434HealthyWS",
+        uiURL,
+      );
+      const degradedCtx = await createAuthenticatedContext(
+        degradedBrowser,
+        "sim-1434-degraded-ws@videocall.rs",
+        "Sim1434DegradedWS",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(healthyCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(degradedCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      // Route degraded receiver through toxiproxy, pinning to WS.
+      await routeDownlinkThroughProxy(degradedCtx);
+
+      const pubPage = await pubCtx.newPage();
+      const healthyPage = await healthyCtx.newPage();
+      const degradedPage = await degradedCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim1434PubWS");
+      await joinMeeting(healthyPage, meetingId, "Sim1434HealthyWS");
+      await joinMeeting(degradedPage, meetingId, "Sim1434DegradedWS");
+
+      await assertCapabilityOverrideActive(pubConsole);
+      await openPerformancePanel(healthyPage);
+      await openPerformancePanel(degradedPage);
+
+      // PHASE 1 — let both receivers climb above base on a healthy link.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage);
+            if (!healthy || !degraded) return -1;
+            return Math.min(healthy.layerCount, degraded.layerCount);
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(0);
+
+      const healthyStart = await readVideoLayer(healthyPage);
+      const degradedStart = await readVideoLayer(degradedPage);
+      test.skip(
+        (healthyStart?.layerCount ?? 1) <= 1 || (degradedStart?.layerCount ?? 1) <= 1,
+        "capability ceiling clamped to single layer; no ladder headroom to diverge",
+      );
+
+      // Wait for degraded receiver to climb above base before impairing.
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // Snapshot relay metrics BEFORE impairment (baseline for delta).
+      const beforeWs = await snapshotDownlinkCongestionMetrics("websocket", meetingId);
+      const layerFilteredBefore = beforeWs.layerFilteredTotal;
+
+      // PHASE 2 — impair the degraded receiver's downlink via toxiproxy.
+      await impairDownlink({ rateKb: 15 });
+
+      // PHASE 3a — RELAY REACTS: assert congestion_total RISES for the WS relay.
+      // The relay's windowed CongestionTracker should cross its threshold within
+      // seconds of the outbound channel filling. Poll until the counter increments.
+      await expect
+        .poll(
+          async () => {
+            const current = await readDownlinkCongestionTotal("websocket");
+            return current - beforeWs.congestionTotal;
+          },
+          {
+            timeout: 60_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 1: relay_receiver_downlink_congestion_total must RISE " +
+              "for the WS relay when a receiver's downlink is impaired",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3b — PROACTIVE SHEDDING: relay_downlink_shed_total RISES (non-base
+      // packets shed before try_send for the congested receiver).
+      await expect
+        .poll(
+          async () => {
+            const current = await readDownlinkShedTotal("websocket");
+            return current - beforeWs.shedTotal;
+          },
+          {
+            timeout: 30_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 2: relay_downlink_shed_total must RISE — the relay " +
+              "must proactively shed non-base packets for the congested receiver",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3c — DURABLE PATH: the congested receiver publishes LAYER_PREFERENCE
+      // stepping down, causing the relay's layer filter to engage. This is proven by
+      // relay_layer_filtered_total rising for this room.
+      await expect
+        .poll(
+          async () => {
+            const current = await readLayerFilteredTotal("websocket", meetingId);
+            return current - layerFilteredBefore;
+          },
+          {
+            timeout: 60_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 3: relay_layer_filtered_total must RISE — the " +
+              "congested receiver must publish LAYER_PREFERENCE stepping down, " +
+              "engaging the relay's durable layer filter",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3d — ISOLATION: the healthy receiver is still decoding above base.
+      // Its layer must not have been dragged down.
+      const healthyAfterImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyAfterImpair,
+        "#1434 isolation: healthy receiver must still be decoding",
+      ).not.toBeNull();
+      expect(
+        healthyAfterImpair!.layerIndex,
+        "#1434 isolation: healthy receiver must stay above base (unaffected by " +
+          "peer's downlink congestion)",
+      ).toBeGreaterThan(0);
+
+      // PHASE 3e — AUDIO PROTECTION: audio is NOT shed for the congested receiver.
+      // The audio readout on the degraded page should still report receiving audio
+      // (the Half 2 pre-filter only sheds non-base VIDEO/SCREEN, never AUDIO).
+      // Allow a generous window since audio may briefly blip under heavy loss.
+      await expect
+        .poll(
+          async () => {
+            const audio = await readAudioLayer(degradedPage);
+            return audio !== null;
+          },
+          {
+            timeout: 30_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 4 (audio protection): the degraded receiver must " +
+              "still be receiving AUDIO — the Half 2 shed path protects audio",
+          },
+        )
+        .toBe(true);
+
+      // PHASE 4 — RECOVERY: heal the downlink and assert the relay's recovery
+      // counter increments (the relief window elapses with no fresh overflow).
+      await healDownlink();
+
+      await expect
+        .poll(
+          async () => {
+            const current = await readDownlinkRecoveredTotal("websocket");
+            return current - beforeWs.recoveredTotal;
+          },
+          {
+            timeout: 90_000,
+            intervals: [3000, 5000, 8000],
+            message:
+              "#1434 assertion 5 (recovery): relay_receiver_downlink_recovered_total " +
+              "must RISE after the impairment is healed (relief window elapsed)",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // Also confirm the degraded receiver climbs back (UI recovery).
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 90_000,
+          intervals: [2000, 3000, 5000],
+        })
+        .toBeGreaterThan(0);
+    } finally {
+      await healDownlink();
+      await pubBrowser.close();
+      await healthyBrowser.close();
+      await degradedBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // WT path: client-side netsim hook → relay detects congestion → sheds →
+  // receiver publishes LAYER_PREFERENCE → relay layer-filters. No toxiproxy;
+  // runs in the default dioxus suite (NOT tagged @impair).
+  //
+  // The WT relay process (:5321) has the SAME Half 2 code path (the congestion
+  // detection runs in the transport-agnostic per-session NATS loop), so the
+  // same metric counters must fire. The only difference is that the LOSS is
+  // manufactured CLIENT-SIDE (netsim drops inbound packets) rather than
+  // RELAY-SIDE (toxiproxy fills the outbound channel). However, for the WT
+  // relay to enter congestion mode, the CLIENT must still signal backpressure
+  // upstream — which it does via QUIC flow control (window exhaustion on the
+  // receiving stream) when it cannot consume packets fast enough. The netsim
+  // hook drops packets AFTER receipt from the transport, so from the relay's
+  // perspective the client's receive window may still drain normally and the
+  // relay-side congestion detection may NOT fire as aggressively as the WS
+  // case. Therefore this test uses a MILDER assertion: it asserts either the
+  // relay-side congestion counters rise OR the durable LAYER_PREFERENCE path
+  // fires (which is the client-side chooser stepping down and publishing its
+  // preference, triggering relay layer filtering regardless of relay-side
+  // congestion state). The key invariant is still: layer filtering engages
+  // for the impaired receiver AND the healthy receiver is unaffected.
+  // -------------------------------------------------------------------------
+  test("relay layer-filters for WT receiver under netsim impairment, healthy peer unaffected (#1434)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1434_wt_${Date.now()}`;
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let degradedPage: Page | undefined;
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1434-pub-wt@videocall.rs",
+        "Sim1434PubWT",
+        uiURL,
+      );
+      const healthyCtx = await createAuthenticatedContext(
+        healthyBrowser,
+        "sim-1434-healthy-wt@videocall.rs",
+        "Sim1434HealthyWT",
+        uiURL,
+      );
+      const degradedCtx = await createAuthenticatedContext(
+        degradedBrowser,
+        "sim-1434-degraded-wt@videocall.rs",
+        "Sim1434DegradedWT",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(healthyCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(degradedCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const healthyPage = await healthyCtx.newPage();
+      degradedPage = await degradedCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim1434PubWT");
+      await joinMeeting(healthyPage, meetingId, "Sim1434HealthyWT");
+      await joinMeeting(degradedPage, meetingId, "Sim1434DegradedWT");
+
+      await assertCapabilityOverrideActive(pubConsole);
+      await openPerformancePanel(healthyPage);
+      await openPerformancePanel(degradedPage);
+
+      // PHASE 1 — let both receivers climb above base on a healthy link.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage!);
+            if (!healthy || !degraded) return -1;
+            return Math.min(healthy.layerCount, degraded.layerCount);
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(0);
+
+      const healthyStart = await readVideoLayer(healthyPage);
+      const degradedStart = await readVideoLayer(degradedPage);
+      test.skip(
+        (healthyStart?.layerCount ?? 1) <= 1 || (degradedStart?.layerCount ?? 1) <= 1,
+        "capability ceiling clamped to single layer; no ladder headroom to diverge",
+      );
+
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // Snapshot relay metrics BEFORE impairment.
+      // For WT, the relay process is :5321. Scrape the WT relay.
+      const beforeWt = await snapshotDownlinkCongestionMetrics("webtransport", meetingId);
+      const layerFilteredBefore = beforeWt.layerFilteredTotal;
+
+      // PHASE 2 — impair the degraded receiver's downlink via netsim.
+      await impairDownlinkNetsim(degradedPage);
+
+      // PHASE 3a — DURABLE PATH: the chooser steps down and publishes
+      // LAYER_PREFERENCE, which engages the relay's layer filter for this room.
+      // This is the primary assertion for the WT path: regardless of whether the
+      // relay itself enters congestion shedding mode (which depends on QUIC
+      // backpressure reaching the relay), the LAYER_PREFERENCE → layer filter
+      // path is the client-driven durable signal that proves #1219 Half 2's
+      // end-to-end loop.
+      await expect
+        .poll(
+          async () => {
+            const current = await readLayerFilteredTotal("webtransport", meetingId);
+            return current - layerFilteredBefore;
+          },
+          {
+            timeout: 90_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 WT assertion (durable path): relay_layer_filtered_total must " +
+              "RISE — the congested receiver's chooser must step down, publish " +
+              "LAYER_PREFERENCE, and cause the relay to filter higher layers",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3b — ISOLATION: the healthy receiver remains above base.
+      const healthyAfterImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyAfterImpair,
+        "#1434 WT isolation: healthy receiver must still be decoding",
+      ).not.toBeNull();
+      expect(
+        healthyAfterImpair!.layerIndex,
+        "#1434 WT isolation: healthy receiver must stay above base",
+      ).toBeGreaterThan(0);
+
+      // PHASE 3c — AUDIO PROTECTION: degraded receiver still receives audio.
+      await expect
+        .poll(
+          async () => {
+            const audio = await readAudioLayer(degradedPage!);
+            return audio !== null;
+          },
+          {
+            timeout: 30_000,
+            intervals: [2000, 3000, 5000],
+            message: "#1434 WT audio protection: degraded receiver must still receive AUDIO",
+          },
+        )
+        .toBe(true);
+
+      // PHASE 3d — RELAY CONGESTION (soft assertion): check if the WT relay's
+      // congestion counter also rose. Under netsim the loss is client-side, so
+      // relay-side congestion detection may not fire (QUIC window may still drain).
+      // We log but do NOT hard-fail if it did not rise — the durable path (3a) is
+      // the load-bearing assertion. If it DID rise, that proves the relay's own
+      // congestion tracker also engaged, which is the full Half 2 story.
+      const congestionAfter = await readDownlinkCongestionTotal("webtransport");
+      const congestionDelta = congestionAfter - beforeWt.congestionTotal;
+      if (congestionDelta > 0) {
+        // Full Half 2 relay-side path also fired — optimal coverage.
+        const shedAfter = await readDownlinkShedTotal("webtransport");
+        const shedDelta = shedAfter - beforeWt.shedTotal;
+        expect(
+          shedDelta,
+          "#1434 WT bonus: if relay entered congestion, shed_total should also rise",
+        ).toBeGreaterThan(0);
+      }
+      // (else: relay did not enter congestion mode, but layer-filter path fired —
+      // the client's chooser handled the step-down autonomously. Still valid.)
+
+      // PHASE 4 — heal and verify recovery (UI-side: degraded climbs back).
+      await healDownlinkNetsim(degradedPage);
+
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
+          timeout: 90_000,
+          intervals: [2000, 3000, 5000],
+        })
+        .toBeGreaterThan(0);
+    } finally {
+      if (degradedPage) {
+        await healDownlinkNetsim(degradedPage);
+      }
+      await pubBrowser.close();
+      await healthyBrowser.close();
+      await degradedBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Recovery stability: validate that after downlink impairment the receiver's
+  // layer does NOT oscillate (up/down flapping). This uses the WT netsim hook
+  // with `crushed_downlink` (40% loss). The key assertion is that after the
+  // initial step-down the layer should SETTLE, not bounce.
+  //
+  // The hysteresis in the layer chooser (consecutive-success counters or decay
+  // windows for step-UP) should prevent rapid oscillation. This test polls the
+  // layer over 30 seconds after step-down and asserts that the max observed
+  // index minus the min observed index is <= 1 (at most one step of jitter,
+  // not full-range flapping).
+  // -------------------------------------------------------------------------
+  test("recovery window does not oscillate under marginal loss — layer settles after step-down (#1434 comment)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1434_stable_${Date.now()}`;
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let rxPage: Page | undefined;
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1434-stab-pub@videocall.rs",
+        "Sim1434StabPub",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-1434-stab-rx@videocall.rs",
+        "Sim1434StabRx",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      rxPage = await rxCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim1434StabPub");
+      await joinMeeting(rxPage, meetingId, "Sim1434StabRx");
+
+      await assertCapabilityOverrideActive(pubConsole);
+      await openPerformancePanel(rxPage);
+
+      // Let the receiver climb above base.
+      await expect
+        .poll(
+          async () => {
+            const layer = await readVideoLayer(rxPage!);
+            return layer?.layerCount ?? 0;
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(1);
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // Impair the receiver — this will cause it to step down.
+      await impairDownlinkNetsim(rxPage);
+
+      // Wait for the initial step-down to take effect.
+      await expect
+        .poll(
+          async () => {
+            const layer = await readVideoLayer(rxPage!);
+            // Accept either layer 0 (stepped all the way down) or a lower layer
+            // than the top. The key is that it stepped DOWN.
+            if (!layer) return false;
+            return layer.layerIndex < layer.layerCount - 1;
+          },
+          { timeout: 60_000, intervals: [2000, 3000, 5000] },
+        )
+        .toBe(true);
+
+      // STABILITY OBSERVATION: now that the receiver has stepped down, observe
+      // its layer index over 30 seconds. Under a marginal impairment the chooser
+      // should SETTLE at the lower layer — not oscillate up and back down
+      // repeatedly. We track the set of unique layer indices observed.
+      const observedIndices: number[] = [];
+      const stabilityDurationMs = 30_000;
+      const pollIntervalMs = 3_000;
+      const iterations = Math.floor(stabilityDurationMs / pollIntervalMs);
+
+      for (let i = 0; i < iterations; i++) {
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        const layer = await readVideoLayer(rxPage);
+        if (layer) {
+          observedIndices.push(layer.layerIndex);
+        }
+      }
+
+      // Assert stability: the range of observed indices (max - min) must be <= 1.
+      // A range of 0 = perfectly stable (settled at one layer).
+      // A range of 1 = at most one step of jitter (acceptable transient).
+      // A range >= 2 = full oscillation (up/down flapping) — FAIL.
+      expect(
+        observedIndices.length,
+        "must have observed at least 5 layer readings during stability window",
+      ).toBeGreaterThanOrEqual(5);
+
+      const minIdx = Math.min(...observedIndices);
+      const maxIdx = Math.max(...observedIndices);
+      expect(
+        maxIdx - minIdx,
+        `#1434 stability: layer must settle after step-down, not oscillate. ` +
+          `Observed indices: [${observedIndices.join(", ")}] ` +
+          `(range ${maxIdx - minIdx}, max allowed = 1)`,
+      ).toBeLessThanOrEqual(1);
+    } finally {
+      if (rxPage) {
+        await healDownlinkNetsim(rxPage);
+      }
+      await pubBrowser.close();
+      await rxBrowser.close();
     }
   });
 });

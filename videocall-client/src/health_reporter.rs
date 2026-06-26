@@ -1077,6 +1077,15 @@ impl HealthReporter {
                                 video_stats["playout_paint_lag_ms"] = json!(v);
                             }
                         }
+                        // Content-staleness (#1641): the content AGE of the painted video
+                        // (drift-baselined), distinct from the paint-lag DEPTH above. Same
+                        // camera/screen bucket and same fps_received > 0 fold guard as the ms
+                        // gauges.
+                        "content_staleness_ms" => {
+                            if let MetricValue::F64(v) = &metric.value {
+                                video_stats["content_staleness_ms"] = json!(v);
+                            }
+                        }
                         // Resync-to-live governor skips (#1252): lifetime cumulative COUNTER (u64),
                         // not an ms gauge. Stored in the camera/screen bucket that emitted the
                         // worker stat. The health packet currently exports this counter from the
@@ -2161,6 +2170,14 @@ impl HealthReporter {
                     if let Some(v) = video.get("playout_paint_lag_ms").and_then(|v| v.as_f64()) {
                         vs.playout_paint_lag_ms = v;
                     }
+                    // Content-staleness (#1641): content AGE of the painted video, vs the paint-lag
+                    // DEPTH above. Same fps_received > 0 guard — a paused/hidden tile paints nothing,
+                    // so when fps == 0 this stays at its 0.0 default => "at live". This is a ms
+                    // GAUGE (not the skip-to-live COUNTER below), so it is gated like the other
+                    // gauges. Unlike playout_latency_ms it can legitimately exceed 1800ms.
+                    if let Some(v) = video.get("content_staleness_ms").and_then(|v| v.as_f64()) {
+                        vs.content_staleness_ms = v;
+                    }
                 }
                 // Resync-to-live governor skips (#1252): folded UNCONDITIONALLY for camera video,
                 // OUTSIDE the fps_received > 0 gate above. The ms gauges are gated because a
@@ -2833,6 +2850,9 @@ mod tests {
             "playout_stage1_span_ms": 1200.0,
             "playout_paint_lag_ms": 1800.0,
             "playout_skip_to_live_total": 4u64,
+            // #1641: a 5-minute content age — deliberately > the 1800ms playout-latency cap, to
+            // prove this field is NOT bounded by it (the whole point of the metric).
+            "content_staleness_ms": 300000.0,
         }));
 
         let mut health_map = HashMap::new();
@@ -2951,6 +2971,144 @@ mod tests {
 
         assert_eq!(stats.fps_received, 0.0);
         assert_eq!(stats.playout_paint_lag_ms, 0.0);
+    }
+
+    /// #1641 content-staleness (content AGE) folds into the wire VideoStats when fps_received > 0,
+    /// and — unlike playout_latency_ms (capped at 1800ms) — carries a value ABOVE that cap. This
+    /// pins both that the field round-trips AND that it is the unbounded age metric, not a clone of
+    /// the capped latency field.
+    ///
+    /// Mutation check: dropping the `vs.content_staleness_ms = v` fold (or gating it differently
+    /// than the other ms gauges) makes this assert read 0.0 and fail.
+    #[test]
+    fn content_staleness_folds_when_fps_received_positive() {
+        let pb = health_packet_with_camera_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.content_staleness_ms, 300000.0);
+        assert!(
+            stats.content_staleness_ms > 1800.0,
+            "content_staleness_ms must NOT be capped at the 1800ms playout-latency bound"
+        );
+    }
+
+    /// #1641 content-staleness is a ms GAUGE, so it shares the fps_received > 0 gate with the other
+    /// ms gauges (paused/hidden tile paints nothing => "at live"). It is NOT the skip-to-live
+    /// COUNTER, which folds unconditionally.
+    ///
+    /// Mutation check: moving the content-staleness fold OUTSIDE the fps_received > 0 guard makes
+    /// this assert read 300000.0 and fail.
+    #[test]
+    fn content_staleness_omitted_when_fps_received_zero() {
+        let pb = health_packet_with_camera_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .video_stats
+            .as_ref()
+            .expect("camera video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        assert_eq!(stats.content_staleness_ms, 0.0);
+    }
+
+    /// #1641 routing regression: a worker "video" playout-stats event tagged `media_type=SCREEN`
+    /// MUST land in `last_screen_stats`, and one tagged `media_type=VIDEO` in `last_camera_stats`.
+    ///
+    /// This guards the bug the worker→main re-broadcast had: the worker's "video" stats DiagEvent
+    /// carried NO `media_type`, so `process_diagnostics_event`'s `is_screen` check defaulted false
+    /// and ALL playout-family stats (incl. #1641 `content_staleness_ms`) routed to the camera
+    /// bucket — a peer sharing camera+screen had the screen decoder's stats overwrite the camera
+    /// bucket. The fix stamps `media_type` in `handle_worker_diag_message` (videocall-codecs
+    /// `decoder/wasm.rs`), which is the real source of these events at runtime; this test drives
+    /// the SAME consuming function (`process_diagnostics_event`) those events flow into.
+    ///
+    /// Mutation sensitivity: remove the `media_type` metric from the SCREEN event below (the exact
+    /// effect of dropping the `decoder/wasm.rs` stamp) and `is_screen` reads false → the screen
+    /// content-staleness lands in `last_camera_stats`, the screen bucket stays `None`, and BOTH
+    /// asserts fail.
+    #[test]
+    fn video_playout_stats_route_to_bucket_by_media_type() {
+        use crate::decode::peer_decoder::{MEDIA_TYPE_CAMERA, MEDIA_TYPE_SCREEN};
+        use std::borrow::Cow;
+        use videocall_diagnostics::Metric;
+
+        let peer_health_data: Rc<RefCell<HashMap<String, PeerHealthData>>> =
+            Rc::new(RefCell::new(HashMap::new()));
+
+        // Helper: build a worker-style "video" stats event for one stream kind, distinguishing the
+        // two buckets by the content-staleness value so a misroute is observable.
+        let make_video_event = |media_type: &'static str, content_staleness_ms: f64| DiagEvent {
+            subsystem: "video",
+            stream_id: None,
+            ts_ms: 1_000,
+            metrics: vec![
+                Metric {
+                    name: "media_type",
+                    value: MetricValue::Text(Cow::Borrowed(media_type)),
+                },
+                Metric {
+                    name: "from_peer",
+                    value: MetricValue::Text(Cow::Borrowed("reporter")),
+                },
+                Metric {
+                    name: "to_peer",
+                    value: MetricValue::Text(Cow::Borrowed("peer-1")),
+                },
+                // fps_received > 0 so the consuming UI fold (a sibling concern) would keep it; the
+                // routing under test does not gate on fps, but a realistic event carries it.
+                Metric {
+                    name: "fps_received",
+                    value: MetricValue::F64(30.0),
+                },
+                Metric {
+                    name: "content_staleness_ms",
+                    value: MetricValue::F64(content_staleness_ms),
+                },
+            ],
+        };
+
+        // Distinct staleness per kind: 9000ms (screen) vs 1000ms (camera).
+        HealthReporter::process_diagnostics_event(
+            make_video_event(MEDIA_TYPE_SCREEN, 9000.0),
+            &peer_health_data,
+        );
+        HealthReporter::process_diagnostics_event(
+            make_video_event(MEDIA_TYPE_CAMERA, 1000.0),
+            &peer_health_data,
+        );
+
+        let map = peer_health_data.borrow();
+        let peer = map.get("peer-1").expect("peer-1 health entry must exist");
+
+        let screen = peer
+            .last_screen_stats
+            .as_ref()
+            .expect("SCREEN-tagged video event must populate last_screen_stats, not camera");
+        assert_eq!(
+            screen.get("content_staleness_ms").and_then(|v| v.as_f64()),
+            Some(9000.0),
+            "screen bucket must hold the screen stream's staleness"
+        );
+
+        let camera = peer
+            .last_camera_stats
+            .as_ref()
+            .expect("VIDEO-tagged video event must populate last_camera_stats");
+        assert_eq!(
+            camera.get("content_staleness_ms").and_then(|v| v.as_f64()),
+            Some(1000.0),
+            "camera bucket must hold the camera stream's staleness, NOT the screen's (the bug: \
+             unstamped screen stats overwrote the camera bucket)"
+        );
     }
 
     /// #1252 resync governor counter folds at fps > 0 — like every other field. The DISTINCT

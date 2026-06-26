@@ -1300,6 +1300,33 @@ impl AdaptiveQualityManager {
         self.simulcast_layer_count
     }
 
+    /// Whether the video stream's adaptive quality is fully exhausted — meaning
+    /// BOTH the tier AND the simulcast layers have reached their respective
+    /// floors and no further video shed is possible (issue #1611).
+    ///
+    /// "Exhausted" = tier at the effective step-down cap (user's `worst` bound
+    /// composed with the array bound — see [`Self::video_step_down_cap`]) AND
+    /// active layers at 1 (or single-stream mode where layers are N/A).
+    ///
+    /// This is the signal the microphone encoder's backstop gate reads: when
+    /// video is exhausted, audio is the ONLY remaining shed axis, so the mic
+    /// detector is permitted to downshift the bitrate even though video is on.
+    ///
+    /// Correctness notes:
+    /// - Uses `video_step_down_cap` (NOT the raw array end) so a user who caps
+    ///   send quality at a higher tier still reports exhausted once that cap is
+    ///   reached (exactness item #1).
+    /// - Checks `active_layer_count <= 1` (NOT just `simulcast_layer_count == 1`)
+    ///   so a simulcast publisher whose layers have been shed down to base also
+    ///   reports exhausted (exactness item #2).
+    pub fn video_at_floor(&self) -> bool {
+        let max_video_index = self.video_tiers.len().saturating_sub(1);
+        let cap = self.video_step_down_cap(max_video_index);
+        let tier_at_floor = self.video_tier_index >= cap;
+        let layers_at_floor = self.active_layer_count <= 1;
+        tier_at_floor && layers_at_floor
+    }
+
     /// Whether the most recent [`update`](Self::update) warranted a video
     /// step-DOWN that the tier floor blocked (issue #1077).
     ///
@@ -3698,5 +3725,97 @@ mod tests {
             SCREEN_QUALITY_TIERS.len() - 1,
             "Default screen bounds must reach the worst tier under congestion"
         );
+    }
+
+    // =========================================================================
+    // video_at_floor (issue #1611)
+    // =========================================================================
+
+    #[test]
+    fn video_at_floor_true_when_tier_at_cap_and_single_layer() {
+        // Tier at floor (max index) AND active_layer_count == 1 → exhausted.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        let max_idx = VIDEO_QUALITY_TIERS.len() - 1;
+        mgr.video_tier_index = max_idx;
+        mgr.active_layer_count = 1;
+        assert!(
+            mgr.video_at_floor(),
+            "must be true at tier floor with 1 layer"
+        );
+    }
+
+    #[test]
+    fn video_at_floor_false_when_tier_not_at_cap() {
+        // Tier NOT at floor → not exhausted (even if layers == 1).
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        mgr.video_tier_index = 0;
+        mgr.active_layer_count = 1;
+        assert!(
+            !mgr.video_at_floor(),
+            "must be false when tier has room to degrade"
+        );
+    }
+
+    #[test]
+    fn video_at_floor_false_when_layers_remain() {
+        // Tier at floor BUT active_layer_count > 1 → not exhausted (layers
+        // can still shed).
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        let max_idx = VIDEO_QUALITY_TIERS.len() - 1;
+        mgr.video_tier_index = max_idx;
+        mgr.active_layer_count = 2;
+        mgr.simulcast_layer_count = 3;
+        assert!(
+            !mgr.video_at_floor(),
+            "must be false when layers can still be shed"
+        );
+    }
+
+    #[test]
+    fn video_at_floor_respects_user_worst_cap() {
+        // Exactness item #1: user caps worst at index 2 on a 5-tier ladder.
+        // Tier at index 2 + 1 layer → exhausted (even though raw array goes
+        // to index 4).
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        assert!(
+            VIDEO_QUALITY_TIERS.len() > 3,
+            "test requires at least 4 tiers"
+        );
+        mgr.user_video_worst_index = Some(2);
+        mgr.video_tier_index = 2;
+        mgr.active_layer_count = 1;
+        assert!(
+            mgr.video_at_floor(),
+            "must be true at user-capped worst tier"
+        );
+        // One tier above the user cap: NOT exhausted.
+        mgr.video_tier_index = 1;
+        assert!(
+            !mgr.video_at_floor(),
+            "must be false when above user worst cap"
+        );
+    }
+
+    #[test]
+    fn video_at_floor_both_conditions_required() {
+        // Neither condition alone suffices; only both together = exhausted.
+        let mut mgr = new_test_manager(VIDEO_QUALITY_TIERS);
+        let max_idx = VIDEO_QUALITY_TIERS.len() - 1;
+
+        // Only tier at floor (layers > 1): false
+        mgr.video_tier_index = max_idx;
+        mgr.active_layer_count = 3;
+        mgr.simulcast_layer_count = 3;
+        assert!(!mgr.video_at_floor());
+
+        // Only layers at floor (tier not): false
+        mgr.video_tier_index = 0;
+        mgr.active_layer_count = 1;
+        assert!(!mgr.video_at_floor());
+
+        // Both: true
+        mgr.video_tier_index = max_idx;
+        mgr.active_layer_count = 1;
+        assert!(mgr.video_at_floor());
     }
 }

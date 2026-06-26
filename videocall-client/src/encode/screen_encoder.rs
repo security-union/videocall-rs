@@ -599,6 +599,25 @@ pub struct ScreenEncoder {
     /// **Initialized to [`u32::MAX`] = fail-open (Auto / no user cap).** The base
     /// layer is always published (the AQ side floors the cap at 1).
     shared_user_layer_ceiling: Rc<AtomicU32>,
+    /// Screen video-at-floor flag (issue #1611): `true` when the screen AQ's
+    /// video quality is fully exhausted — tier at the user-capped step-down floor
+    /// AND active simulcast layers at 1. Stored AFTER every `tick()` while
+    /// sharing, and CLEARED synchronously on share-start (rising edge) to prevent
+    /// a stale `true` from a prior session leaking into a fresh share. Shared
+    /// into the [`MicrophoneEncoder`] so the mic-side backstop gate can open when
+    /// screen video can't shed further.
+    ///
+    /// `Arc` (not `Rc`) because it crosses encoder boundaries into the mic.
+    screen_at_floor_flag: Arc<AtomicBool>,
+    /// Screen-sharing-active flag mirrored as `Arc<AtomicBool>` (issue #1611).
+    /// Written at the same points as the `Rc<AtomicBool>` `screen_sharing_active`:
+    /// share start (`run_screen_encoding` → `true`), normal stop (`stop()` → `false`),
+    /// failure teardown (`cleanup_on_error` → `false`), and final cleanup (end of
+    /// `run_screen_encoding` → `false`). Exists solely because the mic encoder
+    /// trait requires `Arc` and the primary flag is `Rc`. On wasm32 the distinction
+    /// is academic (single-threaded), but the type system enforces it. The host
+    /// passes this to the mic via [`MicrophoneEncoder::set_screen_sharing_active_signal`].
+    screen_sharing_active_arc: Arc<AtomicBool>,
     /// Liveness token bounding the AQ control-loop `spawn_local` future (issue
     /// #1108). The encoder holds the only strong reference; `set_encoder_control`
     /// captures a [`Weak`] and breaks its 1 Hz `tick` loop once `upgrade()`
@@ -608,6 +627,18 @@ pub struct ScreenEncoder {
     /// only — the encode loop (`run_screen_encoding`) already exits on
     /// `enabled == false`.
     control_loop_liveness: Rc<()>,
+}
+
+/// Clear both screen-sharing flags (Rc + Arc mirror) atomically (issue #1611).
+///
+/// Called from all teardown paths: `stop()`, `cleanup_on_error` closure, and
+/// final `run_screen_encoding` cleanup. Exists as a module-scope helper so the
+/// regression test can invoke the SAME dual-store the production code uses —
+/// test-only hand-written stores would be tautological (the anti-pattern named
+/// in CLAUDE.md adversarial check 2).
+fn clear_screen_sharing_flags(rc: &Rc<AtomicBool>, arc: &Arc<AtomicBool>) {
+    rc.store(false, Ordering::Release);
+    arc.store(false, Ordering::Release);
 }
 
 impl ScreenEncoder {
@@ -676,6 +707,12 @@ impl ScreenEncoder {
             // User SEND layer-ceiling (perf-panel). Fail-open: u32::MAX = Auto /
             // no user cap until the panel writes a layer count.
             shared_user_layer_ceiling: Rc::new(AtomicU32::new(u32::MAX)),
+            // Issue #1611: screen video NOT exhausted at construction (no share
+            // running yet). Cleared synchronously on share-start to prevent
+            // staleness from a prior session.
+            screen_at_floor_flag: Arc::new(AtomicBool::new(false)),
+            // Issue #1611: Arc mirror of screen_sharing_active for mic encoder.
+            screen_sharing_active_arc: Arc::new(AtomicBool::new(false)),
             // AQ control-loop liveness token (issue #1108). Sole strong owner;
             // the self-tick loop holds a Weak and exits when this drops.
             control_loop_liveness: Rc::new(()),
@@ -724,6 +761,27 @@ impl ScreenEncoder {
     /// (`u32::MAX` = fail-open / no cap).
     pub fn shared_union_requested_layer(&self) -> Rc<AtomicU32> {
         self.shared_union_requested_layer.clone()
+    }
+
+    /// Returns the screen video-at-floor flag (`Arc<AtomicBool>`): `true` when
+    /// the screen AQ's video quality is fully exhausted (tier at user-capped
+    /// floor AND active simulcast layers at 1) (issue #1611).
+    ///
+    /// Shared into the [`MicrophoneEncoder`] (via
+    /// [`MicrophoneEncoder::set_screen_video_exhausted_signal`]) so the mic-side
+    /// uplink-distress detector's backstop gate can open when screen video can't
+    /// shed further. Updated by the screen AQ control loop every tick AFTER
+    /// `encoder_control.tick()` while sharing, and cleared synchronously on the
+    /// share-start rising edge to prevent stale-`true` leakage across sessions.
+    pub fn screen_at_floor_flag(&self) -> Arc<AtomicBool> {
+        self.screen_at_floor_flag.clone()
+    }
+
+    /// Returns the `Arc<AtomicBool>` mirror of `screen_sharing_active` for the
+    /// mic encoder (issue #1611). Written at the same points as the `Rc`
+    /// version; exists solely because the mic trait requires `Arc`.
+    pub fn screen_sharing_active_arc(&self) -> Arc<AtomicBool> {
+        self.screen_sharing_active_arc.clone()
     }
 
     /// Returns the shared tier transitions buffer for health reporting.
@@ -954,6 +1012,8 @@ impl ScreenEncoder {
         // count the UI wrote and forwards it to the controller's user cap each
         // tick, composed as a further `min` alongside the union cap and the ramp.
         let shared_user_layer_ceiling = self.shared_user_layer_ceiling.clone();
+        // Issue #1611: the QUALITY task stores this each tick AFTER `tick()`.
+        let screen_at_floor_flag = self.screen_at_floor_flag.clone();
         // Liveness sentinel (issue #1108): a Weak to the encoder-owned token. The
         // loop breaks once this fails to upgrade (ScreenEncoder dropped on Host
         // unmount), so the immortal `spawn_local` future doesn't leak per remount.
@@ -1116,6 +1176,15 @@ impl ScreenEncoder {
                 // `set_simulcast_ceiling_start_optimistic` guard — single-stream
                 // mode stays byte-identical.
                 if share_started {
+                    // Issue #1611 (exactness item #3): synchronously CLEAR the
+                    // screen-at-floor flag on the rising edge so a stale `true`
+                    // from a prior exhausted session cannot leak into a fresh
+                    // share. The flag will be re-evaluated AFTER this tick's
+                    // `encoder_control.tick()` in the `now_sharing` block below.
+                    // Must happen BEFORE any async operation (the AQ re-seed is
+                    // below) — the mic detector could sample this on the same
+                    // 1 Hz tick; staleness would open the gate prematurely.
+                    screen_at_floor_flag.store(false, Ordering::Release);
                     if n_layers > 1 {
                         encoder_control.set_simulcast_ceiling_start_optimistic(
                             n_layers,
@@ -1379,6 +1448,12 @@ impl ScreenEncoder {
                     encoder_control.tick(now);
                     let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
+                    // Issue #1611: unconditionally store whether screen video is
+                    // exhausted (tier at user-capped floor AND active layers at 1).
+                    // Placed AFTER tick() so the value is always current; mirrors
+                    // the camera pattern.
+                    screen_at_floor_flag.store(encoder_control.video_at_floor(), Ordering::Release);
+
                     // Screen simulcast (issue #989, Phase 3b): publish the active
                     // layer count + per-layer target bitrates to the encode loop
                     // every tick. Skipped entirely in single-stream mode, so the
@@ -1598,8 +1673,8 @@ impl ScreenEncoder {
     /// It sets the encoder flags, notifies the client at the protocol level,
     /// and synchronously stops all media tracks.
     pub fn stop(&mut self) {
-        // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
-        self.screen_sharing_active.store(false, Ordering::Release);
+        // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
+        clear_screen_sharing_flags(&self.screen_sharing_active, &self.screen_sharing_active_arc);
 
         // Signal the encoding loop to exit
         self.state.stop();
@@ -1782,6 +1857,7 @@ impl ScreenEncoder {
         let keyframe_cooldown_reset = self.keyframe_cooldown_reset.clone();
         let active_video_track = self.active_video_track.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
+        let screen_sharing_active_arc = self.screen_sharing_active_arc.clone();
         let shared_target_bitrate = self.shared_screen_encoder_target_bitrate_kbps.clone();
         let shared_adaptive_tier = self.shared_screen_adaptive_tier.clone();
         let shared_cause_hint = self.shared_screen_cause_hint.clone();
@@ -1817,6 +1893,7 @@ impl ScreenEncoder {
                 keyframe_cooldown_reset,
                 active_video_track,
                 screen_sharing_active,
+                screen_sharing_active_arc,
                 shared_target_bitrate,
                 shared_adaptive_tier,
                 shared_cause_hint,
@@ -1871,6 +1948,7 @@ impl ScreenEncoder {
         let keyframe_cooldown_reset = self.keyframe_cooldown_reset.clone();
         let active_video_track = self.active_video_track.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
+        let screen_sharing_active_arc = self.screen_sharing_active_arc.clone();
         let shared_target_bitrate = self.shared_screen_encoder_target_bitrate_kbps.clone();
         let shared_adaptive_tier = self.shared_screen_adaptive_tier.clone();
         let shared_cause_hint = self.shared_screen_cause_hint.clone();
@@ -1994,6 +2072,7 @@ impl ScreenEncoder {
                 keyframe_cooldown_reset,
                 active_video_track,
                 screen_sharing_active,
+                screen_sharing_active_arc,
                 shared_target_bitrate,
                 shared_adaptive_tier,
                 shared_cause_hint,
@@ -2044,6 +2123,8 @@ impl ScreenEncoder {
         keyframe_cooldown_reset: Rc<AtomicBool>,
         active_video_track: Rc<RefCell<Option<MediaStreamTrack>>>,
         screen_sharing_active: Rc<AtomicBool>,
+        // Issue #1611: Arc mirror of screen_sharing_active for the mic encoder.
+        screen_sharing_active_arc: Arc<AtomicBool>,
         // Issue #903: publisher-side encoder state read at frame-stamping
         // time and stamped onto every `VideoMetadata`. The values are
         // updated by `set_encoder_control` whenever AQ acts; the output
@@ -2073,6 +2154,8 @@ impl ScreenEncoder {
         // Signal camera encoder ASAP after capture is confirmed so it begins
         // stepping down during encoder setup, not after encoding starts.
         screen_sharing_active.store(true, Ordering::Release);
+        // Issue #1611: mirror to the Arc copy the mic encoder reads.
+        screen_sharing_active_arc.store(true, Ordering::Release);
 
         screen_stream.borrow_mut().replace(screen_to_share.clone());
 
@@ -2091,8 +2174,8 @@ impl ScreenEncoder {
             }
             // Reset enabled flag
             enabled.store(false, Ordering::Release);
-            // Clear screen-sharing flag so camera drops its ceiling
-            screen_sharing_active.store(false, Ordering::Release);
+            // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
+            clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
             // Emit Failed event
             if let Some(ref callback) = on_state_change {
                 callback.emit(ScreenShareEvent::Failed(error_msg));
@@ -2370,6 +2453,8 @@ impl ScreenEncoder {
                 // Signal camera encoder ASAP after capture is confirmed so it begins
                 // stepping down during encoder setup, not after encoding starts.
                 screen_sharing_active.store(true, Ordering::Release);
+                // Issue #1611: mirror to the Arc copy the mic encoder reads.
+                screen_sharing_active_arc.store(true, Ordering::Release);
 
                 screen_stream.borrow_mut().replace(acquired_stream.clone());
 
@@ -3538,8 +3623,8 @@ impl ScreenEncoder {
             }
         }
 
-        // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
-        screen_sharing_active.store(false, Ordering::Release);
+        // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
+        clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
 
         // Emit Stopped event if we haven't already (onended handler might have already fired)
         // Check enabled flag - if it's still true, onended hasn't fired yet
@@ -3559,6 +3644,7 @@ mod tests {
 
     use super::cause_hint_from_trigger;
     use super::clamp_screen_layer_count;
+    use super::clear_screen_sharing_flags;
     use super::is_fatal_encoder_error_message;
     use super::keyframe_tick_decision;
     use super::record_screen_restart;
@@ -4309,6 +4395,45 @@ mod tests {
             !next.want_keyframe,
             "after the one-shot reset is consumed, the screen coalescer resumes \
              suppressing PLIs inside the cooldown window"
+        );
+    }
+
+    /// Issue #1611 regression test — `clear_screen_sharing_flags` must store
+    /// BOTH flags (Rc + Arc). Without the Arc store, the mic's audio-after-video
+    /// detector sees a stale-true screen-active signal on failure teardown.
+    ///
+    /// This test invokes the PRODUCTION helper (`clear_screen_sharing_flags`)
+    /// used by `stop()`, `cleanup_on_error`, and final cleanup — NOT hand-written
+    /// stores (which would be tautological per CLAUDE.md adversarial check 2).
+    /// Removing the `arc.store` line from the helper **provably breaks this test**.
+    #[test]
+    fn screen_sharing_active_arc_mirrors_rc_on_all_paths() {
+        use std::sync::Arc;
+
+        let rc_flag = Rc::new(AtomicBool::new(false));
+        let arc_flag = Arc::new(AtomicBool::new(false));
+
+        // Simulate teardown paths (stop / cleanup_on_error / final cleanup):
+        // set both flags true (share was active), then invoke the production
+        // helper that MUST clear both atomically.
+        rc_flag.store(true, Ordering::Release);
+        arc_flag.store(true, Ordering::Release);
+
+        // Invoke the PRODUCTION helper (same one stop/cleanup_on_error/final use)
+        clear_screen_sharing_flags(&rc_flag, &arc_flag);
+
+        // Both flags MUST now be false. If the helper's `arc.store(false)` is
+        // removed (or never added), this assertion FAILS — proving the test guards
+        // the production code, not its own inline copy.
+        assert!(
+            !rc_flag.load(Ordering::Acquire),
+            "Rc must be false after clear_screen_sharing_flags"
+        );
+        assert!(
+            !arc_flag.load(Ordering::Acquire),
+            "Arc MUST be false after clear_screen_sharing_flags — stale-true would \
+             wedge the audio-after-video detector. REGRESSION: if this fails, the \
+             helper is missing the arc.store(false) line at screen_encoder.rs:~643"
         );
     }
 }

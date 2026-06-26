@@ -469,25 +469,51 @@ fn audio_uplink_step_down_decision(
     }
 }
 
-/// Pure GATE for the mic uplink-distress detector (issue #1398): the detector
-/// evaluates a tick ONLY when audio is single-layer AND the camera is OFF
-/// (audio-only): `single_layer && !camera_active`.
+/// Pure GATE for the mic uplink-distress detector (issue #1398 + #1611 backstop):
+/// the detector evaluates a tick ONLY when audio is single-layer AND every active
+/// video stream is either OFF or EXHAUSTED:
 ///
-/// Why camera-off (issue #1398). When the camera is on, [`effective_audio_bitrate`]
-/// returns the camera AQ tier and IGNORES the mic floor, so a mic-side floor cut
-/// would never be read — the detector stays quiet to avoid cutting a dead floor.
-/// (The camera AQ loop owns the audio tier via encoder-queue backpressure; its
-/// uplink self-shed steps VIDEO, not audio — the camera-on uplink→audio downshift
-/// is the deferred #1611 backstop.) The single-layer audio-only publisher (camera
-/// off) is exactly the case nothing else covers, which is what this lever exists
-/// for.
+/// ```text
+/// single_layer
+///   && (!camera_active || camera_video_exhausted)
+///   && (!screen_active || screen_video_exhausted)
+/// ```
 ///
-/// In multi-layer mode the layer-ceiling lever (#621) handles congestion and the
-/// FEC timer ignores the bitrate floor, so the detector never evaluates
-/// regardless of camera state. Pure so the gate is host-testable; the closure
+/// Why this 3-signal form (issue #1611). The original gate (`!camera_active`)
+/// silenced the detector whenever the camera was on, because the camera AQ's
+/// audio-tier is CPU/encoder-queue gated (controller.rs:603-624) — it steps
+/// VIDEO on uplink distress, not audio. But once video reaches its floor (tier
+/// at the user-capped cap AND active layers at 1), video CAN'T shed further and
+/// audio is the only remaining axis. The backstop extends the gate to permit
+/// audio downshift in that case.
+///
+/// The screen-active term uses the same pattern: screen writes no audio-tier
+/// atom, so a screen-sharing publisher relies on this detector for its only
+/// audio downshift, but the gate must not open while screen video can still
+/// shed (screen has priority).
+///
+/// In multi-layer AUDIO mode the layer-ceiling lever (#621) handles congestion
+/// and the FEC timer ignores the bitrate floor, so the detector never evaluates
+/// regardless of video state. Pure so the gate is host-testable; the closure
 /// passes the live atomic loads in.
-fn audio_detector_gate_open(single_layer: bool, camera_active: bool) -> bool {
-    single_layer && !camera_active
+///
+/// NOTE on per-stream attribution (Tony's #1615 review comment): the 3 uplink
+/// counters (unistream_ready_stall_count, unistream_drop_count,
+/// websocket_drop_count) are PROCESS-GLOBAL with NO per-stream attribution.
+/// When the screen is active and driving distress, this gate may fire an audio
+/// downshift. This is BOUNDED (audio floors at 16 kbps and never stops) and
+/// accepted as a known limitation. The root fix is per-stream counter
+/// attribution at the transport level — out of scope for this issue.
+fn audio_detector_gate_open(
+    single_layer: bool,
+    camera_active: bool,
+    camera_video_exhausted: bool,
+    screen_active: bool,
+    screen_video_exhausted: bool,
+) -> bool {
+    single_layer
+        && (!camera_active || camera_video_exhausted)
+        && (!screen_active || screen_video_exhausted)
 }
 
 /// Pure RE-SEED decision for the mic uplink-distress detector window (issue #1398,
@@ -792,9 +818,35 @@ fn audio_bitrate_tick(
 ///
 /// Only the BITRATE choice is camera-state-aware; the FEC/packet-loss ctls still
 /// derive from the tier index, unchanged.
-fn effective_audio_bitrate(tier_bps: u32, congestion_floor_bps: u32, camera_active: bool) -> u32 {
-    if camera_active {
-        // Camera on: the camera AQ tier governs and the mic floor does not apply.
+///
+/// Issue #1611 backstop: when `camera_video_exhausted` is true AND the camera is
+/// on, the detector gate opened because video can't shed further. In this case
+/// the effective bitrate is `min(tier_bps, congestion_floor_bps)` — composing the
+/// camera AQ tier with the mic floor, whichever is more restrictive. This is SAFE
+/// because the camera audio-tier degrade is CPU/encoder-queue-gated
+/// (controller.rs:603-624) and the mic floor is uplink-gated — independent
+/// causes, so MIN composition cannot over-suppress (only the tighter of two
+/// independent constraints applies). If the mic floor has no cut (u32::MAX),
+/// `min(tier, MAX)` = tier (no change from pre-#1611).
+///
+/// Screen: `screen_video_exhausted` is NOT composed into the MIN because the
+/// screen encoder writes NO audio-tier atom. The screen-exhausted signal only
+/// GATES the detector open (via `audio_detector_gate_open`); it does not influence
+/// the bitrate select. A screen-only publisher (camera off) follows the existing
+/// camera-off path (floor governs).
+fn effective_audio_bitrate(
+    tier_bps: u32,
+    congestion_floor_bps: u32,
+    camera_active: bool,
+    camera_video_exhausted: bool,
+) -> u32 {
+    if camera_active && camera_video_exhausted {
+        // Camera on BUT video exhausted (#1611 backstop): compose the camera AQ
+        // tier with the mic floor — the more restrictive wins.
+        tier_bps.min(congestion_floor_bps)
+    } else if camera_active {
+        // Camera on, video NOT exhausted: the camera AQ tier governs and the mic
+        // floor does not apply (unchanged from pre-#1611).
         tier_bps
     } else if congestion_floor_bps == u32::MAX {
         // Camera off, no cut: return the healthy TOP-TIER constant, IGNORING the
@@ -1105,6 +1157,50 @@ pub struct MicrophoneEncoder {
     /// `Arc` (not `Rc`) because it is the camera's `Arc<AtomicBool>` crossing
     /// encoders, matching the congestion-flag wiring.
     camera_active: Arc<AtomicBool>,
+    /// Camera video-exhausted flag (issue #1611 backstop, lever 2): `true` when
+    /// the camera AQ's video quality is fully exhausted (tier at user-capped
+    /// step-down floor AND active simulcast layers at 1). Stored by the camera
+    /// encoder's AQ control loop unconditionally each tick.
+    ///
+    /// Used in the detector gate: when this is `true` AND the camera is on, the
+    /// gate opens anyway (the camera video can't shed further, so audio is the
+    /// only remaining axis). Also used in `effective_audio_bitrate` to compose
+    /// `min(tier, floor)` — see the function's doc for the safety justification.
+    ///
+    /// Defaults to `false` (camera video not exhausted) when unwired (tests),
+    /// which is the SAFE assumption: the detector stays gated to camera-off and
+    /// behaves identically to pre-#1611. Replaced by the camera's atom via
+    /// [`Self::set_camera_video_exhausted_signal`].
+    camera_video_exhausted: Arc<AtomicBool>,
+    /// Screen video-exhausted flag (issue #1611 backstop, lever 3): `true` when
+    /// the screen AQ's video quality is fully exhausted. Stored by the screen
+    /// encoder's AQ control loop each tick while sharing, cleared synchronously
+    /// on share-start.
+    ///
+    /// Used in the detector gate: when this is `true` AND screen is active, the
+    /// gate opens (screen video can't shed further). NOT used in
+    /// `effective_audio_bitrate` (screen writes no audio-tier atom).
+    ///
+    /// Defaults to `false` when unwired (tests) — safe: detector treats screen
+    /// as "can still shed" and stays gated. Replaced via
+    /// [`Self::set_screen_video_exhausted_signal`].
+    screen_video_exhausted: Arc<AtomicBool>,
+    /// Screen-sharing-active flag (issue #1611 backstop, lever 3): `true` when
+    /// screen capture is running. This is the SAME `screen_sharing_active`
+    /// `Rc<AtomicBool>` from the camera encoder, but we accept `Arc<AtomicBool>`
+    /// for the wire. The screen encoder writes it on share start/stop.
+    ///
+    /// Used ONLY in the detector gate's screen term:
+    /// `(!screen_active || screen_video_exhausted)`. When screen is NOT active,
+    /// the term is vacuously true (screen can't block the gate). MUST use
+    /// `now_sharing` semantics (the `screen_sharing_active` atom) rather than
+    /// `state.enabled` (which leads the controller by ~1s and would gate audio
+    /// off prematurely; see issue #1611 exactness item #3).
+    ///
+    /// Defaults to `false` (no screen share) when unwired — safe: gate's screen
+    /// term is vacuously true. Replaced via
+    /// [`Self::set_screen_sharing_active_signal`].
+    screen_sharing_active: Arc<AtomicBool>,
     /// Connection RECONNECT-reseed flag (issue #1398 reconnect P1): the client
     /// sets this `true` in its `Connected` handler (next to the bitrate-floor
     /// reset) on every (re)connect; the mic-side uplink-distress detector tick
@@ -1203,6 +1299,12 @@ impl MicrophoneEncoder {
             // Replaced by the camera's `EncoderState::enabled` atom via
             // `set_camera_active_signal`.
             camera_active: Arc::new(AtomicBool::new(false)),
+            // Issue #1611 backstop signals. Default false = "not exhausted" / "not
+            // sharing" — the safe assumption that keeps the detector behaving
+            // identically to pre-#1611 until wired.
+            camera_video_exhausted: Arc::new(AtomicBool::new(false)),
+            screen_video_exhausted: Arc::new(AtomicBool::new(false)),
+            screen_sharing_active: Arc::new(AtomicBool::new(false)),
             // Reconnect-reseed flag (issue #1398 reconnect P1). Default false (no
             // reconnect pending) so an unwired mic keeps the FIX-1 `!was_active`
             // reseed behaviour unchanged. Replaced by the client-owned atom via
@@ -1318,6 +1420,39 @@ impl MicrophoneEncoder {
     /// so the existing `!was_active` reseed path never fires across a reconnect.
     pub fn set_reconnect_reseed_signal(&mut self, reconnect_reseed: Arc<AtomicBool>) {
         self.reconnect_reseed = reconnect_reseed;
+    }
+
+    /// Share the camera's video-at-floor flag (issue #1611, lever 2). When this
+    /// reads `true` AND the camera is on, the backstop gate opens — video can't
+    /// shed further, so audio is the only remaining axis.
+    ///
+    /// Pass [`CameraEncoder::video_at_floor_flag`](crate::CameraEncoder::video_at_floor_flag).
+    pub fn set_camera_video_exhausted_signal(&mut self, flag: Arc<AtomicBool>) {
+        self.camera_video_exhausted = flag;
+    }
+
+    /// Share the screen's video-at-floor flag (issue #1611, lever 3). When this
+    /// reads `true` AND screen is active, the backstop gate's screen term passes
+    /// — screen video can't shed further.
+    ///
+    /// Pass [`ScreenEncoder::screen_at_floor_flag`](crate::ScreenEncoder::screen_at_floor_flag).
+    pub fn set_screen_video_exhausted_signal(&mut self, flag: Arc<AtomicBool>) {
+        self.screen_video_exhausted = flag;
+    }
+
+    /// Share the screen-sharing-active flag (issue #1611, lever 3). The gate's
+    /// screen term is `(!screen_active || screen_video_exhausted)` — when screen
+    /// is NOT active, the term is vacuously true (screen can't block the gate).
+    /// Uses `now_sharing` (the `screen_sharing_active` atom) rather than
+    /// `state.enabled` which leads the controller by ~1s.
+    ///
+    /// Pass a clone of [`CameraEncoder::screen_sharing_flag`](crate::CameraEncoder::screen_sharing_flag)
+    /// cast to `Arc<AtomicBool>`. Because the camera holds it as `Rc<AtomicBool>`,
+    /// the host must construct a separate `Arc<AtomicBool>` that the screen encoder
+    /// also writes; alternatively, the host can pass a reference obtained from
+    /// [`ScreenEncoder::screen_at_floor_flag`] pattern. See host.rs wiring.
+    pub fn set_screen_sharing_active_signal(&mut self, flag: Arc<AtomicBool>) {
+        self.screen_sharing_active = flag;
     }
 
     /// Returns the effective audio simulcast layer count (#1561): the clamped
@@ -1650,28 +1785,27 @@ impl MicrophoneEncoder {
         let fec_reconfig_tier_bitrate = self.tier_audio_bitrate.clone();
         let fec_reconfig_bitrate_floor = self.shared_congestion_bitrate_floor.clone();
         let fec_camera_active = self.camera_active.clone();
+        // Issue #1611: the FEC reconfig timer needs the camera-exhausted signal
+        // for the updated `effective_audio_bitrate` which now takes 4 args.
+        let fec_camera_video_exhausted = self.camera_video_exhausted.clone();
         // Bitrate-floor recovery lever for the congestion-recovery timer (#1398),
         // a clone of the SAME atom the FEC reconfig timer reads above.
         let bitrate_floor_for_recovery = self.shared_congestion_bitrate_floor.clone();
-        // Mic-side uplink-distress DETECTOR state (issue #1398). The DOWN trigger
-        // for the single-layer bitrate floor — the retarget of the dead b127ee80
-        // self-targeted-CONGESTION trigger onto the live publisher-uplink signal.
-        // Gated to single-layer mode (the floor only matters there) AND to the
-        // CAMERA being OFF (`detector_camera_active` reads false): when the camera
-        // is on, `effective_audio_bitrate` returns the camera AQ tier and ignores
-        // the floor anyway, so the detector stays quiet to avoid cutting a floor
-        // that would never be read (the camera AQ's uplink self-shed steps VIDEO,
-        // not audio — the camera-on uplink→audio downshift is the deferred #1611
-        // backstop). The screen encoder is NOT a gate term — it writes no
-        // audio-tier atom, so a screen-sharing publisher relies on this detector
-        // for its only audio downshift. On the FIRST tick the gate reopens after
-        // being closed (camera on, multi-layer) or after an early-return (mic muted,
-        // switching), the detector RE-SEEDS its windows to `now` (FIX 1) so it never
-        // cashes a stale cross-gap delta. A clone of the SAME floor atom the recovery
-        // climb reads, so a detector step-down restarts recovery automatically.
+        // Mic-side uplink-distress DETECTOR state (issue #1398 + #1611 backstop).
+        // The DOWN trigger for the single-layer bitrate floor. Gated to single-layer
+        // mode AND the 3-signal backstop gate (issue #1611):
+        //   single_layer && (!camera || camera_exhausted) && (!screen || screen_exhausted)
+        // On the FIRST tick the gate reopens after being closed, the detector
+        // RE-SEEDS its windows to `now` (FIX 1) so it never cashes a stale
+        // cross-gap delta. A clone of the SAME floor atom the recovery climb reads,
+        // so a detector step-down restarts recovery automatically.
         let detector_single_layer = n_audio_layers == 1;
         let detector_bitrate_floor = self.shared_congestion_bitrate_floor.clone();
         let detector_camera_active = self.camera_active.clone();
+        // Issue #1611 backstop signals for the detector gate.
+        let detector_camera_video_exhausted = self.camera_video_exhausted.clone();
+        let detector_screen_video_exhausted = self.screen_video_exhausted.clone();
+        let detector_screen_active = self.screen_sharing_active.clone();
         // Reconnect-reseed flag (issue #1398 reconnect P1): the client sets this
         // true on every (re)connect; the detector tick CONSUMES it (swap-to-false)
         // and forces a window re-seed even though the detector stayed active across
@@ -2140,6 +2274,10 @@ impl MicrophoneEncoder {
             // accumulated while inactive.
             let detector_floor = detector_bitrate_floor.clone();
             let detector_camera = detector_camera_active.clone();
+            // Issue #1611: backstop signals, re-cloned for the move closure.
+            let detector_cam_exhausted = detector_camera_video_exhausted.clone();
+            let detector_scr_exhausted = detector_screen_video_exhausted.clone();
+            let detector_scr_active = detector_screen_active.clone();
             // Reconnect-reseed flag (issue #1398 reconnect P1), re-cloned for the
             // move closure. CONSUMED (swap-to-false) each tick the detector
             // evaluates, forcing a window re-seed once per reconnect.
@@ -2257,6 +2395,9 @@ impl MicrophoneEncoder {
                 let detector_should_be_active = audio_detector_gate_open(
                     detector_single_layer,
                     detector_camera.load(Ordering::Acquire),
+                    detector_cam_exhausted.load(Ordering::Acquire),
+                    detector_scr_active.load(Ordering::Acquire),
+                    detector_scr_exhausted.load(Ordering::Acquire),
                 );
                 if detector_should_be_active {
                     // Reconnect-reseed (issue #1398 reconnect P1): CONSUME the
@@ -2352,36 +2493,26 @@ impl MicrophoneEncoder {
                     }
                     det_was_active.set(true);
                 } else {
-                    // Gate closed for ANY reason: the camera is on again (its AQ
-                    // loop is the active audio authority) or multi-layer. The `else`
+                    // Gate closed for ANY reason: the camera is on with video NOT
+                    // exhausted (its AQ loop is the active audio authority), screen
+                    // is on with video NOT exhausted, or multi-layer. The `else`
                     // branch handles ALL gate-closed reasons UNIFORMLY. On the
                     // CLOSING edge specifically (the detector evaluated last tick,
                     // `was_active == true`, and is now gated) CLEAR the bitrate floor
                     // back to the fail-open sentinel exactly once (FIX C, Codex P1).
-                    // This covers the camera-turns-on recovery path: when the camera
-                    // turns on while a mic floor cut was active, the gate closes here
-                    // and clears any mic floor the detector cut earlier, so the
-                    // effective bitrate hands cleanly back to the camera AQ tier (per
-                    // `effective_audio_bitrate`'s camera-on branch) with no stale
-                    // mic-side floor lingering to re-cap the stream if the camera
-                    // later goes off. Clearing to `u32::MAX` RAISES the floor; the
-                    // recovery state machine reads `u32::MAX` as fully-recovered
-                    // (`audio_bitrate_recover` returns `(MAX, true)`) and
-                    // `audio_bitrate_tick` clears the cut memory, so there is no
-                    // misfire — and a raise is not a decrease, so no spurious new-cut.
-                    // Note: on this gate-CLOSED tick the detector did not evaluate
-                    // a step-down, so `bitrate_distress_this_tick` is FALSE; the
-                    // recovery tick runs with `distress_active_now == false` and
-                    // its `current == u32::MAX` short-circuit clears the cut — the
-                    // hold-at-floor branch (#1398) does NOT fire at MAX (nothing to
-                    // hold), so a stale distress flag can never wedge a fail-open
-                    // floor.
+                    // This covers the camera-recovers path: when camera video steps
+                    // back up from the floor (exhausted → not-exhausted), the gate
+                    // closes and clears any mic floor the detector cut earlier, so the
+                    // effective bitrate hands cleanly back to the camera AQ tier with
+                    // no stale mic-side floor lingering. Clearing to `u32::MAX` RAISES
+                    // the floor; the recovery state machine reads `u32::MAX` as
+                    // fully-recovered and clears the cut memory — no misfire.
                     if det_was_active.get() {
                         detector_floor.store(u32::MAX, Ordering::Relaxed);
                         log::info!(
-                            "MicrophoneEncoder: distress-detector gate closed (camera on — \
-                             camera AQ now governs audio); clearing single-layer audio \
-                             bitrate floor to fail-open (#1398 FIX C)"
+                            "MicrophoneEncoder: distress-detector gate closed (video can shed \
+                             again — video AQ now governs); clearing single-layer audio \
+                             bitrate floor to fail-open (#1398 FIX C / #1611)"
                         );
                     }
                     // Mark inactive so the next reopen re-seeds (FIX 1).
@@ -2460,6 +2591,7 @@ impl MicrophoneEncoder {
             let fec_tier_bitrate = fec_reconfig_tier_bitrate;
             let fec_bitrate_floor = fec_reconfig_bitrate_floor;
             let fec_camera = fec_camera_active;
+            // Issue #1611: fec_camera_video_exhausted is already the Arc, captured directly
             let fec_init_bitrate: Option<u32> = if fec_single_layer {
                 // Top-tier bitrate = the bitrate the base encoder inits at while
                 // healthy (no floor cut), so the first healthy observation is
@@ -2492,6 +2624,7 @@ impl MicrophoneEncoder {
                         fec_tier_bitrate.load(Ordering::Relaxed),
                         fec_bitrate_floor.load(Ordering::Relaxed),
                         fec_camera.load(Ordering::Acquire),
+                        fec_camera_video_exhausted.load(Ordering::Acquire),
                     ))
                 } else {
                     None
@@ -3030,19 +3163,22 @@ mod layer_count_tests {
         assert_eq!(audio_congestion_bitrate_step_down(bottom), bottom);
     }
 
+    // effective_audio_bitrate args: (tier_bps, congestion_floor_bps, camera_active, camera_video_exhausted)
     #[test]
     fn effective_audio_bitrate_camera_off_no_cut_ignores_stale_tier_returns_top() {
         // CAMERA-OFF, FLOOR FAIL-OPEN (no cut): the tier atom may hold a STALE low
         // value — the camera AQ loop lowers it on camera-on congestion and never
         // restores it — so it MUST be IGNORED here. With no cut, the correct
-        // audio-only bitrate is the healthy TOP tier (50000). Otherwise, after a
-        // camera-on congestion episode, turning the camera off would pin audio-only
-        // at the stale low tier forever on a healthy link (no recovery path).
-        //
-        // Revert it catches: restoring the camera-off no-cut branch to `tier_bps`
-        // → the 16_000 → 50_000 assertion below reads 16_000 and FAILS.
-        assert_eq!(effective_audio_bitrate(16_000, u32::MAX, false), 50_000); // stale 16k → recover to 50k
-        assert_eq!(effective_audio_bitrate(50_000, u32::MAX, false), 50_000); // already top → 50k
+        // audio-only bitrate is the healthy TOP tier (50000). camera_video_exhausted
+        // is irrelevant when camera is off.
+        assert_eq!(
+            effective_audio_bitrate(16_000, u32::MAX, false, false),
+            50_000
+        );
+        assert_eq!(
+            effective_audio_bitrate(50_000, u32::MAX, false, false),
+            50_000
+        );
     }
 
     #[test]
@@ -3050,28 +3186,42 @@ mod layer_count_tests {
         // FIX B: CAMERA-OFF with an ACTIVE mic floor cut. The tier atom may hold a
         // STALE camera-on value; it MUST be IGNORED — the mic floor is the live
         // authority audio-only. Returns the FLOOR regardless of the tier.
-        // Stale tier ABOVE the floor: floor governs (a plain MIN would also give
-        // the floor here, so this case alone is not decisive).
-        assert_eq!(effective_audio_bitrate(50_000, 32_000, false), 32_000);
-        // THE FIX-B decisive case: a STALE tier BELOW the floor. A plain
-        // `min(tier, floor)` would return the stale 24000 tier; the camera-state-
-        // aware select must return the live 32000 FLOOR. Revert it catches:
-        // restoring `tier_bps.min(floor)` for camera-off → this reads 24000 and
-        // FAILS, proving the stale tier no longer masks the floor.
-        assert_eq!(effective_audio_bitrate(24_000, 32_000, false), 32_000);
+        assert_eq!(
+            effective_audio_bitrate(50_000, 32_000, false, false),
+            32_000
+        );
+        // THE FIX-B decisive case: a STALE tier BELOW the floor.
+        assert_eq!(
+            effective_audio_bitrate(24_000, 32_000, false, false),
+            32_000
+        );
     }
 
     #[test]
-    fn effective_audio_bitrate_camera_on_uses_tier_ignores_floor() {
-        // CAMERA-ON: the camera AQ loop is the live authority and the mic detector
-        // is gated OFF, so the floor MUST NOT apply — the effective bitrate is the
-        // tier, even if a (now stale) floor cut is still present. Revert it catches:
-        // returning `min(tier, floor)` for the camera-on case → the floor-tighter
-        // case below reads 32000 and FAILS, proving the floor is ignored while the
-        // camera governs audio.
-        assert_eq!(effective_audio_bitrate(50_000, 32_000, true), 50_000);
+    fn effective_audio_bitrate_camera_on_not_exhausted_uses_tier_ignores_floor() {
+        // CAMERA-ON, video NOT exhausted: the camera AQ loop is the live authority
+        // and the mic detector is gated OFF, so the floor MUST NOT apply.
+        assert_eq!(effective_audio_bitrate(50_000, 32_000, true, false), 50_000);
         // Tier already below the floor: still the tier (the AQ loop owns it).
-        assert_eq!(effective_audio_bitrate(24_000, u32::MAX, true), 24_000);
+        assert_eq!(
+            effective_audio_bitrate(24_000, u32::MAX, true, false),
+            24_000
+        );
+    }
+
+    #[test]
+    fn effective_audio_bitrate_camera_on_exhausted_composes_min() {
+        // Issue #1611 backstop: camera ON + video EXHAUSTED → min(tier, floor).
+        // This is the "camera can't shed video, audio is the only axis" path.
+        // Floor tighter than tier: floor governs.
+        assert_eq!(effective_audio_bitrate(50_000, 32_000, true, true), 32_000);
+        // Tier tighter than floor: tier governs.
+        assert_eq!(effective_audio_bitrate(24_000, 32_000, true, true), 24_000);
+        // No cut (floor = u32::MAX): min(tier, MAX) = tier (no change from healthy).
+        assert_eq!(
+            effective_audio_bitrate(50_000, u32::MAX, true, true),
+            50_000
+        );
     }
 
     #[test]
@@ -3734,28 +3884,52 @@ mod layer_count_tests {
     // FIX A: detector GATE (audio_detector_gate_open).
     // Args: (single_layer, camera_active).
     // Gate = single_layer && !camera_active.
+    // Args: (single_layer, camera_active, camera_video_exhausted, screen_active, screen_video_exhausted).
     #[test]
     fn detector_gate_audio_only_opens() {
-        // Single-layer + camera off → gate OPEN (the detector evaluates). This is
-        // the audio-only single-layer publisher the lever exists for.
-        assert!(audio_detector_gate_open(true, false));
+        // Single-layer + camera off + no screen → gate OPEN (the detector evaluates).
+        // This is the audio-only single-layer publisher the lever exists for.
+        assert!(audio_detector_gate_open(true, false, false, false, false));
     }
     #[test]
-    fn detector_gate_camera_active_closes() {
-        // Single-layer + camera ON → gate CLOSED (camera-on, effective_audio_bitrate
-        // ignores the mic floor, so a floor cut would never be read). REVERT it
-        // catches: dropping the `!camera_active` term makes the body `single_layer` = true,
-        // flipping this from false to TRUE and FAILING.
-        assert!(!audio_detector_gate_open(true, true));
+    fn detector_gate_camera_active_not_exhausted_closes() {
+        // Single-layer + camera ON + video NOT exhausted → gate CLOSED (camera AQ
+        // can still shed video). REVERT it catches: dropping the camera term opens.
+        assert!(!audio_detector_gate_open(true, true, false, false, false));
+    }
+    #[test]
+    fn detector_gate_camera_active_exhausted_opens() {
+        // Issue #1611 lever 2: camera ON but video EXHAUSTED → gate OPEN (video
+        // can't shed further, audio is the only remaining axis).
+        assert!(audio_detector_gate_open(true, true, true, false, false));
+    }
+    #[test]
+    fn detector_gate_screen_active_not_exhausted_closes() {
+        // Issue #1611 lever 3: screen active + video NOT exhausted → gate CLOSED
+        // (screen video can still shed).
+        assert!(!audio_detector_gate_open(true, false, false, true, false));
+    }
+    #[test]
+    fn detector_gate_screen_active_exhausted_opens() {
+        // Issue #1611 lever 3: screen active + video EXHAUSTED → gate OPEN.
+        assert!(audio_detector_gate_open(true, false, false, true, true));
+    }
+    #[test]
+    fn detector_gate_both_active_both_exhausted_opens() {
+        // Both camera and screen on, both exhausted → gate OPEN.
+        assert!(audio_detector_gate_open(true, true, true, true, true));
+    }
+    #[test]
+    fn detector_gate_both_active_camera_not_exhausted_closes() {
+        // Camera not exhausted blocks even if screen is exhausted.
+        assert!(!audio_detector_gate_open(true, true, false, true, true));
     }
     #[test]
     fn detector_gate_multilayer_closes_regardless() {
-        // Multi-layer mode → gate CLOSED for either camera state (the layer-ceiling
-        // lever handles congestion there; the bitrate floor is inert). REVERT it
-        // catches: dropping the leading `single_layer &&` makes the camera-off case
-        // open.
-        assert!(!audio_detector_gate_open(false, false));
-        assert!(!audio_detector_gate_open(false, true));
+        // Multi-layer mode → gate CLOSED for any video state (the layer-ceiling
+        // lever handles congestion there; the bitrate floor is inert).
+        assert!(!audio_detector_gate_open(false, false, false, false, false));
+        assert!(!audio_detector_gate_open(false, true, true, true, true));
     }
     // FIX 1: window RE-SEED decision (audio_detector_should_reseed).
     // Args: (should_evaluate, was_active, force_reseed).

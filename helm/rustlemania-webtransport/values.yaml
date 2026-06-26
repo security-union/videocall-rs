@@ -38,11 +38,22 @@ env:
     value: webtransport
   - name: SERVER_STATS_INTERVAL_SECS
     value: "5"
-  # Bumped from 2 to 4: 2 worker threads serialised ~30 sessions in
-  # the 17-peer cc7tp meeting on 2026-05-06, contributing to outbound
-  # channel back-pressure. 4 threads matches the new 1500m CPU limit.
-  - name: TOKIO_WORKER_THREADS
-    value: "4"
+  # NOTE: TOKIO_WORKER_THREADS is intentionally NOT set for this relay.
+  # The webtransport_server binary is `#[actix_rt::main]`, which builds a
+  # single-threaded current-thread tokio runtime that never reads
+  # TOKIO_WORKER_THREADS / worker_threads. The runtime is single-threaded
+  # *by necessity*: the per-session `WtChatSession` actor and its
+  # WebTransport I/O are driven on the actix LocalSet via spawn_local
+  # (see actix-api/src/webtransport/mod.rs and the actor's `!Send` I/O),
+  # which a multi-threaded runtime cannot host. Setting the env here was
+  # therefore inert — a prior bump 2->4 (believed to relieve outbound
+  # back-pressure in the 17-peer cc7tp meeting on 2026-05-06) did nothing,
+  # because thread count cannot relieve back-pressure on a current-thread
+  # runtime. The real multi-core fix (multi-Arbiter sharding / off-thread
+  # parse — issue #1639 options a/b) is deferred to after the #1637
+  # scheduler-lag instrumentation lands. The inert env was removed in #1639
+  # (option c). TOKIO_BLOCKING_THREADS below still applies: the
+  # current-thread runtime keeps a blocking-task pool for spawn_blocking.
   - name: TOKIO_BLOCKING_THREADS
     value: "2"
   # WT outbound mpsc capacity per session. Default in code is 512

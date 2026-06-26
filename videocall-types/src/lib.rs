@@ -131,3 +131,65 @@ pub fn truthy(s: Option<&str>) -> bool {
         false
     }
 }
+
+#[cfg(test)]
+mod video_stats_wire_tests {
+    //! Wire-format round-trip coverage for `VideoStats` (issue #1641).
+    //!
+    //! `content_staleness_ms` was added as proto field 9 (tag 73) on the existing `VideoStats`
+    //! message. These tests exercise the REAL generated encode/decode path
+    //! (`protobuf::Message::{write_to_bytes, parse_from_bytes}`) — not an in-memory field set — so
+    //! they fail if the field is mis-tagged, dropped, or read with the wrong wire type, and they
+    //! pin the proto3 backward-compatibility default for peers that predate the field.
+    use crate::protos::health_packet::VideoStats;
+    use protobuf::Message;
+
+    #[test]
+    fn content_staleness_ms_survives_wire_round_trip() {
+        let mut vs = VideoStats::new();
+        // A multi-minute content age — the unbounded staleness this metric exists to carry
+        // (> the 1800ms playout-latency cap), so the value is unmistakable on the far side.
+        vs.content_staleness_ms = 5000.0;
+
+        let bytes = vs
+            .write_to_bytes()
+            .expect("VideoStats must serialize to protobuf bytes");
+        let decoded =
+            VideoStats::parse_from_bytes(&bytes).expect("serialized VideoStats must parse back");
+
+        // Mutation sensitivity: if field 9 were mis-tagged, dropped, or decoded with the wrong
+        // wire type, this read would not return 5000.0.
+        assert_eq!(
+            decoded.content_staleness_ms, 5000.0,
+            "content_staleness_ms (field 9) must round-trip through the wire unchanged"
+        );
+    }
+
+    #[test]
+    fn content_staleness_ms_defaults_to_zero_when_field_absent() {
+        // Serialize a VideoStats that sets ONLY field 1 (fps_received) and leaves field 9 at its
+        // proto3 default. proto3 omits default-valued scalars from the wire, so the encoded bytes
+        // carry NO field-9 entry — exactly what a peer built before #1641 would send.
+        let mut older_peer = VideoStats::new();
+        older_peer.fps_received = 30.0;
+        assert_eq!(
+            older_peer.content_staleness_ms, 0.0,
+            "precondition: field 9 left at proto3 default so it is omitted from the wire"
+        );
+
+        let bytes = older_peer
+            .write_to_bytes()
+            .expect("VideoStats must serialize to protobuf bytes");
+        let decoded = VideoStats::parse_from_bytes(&bytes)
+            .expect("a field-9-less VideoStats must still parse (wire-compatible additive field)");
+
+        assert_eq!(
+            decoded.fps_received, 30.0,
+            "the field that WAS set must survive"
+        );
+        assert_eq!(
+            decoded.content_staleness_ms, 0.0,
+            "a VideoStats without field 9 must decode content_staleness_ms as the proto3 default 0.0"
+        );
+    }
+}

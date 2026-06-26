@@ -1116,6 +1116,13 @@ impl EncoderBitrateController {
         self.quality_manager.active_layer_count()
     }
 
+    /// Whether this stream's video adaptive quality is fully exhausted — tier
+    /// at the effective step-down cap AND active layers at 1 (issue #1611).
+    /// Delegates to [`AdaptiveQualityManager::video_at_floor`].
+    pub fn video_at_floor(&self) -> bool {
+        self.quality_manager.video_at_floor()
+    }
+
     /// Per-layer target bitrates in kbps, lowest layer first (index ==
     /// `layer_id`). One entry per ladder layer; only the first
     /// [`active_layer_count`](Self::active_layer_count) are encoded by the

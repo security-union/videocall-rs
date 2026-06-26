@@ -51,6 +51,13 @@ impl Decodable for WasmDecoder {
         on_decoded_frame: Box<dyn Fn(Self::Frame) + Send + Sync>,
     ) -> Self {
         log::info!("Creating WASM decoder with internal jitter buffer");
+        // Issue #1641: this `Decodable::new` path is not used for real peer rendering (peer
+        // decoders use `new_with_video_frame_callback`, which threads the owner's true media_type).
+        // It still forwards the worker's "video" stats DiagEvent, which health_reporter buckets by
+        // the `media_type` metric — so we must stamp *something*. "VIDEO" (the camera literal,
+        // `MEDIA_TYPE_CAMERA`) is the safe default: there is no real screen-share decoder on this
+        // path, so the camera bucket is correct.
+        const DECODABLE_DEFAULT_MEDIA_TYPE: &str = "VIDEO";
         // Find the worker script URL from the link tag added by Trunk.
         let worker_url = window()
             .expect("no window")
@@ -107,9 +114,10 @@ impl Decodable for WasmDecoder {
                         // Issue #1025: this `Decodable::new` path is not used for real peer
                         // rendering (peer decoders use `new_with_video_frame_callback`), so there
                         // is no proactive keyframe hook to fire here — but we still recognize the
-                        // worker's RequestKeyframeMessage so it isn't logged as "unexpected".
-                        if !handle_worker_request_keyframe(&js_val)
-                            && !handle_worker_diag_message(&js_val)
+                        // worker's RequestKeyframeMessage so it isn't logged as "unexpected". The
+                        // carried `head_age_ms` (#1479) is ignored on this no-render path.
+                        if handle_worker_request_keyframe(&js_val).is_none()
+                            && !handle_worker_diag_message(&js_val, DECODABLE_DEFAULT_MEDIA_TYPE)
                         {
                             log::warn!("Received unexpected message from worker: {js_val:?}");
                         }
@@ -144,12 +152,23 @@ impl WasmDecoder {
     /// worker posts a [`RequestKeyframeMessage`] — i.e. the worker's jitter buffer just
     /// evicted a stale keyframe-less backlog and wants a fresh keyframe fetched now. The
     /// owner (e.g. `VideoPeerDecoder`) supplies a closure that issues a `KEYFRAME_REQUEST`
-    /// for this decoder's peer/stream. Pass a no-op (`Box::new(|| {})`) when no proactive
-    /// keyframe path is wired.
+    /// for this decoder's peer/stream. The closure receives the head-of-line backlog age
+    /// (`head_age_ms`, issue #1479) that tripped the freshness deadline. Pass a no-op
+    /// (`Box::new(|_| {})`) when no proactive keyframe path is wired.
+    ///
+    /// `media_type` (issue #1641) is the owner's stream kind — `"VIDEO"` for a camera decoder
+    /// or `"SCREEN"` for a screen-share decoder (the `MEDIA_TYPE_CAMERA`/`MEDIA_TYPE_SCREEN`
+    /// constants in `videocall-client`). The worker does NOT know which stream it decodes (its
+    /// `SetContext` carries only peer IDs), so this main-thread re-broadcast is the only place
+    /// the kind is known. It is stamped onto the worker's "video" stats DiagEvent (see
+    /// [`handle_worker_diag_message`]) so `health_reporter` buckets the playout-family metrics
+    /// (latency / paint-lag / skip-to-live / content-staleness) into the correct camera-vs-screen
+    /// slot, mirroring how `emit_loss_metrics` already stamps its loss/keyframe metrics.
     pub fn new_with_video_frame_callback(
         _codec: crate::decoder::VideoCodec,
         on_video_frame: Box<dyn Fn(VideoFrame)>,
-        on_request_keyframe: Box<dyn Fn()>,
+        on_request_keyframe: Box<dyn Fn(f64)>,
+        media_type: &'static str,
     ) -> Self {
         log::info!("Creating WASM decoder with VideoFrame callback");
         // Find the worker script URL from the link tag added by Trunk.
@@ -197,10 +216,12 @@ impl WasmDecoder {
                         // Worker->main serde messages: try the proactive keyframe-request signal
                         // (#1025) first, then the diagnostics stats message. Order is irrelevant
                         // (each gates on its own `kind`), but checking the keyframe request first
-                        // keeps the recovery path off the (more frequent) stats path.
-                        if handle_worker_request_keyframe(&js_val) {
-                            request_keyframe();
-                        } else if !handle_worker_diag_message(&js_val) {
+                        // keeps the recovery path off the (more frequent) stats path. The carried
+                        // `head_age_ms` (#1479) is forwarded to the route so the main thread's PLI
+                        // budget can prioritize the stalest stream.
+                        if let Some(head_age_ms) = handle_worker_request_keyframe(&js_val) {
+                            request_keyframe(head_age_ms);
+                        } else if !handle_worker_diag_message(&js_val, media_type) {
                             log::warn!("Received unexpected message from worker: {js_val:?}");
                         }
                     }
@@ -353,30 +374,45 @@ fn post_paint_progress(
     }
 }
 
-/// Recognize the worker's proactive keyframe-request signal (issue #1025). Returns `true` if
-/// the posted value is a [`RequestKeyframeMessage`] (so the caller should fire its keyframe
-/// callback), `false` otherwise (the caller falls through to the diagnostics parse).
+/// Recognize the worker's proactive keyframe-request signal (issue #1025). Returns
+/// `Some(head_age_ms)` if the posted value is a [`RequestKeyframeMessage`] (so the caller should
+/// fire its keyframe callback, passing the carried head-of-line backlog age), `None` otherwise
+/// (the caller falls through to the diagnostics parse).
+///
+/// The `head_age_ms` (issue #1479) is the backlog age that tripped the freshness deadline,
+/// forwarded so the main thread's per-receiver cross-sender PLI budget can prioritize the stalest
+/// stream when its global cap is reached. Old payloads that omit the field decode it as `0.0`
+/// (`#[serde(default)]`), which the budget treats as the freshest possible request.
 ///
 /// Both this and [`handle_worker_diag_message`] deserialize the same JS object shape via serde
 /// and disambiguate on the `kind` field, mirroring the existing stats dispatch. We check the
 /// discriminant explicitly so a `VideoStatsMessage` (whose extra fields are all `Option` and
 /// would deserialize fine into this struct's subset) is NOT mistaken for a keyframe request.
-fn handle_worker_request_keyframe(js_val: &JsValue) -> bool {
+fn handle_worker_request_keyframe(js_val: &JsValue) -> Option<f64> {
     match serde_wasm_bindgen::from_value::<RequestKeyframeMessage>(js_val.clone()) {
         Ok(msg) if msg.kind == REQUEST_KEYFRAME_KIND => {
             log::debug!(
-                "Proactive keyframe request from worker (#1025): from_peer={:?} to_peer={:?}",
+                "Proactive keyframe request from worker (#1025): from_peer={:?} to_peer={:?} head_age_ms={:.0}",
                 msg.from_peer,
-                msg.to_peer
+                msg.to_peer,
+                msg.head_age_ms
             );
-            true
+            Some(msg.head_age_ms)
         }
-        _ => false,
+        _ => None,
     }
 }
 
 /// Handle diagnostics objects posted by the worker. Returns true if handled.
-fn handle_worker_diag_message(js_val: &JsValue) -> bool {
+///
+/// `media_type` (issue #1641) is the owning decoder's stream kind (`"VIDEO"` / `"SCREEN"`),
+/// stamped onto the re-broadcast "video" DiagEvents so `health_reporter` routes their metrics
+/// into the correct camera-vs-screen bucket. The worker itself does not know its media_type
+/// (its `SetContext` carries only peer IDs), so the value is supplied here on the main thread by
+/// the owner (`VideoPeerDecoder`), the only place the kind is known. The `worker_log` branch is a
+/// `"worker_log"` subsystem event that `health_reporter` does NOT camera/screen-bucket, so it is
+/// intentionally left unstamped.
+fn handle_worker_diag_message(js_val: &JsValue, media_type: &'static str) -> bool {
     // video_stats (issue #1252). A freshness_skip message ALSO deserializes into
     // VideoStatsMessage (its fields are all `Option`), so we must check `kind` and
     // fall through rather than treating a successful deserialize as a match.
@@ -389,6 +425,18 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                     stream_id: None,
                     ts_ms: now_ms(),
                     metrics: vec![
+                        // Issue #1641: stamp the owning decoder's stream kind so health_reporter
+                        // routes the playout-family metrics below into the correct camera-vs-screen
+                        // bucket. Without this, a peer's SCREEN-decoder worker stats landed in the
+                        // CAMERA bucket (is_screen defaults false) and raced/overwrote it. The
+                        // worker cannot supply this (it only knows peer IDs), so it is supplied here
+                        // on the main thread, mirroring `emit_loss_metrics`'s media_type stamp.
+                        // `media_type` is `&'static str`, so use the zero-alloc borrowed form
+                        // (#1421) rather than `metric!`'s allocating `From<&str>` path.
+                        Metric {
+                            name: "media_type",
+                            value: MetricValue::text_static(media_type),
+                        },
                         metric!("from_peer", stats_msg.from_peer.unwrap_or_default()),
                         metric!("to_peer", stats_msg.to_peer.unwrap_or_default()),
                         metric!("frames_buffered", stats_msg.frames_buffered.unwrap_or(0)),
@@ -408,6 +456,15 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                         metric!(
                             "playout_skip_to_live_total",
                             stats_msg.playout_skip_to_live_total.unwrap_or(0)
+                        ),
+                        // Content-staleness (#1641): content AGE of the painted video, distinct
+                        // from the paint-lag DEPTH above. This MAIN-THREAD re-broadcast is the
+                        // load-bearing one for health_reporter — the worker's own in-process
+                        // DiagEvent broadcast does not cross the worker→main boundary, so the
+                        // field reaches the health packet only via this forward.
+                        metric!(
+                            "content_staleness_ms",
+                            stats_msg.content_staleness_ms.unwrap_or(0.0)
                         ),
                     ],
                 };
@@ -459,6 +516,16 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                             name: "event",
                             value: MetricValue::text_static("freshness_skip"),
                         },
+                        // Issue #1641: this is also a `subsystem: "video"` event, so
+                        // health_reporter's video handler buckets it camera-vs-screen by
+                        // `media_type` (and bumps that bucket's timestamp). Stamp the owner's kind
+                        // here too — without it a SCREEN-decoder skip lands in the CAMERA bucket —
+                        // for consistency with the video_stats stamp above. The worker cannot supply
+                        // it (peer IDs only); it is the main thread's per-decoder static.
+                        Metric {
+                            name: "media_type",
+                            value: MetricValue::text_static(media_type),
+                        },
                         metric!("from_peer", skip_msg.from_peer.unwrap_or_default()),
                         metric!("to_peer", skip_msg.to_peer.unwrap_or_default()),
                         metric!("head_age_ms", skip_msg.head_age_ms),
@@ -469,6 +536,12 @@ fn handle_worker_diag_message(js_val: &JsValue) -> bool {
                             skip_msg.keyframe_seq.map(|s| s as i64).unwrap_or(-1)
                         ),
                         metric!("dropped", skip_msg.dropped),
+                        // Issue #1662: 1 marks the keyframe-less hold-ceiling escalation
+                        // (decoder-pipeline reset), 0 a routine skip. Encoded as i64 to match the
+                        // numeric-metric convention here (`keyframe_seq` above); lets a structured
+                        // consumer (e.g. a future "reconnecting video" UI) key off the escalation
+                        // without parsing the console line.
+                        metric!("escalated", i64::from(skip_msg.escalated)),
                     ],
                 };
                 let _ = global_sender().try_broadcast(evt);

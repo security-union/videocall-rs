@@ -20,8 +20,11 @@ mod bridge;
 mod cert_preflight;
 
 use crate::actors::chat_server::ChatServer;
-use crate::actors::transports::wt_chat_session::WtChatSession;
+use crate::actors::transports::wt_chat_session::{WtChatSession, WT_HEARTBEAT_INTERVAL};
 use crate::constants::VALID_ID_PATTERN;
+use crate::metrics::{
+    duration_to_millis_f64, forget_connection_path_stats, publish_connection_path_stats,
+};
 use crate::server_diagnostics::TrackerSender;
 use crate::session_manager::SessionManager;
 use crate::token_validator;
@@ -251,7 +254,13 @@ pub async fn start(
 
     // Accept new WebTransport connections
     // NOTE: We use actix_rt::spawn instead of tokio::spawn because the WtChatSession
-    // actor requires the actix LocalSet context for spawn_local.
+    // actor requires the actix LocalSet context for spawn_local. This is also why
+    // the binary is `#[actix_rt::main]` (single-threaded current-thread runtime):
+    // a multi-threaded runtime cannot host these `!Send`, spawn_local-bound tasks.
+    // Because the runtime is current-thread, `TOKIO_WORKER_THREADS` is INERT for
+    // this relay — tuning it does nothing and cannot relieve outbound back-pressure.
+    // Multi-core scaling (multi-Arbiter sharding / off-thread parse — issue #1639
+    // options a/b) is future work gated on the #1637 scheduler-lag instrumentation.
     while let Some(request) = server.accept().await {
         trace_span!("New connection being attempted");
         let chat_server = chat_server.clone();
@@ -389,6 +398,170 @@ async fn run_webtransport_connection_from_request(
     Ok(())
 }
 
+/// The cadence at which `handle_webtransport_session` drives the per-connection
+/// path-stat sampler (#1637).
+///
+/// In production this is always [`WT_HEARTBEAT_INTERVAL`] (5s) — production
+/// behavior is unchanged. Under `#[cfg(test)]` it is overridable via
+/// [`set_path_stat_sample_interval_for_test`] so the sampler tests can drive a
+/// fast cadence (a 5s tick would never fire inside a test window) and observe a
+/// real tick emitted through [`spawn_connection_path_sampler`] (the wiring
+/// `handle_webtransport_session` invokes). The override is a test-only seam; the
+/// production `#[cfg(not(test))]` arm has no atomic and cannot be changed at
+/// runtime. Because [`spawn_connection_path_sampler`] resolves the cadence by
+/// CALLING this function, the override flows through the production spawn path.
+#[cfg(not(test))]
+fn path_stat_sample_interval() -> std::time::Duration {
+    WT_HEARTBEAT_INTERVAL
+}
+
+#[cfg(test)]
+static PATH_STAT_SAMPLE_INTERVAL_MS: AtomicU64 =
+    AtomicU64::new(WT_HEARTBEAT_INTERVAL.as_millis() as u64);
+
+#[cfg(test)]
+fn path_stat_sample_interval() -> std::time::Duration {
+    std::time::Duration::from_millis(PATH_STAT_SAMPLE_INTERVAL_MS.load(Ordering::Relaxed))
+}
+
+/// Test-only: override the path-stat sampler cadence (#1637). See
+/// [`path_stat_sample_interval`].
+#[cfg(test)]
+fn set_path_stat_sample_interval_for_test(d: std::time::Duration) {
+    PATH_STAT_SAMPLE_INTERVAL_MS.store(d.as_millis() as u64, Ordering::Relaxed);
+}
+
+/// Sample relay-measured QUIC path health for one live WT connection (#1637).
+///
+/// Runs as its own task for the lifetime of a WebTransport session, sampling
+/// ~every `sample_interval` (production passes [`path_stat_sample_interval`] =
+/// [`WT_HEARTBEAT_INTERVAL`], 5s; the param exists so the integration test can
+/// drive a faster cadence and observe a tick within its window). On each tick it
+/// reads ONE quinn `stats()` snapshot and hands the four scalars to
+/// [`publish_connection_path_stats`], which sets the four per-`session_id` gauges
+/// — the LEAD signal set for epic #1636's B-vs-C discrimination (see the metric
+/// docs in `metrics.rs` for the full reading: rtt/loss/congestion freeze under a
+/// downlink collapse, `sent_packets` keeps climbing, so the two together separate
+/// a network collapse from a relay thread stall).
+///
+/// `conn` is a CLONE of the session's `quinn::Connection` (Arc-backed, cheap to
+/// clone), taken BEFORE the owning `Session` is moved into the bridge. A
+/// `quinn::Connection` clone is a COUNTED handle: quinn auto-closes a connection
+/// only when its handle ref-count reaches 0 (the driver task is explicitly
+/// excluded from that count — quinn 0.11.9 connection.rs:927-941), so holding this
+/// clone DEFERS that implicit close. The connection lifetime and the gauge GC are
+/// therefore bounded NOT by quinn auto-close but by [`stop_connection_path_sampler`]'s
+/// UNCONDITIONAL `abort()` + `forget_connection_path_stats` at session teardown.
+/// (We also break the loop on `close_reason()` so a real peer/idle-timeout close —
+/// which the protocol state machine drives independently of ref-count — stops the
+/// sampler promptly and avoids one stale final sample; that is a convenience, not
+/// the lifetime bound.)
+///
+/// quinn exposes no "last-ACK age"; the rtt/loss/congestion freeze contrasted
+/// against `sent_packets` still climbing carries that intent (see the metric-doc
+/// note in `metrics.rs`). All counters are sampled SERVER-SIDE, so this reflects
+/// the relay's authoritative view of the downlink even when a client is wedged and
+/// stops self-reporting.
+async fn sample_connection_path_stats(
+    conn: quinn::Connection,
+    room: String,
+    session_id: String,
+    sample_interval: std::time::Duration,
+) {
+    let mut interval = tokio::time::interval(sample_interval);
+    // Skip the immediate first tick: on a brand-new connection RTT/stats are not
+    // yet meaningful (rtt() would return the unsampled initial_rtt floor), and the
+    // first heartbeat-aligned sample is what we want.
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+
+        // If quinn has closed the connection, stop sampling. The teardown path
+        // also aborts us + removes the series; this just avoids one stale sample
+        // and an idle task between close and abort. This `close_reason()` check is
+        // a separate cheap lock acquisition; the four gauge reads below then share
+        // a SINGLE `stats()` snapshot (one more acquisition) — two short reads per
+        // ~5s tick, not four.
+        if conn.close_reason().is_some() {
+            debug!(
+                "WT path-stat sampler stopping (connection closed) for session {} in {}",
+                session_id, room
+            );
+            break;
+        }
+
+        // Read all four values from ONE `stats()` snapshot so they reflect a single
+        // consistent connection state. `ConnectionStats.path.rtt` is the SAME value
+        // as `Connection::rtt()` — both return `self.path.rtt.get()`
+        // (quinn-proto-0.11.13 connection/mod.rs:1269 vs :1381), the current
+        // smoothed round-trip estimate. `lost_packets` / `congestion_events` /
+        // `sent_packets` are CUMULATIVE for the connection; the gauges publish the
+        // running totals (chart with rate()/increase()). The scalar→gauge mapping
+        // lives in `publish_connection_path_stats` so a host unit test can pin it.
+        let path = conn.stats().path;
+        publish_connection_path_stats(
+            &room,
+            &session_id,
+            duration_to_millis_f64(path.rtt),
+            path.lost_packets,
+            path.congestion_events,
+            path.sent_packets,
+        );
+    }
+}
+
+/// Spawn the per-connection path-health sampler for one WT connection and return
+/// its task handle (#1637).
+///
+/// This is the SPAWN half of the sampler lifecycle, extracted from
+/// `handle_webtransport_session` so the runtime wiring is exercisable by a host
+/// test WITHOUT NATS: the `path_stat_sampler_emits_and_gcs_over_loopback_quinn`
+/// test stands up a real loopback `quinn` connection and calls THIS function (and
+/// [`stop_connection_path_sampler`]) directly — the same functions production
+/// calls — so deleting the spawn here, or the GC in the stop half, fails that
+/// test. Routing through these helpers (rather than re-implementing the spawn in
+/// the test) is what makes the test guard the real wiring.
+///
+/// `actix_rt::spawn` keeps the sampler on the relay's single-thread runtime
+/// (consistent with the rest of WT handling). The cadence is resolved INTERNALLY
+/// via [`path_stat_sample_interval`] (NOT a parameter) so the `#[cfg(test)]`
+/// override flows through this production call. `conn` is the caller's
+/// already-obtained `quinn::Connection` clone (taken before the owning `Session`
+/// is moved into the bridge).
+pub(crate) fn spawn_connection_path_sampler(
+    conn: quinn::Connection,
+    room: &str,
+    session_id: &str,
+) -> actix_rt::task::JoinHandle<()> {
+    actix_rt::spawn(sample_connection_path_stats(
+        conn,
+        room.to_string(),
+        session_id.to_string(),
+        path_stat_sample_interval(),
+    ))
+}
+
+/// Stop the per-connection path-health sampler and remove its per-session gauges
+/// (#1637) — the TEARDOWN half of the sampler lifecycle.
+///
+/// The sampler also self-exits when quinn reports the connection closed, but we
+/// `abort()` UNCONDITIONALLY here so the task cannot outlive the session under any
+/// path, then GC the `session_id`-labeled series via [`forget_connection_path_stats`]
+/// so it does not leak for the process lifetime (issue #996 pattern). This GC is
+/// co-located with the sampler spawn/abort in the WT entry point — NOT in
+/// `SessionLogic::on_stopping` where `forget_session_drops` lives — because the
+/// sampler is WT-only (it needs the quinn connection). Both run on every normal
+/// disconnect. Extracted alongside [`spawn_connection_path_sampler`] so a host
+/// test drives the real GC, not a replica.
+pub(crate) fn stop_connection_path_sampler(
+    sampler_handle: actix_rt::task::JoinHandle<()>,
+    room: &str,
+    session_id: &str,
+) {
+    sampler_handle.abort();
+    forget_connection_path_stats(room, session_id);
+}
+
 /// Handle a WebTransport session using the WtChatSession actor
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
@@ -442,7 +615,23 @@ async fn handle_webtransport_session(
         is_host,
         end_on_host_leave,
     );
+    // Capture the canonical per-session id BEFORE `start()` consumes the actor.
+    // It is the SAME id `relay_session_drops_total` uses, so the #1637 relay RTT
+    // gauge joins with the per-session drop series for this connection.
+    let metrics_session_id = actor.session_id().to_string();
+    let metrics_room = lobby_id.to_string();
+
     let actor_addr = actor.start();
+
+    // #1637: start the relay-side QUIC path-health sampler for this connection.
+    // Clone the `quinn::Connection` (Arc-backed) BEFORE `session` is moved into
+    // the bridge below — `web_transport_quinn::Session: Deref<Target =
+    // quinn::Connection>`, so `(*session).clone()` is the underlying connection
+    // handle. The spawn + teardown live in `spawn_connection_path_sampler` /
+    // `stop_connection_path_sampler` so the WIRING is exercised by a host test
+    // (a loopback-quinn test drives the same helpers without NATS); see those fns.
+    let sampler_handle =
+        spawn_connection_path_sampler((*session).clone(), &metrics_room, &metrics_session_id);
 
     // Create bridge (with test callback if in test mode)
     #[cfg(test)]
@@ -465,6 +654,9 @@ async fn handle_webtransport_session(
     );
     bridge.wait_for_disconnect().await;
     bridge.shutdown().await;
+
+    // #1637: stop the path-health sampler and remove its per-session gauges.
+    stop_connection_path_sampler(sampler_handle, &metrics_room, &metrics_session_id);
 
     // Signal actor to stop
     actor_addr.do_send(crate::actors::transports::wt_chat_session::StopSession);
@@ -1960,5 +2152,394 @@ mod tests {
 
         host.close(0u32, b"done");
         attendee.close(0u32, b"done");
+    }
+
+    /// RAII guard that restores the process-global path-stat sampler cadence to
+    /// production ([`WT_HEARTBEAT_INTERVAL`]) on drop — on the NORMAL path AND on
+    /// UNWIND. The sampler tests run inside a `tokio::time::timeout(...).await`
+    /// block; an assert panic there unwinds PAST any manual restore line, which
+    /// would leak the fast 50ms cadence into later `#[serial]` tests in the same
+    /// binary. Constructing this guard right after the override (and deleting the
+    /// manual restore) makes the restore panic-safe via `Drop`.
+    struct PathStatIntervalGuard;
+    impl Drop for PathStatIntervalGuard {
+        fn drop(&mut self) {
+            set_path_stat_sample_interval_for_test(WT_HEARTBEAT_INTERVAL);
+        }
+    }
+
+    /// RAII guard that clears the process-global meeting-management FeatureFlag
+    /// override on drop — on the NORMAL path AND on UNWIND, same rationale as
+    /// [`PathStatIntervalGuard`]. The harness test sets the override to run the
+    /// deprecated path-based connect; an assert panic inside its timeout block
+    /// would otherwise leak the flag to later `#[serial]` tests.
+    struct MeetingMgmtOverrideGuard;
+    impl Drop for MeetingMgmtOverrideGuard {
+        fn drop(&mut self) {
+            videocall_types::FeatureFlags::clear_meeting_management_override();
+        }
+    }
+
+    /// True iff a `videocall_relay_connection_rtt_ms` series currently exists in
+    /// the default Prometheus registry whose `room` label equals `room`.
+    ///
+    /// The relay generates the per-connection `session_id` server-side, so the
+    /// test cannot predict it; it filters on the `room` label (= the meeting name
+    /// the test DOES control) via `prometheus::gather()`. Used by the #1637
+    /// sampler-wiring regression test to assert the gauge appears for a live
+    /// session and disappears after teardown.
+    fn rtt_series_exists_for_room(room: &str) -> bool {
+        prometheus::gather().iter().any(|mf| {
+            mf.get_name() == "videocall_relay_connection_rtt_ms"
+                && mf.get_metric().iter().any(|m| {
+                    m.get_label()
+                        .iter()
+                        .any(|l| l.get_name() == "room" && l.get_value() == room)
+                })
+        })
+    }
+
+    /// #1637 regression test: the per-connection path-stat sampler is actually
+    /// SPAWNED and emitting through the REAL end-to-end session path
+    /// (`handle_webtransport_session` -> `spawn_connection_path_sampler`), and its
+    /// per-session series is GC'd at teardown.
+    ///
+    /// This is the END-TO-END belt-and-suspenders for the wiring: it proves the
+    /// sampler fires through the real `handle_webtransport_session` with a real
+    /// actor + real session accept. RUNS ONLY IN NATS-PROVIDING CI: like every
+    /// other test in this module it depends on `start_webtransport_server`, which
+    /// blocks on `ChatServer::new`'s NATS connect — so it CANNOT run (nor be
+    /// mutation-verified) in a bare environment with no `NATS_URL`. The
+    /// deterministic, locally-runnable guard for the same wiring is
+    /// `path_stat_sampler_emits_and_gcs_over_loopback_quinn` below, which drives the
+    /// extracted `spawn_connection_path_sampler` / `stop_connection_path_sampler`
+    /// over a loopback quinn connection with NO NATS and IS mutation-verified.
+    ///
+    /// Cadence: the production sampler ticks every `WT_HEARTBEAT_INTERVAL` (5s),
+    /// far too slow for a test, so we override it to 50ms via the `#[cfg(test)]`
+    /// seam `set_path_stat_sample_interval_for_test` (production stays 5s). One
+    /// live WT client suffices — the sampler runs per-connection regardless of how
+    /// many peers are present.
+    ///
+    /// `#[serial]`: reads the process-global Prometheus registry and mutates the
+    /// process-global sampler-interval override, so it must not race other tests.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn path_stat_sampler_emits_through_real_session_and_gcs_on_teardown() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .with_writer(std::io::stderr)
+            .try_init();
+
+        // Deprecated path-based connect (connect_client) requires FF=off. Drive the
+        // sampler fast enough to observe a tick inside the test window. Both
+        // process-global overrides are restored by RAII guards on the normal path
+        // AND on an assert-panic unwind inside the timeout block below.
+        videocall_types::FeatureFlags::set_meeting_management_override(false);
+        let _ff_guard = MeetingMgmtOverrideGuard;
+        set_path_stat_sample_interval_for_test(Duration::from_millis(50));
+        let _interval_guard = PathStatIntervalGuard;
+
+        let result = tokio::time::timeout(Duration::from_secs(20), async {
+            let _wt_handle = start_webtransport_server().await;
+            wait_for_server_ready().await;
+
+            // A room name unique to this test so the registry scan cannot collide
+            // with series left by other harness tests in the same process.
+            let meeting = "rtt-sampler-1637";
+            let session = connect_client("rtt-probe-user", meeting)
+                .await
+                .expect("connect client");
+            wait_for_session_ready(&session, "rtt-probe-user")
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
+
+            // Wait for at least one 50ms sampler tick to fire and publish the
+            // gauge for this live session's room. Poll up to ~3s so a slow CI box
+            // (QUIC handshake + actor spin-up) still sees the first tick; the
+            // sampler skips its immediate first tick, so the earliest emit is ~2
+            // intervals in.
+            let emitted = wait_for_condition_bool(
+                || async { rtt_series_exists_for_room(meeting) },
+                Duration::from_secs(3),
+                Duration::from_millis(25),
+            )
+            .await
+            .is_ok();
+            assert!(
+                emitted,
+                "the path-stat sampler must emit videocall_relay_connection_rtt_ms \
+                 for room={meeting} of a live WT session — if this never appears, \
+                 the sample_connection_path_stats spawn in handle_webtransport_session \
+                 is missing"
+            );
+
+            // Tear the session down and confirm the per-session series is removed
+            // (forget_connection_path_stats fired at teardown). Closing the client
+            // drives the bridge's wait_for_disconnect() to return.
+            session.close(0u32, b"done");
+            drop(session);
+
+            let gced = wait_for_condition_bool(
+                || async { !rtt_series_exists_for_room(meeting) },
+                Duration::from_secs(5),
+                Duration::from_millis(50),
+            )
+            .await
+            .is_ok();
+            assert!(
+                gced,
+                "the path-stat series for room={meeting} must be removed at session \
+                 teardown (forget_connection_path_stats) — a lingering series is the \
+                 #996 per-session_id leak"
+            );
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+
+        // Cadence + FF override restores are handled by `_interval_guard` /
+        // `_ff_guard` Drop (panic-safe — runs even if an assert inside the timeout
+        // block above unwound past this point).
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("test failed: {e}"),
+            Err(_) => panic!("test timed out after 20s"),
+        }
+    }
+
+    /// A `rustls` server-cert verifier that accepts EVERYTHING — test-only, for the
+    /// loopback quinn client below. The loopback server presents the shipped
+    /// self-signed dev cert; we are not testing TLS trust, only that the sampler
+    /// runs over a real `quinn::Connection`, so the client skips verification.
+    #[derive(Debug)]
+    struct SkipServerVerification(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// #1637 DETERMINISTIC regression test for the path-stat sampler's spawn +
+    /// teardown WIRING, runnable in a bare environment with NO NATS.
+    ///
+    /// It stands up a real loopback `quinn` connection (server + client `Endpoint`
+    /// on 127.0.0.1, no `ChatServer`/actor/NATS) and drives the EXACT production
+    /// helpers `handle_webtransport_session` uses — [`spawn_connection_path_sampler`]
+    /// and [`stop_connection_path_sampler`] — against the live server-side
+    /// `quinn::Connection`. It asserts the per-session gauge series APPEARS while
+    /// the sampler runs, then DISAPPEARS after the stop helper's GC.
+    ///
+    /// MUTATION-GUARANTEE (the Codex P1): because the test calls the real helpers,
+    /// deleting the `actix_rt::spawn(...)` inside `spawn_connection_path_sampler`
+    /// makes no series ever appear (the "emitted" assert fails), and deleting the
+    /// `forget_connection_path_stats` inside `stop_connection_path_sampler` leaves
+    /// the series present (the "GC'd" assert fails). The end-to-end harness test
+    /// above proves the same wiring through `handle_webtransport_session` but only
+    /// runs in NATS-providing CI; THIS test is the locally-runnable, mutation-
+    /// verified guard.
+    ///
+    /// `#[serial]`: process-global Prometheus registry + sampler-interval override.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn path_stat_sampler_emits_and_gcs_over_loopback_quinn() {
+        // Match production: install the ring crypto provider before building TLS
+        // configs (ignore error if another test already installed it).
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+
+        // Override the sampler cadence and arm the RAII guard that restores the
+        // production cadence on BOTH the normal path and an assert-panic unwind
+        // (the timeout block below panics on assert failure).
+        set_path_stat_sample_interval_for_test(Duration::from_millis(50));
+        let _interval_guard = PathStatIntervalGuard;
+
+        let result = tokio::time::timeout(Duration::from_secs(15), async {
+            // --- Server endpoint from the shipped DER dev cert/key ---
+            let cert_der = rustls::pki_types::CertificateDer::from(
+                std::fs::read("certs/localhost.der").expect("read certs/localhost.der"),
+            );
+            let key_der = rustls::pki_types::PrivateKeyDer::try_from(
+                std::fs::read("certs/localhost_key.der").expect("read certs/localhost_key.der"),
+            )
+            .expect("parse localhost_key.der");
+
+            let mut server_crypto = rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .expect("server tls13")
+                .with_no_client_auth()
+                .with_single_cert(vec![cert_der], key_der)
+                .expect("server single cert");
+            server_crypto.alpn_protocols = vec![b"h3".to_vec()];
+            let server_config = quinn::ServerConfig::with_crypto(std::sync::Arc::new(
+                quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
+                    .expect("quic server config"),
+            ));
+            let server_endpoint =
+                quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap())
+                    .expect("server endpoint");
+            let server_addr = server_endpoint.local_addr().expect("server addr");
+
+            // --- Client endpoint that skips cert verification ---
+            let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .expect("client tls13")
+                .dangerous()
+                .with_custom_certificate_verifier(std::sync::Arc::new(SkipServerVerification(
+                    provider.clone(),
+                )))
+                .with_no_client_auth();
+            client_crypto.alpn_protocols = vec![b"h3".to_vec()];
+            let mut client_endpoint =
+                quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).expect("client endpoint");
+            client_endpoint.set_default_client_config(quinn::ClientConfig::new(
+                std::sync::Arc::new(
+                    quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
+                        .expect("quic client config"),
+                ),
+            ));
+
+            // --- Handshake: both sides must be driven concurrently. The client
+            // `connect` future only resolves once the FULL handshake completes,
+            // which requires the server to accept AND establish the `Incoming` at
+            // the same time — so drive the server's accept->establish in its own
+            // future and `join!` it with the client connect (awaiting only
+            // `accept()` without establishing the `Incoming` would deadlock).
+            let server_establish = async {
+                server_endpoint
+                    .accept()
+                    .await
+                    .expect("server incoming")
+                    .await
+                    .expect("server established")
+            };
+            let client_connect = async {
+                client_endpoint
+                    .connect(server_addr, "localhost")
+                    .expect("client connect")
+                    .await
+                    .expect("client established")
+            };
+            let (server_conn, _client_conn) = tokio::join!(server_establish, client_connect);
+
+            // A room unique to this test so the registry scan cannot collide.
+            let room = "loopback-rtt-1637";
+            let session_id = "loopback-session-1";
+
+            // Drive the REAL production spawn helper against the live server conn.
+            let handle = spawn_connection_path_sampler(server_conn.clone(), room, session_id);
+
+            // Wait for a sampler tick to publish the gauge (skips first tick, so
+            // earliest emit is ~2 * 50ms; poll generously for slow CI).
+            let emitted = wait_for_condition_bool(
+                || async { rtt_series_exists_for_room(room) },
+                Duration::from_secs(3),
+                Duration::from_millis(20),
+            )
+            .await
+            .is_ok();
+            assert!(
+                emitted,
+                "spawn_connection_path_sampler must emit \
+                 videocall_relay_connection_rtt_ms for room={room}; if it never \
+                 appears the actix_rt::spawn wiring inside the helper is gone"
+            );
+
+            // VALUE assert (not just existence): the sampler must publish the LIVE
+            // climbing sent_packets, not a hardcoded/zeroed value nor a mis-mapped
+            // always-zero field (lost_packets / congestion_events are 0 on a quiet
+            // loopback link). On a real QUIC connection the relay sends packets
+            // during the handshake + sampling window, so path.sent_packets is
+            // reliably > 0 by sample time — non-flaky. This catches a mutation
+            // INSIDE sample_connection_path_stats that existence-only asserts miss.
+            let published_sent = crate::metrics::RELAY_CONNECTION_PATH_SENT_PACKETS
+                .with_label_values(&[room, session_id])
+                .get();
+            assert!(
+                published_sent > 0.0,
+                "sampler must publish the live climbing sent_packets, not a \
+                 hardcoded/zeroed or mis-mapped (always-zero) field; got {published_sent}"
+            );
+            // Cross-check the gauge tracks the REAL monotonic counter: the gauge
+            // holds the value from the last sampler tick, and sent_packets only
+            // climbs, so the live counter read now must be >= the published gauge.
+            // (Upper-bound only; no exact/lower-bound match — that would race the
+            // next tick / further sends. RTT is deliberately NOT value-asserted —
+            // loopback RTT varies and would be flaky.)
+            let live_sent = server_conn.stats().path.sent_packets as f64;
+            assert!(
+                published_sent <= live_sent,
+                "published sent_packets gauge ({published_sent}) must not exceed the \
+                 live monotonic counter ({live_sent}) — the gauge was sampled at or \
+                 before now and the counter only climbs"
+            );
+
+            // Drive the REAL production teardown helper and confirm GC.
+            stop_connection_path_sampler(handle, room, session_id);
+            assert!(
+                !rtt_series_exists_for_room(room),
+                "stop_connection_path_sampler must remove the per-session series \
+                 for room={room} (forget_connection_path_stats); a lingering \
+                 series is the #996 leak"
+            );
+
+            // Keep the connection handles alive until here so the conn is not
+            // implicitly closed before the sampler ran.
+            drop(server_conn);
+            client_endpoint.close(0u32.into(), b"done");
+            server_endpoint.close(0u32.into(), b"done");
+
+            Ok::<(), anyhow::Error>(())
+        })
+        .await;
+
+        // Cadence restore is handled by `_interval_guard`'s Drop (panic-safe).
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("loopback test failed: {e}"),
+            Err(_) => panic!("loopback test timed out after 15s"),
+        }
     }
 }

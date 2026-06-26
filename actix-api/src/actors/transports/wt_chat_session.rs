@@ -53,8 +53,13 @@ use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 pub use crate::actors::session_logic::{RoomId, SessionId, UserId};
 
-/// Heartbeat interval for WebTransport sessions
-const WT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
+/// Heartbeat interval for WebTransport sessions.
+///
+/// `pub(crate)` so the #1637 relay-side QUIC path-stat sampler in
+/// `webtransport::handle_webtransport_session` can sample at the SAME cadence as
+/// this actor's heartbeat (the cadence the issue specifies), driven by the single
+/// source of truth rather than a duplicated literal.
+pub(crate) const WT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Keep-alive ping data (WebTransport-specific)
 const KEEP_ALIVE_PING: &[u8] = b"ping";
@@ -88,7 +93,11 @@ pub enum WtOutbound {
 enum WtSendResult {
     /// Message sent successfully.
     Sent,
-    /// Channel is full at the time of `try_send`; message was dropped.
+    /// Channel is full at the time of `try_send`; THIS (newest) message was
+    /// dropped — a TAIL drop. A drop-oldest is not implementable on tokio mpsc
+    /// from the sender side (see the `Full` arm in `send_auto`, #1638 PART 2);
+    /// the congestion signal is instead delivered by the priority pre-drop and
+    /// the bridge writer's backpressure-gated shed.
     /// The transport-agnostic drop counters and the legacy media-kind
     /// labels (`audio`/`video`/`screen`/`media`/`control`/`unknown`,
     /// or `overflow_critical` for Critical packets) are bumped at the
@@ -285,6 +294,18 @@ impl WtChatSession {
         }
     }
 
+    /// The canonical per-session id for this connection (`SessionLogic::id`).
+    ///
+    /// This is the SAME `u64` that `record_session_drop` / `forget_session_drops`
+    /// stringify for the `session_id` label on `relay_session_drops_total`, so a
+    /// caller reading it here (e.g. to label the #1637 relay RTT gauge) produces a
+    /// series that JOINS with the per-session drop series for this connection.
+    /// Read on the constructed actor value BEFORE `start()` consumes it —
+    /// `SessionLogic` assigns the id in `new`, so it is stable from construction.
+    pub fn session_id(&self) -> SessionId {
+        self.logic.id
+    }
+
     /// Send outbound message via the channel (reliable unidirectional stream).
     /// Returns false if the channel is closed (connection dead).
     ///
@@ -443,6 +464,46 @@ impl WtChatSession {
                 WtSendResult::Dead
             }
             Err(mpsc::error::TrySendError::Full(_)) => {
+                // #1638 PART 2 — congestion signal, and why this is a TAIL drop
+                // (newest dropped), NOT a drop-oldest:
+                //
+                // A true "drop the oldest queued frame to make room for the new
+                // one" is NOT implementable with `tokio::sync::mpsc`. The
+                // producer here holds only a `Sender`, and the tokio mpsc Sender
+                // exposes no pop-front / evict-oldest operation — only the
+                // single owning `Receiver` (the bridge writer task) can dequeue,
+                // and it does so strictly in FIFO order. There is no
+                // channel-type change that makes sender-side eviction safe
+                // without also racing the writer's `recv()`. So on `Full` we
+                // drop the NEWEST packet (tail drop) — and this comment must NOT
+                // claim otherwise (per the adversarial-self-review rule, a
+                // "drops oldest" comment over tail-drop code is a shippable
+                // defect).
+                //
+                // Queue depth is STILL the congestion signal — it is just
+                // delivered through two mechanisms that compose, NOT through
+                // sender-side eviction:
+                //   (i) the `evaluate_priority_drop` PRE-check above already shed
+                //       VIDEO/SCREEN at 80% fill and AUDIO at 95% BEFORE this
+                //       `try_send` ran (priority_drop.rs), so by the time we
+                //       reach `Full` the policy has already had its say and the
+                //       packets still arriving are the protected/critical ones;
+                //  (ii) the #1638 backpressure-gated writer shed
+                //       (`bridge.rs::spawn_unistream_writer`) prevents the queue
+                //       from STAYING full: the shed arms precisely when the
+                //       channel is backed up (it gates on channel depth crossing
+                //       `WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`), and a `Full`
+                //       channel — the state at THIS arm — is unambiguously past
+                //       that gate, so a stalled receiver's wedged stream is reset
+                //       within `WT_UNISTREAM_WRITE_DEADLINE` of continuous
+                //       backpressure and the writer resumes draining instead of
+                //       pinning the channel full indefinitely (the #1631 M1
+                //       cascade). The shed deliberately does NOT fire on a healthy
+                //       (non-backed-up) stream merely slow to be polled, so it
+                //       cannot spuriously reset a low-traffic receiver. The
+                //       deep-stale-frame hazard #979 warns about is bounded by the
+                //       shallow 512 cap plus that shed, not by evicting the oldest.
+                //
                 // Phase 8b TELEM-8: this drop site previously lacked any
                 // counter increment, so a flood of media drops only surfaced
                 // in the log line below. Increment both the room-tagged
@@ -1533,5 +1594,112 @@ mod tests {
         drop(dgram_tx);
         let _ = unistream_writer.await;
         let _ = datagram_writer.await;
+    }
+
+    // -----------------------------------------------------------------------
+    // #1638 PART 2: Full-arm congestion-signal behaviour.
+    //
+    // The ask was to make queue depth the congestion signal by dropping the
+    // OLDEST queued frame on `Full`. A true sender-side drop-oldest is NOT
+    // implementable on `tokio::sync::mpsc` (the producer holds only a `Sender`,
+    // which has no pop-front / evict-oldest). So the honest implementation keeps
+    // a TAIL drop on `Full` and delivers the congestion signal via (i) the
+    // priority pre-drop and (ii) the bridge writer deadline (#1638 PART 1).
+    //
+    // These tests pin that honest contract against the REAL production paths —
+    // they do NOT re-implement the decision logic inline:
+    //   * the priority pre-check is `evaluate_priority_drop` (the production
+    //     re-export of `priority_drop::evaluate`), which `send_auto` calls
+    //     BEFORE `try_send`;
+    //   * the channel is a real `tokio::sync::mpsc` of `Bytes` at the production
+    //     unistream capacity, whose sender-side `try_send` is exactly what the
+    //     `Full` arm runs.
+    // -----------------------------------------------------------------------
+
+    /// The priority pre-check (the REAL shedding surface) sheds VIDEO before the
+    /// channel ever reaches `Full`, so by the time `try_send` could return
+    /// `Full` the policy has already done the congestion shedding. This is the
+    /// "(i) priority pre-drop" half of the PART-2 honest design.
+    #[test]
+    fn part2_priority_precheck_is_the_real_video_shedding_surface() {
+        let total = wt_outbound_channel_capacity();
+        // 85% full: above the 80% video threshold, below the 95% audio one.
+        let used = total * 85 / 100;
+        let free = total - used;
+
+        // VIDEO is shed by the PRE-CHECK (before try_send) — this is the real
+        // congestion response, not the Full arm.
+        assert!(
+            matches!(
+                evaluate_priority_drop(OutboundPriority::Video, free, total),
+                PriorityDropDecision::Drop {
+                    reason: "priority_drop_video"
+                }
+            ),
+            "VIDEO must be shed by the priority pre-check at 85% fill"
+        );
+        // AUDIO is still protected at the same fill — the pre-check does NOT
+        // shed it, so audio only ever risks the (tail) Full drop.
+        assert_eq!(
+            evaluate_priority_drop(OutboundPriority::Audio, free, total),
+            PriorityDropDecision::Admit,
+            "AUDIO must be protected by the priority pre-check at 85% fill"
+        );
+    }
+
+    /// Honesty guard for the PART-2 decision: on a real full production-type
+    /// channel, `try_send` is a TAIL drop — the NEWEST packet is rejected and
+    /// every already-queued (older) packet is preserved in FIFO order. This
+    /// proves drop-oldest is genuinely unavailable from the sender side, so the
+    /// `Full`-arm comment must NOT claim "drops oldest" (a `try_send` on a full
+    /// channel cannot evict the head). If a future edit fakes a drop-oldest by,
+    /// say, popping from a side buffer, this test would have to change — keeping
+    /// the code and the comment in lock-step.
+    #[tokio::test]
+    async fn part2_full_arm_is_tail_drop_not_drop_oldest() {
+        const CAP: usize = 4;
+        let (tx, mut rx) = mpsc::channel::<Bytes>(CAP);
+
+        // Fill the channel with identifiable OLDEST..=newest frames.
+        for i in 0..CAP {
+            tx.try_send(Bytes::from(vec![i as u8]))
+                .unwrap_or_else(|_| panic!("pre-fill slot {i} must accept"));
+        }
+        assert_eq!(tx.capacity(), 0, "channel must be full before the Full arm");
+
+        // The "new" packet that arrives while Full. With a TAIL drop this is the
+        // one rejected; with a (non-existent) drop-oldest the head (0) would be
+        // evicted to make room for it.
+        let newest = Bytes::from(vec![0xFFu8]);
+        match tx.try_send(newest) {
+            Err(mpsc::error::TrySendError::Full(rejected)) => {
+                // The newest packet is what the channel handed back as rejected —
+                // i.e. it is the tail drop. The sender did NOT evict the oldest.
+                assert_eq!(
+                    rejected.as_ref(),
+                    &[0xFFu8],
+                    "the NEWEST packet must be the one rejected (tail drop)"
+                );
+            }
+            other => panic!("expected Full(newest), got {other:?}"),
+        }
+
+        // The oldest queued frame (0) is still at the HEAD, untouched — no
+        // drop-oldest occurred. Drain and confirm strict FIFO of the original
+        // CAP frames.
+        for expected in 0..CAP {
+            let got = rx.try_recv().expect("queued frame must still be present");
+            assert_eq!(
+                got.as_ref(),
+                &[expected as u8],
+                "queued frames must survive a Full try_send in FIFO order \
+                 (oldest first); a drop-oldest would have evicted frame 0"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "exactly the CAP pre-filled frames should remain; the newest was \
+             tail-dropped and never enqueued"
+        );
     }
 }

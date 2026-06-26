@@ -649,6 +649,22 @@ lazy_static! {
     )
     .expect("Failed to create video_playout_paint_lag_ms metric");
 
+    /// Per-peer content staleness in ms (#1641): the AGE of the video content currently being
+    /// painted — how old the just-painted frame's content is relative to live — as distinct from
+    /// `videocall_video_playout_paint_lag_ms`, which measures queue DEPTH (decoded-but-unpainted
+    /// backlog). A receiver that drains a stale backlog can keep paint_lag near 0 while still
+    /// painting minutes-old content; this gauge surfaces that age. Reported only while the tile is
+    /// actively receiving (fps_received > 0); 0 = at live. UNBOUNDED, unlike
+    /// `videocall_video_playout_latency_ms` whose client-side value is capped at 1800ms — so this is
+    /// the metric that exposes the #1631 M2 "video lagged by minutes while playout_latency_ms read
+    /// ~0" failure mode that the capped/queue-depth gauges structurally cannot show.
+    pub static ref VIDEO_CONTENT_STALENESS_MS: GaugeVec = register_gauge_vec!(
+        "videocall_video_content_staleness_ms",
+        "Per-peer content age in ms of the painted video — content-staleness (#1641); UNBOUNDED (unlike playout_latency_ms's 1800ms cap). A stream draining stale content keeps paint_lag ~0 while this climbs; surfaces the #1631 M2 minutes-of-lag",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create video_content_staleness_ms metric");
+
     /// Per-peer cumulative count of resync-to-live governor skips (#1252): how many times the
     /// decode-side governor jumped this receiver→source stream forward to live to shed accumulated
     /// lag. A COUNTER value held in a GaugeVec (set to the current cumulative total) so the per-pair
@@ -1705,6 +1721,37 @@ lazy_static! {
     )
     .expect("Failed to create relay_inbound_bridge_drops_total metric");
 
+    /// Persistent server->client WebTransport uni stream RESETS at the OUTBOUND
+    /// bridge writer (`webtransport/bridge.rs` `spawn_unistream_writer`), by
+    /// transport and `reason` (#1638).
+    ///
+    /// DISTINCT from `videocall_outbound_channel_drops_total`: that counter
+    /// covers PRODUCER-side `try_send` drops at the `WtChatSession`
+    /// `Handler<Message>` enqueue hop (before the bytes ever reach the writer).
+    /// THIS counter covers the WRITER-side event the #1638 fix introduces — the
+    /// single persistent uni stream being torn down and re-opened because a write
+    /// onto it could not complete. The in-flight frame that triggered the reset
+    /// is dropped (the receiver was wedged), so this is also a drop, but it is a
+    /// transport-layer stream reset rather than a queue overflow and is counted
+    /// separately so operators can tell "the receiver's downlink stalled past the
+    /// write deadline" (`reason="write_timeout"`, the #1638 shed) apart from "the
+    /// stream errored / was already torn down" (`reason="write_error"`, the
+    /// pre-existing single-retry path). Both end in reset+reopen.
+    ///
+    /// `transport` is always `webtransport` here (only the WT bridge owns a
+    /// persistent uni stream), kept for label-shape parity with the sibling
+    /// bridge counters.
+    ///
+    /// CARDINALITY BOUND: at most 2 series
+    /// (`webtransport` x {write_timeout, write_error}). Safe for indefinite
+    /// retention; no cleanup required.
+    pub static ref RELAY_OUTBOUND_BRIDGE_STREAM_RESETS_TOTAL: CounterVec = register_counter_vec!(
+        "relay_outbound_bridge_stream_resets_total",
+        "Persistent server->client WebTransport uni stream resets at the outbound bridge writer, by transport and reason (write_timeout|write_error) (#1638)",
+        &["transport", "reason"]
+    )
+    .expect("Failed to create relay_outbound_bridge_stream_resets_total metric");
+
     /// Outbound (relay→client) channel drops, labeled by transport and packet kind.
     ///
     /// CARDINALITY: bounded — `transport` is `webtransport`|`websocket` and
@@ -1881,6 +1928,413 @@ lazy_static! {
         &["room"]
     )
     .expect("Failed to create relay_downlink_congestion_filtered_total metric");
+
+    // ===== RELAY-MEASURED PER-CONNECTION QUIC PATH HEALTH (#1637, epic #1636) =====
+    //
+    // LEAD SIGNAL SET for distinguishing the two incident mechanisms epic #1636 is
+    // chasing on the single-threaded WT relay. Read these FOUR per-connection
+    // gauges TOGETHER — no single one separates B from C; the separability comes
+    // from the PATTERN across them plus `videocall_relay_scheduler_lag_ms`:
+    //
+    //   (i)   ACK-DELAYED degradation (mechanism C, partial): `rtt`, `lost_packets`
+    //         and `congestion_events` RISE together across many sessions at one
+    //         instant while `sent_packets` keeps climbing. ACKs are still arriving
+    //         (just late/lossy), so the ACK-gated estimators move. Shared network.
+    //
+    //   (ii)  FULL COLLAPSE (mechanism C, the 14:07:00 synchronized-SESSION-DROPPED
+    //         shape): the downlink stops returning ACKs entirely. `rtt`,
+    //         `lost_packets`, `congestion_events` FREEZE FLAT — they update ONLY on
+    //         ACK receipt (`RttEstimator::update`/`detect_lost_packets`/`process_ecn`,
+    //         all reached only from `on_ack_received` in quinn-proto 0.11.13
+    //         connection/mod.rs:1522/1530/…). BUT the relay keeps TRANSMITTING into
+    //         the void (egress + runtime are fine), so `sent_packets` KEEPS CLIMBING
+    //         (incremented on every packet built — `PacketBuilder::finish`,
+    //         packet_builder.rs:217 — independent of ACKs). So: rtt/loss/congestion
+    //         flat + `sent_packets` climbing ⇒ C-collapse, NOT B. This case is the
+    //         whole reason `sent_packets` exists; without it a full collapse is
+    //         INDISTINGUISHABLE from mechanism B and from a healthy idle link.
+    //
+    //   (iii) THREAD-STARVATION (mechanism B / Gun #2, #1639): the relay's single
+    //         runtime thread is wedged, so it cannot run the SEND path either —
+    //         `sent_packets` ALSO goes flat — AND `videocall_relay_scheduler_lag_ms`
+    //         spikes. EVERYTHING (rtt, loss, congestion, sent_packets) flat + a
+    //         scheduler-lag spike ⇒ B.
+    //
+    // These are sampled SERVER-SIDE from the quinn `Connection` (via
+    // `web_transport_quinn::Session`'s `Deref<Target = quinn::Connection>`), so
+    // unlike `videocall_client_active_server_rtt_ms` (the CLIENT's view, which
+    // depends on the client's own clock + probe pipeline and is absent when a
+    // client is wedged) this is the RELAY's authoritative measurement of every
+    // live WT downlink. The sampler runs in `webtransport::handle_webtransport_session`
+    // ~every `WT_HEARTBEAT_INTERVAL` (5s) and reads ALL four values from a SINGLE
+    // `stats()` snapshot per tick (see `publish_connection_path_stats`).
+    //
+    // NOTE — there is NO "last-ACK age" field in quinn (quinn-proto 0.11
+    // `connection/stats.rs` exposes `PathStats { rtt, lost_packets, lost_bytes,
+    // congestion_events, sent_packets, cwnd, current_mtu, .. }` and
+    // `Connection::rtt()`, but no direct ack-age accessor). The issue's "last-ACK
+    // age" intent is served HERE by the (rtt+loss+congestion) freeze contrasted
+    // against `sent_packets` still climbing — together they answer "is this path
+    // still being serviced, and are WE still sending?" without fabricating a field
+    // quinn does not expose.
+
+    /// Relay-measured smoothed RTT for a live WebTransport connection, in ms
+    /// (#1637). Read from `quinn` `ConnectionStats.path.rtt` (identical to
+    /// `Connection::rtt()` — both return `self.path.rtt.get()`), the connection's
+    /// current smoothed round-trip estimate, ~every `WT_HEARTBEAT_INTERVAL`.
+    ///
+    /// HOW TO READ B-vs-C (see the section header above for the full 3-case table):
+    /// this gauge ALONE does not separate B from C. A CORRELATED RISE across many
+    /// `session_id`s ⇒ ACK-delayed mechanism-C degradation. But RTT going/ staying
+    /// FLAT is AMBIGUOUS on its own — it is the shape of BOTH a full mechanism-C
+    /// collapse (ACKs stopped, so this ACK-gated estimator freezes) AND mechanism-B
+    /// thread-starvation AND a healthy idle link. Disambiguate with
+    /// `videocall_relay_connection_path_sent_packets` (climbing ⇒ C-collapse, we're
+    /// still sending; flat ⇒ B/idle) and `videocall_relay_scheduler_lag_ms`
+    /// (spiking ⇒ B). "Flat RTT ⇒ B" WITHOUT those two corroborators is wrong.
+    ///
+    /// CAVEAT — `initial_rtt` floor: a path that has NOT YET had an ACK sampled
+    /// returns the `initial_rtt` CONSTANT, not a real measurement. quinn-proto 0.11
+    /// defaults that to 333ms (`config/transport.rs:373`; the relay does not
+    /// override it), because `RttEstimator::get()` is `smoothed.unwrap_or(latest)`
+    /// and `latest` starts at `initial_rtt` (`connection/paths.rs:307`,`:299`). So
+    /// a flat ~333ms reading can mean "no ACK sampled yet" (e.g. a path reset)
+    /// rather than a healthy 333ms link — do not misread it as a real RTT. The
+    /// sampler deliberately SKIPS the first tick on a brand-new connection (see
+    /// `sample_connection_path_stats`) to avoid emitting this floor at t=0, but a
+    /// mid-life path reset can still surface it.
+    ///
+    /// CARDINALITY: `room` × `session_id` (live only). `session_id` is the
+    /// SAME canonical per-session id (`SessionLogic::id`, stringified) carried by
+    /// `relay_session_drops_total`, so this gauge JOINS with the per-session drop
+    /// series for the same connection. NO `display_name`/`peer_id` label (would be
+    /// high-cardinality and adds nothing to the shared-vs-isolated signal). The
+    /// per-session series is REMOVED at session teardown by
+    /// [`forget_connection_path_stats`] (issue #996 pattern), so a process that
+    /// served N sessions over its life does not accrue N permanent series.
+    pub static ref RELAY_CONNECTION_RTT_MS: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_rtt_ms",
+        "Relay-measured smoothed RTT (quinn path.rtt) for a live WebTransport connection, in ms; sampled ~every WT heartbeat. Correlated cross-session RISE => ACK-delayed shared downlink/NIC (mechanism C). FLAT is ambiguous: disambiguate with path_sent_packets (climbing=>C-collapse) + scheduler_lag (spike=>B). A flat ~333ms may be the unsampled initial_rtt floor, not a real RTT (#1637)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_rtt_ms metric");
+
+    /// Relay-measured CUMULATIVE lost-packet count on a live WebTransport
+    /// connection's primary path (#1637). Sourced from quinn-proto
+    /// `ConnectionStats.path.lost_packets`, sampled every `WT_HEARTBEAT_INTERVAL`.
+    ///
+    /// EXPORTED AS THE CUMULATIVE VALUE (a counter held in a GaugeVec, the same
+    /// convention as `videocall_video_skip_to_live_total`): the gauge is `.set()`
+    /// to quinn's running total for this connection, which is monotonic for the
+    /// connection's lifetime. Query the RATE with `rate()`/`increase()` (those
+    /// tolerate the series vanishing at disconnect). A GaugeVec — not a CounterVec
+    /// — specifically so the per-`session_id` series can be REMOVED at teardown
+    /// (counters cannot be cheaply unregistered); see [`forget_connection_path_stats`].
+    ///
+    /// READ ALONGSIDE `videocall_relay_connection_rtt_ms`: a loss-rate spike
+    /// shared across sessions corroborates a mechanism-C downlink/NIC event.
+    ///
+    /// CARDINALITY: `room` × `session_id` (live only), GC'd at teardown.
+    pub static ref RELAY_CONNECTION_PATH_LOST_PACKETS: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_path_lost_packets",
+        "Relay-measured cumulative lost packets (quinn ConnectionStats.path.lost_packets) on a live WebTransport connection's primary path; cumulative value held in a gauge so it can be GC'd at session end — chart the rate with rate()/increase() (#1637)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_path_lost_packets metric");
+
+    /// Relay-measured CUMULATIVE congestion-controller event count on a live
+    /// WebTransport connection's primary path (#1637). Sourced from quinn-proto
+    /// `ConnectionStats.path.congestion_events`, sampled every
+    /// `WT_HEARTBEAT_INTERVAL`. Same cumulative-in-a-gauge convention and the same
+    /// `rate()`/`increase()` query guidance as
+    /// [`RELAY_CONNECTION_PATH_LOST_PACKETS`] above.
+    ///
+    /// A congestion-event-rate spike that is SHARED across many sessions at one
+    /// instant is additional mechanism-C corroboration (the relay's uplink/NIC, or
+    /// a shared bottleneck, throttling everyone at once); per-session isolated
+    /// spikes are ordinary single-client congestion and are NOT the incident
+    /// signal.
+    ///
+    /// CARDINALITY: `room` × `session_id` (live only), GC'd at teardown.
+    pub static ref RELAY_CONNECTION_PATH_CONGESTION_EVENTS: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_path_congestion_events",
+        "Relay-measured cumulative congestion events (quinn ConnectionStats.path.congestion_events) on a live WebTransport connection's primary path; cumulative value held in a gauge so it can be GC'd at session end — chart the rate with rate()/increase() (#1637)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_path_congestion_events metric");
+
+    /// Relay-measured CUMULATIVE count of packets the relay has SENT on a live
+    /// WebTransport connection's primary path (#1637). Sourced from quinn-proto
+    /// `ConnectionStats.path.sent_packets`, read from the same per-tick `stats()`
+    /// snapshot as the three gauges above.
+    ///
+    /// THE B-vs-C DISAMBIGUATOR (this is why the gauge exists). Unlike `rtt` /
+    /// `lost_packets` / `congestion_events` — which update ONLY on ACK receipt and
+    /// therefore FREEZE FLAT the instant a downlink fully collapses — `sent_packets`
+    /// is incremented on the EGRESS path, on every packet the relay builds
+    /// (quinn-proto `PacketBuilder::finish`, packet_builder.rs:217), independent of
+    /// whether any ACK ever comes back. So:
+    ///   * `sent_packets` CLIMBING while rtt/loss/congestion are FLAT ⇒ the relay is
+    ///     still transmitting but getting nothing back: a downlink/NIC COLLAPSE
+    ///     (mechanism C), NOT a relay stall. Without this gauge that collapse is
+    ///     indistinguishable from mechanism B and from a healthy idle link.
+    ///   * `sent_packets` ALSO FLAT (plus a `videocall_relay_scheduler_lag_ms`
+    ///     spike) ⇒ the relay's single runtime thread is wedged and cannot even run
+    ///     the send path: mechanism B (thread-starvation / Gun #2, #1639).
+    ///
+    /// Cumulative-in-a-gauge, same convention/GC/`rate()`-query guidance as the
+    /// loss/congestion gauges above. Note it counts BUILT packets across all
+    /// connections' fan-out, so a per-connection `rate()` is the relay's send rate
+    /// TO that receiver — exactly the "are we still sending to them?" signal.
+    ///
+    /// CARDINALITY: `room` × `session_id` (live only), GC'd at teardown by
+    /// [`forget_connection_path_stats`].
+    pub static ref RELAY_CONNECTION_PATH_SENT_PACKETS: GaugeVec = register_gauge_vec!(
+        "videocall_relay_connection_path_sent_packets",
+        "Relay-measured cumulative packets SENT (quinn ConnectionStats.path.sent_packets, egress-counted, NOT ACK-gated) on a live WebTransport connection. Climbing while rtt/loss freeze flat => downlink collapse (mechanism C); flat + scheduler_lag spike => relay thread-starvation (mechanism B). Cumulative-in-a-gauge; chart with rate()/increase() (#1637)",
+        &["room", "session_id"]
+    )
+    .expect("Failed to create videocall_relay_connection_path_sent_packets metric");
+
+    // ===== TOKIO SCHEDULER-LAG PROBE (#1637, epic #1636 — INSURANCE SIGNAL) =====
+
+    /// Tokio scheduler lag of the WebTransport relay's runtime, in ms — a
+    /// HISTOGRAM (#1637).
+    ///
+    /// This is the ONLY signal that resolves sub-second correlated scheduling
+    /// jitter on the relay's SINGLE-THREADED `#[actix_rt::main]` runtime (the
+    /// latent Gun #2 / #1639). The cgroup CPU average (cAdvisor `rate()` over
+    /// >=15s) is structurally blind to a short stall: a 200ms freeze hides
+    /// completely in a 5-second CPU average, yet it is exactly long enough to make
+    /// every receiver's outbound channel back up at once. The only way to see it
+    /// is to measure how late a timer that SHOULD fire on the relay's runtime
+    /// actually fires.
+    ///
+    /// WHAT IT MEASURES: a dedicated probe task (spawned in
+    /// `bin/webtransport_server.rs` `main` via `actix_rt::spawn`, so it lives on
+    /// the SAME single-thread runtime whose lag we want to observe) ticks a fixed
+    /// `tokio::time::interval` and `observe()`s how late each tick was POLLED versus
+    /// the deadline it was SCHEDULED to fire — `Interval::tick().await` returns that
+    /// scheduled deadline `Instant`, so the lag is `Instant::now() - deadline` via
+    /// [`scheduler_lag_from_deadline`]. When the runtime is healthy the task is
+    /// polled on time and observes ~0. When some other future on that one thread
+    /// holds the thread without yielding (a long synchronous span, a blocking call,
+    /// a fan-out burst that monopolises the executor) the probe's poll is DELAYED
+    /// past the deadline by exactly that stall, and that delay is observed.
+    /// Measuring from the returned deadline (not an expected-vs-actual period) makes
+    /// this correct under both `MissedTickBehavior::Burst` and `Delay` — see
+    /// [`scheduler_lag_from_deadline`] for why. A probe on any OTHER thread would
+    /// measure nothing — running on the relay's own runtime is the whole point.
+    ///
+    /// WHY A HISTOGRAM, NOT A GAUGE: the relay is Prometheus-scraped every ~15s but
+    /// the probe samples every 500ms. A Gauge holding only the most-recent sample
+    /// would be overwritten back to ~0 within 500ms of any spike, so ~29 of every
+    /// 30 sub-second stalls would be invisible at scrape time — the metric would
+    /// have the exact blind spot it was built to remove. A Histogram instead
+    /// ACCUMULATES every observation into monotonic bucket counters; ~30
+    /// observations land between scrapes and a spike is preserved in the upper
+    /// buckets regardless of when the scrape fires. Query a spike with
+    /// `increase(videocall_relay_scheduler_lag_ms_bucket{le="100"}[1m])` vs the
+    /// `le="+Inf"` total, or `histogram_quantile(0.99, ...)`.
+    ///
+    /// BUCKETS (ms): 1/5/10/25/50/100/250/500/1000/2500. Sub-10ms is healthy
+    /// timer jitter on a busy runtime; the 100ms+ buckets are the freeze class
+    /// epic #1636 cares about (a single-thread stall long enough to back up every
+    /// receiver's outbound channel at once). A nonzero `increase()` in the >=100ms
+    /// buckets during an incident window is the mechanism-B fingerprint.
+    ///
+    /// HOW TO READ B-vs-C: upper-bucket `increase()` HERE during an incident, with
+    /// the per-connection `sent_packets` ALSO flat (relay not even sending), is
+    /// mechanism B (the relay thread stalled; the network was beside the point). No
+    /// upper-bucket movement here while the RTT/loss gauges blow up together — or
+    /// while `sent_packets` keeps climbing under flat rtt/loss — is mechanism C
+    /// (shared downlink/NIC; the relay was scheduling fine, the link degraded).
+    ///
+    /// CARDINALITY: a single histogram, NO labels — process-global runtime health.
+    /// No cleanup needed (it is never per-session).
+    pub static ref RELAY_SCHEDULER_LAG_MS: Histogram = register_histogram!(
+        "videocall_relay_scheduler_lag_ms",
+        "Tokio scheduler lag of the WebTransport relay's single-threaded runtime, in ms (actual minus expected wake of a fixed-interval probe running ON that runtime), as a histogram so sub-second spikes survive the ~15s scrape. Upper-bucket increase() with sent_packets flat => relay thread-starvation (mechanism B, #1639); no upper-bucket movement while RTT/loss spike or sent_packets climbs => shared downlink/NIC (mechanism C) (#1637)",
+        vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 2500.0]
+    )
+    .expect("Failed to create videocall_relay_scheduler_lag_ms metric");
+}
+
+/// Publish a per-connection QUIC path-health snapshot to all FOUR per-`session_id`
+/// gauges (#1637). This is the SINGLE production emission seam — the relay's
+/// per-tick sampler (`webtransport::sample_connection_path_stats`) reads ONE
+/// `quinn` `ConnectionStats` snapshot per tick and calls exactly this, so the
+/// scalar→gauge mapping is pinned to a function a host unit test can drive without
+/// a live quinn connection
+/// (`metrics::tests::publish_connection_path_stats_sets_all_four_gauges`). Reverting
+/// any one `.set()` here therefore fails that test.
+///
+/// `rtt_ms` is the already-converted millisecond RTT (the caller runs
+/// `duration_to_millis_f64` on the `Duration`); the three packet counters are the
+/// raw cumulative `u64`s from `ConnectionStats.path`, set as `f64` (a gauge's
+/// native type) — Prometheus gauges are `f64` and packet counts well within
+/// `f64`'s exact-integer range. See each gauge's doc for how the four values
+/// separate mechanism B from C.
+pub fn publish_connection_path_stats(
+    room: &str,
+    session_id: &str,
+    rtt_ms: f64,
+    lost_packets: u64,
+    congestion_events: u64,
+    sent_packets: u64,
+) {
+    RELAY_CONNECTION_RTT_MS
+        .with_label_values(&[room, session_id])
+        .set(rtt_ms);
+    RELAY_CONNECTION_PATH_LOST_PACKETS
+        .with_label_values(&[room, session_id])
+        .set(lost_packets as f64);
+    RELAY_CONNECTION_PATH_CONGESTION_EVENTS
+        .with_label_values(&[room, session_id])
+        .set(congestion_events as f64);
+    RELAY_CONNECTION_PATH_SENT_PACKETS
+        .with_label_values(&[room, session_id])
+        .set(sent_packets as f64);
+}
+
+/// Convert a [`std::time::Duration`] to whole-plus-fractional milliseconds as an
+/// `f64`, for setting a millisecond-valued Prometheus gauge (#1637).
+///
+/// Extracted as a free function so the conversion is unit-testable WITHOUT a live
+/// quinn connection (the RTT sampler reads `Connection::rtt() -> Duration` and
+/// feeds it straight here). `Duration::as_secs_f64() * 1000.0` preserves
+/// sub-millisecond precision (e.g. a 1.5ms RTT reads `1.5`, not `1`), which a
+/// `Duration::as_millis()` truncation would lose — and sub-ms precision matters
+/// at the low end where a healthy LAN RTT lives.
+pub fn duration_to_millis_f64(d: std::time::Duration) -> f64 {
+    d.as_secs_f64() * 1000.0
+}
+
+/// Tokio scheduler lag in milliseconds: how late a probe tick was POLLED versus
+/// the instant it was SCHEDULED to fire (#1637, epic #1636).
+///
+/// `deadline` is the `tokio::time::Instant` that `Interval::tick().await` RETURNS
+/// — verified against tokio 1.48.0 `interval.rs:467,492-493`: `poll_tick` captures
+/// `self.delay.deadline()` (the scheduled fire time) and returns THAT, not the
+/// poll time. `polled_at` is `tokio::time::Instant::now()` captured the moment the
+/// probe task actually got to run after the tick. The lag is therefore
+/// `polled_at - deadline` — the lateness directly, with NO period subtraction and
+/// NO separately-captured start time.
+///
+/// WHY THIS IS ROBUST (the #1636 insurance signal must not hinge on one config
+/// line): because it uses the REAL deadline tokio returns, the measurement is
+/// correct under BOTH `MissedTickBehavior::Burst` (the default) AND `Delay`. The
+/// previous expected-vs-actual formulation was correct ONLY under `Delay` (which
+/// re-anchors the next deadline so a per-iteration start time never lands after a
+/// missed deadline); under `Burst` a missed deadline makes `tick()` return
+/// immediately and an expected-vs-actual probe would read ~0, hiding the very
+/// stall it exists to catch. Deadline-based math has no such dependency.
+///
+/// `saturating_duration_since` clamps to 0 when `polled_at < deadline` (a tick
+/// cannot be polled before its scheduled time as REAL lag; only clock granularity
+/// could produce a nominally-early read), so an on-time/early poll reports 0ms,
+/// never a negative. The positive tail is the signal: the time the relay's single
+/// runtime thread was held by something else past this tick's due instant.
+///
+/// Pure and side-effect-free so it can be unit-tested against the named cases
+/// (on-time => 0, late => the overage in ms, early => 0) by referencing THIS
+/// function — the probe task calls exactly this, so the test guards the real
+/// computation, not a re-implementation.
+pub fn scheduler_lag_from_deadline(
+    deadline: tokio::time::Instant,
+    polled_at: tokio::time::Instant,
+) -> f64 {
+    duration_to_millis_f64(polled_at.saturating_duration_since(deadline))
+}
+
+/// The tokio scheduler-lag probe loop (#1637, epic #1636 — INSURANCE SIGNAL).
+///
+/// This is the PRODUCTION probe body, extracted into a library function (not left
+/// inline in `bin/webtransport_server.rs`) for ONE reason: binaries are not
+/// unit-testable, so an inline loop's `.observe()` could be deleted with every
+/// test still green — the runtime emission would be unguarded. Living here, the
+/// loop is exercised by `metrics::tests::run_scheduler_lag_probe_observes_into_histogram`,
+/// which drives it under tokio paused time and asserts the histogram sample count
+/// rises; deleting the `.observe(...)` below makes that test fail.
+///
+/// `main` spawns this with `actix_rt::spawn(run_scheduler_lag_probe(...))` so it
+/// runs ON the relay's single-threaded runtime — the whole point of the signal (a
+/// probe on any other thread would measure that thread's scheduler, not the
+/// relay's). It never returns (infinite loop); the process owns its lifetime.
+/// `pub` (not `pub(crate)`) because the `webtransport_server` binary is a separate
+/// crate target that imports it from the `sec_api` library.
+///
+/// Lag is measured from the tick's SCHEDULED DEADLINE — `Interval::tick().await`
+/// returns the `Instant` the tick was scheduled to fire (tokio 1.48
+/// interval.rs:467,492-493), so `now - deadline` is the lateness directly. This is
+/// correct under both `MissedTickBehavior::Burst` and `Delay`; `Delay` is retained
+/// only as the cadence policy (no burst catch-up after a stall), NOT load-bearing
+/// for correctness. See [`scheduler_lag_from_deadline`].
+pub async fn run_scheduler_lag_probe(period: std::time::Duration) {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        // `tick()` returns the deadline the tick was scheduled to fire; the first
+        // tick fires immediately with deadline ~= now, so its lag is ~0 (no priming
+        // tick needed — the deadline-based math handles it).
+        let deadline = interval.tick().await;
+        let now = tokio::time::Instant::now();
+        RELAY_SCHEDULER_LAG_MS.observe(scheduler_lag_from_deadline(deadline, now));
+    }
+}
+
+/// Spawn the scheduler-lag probe on the relay's single-thread runtime (#1637).
+///
+/// Extracted (mirrors `webtransport::spawn_connection_path_sampler`) so the
+/// `actix_rt::spawn` + probe loop + `.observe()` wiring is exercised by a host
+/// test: `metrics::tests::spawn_scheduler_lag_probe_observes_into_histogram` calls
+/// THIS fn and asserts the histogram sample count rises, so deleting the spawn
+/// here fails that test. `actix_rt::spawn` keeps the probe on the relay runtime
+/// whose lag it measures (a probe on any other thread would measure that thread's
+/// scheduler, not the relay's).
+///
+/// The residual `main() -> spawn_scheduler_lag_probe()` call is the one
+/// irreducible composition line — same status as `main`'s NATS-connect /
+/// health-server-bind / `webtransport::start` wiring: a binary's `main` cannot be
+/// unit-tested without a full smoke harness, so we deliberately do NOT add a
+/// fragile binary smoke test for it. Every reducible seam below `main` is now
+/// covered.
+///
+/// `pub` (not `pub(crate)`) because the `webtransport_server` binary is a separate
+/// crate target that imports it from the `sec_api` library — same as
+/// [`run_scheduler_lag_probe`].
+pub fn spawn_scheduler_lag_probe(period: std::time::Duration) -> actix_rt::task::JoinHandle<()> {
+    actix_rt::spawn(run_scheduler_lag_probe(period))
+}
+
+/// Remove the per-connection QUIC path-health gauges for a single WebTransport
+/// `session_id` (#1637; issue #996 cardinality-GC pattern).
+///
+/// `videocall_relay_connection_rtt_ms` /
+/// `videocall_relay_connection_path_lost_packets` /
+/// `videocall_relay_connection_path_congestion_events` /
+/// `videocall_relay_connection_path_sent_packets` carry an unbounded-over-time
+/// `session_id` label, so — like [`forget_session_drops`] — the series for a
+/// disconnected connection must be removed the instant its session ends or it
+/// leaks for the process lifetime.
+///
+/// CALL SITE (note the difference from [`forget_session_drops`]): this is invoked
+/// inline in `webtransport::handle_webtransport_session` right after
+/// `bridge.wait_for_disconnect()` returns — the same place the sampler task is
+/// aborted — NOT from `SessionLogic::on_stopping` (where `forget_session_drops`
+/// runs). Both fire on every normal disconnect, so neither leaks; the sampler is
+/// only ever spawned for WT (it needs the quinn connection), so co-locating its
+/// GC with its spawn/teardown in the WT entry point keeps the two on one code
+/// path rather than reaching into the shared actor hook.
+///
+/// `remove_label_values` returns a benign `Err` when the series was never created
+/// (e.g. the sampler had not yet taken its first sample), so each call is
+/// intentionally `let _ =`-discarded.
+pub fn forget_connection_path_stats(room: &str, session_id: &str) {
+    let _ = RELAY_CONNECTION_RTT_MS.remove_label_values(&[room, session_id]);
+    let _ = RELAY_CONNECTION_PATH_LOST_PACKETS.remove_label_values(&[room, session_id]);
+    let _ = RELAY_CONNECTION_PATH_CONGESTION_EVENTS.remove_label_values(&[room, session_id]);
+    let _ = RELAY_CONNECTION_PATH_SENT_PACKETS.remove_label_values(&[room, session_id]);
 }
 
 // =============================================================================
@@ -2591,5 +3045,240 @@ mod tests {
             session_id,
             unrelated_kind,
         ]);
+    }
+
+    // =========================================================================
+    // #1637 — scheduler-lag computation + per-connection path-stat GC
+    // =========================================================================
+
+    use std::time::Duration;
+
+    /// `duration_to_millis_f64` preserves sub-millisecond precision and the
+    /// integer-ms cases the RTT gauge relies on. Pins the PRODUCTION conversion
+    /// the RTT sampler feeds `Connection::rtt()` through — break the `* 1000.0`
+    /// (e.g. to `as_millis()` truncation) and the 1.5ms case fails.
+    #[test]
+    fn duration_to_millis_f64_converts_with_sub_ms_precision() {
+        assert_eq!(duration_to_millis_f64(Duration::ZERO), 0.0);
+        assert_eq!(duration_to_millis_f64(Duration::from_millis(40)), 40.0);
+        assert_eq!(duration_to_millis_f64(Duration::from_secs(1)), 1000.0);
+        // 1.5ms must NOT truncate to 1 — sub-ms precision matters at LAN RTTs.
+        assert_eq!(duration_to_millis_f64(Duration::from_micros(1500)), 1.5);
+    }
+
+    /// `scheduler_lag_from_deadline` returns how late a tick was polled vs its
+    /// scheduled deadline, clamped at 0 for on-time/early polls. These are the
+    /// exact cases #1637 names. Builds two `tokio::time::Instant`s by arithmetic
+    /// (no real sleeping) and calls the PRODUCTION function — flipping the
+    /// subtraction order to `deadline.saturating_duration_since(polled_at)` makes
+    /// the 200ms-late case read 0.0 and FAILS this test, pinning that `polled_at -
+    /// deadline` (not the reverse) is the lag.
+    #[test]
+    fn scheduler_lag_from_deadline_named_cases() {
+        // A fixed base so both Instants share a monotonic origin (the probe passes
+        // tokio Instants straight through; arithmetic on them is exact here).
+        let deadline = tokio::time::Instant::now();
+
+        // On-time poll: polled exactly at the deadline => 0ms lag (no false spike).
+        assert_eq!(scheduler_lag_from_deadline(deadline, deadline), 0.0);
+
+        // Late by 200ms: the runtime polled the tick 200ms past its scheduled
+        // fire instant — exactly the stall the probe must surface.
+        assert_eq!(
+            scheduler_lag_from_deadline(deadline, deadline + Duration::from_millis(200)),
+            200.0,
+            "a tick polled 200ms after its deadline must report 200.0ms of lag"
+        );
+
+        // Early poll (polled_at < deadline; only clock granularity could cause it):
+        // saturates to 0 rather than a negative.
+        assert_eq!(
+            scheduler_lag_from_deadline(deadline + Duration::from_millis(40), deadline),
+            0.0,
+            "a poll before the deadline must saturate to 0, never go negative"
+        );
+    }
+
+    /// `publish_connection_path_stats` sets ALL FOUR per-connection gauges from a
+    /// known snapshot, then `forget_connection_path_stats` removes all four
+    /// (#1637 / #996). This pins BOTH production seams: the per-tick EMISSION
+    /// mapping (the function the sampler calls every tick — reverting any one
+    /// `.set()` makes the matching assert below fail) AND the teardown GC sweep
+    /// (deleting any one `remove_label_values` makes the matching 0.0 assert fail).
+    /// It calls the REAL production functions, not inline replicas, so a mutation
+    /// to either is caught here.
+    #[test]
+    #[serial(relay_connection_path_stats_metric)]
+    fn publish_connection_path_stats_sets_all_four_gauges_then_gc_removes_them() {
+        let room = "gc-room-1637";
+        let session_id = "987654321";
+
+        // Distinct sentinel values so a copy-paste bug that wires one gauge to the
+        // wrong field is caught (each gauge must read ITS OWN value, not another's).
+        let rtt_ms = 123.0_f64;
+        let lost_packets = 7_u64;
+        let congestion_events = 3_u64;
+        let sent_packets = 9001_u64;
+
+        // PRODUCTION emission seam — the exact function the per-tick sampler calls.
+        publish_connection_path_stats(
+            room,
+            session_id,
+            rtt_ms,
+            lost_packets,
+            congestion_events,
+            sent_packets,
+        );
+
+        // Each gauge must hold ITS OWN published value. Reverting/mis-wiring any
+        // single `.set()` in `publish_connection_path_stats` breaks exactly one of
+        // these (non-vacuous: the values are distinct and nonzero).
+        assert_eq!(
+            RELAY_CONNECTION_RTT_MS
+                .with_label_values(&[room, session_id])
+                .get(),
+            rtt_ms,
+            "rtt gauge must reflect the published rtt_ms"
+        );
+        assert_eq!(
+            RELAY_CONNECTION_PATH_LOST_PACKETS
+                .with_label_values(&[room, session_id])
+                .get(),
+            lost_packets as f64,
+            "lost_packets gauge must reflect the published count"
+        );
+        assert_eq!(
+            RELAY_CONNECTION_PATH_CONGESTION_EVENTS
+                .with_label_values(&[room, session_id])
+                .get(),
+            congestion_events as f64,
+            "congestion_events gauge must reflect the published count"
+        );
+        assert_eq!(
+            RELAY_CONNECTION_PATH_SENT_PACKETS
+                .with_label_values(&[room, session_id])
+                .get(),
+            sent_packets as f64,
+            "sent_packets gauge must reflect the published count (B-vs-C disambiguator)"
+        );
+
+        // PRODUCTION teardown sweep — the exact function the session teardown calls.
+        forget_connection_path_stats(room, session_id);
+
+        // All four series must be gone (re-fetch yields a fresh 0.0 handle).
+        // Deleting any one removal line in `forget_connection_path_stats` leaves a
+        // residual nonzero value here and fails the matching assert.
+        assert_eq!(
+            RELAY_CONNECTION_RTT_MS
+                .with_label_values(&[room, session_id])
+                .get(),
+            0.0,
+            "rtt gauge must be removed at teardown"
+        );
+        assert_eq!(
+            RELAY_CONNECTION_PATH_LOST_PACKETS
+                .with_label_values(&[room, session_id])
+                .get(),
+            0.0,
+            "lost_packets gauge must be removed at teardown"
+        );
+        assert_eq!(
+            RELAY_CONNECTION_PATH_CONGESTION_EVENTS
+                .with_label_values(&[room, session_id])
+                .get(),
+            0.0,
+            "congestion_events gauge must be removed at teardown"
+        );
+        assert_eq!(
+            RELAY_CONNECTION_PATH_SENT_PACKETS
+                .with_label_values(&[room, session_id])
+                .get(),
+            0.0,
+            "sent_packets gauge must be removed at teardown"
+        );
+
+        // Clean up the fresh zero handles the asserts above created.
+        forget_connection_path_stats(room, session_id);
+    }
+
+    /// Regression test for the scheduler-lag probe's PRODUCTION emission wiring
+    /// (#1637, Codex P1). Drives the real `run_scheduler_lag_probe` loop — the same
+    /// function `webtransport_server` main spawns — under tokio PAUSED time and
+    /// asserts the histogram's sample count RISES. Deleting the `.observe(...)`
+    /// line inside `run_scheduler_lag_probe` makes the count stop rising and FAILS
+    /// this test, so the runtime emission is no longer unguarded (the pure
+    /// `scheduler_lag_from_deadline` test pins the arithmetic; THIS pins the loop).
+    ///
+    /// `RELAY_SCHEDULER_LAG_MS` is a process-global single histogram shared by all
+    /// tests, so this is `#[serial]` (distinct key) and asserts a DELTA, not an
+    /// absolute count — another test may also have observed into it.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    #[serial(relay_scheduler_lag_probe)]
+    async fn run_scheduler_lag_probe_observes_into_histogram() {
+        let period = std::time::Duration::from_millis(500);
+
+        let before = RELAY_SCHEDULER_LAG_MS.get_sample_count();
+
+        // Spawn the REAL production probe loop. It never returns, so we drive it a
+        // few ticks under paused time then abort it.
+        let handle = tokio::spawn(run_scheduler_lag_probe(period));
+
+        // Under `start_paused`, timers only fire when we advance the clock. The
+        // first `interval.tick()` is immediate; advancing by several periods (with
+        // a yield after each so the spawned task is actually polled and runs its
+        // `.observe()`) forces multiple ticks to fire and be observed.
+        for _ in 0..3 {
+            tokio::time::advance(period).await;
+            tokio::task::yield_now().await;
+        }
+
+        let after = RELAY_SCHEDULER_LAG_MS.get_sample_count();
+        handle.abort();
+
+        assert!(
+            after > before,
+            "run_scheduler_lag_probe must observe at least one sample into the \
+             histogram (before={before}, after={after}); a non-increasing count \
+             means the production .observe() wiring is gone"
+        );
+    }
+
+    /// Regression test for the scheduler-lag probe's SPAWN wiring (#1637, Codex
+    /// P1) — parity with `webtransport`'s loopback sampler-spawn test. Calls the
+    /// REAL `spawn_scheduler_lag_probe` (the same fn `webtransport_server` main
+    /// calls) and asserts the histogram's sample count RISES. Deleting the
+    /// `actix_rt::spawn(...)` inside `spawn_scheduler_lag_probe` makes the count
+    /// stop rising and FAILS this test. The sibling
+    /// `run_scheduler_lag_probe_observes_into_histogram` pins the LOOP/observe;
+    /// THIS pins the spawn — together the only uncovered line is the irreducible
+    /// `main() -> spawn_scheduler_lag_probe()` composition.
+    ///
+    /// `#[actix_rt::test]` (NOT `#[tokio::test]`): `actix_rt::spawn` needs the
+    /// actix System/LocalSet that `actix_rt::test` provides — exactly like the
+    /// loopback sampler-spawn test. Same `#[serial]` key as the loop test so the
+    /// two probe tests cannot race the process-global histogram; asserts a DELTA.
+    ///
+    /// Non-flaky: 10ms period + a 60ms real sleep gives ~6 ticks of margin, and
+    /// `Interval`'s immediate first tick guarantees >=1 observe even if scheduling
+    /// is slow. `abort()` cleanly stops the otherwise-infinite probe loop.
+    #[actix_rt::test]
+    #[serial(relay_scheduler_lag_probe)]
+    async fn spawn_scheduler_lag_probe_observes_into_histogram() {
+        let before = RELAY_SCHEDULER_LAG_MS.get_sample_count();
+
+        // Drive the REAL production spawn helper.
+        let handle = spawn_scheduler_lag_probe(std::time::Duration::from_millis(10));
+
+        // Let a few real ticks land (immediate first tick => >=1 observe).
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        handle.abort();
+
+        let after = RELAY_SCHEDULER_LAG_MS.get_sample_count();
+        assert!(
+            after > before,
+            "spawn_scheduler_lag_probe must spawn the probe and observe at least \
+             one sample (before={before}, after={after}); if not, the \
+             actix_rt::spawn wiring inside the helper is gone"
+        );
     }
 }

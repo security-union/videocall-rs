@@ -297,6 +297,13 @@ pub fn Host(
         // audio-tier atom, so a screen-sharing publisher relies on this detector
         // for its only audio downshift.
         microphone.set_camera_active_signal(camera.camera_enabled_flag());
+        // Issue #1611 backstop: give the microphone encoder the camera's
+        // video-at-floor flag, the screen's video-at-floor flag, and the screen's
+        // sharing-active (Arc) flag. Together these form the 3-signal gate:
+        //   single_layer && (!camera || cam_exhausted) && (!screen || scr_exhausted)
+        microphone.set_camera_video_exhausted_signal(camera.video_at_floor_flag());
+        microphone.set_screen_video_exhausted_signal(screen.screen_at_floor_flag());
+        microphone.set_screen_sharing_active_signal(screen.screen_sharing_active_arc());
         // Issue #1398 reconnect P1: give the microphone encoder the client's
         // RECONNECT-reseed flag. The client sets it on every (re)connect (in its
         // `Connected` handler, next to the bitrate-floor reset); the mic-side

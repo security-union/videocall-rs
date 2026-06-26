@@ -40,8 +40,11 @@ rustlemania-webtransport:
       value: webtransport
     - name: SERVER_STATS_INTERVAL_SECS
       value: "5"
-    - name: TOKIO_WORKER_THREADS
-      value: "4"
+    # TOKIO_WORKER_THREADS intentionally omitted: webtransport_server is
+    # `#[actix_rt::main]` (single-threaded current-thread runtime) and never
+    # reads it — the WtChatSession actor needs the LocalSet/spawn_local, so a
+    # multi-threaded runtime cannot host it. Inert env removed in issue #1639
+    # (option c); multi-core rearchitecture (#1639 a/b) is gated on #1637.
     - name: TOKIO_BLOCKING_THREADS
       value: "2"
     - name: JWT_SECRET

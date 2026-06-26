@@ -78,6 +78,19 @@ message VideoStats {
   // counter must keep reporting even at fps 0. A rising value proves the governor
   // fired in the field.
   uint64 playout_skip_to_live_total = 8;
+  // Content-staleness (#1641): the content AGE of the video currently being
+  // painted, in milliseconds — how old (capture/wall-clock) the released content
+  // is, drift-baselined to cancel the unsynchronized publisher/receiver clock
+  // offset. This is content AGE, NOT queue DEPTH: playout_paint_lag_ms (field 7)
+  // is (frames_emitted − frames_painted) × interval, so a stream draining
+  // minutes-old content at display rate keeps a small queue and reads ~0 — it
+  // cannot see the lag. This field can; it surfaces the "video lagged by minutes
+  // while playout_latency/paint_lag read ~0" case (#1631 M2). Unlike
+  // playout_latency_ms (field 5, capped at MAX_PLAYOUT_AGE_MS = 1800ms) this is
+  // UNBOUNDED and routinely EXCEEDS 1800ms when content is genuinely stale.
+  // Same fps_received > 0 gate as the ms gauges above: a paused/hidden tile
+  // decodes nothing, so when fps == 0 this stays at its 0.0 default ("at live").
+  double content_staleness_ms = 9;
 }
 
 message PeerStats {

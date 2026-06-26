@@ -83,6 +83,15 @@ pub trait MicrophoneEncoderTrait {
     /// (re)connect, preventing a cross-reconnect counter delta from cashing a
     /// spurious cut. See [`MicrophoneEncoder::set_reconnect_reseed_signal`].
     fn set_reconnect_reseed_signal(&mut self, reconnect_reseed: Arc<AtomicBool>);
+    /// Share the camera's video-at-floor flag (issue #1611, lever 2).
+    /// See [`MicrophoneEncoder::set_camera_video_exhausted_signal`].
+    fn set_camera_video_exhausted_signal(&mut self, flag: Arc<AtomicBool>);
+    /// Share the screen's video-at-floor flag (issue #1611, lever 3).
+    /// See [`MicrophoneEncoder::set_screen_video_exhausted_signal`].
+    fn set_screen_video_exhausted_signal(&mut self, flag: Arc<AtomicBool>);
+    /// Share the screen-sharing-active flag (issue #1611, lever 3).
+    /// See [`MicrophoneEncoder::set_screen_sharing_active_signal`].
+    fn set_screen_sharing_active_signal(&mut self, flag: Arc<AtomicBool>);
     /// Returns the effective audio simulcast layer count (#1561).
     fn effective_audio_layers(&self) -> u32;
     /// Returns the shared CONGESTION audio layer-ceiling atom (#1561).
@@ -135,6 +144,18 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
     fn set_reconnect_reseed_signal(&mut self, reconnect_reseed: Arc<AtomicBool>) {
         self.set_reconnect_reseed_signal(reconnect_reseed)
+    }
+
+    fn set_camera_video_exhausted_signal(&mut self, flag: Arc<AtomicBool>) {
+        self.set_camera_video_exhausted_signal(flag)
+    }
+
+    fn set_screen_video_exhausted_signal(&mut self, flag: Arc<AtomicBool>) {
+        self.set_screen_video_exhausted_signal(flag)
+    }
+
+    fn set_screen_sharing_active_signal(&mut self, flag: Arc<AtomicBool>) {
+        self.set_screen_sharing_active_signal(flag)
     }
 
     fn effective_audio_layers(&self) -> u32 {

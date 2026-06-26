@@ -30,6 +30,8 @@ use crate::constants::{meeting_api_base_url, meeting_api_client};
 use crate::local_storage::{load_bool, load_json, save_bool, save_json};
 use crate::routing::Route;
 use dioxus::prelude::*;
+use futures::channel::mpsc::UnboundedReceiver;
+use futures::StreamExt;
 use std::cell::RefCell;
 use std::rc::Rc;
 use videocall_meeting_types::responses::{ListFeedResponse, MeetingFeedSummary};
@@ -64,9 +66,11 @@ const FEED_CHANGED_EVENT: &str = "feed-changed";
 /// Debounce window (ms) applied to SSE `feed-changed` nudges before re-fetching
 /// the feed. The nudge payload is advisory-only; on ANY nudge we re-fetch
 /// `GET /api/v1/meetings/feed`. Bursts of nudges (admit-all storms, reconnection
-/// waves, many joins/leaves at once) are coalesced into a single re-fetch by
-/// resetting this timer on each nudge. 400ms sits inside the server-documented
-/// 300–500ms guidance: long enough to absorb a burst, short enough to feel live.
+/// waves, many joins/leaves at once) are coalesced into a single re-fetch: the
+/// first nudge opens a fixed 400ms window, and any further nudges that arrive
+/// during it are drained before one re-fetch fires. 400ms sits inside the
+/// server-documented 300–500ms guidance: long enough to absorb a burst, short
+/// enough to feel live.
 const FEED_SSE_DEBOUNCE_MS: u32 = 400;
 
 /// Build the meeting-feed SSE stream URL from the meeting-api base URL.
@@ -184,43 +188,108 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
         });
     };
 
-    // SSE-driven background re-fetch (issue #1081). Reuses the EXACT same feed
-    // fetch path as `fetch_meetings` (`do_fetch_feed`), but does NOT flip
-    // `loading` to true: a live nudge updates the list in place rather than
-    // blanking it to the spinner, so the homepage doesn't blink on every
-    // remote join/leave. The initial mount fetch (`fetch_meetings`) still shows
-    // the spinner; only the background SSE-driven refresh is silent.
+    // SSE → coroutine bridge (issue #1671). The raw browser `EventSource`
+    // callbacks fire on the bare event-loop stack with NO Dioxus runtime / scope
+    // present, so calling `spawn`/`Signal::set` directly from them panics inside
+    // dioxus-core (Option::unwrap on the runtime, or a RefCell-already-borrowed
+    // re-entry mid-diff). We therefore bridge the nudge across a stable
+    // `futures` channel to a `use_coroutine` task: the coroutine's async body
+    // runs INSIDE the component scope (it is built on `use_future`, which Dioxus
+    // polls under the runtime), so `meetings.set(...)` etc. there are safe.
     //
-    // Auth/error transitions are still honored so the list self-heals: if the
-    // session has since expired, a nudge-driven re-fetch surfaces the
-    // unauthenticated prompt (and a later valid re-fetch clears it); a transient
-    // error is shown without first wiping the currently-displayed rows.
-    let background_refetch = move || {
-        spawn(async move {
-            match do_fetch_feed().await {
-                Ok(response) => {
-                    // Equality-skip: `Signal::set` does NOT short-circuit on
-                    // equality (dioxus-signals 0.7.3) — it unconditionally
-                    // dirties subscribers. When an SSE nudge re-fetch returns an
-                    // unchanged feed, an unguarded `set` would still force the
-                    // `visible_meetings` memo to recompute `filter_and_sort_meetings`
-                    // over up to 200 rows + 200 `Rc::new` allocations for nothing.
-                    // `.peek()` so the compare creates no reactive subscription.
-                    if *meetings.peek() != response.meetings {
-                        meetings.set(response.meetings);
+    // The channel pair is created with `use_hook` so it is STABLE across renders
+    // (one channel for the lifetime of the mount). The sender is cloned into the
+    // SSE `on_message` closure; the receiver lives in an `Rc<RefCell<Option<…>>>`
+    // holder and is taken ONCE into the coroutine body below — so the closure and
+    // the coroutine share the SAME channel pair. We default to our OWN channel
+    // rather than the coroutine's internal `tx()` because reading that handle is
+    // not guaranteed runtime-free. (`use_hook` requires its stored value to be
+    // `Clone`; an `UnboundedReceiver` is not, so we hide it behind an `Rc` cell —
+    // the sender already is `Clone`, hence the tuple is.)
+    let (feed_nudge_tx, feed_nudge_rx_holder) = use_hook(|| {
+        let (tx, rx) = futures::channel::mpsc::unbounded::<()>();
+        (tx, Rc::new(RefCell::new(Some(rx))))
+    });
+
+    // The coroutine OWNS the silent background re-fetch that used to live in the
+    // `background_refetch` closure: it reuses the EXACT same feed fetch path
+    // (`do_fetch_feed`) but does NOT flip `loading` — a live nudge updates the
+    // list in place rather than blanking it to the spinner, so the homepage
+    // doesn't blink on every remote join/leave. Auth/error transitions are still
+    // honored so the list self-heals (an expired session surfaces the
+    // unauthenticated prompt; a later valid re-fetch clears it; a transient
+    // error is shown without wiping the currently-displayed rows), and the
+    // `meetings.set` is equality-skipped so an unchanged feed costs no recompute.
+    //
+    // Debounce now lives HERE (not in a raw `gloo_timers::callback::Timeout`):
+    // we await one nudge, sleep `FEED_SSE_DEBOUNCE_MS`, drain any nudges that
+    // queued during the sleep, then do ONE refetch — so a burst of nudges
+    // (admit-all storms, reconnection waves) coalesces into a single re-fetch.
+    // Note this is a LEADING fixed window (the first nudge opens a 400ms window
+    // that absorbs the burst), not the old trailing reset-on-each-nudge timer;
+    // it still coalesces a burst to one refetch and is marginally more prompt.
+    // Behavioral note (issue #1671 review): under a SUSTAINED stream of nudges
+    // spaced <400ms apart indefinitely (a long reconnection-wave tail), the
+    // leading window refetches at a steady-state ceiling of ~1 fetch / 400ms
+    // (≈2.5/sec) so the list converges. The old trailing timer reset on every
+    // nudge and so STARVED under that same stream (≈0 fetches until it subsided,
+    // leaving the list stale). We deliberately prefer convergence over freezing;
+    // the ceiling is bounded and far below a tight poll, and each fetch is the
+    // same server-capped (≤200-row) feed the render already reads.
+    // On unmount Dioxus drops the coroutine future, which cancels the in-flight
+    // `TimeoutFuture` — that is the new debounce-cancellation path (it replaces
+    // dropping the old `Timeout`). The `use_coroutine` closure receives its own
+    // internal receiver, which we ignore (`_`) in favor of our stable `rx`.
+    use_coroutine(move |_: UnboundedReceiver<()>| {
+        // Move our OWN receiver into the task on first build. `use_coroutine`'s
+        // `init` runs once, so the `.take()` yields the real receiver here.
+        let rx = feed_nudge_rx_holder.borrow_mut().take();
+        async move {
+            let Some(mut rx) = rx else {
+                // No receiver (would only happen on an impossible double-build).
+                // Nothing to drive — exit cleanly rather than busy-spin.
+                return;
+            };
+            loop {
+                // Block until a nudge arrives. `None` => all senders dropped
+                // (component torn down): exit the loop, do not busy-spin.
+                if rx.next().await.is_none() {
+                    break;
+                }
+                // Debounce window: absorb a burst into one refetch.
+                gloo_timers::future::TimeoutFuture::new(FEED_SSE_DEBOUNCE_MS).await;
+                // Non-blockingly drain any nudges that queued during the sleep so
+                // the whole burst collapses to a single refetch. `try_next` is
+                // `Ok(Some(()))` while items remain, then `Err` (empty-but-open)
+                // or `Ok(None)` (closed) — either non-`Ok(Some)` ends the drain.
+                while let Ok(Some(())) = rx.try_next() {}
+                // ── single silent refetch (subsumes `background_refetch`) ──
+                match do_fetch_feed().await {
+                    Ok(response) => {
+                        // Equality-skip: `Signal::set` does NOT short-circuit on
+                        // equality (dioxus-signals 0.7.3) — it unconditionally
+                        // dirties subscribers. When an SSE nudge re-fetch returns
+                        // an unchanged feed, an unguarded `set` would still force
+                        // the `visible_meetings` memo to recompute
+                        // `filter_and_sort_meetings` over up to 200 rows + 200
+                        // `Rc::new` allocations for nothing. `.peek()` so the
+                        // compare creates no reactive subscription.
+                        if *meetings.peek() != response.meetings {
+                            meetings.set(response.meetings);
+                        }
+                        error.set(None);
+                        unauthenticated.set(false);
                     }
-                    error.set(None);
-                    unauthenticated.set(false);
-                }
-                Err(FetchMeetingsError::Unauthenticated) => {
-                    unauthenticated.set(true);
-                }
-                Err(FetchMeetingsError::Other(e)) => {
-                    error.set(Some(e));
+                    Err(FetchMeetingsError::Unauthenticated) => {
+                        unauthenticated.set(true);
+                    }
+                    Err(FetchMeetingsError::Other(e)) => {
+                        error.set(Some(e));
+                    }
                 }
             }
-        });
-    };
+        }
+    });
 
     // Fetch on mount
     use_effect({
@@ -232,13 +301,16 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
 
     // Subscribe the list to the server's live feed-change stream (issue #1081):
     // an `EventSource` over `…/api/v1/meetings/feed/stream`. On each named
-    // `feed-changed` nudge we debounce (`FEED_SSE_DEBOUNCE_MS`) and then run the
-    // silent `background_refetch` above. This is a SUBSCRIPTION, not a poll — we
-    // add no interval; updates are pushed by the server. The mount fetch, this
+    // `feed-changed` nudge the raw callback does a runtime-free
+    // `notify_feed_changed(&tx)` channel send (issue #1671); the
+    // `use_coroutine` task above then debounces (`FEED_SSE_DEBOUNCE_MS`) and runs
+    // ONE silent refetch. This is a SUBSCRIPTION, not a poll — we add no
+    // interval; updates are pushed by the server. The mount fetch, this
     // SSE-driven refresh, and the manual refresh button are the only update
     // paths, and the list degrades gracefully to the first and last of those if
-    // SSE never connects (see below).
-    install_feed_sse(background_refetch);
+    // SSE never connects (see below). We pass a clone of the nudge sender so the
+    // closure can hand off across the channel without touching the Dioxus runtime.
+    install_feed_sse(feed_nudge_tx.clone());
 
     // Low-frequency fallback poll (issue #1628). SSE (above) is the PRIMARY
     // live-update path; this poll exists ONLY for when SSE never connects or
@@ -257,9 +329,9 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
     // completes and its result is discarded, since the future is gone.
     //
     // Silent + non-stomping: reuses `do_fetch_feed()` (the EXACT endpoint the
-    // render reads) and the `background_refetch` update shape (meetings.set +
-    // clear error/unauthenticated) WITHOUT flipping `loading` — so a fallback
-    // refresh updates rows in place and never blanks the list to the spinner.
+    // render reads) and the SSE nudge coroutine's update shape (equality-skipped
+    // meetings.set + clear error/unauthenticated) WITHOUT flipping `loading` — so
+    // a fallback refresh updates rows in place and never blanks to the spinner.
     // It writes ONLY `meetings`/`error`/`unauthenticated`; it never touches the
     // filter/sort/expanded/popover signals, so a fallback tick cannot stomp an
     // open filter popover or the user's sort selection.
@@ -298,8 +370,8 @@ pub fn MeetingsList(on_select_meeting: Option<EventHandler<String>>) -> Element 
                 Ok(response) => {
                     // Re-check guards AFTER the await: the user may have hit
                     // refresh (loading flipped) or the session may have expired
-                    // while the request was in flight. Mirror background_refetch:
-                    // silent in-place update, clear transient error/auth.
+                    // while the request was in flight. Mirror the SSE nudge
+                    // coroutine: silent in-place update, clear transient error/auth.
                     if *loading.peek() {
                         continue;
                     }
@@ -1021,9 +1093,6 @@ struct FeedSseState {
     /// Resets the error budget so a stream that flaps but keeps reconnecting is
     /// never closed — only an UNBROKEN run of failed connects trips the cap.
     on_open: Option<Closure<dyn FnMut(web_sys::Event)>>,
-    /// The in-flight debounce timer, if a nudge is currently coalescing. Held so
-    /// a fresh nudge cancels (drops) and replaces it, and so unmount cancels it.
-    debounce: Option<gloo_timers::callback::Timeout>,
     /// Count of consecutive `error`s since the last successful (re)connection or
     /// nudge. Reset to 0 on every `open` and every `feed-changed`; closes the
     /// stream once it reaches [`FEED_SSE_MAX_CONSECUTIVE_ERRORS`]. Because a
@@ -1032,12 +1101,32 @@ struct FeedSseState {
     consecutive_errors: u32,
 }
 
+/// Runtime-free handoff of an SSE `feed-changed` nudge from the raw browser
+/// `EventSource` callback to the Dioxus-driven coroutine (issue #1671).
+///
+/// The `on_message` `Closure` fires on the bare event-loop stack with NO Dioxus
+/// runtime/scope present, so it must NOT touch `spawn`/`Signal::set`/`peek`/the
+/// `Coroutine` handle (any of those panics in dioxus-core). All it may do is push
+/// a `()` across the stable `futures` channel; the coroutine — which IS polled
+/// under the runtime — wakes, debounces, and performs the actual refetch.
+///
+/// `unbounded_send` is non-blocking and never touches the runtime, so it is safe
+/// from a raw callback. We deliberately swallow the `Err` it returns when the
+/// receiver has been dropped (the component unmounted): a late nudge arriving
+/// after navigate-away is a no-op, NOT a panic. Kept as a separate fn so the
+/// host regression test can exercise this exact handoff with no runtime present.
+fn notify_feed_changed(tx: &futures::channel::mpsc::UnboundedSender<()>) {
+    let _ = tx.unbounded_send(());
+}
+
 /// Subscribe the mounted `MeetingsList` to the server's live meeting-feed change
 /// stream (issue #1081) via a browser `EventSource`.
 ///
-/// `on_nudge` is the silent background re-fetch (no `loading` flash). It is a
-/// Dioxus closure capturing only `Signal`s, hence `Copy + 'static`, so it can be
-/// copied into the debounced timer callback.
+/// `nudge_tx` is the sender half of the stable `futures` channel that feeds the
+/// component's nudge coroutine (issue #1671). The raw `feed-changed` callback
+/// hands off across this channel via [`notify_feed_changed`] instead of calling
+/// into the Dioxus runtime directly (which would panic from a bare browser
+/// callback); the coroutine owns the debounce + silent refetch.
 ///
 /// # Connection & data flow
 ///
@@ -1047,10 +1136,11 @@ struct FeedSseState {
 ///    DIFFERENT origin than the page, so the session cookie only rides along on
 ///    the SSE handshake if `withCredentials` is set. It is a harmless no-op when
 ///    the stream is same-origin, so this matches the fetch's auth either way.
-/// 2. On each named `feed-changed` event, reset the debounce timer; when it
-///    fires (`FEED_SSE_DEBOUNCE_MS`) call `on_nudge` once — coalescing a burst of
-///    nudges into a single feed re-fetch. The payload is advisory-only and is
-///    intentionally ignored: the re-fetch is what enforces per-user visibility.
+/// 2. On each named `feed-changed` event, send one `()` across `nudge_tx`
+///    (`notify_feed_changed`). The coroutine debounces `FEED_SSE_DEBOUNCE_MS` and
+///    coalesces a burst of nudges into a single feed re-fetch. The payload is
+///    advisory-only and is intentionally ignored: the re-fetch is what enforces
+///    per-user visibility.
 /// 3. On `error`, increment a consecutive-error counter; EventSource reconnects
 ///    itself on transient drops, so we tolerate a few. A successful (re)connect
 ///    (`open`) or any `feed-changed` nudge resets the counter, so only an UNBROKEN
@@ -1064,7 +1154,7 @@ struct FeedSseState {
 /// If `EventSource` construction fails (feature disabled, bad URL) or the config
 /// lookup errors, we simply don't subscribe; the component's existing
 /// fetch-on-mount + manual-refresh behavior is untouched and fully functional.
-fn install_feed_sse(on_nudge: impl FnMut() + Copy + 'static) {
+fn install_feed_sse(nudge_tx: futures::channel::mpsc::UnboundedSender<()>) {
     let state: Rc<RefCell<Option<FeedSseState>>> = use_hook(|| Rc::new(RefCell::new(None)));
 
     {
@@ -1092,24 +1182,29 @@ fn install_feed_sse(on_nudge: impl FnMut() + Copy + 'static) {
                 Err(_) => return,
             };
 
-            // ── named `feed-changed` listener → debounced background re-fetch ──
+            // ── named `feed-changed` listener → coroutine handoff (issue #1671) ──
             // The server emits a NAMED event, so a `message` (default) handler
             // would never fire; we must listen for `feed-changed` specifically.
+            // This fires on the bare browser event-loop stack with NO Dioxus
+            // runtime present, so it does ONLY runtime-free work: bump the error
+            // budget (touches the `Rc<RefCell<…>>` state, not the runtime) and
+            // push a nudge across the channel. The Dioxus-driven coroutine, which
+            // IS polled under the runtime, debounces and does the actual refetch.
             let on_message: Closure<dyn FnMut(web_sys::MessageEvent)> = Closure::new({
                 let state = state_for_init.clone();
+                let nudge_tx = nudge_tx.clone();
                 move |_ev: web_sys::MessageEvent| {
                     if let Some(s) = state.borrow_mut().as_mut() {
                         // A successful nudge means the stream is healthy — reset
                         // the error budget.
                         s.consecutive_errors = 0;
-                        // Reset-on-nudge debounce: dropping the prior `Timeout`
-                        // cancels it, so a burst collapses to one re-fetch. The
-                        // timer fires the re-fetch once (`FnOnce`); `on_nudge` is
-                        // `Copy`, so each scheduled timer gets its own copy.
-                        s.debounce = Some(gloo_timers::callback::Timeout::new(
-                            FEED_SSE_DEBOUNCE_MS,
-                            on_nudge,
-                        ));
+                        // Runtime-free handoff: push one `()` to the nudge
+                        // coroutine, which owns the debounce + silent refetch. A
+                        // closed channel (post-unmount) makes this a no-op, never
+                        // a panic. Inside the same `Some(s)` guard as the reset: a
+                        // transiently-`None` state means the stream is tearing
+                        // down anyway, so skipping the send is correct.
+                        notify_feed_changed(&nudge_tx);
                     }
                 }
             });
@@ -1158,22 +1253,21 @@ fn install_feed_sse(on_nudge: impl FnMut() + Copy + 'static) {
                 on_message: Some(on_message),
                 on_error: Some(on_error),
                 on_open: Some(on_open),
-                debounce: None,
                 consecutive_errors: 0,
             });
         });
     }
 
-    // Clean teardown on unmount: cancel the pending debounce, detach both
-    // listeners, drop the closures, and close the socket. Removing the listeners
-    // (rather than `forget()`-ing the closures) is what prevents a leak across
-    // the component's mount/unmount cycles during navigation.
+    // Clean teardown on unmount: detach all three listeners, drop the closures,
+    // and close the socket. Removing the listeners (rather than `forget()`-ing
+    // the closures) is what prevents a leak across the component's mount/unmount
+    // cycles during navigation. The pending debounce no longer lives here — the
+    // coroutine future is dropped by Dioxus on unmount, which cancels the
+    // in-flight `TimeoutFuture` (issue #1671).
     use_drop({
         let state = state.clone();
         move || {
             if let Some(mut s) = state.borrow_mut().take() {
-                // Dropping the `Timeout` cancels any pending re-fetch.
-                s.debounce = None;
                 if let Some(cb) = s.on_message.take() {
                     let _ = s.source.remove_event_listener_with_callback(
                         FEED_CHANGED_EVENT,
@@ -1672,6 +1766,49 @@ mod tests {
             feed_stream_url("http://localhost:8081"),
             "http://localhost:8081/api/v1/meetings/feed/stream"
         );
+    }
+
+    /// Regression guard for issue #1671. The raw SSE `feed-changed` callback
+    /// fires on the bare browser event-loop stack with NO Dioxus runtime/scope
+    /// present, so it MUST NOT touch the runtime — it only hands the nudge across
+    /// the `futures` channel via the production [`notify_feed_changed`]. This
+    /// test exercises that exact production fn with no runtime installed:
+    ///
+    /// 1. a live nudge enqueues exactly one `()` (not zero, not two) and does not
+    ///    panic — proving the runtime-free handoff works; and
+    /// 2. after the receiver is dropped (the navigate-away/unmount path), a LATE
+    ///    nudge is swallowed (`Err` ignored) and still does not panic.
+    ///
+    /// It calls the REAL `super::notify_feed_changed` — not an inline copy — so a
+    /// regression that re-introduces a runtime touch on the send path (the
+    /// original #1671 panic) breaks THIS test. (Verified fails-on-revert by
+    /// temporarily inserting `dioxus::prelude::spawn(async {})` before the send,
+    /// which panics on the host with no runtime; the test went red.)
+    #[test]
+    fn notify_feed_changed_enqueues_one_nudge_without_runtime() {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded::<()>();
+
+        // (1) One nudge → exactly one `()` queued, no runtime present, no panic.
+        super::notify_feed_changed(&tx);
+        assert!(
+            matches!(rx.try_next(), Ok(Some(()))),
+            "notify_feed_changed must enqueue exactly one () on the channel"
+        );
+        // A second drain must be `Err` (empty-but-OPEN: `tx` is still alive), NOT
+        // `Ok(Some(_))`. `Ok(Some)` here would mean a double-send; `Ok(None)`
+        // would mean the channel was closed (it is not). `Err` proves exactly one
+        // item was sent. (futures-channel: `Ok(None)` is closed-and-empty,
+        // `Err(_)` is empty-but-still-open — verified against the crate docs.)
+        assert!(
+            rx.try_next().is_err(),
+            "channel must be empty-but-open after draining the single nudge \
+             (a second item would mean a double-send)"
+        );
+
+        // (2) Navigate-away path: drop the receiver, then a late nudge must be a
+        // no-op (its `Err` is swallowed) and must NOT panic.
+        drop(rx);
+        super::notify_feed_changed(&tx);
     }
 
     /// The fallback poll must re-fetch ONLY when the list is loaded, the user

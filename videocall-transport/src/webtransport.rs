@@ -92,8 +92,9 @@ fn record_unistream_drop() {
 /// Cumulative count of "slow `writer.ready()`" events on the persistent
 /// unidirectional media streams (`send_on_persistent_stream`): each time a
 /// single `JsFuture::from(writer.ready()).await` on an ESTABLISHED media stream
-/// takes longer than [`READY_STALL_THRESHOLD_MS`] to resolve, this counter is
-/// incremented once.
+/// takes longer than the effective stall threshold (see
+/// [`effective_stall_threshold_ms`]) to resolve, this counter is incremented
+/// once.
 ///
 /// ## Why this exists (the gap [`UNISTREAM_DROP_COUNT`] cannot fill)
 ///
@@ -143,25 +144,101 @@ pub fn force_unistream_ready_stall(n: u64) {
     UNISTREAM_READY_STALL_COUNT.fetch_add(n, Ordering::Relaxed);
 }
 
-/// Wall-clock threshold (ms) above which a single `writer.ready().await` on an
-/// established media unistream is counted as a saturation ("slow-ready") event.
+/// Absolute floor for the uplink-saturation threshold (ms). The effective
+/// threshold may be raised above this via [`set_ready_stall_threshold_ms`] when
+/// the publisher is dual-streaming (camera + screen), but it can never go below
+/// this floor.
 ///
 /// Lives here (not in `videocall-aq`) because it parameterises the PRODUCER-side
 /// measurement, not the consumer's window/threshold decision. The consumer's
 /// "how many slow events trip a shed" threshold and window live in
 /// `videocall-aq` alongside the drop-counter constants.
 ///
-/// Initial value rationale (netsim-tunable): the AQ loop ticks at
-/// `AQ_TICK_INTERVAL_MS` (1000 ms) and a healthy `ready()` on a live link
-/// resolves in well under a frame interval (sub-10 ms once the QUIC congestion
-/// window has room). 250 ms is ~8× a 30 fps frame interval (33 ms): long enough
-/// that an ordinary bursty-but-recovering link (a few queued frames draining)
-/// does NOT cross it, but short enough that a genuine bandwidth cliff — where
-/// `ready()` blocks for hundreds of ms to multiple seconds while the send buffer
-/// refuses to drain — crosses it on most frames. Combined with the consumer
-/// requiring SEVERAL such events within its window, an isolated 250 ms hiccup
-/// (one reordered/retransmitted packet on a high-RTT link) cannot shed a layer.
-const READY_STALL_THRESHOLD_MS: f64 = 250.0;
+/// Value rationale: the AQ loop ticks at `AQ_TICK_INTERVAL_MS` (1000 ms) and a
+/// healthy `ready()` on a live link resolves in well under a frame interval
+/// (sub-10 ms once the QUIC congestion window has room). 250 ms is ~8× a
+/// 30 fps frame interval (33 ms): long enough that an ordinary bursty-but-
+/// recovering link (a few queued frames draining) does NOT cross it, but short
+/// enough that a genuine bandwidth cliff — where `ready()` blocks for hundreds
+/// of ms to multiple seconds while the send buffer refuses to drain — crosses
+/// it on most frames.
+const READY_STALL_THRESHOLD_MS_FLOOR: f64 = 250.0;
+
+/// Runtime-configurable uplink-saturation threshold (ms), stored as the bits of
+/// an `f64`. Defaults to [`READY_STALL_THRESHOLD_MS_FLOOR`] (250 ms).
+///
+/// When the publisher activates a second video stream (screen share), the
+/// combined uplink burst density is higher: the SAME `writer.ready()` stall
+/// catches more concurrent frames (higher K-factor), making the count-gate
+/// easier to trip. To compensate, the client raises this threshold to
+/// `max(FLOOR, 8 × screen_top_tier_frame_interval_ms)` — a fixed 800 ms bound
+/// (10 fps top tier × 8), NOT recomputed as either stream degrades. When the
+/// screen share stops, the client resets it back to the floor.
+///
+/// Stored as `f64::to_bits()` because `AtomicF64` does not exist in std.
+/// [`effective_stall_threshold_ms`] reads it; [`set_ready_stall_threshold_ms`]
+/// writes it. The floor guarantee is enforced at write time.
+///
+/// Initial value: bit pattern of 250.0_f64 (IEEE 754). Pinned by unit test
+/// `threshold_static_initializer_matches_floor` to the floor constant. Using a
+/// literal (not `f64::to_bits()`) because const float operations require Rust
+/// 1.83+ and the project is pinned to 1.95 without MSRV enforcement, so the
+/// real cost is the un-named magic number, not a declared-MSRV constraint.
+const READY_STALL_THRESHOLD_MS_INIT_BITS: u64 = 4_643_000_109_586_448_384;
+
+static READY_STALL_THRESHOLD_MS: AtomicU64 = AtomicU64::new(READY_STALL_THRESHOLD_MS_INIT_BITS);
+
+/// Read the current effective stall threshold (ms). This is the runtime value
+/// used by [`is_ready_stall`], which may be higher than the floor when
+/// dual-streaming.
+#[inline]
+fn effective_stall_threshold_ms() -> f64 {
+    f64::from_bits(READY_STALL_THRESHOLD_MS.load(Ordering::Relaxed))
+}
+
+/// Set the uplink-saturation threshold (ms) for the WT slow-`ready()` signal.
+///
+/// The effective threshold is `max(floor, ms)` — it can never go below
+/// [`READY_STALL_THRESHOLD_MS_FLOOR`] (250 ms). Call this when the active
+/// media-stream configuration changes (e.g. screen share starts/stops) so the
+/// threshold is frame-rate-aware for dual-stream publishers.
+///
+/// # Recommended formula
+///
+/// ```text
+/// threshold = max(250.0, 8.0 * max_frame_interval_ms_across_active_streams)
+/// ```
+///
+/// For a single camera at 30 fps: `max(250, 8×33) = 264 ≈ floor`.
+/// For camera (30 fps) + screen (10 fps): `max(250, 8×100) = 800 ms`.
+///
+/// This prevents false-positive saturation events on a healthy link that is
+/// simply bursty under dual-stream load (issue #1618). The risk — delaying
+/// genuine shed detection by up to one extra 2 s window — is acceptable because
+/// the shed is a gentle single-rung `force_video_step_down` with the relay
+/// CONGESTION path as backstop.
+pub fn set_ready_stall_threshold_ms(ms: f64) {
+    let clamped = if ms < READY_STALL_THRESHOLD_MS_FLOOR {
+        READY_STALL_THRESHOLD_MS_FLOOR
+    } else {
+        ms
+    };
+    READY_STALL_THRESHOLD_MS.store(clamped.to_bits(), Ordering::Relaxed);
+}
+
+/// Reset the uplink-saturation threshold back to the floor (250 ms).
+///
+/// Call this when switching from dual-stream back to single-stream (e.g. screen
+/// share stops), or when initializing a fresh encoder to ensure a clean baseline.
+pub fn reset_ready_stall_threshold() {
+    set_ready_stall_threshold_ms(READY_STALL_THRESHOLD_MS_FLOOR);
+}
+
+/// Returns the current effective ready-stall threshold in milliseconds.
+/// Useful for diagnostics and testing. See [`set_ready_stall_threshold_ms`].
+pub fn ready_stall_threshold_ms() -> f64 {
+    effective_stall_threshold_ms()
+}
 
 /// Pure threshold predicate for the uplink-saturation signal: returns `true`
 /// when a single `writer.ready().await` that took `elapsed_ms` to resolve
@@ -178,9 +255,13 @@ const READY_STALL_THRESHOLD_MS: f64 = 250.0;
 ///
 /// The comparison is strictly `>` (NOT `>=`): a wait of EXACTLY the threshold
 /// is not yet a stall. This boundary is pinned by unit tests.
+///
+/// The threshold is DYNAMIC: it reads [`effective_stall_threshold_ms`] which
+/// defaults to 250 ms (single-stream) but is raised when dual-streaming via
+/// [`set_ready_stall_threshold_ms`] (issue #1618).
 #[inline]
 fn is_ready_stall(elapsed_ms: f64) -> bool {
-    elapsed_ms > READY_STALL_THRESHOLD_MS
+    elapsed_ms > effective_stall_threshold_ms()
 }
 
 /// Record one `writer.ready()` measurement against the saturation threshold:
@@ -1645,43 +1726,81 @@ mod framing_tests {
     /// do not need this guard.
     static STALL_COUNTER_GUARD: Mutex<()> = Mutex::new(());
 
+    /// Serialises tests that depend on the process-global dynamic threshold
+    /// (`READY_STALL_THRESHOLD_MS`). Tests that assert boundary behavior must
+    /// hold this guard and reset the threshold to the floor before asserting,
+    /// otherwise a parallel test that raised the threshold would corrupt them.
+    static THRESHOLD_GUARD: Mutex<()> = Mutex::new(());
+
+    /// Reset the dynamic threshold to the floor (250 ms) for tests.
+    fn reset_threshold_to_floor() {
+        set_ready_stall_threshold_ms(READY_STALL_THRESHOLD_MS_FLOOR);
+    }
+
     // --- Pure threshold predicate: the mutation target ---------------------
-    // The single source of truth for the boundary is `READY_STALL_THRESHOLD_MS`
-    // (250.0). Mutating either the `>` (to `>=`) or the constant must break at
-    // least one of the boundary tests below — proven in the agent report.
+    // The single source of truth for the DEFAULT boundary is
+    // `READY_STALL_THRESHOLD_MS_FLOOR` (250.0). The effective threshold is
+    // dynamic (raised when dual-streaming) but the floor is pinned by tests.
+    // Mutating either the `>` (to `>=`) or the floor constant must break at
+    // least one of the boundary tests below.
+
+    #[test]
+    fn threshold_static_initializer_matches_floor() {
+        // Pin the bit-pattern literal (READY_STALL_THRESHOLD_MS_INIT_BITS) to
+        // the floor constant. If someone changes the literal without updating
+        // the floor (or vice versa), this fails immediately. Does NOT call
+        // reset_threshold_to_floor() — reads the actual static initializer.
+        assert_eq!(
+            f64::from_bits(READY_STALL_THRESHOLD_MS_INIT_BITS),
+            READY_STALL_THRESHOLD_MS_FLOOR,
+            "static initializer bit pattern must decode to the floor (250.0)",
+        );
+        assert_eq!(
+            READY_STALL_THRESHOLD_MS_FLOOR, 250.0,
+            "floor must be exactly 250.0 ms",
+        );
+    }
 
     #[test]
     fn ready_stall_just_below_threshold_is_not_a_stall() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
         // One frame interval under the threshold: an ordinary
         // bursty-but-recovering link must NOT register as saturation.
         assert!(
-            !is_ready_stall(READY_STALL_THRESHOLD_MS - 1.0),
+            !is_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR - 1.0),
             "a wait below the threshold must not count as a stall",
         );
     }
 
     #[test]
     fn ready_stall_exactly_at_threshold_is_not_a_stall() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
         // Boundary pin: the comparison is strictly `>`, so a wait of EXACTLY
         // the threshold is not yet a stall. Flipping `>` to `>=` flips this.
         assert!(
-            !is_ready_stall(READY_STALL_THRESHOLD_MS),
+            !is_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR),
             "a wait of exactly the threshold must NOT count (strict `>`)",
         );
     }
 
     #[test]
     fn ready_stall_just_above_threshold_is_a_stall() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
         // One millisecond over the threshold: the smallest wait that must
         // register. Flipping the constant up (or the `>` away) flips this.
         assert!(
-            is_ready_stall(READY_STALL_THRESHOLD_MS + 1.0),
+            is_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR + 1.0),
             "a wait just above the threshold must count as a stall",
         );
     }
 
     #[test]
     fn ready_stall_well_above_threshold_is_a_stall() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
         // A multi-second cliff — the case the signal exists to catch.
         assert!(
             is_ready_stall(2_000.0),
@@ -1691,12 +1810,13 @@ mod framing_tests {
 
     #[test]
     fn ready_stall_boundary_is_pinned_to_250ms_absolute() {
-        // The relative tests above track `READY_STALL_THRESHOLD_MS`, so they
-        // cannot catch a change to the constant's VALUE. This test pins the
-        // 250 ms boundary in ABSOLUTE terms, matching the constant's documented
-        // contract ("250 ms is ~8x a 30 fps frame interval"). It is the
-        // mutation guard for the constant itself: changing 250.0 to any other
-        // value breaks exactly one of these three assertions.
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+        // This test pins the 250 ms FLOOR boundary in ABSOLUTE terms, matching
+        // the constant's documented contract ("250 ms is ~8x a 30 fps frame
+        // interval"). It is the mutation guard for the floor constant itself:
+        // changing 250.0 to any other value breaks exactly one of these three
+        // assertions.
         assert!(
             !is_ready_stall(249.0),
             "249 ms must NOT be a stall (just under the 250 ms boundary)",
@@ -1716,9 +1836,11 @@ mod framing_tests {
     #[test]
     fn record_ready_stall_increments_counter_once_above_threshold() {
         let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
         let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
 
-        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS + 50.0);
+        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR + 50.0);
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
         assert!(
@@ -1742,9 +1864,11 @@ mod framing_tests {
     #[test]
     fn record_ready_stall_leaves_counter_untouched_below_threshold() {
         let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
         let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
 
-        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS - 50.0);
+        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR - 50.0);
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
         assert!(
@@ -1762,9 +1886,11 @@ mod framing_tests {
         // The increment must obey the same strict `>` boundary as the
         // predicate: a wait of exactly the threshold leaves the counter flat.
         let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
         let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
 
-        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS);
+        let counted = record_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR);
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
         assert!(!counted, "exactly-at-threshold must not count");
@@ -1777,11 +1903,13 @@ mod framing_tests {
         // distinct above-threshold waits must produce exactly K increments —
         // the property the inline-vs-extracted refactor must preserve.
         let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
         let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
 
         const K: u64 = 5;
         for _ in 0..K {
-            assert!(record_ready_stall(READY_STALL_THRESHOLD_MS + 10.0));
+            assert!(record_ready_stall(READY_STALL_THRESHOLD_MS_FLOOR + 10.0));
         }
 
         let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
@@ -1790,6 +1918,107 @@ mod framing_tests {
             K,
             "K above-threshold stalls must produce exactly K increments",
         );
+    }
+
+    // --- Dynamic threshold (frame-rate-aware, issue #1618) ---------------
+
+    #[test]
+    fn set_threshold_raises_above_floor() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        // Simulate dual-stream: camera 30fps + screen 10fps.
+        // Longest frame interval = 100ms (screen). 8 × 100 = 800ms.
+        set_ready_stall_threshold_ms(800.0);
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            800.0,
+            "threshold must be raised to the requested value",
+        );
+        // A 400ms wait that would be a stall at floor (250) is NOT a stall
+        // at the raised threshold (800).
+        assert!(
+            !is_ready_stall(400.0),
+            "400ms must NOT stall when threshold is raised to 800ms",
+        );
+        // A 900ms wait exceeds even the raised threshold.
+        assert!(
+            is_ready_stall(900.0),
+            "900ms must stall even when threshold is raised to 800ms",
+        );
+        // Clean up for other tests.
+        reset_threshold_to_floor();
+    }
+
+    #[test]
+    fn set_threshold_clamps_below_floor() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        // Attempting to set below floor must clamp to floor.
+        set_ready_stall_threshold_ms(100.0);
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            READY_STALL_THRESHOLD_MS_FLOOR,
+            "threshold must never go below the floor",
+        );
+        // Still behaves as 250ms boundary.
+        assert!(!is_ready_stall(250.0));
+        assert!(is_ready_stall(251.0));
+        reset_threshold_to_floor();
+    }
+
+    #[test]
+    fn set_threshold_reset_to_floor_restores_default() {
+        let _guard = THRESHOLD_GUARD.lock().unwrap();
+        set_ready_stall_threshold_ms(600.0);
+        assert_eq!(ready_stall_threshold_ms(), 600.0);
+        // Reset.
+        set_ready_stall_threshold_ms(READY_STALL_THRESHOLD_MS_FLOOR);
+        assert_eq!(ready_stall_threshold_ms(), READY_STALL_THRESHOLD_MS_FLOOR);
+        // Boundary restored.
+        assert!(is_ready_stall(251.0));
+        assert!(!is_ready_stall(250.0));
+    }
+
+    #[test]
+    fn raised_threshold_prevents_counter_increment() {
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        // Raise threshold to 800ms (dual-stream scenario).
+        set_ready_stall_threshold_ms(800.0);
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        // A 400ms wait: above floor (250) but below raised threshold (800).
+        let counted = record_ready_stall(400.0);
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert!(!counted, "a wait below the raised threshold must NOT count",);
+        assert_eq!(
+            after, before,
+            "counter must not increment below the raised threshold",
+        );
+        reset_threshold_to_floor();
+    }
+
+    #[test]
+    fn raised_threshold_still_counts_genuine_cliff() {
+        let _guard = STALL_COUNTER_GUARD.lock().unwrap();
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        // Raise threshold to 800ms.
+        set_ready_stall_threshold_ms(800.0);
+        let before = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+
+        // A 1500ms wait: a genuine bandwidth cliff exceeds even the raised threshold.
+        let counted = record_ready_stall(1500.0);
+
+        let after = UNISTREAM_READY_STALL_COUNT.load(Ordering::Relaxed);
+        assert!(
+            counted,
+            "a wait above the raised threshold must count (genuine cliff)",
+        );
+        assert_eq!(
+            after - before,
+            1,
+            "genuine cliff must still increment the counter",
+        );
+        reset_threshold_to_floor();
     }
 
     // ─────────────────────────────────────────────────────────────────────

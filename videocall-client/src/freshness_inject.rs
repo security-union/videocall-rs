@@ -147,7 +147,8 @@ pub fn register_freshness_inject_hooks() {}
 /// Spawn a diagnostics-bus subscriber that pushes each `freshness_skip`
 /// `DiagEvent` (subsystem `video`; see issue #1045) onto
 /// `window.__videocall_freshness_skips` as a plain JS object the spec can read:
-/// `{ head_age_ms, keyframe_seq, dropped, ts_ms }`.
+/// `{ head_age_ms, keyframe_seq, dropped, ts_ms, escalated }` (`escalated` is the #1662
+/// keyframe-less hold-ceiling escalation flag, a real JS boolean).
 #[cfg(target_arch = "wasm32")]
 fn spawn_freshness_skip_collector() {
     use videocall_diagnostics::{subscribe, MetricValue};
@@ -171,12 +172,17 @@ fn spawn_freshness_skip_collector() {
             let mut head_age_ms = f64::NAN;
             let mut keyframe_seq = i64::MIN;
             let mut dropped = 0u64;
+            // #1662: the worker encodes `escalated` as i64 0/1 (mirroring keyframe_seq's i64). It is
+            // absent on older events / never set false-vs-true confusion: default false.
+            let mut escalated = false;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
                     ("head_age_ms", MetricValue::F64(v)) => head_age_ms = *v,
                     // #1045 encodes keyframe_seq as i64 with -1 for the keyframe-less case.
                     ("keyframe_seq", MetricValue::I64(v)) => keyframe_seq = *v,
                     ("dropped", MetricValue::U64(v)) => dropped = *v,
+                    // #1662 escalation flag: i64 0/1 → coerce to a real bool for the JS object.
+                    ("escalated", MetricValue::I64(v)) => escalated = *v != 0,
                     _ => {}
                 }
             }
@@ -201,6 +207,13 @@ fn spawn_freshness_skip_collector() {
                 &obj,
                 &JsValue::from_str("ts_ms"),
                 &JsValue::from_f64(evt.ts_ms as f64),
+            );
+            // #1662: surface the escalation flag as a real JS boolean so an e2e spec can assert
+            // `skip.escalated === true` cleanly (rather than reading a 0/1 number).
+            let _ = js_sys::Reflect::set(
+                &obj,
+                &JsValue::from_str("escalated"),
+                &JsValue::from_bool(escalated),
             );
 
             if let Some(window) = web_sys::window() {
@@ -282,7 +295,11 @@ fn ensure_test_decoder() {
         let decoder = WasmDecoder::new_with_video_frame_callback(
             VideoCodec::Vp9Profile0Level10Bit8,
             Box::new(|_frame| {}),
-            Box::new(|| {}),
+            Box::new(|_head_age_ms| {}),
+            // Issue #1641: this #1022/#1045 inject harness exercises the camera freshness path,
+            // so tag it as camera ("VIDEO" / MEDIA_TYPE_CAMERA) — the value health_reporter
+            // treats as non-screen.
+            crate::decode::peer_decoder::MEDIA_TYPE_CAMERA,
         );
         *slot = Some(decoder);
     });

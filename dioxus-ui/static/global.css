@@ -3,8 +3,8 @@
   position: fixed;
   inset: 0;
   background: var(--overlay-backdrop);
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  backdrop-filter: saturate(180%) blur(var(--effect-blur-md));
+  -webkit-backdrop-filter: saturate(180%) blur(var(--effect-blur-md));
   z-index: 9600;
   display: flex;
   align-items: center;
@@ -1437,7 +1437,9 @@ html[data-theme="light"] #invite-overlay p {
 
   /* v0.1 component/effect extension tokens */
   --effect-blur-sm: 4px;
+  --effect-blur-surface: 12px;
   --effect-blur-md: 14px;
+  --effect-blur-glass: 16px;
   --effect-blur-lg: var(--glass-blur);
 
   /* v0.1 component-extension defaults — theme-agnostic baseline.
@@ -1494,6 +1496,25 @@ html[data-theme="light"] #invite-overlay p {
   --fs-subheading:  var(--fs-9);   /* 20px — page sub-headings               */
   --fs-title:       var(--fs-10);  /* 24px — page-level headings             */
   --fs-display:     var(--fs-12);  /* 32px — hero display                    */
+
+  /* ─── Fixed dark surfaces ─────────────────────────────────────────────────
+     Theme-independent "always dark" tokens for components that maintain a
+     dark appearance regardless of the active theme (toasts, banners, context
+     menus, fixed-dark overlays).  Defined on `html` — NOT per-theme — so
+     they never flip.  Components rendered on these surfaces must use the
+     --on-dark-* text tokens below, NOT theme-aware tokens like --text-primary
+     or --text-on-glass-* (those flip to dark in light theme → invisible).
+     ─────────────────────────────────────────────────────────────────────── */
+  --fixed-dark:        rgba(30, 30, 30, 0.88);  /* light glass — toast       */
+  --fixed-dark-strong: rgba(30, 30, 30, 0.95);  /* medium glass — controls   */
+  --fixed-dark-heavy:  rgba(30, 30, 30, 0.97);  /* near-opaque — banner      */
+  --fixed-dark-opaque: rgba(30, 30, 30, 0.98);  /* opaque — context menu     */
+
+  /* Text on fixed dark surfaces */
+  --on-dark-text:      #ffffff;
+  --on-dark-text-high: rgba(255, 255, 255, 0.95);
+  --on-dark-text-secondary: rgba(255, 255, 255, 0.7);
+  --on-dark-text-muted: rgba(255, 255, 255, 0.5);
 
   /* Vertical room to reserve below the controls dock: dock bottom 20px + dock
      height ~79px + ~12px gap = 112px. (The ~79px = .video-control-button 3.1rem
@@ -1964,7 +1985,7 @@ html[data-theme="light"] #invite-overlay p {
   gap: 1.2rem;
   padding: 0.85rem 1.5rem;
   background: rgba(28, 28, 30, 0.85);
-  backdrop-filter: blur(14px);
+  backdrop-filter: blur(var(--effect-blur-md));
   border-radius: 2.5rem;
   border: 1px solid #38383a;
   box-shadow:
@@ -2125,8 +2146,8 @@ html[data-theme="light"] #invite-overlay p {
   border-radius: 10px;
   border-top: 1px solid var(--glass-popover-border);
   background: var(--glass-popover-bg);
-  backdrop-filter: blur(16px) saturate(1.1);
-  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow: var(--glass-popover-shadow);
 }
 
@@ -2259,26 +2280,6 @@ html[data-theme="light"] #invite-overlay p {
   box-shadow:
     0 0 0 2px #1c1c1e,
     0 0 10px rgba(255, 69, 58, 0.6);
-  z-index: 2;
-  pointer-events: none;
-}
-
-/* Unread-chat indicator dot on the OpenChatButton */
-@keyframes chat-badge-pulse {
-  0%, 100% { box-shadow: 0 0 0 2px var(--surface), 0 0 6px 2px rgba(48, 209, 88, 0.7); }
-  50%       { box-shadow: 0 0 0 2px var(--surface), 0 0 10px 4px rgba(48, 209, 88, 0.4); }
-}
-
-.video-control-button .chat-unread-badge {
-  position: absolute;
-  top: 5px;
-  right: 5px;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: #30D158;
-  box-shadow: 0 0 0 2px var(--surface), 0 0 6px 2px rgba(48, 209, 88, 0.7);
-  animation: chat-badge-pulse 1.8s ease-in-out infinite;
   z-index: 2;
   pointer-events: none;
 }
@@ -2830,8 +2831,8 @@ html[data-theme="light"] #invite-overlay p {
   max-width: min(260px, calc(100vw - 4rem));
   padding: 0.5rem 0.625rem;
   background: rgba(28, 28, 30, 0.96);
-  -webkit-backdrop-filter: blur(20px) saturate(180%);
-  backdrop-filter: blur(20px) saturate(180%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg)) saturate(180%);
+  backdrop-filter: blur(var(--effect-blur-lg)) saturate(180%);
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: var(--radius-md);
   box-shadow:
@@ -3131,8 +3132,8 @@ html[data-theme="light"] #invite-overlay p {
 .copy-toast {
   color: #ffffff;
   background: rgba(44, 44, 46, 0.75);
-  -webkit-backdrop-filter: saturate(180%) blur(20px);
-  backdrop-filter: saturate(180%) blur(20px);
+  -webkit-backdrop-filter: saturate(180%) blur(var(--effect-blur-lg));
+  backdrop-filter: saturate(180%) blur(var(--effect-blur-lg));
   border: 1px solid rgba(255, 255, 255, 0.18);
   padding: 0.5rem 0.75rem;
   border-radius: var(--radius-lg);
@@ -3403,8 +3404,8 @@ html[data-theme="light"] #invite-overlay p {
   top: calc(100% + 8px);
   min-width: 220px;
   background: rgba(30, 30, 30, 0.95);
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(var(--effect-blur-lg));
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg));
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: var(--radius-lg);
   box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);

@@ -166,7 +166,7 @@ Key features:
 3. Multi-codec framing helpers (Opus, LC3 …)
 4. SIMD accelerations for time-stretch routines
 
-Contributions are welcome — please skim the [CONTRIBUTING.md](CONTRIBUTING.md) first.
+Contributions are welcome — please skim the [CONTRIBUTING.md](../CONTRIBUTING.md) first.
 
 ## License
 

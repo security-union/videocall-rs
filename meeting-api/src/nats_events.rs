@@ -64,6 +64,71 @@ pub const MEETING_ENDED_BY_HOST_SUBJECT: &str = "internal.meeting_ended_by_host"
 /// `MEETING_BECAME_EMPTY_SUBJECT`).
 pub const MEETING_BECAME_EMPTY_SUBJECT: &str = "internal.meeting_became_empty";
 
+/// NATS subject consumed by `meeting-api` to mark a single participant
+/// `status='left', left_at=NOW()` when `actix-api` observes that participant's
+/// session leave a room (an ABNORMAL disconnect — closed tab / network drop /
+/// crash — that does NOT go through the REST `/leave` endpoint, OR an explicit
+/// transport leave). This is the backstop that keeps the DB
+/// `meeting_participants` roster in sync with live presence so the
+/// meeting-settings "Activity" participant count reflects who is CURRENTLY in
+/// the meeting (issue #1551).
+///
+/// `actix-api` fires this from the SAME point it broadcasts the per-peer
+/// `PARTICIPANT_LEFT` packet — inside `ChatServer::leave_rooms`, which only runs
+/// after the [`RECONNECT_GRACE_PERIOD`] (a timely reconnect cancels the pending
+/// departure first) or on an explicit `Leave`.
+///
+/// ## Reconnect-race safety (relay-side, NOT a DB guard)
+///
+/// The consumer's UPDATE ([`crate::db::participants::mark_left_by_disconnect`])
+/// is keyed by `user_id` and intentionally does NOT add a `left_at IS NULL`
+/// predicate — that would be false safety, since a freshly-rejoined row already
+/// has `left_at IS NULL` and such a predicate would still MATCH it. The real
+/// protection lives entirely on the relay, BEFORE the publish:
+///
+/// - The 3s [`RECONNECT_GRACE_PERIOD`] debounce: a brief disconnect+reconnect
+///   cancels the pending departure, so `leave_rooms` (and therefore this
+///   publish) never runs.
+/// - A presence check: the relay publishes only when the departing user has NO
+///   remaining live session in the room (`user_has_remaining_session` /
+///   `user_still_present` in `chat_server.rs::leave_rooms`), which also covers a
+///   different tab that rejoined after the grace expired.
+///
+/// So by the time the consumer's UPDATE runs, the relay has already confirmed
+/// the user is no longer present. The matching rationale lives on
+/// [`crate::db::participants::mark_left_by_disconnect`]; keep the two in sync.
+///
+/// The corresponding publisher lives in
+/// `actix-api/src/actors/chat_server.rs` (search for
+/// `PARTICIPANT_LEFT_SUBJECT`).
+pub const PARTICIPANT_LEFT_SUBJECT: &str = "internal.participant_left";
+
+/// NATS subject carrying chat_server → meeting-api "a participant became
+/// PRESENT" notifications (issue #1628). The symmetric counterpart to
+/// [`PARTICIPANT_LEFT_SUBJECT`].
+///
+/// Sent by chat_server when a session is elected Testing→Active in a room (a
+/// fresh join or a transport reconnect-after-grace). The `meeting-api` consumer
+/// looks the meeting up by `room_id`, marks `(meeting_id, user_id)` as
+/// `status='admitted', left_at=NULL` via
+/// [`crate::db::participants::mark_present_by_connect`], and re-activates the
+/// meeting (`idle -> active`) via [`crate::db::meetings::reactivate_from_idle`].
+///
+/// This closes the presence asymmetry: before #1628, re-activation only fired
+/// on a REST `/join`, so a transport-only reconnect left the meeting stuck
+/// `idle` with a present participant (and `participant_count == 0`). With this
+/// event the DB roster tracks the relay's authoritative `room_members`
+/// symmetrically with the empty→idle path.
+///
+/// Idempotent and `ended`-safe: `mark_present_by_connect` only flips rows that
+/// are not already present, and `reactivate_from_idle` is an atomic
+/// `UPDATE … WHERE state='idle'`, so an `ended` (terminal) meeting matches zero
+/// rows and is never resurrected — even if a late present event races a
+/// host-end. The corresponding publisher lives in
+/// `actix-api/src/actors/chat_server.rs` (search for
+/// `PARTICIPANT_PRESENT_SUBJECT`).
+pub const PARTICIPANT_PRESENT_SUBJECT: &str = "internal.participant_present";
+
 /// NATS subject for fanning out per-participant host-flag changes to every
 /// `actix-api` chat_server instance. The chat_server caches each member's
 /// `is_host` at JoinRoom time from the JWT, so without this fanout a
@@ -111,6 +176,35 @@ pub struct MeetingEndedByHostPayload {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 pub struct MeetingBecameEmptyPayload {
     pub room_id: String,
+}
+
+/// Payload consumed on [`PARTICIPANT_LEFT_SUBJECT`].
+///
+/// Sent by chat_server when a single participant's session leaves a room (the
+/// per-peer departure that also produces the client-facing `PARTICIPANT_LEFT`
+/// packet). The `meeting-api` consumer looks the meeting up by `room_id` and
+/// marks `(meeting_id, user_id)` as `status='left', left_at=NOW()` so a
+/// participant who dropped without calling REST `/leave` stops being counted as
+/// present. Idempotent and reconnect-safe — see
+/// [`crate::db::participants::mark_left_by_disconnect`].
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ParticipantLeftPayload {
+    pub room_id: String,
+    pub user_id: String,
+}
+
+/// Payload consumed on [`PARTICIPANT_PRESENT_SUBJECT`] (issue #1628).
+///
+/// Sent by chat_server when a participant's session became present in a room (a
+/// fresh join or a transport reconnect). The `meeting-api` consumer looks the
+/// meeting up by `room_id`, marks `(meeting_id, user_id)` as
+/// `status='admitted', left_at=NULL`, and re-activates the meeting. Mirrors
+/// [`ParticipantLeftPayload`] — carries the `(room_id, user_id)` the
+/// `meeting_participants` rows are keyed by.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ParticipantPresentPayload {
+    pub room_id: String,
+    pub user_id: String,
 }
 
 /// Payload published on [`MEETING_HOST_CHANGE_SUBJECT`].
@@ -837,6 +931,28 @@ mod tests {
         assert_eq!(sanitize_room_id("has*stars"), "has_stars");
         assert_eq!(sanitize_room_id("has>gt"), "has_gt");
         assert_eq!(sanitize_room_id("a.b*c>d e"), "a_b_c_d_e");
+    }
+
+    #[test]
+    fn test_participant_left_payload_json_wire_format() {
+        // The relay (`actix-api`) and this consumer are SEPARATE crates that do
+        // NOT share this struct — they agree only on the JSON field names
+        // `room_id` and `user_id` over `internal.participant_left`. Pin that
+        // exact shape so a rename on either side is caught here rather than
+        // silently dropping disconnect events (issue #1551).
+        let payload = ParticipantLeftPayload {
+            room_id: "test-room".to_string(),
+            user_id: "ghost@example.com".to_string(),
+        };
+        let json = serde_json::to_string(&payload).unwrap();
+        assert_eq!(
+            json,
+            r#"{"room_id":"test-room","user_id":"ghost@example.com"}"#
+        );
+
+        // And it round-trips from the wire bytes the relay would publish.
+        let back: ParticipantLeftPayload = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, payload);
     }
 
     #[tokio::test]

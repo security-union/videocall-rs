@@ -145,6 +145,94 @@ pub(crate) fn resolve_wt_outbound_channel_capacity(raw: Option<&str>) -> usize {
     }
 }
 
+/// Pure resolver for [`viewport_filter_enabled`]: maps the raw optional
+/// environment string to the concrete #1436 kill-switch boolean, applying
+/// the same recognised-boolean parsing and warn-on-unknown rules without
+/// touching any process-global state.
+///
+/// Default is `true`: the #988 per-subscriber viewport VIDEO filter is
+/// already LIVE in production, so the kill switch defaults to the status
+/// quo (filter ON). An empty string trims to `""`, matches no arm, and
+/// therefore takes the warn-and-default-`true` path — it is NOT special-cased.
+/// No input panics.
+///
+/// Extracted as a free function so unit tests can exercise the resolution
+/// logic without racing against the `OnceLock` cache or mutating the real
+/// process environment.
+pub(crate) fn resolve_viewport_filter_enabled(raw: Option<&str>) -> bool {
+    match raw {
+        None => true,
+        Some(value) => match value.trim().to_ascii_lowercase().as_str() {
+            "false" | "0" | "off" | "no" => false,
+            "true" | "1" | "on" | "yes" => true,
+            _ => {
+                tracing::warn!(
+                    "VIEWPORT_FILTER_ENABLED={:?} is not a recognised boolean; falling back to default true",
+                    value
+                );
+                true
+            }
+        },
+    }
+}
+
+/// Memoized accessor for the #1436 viewport-filter kill switch.
+///
+/// Reads `VIEWPORT_FILTER_ENABLED` exactly once on the first call and caches
+/// the resolved boolean in a process-global `OnceLock`. Consequently, flipping
+/// the environment variable requires a relay **process restart** to take
+/// effect — there is NO hot-reload. This is acceptable and intended for an ops
+/// kill switch: the #1436 requirement is to be able to revert the #988 filter
+/// WITHOUT a client redeploy, and a relay restart satisfies that requirement.
+///
+/// Cheap on the hot path after the first call (a single atomic load), which is
+/// why it can be invoked per VIDEO packet on the relay forward path.
+pub fn viewport_filter_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        resolve_viewport_filter_enabled(std::env::var("VIEWPORT_FILTER_ENABLED").ok().as_deref())
+    })
+}
+
+/// Pure #988 viewport drop decision. Returns true iff the off-screen VIDEO
+/// packet must be dropped. `enabled` is the #1436 kill-switch state.
+///
+/// Fail-open semantics: `!enabled` -> `false` (the #1436 kill switch is OFF, so
+/// forward-all is restored); `None` source -> `false` (unparseable sender,
+/// fail open); empty viewport set -> `false` (no viewport signal yet, fail
+/// open); otherwise drop iff the source session is NOT present in the set.
+pub(crate) fn viewport_should_drop(
+    enabled: bool,
+    viewport_ids: &std::collections::HashSet<u64>,
+    source: Option<u64>,
+) -> bool {
+    if !enabled {
+        return false;
+    }
+    match source {
+        None => false,
+        Some(src) => !viewport_ids.is_empty() && !viewport_ids.contains(&src),
+    }
+}
+
+/// Pure #1437 invariant predicate. Returns `true` iff a NON-VIDEO media kind
+/// reached the viewport drop-decision site — the impossible case the #1437
+/// tripwire counts. `MediaKind::VIDEO` => `false`; everything else, including an
+/// unknown/unparseable kind (`Err(_)`), => `true`. The viewport filter is
+/// VIDEO-only and guarded by `is_video` in `chat_server.rs` (#988), so on every
+/// real packet this returns `false`; a `true` here means that guard regressed.
+/// See #1437, #988.
+pub(crate) fn nonvideo_reached_viewport_drop_branch(
+    wire_media_kind: Result<
+        videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind,
+        i32,
+    >,
+) -> bool {
+    use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+    wire_media_kind != Ok(MediaKind::VIDEO)
+}
+
 /// Bounded channel capacity for WebSocket outbound relay queue.
 ///
 /// Half the WebTransport capacity because WS frames are larger
@@ -181,6 +269,146 @@ pub const WS_OUTBOUND_CHANNEL_CAPACITY: usize = 128;
 /// needs a larger datagram queue (e.g. very chatty diagnostics), promote
 /// it to an env-resolved getter mirroring [`wt_outbound_channel_capacity`].
 pub const WT_DATAGRAM_CHANNEL_CAPACITY: usize = 512;
+
+/// Grace period a write onto the persistent server→client WebTransport uni
+/// stream may stay parked **while the outbound channel is backed up** before the
+/// writer sheds the wedged stream (issue #1638 — "#979 part 2": bound the
+/// WRITER, but ONLY when real backpressure is present).
+///
+/// ## The defect the shed bounds — and the defect the v1 shed CAUSED
+///
+/// `spawn_unistream_writer` (`webtransport/bridge.rs`) owns the single
+/// persistent uni stream and drains the 512-deep `unistream_tx` channel with
+/// back-to-back `stream.write_all().await` calls. Those writes are subject to
+/// QUIC per-stream flow control: when a slow receiver stops granting credits
+/// (a downlink stall), `write_all` PARKS. The writer task is the channel's only
+/// consumer, so while it is parked the 512-slot channel fills and `try_send`
+/// starts returning `Full` (`wt_chat_session.rs`) — and at that point media
+/// drops for EVERY publisher targeting that one receiver. #979 deliberately
+/// keeps the channel SHALLOW (512) so a stall fails fast rather than hoarding
+/// stale frames; the shed is the matching bound on the WRITER so a single wedged
+/// receiver sheds (via stream reset+reopen) instead of holding the channel full
+/// indefinitely.
+///
+/// The FIRST cut of this fix bounded each write with a bare per-frame
+/// `tokio::time::timeout(.., write_all)` on WALL-CLOCK. That conflated two
+/// distinct causes of "this write did not finish in N ms": (1) the receiver's
+/// downlink is flow-control-stalled (the thing to shed), and (2) the relay's
+/// single-threaded runtime simply did not POLL the write future in time because
+/// the one thread was CPU/scheduling-starved.
+///
+/// Cause (2) is NOT congestion — credits may be available; the executor was just
+/// busy. Resetting on cause (2) sheds a perfectly HEALTHY low-traffic stream and
+/// drops its in-flight frame. That regression is observable: it failed
+/// `webtransport::tests::test_lobby_isolation` (a few-frames-of-traffic stream)
+/// under the test runner's CPU starvation. So the shed must be gated on the
+/// GENUINE congestion signal — the outbound channel actually backing up — NOT on
+/// wall-clock elapsed on a single write.
+///
+/// ## How this grace is now used (see `spawn_unistream_writer`)
+///
+/// The writer polls each `write_all` against a periodic tick
+/// ([`WT_UNISTREAM_BACKPRESSURE_POLL`]). It maintains a "stalled-while-backed-up"
+/// accumulator that advances ONLY on ticks where the outbound channel is at or
+/// above [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] full (real backpressure: the
+/// parked writer is starving publishers). The stream is sheds only once that
+/// accumulator reaches THIS grace. On any tick where the channel is below the
+/// ratio (healthy / draining) the accumulator RESETS — so a write that is merely
+/// slow to be polled, on a stream whose channel is not backing up, can NEVER
+/// trip the shed no matter how long the executor starves it. The shed fires iff
+/// the channel is genuinely wedging because the receiver isn't draining.
+///
+/// ## Why 1000 ms
+///
+/// The grace must straddle two requirements:
+///
+/// * **Long enough not to falsely reset a bursty-but-recovering link.** On a
+///   200 ms+ high-latency path, a single `write_all` for a large keyframe can
+///   legitimately take several RTTs while the receiver drains a transient
+///   backlog and re-grants credits. At 30 fps the frame cadence is ~33 ms, so
+///   1000 ms is ~30 frame intervals of slack — comfortably more than a healthy
+///   high-RTT link needs to clear a normal jitter burst, so we do NOT reset a
+///   stream that is merely slow-and-recovering (a needless reset throws away an
+///   in-flight frame and costs a fresh-stream round trip).
+/// * **Short enough that a genuinely stalled receiver cannot pin the channel
+///   full for multiple seconds.** Under a 4-publisher fan-in the channel can
+///   refill in ~4 s once the single writer parks; a grace of 1 s of
+///   continuous backpressure caps the head-of-line stall to ~1 s (plus at most
+///   one poll interval) before the writer sheds and resumes draining the next
+///   frame onto a fresh stream, well under that floor.
+///
+/// We deliberately pin it to [`CONGESTION_WINDOW`] (1000 ms) — the same window
+/// the relay already uses to decide a receiver is congested. A write that has
+/// not completed within one congestion window WHILE THE CHANNEL IS BACKED UP is,
+/// by the relay's own existing definition of congestion, a stalled (not merely
+/// jittery) stream, so resetting it is consistent with the rest of the
+/// congestion machinery. It sits below [`KEYFRAME_CONGESTION_RELAX_WINDOW`] (2 s)
+/// and well below [`RECEIVER_DOWNLINK_RELIEF_WINDOW`] (8 s), so the writer sheds
+/// a wedged stream before those longer recovery windows would even arm.
+pub const WT_UNISTREAM_WRITE_DEADLINE: Duration = Duration::from_millis(1000);
+
+/// Fill ratio of the 512-deep `unistream_tx` channel at or above which the
+/// outbound stream is considered to be under REAL backpressure, arming the
+/// [`WT_UNISTREAM_WRITE_DEADLINE`] shed grace (issue #1638).
+///
+/// This is the gate that prevents the v1 spurious-reset regression. The shed's
+/// stalled-while-backed-up accumulator advances ONLY while the channel depth is
+/// at or above `ceil(max_capacity * this)`; below it the accumulator resets and
+/// a parked write is left to park (executor starvation only delays it, never
+/// resets it). The number that matters is therefore: "is the writer being parked
+/// actually starving publishers?" — answered by the channel filling, the genuine
+/// per-receiver downlink-backpressure surface (#1219's B1 note: the per-session
+/// outbound channel overflow is the real per-receiver signal, NOT a wall-clock
+/// or a mailbox `Full`).
+///
+/// ## Why 0.5
+///
+/// The channel only climbs to and stays near half-full (256+ of 512 frames
+/// queued) when its single consumer — this writer — is parked on a stalled
+/// stream and publishers keep enqueuing faster than it drains. A healthy stream
+/// drains every frame essentially immediately, so its depth hovers at 0–1 and
+/// never approaches this ratio; thus a healthy stream's shed never arms even
+/// under heavy executor starvation. 0.5 is deliberately well ABOVE the noise
+/// floor of a transient burst (a join-fan-out spike spills a few dozen frames
+/// and clears within one drain) yet well BELOW the
+/// [`crate::actors::priority_drop::PRIORITY_DROP_VIDEO_FILL_RATIO`] (0.8) at
+/// which the producer-side policy
+/// begins shedding video — so by the time the channel reaches the priority-drop
+/// zone the writer-shed accumulator is already armed and counting, and the two
+/// backpressure responses compose rather than fight. A sustained ≥50%-full
+/// channel is, unambiguously, a writer that cannot keep up — exactly the
+/// receiver-not-draining condition the shed targets.
+pub const WT_UNISTREAM_BACKPRESSURE_SHED_RATIO: f64 = 0.5;
+
+/// Interval at which `spawn_unistream_writer` re-evaluates whether a parked write
+/// is stalled-while-backed-up (issue #1638).
+///
+/// On each tick the writer samples the outbound channel depth: a tick spent at or
+/// above [`WT_UNISTREAM_BACKPRESSURE_SHED_RATIO`] advances the shed accumulator;
+/// a tick below it resets the accumulator. The poll only runs while a write is
+/// actually parked (it is one arm of a `select!` against the write future).
+///
+/// The interval timer itself is constructed ONCE per writer task — in
+/// `spawn_unistream_writer`, before the drain loop — and the per-frame shed
+/// helper borrows it and `reset()`s it at the start of each call rather than
+/// rebuilding it. So on the fast path (a write that completes promptly) this poll
+/// touches no timer allocation at all: the shared interval's next tick is reset
+/// one period into the future and the write returns before that tick ever arms.
+/// A timer only does work while a write is actually parked.
+///
+/// ## Why 50 ms
+///
+/// 50 ms is fine-grained relative to the 1000 ms shed grace (≈20 samples across
+/// the grace), so the worst-case shed latency overshoot from sampling
+/// granularity is one tick (≤50 ms on top of the 1000 ms grace) — negligible
+/// against the multi-second floor a genuinely wedged channel would otherwise sit
+/// at. It is also coarse enough that the periodic wakeups add no meaningful load:
+/// they only fire while a write is parked, and a parked write means the thread is
+/// otherwise idle on this task anyway. Critically, because the accumulator only
+/// advances on backed-up ticks, a slow/starved poll cadence on a HEALTHY stream
+/// (ticks arriving late, or the channel near-empty) cannot manufacture a false
+/// shed — late ticks on a non-backed-up channel simply reset the accumulator.
+pub const WT_UNISTREAM_BACKPRESSURE_POLL: Duration = Duration::from_millis(50);
 
 // ---------------------------------------------------------------------------
 // Inbound fan-out mailbox headroom (issues #1144 / #1145)
@@ -652,10 +880,10 @@ pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
 /// serves (the exact O(n)-per-connection fan-out hazard the Change Impact Policy
 /// warns about).
 ///
-/// ## Why DEPARTURES are safe to debounce but JOINS are not
+/// ## Debounce policy per recompute trigger
 ///
-/// The emit policy is ASYMMETRIC (mirroring the suppress-lazy / restore-eager
-/// split in [`LAYER_HINT_SUPPRESS_DEBOUNCE_MS`]):
+/// The emit policy has three tiers (per-LAYER_PREFERENCE is immediate; joins
+/// and departures are both debounced behind this trailing window):
 ///
 /// * **Departures (leave/evict) → DEBOUNCE.** A leaving receiver can only RAISE
 ///   a remaining publisher's fail-open union (its constraint disappears), and a
@@ -668,12 +896,15 @@ pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
 ///   membership. Delaying it by this window cannot black-tile anyone (a publisher
 ///   over-encoding for a few hundred ms is the fail-open-safe direction).
 ///
-/// * **Joins → IMMEDIATE (never debounced).** A NEW receiver has no recorded
-///   preference, so under fail-open it wants the FULL ladder from every existing
-///   publisher — its recompute can RESTORE a layer a publisher had suppressed. A
-///   real human is waiting on that tile; delaying it leaves the joiner stuck on a
-///   low/black layer for the window. The join recompute (`chat_server.rs` join
-///   path) stays a direct `do_send`.
+/// * **Joins → DEBOUNCED (same window as departures, issue #1288).** A join can
+///   only RAISE the union (fail-open demand), which is the restore-eager
+///   direction. The 300ms delay is acceptable because: (a) a new receiver's NATS
+///   subscription setup takes ~100-200ms before media flows, (b) the publisher's
+///   AQ controller needs an encoder tick + keyframe to re-enable upper layers
+///   (~300-1000ms), so the recompute delay is subsumed by the encoder reaction.
+///   Meanwhile, a join burst of K participants (call start, reconnection wave)
+///   collapses K separate O(publishers × receivers) recomputes into 1, avoiding
+///   actor starvation on the ChatServer's serialized mailbox.
 ///
 /// * **Per-LAYER_PREFERENCE recompute → IMMEDIATE (never debounced).** That path
 ///   is the latency-sensitive UPGRADE case and is already rate-limited upstream by
@@ -693,6 +924,30 @@ pub const LAYER_HINT_MAX_RECEIVERS_SCANNED: usize = 256;
 /// governs whether a LOWER hint is actually emitted, so the two debounces
 /// compose without double-counting.
 pub const LAYER_HINT_RECOMPUTE_COALESCE_MS: u64 = 300;
+
+/// Trailing-debounce window for coalescing cross-server presence re-announces.
+///
+/// On a join, a peer publishes one `PARTICIPANT_LIST_REQUEST` and every existing
+/// active peer answers with its own `PARTICIPANT_JOINED`. A reconnection wave of
+/// M joiners would otherwise make each of N peers publish M replies. Instead a
+/// peer records itself once and arms one trailing timer of this length; when it
+/// fires, the flush re-announces that peer exactly once, so the wave's publishes
+/// drop from M·N to N. (The M·N inbound request messages still arrive, but the
+/// arm path is a cheap O(1) per message.)
+///
+/// The flush broadcasts to `room.{room}.system` for a wave (≥2 distinct
+/// requesters) but unicasts to the lone requester for an ordinary single join, so
+/// the common path keeps its O(N) relay→client fan-out instead of O(N²).
+///
+/// This is safe for late joiners: the join flow subscribes to the room wildcard
+/// before publishing its request, so any joiner counted in the window is
+/// subscribed before the trailing re-announce fires. A broadcast's already-present
+/// recipients get the same packet they got at activation and dedup it.
+///
+/// Separate from [`LAYER_HINT_RECOMPUTE_COALESCE_MS`] (unrelated concern) but the
+/// same 300 ms reasoning: long enough to swallow a wave's request cluster, short
+/// enough that a late joiner still learns every peer well within a second.
+pub const PARTICIPANT_REBROADCAST_COALESCE_MS: u64 = 300;
 
 /// Period of the [`ChatServer`](crate::actors::chat_server) sweep that publishes
 /// the DEMAND-side simulcast gauge `relay_layer_preference_sessions{room, kind,
@@ -730,23 +985,21 @@ pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_se
 ///
 /// The relay enters relief mode for a receiver when that receiver's REAL
 /// downlink backpressure surface — the bounded per-session `outbound_tx`
-/// channel overflowing on a slow socket — drives the windowed
-/// [`CongestionTracker`](crate::actors::session_logic::CongestionTracker) across
-/// its drop threshold (`is_actively_congested()`). The transport actor stamps a
-/// monotonic epoch into a shared atomic on each such crossing
-/// (`SessionLogic::on_outbound_drop`), and the per-receiver fan-out closure
-/// reads it against THIS window. While the most recent crossing is within the
-/// window, the closure (a) discards non-base-layer VIDEO/SCREEN BEFORE
-/// `try_send`, giving the downlink headroom to drain, and (b) emits one
-/// DOWNLINK_CONGESTION control packet so the client's LayerChooser steps its own
-/// receive layers down. AUDIO and base layer are NEVER shed.
+/// channel overflowing on a slow socket — fires an outbound drop
+/// (`SessionLogic::on_outbound_drop`). The transport actor stamps a monotonic
+/// epoch into a shared atomic on EVERY drop unconditionally (#1481), and the
+/// per-receiver fan-out closure reads it against THIS window. While the most
+/// recent drop is within the window, the closure (a) discards non-base-layer
+/// VIDEO/SCREEN BEFORE `try_send`, giving the downlink headroom to drain, and
+/// (b) emits one DOWNLINK_CONGESTION control packet so the client's
+/// LayerChooser steps its own receive layers down. AUDIO and base layer are
+/// NEVER shed.
 ///
 /// This is DELIBERATELY NOT keyed off the relay's actor-mailbox `Full` (which an
 /// earlier draft used): the mailbox sits in front of `outbound_tx` and overflows
 /// on a room-wide fan-out / scheduling burst that says nothing about any single
-/// receiver's downlink. The `CongestionTracker` one queue downstream is the
-/// genuine per-receiver signal — the same one the #979 keyframe-relax path
-/// already trusts.
+/// receiver's downlink. The per-receiver outbound channel overflow is the
+/// genuine per-receiver signal.
 ///
 /// ## Why a windowed decay, not a consecutive-success exit (B2)
 ///
@@ -759,15 +1012,26 @@ pub const LAYER_PREFERENCE_SESSIONS_SWEEP_INTERVAL: Duration = Duration::from_se
 /// time-decaying window recovers automatically: once the receiver stops
 /// overflowing for `RECEIVER_DOWNLINK_RELIEF_WINDOW`, full layers resume.
 ///
-/// ## Why 2 s
+/// ## Why 8 s (widened from 2 s in #1481)
 ///
-/// Set equal to [`KEYFRAME_CONGESTION_RELAX_WINDOW`] so the relay-side shed, the
-/// #979 keyframe relaxation, and the client step-down all reason about "recently
-/// congested" over the SAME horizon. 2 s is long enough that a brief stall keeps
-/// relief armed through the recovery (avoiding flap), short enough that a
-/// receiver whose downlink genuinely recovers is back to full quality within a
-/// couple of seconds.
-pub const RECEIVER_DOWNLINK_RELIEF_WINDOW: Duration = Duration::from_secs(2);
+/// Field data (CC7, 2026-06-18) showed the shed flapping on WebTransport in a
+/// cycle: shed activates → drops stop (works!) → epoch ages over 2 s → shed
+/// deactivates → L1+L2 resume → buffer slowly refills over 10-14 s → overflow
+/// → shed reactivates. The 2 s window was too short to bridge the quiet gap
+/// that naturally follows a successful shed on a constrained downlink.
+///
+/// 8 s bridges the typical 5-10 s quiet gap after a successful shed. The
+/// buffer drains in 2-5 s (only L0 = low bitrate), so 8 s gives 3-6 s of
+/// additional hold after the buffer is drained — enough for the receiver to
+/// stabilize. Recovery is still bounded: if drops truly stop (link improves),
+/// shedding releases after 8 s.
+///
+/// NOTE: [`KEYFRAME_CONGESTION_RELAX_WINDOW`] (2 s) is a SEPARATE concern
+/// (per-pair keyframe budget expansion) and is intentionally NOT changed here.
+/// They were previously equal but serve different purposes: the keyframe relax
+/// window arms a short budget burst for immediate recovery retries, while the
+/// downlink relief window holds the L1/L2 shed for sustained stabilization.
+pub const RECEIVER_DOWNLINK_RELIEF_WINDOW: Duration = Duration::from_secs(8);
 
 #[cfg(test)]
 mod tests {
@@ -830,5 +1094,102 @@ mod tests {
             resolve_wt_outbound_channel_capacity(Some("")),
             WT_OUTBOUND_CHANNEL_CAPACITY_DEFAULT
         );
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_unset_defaults_to_true() {
+        // #988 filter is already LIVE in prod; the #1436 kill switch must
+        // default to the status quo (filter ON) when unset.
+        assert!(resolve_viewport_filter_enabled(None));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_recognised_false_values_disable() {
+        assert!(!resolve_viewport_filter_enabled(Some("false")));
+        assert!(!resolve_viewport_filter_enabled(Some("0")));
+        assert!(!resolve_viewport_filter_enabled(Some("off")));
+        assert!(!resolve_viewport_filter_enabled(Some("no")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_recognised_true_values_enable() {
+        assert!(resolve_viewport_filter_enabled(Some("true")));
+        assert!(resolve_viewport_filter_enabled(Some("1")));
+        assert!(resolve_viewport_filter_enabled(Some("on")));
+        assert!(resolve_viewport_filter_enabled(Some("yes")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_is_case_insensitive() {
+        assert!(!resolve_viewport_filter_enabled(Some("FALSE")));
+        assert!(resolve_viewport_filter_enabled(Some("True")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_garbage_falls_back_to_default_true() {
+        // Unrecognised tokens warn and fall back to the default (ON).
+        assert!(resolve_viewport_filter_enabled(Some("GARBAGE")));
+    }
+
+    #[test]
+    fn resolve_viewport_filter_enabled_empty_falls_back_to_default_true() {
+        // "" trims to "", matches no arm, warns, and defaults to true.
+        // It is NOT special-cased.
+        assert!(resolve_viewport_filter_enabled(Some("")));
+    }
+
+    #[test]
+    fn viewport_should_drop_kill_switch_off_forwards_all() {
+        // enabled=false: forward-all restored regardless of set membership.
+        let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(!viewport_should_drop(false, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_drops_source_not_in_set() {
+        // enabled=true, non-empty set EXCLUDING the source -> drop.
+        let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(viewport_should_drop(true, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_keeps_source_in_set() {
+        // enabled=true, source present in the set -> forward.
+        let ids: std::collections::HashSet<u64> = [1, 2, 99].into_iter().collect();
+        assert!(!viewport_should_drop(true, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_empty_set_fails_open() {
+        // enabled=true, empty set (no viewport signal yet) -> fail open.
+        let ids: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        assert!(!viewport_should_drop(true, &ids, Some(99)));
+    }
+
+    #[test]
+    fn viewport_should_drop_enabled_none_source_fails_open() {
+        // enabled=true, unparseable source (None) -> fail open.
+        let ids: std::collections::HashSet<u64> = [1, 2, 3].into_iter().collect();
+        assert!(!viewport_should_drop(true, &ids, None));
+    }
+
+    #[test]
+    fn nonvideo_reached_viewport_drop_branch_video_does_not_trip() {
+        use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+        // VIDEO is the only kind that legitimately reaches the viewport drop
+        // branch — the tripwire must NOT fire.
+        assert!(!nonvideo_reached_viewport_drop_branch(Ok(MediaKind::VIDEO)));
+    }
+
+    #[test]
+    fn nonvideo_reached_viewport_drop_branch_nonvideo_and_err_trip() {
+        use videocall_types::protos::packet_wrapper::packet_wrapper::MediaKind;
+        // AUDIO, SCREEN, and an unknown/unparseable kind (Err) are all the
+        // impossible case — each must trip. MUTATION GUARD: if the helper is
+        // neutered to always return `false` (the "guard removed" mutation),
+        // every assert below fails.
+        assert!(nonvideo_reached_viewport_drop_branch(Ok(MediaKind::AUDIO)));
+        assert!(nonvideo_reached_viewport_drop_branch(Ok(MediaKind::SCREEN)));
+        assert!(nonvideo_reached_viewport_drop_branch(Err(999)));
     }
 }

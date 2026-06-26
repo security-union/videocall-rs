@@ -294,7 +294,10 @@ impl BannerDamper {
 /// Props are the live render-scope signals from `attendants.rs`. The component
 /// owns the [`BannerDamper`] and a `dismissed` latch; it renders the bar only
 /// when the damper says visible AND the user has not dismissed it for the
-/// current episode.
+/// current episode. It also PUBLISHES that true effective on-screen state into
+/// the shared `on_screen` signal so the sibling decode-paused pill can take
+/// over the persistent signpost whenever the banner is not on screen — back-off,
+/// natural hide, OR user dismiss (issue #1142 Gap 1).
 #[component]
 pub fn DecodeBudgetBanner(
     /// Raw decode-budget pressure flag (`decode_budget_pressured`).
@@ -308,6 +311,12 @@ pub fn DecodeBudgetBanner(
     /// retained because it carries meaningful context for the action button's
     /// accessible label ("Show all N videos").
     natural: usize,
+    /// Shared flag owned by `attendants.rs`. The banner publishes its TRUE
+    /// effective on-screen visibility (`damper_visible && !dismissed &&
+    /// avatar_count > 0`) into this so the sibling decode-paused pill can read it
+    /// and stay exactly mutually exclusive with the banner — including after the
+    /// user DISMISSES the banner while tiles are still paused (issue #1142 Gap 1).
+    on_screen: Signal<bool>,
 ) -> Element {
     // The damper persists across renders. `use_signal` gives us a mutable,
     // render-surviving cell without re-running the constructor each render.
@@ -369,6 +378,16 @@ pub fn DecodeBudgetBanner(
     });
 
     let show_banner = visible() && !dismissed() && avatar_count > 0;
+
+    // Publish the banner's TRUE on-screen state so the sibling decode-paused
+    // pill can take over the persistent signpost whenever the banner is NOT on
+    // screen — including after the user dismisses it (issue #1142 Gap 1). Write
+    // only on change to avoid a render loop. Must run BEFORE the early return so
+    // the hidden state is published too.
+    let mut on_screen = on_screen;
+    if *on_screen.peek() != show_banner {
+        on_screen.set(show_banner);
+    }
 
     if !show_banner {
         return rsx! {};

@@ -162,7 +162,10 @@ test.describe("Theme toggle icon buttons in AppearanceSettingsPanel", () => {
 
   test.afterEach(async ({ page }) => {
     // Clean up persisted theme so tests remain independent.
-    await page.evaluate(() => localStorage.removeItem("ui-theme"));
+    await page.evaluate(() => {
+      localStorage.removeItem("ui-theme");
+      localStorage.removeItem("vc_theme_custom");
+    });
   });
 
   // ── 1. Default selection ────────────────────────────────────────────────

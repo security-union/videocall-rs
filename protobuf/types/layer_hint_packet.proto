@@ -52,8 +52,15 @@ message LayerHintPacket {
   //
   // BACK-COMPAT / fail-open: the default (UNSPECIFIED = 0) MUST be treated by
   // the publisher as "no actionable hint for a known kind" and ignored — the
-  // relay always stamps a concrete VIDEO/AUDIO/SCREEN kind on the entries it
-  // emits, so an UNSPECIFIED entry is never produced on the happy path.
+  // relay always stamps a concrete laddered kind on the entries it emits, so an
+  // UNSPECIFIED entry is never produced on the happy path.
+  //
+  // EMITTED KINDS: the relay currently computes/emits hints for VIDEO and
+  // SCREEN ONLY (the only kinds with a simulcast ladder). AUDIO(2) is defined
+  // here for symmetry with PacketWrapper.MediaKind but is RESERVED/UNUSED today:
+  // audio has no simulcast ladder, so the relay never computes an AUDIO union
+  // and never emits an AUDIO entry (see LAYER_HINT_MEDIA_KINDS = [VIDEO, SCREEN]
+  // on the relay, issue #1118 N3).
   enum MediaKind {
     MEDIA_KIND_UNSPECIFIED = 0;
     VIDEO = 1;

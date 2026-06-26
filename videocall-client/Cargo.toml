@@ -56,7 +56,10 @@ default = []
 # `WebTransportTask::send_bytes_datagram` are byte-for-byte equivalent
 # to the pre-3b implementation. When ON, the optional
 # `ConnectOptions::netsim_hook` is consulted before each send.
-netsim = ["dep:videocall-netsim"]
+# Also enables `videocall-transport/netsim` so the `force_unistream_ready_stall`
+# / `force_websocket_drop` counter bumpers exist for the `__vcNetsim` e2e
+# bindings (issue #1398).
+netsim = ["dep:videocall-netsim", "videocall-transport/netsim"]
 
 [dependencies.web-sys]
 version = "0.3"
@@ -154,6 +157,8 @@ features = [
     "Crypto",
     "Window",
     "Location",
+    "Document",
+    "VisibilityState",
 ]
 
 [dev-dependencies]

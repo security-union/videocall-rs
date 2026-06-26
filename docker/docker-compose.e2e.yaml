@@ -276,6 +276,16 @@ services:
       # back to WS. See issue #777.
       - WEBTRANSPORT_ENABLED=true
       - TRANSPORT_BADGE_ENABLED=false
+      # Issue #1480: the E2E stack is NON-production, where the committed
+      # dioxus-ui/scripts/config.js default is showBuildGitInfo: "true". Set the
+      # env to true so the docker-generated config.local.js AGREES ("true") —
+      # otherwise start-dioxus.sh's "${SHOW_BUILD_GIT_INFO:-false}" default
+      # overrides config.js back to "false" and the UN-FORCED build-info table
+      # in performance-settings.spec.ts would see the 2-col --nogit variant. The
+      # FORCED HIDDEN about-modal test still wins with "false" because the helper
+      # appends its override AFTER config.local.js's body (see
+      # helpers/show-build-git-info-config.ts).
+      - SHOW_BUILD_GIT_INFO=true
       - E2EE_ENABLED=false
       - FIREFOX_ENABLED=false
       # Enable the mock-peers debug feature so layout-driven specs (e.g.

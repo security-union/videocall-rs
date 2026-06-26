@@ -48,6 +48,7 @@ const MAX_PLAYOUT_DELAY_MS: f64 = 500.0;
 /// - This is a live videoconference: liveness beats completeness. ~1.8s is the boundary past which
 ///   continuing to drain buffered video does more harm (A/V desync, growing lag) than dropping it.
 const MAX_PLAYOUT_AGE_MS: f64 = 1800.0;
+
 /// *Base* (first-strike) interval between proactive keyframe requests fired by the
 /// keyframe-less eviction path (issue #1025). Matched to the relay's KEYFRAME_REQUEST
 /// window (`KEYFRAME_REQUEST_WINDOW_MS`, ~1s) so the FIRST request of a stall emits at
@@ -70,10 +71,11 @@ const PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS: f64 = 1000.0;
 /// the proactive-PLI cadence at `1000 * 2^3 = 8000ms` — i.e. once recovery is clearly not
 /// arriving, this receiver pokes the speaker at most ~1/8s instead of ~1/s, damping the
 /// self-sustaining PLI storm. Going quiet is safe: the binding lower bound on freeze recovery is
-/// the *publisher's periodic GOP keyframe* (~5s camera / ~3s screen — the encoder's own
-/// `keyframe_interval_frames` cadence, NOT gated by the PLI cooldown; see `videocall-aq`'s tier
-/// `keyframe_interval_frames` and `camera_encoder`'s emit coalescer, which exempts the periodic
-/// keyframe). The reactive gap-driven path (`peer_decode_manager::should_request_keyframe`) is an
+/// the *publisher's periodic GOP keyframe* (wall-clock-bounded at 5s camera / 3s screen via
+/// `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` / `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`, NOT gated
+/// by the PLI cooldown; see `videocall-aq` and the camera/screen encoder's `periodic_keyframe_due`,
+/// which exempts the periodic keyframe from the coalescer). The reactive gap-driven path
+/// (`peer_decode_manager::should_request_keyframe`) is an
 /// additional accelerator but does NOT fire on a contiguous-delta *lossless* (WS) keyframe-less
 /// stall — the exact #1479 shape — because it gates on `lost_count > 0`. So this proactive path is
 /// one accelerator above the periodic-keyframe floor, and the whole point of #1479 is to stop it
@@ -95,6 +97,12 @@ const PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP: u32 = 3;
 /// `PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP`) so a stall firing at the capped cadence never
 /// self-resets mid-storm.
 const PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS: f64 = 12_000.0;
+/// Hard ceiling (ms) on how long the keyframe-arrival gate can suppress proactive PLIs (issue
+/// #1479). On a lossless WS path the keyframe always arrives within ~1-2s, but if the relay
+/// suppresses it (rate-limiter) or the publisher crashes, this timeout ensures we eventually
+/// retry. Set well above the publisher's periodic keyframe cadence (~5s camera) so the gate
+/// almost never times out under normal operation.
+const PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS: f64 = 15_000.0;
 
 /// Compile-time guard on the load-bearing backoff invariant (issue #1499):
 /// `PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS` must stay STRICTLY ABOVE the
@@ -111,6 +119,163 @@ const _: () = assert!(
         * (2u32.pow(PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP) as f64)
         < PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS
 );
+/// Compile-time guard: the arrival-gate timeout must exceed the backoff-reset quiet interval.
+/// When the gate times out, the backoff exponent has already been zeroed (since the quiet
+/// interval elapsed), so the retry fires at the base cadence. If a future re-tune inverted
+/// this, the retry would fire with a stale high exponent (up to 8s delay on top of the 15s
+/// wait — 23s total freeze, far worse than the pre-fix storm).
+const _: () =
+    assert!(PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS > PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS);
+
+/// Hard ceiling (ms) on the keyframe-LESS held-last-good freeze (issue #1662).
+///
+/// The freshness deadline's keyframe-less branch (`enforce_freshness_deadline`'s `else` arm) evicts
+/// the stale delta backlog, holds the last-good frame on screen, and fires a throttled proactive
+/// PLI — but there is **no buffered keyframe to skip to**, so playout stays frozen on that last-good
+/// frame until a fresh keyframe finally arrives AND decodes. The bounded skip-to-live path
+/// (`MAX_PLAYOUT_AGE_MS` + `skip_to_newest_buffered_keyframe`) structurally cannot bound this: there
+/// is nothing live to drop *to*. Field-observed in meeting_sync 2026-06-24, `head_age` reached
+/// **27,891 ms (~28 s)** on a keyframe-starved receiver (`skip_to_live` = 0 for every participant —
+/// the bounded path never engaged), which is the mechanism behind "video lagging by minutes": the
+/// frame does not drift behind live, it FREEZES.
+///
+/// This constant is a *second, larger* deadline: once the keyframe-less hold's `head_age` crosses
+/// it, the buffer signals the worker to escalate recovery (a cooldown-gated, one-shot
+/// decoder-pipeline reset; see `signal_keyframe_less_ceiling`) instead of holding indefinitely.
+///
+/// Rationale for 6000ms:
+/// - It MUST sit ABOVE the publisher's periodic-keyframe recovery window so it fires ONLY when
+///   periodic recovery has genuinely failed — never pre-empting the cheaper natural recovery. The
+///   publisher emits an unconditional periodic GOP keyframe at most every
+///   `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` = 5s (camera) / `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`
+///   = 3s (screen), exempt from the PLI coalescer (see `videocall-aq` / the encoders'
+///   `periodic_keyframe_due`). 6000ms sits ~1s above the *slower* (camera, 5s) of those two
+///   cadences — that publisher-measured cadence plus one-way transit (200ms+ RTT, loss) and decode
+///   is what the receiver actually waits, so the receiver-side margin is smaller than 1s but still
+///   positive in the common case: a stream merely waiting out its next periodic keyframe recovers
+///   naturally and this escalation does not fire. If a slow/lossy link does push the periodic
+///   keyframe just past 6s, the escalation is benign — it resets the decoder and the in-flight
+///   keyframe then satisfies the clean CASE-3 (waiting-for-keyframe) path; it does not discard a
+///   recovery that was about to land, it accelerates accepting it. It is genuinely load-bearing
+///   only under sustained starvation (relay suppression, flapping publisher, a keyframe that keeps
+///   failing to decode), exactly the 18-30s freezes the field showed.
+/// - It is far enough below the field-observed 28s tail that the worst-case freeze is cut from tens
+///   of seconds to ~6s + one keyframe RTT, which a viewer perceives as "it reconnected" rather than
+///   "it is broken."
+/// - It is independent of and additive to the #1479 proactive-PLI machinery above: that path keeps
+///   asking the publisher for a keyframe (and backs off to avoid the storm); this ceiling is the
+///   backstop for when those requests are not producing a *decodable* recovery in bounded time.
+const MAX_KEYFRAME_LESS_HOLD_MS: f64 = 6000.0;
+
+/// Minimum wall-clock interval (ms) between keyframe-less-hold escalations (issue #1662).
+///
+/// CRITICAL hysteresis guard. Once `head_age` crosses `MAX_KEYFRAME_LESS_HOLD_MS` the condition is
+/// true on EVERY ~10ms worker tick (the held-last-good frame keeps aging), so a naive "reset every
+/// tick past the ceiling" would be a reset STORM — and across the N per-publisher jitter buffers a
+/// receiver runs during a meeting-wide stall, an O(N) storm of decoder teardowns. This interval
+/// gates the escalation to at most once per window. It is time-bounded, NOT a
+/// consecutive-success counter: the repo's recovery-hysteresis rule forbids strictly-consecutive
+/// counters because they reset under ongoing contention and can pin an entity indefinitely; a
+/// plain wall-clock cooldown cannot wedge — it always permits the next escalation after the window
+/// regardless of intervening state.
+///
+/// CRITICAL ownership note (#1662 review B1): the cooldown ANCHOR is held in the WORKER layer
+/// (`bin/worker_decoder.rs`'s `LAST_KEYFRAME_LESS_ESCALATION_MS` thread-local), NOT in the
+/// `JitterBuffer`. A successful escalation calls the real `WebDecoder::reset()` →
+/// `reset_pipeline()`, which on a later event-loop tick drops the worker's `JITTER_BUFFER`
+/// thread-local to `None` and rebuilds it via `new()`. Any cooldown anchor stored *inside* the
+/// buffer would be wiped by that rebuild, so a continuously-starved stream would re-escalate as
+/// fast as `head_age` could re-age (~6s) instead of respecting this 8s interval. Hoisting the
+/// anchor to the worker (which owns and outlives the thread-local) makes the cooldown bound
+/// *cross-reset* re-escalation, which is exactly when it matters. The decision itself is the pure,
+/// natively-tested [`keyframe_less_escalation_due`] free function.
+///
+/// Set to 8000ms: comfortably above `MAX_KEYFRAME_LESS_HOLD_MS` (6000) so a *successful* escalation
+/// (which resets the pipeline → rebuilds the buffer via `new()` → the next keyframe re-bases
+/// playout) has a full keyframe-cadence window to take effect before another reset is even
+/// considered; and matched to the publisher's 5s periodic-keyframe cadence + margin so a second
+/// escalation only fires if a *full* additional recovery window also failed. A reset is expensive
+/// (tears down the WebCodecs `VideoDecoder` and rebuilds on the next keyframe), so spacing them at
+/// the keyframe cadence avoids thrashing recovery while still bounding the freeze.
+const KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS: f64 = 8000.0;
+
+/// Compile-time guard on the load-bearing #1662 ceiling invariant: the keyframe-less hold ceiling
+/// MUST sit STRICTLY ABOVE the freshness-deadline trigger. If a future re-tune dropped
+/// `MAX_KEYFRAME_LESS_HOLD_MS` to/below `MAX_PLAYOUT_AGE_MS`, the escalation would fire the instant
+/// the freshness deadline trips (1800ms) — pre-empting the cheaper skip-to-live / proactive-PLI
+/// recovery with an expensive pipeline reset on every transient stall. Mirrors the `GOVERNOR_*` and
+/// proactive-backoff ordering asserts in this file.
+const _: () = assert!(MAX_KEYFRAME_LESS_HOLD_MS > MAX_PLAYOUT_AGE_MS);
+/// Compile-time guard: the escalation cooldown must sit STRICTLY ABOVE the ceiling it gates so a
+/// successful escalation gets at least one full ceiling window to take effect before the next
+/// escalation is permitted. If inverted, a second reset could fire before the first reset's clean
+/// keyframe even had a chance to arrive — thrashing the decode pipeline.
+const _: () = assert!(KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS > MAX_KEYFRAME_LESS_HOLD_MS);
+
+/// Keyframe-less hold-ceiling escalation cooldown gate (issue #1662), as a PURE function so the
+/// hysteresis decision is natively unit-testable off the wasm-only worker path that owns the anchor.
+///
+/// Returns `true` iff an escalation is due now: either there has been no prior escalation on this
+/// stream (`last_escalation_ms == None`) or at least `KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS` has
+/// elapsed since the last one. The caller (the worker's `request_escalation` hook) owns the anchor
+/// in a thread-local that survives the buffer rebuild a successful escalation triggers, and updates
+/// it to `now_ms` only when this returns `true`.
+///
+/// This is the load-bearing hysteresis guard. It cannot WEDGE (a plain wall-clock cooldown always
+/// re-arms after the window, regardless of ongoing contention — unlike a strictly-consecutive
+/// counter, which the repo's recovery-hysteresis rule forbids) and it cannot STORM (the buffer
+/// signals "ceiling exceeded" on every ~10ms tick once `head_age` crosses the ceiling, but this gate
+/// lets the expensive `reset()` fire at most once per 8s window — per buffer, so an N-buffer
+/// meeting-wide stall is bounded to N resets per window, not N-per-tick).
+pub fn keyframe_less_escalation_due(last_escalation_ms: Option<u128>, now_ms: u128) -> bool {
+    match last_escalation_ms {
+        None => true,
+        Some(last) => {
+            (now_ms.saturating_sub(last)) as f64 >= KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS
+        }
+    }
+}
+
+/// Pure decision for the worker's keyframe-less escalation gate (issue #1662), extracted so the
+/// load-bearing WIRING — "if the cooldown allows it, advance the anchor to `now_ms` AND emit an
+/// `escalated: true` diagnostic" — is natively unit-testable instead of living only in the wasm-only
+/// `bin/worker_decoder.rs` hook (#1662 review follow-up).
+///
+/// Given the worker-held cooldown anchor (`last_escalation_ms`), the current `now_ms`, and the
+/// `head_age_ms` that crossed the ceiling, returns:
+/// - `Some((now_ms, FreshnessSkip { escalated: true, .. }))` when [`keyframe_less_escalation_due`]
+///   says an escalation is permitted — the first element is the NEW anchor the caller must store
+///   (so the cooldown survives the buffer rebuild the reset triggers), the second is the diagnostic
+///   the caller must force-post (immediately, bypassing the buffer throttle). The caller then fires
+///   the decoder reset.
+/// - `None` when the cooldown has not elapsed — the caller does nothing (no anchor update, no post,
+///   no reset).
+///
+/// The returned `FreshnessSkip` carries `keyframe_seq: None` (still no buffered keyframe) and
+/// `dropped: 0` (the escalation event itself drops nothing; the tick's eviction, if any, is recorded
+/// separately by the buffer's routine skip path). Keeping the anchor-advance and the
+/// `escalated: true` stamp in ONE pure function means a native test pins both at once — catching the
+/// two wiring regressions a wasm-only hook would hide: forgetting to advance the anchor, and posting
+/// with `escalated: false`.
+pub fn decide_keyframe_less_escalation(
+    last_escalation_ms: Option<u128>,
+    now_ms: u128,
+    head_age_ms: f64,
+) -> Option<(u128, FreshnessSkip)> {
+    if !keyframe_less_escalation_due(last_escalation_ms, now_ms) {
+        return None;
+    }
+    Some((
+        now_ms,
+        FreshnessSkip {
+            head_age_ms,
+            keyframe_seq: None,
+            dropped: 0,
+            escalated: true,
+        },
+    ))
+}
+
 /// A multiplier applied to the jitter estimate to provide a safety margin.
 /// A value of 3.0 means we buffer enough to handle jitter up to 3x the running average.
 const JITTER_MULTIPLIER: f64 = 3.0;
@@ -282,6 +447,14 @@ pub struct FreshnessSkip {
     pub keyframe_seq: Option<u64>,
     /// Number of stale frames evicted in this skip.
     pub dropped: u64,
+    /// `true` when this skip is the keyframe-less hold-ceiling escalation (issue #1662): the
+    /// held-last-good freeze exceeded `MAX_KEYFRAME_LESS_HOLD_MS` and we forced a decoder-pipeline
+    /// reset rather than continue holding indefinitely. Always `false` for the ordinary
+    /// skip-to-live (`keyframe_seq: Some`) and the throttled keyframe-less hold
+    /// (`keyframe_seq: None`, below the ceiling). Surfaced so field logs can distinguish a routine
+    /// freshness skip from a bounded-freeze escalation, and so a future "reconnecting video" UI
+    /// state could key off it.
+    pub escalated: bool,
 }
 
 pub struct JitterBuffer<T> {
@@ -327,6 +500,26 @@ pub struct JitterBuffer<T> {
     /// inter-arrival delta. `None` until the first release (and after a flush).
     last_released_arrival_time_ms: Option<u128>,
 
+    /// Media (capture-presentation) timestamp in MILLISECONDS of the most recently RELEASED frame,
+    /// derived from `frame.frame.timestamp` (microseconds) at the release point (issue #1641). This
+    /// is the content age anchor for the [`content_staleness_ms`] receive-path diagnostic: it tracks
+    /// the publisher-clock timestamp of the content currently being painted, which is what lets that
+    /// metric surface MINUTES of content lag that `playout_latency_ms` (capped at
+    /// `MAX_PLAYOUT_AGE_MS`) and `paint_lag_ms` (a queue-DEPTH measure) structurally cannot.
+    /// `None` until the first release (and after a flush). On the PUBLISHER's clock — do NOT subtract
+    /// a receiver-clock value from it without subtracting `min_skew_ms` first (see
+    /// [`content_staleness_ms`]).
+    last_released_media_ts_ms: Option<f64>,
+
+    /// Running MINIMUM of `arrival_time_ms − media_ts_ms` over all released frames (issue #1641).
+    /// This is the best-case (freshest) capture→arrival offset ever observed in the (receiver −
+    /// publisher) clock domain — the drift baseline that cancels the constant, unsynchronized
+    /// clock offset between the publisher's capture clock and the receiver's wall clock. Subtracting
+    /// it from `(now − last_released_media_ts_ms)` yields the EXCESS delay beyond best-case = true
+    /// content lag (see [`content_staleness_ms`]). `None` until the first release (and after a
+    /// flush). Reset on `flush()` so a stream restart re-baselines.
+    min_skew_ms: Option<f64>,
+
     // --- Decoder Interface ---
     /// The abstract decoder that will receive frames ready for decoding.
     decoder: Box<dyn Decodable<Frame = T>>,
@@ -344,7 +537,13 @@ pub struct JitterBuffer<T> {
     /// KEYFRAME_REQUEST limiter (#979/#1011) coalesces for the *publisher*, but it
     /// does not throttle *this* receiver's uplink or worker→main bus, so the fire
     /// is additionally rate-limited at the source — see `last_keyframe_request_ms`.
-    request_keyframe: Box<dyn Fn()>,
+    ///
+    /// Invoked with the head-of-line backlog age (`head_age_ms`) that tripped the
+    /// freshness deadline (issue #1479): the worker forwards it on the wire so the
+    /// main thread's per-receiver cross-sender PLI budget can prioritize the stalest
+    /// stream when its global cap is reached. This buffer does NOT itself read the
+    /// value — it is a pure detector that hands the age to the hook.
+    request_keyframe: Box<dyn Fn(f64)>,
 
     /// Wall-clock (ms) of the last proactive keyframe request fired by the
     /// keyframe-less eviction path (issue #1025). Source-side throttle: under a
@@ -375,6 +574,35 @@ pub struct JitterBuffer<T> {
     /// closely-spaced re-freezes and only resets once the stream has genuinely stopped needing
     /// proactive requests.
     consecutive_proactive_keyframe_requests: u32,
+
+    /// Keyframe-arrival gate (issue #1479): `true` when a proactive PLI has been fired and we
+    /// are waiting for the resulting keyframe to arrive (be inserted into the buffer). While
+    /// this is `true`, NO further proactive PLIs fire — each freeze episode produces exactly 1
+    /// PLI per receiver. Cleared when a keyframe is inserted (`insert_frame`) or when
+    /// `PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS` expires since the last fire (backstop against
+    /// publisher crash or relay suppression). This is the primary #1479 loop-breaker: it
+    /// decouples the freshness-deadline eviction cadence (~10ms) from PLI emission cadence,
+    /// which was the 1:1 coupling that created the storm.
+    awaiting_proactive_keyframe: bool,
+
+    /// Keyframe-less hold-ceiling escalation hook (issue #1662). Invoked with the current
+    /// `head_age_ms` on EVERY tick that the keyframe-less held-last-good freeze is at/above
+    /// `MAX_KEYFRAME_LESS_HOLD_MS`. Returns `true` iff the worker GATED IN this escalation (cooldown
+    /// elapsed) — only then does the buffer call `self.decoder.reset()` for the actual recovery.
+    ///
+    /// The buffer is a pure *detector* (mirroring `request_keyframe`): it does NOT own the cooldown
+    /// or the escalation diagnostic. Those live in the WORKER hook ([`bin/worker_decoder.rs`]) on
+    /// purpose (#1662 review B1/B2): a successful reset rebuilds the whole `JitterBuffer` via `new()`
+    /// on a later event-loop tick, so any cooldown anchor or pending diagnostic kept *inside* the
+    /// buffer would be wiped by that rebuild — defeating both the cross-reset cooldown and the
+    /// diagnostic. The worker owns a thread-local anchor that survives the rebuild and force-posts
+    /// the diagnostic synchronously (before the deferred reset runs), then returns `true` so the
+    /// buffer fires the decoder reset. The `reset()` call itself stays in the buffer because the
+    /// decoder is the buffer's own field (the worker hook cannot re-borrow the `JITTER_BUFFER`
+    /// thread-local mid-poll without panicking). Defaults to "never escalate" (`new`), so native/mock
+    /// callers need not supply one; the worker injects the real one via
+    /// [`JitterBuffer::with_recovery_hooks`].
+    request_escalation: Box<dyn Fn(f64) -> bool>,
 
     /// Most recent freshness-deadline skip this poll produced (issue #1045), set by
     /// `enforce_freshness_deadline` and consumed by the worker via
@@ -426,16 +654,31 @@ pub struct JitterBuffer<T> {
 
 impl<T> JitterBuffer<T> {
     pub fn new(decoder: Box<dyn Decodable<Frame = T>>) -> Self {
-        // Default: no proactive keyframe request (native/mock callers). The worker
-        // supplies a real hook via `with_keyframe_request`.
-        Self::with_keyframe_request(decoder, Box::new(|| {}))
+        // Default: no proactive keyframe request and never-escalate (native/mock callers). The
+        // worker supplies the real hooks via `with_recovery_hooks`.
+        Self::with_recovery_hooks(decoder, Box::new(|_| {}), Box::new(|_| false))
     }
 
     /// Like [`JitterBuffer::new`] but injects the proactive keyframe-request hook
-    /// (issue #1025) — mirroring how `decoder` is injected. See `request_keyframe`.
+    /// (issue #1025) — mirroring how `decoder` is injected. See `request_keyframe`. The
+    /// keyframe-less hold-ceiling escalation hook (#1662) defaults to a no-op; use
+    /// [`JitterBuffer::with_recovery_hooks`] to inject both.
     pub fn with_keyframe_request(
         decoder: Box<dyn Decodable<Frame = T>>,
-        request_keyframe: Box<dyn Fn()>,
+        request_keyframe: Box<dyn Fn(f64)>,
+    ) -> Self {
+        Self::with_recovery_hooks(decoder, request_keyframe, Box::new(|_| false))
+    }
+
+    /// Like [`JitterBuffer::with_keyframe_request`] but also injects the keyframe-less hold-ceiling
+    /// escalation hook (issue #1662). The escalation hook is invoked with the current `head_age_ms`
+    /// on every tick the keyframe-less freeze is at/above `MAX_KEYFRAME_LESS_HOLD_MS`; the worker's
+    /// implementation owns the cooldown anchor (which must survive the buffer rebuild the reset
+    /// triggers) and the actual `reset()` + escalation diagnostic. See `request_escalation`.
+    pub fn with_recovery_hooks(
+        decoder: Box<dyn Decodable<Frame = T>>,
+        request_keyframe: Box<dyn Fn(f64)>,
+        request_escalation: Box<dyn Fn(f64) -> bool>,
     ) -> Self {
         Self {
             buffered_frames: BTreeMap::new(),
@@ -447,10 +690,14 @@ impl<T> JitterBuffer<T> {
             backpressure_hold_since_ms: None,
             source_frame_interval_ms: DEFAULT_SOURCE_FRAME_INTERVAL_MS,
             last_released_arrival_time_ms: None,
+            last_released_media_ts_ms: None,
+            min_skew_ms: None,
             decoder,
             request_keyframe,
+            request_escalation,
             last_keyframe_request_ms: None,
             consecutive_proactive_keyframe_requests: 0,
+            awaiting_proactive_keyframe: false,
             last_freshness_skip: None,
             last_freshness_skip_emit_ms: None,
             pending_freshness_skip: None,
@@ -480,6 +727,10 @@ impl<T> JitterBuffer<T> {
         existing.head_age_ms = existing.head_age_ms.max(next.head_age_ms);
         existing.keyframe_seq = next.keyframe_seq;
         existing.dropped += next.dropped;
+        // An escalation (issue #1662) coalesced into the same diagnostic window must remain
+        // visible: it is a strictly more severe event than a routine skip, so OR it in rather than
+        // overwrite — a window that contained an escalation reports `escalated: true`.
+        existing.escalated |= next.escalated;
         existing
     }
 
@@ -511,6 +762,14 @@ impl<T> JitterBuffer<T> {
     pub fn insert_frame(&mut self, frame: VideoFrame, arrival_time_ms: u128) {
         let seq = frame.sequence_number;
         log::trace!("[JITTER_BUFFER] Inserting frame: {seq}");
+
+        // Issue #1479: ANY keyframe arrival (even an old/duplicate one) clears the proactive-PLI
+        // gate. Placed before old-frame rejection because the gate is about "did the publisher
+        // respond to our PLI" — even a retransmitted keyframe proves it did. On a lossless WS
+        // path the PLI-triggered keyframe always arrives; on WT the timeout backstop handles loss.
+        if frame.frame_type == FrameType::KeyFrame && self.awaiting_proactive_keyframe {
+            self.awaiting_proactive_keyframe = false;
+        }
 
         // --- Pre-insertion checks ---
         // 1. Ignore frames that are too old.
@@ -857,13 +1116,15 @@ impl<T> JitterBuffer<T> {
             return false; // Empty buffer — nothing can be stale.
         };
 
-        let head_age_ms = {
-            let frame = match self.buffered_frames.get(&head_key) {
-                Some(f) => f,
-                None => return false,
-            };
-            current_time_ms.saturating_sub(frame.arrival_time_ms) as f64
+        // Arrival-based age (issue #1020): how long the head sat in THIS buffer. This is the SOLE
+        // freshness-deadline trip — the deadline is arrival-only. Read only the head's arrival time
+        // (a scalar copy) inside the borrow, then drop it so the later `&mut self` skip/evict paths
+        // are unobstructed.
+        let head_arrival_ms = match self.buffered_frames.get(&head_key) {
+            Some(f) => f.arrival_time_ms,
+            None => return false,
         };
+        let head_age_ms = current_time_ms.saturating_sub(head_arrival_ms) as f64;
 
         if head_age_ms < MAX_PLAYOUT_AGE_MS {
             // Within freshness bounds — normal jitter handling is byte-for-byte unaffected.
@@ -911,6 +1172,7 @@ impl<T> JitterBuffer<T> {
                             head_age_ms,
                             keyframe_seq: Some(keyframe_seq),
                             dropped,
+                            escalated: false,
                         },
                     );
                     true
@@ -927,6 +1189,32 @@ impl<T> JitterBuffer<T> {
             //
             // We keep only frames newer than the (now-evicted) stale head so a subsequently
             // arriving keyframe can still be matched, but we do not advance playout.
+            //
+            // Hard ceiling on the keyframe-less hold (issue #1662). The eviction + throttled PLI
+            // below bound *buffer* growth and keep asking the publisher for a keyframe, but they do
+            // NOT bound the *freeze*: with no buffered keyframe to skip to, playout stays frozen on
+            // the last-good frame until a fresh keyframe arrives AND decodes. Field-observed
+            // `head_age` reached ~28s. Once the held-last-good age crosses
+            // `MAX_KEYFRAME_LESS_HOLD_MS` — i.e. even the publisher's 5s periodic GOP keyframe has
+            // failed to recover us — SIGNAL the escalation hook (the worker gates it on its own
+            // cooldown and performs the decoder reset + diagnostic; see `signal_keyframe_less_ceiling`
+            // for why those live in the worker, not here).
+            //
+            // ADDITIVE, not a replacement: this is invoked for its side effect (the escalation
+            // signal) and the eviction + throttled #1479 PLI logic below STILL runs this tick. The
+            // signal must NOT short-circuit the #1479 path — that path is the cheap, primary recovery
+            // (it keeps asking the publisher for a keyframe and backs off to avoid the storm), and the
+            // escalation is the backstop for when those requests are not producing a *decodable*
+            // recovery in bounded time. The worker's reset re-base is deferred via `setTimeout(0)`
+            // (no synchronous buffer mutation here), so it is safe to continue into the eviction
+            // below; on a later event-loop tick the deferred `reset_jitter_buffer()` drops the whole
+            // buffer to `None` and rebuilds it via `new()` (which inits the #1479 throttle state
+            // fresh), re-basing everything. The routine keyframe-less eviction diagnostic
+            // (`escalated: false`) is recorded below as usual; the worker posts the escalation
+            // diagnostic (`escalated: true`) separately and force-emitted, so the two do not race
+            // through this buffer's ~1s `record_freshness_skip` throttle.
+            self.signal_keyframe_less_ceiling(head_age_ms);
+
             let stale_cutoff = head_key + 1;
             let dropped_before = self.dropped_frames_count;
             self.drop_frames_before(stale_cutoff);
@@ -944,6 +1232,7 @@ impl<T> JitterBuffer<T> {
                         head_age_ms,
                         keyframe_seq: None,
                         dropped,
+                        escalated: false,
                     },
                 );
                 // Issue #1025 (resolves the TODO(#1020) here): proactively ask the client to
@@ -976,21 +1265,36 @@ impl<T> JitterBuffer<T> {
                     }
                 }
 
+                // Issue #1479 keyframe-arrival gate: once a proactive PLI fires, suppress
+                // ALL further proactive PLIs until a keyframe arrives or the hard timeout
+                // expires. This breaks the 1:1 freshness_skip→PLI coupling that created the
+                // meeting-wide storm. The timeout backstop ensures we eventually retry if the
+                // keyframe is lost (relay suppression, publisher crash).
+                let gate_timed_out = self.awaiting_proactive_keyframe
+                    && self.last_keyframe_request_ms.is_some_and(|last| {
+                        (current_time_ms.saturating_sub(last)) as f64
+                            >= PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS
+                    });
+                if gate_timed_out {
+                    self.awaiting_proactive_keyframe = false;
+                    log::debug!(
+                        "[JITTER_BUFFER] Proactive-PLI arrival gate timed out ({}ms); re-arming (#1479).",
+                        PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS
+                    );
+                }
+
+                if self.awaiting_proactive_keyframe {
+                    // Gate closed: a PLI is already in flight; suppress until keyframe arrives.
+                    return false;
+                }
+
                 // The FIRST request fires after PROACTIVE_KEYFRAME_REQUEST_MIN_INTERVAL_MS
                 // (≈ the relay window). Each subsequent request within the backoff window then
                 // doubles the interval — exponential backoff capped at
-                // PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP (issue #1479). A fixed ~1/s cadence
-                // across a meeting-long sequence of freezes is precisely the receiver-side
-                // amplifier of the PLI keyframe storm: every receiver pokes the active speaker
-                // every second. The relay's KEYFRAME_REQUEST limiter became delivery-aware in
-                // #1297 (a ~200ms still-waiting retry under a global cap — see actix-api's
-                // packet_handler `KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS` / `observe_delivery`),
-                // so it coalesces these pokes rather than forwarding each one; but a meeting-wide
-                // ~1/s spray from every receiver still wastes the speaker's uplink and the relay's
-                // limiter budget on requests for a keyframe already in flight. Backing off decays
-                // the cadence
-                // toward ~1/8s while the stall persists, then the quiet-interval reset above
-                // restores full speed once the stream genuinely recovers.
+                // PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP (issue #1479). Backing off decays
+                // the cadence toward ~1/8s while the stall persists; the keyframe-arrival gate
+                // above is the primary storm-breaker, and backoff is the secondary layer for
+                // the timeout-retry case.
                 let backoff_exp = self
                     .consecutive_proactive_keyframe_requests
                     .min(PROACTIVE_KEYFRAME_REQUEST_MAX_BACKOFF_EXP);
@@ -1007,10 +1311,75 @@ impl<T> JitterBuffer<T> {
                     self.consecutive_proactive_keyframe_requests = self
                         .consecutive_proactive_keyframe_requests
                         .saturating_add(1);
-                    (self.request_keyframe)();
+                    self.awaiting_proactive_keyframe = true;
+                    // Issue #1479: forward the head-of-line backlog age that tripped the deadline
+                    // so the main thread's per-receiver cross-sender PLI budget can prioritize the
+                    // stalest stream when its global cap is reached.
+                    (self.request_keyframe)(head_age_ms);
                 }
             }
             false
+        }
+    }
+
+    /// Keyframe-less hold-ceiling escalation trigger (issue #1662).
+    ///
+    /// Called from the keyframe-less branch of `enforce_freshness_deadline` once the head-of-line
+    /// backlog is confirmed stale (`head_age_ms >= MAX_PLAYOUT_AGE_MS`) AND no keyframe is buffered.
+    /// When `head_age_ms >= MAX_KEYFRAME_LESS_HOLD_MS` — the held-last-good freeze has outlasted even
+    /// the publisher's slowest (5s camera) periodic-keyframe recovery window, so natural recovery has
+    /// genuinely failed (relay suppression, flapping publisher, or the arriving keyframe not
+    /// decoding) — it asks the injected `request_escalation` hook whether to escalate, passing the
+    /// current `head_age_ms`. If the hook returns `true` (the worker's cooldown allowed it), the
+    /// buffer fires `self.decoder.reset()` for the actual recovery. Below the ceiling it does nothing
+    /// (the cheaper eviction + throttled #1479 PLI own recovery).
+    ///
+    /// Split of responsibilities (#1662 review B1/B2):
+    /// - The buffer DETECTS the ceiling crossing (every tick) and OWNS the `reset()` call, because
+    ///   the decoder is its own field (the worker hook cannot re-borrow the `JITTER_BUFFER`
+    ///   thread-local mid-poll without panicking).
+    /// - The WORKER hook OWNS the cooldown gate and the escalation diagnostic, because both must
+    ///   survive the buffer rebuild a successful reset triggers: the cooldown anchor lives in a
+    ///   worker thread-local (a buffer-held anchor would be wiped, so a continuously-starved stream
+    ///   would re-escalate every ~6s re-age instead of the documented 8s — the pure decision is
+    ///   [`keyframe_less_escalation_due`]), and the worker force-posts the `escalated: true`
+    ///   diagnostic synchronously when it gates one in, BEFORE the deferred `setTimeout(0)` reset
+    ///   runs — so it is forwarded on the same poll and cannot be swallowed by the buffer's ~1s
+    ///   `record_freshness_skip` throttle and then wiped by the rebuild.
+    ///
+    /// ## Why the `Decodable::reset()` shortens the freeze (traced, not asserted)
+    /// It is the SAME primitive the wedged-decoder escape hatch uses (`:869`). On the real wasm path
+    /// `WebDecoder::reset()` → `reset_pipeline()` (`bin/worker_decoder.rs`):
+    /// - `destroy_decoder()` tears down the current WebCodecs `VideoDecoder`, discarding partial /
+    ///   stuck internal decode state, and arms `just_reinitialized` so the next `decode()` builds a
+    ///   fresh decoder that requires its first chunk to be a keyframe.
+    /// - it schedules `reset_jitter_buffer()` via `setTimeout(0)`, which drops the worker's
+    ///   `JITTER_BUFFER` thread-local to `None`; the next inserted frame rebuilds it via `new()` with
+    ///   `last_decoded_sequence_number = None` → `is_waiting_for_keyframe()` true.
+    ///
+    /// So after the reset the decode pipeline is clean and keyframe-accepting and the buffer is back
+    /// in the "never decoded / waiting for keyframe" CASE-3 state; the very next keyframe (publisher
+    /// periodic GOP, #1479 PLI response, or the client's reactive `peer_decode_manager` request)
+    /// decodes immediately and cleanly via CASE-3, re-basing playout, instead of being stalled behind
+    /// accumulated stuck decoder state or a stale `last_decoded_sequence_number`. It does NOT *fetch*
+    /// a keyframe (the #1479 path + periodic cadence own that); it removes the decode-side state that
+    /// could keep a freeze pinned even once a keyframe is available and re-arms the
+    /// waiting-for-keyframe reactive path.
+    ///
+    /// Scope boundary (matches where the freshness deadline can see): the head age is measured from
+    /// the oldest *buffered* frame, so this bounds the freeze for the field-observed shape — the
+    /// publisher keeps sending deltas that age past the deadline (28s `head_age` came from buffered
+    /// deltas). If a keyframe-less stream instead drains its buffer to EMPTY and the publisher sends
+    /// nothing further, `enforce_freshness_deadline` returns at its empty-buffer guard and this never
+    /// fires — there is no buffered frame whose age the deadline can observe. That empty-and-silent
+    /// case is a pre-existing limitation of where the deadline runs (the last-good frame lives in the
+    /// decoder, not the buffer); it is out of scope here and is covered by the client's reactive
+    /// `peer_decode_manager` recovery and the publisher's periodic keyframe.
+    fn signal_keyframe_less_ceiling(&self, head_age_ms: f64) {
+        if head_age_ms >= MAX_KEYFRAME_LESS_HOLD_MS && (self.request_escalation)(head_age_ms) {
+            // The worker's cooldown gated this escalation IN and already force-posted the
+            // `escalated: true` diagnostic. Fire the recovery primitive on our own decoder.
+            self.decoder.reset();
         }
     }
 
@@ -1115,9 +1484,37 @@ impl<T> JitterBuffer<T> {
         let seq = frame.sequence_number();
         // Record source cadence BEFORE the frame is moved into the decoder (issue #1252).
         self.record_release_cadence(frame.arrival_time_ms);
+        // Record the content-staleness anchors BEFORE the frame is moved into the decoder
+        // (issue #1641). Pure observability: this only reads the frame's timestamps and updates
+        // two diagnostic fields — it never alters which frame is released or when.
+        self.record_release_content_staleness(frame.arrival_time_ms, frame.frame.timestamp);
         log::trace!("[JITTER_BUFFER] Pushing frame {seq} to decoder.");
         self.decoder.decode(frame);
         self.backpressure_hold_since_ms = None;
+    }
+
+    /// Folds a released frame's media (capture-presentation) timestamp into the content-staleness
+    /// anchors (issue #1641). Read-only diagnostic: updates `last_released_media_ts_ms` and the
+    /// `min_skew_ms` drift baseline; it does NOT affect release/decode/playout behavior in any way.
+    ///
+    /// `media_ts_us` is `frame.frame.timestamp` in MICROSECONDS on the PUBLISHER's clock;
+    /// `arrival_time_ms` is the receiver wall-clock time the frame was received. The fold is skipped
+    /// when `media_ts_ms <= 0.0`: the test-injection path stamps 0.0, and unknown-codec / very old
+    /// clients may carry no usable presentation timestamp — folding a bogus 0 would corrupt the
+    /// `min_skew_ms` baseline (it would record a skew ≈ arrival_time_ms, an enormous offset that
+    /// would then mask all real staleness). See [`content_staleness_ms`] for the formula these
+    /// anchors feed.
+    fn record_release_content_staleness(&mut self, arrival_time_ms: u128, media_ts_us: f64) {
+        let media_ts_ms = media_ts_us / 1000.0;
+        if media_ts_ms <= 0.0 {
+            return;
+        }
+        self.last_released_media_ts_ms = Some(media_ts_ms);
+        let skew = arrival_time_ms as f64 - media_ts_ms;
+        self.min_skew_ms = Some(match self.min_skew_ms {
+            Some(prev) => prev.min(skew),
+            None => skew,
+        });
     }
 
     /// Folds a released frame's arrival time into the rolling source frame-interval estimate
@@ -1180,12 +1577,30 @@ impl<T> JitterBuffer<T> {
         // across the flush gap (issue #1252). The smoothed interval estimate itself persists — the
         // source cadence does not change across a flush.
         self.last_released_arrival_time_ms = None;
+        // Reset the content-staleness anchors (issue #1641) so a stream restart (publisher
+        // re-publish / camera switch, which routes through this flush()) re-baselines from scratch.
+        // A restart may reset the publisher's capture-timestamp epoch, so the pre-flush
+        // `min_skew_ms` baseline (and the stale media_ts) MUST be discarded; a `None`-after-cold-
+        // start and a `None`-after-flush must both read 0, never a stale latch. (The decoder-error
+        // reset_pipeline path re-baselines too, but by a different mechanism — it destroys and
+        // rebuilds the whole JitterBuffer via `new()`, which inits both anchors to `None`.)
+        self.last_released_media_ts_ms = None;
+        self.min_skew_ms = None;
         // Reset the proactive keyframe-request throttle (issue #1025) so a fresh stream after a
         // flush (e.g. stream restart) can request a recovery keyframe immediately rather than
         // inheriting the pre-flush cooldown. Reset the backoff exponent too (issue #1479) so the
         // post-flush stream is not handicapped by a prior stall's accumulated backoff.
         self.last_keyframe_request_ms = None;
         self.consecutive_proactive_keyframe_requests = 0;
+        self.awaiting_proactive_keyframe = false;
+        // NOTE (issue #1662): the keyframe-less hold-ceiling escalation cooldown anchor is NOT a
+        // field of this buffer — it lives in the worker thread-local (`LAST_KEYFRAME_LESS_ESCALATION_MS`
+        // in `bin/worker_decoder.rs`) so it survives the buffer rebuild a reset triggers. There is
+        // therefore nothing to reset here. A `flush()` (stream restart) does not clear the worker
+        // anchor, which is correct: a restart does not mean a fresh escalation should be permitted
+        // immediately — the 8s cooldown still governs cross-restart escalation, preventing a
+        // restart-flap from thrashing the decoder. The worker re-arms naturally once the window
+        // elapses (see `keyframe_less_escalation_due`).
         // Reset freshness-skip diagnostic throttling too: a post-flush stream should not inherit
         // stale diagnostic cooldown or coalesced skip details from before the stream reset.
         self.last_freshness_skip = None;
@@ -1282,6 +1697,15 @@ impl<T> JitterBuffer<T> {
     pub fn governor_skip_count(&self) -> u64 {
         self.governor_skips
     }
+
+    /// Live content-staleness estimate in ms (issue #1641) for the content currently being painted,
+    /// computed against the caller's current wall-clock `now_ms`. Read-only: never mutates state.
+    /// Thin wrapper over the pure [`content_staleness_ms`] free function, passing this buffer's
+    /// stored release anchors so the arithmetic stays unit-testable off the wasm-only worker path.
+    /// Returns 0.0 before the first release / after a flush (anchors `None`).
+    pub fn content_staleness_ms_live(&self, now_ms: u128) -> f64 {
+        content_staleness_ms(now_ms, self.last_released_media_ts_ms, self.min_skew_ms)
+    }
 }
 
 /// Stage-3 paint lag in ms (issue #1252): the time-valued backlog of decoded-but-unpainted frames
@@ -1302,6 +1726,76 @@ pub fn paint_lag_ms(
 ) -> f64 {
     let outstanding = frames_emitted.saturating_sub(frames_painted);
     outstanding as f64 * source_frame_interval_ms
+}
+
+/// Content-staleness (content AGE) in ms of the video currently being painted (issue #1641).
+///
+/// This surfaces the observability hole behind #1631 M2 — "video lagged by minutes" while
+/// `playout_latency_ms` read ~0 — that BOTH existing receive-path metrics structurally cannot
+/// represent:
+/// - `playout_latency_ms` is bounded by `MAX_PLAYOUT_AGE_MS` (1800ms): its stage-1 span can never
+///   exceed ~1.8s because the freshness deadline skips the head-of-line past that.
+/// - `paint_lag_ms` is a queue-DEPTH measure (`(emitted − painted) × interval`): a stream draining
+///   at display rate keeps the outstanding count small, so it reads ~0 even for minutes-old content.
+///
+/// This function instead measures content AGE: how old (in capture/wall-clock terms) the content
+/// being painted is, regardless of how shallow the queue is.
+///
+/// ## Why a naive `now − media_ts` is WRONG (cross-clock)
+/// `last_released_media_ts_ms` comes from `VideoFrame.timestamp` — the source frame's capture
+/// presentation timestamp, on the PUBLISHER's clock with an ARBITRARY EPOCH. `now_ms` is the
+/// RECEIVER's wall clock. The two clocks are UNSYNCHRONIZED (no NTP relationship between an arbitrary
+/// browser publisher and an arbitrary browser receiver), so `now_ms − media_ts_ms` is a meaningless
+/// cross-clock subtraction dominated by the constant clock offset — it could be hugely positive or
+/// negative and bears no relation to real lag.
+///
+/// ## The drift-baselined formula
+/// We cancel the constant offset by subtracting the best-case (freshest) offset ever observed:
+///
+/// ```text
+///   skew_at_release   = arrival_time_ms − media_ts_ms       // (receiver − publisher) domain
+///   base (min_skew)   = running MIN of skew_at_release       // best-case offset + min one-way delay
+///   content_staleness = (now_ms − last_released_media_ts_ms) − base, clamped ≥ 0
+/// ```
+///
+/// `(now − media_ts_painted)` is the capture→paint span expressed in the (receiver − publisher)
+/// domain; subtracting `base` (the minimum capture→arrival offset, i.e. the freshest frame ever
+/// seen) removes both the clock offset and the irreducible best-case one-way delay, leaving the
+/// EXCESS delay beyond best-case = true content lag. The constant offset cancels because it appears
+/// in BOTH `now − media_ts` (via media_ts) and `base` (via media_ts) with the same sign.
+///
+/// Behavior across the lifecycle (issue #1641):
+/// - Painting fresh content: `now ≈ arrival`, current skew ≈ base → staleness ≈ 0. ✓
+/// - Draining minutes-old content: `now` advances with real time while `media_ts` of the drained
+///   frames is minutes old → staleness is huge. ✓ (the invisible #1631-M2 case)
+/// - Freshness-skip / skip-to-live jumps `last_released_media_ts_ms` forward → staleness drops. ✓
+/// - Frozen stream (no releases): `now` keeps advancing, `last_released_media_ts_ms` is frozen →
+///   this function's value climbs (a frozen stream IS getting more stale). ✓ NOTE: this describes
+///   the value THIS function computes. On the wire it is additionally gated by `fps_received > 0`
+///   in the health reporter, so a fully-stalled stream with NO inbound packets (fps→0 after ~1s)
+///   reports 0.0 ("at live") to Prometheus, same as the sibling #1252 ms-gauges. The #1631-M2
+///   target case (draining stale content while packets keep arriving) keeps `fps_received > 0`,
+///   so the wire value climbs there as intended; the no-arrivals stall is observed instead by the
+///   relay-side freeze signals (#1637).
+///
+/// ## Caveats
+/// - Returns `0.0` when either anchor is `None` (cold start, or post-`flush()` re-baseline) — a
+///   `None` state must read "at live", never a stale latch.
+/// - Over a long meeting the publisher/receiver clocks may DRIFT, so a `base` captured early can
+///   slowly understate the true best-case offset (making staleness read slightly high). This is
+///   acceptable for a coarse diagnostic meant to surface MINUTES of lag, and it is reset on every
+///   `flush()` (stream restart). Deliberately NOT gold-plated with a decaying/windowed min.
+///
+/// Pure and side-effect free so the arithmetic can be unit-tested off the wasm-only worker path.
+pub fn content_staleness_ms(
+    now_ms: u128,
+    last_released_media_ts_ms: Option<f64>,
+    min_skew_ms: Option<f64>,
+) -> f64 {
+    let (Some(media_ts_ms), Some(base)) = (last_released_media_ts_ms, min_skew_ms) else {
+        return 0.0;
+    };
+    ((now_ms as f64 - media_ts_ms) - base).max(0.0)
 }
 
 #[cfg(test)]
@@ -1963,7 +2457,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded_frames.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -1996,7 +2490,7 @@ mod tests {
         let r2 = requests2.clone();
         let mut jb2 = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded2.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 r2.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2033,7 +2527,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2057,11 +2551,15 @@ mod tests {
             "sustained eviction within one throttle window must fire exactly once"
         );
 
-        // After the first fire the backoff exponent is 1, so the next interval is
-        // 1000 * 2^1 = 2000ms. An eviction only 1050ms after the first must STILL be
-        // throttled — proving the interval grew (issue #1479). Without backoff (fixed
-        // 1000ms) this would fire and bump the count to 2.
-        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 1400);
+        // Issue #1479: the keyframe-arrival gate now suppresses all further PLIs until a
+        // keyframe arrives. Insert an OLD keyframe (seq 1 <= last_decoded=1) to clear the gate
+        // without disturbing the buffer (rejected by old-frame check after gate clear).
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 2200);
+
+        // After the gate clears and the first fire the backoff exponent is 1, so the next
+        // interval is 1000 * 2^1 = 2000ms. An eviction only 1050ms after the first must STILL
+        // be throttled — proving the interval grew (issue #1479).
+        jb.insert_frame(create_test_frame(5, FrameType::DeltaFrame), 2250);
         jb.find_and_move_continuous_frames(3200); // 3200 - 2150 = 1050ms < 2000ms → throttled
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -2070,12 +2568,119 @@ mod tests {
         );
 
         // Past the backed-off window (>= 2000ms after the first fire) it fires again.
-        jb.insert_frame(create_test_frame(6, FrameType::DeltaFrame), 1450);
+        jb.insert_frame(create_test_frame(6, FrameType::DeltaFrame), 2300);
         jb.find_and_move_continuous_frames(4200); // 4200 - 2150 = 2050ms >= 2000ms → fires (#2)
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,
             "an eviction past the backed-off window fires a fresh request"
+        );
+    }
+
+    /// Issue #1479 — PRIMARY LOOP-BREAKER: after a proactive PLI fires, the arrival gate
+    /// suppresses ALL further proactive PLIs until a keyframe arrives. This decouples the
+    /// freshness-deadline eviction cadence (~10ms) from PLI emission, breaking the 1:1
+    /// freshness_skip→PLI coupling that created the meeting-wide storm.
+    ///
+    /// Mutation coverage: deleting `self.awaiting_proactive_keyframe = true` on fire allows
+    /// a second PLI to fire at the backoff interval (count goes to 2); deleting the gate
+    /// check (`if self.awaiting_proactive_keyframe { return false }`) has the same effect.
+    /// Deleting the keyframe-arrival clear means the gate never opens and the timeout test
+    /// at the end fails.
+    #[test]
+    fn proactive_pli_arrival_gate_suppresses_until_keyframe() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move |_head_age_ms| {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // last-good = seq 1.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+
+        // Keyframe-less backlog.
+        for s in 2u64..=10 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 300);
+        }
+
+        // First eviction fires the proactive PLI.
+        jb.find_and_move_continuous_frames(5000);
+        assert_eq!(requests.load(Ordering::SeqCst), 1, "first PLI fires");
+
+        // Subsequent evictions past the backoff window are SUPPRESSED by the arrival gate —
+        // no keyframe has arrived yet.
+        jb.find_and_move_continuous_frames(7100); // 2100ms > 2000ms (backoff exp=1) — would fire without gate
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "gate suppresses second PLI even past backoff interval"
+        );
+        jb.find_and_move_continuous_frames(15000); // 10000ms — would definitely fire without gate
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "gate suppresses indefinitely until keyframe arrives"
+        );
+
+        // A keyframe arrives (old seq to not disturb buffer) — clears the gate.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 15100);
+        assert!(!jb.awaiting_proactive_keyframe, "gate cleared by keyframe");
+
+        // Next eviction past backoff window fires again.
+        jb.find_and_move_continuous_frames(16100); // 16100 - 5000 = 11100ms > 8000ms (capped) → fires
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "after keyframe arrival gate clears, next eligible eviction fires"
+        );
+    }
+
+    /// Issue #1479 — TIMEOUT BACKSTOP: if no keyframe arrives within
+    /// `PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS`, the gate clears so a retry can fire.
+    #[test]
+    fn proactive_pli_arrival_gate_times_out() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move |_head_age_ms| {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        for s in 2u64..=20 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 300);
+        }
+
+        // First PLI fires.
+        let fire_time = 5000u128;
+        jb.find_and_move_continuous_frames(fire_time);
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        // Just before timeout — still gated.
+        let just_before = fire_time + (PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS as u128) - 100;
+        jb.find_and_move_continuous_frames(just_before);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "gate holds just before timeout"
+        );
+
+        // Past timeout — gate expires, next eligible eviction fires.
+        let past_timeout = fire_time + (PROACTIVE_KEYFRAME_ARRIVAL_TIMEOUT_MS as u128) + 100;
+        jb.find_and_move_continuous_frames(past_timeout);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "gate times out and a retry PLI fires"
         );
     }
 
@@ -2099,7 +2704,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2132,8 +2737,15 @@ mod tests {
         );
 
         // Sustained stall: the interval after each fire doubles — 2s, 4s, 8s, then capped at 8s.
+        // Each cycle: fire → insert an OLD keyframe (clears the #1479 arrival gate without
+        // disturbing the buffer — seq 1 is <= last_decoded so it's rejected after the gate
+        // clear) → wait for backoff → fire.
         let expected_gaps_ms = [2 * base, 4 * base, 8 * base, 8 * base];
         for (i, gap) in expected_gaps_ms.iter().enumerate() {
+            // An old keyframe arrives: clears the arrival gate (placed before old-frame check)
+            // but is rejected by the old-frame filter (seq 1 <= last_decoded_sequence_number=1).
+            jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), last_fire + 200);
+
             // Just BEFORE the backed-off interval → still throttled.
             jb.find_and_move_continuous_frames(last_fire + gap - 100);
             assert_eq!(
@@ -2161,13 +2773,10 @@ mod tests {
 
         // QUIET INTERVAL (genuine recovery): no proactive request fires for longer than
         // PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS. The next keyframe-less eviction after
-        // that gap must reset the exponent to 0 and fire at the BASE interval again. We poll
-        // once, `RESET_MS + a bit` after the last fire: that single poll is >= base (so it is
-        // eligible) and, because it crossed the reset threshold, the exponent is cleared FIRST,
-        // so it fires. With the reset deleted the exponent stays at the cap and the required
-        // interval is 8s — but RESET_MS (12s) > 8s, so to prove the *reset* (not just elapsed
-        // time) we follow with a second poll exactly base+ after this fire: that only fires if
-        // the exponent is now back at 0.
+        // that gap must reset the exponent to 0 and fire at the BASE interval again.
+        // First, insert an old keyframe to clear the #1479 arrival gate from the last fire.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), last_fire + 200);
+
         let reset_ms = PROACTIVE_KEYFRAME_REQUEST_BACKOFF_RESET_MS as u128;
         let quiet_fire = last_fire + reset_ms + 100;
         jb.find_and_move_continuous_frames(quiet_fire);
@@ -2177,14 +2786,12 @@ mod tests {
             "after a quiet interval the next eviction fires"
         );
 
-        // The DISCRIMINATING assert: a follow-up eviction only `2*base` after `quiet_fire` must
-        // FIRE — proving the exponent was reset to 0 (interval back to base), not still at the
-        // cap (which would require 8s). 2*base = 2000ms is >= base(1000, after the now-1 exponent
-        // doubles to 2s) … so we instead poll base+50 after, before the post-reset exponent's
-        // own 2s step. Precisely: after the reset-fire the exponent is 1, so the next interval is
-        // 2s; a poll at base+50 (1050ms) is < 2s and must be THROTTLED, and a poll at 2*base+50
-        // must FIRE. We assert the throttle first (distinguishes reset-to-0 from no-reset, since
-        // no-reset would also be throttled here — so this alone is not enough), then the fire.
+        // Clear the arrival gate again for the discriminating asserts.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), quiet_fire + 100);
+
+        // The DISCRIMINATING assert: after the reset-fire the exponent is 1, so the next
+        // interval is 2s; a poll at base+50 (1050ms) is < 2s and must be THROTTLED, and a poll
+        // at 2*base+50 must FIRE.
         jb.find_and_move_continuous_frames(quiet_fire + base + 50); // 1050ms < 2000ms post-reset step
         assert_eq!(
             requests.load(Ordering::SeqCst),
@@ -2209,7 +2816,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2255,7 +2862,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -2264,6 +2871,8 @@ mod tests {
 
         // Drive the exponent to the cap: last-good = seq 1, then a keyframe-less backlog polled
         // past each backed-off window so several requests fire (exponent climbs to >= cap).
+        // Between each fire we insert an OLD keyframe (seq 1, <= last_decoded) to clear the
+        // #1479 arrival gate without disturbing the buffer.
         jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
         jb.find_and_move_continuous_frames(200);
         for s in 2u64..=12 {
@@ -2272,6 +2881,8 @@ mod tests {
         let mut last_fire = 5000u128;
         jb.find_and_move_continuous_frames(last_fire); // fire #1 (exp→1)
         for gap in [2 * base, 4 * base, 8 * base, 8 * base] {
+            // Clear the arrival gate with an old keyframe (rejected but gate clears first).
+            jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), last_fire + 200);
             last_fire += gap + 50;
             jb.find_and_move_continuous_frames(last_fire); // fires; exponent climbs to the cap
         }
@@ -2283,8 +2894,8 @@ mod tests {
 
         jb.flush();
 
-        // Post-flush stall. First eviction fires immediately (last_keyframe_request_ms is None).
-        // After it, the exponent is 1 ONLY IF flush reset it (else it is cap+1, still cap).
+        // Post-flush stall. First eviction fires immediately (last_keyframe_request_ms is None,
+        // awaiting_proactive_keyframe is false after flush).
         jb.last_decoded_sequence_number = Some(100);
         for s in 101u64..=104 {
             jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), 20_000);
@@ -2296,6 +2907,9 @@ mod tests {
             pre_flush + 1,
             "first post-flush eviction fires"
         );
+
+        // Clear the arrival gate with an old keyframe (seq 100 == last_decoded, so rejected).
+        jb.insert_frame(create_test_frame(100, FrameType::KeyFrame), t0 + 100);
 
         // Discriminator: with the exponent reset to 0 → now 1, the next interval is 2s. A poll
         // base+50 (1050ms) after the post-flush fire must be THROTTLED, and a poll 2*base+50 must
@@ -3250,7 +3864,7 @@ mod tests {
         let req = requests.clone();
         let mut jb = JitterBuffer::with_keyframe_request(
             Box::new(MockDecoder::new_with_vec(decoded.clone())),
-            Box::new(move || {
+            Box::new(move |_head_age_ms| {
                 req.fetch_add(1, Ordering::SeqCst);
             }),
         );
@@ -3451,5 +4065,478 @@ mod tests {
             jb.governor_last_skip_ms.is_none(),
             "flush must clear the last-skip anchor"
         );
+    }
+
+    // ---- #1641: content-staleness (content AGE) receive-path diagnostic -----------------------
+
+    /// Build a `VideoFrame` carrying a chosen media (capture) timestamp in MICROSECONDS, so a test
+    /// can exercise the real release-path content-staleness fold (which reads `frame.frame.timestamp`
+    /// in microseconds). `create_test_frame` hard-codes `timestamp: 0.0`, which the fold skips.
+    fn create_test_frame_with_media_ts(
+        seq: u64,
+        frame_type: FrameType,
+        media_ts_us: f64,
+    ) -> VideoFrame {
+        VideoFrame {
+            sequence_number: seq,
+            frame_type,
+            codec: crate::frame::FrameCodec::default(),
+            data: vec![0; 10],
+            timestamp: media_ts_us,
+        }
+    }
+
+    /// (a) Fresh content: `now ≈ arrival` and the current skew equals `base`, so the drift-baselined
+    /// formula must read ~0. Calls the PRODUCTION `content_staleness_ms` free fn directly.
+    ///
+    /// Mutation coverage: dropping the `− base` term makes this read `now − media_ts = 500` ≠ 0 and
+    /// fail. media_ts = 1000ms (publisher clock), arrival/now = 1500ms (receiver clock) ⇒ base = 500.
+    #[test]
+    fn content_staleness_fresh_content_reads_zero() {
+        let media_ts_ms = 1000.0;
+        let base = 500.0; // arrival(1500) − media_ts(1000)
+        let now_ms = 1500u128; // now == arrival: freshest possible
+        let staleness = content_staleness_ms(now_ms, Some(media_ts_ms), Some(base));
+        assert_eq!(
+            staleness, 0.0,
+            "fresh content (now==arrival, skew==base) must read ~0; got {staleness}"
+        );
+    }
+
+    /// (b) Drained stale content: `now` has advanced minutes past the painted frame's capture time
+    /// while `base` (best-case offset) stays small — staleness must read the EXCESS over best-case,
+    /// i.e. ≈ the real content lag. This is the #1631-M2 case that `playout_latency_ms` (capped at
+    /// 1800ms) and `paint_lag_ms` (queue depth) both miss.
+    ///
+    /// Mutation coverage: the exact-equality assert (300_000, not 300_050) fails if the `− base`
+    /// term is dropped, and fails if `now − media_ts` is computed with the wrong operand order.
+    #[test]
+    fn content_staleness_drained_stale_content_reads_excess_over_base() {
+        let media_ts_ms = 1000.0; // content captured at publisher-clock t=1000ms
+        let base = 50.0; // best-case capture→arrival offset ever seen (R−P domain)
+        let five_minutes_ms = 300_000.0;
+        // now is 5 minutes + base past the painted frame's media timestamp: a stream draining
+        // 5-minute-old content while frames keep flowing (paint_lag stays ~0, playout_latency capped).
+        let now_ms = (media_ts_ms + five_minutes_ms + base) as u128;
+        let staleness = content_staleness_ms(now_ms, Some(media_ts_ms), Some(base));
+        assert_eq!(
+            staleness, five_minutes_ms,
+            "drained 5-min-old content must read the excess over best-case (300_000ms), not the raw \
+             cross-clock span; got {staleness}"
+        );
+        assert!(
+            staleness > MAX_PLAYOUT_AGE_MS,
+            "the whole point: content staleness can exceed the 1800ms playout-latency cap"
+        );
+    }
+
+    /// (c) Guard inputs: either anchor `None` (cold start / post-flush) must read 0, never a stale
+    /// latch or a NaN. Also covers the media_ts==0 effect indirectly via the None path that the
+    /// release-fold skip produces.
+    ///
+    /// Mutation coverage: replacing the `None => return 0.0` guard with an `unwrap_or` of a nonzero
+    /// default, or removing the early return, fails one of these asserts.
+    #[test]
+    fn content_staleness_none_inputs_read_zero() {
+        assert_eq!(
+            content_staleness_ms(10_000, None, Some(50.0)),
+            0.0,
+            "media_ts None (cold start) must read 0"
+        );
+        assert_eq!(
+            content_staleness_ms(10_000, Some(1000.0), None),
+            0.0,
+            "min_skew None (cold start) must read 0"
+        );
+        assert_eq!(
+            content_staleness_ms(10_000, None, None),
+            0.0,
+            "both None must read 0"
+        );
+    }
+
+    /// The release-path fold must SKIP frames whose media_ts <= 0 (test-inject path stamps 0.0;
+    /// unknown-codec / very old clients carry no usable presentation timestamp). Folding a bogus 0
+    /// would record a skew ≈ arrival_time_ms, corrupting `min_skew_ms` so all real staleness reads 0.
+    ///
+    /// Mutation coverage: removing the `media_ts_ms <= 0.0` skip latches the anchors and makes the
+    /// live staleness nonzero here, failing the `== 0.0` assert.
+    #[test]
+    fn content_staleness_release_fold_skips_zero_media_ts() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+        let mut time = 1000u128;
+        // create_test_frame stamps timestamp: 0.0, so the fold must skip it.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), time);
+        time += 100;
+        jb.find_and_move_continuous_frames(time); // releases frame 1
+        assert!(
+            jb.last_released_media_ts_ms.is_none(),
+            "a media_ts==0 frame must not set the content-staleness media anchor"
+        );
+        assert!(
+            jb.min_skew_ms.is_none(),
+            "a media_ts==0 frame must not seed the min-skew baseline"
+        );
+        // With anchors still None, live staleness reads 0 regardless of how far `now` has advanced.
+        assert_eq!(jb.content_staleness_ms_live(10_000_000), 0.0);
+    }
+
+    /// (d) Integration: insert+release real frames carrying media timestamps through the PRODUCTION
+    /// release path (`find_and_move_continuous_frames` → `push_to_decoder` →
+    /// `record_release_content_staleness`), then assert the live staleness reflects content age and
+    /// that `flush()` resets it back to 0.
+    ///
+    /// Lifecycle covered: cold-start (None ⇒ 0), fresh release (~0), frozen stream (now advances,
+    /// no new release ⇒ staleness climbs), then flush (⇒ 0 re-baseline).
+    ///
+    /// Mutation coverage: failing to update the anchors in the release path leaves staleness 0 and
+    /// fails the "climbs" assert; failing to reset them in `flush()` fails the post-flush `== 0.0`
+    /// assert (live staleness would still climb against the stale media anchor).
+    #[test]
+    fn content_staleness_integration_release_then_flush_resets() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+
+        // Cold start: no release yet ⇒ 0.
+        assert_eq!(
+            jb.content_staleness_ms_live(5000),
+            0.0,
+            "cold start (no release) must read 0"
+        );
+
+        // Release a keyframe captured at publisher-clock media_ts = 2000ms, arriving at receiver
+        // wall-clock 5000ms (so base skew = 3000ms). Use the real insert→release path.
+        let media_ts_ms = 2000.0;
+        let arrival_ms = 5000u128;
+        jb.insert_frame(
+            create_test_frame_with_media_ts(1, FrameType::KeyFrame, media_ts_ms * 1000.0),
+            arrival_ms,
+        );
+        // find_and_move releases once the playout delay elapses; advance `now` past it.
+        let release_now = arrival_ms + 100;
+        jb.find_and_move_continuous_frames(release_now);
+        assert_eq!(
+            jb.last_released_media_ts_ms,
+            Some(media_ts_ms),
+            "release must record the painted frame's media_ts (µs→ms)"
+        );
+        assert_eq!(
+            jb.min_skew_ms,
+            Some(arrival_ms as f64 - media_ts_ms),
+            "release must seed the min-skew baseline from arrival − media_ts"
+        );
+
+        // Fresh-ish: just after release, staleness ≈ (release_now − media_ts) − base
+        // = (5100 − 2000) − 3000 = 100ms. Small, as expected for freshly-released content.
+        assert_eq!(
+            jb.content_staleness_ms_live(release_now),
+            100.0,
+            "freshly released content should read a small staleness (the 100ms release lag)"
+        );
+
+        // Frozen stream: no further releases, `now` advances 4 minutes. media anchor frozen ⇒
+        // staleness climbs to ~ the elapsed-since-capture minus base.
+        let frozen_now = release_now + 240_000;
+        let frozen_staleness = jb.content_staleness_ms_live(frozen_now);
+        assert_eq!(
+            frozen_staleness,
+            (frozen_now as f64 - media_ts_ms) - (arrival_ms as f64 - media_ts_ms),
+            "a frozen stream's staleness must climb as `now` advances against the frozen media anchor"
+        );
+        assert!(
+            frozen_staleness > MAX_PLAYOUT_AGE_MS,
+            "frozen-stream staleness must be able to exceed the 1800ms playout cap"
+        );
+
+        // Flush (stream restart / reset_pipeline): anchors reset ⇒ staleness back to 0 even though
+        // `now` is far in the future.
+        jb.flush();
+        assert!(jb.last_released_media_ts_ms.is_none());
+        assert!(jb.min_skew_ms.is_none());
+        assert_eq!(
+            jb.content_staleness_ms_live(frozen_now),
+            0.0,
+            "flush must reset the content-staleness anchors so a restarted stream reads 0"
+        );
+    }
+
+    // === Issue #1662: keyframe-less hold-ceiling escalation ===
+
+    /// Shared handle to the escalation signals a `JitterBuffer` raised: the count of
+    /// `request_escalation` invocations, the last `head_age_ms` passed, and a controllable return
+    /// value standing in for the worker's cooldown gate. The buffer DETECTS the ceiling (every tick)
+    /// and OWNS the `reset()` call; the cooldown/diagnostic live in the worker (#1662), so this spy
+    /// lets a test drive the gate decision and observe both the per-tick signal and (via the mock's
+    /// reset counter) the gated reset.
+    #[derive(Clone)]
+    struct EscalationSpy {
+        count: Arc<AtomicU32>,
+        last_head_age_bits: Arc<std::sync::atomic::AtomicU64>,
+        gate_open: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl EscalationSpy {
+        /// `gate_open` = whether the hook returns `true` (worker would gate the escalation IN).
+        fn new(gate_open: bool) -> Self {
+            Self {
+                count: Arc::new(AtomicU32::new(0)),
+                last_head_age_bits: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                gate_open: Arc::new(std::sync::atomic::AtomicBool::new(gate_open)),
+            }
+        }
+        fn count(&self) -> u32 {
+            self.count.load(Ordering::SeqCst)
+        }
+        fn last_head_age(&self) -> f64 {
+            f64::from_bits(self.last_head_age_bits.load(Ordering::SeqCst))
+        }
+        fn hook(&self) -> Box<dyn Fn(f64) -> bool> {
+            let count = self.count.clone();
+            let bits = self.last_head_age_bits.clone();
+            let gate_open = self.gate_open.clone();
+            Box::new(move |head_age_ms: f64| {
+                count.fetch_add(1, Ordering::SeqCst);
+                bits.store(head_age_ms.to_bits(), Ordering::SeqCst);
+                gate_open.load(Ordering::SeqCst)
+            })
+        }
+    }
+
+    /// Build a jitter buffer wedged in the keyframe-LESS held-last-good state: a keyframe is
+    /// decoded (last-good = seq 1), then ONLY delta frames arrive (no keyframe to skip to), all at
+    /// the same early `arrival_ms`. The next continuous delta (seq 2) is the perpetual head; the
+    /// keyframe-less branch evicts one head delta per poll and the next delta — same old arrival —
+    /// becomes the head, so the head stays old and `head_age` is driven purely by how far the poll
+    /// clock has advanced past `arrival_ms`. Returns the buffer, an [`EscalationSpy`] wired to its
+    /// `request_escalation` hook, a handle to the mock decoder's reset counter (to observe the gated
+    /// `reset()`), and `arrival_ms`. Mirrors the existing keyframe-less stall tests' construction so
+    /// the trigger rides the SAME production path they exercise.
+    fn keyframe_less_stall_buffer(
+        gate_open: bool,
+    ) -> (
+        JitterBuffer<crate::decoder::DecodedFrame>,
+        EscalationSpy,
+        Arc<AtomicU32>,
+        u128,
+    ) {
+        let decoded_frames = Arc::new(Mutex::new(Vec::new()));
+        let reset_count = Arc::new(AtomicU32::new(0));
+        let mock = Box::new(MockDecoder::new_with_vec_and_depth(
+            decoded_frames,
+            Arc::new(AtomicU32::new(0)),
+            reset_count.clone(),
+        ));
+        let spy = EscalationSpy::new(gate_open);
+        let mut jb = JitterBuffer::with_recovery_hooks(mock, Box::new(|_| {}), spy.hook());
+
+        // Decode a keyframe so last-good = seq 1.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+
+        // Keyframe-less backlog: deltas only, all at one early arrival. Plenty of them so the head
+        // keeps aging across many polls without the buffer emptying (each poll evicts one head).
+        let arrival_ms = 1000u128;
+        for s in 2u64..=200 {
+            jb.insert_frame(create_test_frame(s, FrameType::DeltaFrame), arrival_ms);
+        }
+        (jb, spy, reset_count, arrival_ms)
+    }
+
+    /// PRIMARY #1662 regression test (buffer trigger + gated reset). The keyframe-less held-last-good
+    /// freeze MUST consult the escalation hook once `head_age` crosses `MAX_KEYFRAME_LESS_HOLD_MS`
+    /// (and MUST NOT below it, so it never pre-empts the cheaper #1479 recovery for a transient
+    /// stall); when the hook gates the escalation IN it MUST fire the decoder `reset()`.
+    ///
+    /// Drives the REAL production path: `find_and_move_continuous_frames` →
+    /// `enforce_freshness_deadline` (keyframe-less branch) → `signal_keyframe_less_ceiling` →
+    /// `(self.request_escalation)(head_age_ms)` → `self.decoder.reset()`, observed via the injected
+    /// hook (with the gate OPEN) and the mock decoder's reset counter — no logic re-implemented
+    /// inline.
+    ///
+    /// FAILS ON UNFIXED CODE: today's keyframe-less branch never consults the hook or resets, so both
+    /// the hook count and `reset_count` stay 0 no matter how large `head_age` grows. Reverting
+    /// `signal_keyframe_less_ceiling` (or its call site) fails the post-ceiling asserts. The
+    /// below-ceiling assert guards against an over-eager trigger that would pre-empt cheaper recovery.
+    #[test]
+    fn keyframe_less_ceiling_triggers_gated_reset_at_ceiling_not_before() {
+        let (mut jb, spy, reset_count, arrival_ms) = keyframe_less_stall_buffer(true);
+
+        // (1) Head is stale (past MAX_PLAYOUT_AGE_MS) but BELOW the keyframe-less ceiling: the
+        // cheaper eviction + throttled PLI own recovery; the hook is NOT consulted and NO reset.
+        let below_ceiling = arrival_ms + (MAX_PLAYOUT_AGE_MS as u128) + 500; // head_age ≈ 2300ms
+        assert!((below_ceiling - arrival_ms) < MAX_KEYFRAME_LESS_HOLD_MS as u128);
+        jb.find_and_move_continuous_frames(below_ceiling);
+        assert_eq!(
+            spy.count(),
+            0,
+            "below the keyframe-less ceiling, the escalation hook must NOT be consulted"
+        );
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "below the ceiling there must be no decoder reset"
+        );
+        // The routine keyframe-less hold still surfaced — and it is NOT marked escalated.
+        let routine = jb
+            .take_freshness_skip()
+            .expect("a below-ceiling keyframe-less eviction surfaces a routine freshness skip");
+        assert!(
+            !routine.escalated,
+            "a below-ceiling keyframe-less hold must surface escalated=false: {routine:?}"
+        );
+
+        // (2) Head crosses the ceiling: the hook is consulted with the real head_age, and because
+        // the gate is open it returns true → the buffer fires the decoder reset.
+        let above_ceiling = arrival_ms + (MAX_KEYFRAME_LESS_HOLD_MS as u128) + 100; // head_age ≈ 6100ms
+        jb.find_and_move_continuous_frames(above_ceiling);
+        assert_eq!(
+            spy.count(),
+            1,
+            "crossing MAX_KEYFRAME_LESS_HOLD_MS must consult the escalation hook (#1662)"
+        );
+        assert!(
+            spy.last_head_age() >= MAX_KEYFRAME_LESS_HOLD_MS,
+            "the escalation hook must be passed a head_age at/above the ceiling: {}",
+            spy.last_head_age()
+        );
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            1,
+            "a gated-in escalation must fire exactly one decoder reset (#1662)"
+        );
+    }
+
+    /// #1662 split-responsibility contract: the buffer CONSULTS the hook on EVERY tick past the
+    /// ceiling (it does NOT gate), and fires `reset()` ONLY when the hook returns true. Gating (the
+    /// cooldown) is the WORKER's job, because the reset the worker triggers rebuilds the buffer and
+    /// would wipe a buffer-held anchor (review B1). With the gate CLOSED here, the hook is consulted
+    /// every tick but no reset fires — proving the buffer respects the worker's gate and does not
+    /// gate itself.
+    ///
+    /// FAILS if someone re-introduces a buffer-side cooldown gate (the hook would be consulted only
+    /// once, not once per tick) — exactly the regression that re-opens B1 — or if the buffer reset
+    /// ignored the hook's return (reset_count would climb despite the closed gate).
+    #[test]
+    fn keyframe_less_ceiling_consults_hook_every_tick_and_respects_closed_gate() {
+        let (mut jb, spy, reset_count, arrival_ms) = keyframe_less_stall_buffer(false);
+
+        // Four polls all past the ceiling, 10ms apart. The buffer must consult the hook on each (no
+        // self-gating), but with the gate CLOSED it must NOT reset.
+        let first = arrival_ms + (MAX_KEYFRAME_LESS_HOLD_MS as u128) + 100;
+        jb.find_and_move_continuous_frames(first);
+        jb.find_and_move_continuous_frames(first + 10);
+        jb.find_and_move_continuous_frames(first + 20);
+        jb.find_and_move_continuous_frames(first + 30);
+        assert_eq!(
+            spy.count(),
+            4,
+            "the buffer must consult the escalation hook on every tick past the ceiling (gating is the worker's job, review B1)"
+        );
+        assert_eq!(
+            reset_count.load(Ordering::SeqCst),
+            0,
+            "with the worker gate closed, the buffer must not reset (it respects the hook's return)"
+        );
+    }
+
+    /// #1662 hysteresis guard — the cooldown decision, tested as the pure function the worker uses.
+    /// This is where the no-storm / no-wedge / cross-reset-survival property is pinned, because the
+    /// worker owns the anchor (a thread-local that survives the buffer rebuild) and gates the
+    /// expensive `reset()` on this function.
+    ///
+    /// FAILS ON UNFIXED COOLDOWN: if `keyframe_less_escalation_due` ignored the interval (always
+    /// returned true), the within-window assert fails; if it never re-armed, the past-window assert
+    /// fails. The cross-reset case asserts the property the WHOLE redesign exists for (review B1):
+    /// because the anchor is passed in (worker-owned, not buffer-owned), a reset that rebuilds the
+    /// buffer does NOT reset the cooldown — re-escalation is still bounded by the 8s interval, not
+    /// the ~6s head re-age.
+    #[test]
+    fn keyframe_less_escalation_due_cooldown_semantics() {
+        let interval = KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS as u128;
+
+        // Cold start (no prior escalation) → due.
+        assert!(
+            keyframe_less_escalation_due(None, 10_000),
+            "first escalation on a stream is always due"
+        );
+
+        // Within the cooldown window after a prior escalation → NOT due (no storm).
+        let last = 10_000u128;
+        assert!(
+            !keyframe_less_escalation_due(Some(last), last + interval - 100),
+            "within KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS the escalation must be throttled"
+        );
+
+        // Past the window → due again (re-arms; cannot wedge a still-frozen stream shut).
+        assert!(
+            keyframe_less_escalation_due(Some(last), last + interval + 50),
+            "past the cooldown window a still-frozen stream may escalate again (re-arms, cannot wedge)"
+        );
+
+        // Cross-reset (review B1): the worker keeps the anchor across the buffer rebuild a reset
+        // triggers. So even though the rebuilt buffer's head re-ages to the ceiling in ~6s
+        // (< 8s interval), the cooldown — anchored at the prior escalation time — still throttles.
+        let re_age_ms = MAX_KEYFRAME_LESS_HOLD_MS as u128; // ~6000ms to re-cross the ceiling post-reset
+        assert!(
+            re_age_ms < interval,
+            "precondition: the post-reset re-age is faster than the cooldown, so a buffer-held anchor would have re-escalated early"
+        );
+        assert!(
+            !keyframe_less_escalation_due(Some(last), last + re_age_ms),
+            "with a worker-owned anchor, a reset+re-age within the window must NOT re-escalate (this is the B1 fix)"
+        );
+    }
+
+    /// #1662 wiring (review follow-up): the worker's escalation gate is the pure
+    /// `decide_keyframe_less_escalation`. A gated-IN escalation MUST (a) advance the anchor to
+    /// `now_ms` so the cooldown survives the buffer rebuild (B1), and (b) carry an `escalated: true`
+    /// diagnostic with `keyframe_seq: None` / `dropped: 0` (B2). A throttled call MUST return `None`
+    /// (no anchor advance, no diagnostic). This pins the wasm-only worker hook's contract natively.
+    ///
+    /// FAILS if the production code forgets the anchor advance (the returned anchor would not equal
+    /// `now_ms`) or builds the skip with `escalated: false` — the two wiring regressions a wasm-only
+    /// hook would hide.
+    #[test]
+    fn decide_keyframe_less_escalation_advances_anchor_and_marks_escalated() {
+        let interval = KEYFRAME_LESS_ESCALATION_MIN_INTERVAL_MS as u128;
+        let head_age = MAX_KEYFRAME_LESS_HOLD_MS + 250.0;
+
+        // Cold start → escalates: anchor advances to now, diagnostic is marked escalated.
+        let now = 50_000u128;
+        let (anchor, skip) = decide_keyframe_less_escalation(None, now, head_age)
+            .expect("cold-start escalation must be permitted");
+        assert_eq!(
+            anchor, now,
+            "the new anchor must be now_ms (B1: advance the cooldown)"
+        );
+        assert!(
+            skip.escalated,
+            "the escalation diagnostic must be marked escalated (B2)"
+        );
+        assert!(
+            skip.keyframe_seq.is_none(),
+            "an escalation is still the keyframe-less case"
+        );
+        assert_eq!(skip.dropped, 0, "the escalation event itself drops nothing");
+        assert_eq!(
+            skip.head_age_ms, head_age,
+            "the diagnostic must carry the real head_age"
+        );
+
+        // Within the cooldown window → None (no anchor advance, no diagnostic, no reset).
+        assert!(
+            decide_keyframe_less_escalation(Some(now), now + interval - 100, head_age).is_none(),
+            "within the cooldown window the gate must return None"
+        );
+
+        // Past the window → escalates again with the advanced anchor.
+        let later = now + interval + 1;
+        let (anchor2, skip2) = decide_keyframe_less_escalation(Some(now), later, head_age)
+            .expect("past the cooldown a still-frozen stream re-escalates");
+        assert_eq!(
+            anchor2, later,
+            "the re-escalation advances the anchor to the new now_ms"
+        );
+        assert!(skip2.escalated);
     }
 }

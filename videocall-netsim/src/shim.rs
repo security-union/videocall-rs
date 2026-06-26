@@ -806,4 +806,81 @@ mod tests {
         // The Up shim at 8 kbps should impose some delay on 10 KB.
         assert!(matches!(up.admit(10_000), Admission::Delay(_)));
     }
+
+    #[test]
+    fn delay_and_duplicate_delays_and_duplicates() {
+        // `DelayAndDuplicate(d)` encodes BOTH behaviors at once: the caller
+        // must sleep `d` (the delay) AND emit one extra copy (the duplicate).
+        // With `duplicate_pct = 100.0` every packet duplicates — a
+        // deterministic, tolerance-free degenerate case — and `jitter_ms = 0`
+        // with `loss_pct = 0` (default) pins the delay payload to exactly
+        // `latency_ms`. So every `admit` MUST return
+        // `DelayAndDuplicate(Duration::from_millis(100))`.
+        let profile = NetworkProfile {
+            latency_ms: 100,
+            jitter_ms: 0,
+            duplicate_pct: 100.0,
+            seed: Some(99),
+            ..Default::default()
+        };
+        let shim = NetSimShim::new(profile, Direction::Up);
+        let n = 1000;
+        let mut dups = 0;
+        for _ in 0..n {
+            match shim.admit(500) {
+                // DUPLICATION assertion: the variant must be exactly
+                // `DelayAndDuplicate`. If Step 5 stopped signalling the extra
+                // copy (returned `Delay(total_delay)` instead), this arm would
+                // never match and the `other =>` arm below would panic.
+                Admission::DelayAndDuplicate(d) => {
+                    // DELAY assertion: the exact payload. If the base latency
+                    // stopped being added to `total_delay`, this would observe
+                    // 0ms and fail. Exact (not `d > 0`) is sound because
+                    // jitter_ms = 0 makes the value deterministic.
+                    assert_eq!(d, Duration::from_millis(100));
+                    dups += 1;
+                }
+                other => panic!("expected DelayAndDuplicate(100ms), got {other:?}"),
+            }
+        }
+        // Every packet duplicated — no statistical tolerance needed.
+        assert_eq!(dups, n, "duplicate_pct=100 must duplicate every packet");
+    }
+
+    #[test]
+    fn duplicate_rate() {
+        // Statistical companion to `delay_and_duplicate_delays_and_duplicates`:
+        // proves the `duplicate_pct` probability gate (Step 5) actually fires
+        // at the requested rate, not just at the 100% degenerate case. Mirrors
+        // `loss_rate`'s seeded ±2% style. `latency_ms = 100` makes the
+        // non-duplicated packets `Delay(_)` so the two outcomes are distinct;
+        // we count only the `DelayAndDuplicate` arm.
+        let profile = NetworkProfile {
+            latency_ms: 100,
+            jitter_ms: 0,
+            duplicate_pct: 50.0,
+            seed: Some(42),
+            ..Default::default()
+        };
+        let shim = NetSimShim::new(profile, Direction::Up);
+        let n = 10_000;
+        let mut dups = 0;
+        for _ in 0..n {
+            match shim.admit(500) {
+                Admission::DelayAndDuplicate(d) => {
+                    assert_eq!(d, Duration::from_millis(100));
+                    dups += 1;
+                }
+                // Non-duplicated packets still carry the base latency.
+                Admission::Delay(d) => assert_eq!(d, Duration::from_millis(100)),
+                other => panic!("expected Delay or DelayAndDuplicate, got {other:?}"),
+            }
+        }
+        let expected = n / 2;
+        let tol = n / 50; // ±2%
+        assert!(
+            (dups as i64 - expected as i64).unsigned_abs() < tol as u64,
+            "dups={dups}, expected {expected}±{tol}"
+        );
+    }
 }

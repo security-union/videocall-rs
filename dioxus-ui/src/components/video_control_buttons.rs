@@ -333,6 +333,51 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
 }
 
 // =============================================================================
+// Meeting Options Button (host-only)
+// =============================================================================
+
+/// Host-only in-call control that opens the Meeting Options panel (waiting
+/// room, admitted-can-admit, end-on-host-leave, allow-guests). Lets the host
+/// change meeting options live without navigating away from the call.
+#[component]
+pub fn MeetingOptionsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
+    let class = if open {
+        "video-control-button active"
+    } else {
+        "video-control-button"
+    };
+
+    let tooltip = if open {
+        "Close Meeting Options"
+    } else {
+        "Meeting Options"
+    };
+
+    rsx! {
+        button {
+            class,
+            "data-testid": "open-meeting-options",
+            "aria-label": "Meeting options",
+            onclick: move |evt| onclick.call(evt),
+
+            svg {
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M12 20h9" }
+                path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
+            }
+
+            span { class: "tooltip", "{tooltip}" }
+        }
+    }
+}
+
+// =============================================================================
 // Mock Peers Button (debug / layout testing)
 // =============================================================================
 

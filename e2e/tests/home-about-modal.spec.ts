@@ -3,6 +3,7 @@ import path from "node:path";
 import { test, expect } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { setShowBuildGitInfoFlag } from "../helpers/show-build-git-info-config";
 
 /**
  * E2E tests for the "About" modal on the homepage (issue 785).
@@ -84,12 +85,39 @@ test.describe("Homepage About modal", () => {
 
     const aboutLink = page.locator('[data-testid="about-footer-link"]');
     await expect(aboutLink).toBeVisible({ timeout: 10_000 });
+    // Non-anchored RegExp → matches as a substring, so the ungated
+    // " \u{00b7} built <date>" suffix (issue #1480) appended after the version
+    // does NOT break this prefix assertion.
     await expect(aboutLink).toHaveText(new RegExp(`About videocall-ui v${CLIENT_VERSION}`));
+  });
+
+  test("footer shows the ungated ' \u{00b7} built <YYYY-MM-DD>' build-date suffix (issue #1480)", async ({
+    page,
+  }) => {
+    // Issue #1480: the home footer reads
+    //   `About videocall-ui v<version> \u{00b7} built <YYYY-MM-DD>`
+    // The " \u{00b7} built <date>" suffix is UNGATED (shown regardless of
+    // showBuildGitInfo) — it is the build TIMESTAMP compacted to its calendar
+    // date (`build_date(env!("BUILD_TIMESTAMP"))` in pages/home.rs). It is
+    // omitted entirely only when build.rs emitted the `"unknown"` sentinel. The
+    // E2E stack builds with a real timestamp, so the suffix is present.
+    await page.goto("/");
+
+    const aboutLink = page.locator('[data-testid="about-footer-link"]');
+    await expect(aboutLink).toBeVisible({ timeout: 10_000 });
+    // U+00B7 MIDDLE DOT separator + a literal "built" + a YYYY-MM-DD-shaped date.
+    await expect(aboutLink).toHaveText(/· built \d{4}-\d{2}-\d{2}/);
   });
 
   test("clicking the footer link opens the About modal with client + server rows", async ({
     page,
+    context,
   }) => {
+    // Issue #1480: pin showBuildGitInfo ON EXPLICITLY (rather than leaning on the
+    // committed config.js default) so this test's commit/branch assertions are
+    // self-documenting and survive a future flip of the committed default. Must
+    // run before the first navigation so the very first /config.js is patched.
+    await setShowBuildGitInfoFlag(context, "true");
     await page.goto("/");
 
     await page.locator('[data-testid="about-footer-link"]').click();
@@ -104,12 +132,73 @@ test.describe("Homepage About modal", () => {
     await expect(modal).toContainText(`v${CLIENT_VERSION}`);
     await expect(modal).toContainText("videocall-ui");
 
+    // Issue #1480 — Client section: with showBuildGitInfo truthy the Commit AND
+    // Branch rows are present (each an `.about-modal-row` whose `.about-modal-label`
+    // is the row name), and the always-shown Built row is present. These labels
+    // pin the gated rows by their stable label text, independent of the (volatile)
+    // SHA / branch / timestamp VALUES the build compiles in.
+    const clientLabels = modal.locator(".about-modal-row .about-modal-label");
+    await expect(clientLabels.filter({ hasText: "Commit" })).toHaveCount(1);
+    await expect(clientLabels.filter({ hasText: "Branch" })).toHaveCount(1);
+    await expect(clientLabels.filter({ hasText: "Built" })).toHaveCount(1);
+
     // Server section rows from the mocked response.
     await expect(modal).toContainText("meeting-api");
     await expect(modal).toContainText("1.2.3");
-    // Short SHA (first 7 chars) of "deadbeefcafef00d".
+    // Short SHA (first 7 chars) of "deadbeefcafef00d" — present ONLY because the
+    // server table's gated Commit column is shown (showBuildGitInfo truthy).
     await expect(modal).toContainText("deadbee");
     await expect(modal).toContainText("websocket");
+
+    // Issue #1480 — Server table: the gated `Commit` header span is present and
+    // the rows use the base 4-col `.about-modal-row` (NOT the 3-col
+    // `--server-nogit` modifier). The `Built` header is always present.
+    const serverHeader = modal.locator(".about-modal-row--header");
+    await expect(serverHeader).toContainText("Commit");
+    await expect(serverHeader).toContainText("Built");
+    await expect(modal.locator(".about-modal-row--server-nogit")).toHaveCount(0);
+  });
+
+  test("About modal HIDES commit/branch when showBuildGitInfo is falsey, but keeps version + built (issue #1480)", async ({
+    page,
+    context,
+  }) => {
+    // Issue #1480 HIDDEN path — the production-style default: github info
+    // (commit + branch) FAILS CLOSED. We force showBuildGitInfo OFF for this
+    // context only (the committed e2e config.js ships it "true"), exercising the
+    // exact gating a production config.js that omits the key would produce. The
+    // rows/columns are rsx-`if`-gated, so they are REMOVED from the DOM (not
+    // CSS-hidden) — asserted via toHaveCount(0).
+    await setShowBuildGitInfoFlag(context, "false");
+    await page.goto("/");
+
+    await page.locator('[data-testid="about-footer-link"]').click();
+
+    const modal = page.locator('[data-testid="about-modal"]');
+    await expect(modal).toBeVisible({ timeout: 5_000 });
+
+    // Version + Built (the ALWAYS-shown rows) remain.
+    await expect(modal).toContainText(`v${CLIENT_VERSION}`);
+    await expect(modal).toContainText("videocall-ui");
+    const clientLabels = modal.locator(".about-modal-row .about-modal-label");
+    await expect(clientLabels.filter({ hasText: "Built" })).toHaveCount(1);
+
+    // Client section: Commit + Branch rows are GONE from the DOM.
+    await expect(clientLabels.filter({ hasText: "Commit" })).toHaveCount(0);
+    await expect(clientLabels.filter({ hasText: "Branch" })).toHaveCount(0);
+
+    // Server table still renders (the mocked response is reused), but with the
+    // 3-col `--server-nogit` modifier and NO Commit column. Wait for the server
+    // section to finish loading by anchoring on a known mocked service row, then
+    // assert the gated Commit header span is absent while Built is still present.
+    await expect(modal).toContainText("meeting-api");
+    const serverHeader = modal.locator(".about-modal-row--header");
+    await expect(serverHeader).toContainText("Built");
+    await expect(serverHeader).not.toContainText("Commit");
+    // The short SHA of the mocked git_sha is NOT rendered (no server Commit col).
+    await expect(modal).not.toContainText("deadbee");
+    // Header + every data row carry the 3-col nogit modifier (header + 2 rows).
+    await expect(modal.locator(".about-modal-row--server-nogit")).toHaveCount(3);
   });
 
   test("dialog autofocuses on open and Escape closes it", async ({ page }) => {

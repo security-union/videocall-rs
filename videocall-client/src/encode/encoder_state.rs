@@ -103,6 +103,35 @@ pub(super) fn pli_keyframe_allowed(
     }
 }
 
+/// Determines whether a periodic keyframe is due this frame (issue #1510).
+/// Shared by both camera and screen encode loops so the test exercises the
+/// exact production predicate (not a copy).
+///
+/// Returns `true` when EITHER:
+/// - The frame counter hits the tier's modulo boundary, OR
+/// - Wall-clock since the last keyframe exceeds `max_interval_ms`, OR
+/// - `last_keyframe_emit_ms` is `None` AND `frame_counter > 0` (a reconnect
+///   cleared the clock mid-session; emit immediately to re-arm the ceiling).
+#[allow(clippy::manual_is_multiple_of)]
+pub(super) fn periodic_keyframe_due(
+    frame_counter: u32,
+    keyframe_interval_frames: u32,
+    now_ms: f64,
+    last_keyframe_emit_ms: Option<f64>,
+    max_interval_ms: f64,
+) -> bool {
+    let frame_count_periodic =
+        keyframe_interval_frames > 0 && frame_counter % keyframe_interval_frames == 0;
+    let wallclock_periodic = match last_keyframe_emit_ms {
+        Some(last) => (now_ms - last) >= max_interval_ms,
+        // None mid-session (reconnect cleared the clock): emit immediately so
+        // the ceiling re-arms. On first-ever frame (counter == 0) this is moot
+        // because frame_count_periodic already fires (0 % N == 0).
+        None => frame_counter > 0,
+    };
+    frame_count_periodic || wallclock_periodic
+}
+
 /// Per-frame inputs to [`keyframe_tick_decision`]. All atomic reads/swaps are done
 /// by the caller (the encode loop) — this struct carries the already-loaded values
 /// so the decision itself is pure and host-testable.

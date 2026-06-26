@@ -456,6 +456,20 @@ pub fn PeerTile(
         None
     };
 
+    // #1482: this peer's self-reported device/hardware metrics for the popup's
+    // compact "Device" line. Resolved the SAME way as `sig_receive_diag`
+    // (parse the tile key as session_id, look up live via the client) and only
+    // while the popup is open. `None` (unknown / nothing reported) → the popup
+    // omits the Device line.
+    let sig_device_info = if show_signal_popup {
+        peer_id
+            .parse::<u64>()
+            .ok()
+            .and_then(|sid| client.peer_device_info(sid))
+    } else {
+        None
+    };
+
     let appearance = use_context::<AppearanceSettingsCtx>().0();
 
     // Only show mute button when: viewer is host, peer is not self, peer is unmuted.
@@ -616,6 +630,7 @@ pub fn PeerTile(
             transport: sig_transport,
             meter_mode,
             receive_diag: sig_receive_diag,
+            device_info: sig_device_info,
             badge_transport,
         },
         SignalPopupHandlers {
@@ -687,13 +702,13 @@ fn handle_diagnostics_event(
             let mut transport: Option<String> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
                     ("audio_enabled", MetricValue::U64(v)) => audio = Some(*v != 0),
                     ("video_enabled", MetricValue::U64(v)) => video = Some(*v != 0),
                     ("screen_enabled", MetricValue::U64(v)) => screen = Some(*v != 0),
                     ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v as f32),
                     ("is_speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
-                    ("peer_transport", MetricValue::Text(t)) => transport = Some(t.clone()),
+                    ("peer_transport", MetricValue::Text(t)) => transport = Some(t.to_string()),
                     _ => {}
                 }
             }
@@ -753,7 +768,7 @@ fn handle_diagnostics_event(
             let mut speaking: Option<bool> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
                     ("audio_level", MetricValue::F64(v)) => audio_lvl = Some(*v as f32),
                     ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
                     _ => {}
@@ -779,10 +794,10 @@ fn handle_diagnostics_event(
             let mut media_type_str: Option<String> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
                     ("fps_received", MetricValue::F64(v)) => fps = Some(*v),
                     ("bitrate_kbps", MetricValue::F64(v)) => bitrate = Some(*v),
-                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.to_string()),
                     _ => {}
                 }
             }
@@ -813,7 +828,7 @@ fn handle_diagnostics_event(
             let mut buf_ms: Option<f64> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("target_peer", MetricValue::Text(p)) => target_peer = Some(p.clone()),
+                    ("target_peer", MetricValue::Text(p)) => target_peer = Some(p.to_string()),
                     ("expand_rate", MetricValue::F64(v)) => er = Some(*v),
                     ("audio_buffer_ms", MetricValue::U64(v)) => buf_ms = Some(*v as f64),
                     _ => {}
@@ -840,10 +855,10 @@ fn handle_diagnostics_event(
             let mut media_type_str: Option<String> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
                     ("resolution_width", MetricValue::U64(w)) => res_w = Some(*w),
                     ("resolution_height", MetricValue::U64(h)) => res_h = Some(*h),
-                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.to_string()),
                     _ => {}
                 }
             }
@@ -875,10 +890,10 @@ fn handle_diagnostics_event(
             let mut media_type_str: Option<String> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
                     ("source_width", MetricValue::U64(w)) => src_w = Some(*w),
                     ("source_height", MetricValue::U64(h)) => src_h = Some(*h),
-                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.to_string()),
                     _ => {}
                 }
             }
@@ -915,13 +930,13 @@ fn handle_diagnostics_event(
             let mut media_type_str: Option<String> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
                     ("encoder_target_bitrate_kbps", MetricValue::F64(v)) => {
                         bitrate = Some(v.round().max(0.0) as u32);
                     }
-                    ("adaptive_tier", MetricValue::Text(t)) => tier = Some(t.clone()),
-                    ("cause_hint", MetricValue::Text(t)) => hint = Some(t.clone()),
-                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.clone()),
+                    ("adaptive_tier", MetricValue::Text(t)) => tier = Some(t.to_string()),
+                    ("cause_hint", MetricValue::Text(t)) => hint = Some(t.to_string()),
+                    ("media_type", MetricValue::Text(t)) => media_type_str = Some(t.to_string()),
                     _ => {}
                 }
             }

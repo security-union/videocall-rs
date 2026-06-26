@@ -98,23 +98,30 @@ impl NetEqSample {
 
 /// Shared, render-prop wrapper around the (up-to-7200-element) NetEq history.
 ///
-/// The history vec is built ONCE per kept-sample tick in the parent and handed
-/// to several chart components. A plain `Vec<NetEqSample>` prop makes Dioxus
-/// derive a CONTENT-based `PartialEq`, so every render-diff would walk all 7200
-/// samples (and again per chart) just to decide "did the prop change?". Wrapping
-/// it in an `Rc` and comparing by POINTER identity (`Rc::ptr_eq`) makes that
-/// memo check O(1): if the parent handed down the same `Rc`, the prop is equal
-/// and the chart subtree is skipped — no O(n) element walk. Clone is a refcount
-/// bump, not a deep copy, so passing the same history to four charts is cheap.
-/// (#1223)
+/// The history vec is built in the parent and handed to several chart
+/// components. A plain `Vec<NetEqSample>` prop makes Dioxus derive a
+/// CONTENT-based `PartialEq`, so every render-diff would walk all 7200 samples
+/// (and again per chart) just to decide "did the prop change?". Wrapping it in an
+/// `Rc` and comparing by POINTER identity (`Rc::ptr_eq`) makes that memo check
+/// O(1): if the parent handed down the same `Rc`, the prop is equal and the chart
+/// subtree is skipped — no O(n) element walk. Clone is a refcount bump, not a deep
+/// copy, so passing the same history to four charts is cheap.
+///
+/// For this pointer gate to ENGAGE across renders, the `Rc` identity must be
+/// STABLE when the data is unchanged. The parent memoizes the `Rc::new(...)` build
+/// on a cheap `neteq_history_key` (peer + len + last_ts), so the same `Rc` is
+/// handed down across parent re-renders that did not append a sample to the
+/// selected peer; a NEW `Rc` is built only on a real append (≤1 Hz) or a peer
+/// switch. (#1223, #1451)
 #[derive(Clone)]
 pub struct NetEqHistory(pub Rc<Vec<NetEqSample>>);
 
 impl PartialEq for NetEqHistory {
     fn eq(&self, other: &Self) -> bool {
-        // Identity, not content: the parent rebuilds the Rc only when the
-        // history actually changed, so pointer equality is the correct (and
-        // O(1)) "unchanged" signal. A derived content compare would be O(7200).
+        // Identity, not content: the parent rebuilds the Rc only when the selected
+        // peer's history actually changed (memoized on `neteq_history_key`, #1451),
+        // so pointer equality is the correct (and O(1)) "unchanged" signal. A
+        // derived content compare would be O(7200).
         Rc::ptr_eq(&self.0, &other.0)
     }
 }
@@ -147,6 +154,52 @@ pub fn should_push(last_push_ms: Option<u64>, now_ms: u64) -> bool {
     match last_push_ms {
         None => true,
         Some(last) => now_ms.saturating_sub(last) >= 1000,
+    }
+}
+
+/// Cheap identity key for the selected peer's NetEq history, used to memoize the
+/// parent's `Rc<Vec<NetEqSample>>` build so the `Rc` pointer stays STABLE across
+/// parent re-renders that did NOT append a sample to the selected peer (#1451).
+///
+/// The key changes EXACTLY when the rendered history changes, because the deque
+/// is append-only / pop-front-only (`push_capped` — samples are never edited in
+/// place):
+/// - `peer`: the selected peer switched → a different deque is rendered.
+/// - `len`: a sample was appended below the cap (length grows).
+/// - `last_ts`: at the 2-hour cap, `push_capped` does `pop_front` + `push_back`,
+///   so `len` stays pinned at `NETEQ_SAMPLE_CAP` but the NEWEST timestamp moves —
+///   `last_ts` catches that cap-state append (and any append in general).
+///
+/// INVARIANT (at-cap correctness): `last_ts` detecting every cap-state append
+/// relies on consecutive KEPT samples always having DISTINCT `timestamp_ms`. That
+/// is guaranteed by the `should_push` >=1000 ms per-peer throttle in
+/// `diagnostics.rs` (a sample is kept only ≥1000 ms after the prior kept one), so
+/// two retained samples can never share a timestamp and a capped append always
+/// moves `last_ts`. If that throttle is ever loosened to allow sub-millisecond /
+/// duplicate-timestamp keeps, this key could go stale at the cap (`len` pinned AND
+/// `last_ts` unchanged) — revisit the key (e.g. add a monotonic push counter) then.
+///
+/// An unrelated parent re-render (toggling a help popover, resizing the drawer)
+/// that adds no sample leaves `peer` + `len` + `last_ts` all unchanged → the key
+/// is equal → the memo short-circuits and hands down the SAME `Rc`, so the child
+/// `UnifiedTimelineChart`'s `Rc::ptr_eq` prop gate actually engages. Pure +
+/// host-testable so the "changes iff a sample appends" contract has one source of
+/// truth (`neteq_history_key_*` tests).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct NetEqHistoryKey {
+    pub peer: String,
+    pub len: usize,
+    pub last_ts: Option<u64>,
+}
+
+/// Derive the [`NetEqHistoryKey`] for `peer`'s deque. `None` deque (peer absent,
+/// or the "All Peers" aggregate which has no single timeline) → `len = 0`,
+/// `last_ts = None` — distinct from any populated peer and stable while empty.
+pub fn neteq_history_key(peer: &str, deque: Option<&VecDeque<NetEqSample>>) -> NetEqHistoryKey {
+    NetEqHistoryKey {
+        peer: peer.to_string(),
+        len: deque.map(|d| d.len()).unwrap_or(0),
+        last_ts: deque.and_then(|d| d.back()).map(|s| s.timestamp_ms),
     }
 }
 
@@ -648,16 +701,23 @@ fn hide_unified_tooltip() {
 /// PERF (issue 173): every series polyline is CLIPPED to the scrolled-visible
 /// window via `clip_visible`, so the node count stays bounded regardless of how
 /// many hours of history are retained — the off-screen majority is never
-/// formatted. `scroll_pos` (a single signal updated by `onscroll` + auto-follow)
-/// drives the re-clip.
+/// formatted. The clip window is `[scroll_pos, scroll_pos + viewport_w_sig]`: two
+/// signals, `scroll_pos` updated by `onscroll` + the auto-follow `spawn`, and
+/// `viewport_w_sig` updated by a ResizeObserver-backed `onresize` (so the render
+/// body performs NO synchronous layout read — #1451).
 #[component]
 pub fn UnifiedTimelineChart(
     /// Shared, Rc-wrapped per-peer history — see [`NetEqHistory`]. Passed by the
-    /// drawer with O(1) `Rc::ptr_eq` prop memo (NOT a `Vec<TimelineSeries>` whose
-    /// content-based `PartialEq` would walk all points each render). A
-    /// `ReadSignal` so the `use_memo` below recomputes when the parent hands
-    /// down a NEW history Rc — i.e. only on a kept-sample tick (≤1 Hz), never on
-    /// an unrelated re-render. (issue 173 perf)
+    /// drawer with an O(1) `Rc::ptr_eq` prop memo (NOT a `Vec<TimelineSeries>`
+    /// whose content-based `PartialEq` would walk all points each render). It is a
+    /// `ReadSignal`, and the `use_memo` below re-runs `unified_series_from_samples`
+    /// only when the read `NetEqHistory` Rc IDENTITY changes. That identity is
+    /// stable across unrelated parent re-renders because the parent memoizes its
+    /// `Rc::new(...)` build on `neteq_history_key` (#1451): the same Rc is handed
+    /// down until a sample actually appends to the selected peer (≤1 Hz) or the
+    /// peer switches, so the deep-copy into the four point vecs runs only then —
+    /// not on a help-popover toggle, a drawer resize, or another peer's sample.
+    /// (issue 173 perf, #1451)
     history: ReadSignal<NetEqHistory>,
     /// Unique scroll-container id so this chart can scroll-sync with the sibling
     /// per-type charts (it joins the same `.neteq-chart-scroll` class group).
@@ -665,10 +725,16 @@ pub fn UnifiedTimelineChart(
     /// `true` only at the 2-hour cap → gates the "Showing last 2 hours" caption.
     capped: bool,
 ) -> Element {
-    // Build the overlaid series from the per-peer deque ONCE per history change
-    // (use_memo keyed on the `NetEqHistory` Rc read), not on every render. The
-    // deep-copy into the four point vecs is the cost this memoization removes.
-    // (issue 173 perf)
+    // Build the overlaid series from the per-peer deque only when the history Rc
+    // IDENTITY changes, not on every render. This memo's reactive dependency is the
+    // `history` signal; Dioxus re-runs it only when that signal is marked dirty,
+    // and the signal's change check is `NetEqHistory`'s `PartialEq` — which is
+    // `Rc::ptr_eq`. Because the parent now memoizes its `Rc::new(...)` build on
+    // `neteq_history_key` (#1451), it hands down the SAME Rc across unrelated
+    // re-renders, so the ptr_eq compares equal, the signal is NOT dirtied, and the
+    // memo does NOT re-run — the deep-copy into the four point vecs (the cost this
+    // memoization removes) happens only on a real append (≤1 Hz) or peer switch.
+    // (issue 173 perf, #1451)
     let series_memo = use_memo(move || unified_series_from_samples(&history().0));
     let series = series_memo();
 
@@ -693,6 +759,15 @@ pub fn UnifiedTimelineChart(
     // Current horizontal scroll offset (px) of THIS chart's scroll box — drives
     // visible-range clipping. Seeded at 0; updated by onscroll + auto-follow.
     let mut scroll_pos = use_signal(|| 0.0_f64);
+    // Visible viewport width (px) of THIS chart's scroll box — the other half of
+    // the clip window. Sourced from a SIGNAL (not a per-render `client_width()`
+    // layout read) so the render body performs NO synchronous reflow. Seeded at
+    // the `NETEQ_MIN_CHART_WIDTH` fallback for first paint (before the box is
+    // measured) and written ONLY by the ResizeObserver-backed `onresize` handler
+    // on the scroll box below (which fires on mount + every drawer resize,
+    // render-decoupled). Neither the `onscroll` handler nor the auto-follow
+    // `spawn` writes this — they touch `scroll_pos` only. (#1451)
+    let mut viewport_w_sig = use_signal(|| NETEQ_MIN_CHART_WIDTH);
 
     // Empty → placeholder (never a mega-wide empty SVG). Matches BaseChart.
     let all_empty = series.iter().all(|s| s.points.is_empty());
@@ -733,14 +808,14 @@ pub fn UnifiedTimelineChart(
     );
     let total_seconds = ((last_ts - first_ts) / 1000.0).max(1.0);
 
-    // Visible viewport width: the scroll box's client width. Before the box is
-    // mounted (or in a headless env) fall back to the min viewport so the first
-    // paint clips to a sane window rather than the whole multi-hour timeline.
-    let viewport_w = gloo_utils::document()
-        .get_element_by_id(&scroll_id)
-        .map(|el| el.client_width() as f64)
-        .filter(|w| *w > 0.0)
-        .unwrap_or(NETEQ_MIN_CHART_WIDTH);
+    // Visible viewport width: read from the `viewport_w_sig` SIGNAL, NOT a
+    // synchronous `client_width()` layout read in the render body. The signal is
+    // written ONLY by the ResizeObserver-backed `onresize` handler on the scroll
+    // box (fires on mount + every drawer resize); until the box is first measured
+    // it holds the `NETEQ_MIN_CHART_WIDTH` fallback so the first paint clips to a
+    // sane window rather than the whole multi-hour timeline. No reflow on the
+    // render path. (#1451)
+    let viewport_w = viewport_w_sig();
     let scroll_left = scroll_pos();
 
     // Build ONE clipped polyline per VISIBLE series. Off-screen points are never
@@ -820,6 +895,11 @@ pub fn UnifiedTimelineChart(
             if (live - scroll_pos.peek().to_owned()).abs() > 0.5 {
                 scroll_pos.set(live);
             }
+            // NOTE: viewport WIDTH is NOT measured here — it is sourced from
+            // `viewport_w_sig`, written by the ResizeObserver-backed `onresize` on
+            // the scroll box (fix #1451). The `client_width()` read above stays
+            // because the `at_end` auto-follow test is inherently a scroll-geometry
+            // check, not a per-render layout read in the render body.
         }
     });
 
@@ -853,6 +933,23 @@ pub fn UnifiedTimelineChart(
                 div {
                     class: "neteq-chart-scroll",
                     id: "{scroll_id}",
+                    // Responsive width WITHOUT a per-render reflow (#1451): a
+                    // ResizeObserver-backed `onresize` writes the scroll box's
+                    // content-box width into `viewport_w_sig`. This fires on mount
+                    // (first real measurement, replacing the old per-render
+                    // `client_width()` read) AND on every drawer resize — crucially
+                    // INDEPENDENT of whether this component re-renders, so the clip
+                    // window stays correct even after fix-1 made the history Rc
+                    // stable (a resize that adds no NetEQ sample no longer re-runs
+                    // the body, so the auto-follow `spawn` alone wouldn't re-measure).
+                    onresize: move |evt: ResizeEvent| {
+                        if let Ok(size) = evt.get_content_box_size() {
+                            let w = size.width;
+                            if w > 0.0 && (w - viewport_w_sig.peek().to_owned()).abs() > 0.5 {
+                                viewport_w_sig.set(w);
+                            }
+                        }
+                    },
                     onscroll: {
                         let scroll_id = scroll_id.clone();
                         move |_| {
@@ -2226,5 +2323,99 @@ mod tests {
         // Cycles with period 4 (index 4 repeats index 0's solid).
         assert_eq!(series_dash(4), d0, "pattern cycles every 4 series");
         assert_eq!(series_dash(5), d1);
+    }
+
+    // ── neteq_history_key: the memo-key derivation that lets the parent's
+    //    `Rc<Vec<NetEqSample>>` build (and thus the child's `Rc::ptr_eq` prop
+    //    gate) be memoized so a non-appending parent re-render reuses the same Rc
+    //    (#1451). These pin the "key changes IFF a sample appends / peer switches"
+    //    contract. What they DON'T cover: the actual Dioxus `use_memo` short-circuit
+    //    + `Rc::ptr_eq` engagement is a runtime concern (the parent body, the
+    //    signal dirty-check) that is exercised by the live drawer, not host tests.
+
+    /// A rebuild from the SAME deque (the "unrelated parent re-render" case: a help
+    /// popover toggle / drawer resize that adds NO sample) yields an EQUAL key, so
+    /// the memo short-circuits and the same Rc is handed down. If this regressed,
+    /// the Rc would be rebuilt every render and the child would re-deep-copy.
+    #[test]
+    fn neteq_history_key_stable_when_no_sample_appended() {
+        let mut dq: VecDeque<NetEqSample> = VecDeque::new();
+        dq.push_back(sample_at(1000));
+        dq.push_back(sample_at(2000));
+        let k1 = neteq_history_key("peer-1", Some(&dq));
+        // No mutation — same deque observed again on the next render.
+        let k2 = neteq_history_key("peer-1", Some(&dq));
+        assert_eq!(
+            k1, k2,
+            "no append → key unchanged → memo reuses the same Rc"
+        );
+    }
+
+    /// A normal append BELOW the cap grows `len`, so the key changes and a NEW Rc
+    /// is built — the chart picks up the new sample. Mutating the source so no
+    /// sample is added would leave `len` equal and (correctly) fail to rebuild;
+    /// this asserts the key actually moves on a real append.
+    #[test]
+    fn neteq_history_key_changes_on_append_below_cap() {
+        let mut dq: VecDeque<NetEqSample> = VecDeque::new();
+        dq.push_back(sample_at(1000));
+        let before = neteq_history_key("peer-1", Some(&dq));
+        dq.push_back(sample_at(2000));
+        let after = neteq_history_key("peer-1", Some(&dq));
+        assert_ne!(before, after, "append below cap grows len → key changes");
+        assert_eq!(after.len, 2);
+        assert_eq!(after.last_ts, Some(2000));
+    }
+
+    /// AT the 2-hour cap, `push_capped` does `pop_front` + `push_back`, so `len`
+    /// stays pinned — `len` ALONE could not detect the append. The `last_ts`
+    /// component catches it: the newest timestamp moved. This is the exact case the
+    /// key was designed for; dropping `last_ts` from the key would make this fail
+    /// (key would compare equal and the capped chart would go stale).
+    #[test]
+    fn neteq_history_key_changes_on_append_at_cap() {
+        // Two-element deque simulating "at cap": push_capped pops front, pushes back.
+        let mut dq: VecDeque<NetEqSample> = VecDeque::new();
+        dq.push_back(sample_at(1000));
+        dq.push_back(sample_at(2000));
+        let before = neteq_history_key("peer-1", Some(&dq));
+        // Simulate a capped append: drop oldest, add a newer sample (len unchanged).
+        dq.pop_front();
+        dq.push_back(sample_at(3000));
+        let after = neteq_history_key("peer-1", Some(&dq));
+        assert_eq!(before.len, after.len, "len is pinned at the cap");
+        assert_ne!(
+            before, after,
+            "last_ts moved on the capped append → key still changes"
+        );
+        assert_eq!(after.last_ts, Some(3000));
+    }
+
+    /// Switching the selected peer changes the key (a different deque is rendered),
+    /// even if the two peers' deques happen to have the same len + last_ts. The
+    /// `peer` component disambiguates.
+    #[test]
+    fn neteq_history_key_changes_on_peer_switch() {
+        let mut dq: VecDeque<NetEqSample> = VecDeque::new();
+        dq.push_back(sample_at(1000));
+        let k_a = neteq_history_key("peer-A", Some(&dq));
+        let k_b = neteq_history_key("peer-B", Some(&dq));
+        assert_ne!(k_a, k_b, "same data, different peer → distinct key");
+    }
+
+    /// The "All Peers" aggregate / an absent peer maps to a STABLE empty key
+    /// (`len = 0`, `last_ts = None`) regardless of how many calls — so the empty
+    /// history Rc is itself stable and never churns the placeholder subtree.
+    #[test]
+    fn neteq_history_key_none_deque_is_stable_empty() {
+        let k1 = neteq_history_key("All Peers", None);
+        let k2 = neteq_history_key("All Peers", None);
+        assert_eq!(k1, k2);
+        assert_eq!(k1.len, 0);
+        assert_eq!(k1.last_ts, None);
+        // Distinct from any populated single peer's key.
+        let mut dq: VecDeque<NetEqSample> = VecDeque::new();
+        dq.push_back(sample_at(1000));
+        assert_ne!(k1, neteq_history_key("peer-1", Some(&dq)));
     }
 }

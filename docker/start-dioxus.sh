@@ -24,6 +24,7 @@ if (window.__APP_CONFIG) {
   e2eeEnabled: "${E2EE_ENABLED:-false}",
   webTransportEnabled: "${WEBTRANSPORT_ENABLED:-false}",
   transportBadgeEnabled: "${TRANSPORT_BADGE_ENABLED:-false}",
+  showBuildGitInfo: "${SHOW_BUILD_GIT_INFO:-false}",
   firefoxEnabled: "${FIREFOX_ENABLED:-false}",
   usersAllowedToStream: "${USERS_ALLOWED_TO_STREAM:-}",
   serverElectionPeriodMs: ${SERVER_ELECTION_PERIOD_MS:-2000},

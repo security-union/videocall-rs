@@ -1,0 +1,9 @@
+{
+  "version": 99,
+  "name": "Future Theme",
+  "color": {
+    "surface": {
+      "base": { "dark": "#ff0000", "light": "#00ff00" }
+    }
+  }
+}

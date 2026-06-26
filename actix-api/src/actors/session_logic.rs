@@ -95,26 +95,6 @@ pub fn downlink_epoch_is_active(epoch: u64, window: std::time::Duration) -> bool
     now.saturating_sub(epoch) <= window.as_millis() as u64
 }
 
-/// WRITE side of the #1219 Half-2 receiver-downlink relief signal (B1). When the
-/// windowed [`CongestionTracker`] reports this receiver `is_actively_congested()`
-/// — i.e. its REAL downlink (the bounded outbound channel) overflowed enough to
-/// cross the drop threshold within the tracker's window — stamp `epoch` with the
-/// current monotonic epoch so the fan-out closure can read it via
-/// [`downlink_epoch_is_active`] and shed/emit. Returns whether it stamped (so a
-/// caller / test can observe the decision). Refreshing on every congested drop
-/// (not only the threshold crossing) keeps the window alive while a receiver
-/// stays marginally congested; the closure debounces the actual emit to once per
-/// episode. Sub-threshold drops do NOT stamp — relief keys off the windowed
-/// tracker, never a single raw drop.
-pub fn stamp_downlink_epoch_if_congested(tracker: &CongestionTracker, epoch: &AtomicU64) -> bool {
-    if tracker.is_actively_congested() {
-        epoch.store(downlink_congested_epoch_now(), Ordering::Relaxed);
-        true
-    } else {
-        false
-    }
-}
-
 /// Connection state for session management during election
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionState {
@@ -663,8 +643,28 @@ impl SessionLogic {
             }
             PacketKind::Health => {
                 trace!("Health packet from {}", self.user_id);
+                // #1482: process for server-side NATS telemetry AND forward to peers
+                // so each peer's client can read the sender's self-reported
+                // device/hardware metrics (peer_device_info). Previously returned
+                // Processed, which consumed the packet and starved the per-peer
+                // Device UI of data. HEALTH carries no media and is unencrypted; the
+                // outbound observer allowlist in ChatServer::handle_msg still drops it
+                // for waiting-room observers, so isolation is preserved.
+                // No observer guard here (unlike Data/KeyframeRequest): an observer
+                // may publish HEALTH and it is forwarded — intentional, as HEALTH is
+                // non-media diagnostics, mirroring the RTT arm's observer policy.
+                //
+                // #1543: the FULL packet goes to the server-side NATS telemetry path
+                // FIRST (operators rely on the heavy per-peer `peer_stats` map). Then
+                // the PEER fan-out is TRIMMED to only the device fields the peer UI
+                // reads (`trim_health_packet_for_peers`), dropping `peer_stats` and
+                // every other unread field — this breaks the O(N²) relay egress at
+                // scale. The trim parses + re-serializes ONCE here (O(1) per inbound
+                // HEALTH), BEFORE the relay's per-recipient fan-out, so it is never
+                // repeated per recipient.
                 health_processor::process_health_packet_bytes(data, self.nats_client.clone());
-                InboundAction::Processed
+                let trimmed = health_processor::trim_health_packet_for_peers(data);
+                InboundAction::Forward(Arc::new(trimmed))
             }
             PacketKind::KeyframeRequest {
                 target_user_id,
@@ -852,32 +852,36 @@ impl SessionLogic {
     /// its own frozen video faster. That is a per-receiver downlink response
     /// and is correct to keep; only the sender-keyed CONGESTION emit is removed.
     ///
-    /// ## #1219 (Half 2) — this is also the TRIGGER for receiver-downlink relief
+    /// Record an outbound drop for this receiver and refresh the shared
+    /// downlink-congestion epoch UNCONDITIONALLY (#1481).
     ///
     /// This callback is the GENUINE receiver-downlink backpressure surface: it
     /// fires only when the bounded `outbound_tx` channel to THIS one receiver
-    /// overflows (a slow socket / parked event loop), which is exactly the
-    /// per-receiver "slow downlink" condition Half 2 must react to — NOT the
-    /// relay-side actor-mailbox `Full` (room-wide fan-out burst / scheduling
-    /// pressure) that an earlier draft keyed off. When the windowed
-    /// [`CongestionTracker`] reports `is_actively_congested()` we stamp the
-    /// shared [`downlink_congested_epoch`](Self::downlink_congested_epoch) with
-    /// the current monotonic epoch. The fan-out closure
-    /// (`chat_server::handle_msg`) reads that epoch against a relief window to
-    /// (a) shed this receiver's non-base VIDEO/SCREEN layers and (b) emit one
-    /// DOWNLINK_CONGESTION packet so the client steps its own receive layers
-    /// down. Because the signal is a windowed, time-decaying LEVEL, recovery is
-    /// automatic once the window elapses with no fresh crossing — no
-    /// consecutive-success counter that a stray drop could reset. Receiver-only
-    /// scope is preserved: this never touches the publisher's encoder.
+    /// overflows (a slow socket / parked event loop) — NOT the relay-side
+    /// actor-mailbox `Full` (room-wide fan-out burst). The fan-out closure
+    /// (`chat_server::handle_msg`) reads the epoch against
+    /// [`RECEIVER_DOWNLINK_RELIEF_WINDOW`] to (a) shed non-base VIDEO/SCREEN
+    /// layers and (b) emit one DOWNLINK_CONGESTION packet so the client steps
+    /// down. Recovery is automatic once the window elapses with no fresh drops.
+    /// Receiver-only scope: this never touches the publisher's encoder.
+    ///
+    /// Every drop — regardless of whether the windowed `CongestionTracker` is
+    /// above its threshold — refreshes the epoch. The relief window
+    /// (`RECEIVER_DOWNLINK_RELIEF_WINDOW`) provides the natural decay: shedding
+    /// turns off on its own once the window elapses with no fresh drops. The
+    /// previous `is_actively_congested()` gate caused flapping on WebTransport:
+    /// shed works → drops stop → tracker decays below threshold → gate closes →
+    /// epoch ages → shed off → buffer refills → repeat (#1481).
     pub fn on_outbound_drop(&mut self, sender_session_id: u64, sender_user_id: &[u8]) {
         let crossed = self.congestion_tracker.record_drop(sender_session_id);
 
-        // #1219 Half 2: refresh the shared downlink-congestion epoch from the
-        // WINDOWED tracker on every drop. Extracted into a free function so the
-        // wiring is unit-testable without standing up a full `SessionLogic`
-        // (which needs NATS) — see `stamp_downlink_epoch_if_congested`.
-        stamp_downlink_epoch_if_congested(&self.congestion_tracker, &self.downlink_congested_epoch);
+        // #1481: stamp on EVERY drop unconditionally. The relief window provides
+        // decay — shedding turns off after RECEIVER_DOWNLINK_RELIEF_WINDOW with
+        // no fresh drops. The is_actively_congested() gate caused the shed to
+        // flap on WT where drops cluster then go quiet (shed works → drops stop
+        // → gate closes → epoch decays → shed off → buffer refills → repeat).
+        self.downlink_congested_epoch
+            .store(downlink_congested_epoch_now(), Ordering::Relaxed);
 
         if let Some(sender_sid) = crossed {
             // #1219 (Half 1): intentionally do NOT publish a sender-keyed
@@ -1537,6 +1541,14 @@ mod tests {
             "#979 keyframe-relax path must survive: record_drop still flags active congestion"
         );
 
+        // #1481: after 15 drops the epoch must be stamped (both gated and
+        // ungated code would stamp here since the tracker IS congested).
+        assert_ne!(
+            logic.downlink_congested_epoch.load(Ordering::Relaxed),
+            DOWNLINK_EPOCH_NEVER,
+            "#1481: on_outbound_drop must stamp the epoch after drops"
+        );
+
         // Allow any (erroneously) spawned publish task to land on the wire.
         let mut received = 0usize;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(500);
@@ -1559,80 +1571,44 @@ mod tests {
     }
 
     // =====================================================================
-    // #1219 Half 2 WRITER SIDE — the shared downlink-epoch stamp (B1)
+    // #1481 — downlink-epoch stamp is now UNCONDITIONAL on every drop
     // =====================================================================
-    //
-    // These exercise `stamp_downlink_epoch_if_congested` — the exact decision
-    // `SessionLogic::on_outbound_drop` makes — against a real `CongestionTracker`
-    // with NO NATS dependency, so they actually run in this environment (the
-    // `SessionLogic`-level NATS test would SKIP). `on_outbound_drop` is a thin
-    // wrapper over this function, so a regression in the wiring it pins surfaces
-    // here.
 
-    /// Sub-threshold drops must NOT arm relief: B1 keys off the windowed
-    /// `CongestionTracker`, never a single raw drop. The stamp stays at the
-    /// `NEVER` sentinel until the tracker crosses its threshold.
-    ///
-    /// MUTATION PROOF: making `stamp_downlink_epoch_if_congested` stamp
-    /// unconditionally (dropping the `is_actively_congested()` gate) arms the
-    /// epoch after the first drop, so this test's post-sub-threshold `== NEVER`
-    /// assert FAILS.
-    #[test]
-    fn stamp_downlink_epoch_skips_below_threshold() {
-        let mut tracker = CongestionTracker::new();
-        let epoch = AtomicU64::new(DOWNLINK_EPOCH_NEVER);
-        let sender = 7777u64;
+    /// THE regression test for #1481: a SINGLE sub-threshold drop through the
+    /// real `on_outbound_drop` must stamp the epoch. On the old gated code
+    /// (where `stamp_downlink_epoch_if_congested` required
+    /// `is_actively_congested() == true`), 1 drop does NOT cross the threshold
+    /// (needs 5), so the epoch stays NEVER → this assert FAILS. On the fixed
+    /// code it stamps unconditionally → passes.
+    #[actix_rt::test]
+    #[serial_test::serial]
+    async fn epoch_stamps_on_single_sub_threshold_drop() {
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = match async_nats::connect(&nats_url).await {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP: NATS unavailable at {nats_url}: {e}");
+                return;
+            }
+        };
 
-        // One short of the windowed crossing.
-        for _ in 0..(CONGESTION_DROP_THRESHOLD - 1) {
-            tracker.record_drop(sender);
-            assert!(
-                !stamp_downlink_epoch_if_congested(&tracker, &epoch),
-                "sub-threshold drop must not stamp the downlink epoch"
-            );
-        }
-        assert_eq!(
-            epoch.load(Ordering::Relaxed),
-            DOWNLINK_EPOCH_NEVER,
-            "sub-threshold drops must leave the epoch unarmed (B1: windowed \
-             tracker gates relief, not a single drop)"
-        );
-    }
+        let mut logic = build_test_receiver_logic(nats_client.clone(), "epoch_1481_room").await;
 
-    /// Crossing the windowed `CongestionTracker` threshold stamps a real
-    /// (non-`NEVER`) epoch that reads as active within the production relief
-    /// window — the exact value the fan-out closure consumes.
-    ///
-    /// MUTATION PROOF: removing the `epoch.store(...)` inside
-    /// `stamp_downlink_epoch_if_congested` (or having it return without stamping)
-    /// leaves the epoch at `NEVER`, so the `!= NEVER` and `is_active` asserts
-    /// FAIL.
-    #[test]
-    fn stamp_downlink_epoch_arms_on_threshold_crossing() {
-        let mut tracker = CongestionTracker::new();
-        let epoch = AtomicU64::new(DOWNLINK_EPOCH_NEVER);
-        let sender = 7777u64;
+        // ONE drop — below CONGESTION_DROP_THRESHOLD (5).
+        logic.on_outbound_drop(9999, b"some-sender");
 
-        for _ in 0..CONGESTION_DROP_THRESHOLD {
-            tracker.record_drop(sender);
-        }
+        // Premise: the tracker must NOT be congested after a single drop.
         assert!(
-            tracker.is_actively_congested(),
-            "test setup: crossing the threshold must flag the tracker congested"
-        );
-        assert!(
-            stamp_downlink_epoch_if_congested(&tracker, &epoch),
-            "a congested tracker must stamp the downlink epoch"
+            !logic.congestion_tracker.is_actively_congested(),
+            "test premise: a single drop must NOT cross the threshold"
         );
 
-        let stamped = epoch.load(Ordering::Relaxed);
+        // The fix: epoch is stamped DESPITE being below threshold.
         assert_ne!(
-            stamped, DOWNLINK_EPOCH_NEVER,
-            "crossing downlink congestion must stamp a real epoch for the closure"
-        );
-        assert!(
-            downlink_epoch_is_active(stamped, crate::constants::RECEIVER_DOWNLINK_RELIEF_WINDOW),
-            "the stamped epoch must read as active within the relief window"
+            logic.downlink_congested_epoch.load(Ordering::Relaxed),
+            DOWNLINK_EPOCH_NEVER,
+            "#1481: a single sub-threshold drop must still stamp the epoch \
+             (fails on gated code, passes on unconditional stamp)"
         );
     }
 }

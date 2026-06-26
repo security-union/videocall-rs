@@ -196,6 +196,13 @@ import {
   impairDownlinkNetsim,
   healDownlinkNetsim,
 } from "../helpers/downlink-impair";
+import {
+  readDownlinkCongestionTotal,
+  readDownlinkRecoveredTotal,
+  readDownlinkShedTotal,
+  readLayerFilteredTotal,
+  snapshotDownlinkCongestionMetrics,
+} from "../helpers/relay-metrics";
 import { waitForServices } from "../helpers/wait-for-services";
 
 // ---------------------------------------------------------------------------
@@ -491,6 +498,165 @@ async function joinMeeting(page: Page, meetingId: string, displayName: string): 
         });
       }
     }
+
+    await page.waitForTimeout(500);
+    await joinButton.click().catch(() => {
+      /* auto-join already unmounted the pre-join button */
+    });
+  }
+
+  await expect(grid).toBeVisible({ timeout: 15_000 });
+}
+
+/**
+ * Drive a fresh page from the HOME FORM into the meeting grid as an AUDIO-ONLY
+ * publisher: microphone ON, camera OFF. This is the join shape the #1398 mic-side
+ * uplink-distress detector requires — its DOWN-step is gated to camera OFF
+ * (`detector_camera` reads false; the camera's enabled flag is shared into the
+ * mic encoder via `host.rs::set_camera_active_signal`) AND single-layer audio
+ * (`pinSimulcastMaxLayers(ctx, 1)` ⇒ `n_audio_layers == 1`). The standard
+ * {@link joinMeeting} above FORCES the camera ON for the receive-side video
+ * assertions, so it cannot be reused here; this is the deliberate camera-OFF
+ * counterpart.
+ *
+ * Mechanism for camera-OFF / mic-ON:
+ *   - Seed `vc_prejoin_camera_on=false` + `vc_prejoin_mic_on=true` BEFORE boot
+ *     (the keys `context.rs::DEVICE_PREF_CAMERA_ON_KEY` / `_MIC_ON_KEY` that
+ *     `load_preferred_camera_on` / `load_preferred_mic_on` read).
+ *   - Grant media permission (so the device list enumerates and `want_mic` in
+ *     `attendants.rs::resolve_initial_enabled(prejoin_mic_on, audio_ok, has_mic)`
+ *     evaluates true). Camera permission is granted too, but the camera toggle is
+ *     left OFF so `want_cam` is false and no video track is published.
+ *   - DO NOT click the camera toggle (the only thing that would turn it on).
+ *   - Readiness signal is the populated MIC SELECT (`#prejoin-mic-select`,
+ *     `pre_join_settings_card.rs::PREVIEW_MIC_SELECT_ID`) — it renders only once
+ *     the mic device list is enumerated, which is what makes `want_mic` true.
+ *
+ * Single publisher page; no receiver is needed (the detector is publisher-side).
+ */
+async function joinMeetingAudioOnly(
+  page: Page,
+  meetingId: string,
+  displayName: string,
+): Promise<void> {
+  // Camera OFF, mic ON — the exact inverse of joinMeeting's seed. addInitScript
+  // runs on every navigation before the app's own scripts read these keys.
+  await page.addInitScript(() => {
+    try {
+      window.localStorage.setItem("vc_prejoin_camera_on", "false");
+      window.localStorage.setItem("vc_prejoin_mic_on", "true");
+    } catch {
+      /* storage may be unavailable pre-navigation; the app origin sets it */
+    }
+  });
+
+  await page.goto("/");
+  await page.waitForTimeout(1500);
+
+  await page.locator("#meeting-id").click();
+  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
+
+  await page.locator("#username").click();
+  await page.locator("#username").fill("");
+  await page.locator("#username").pressSequentially(displayName, { delay: 50 });
+  await page.waitForTimeout(500);
+  await page.locator("#username").press("Enter");
+
+  await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+  await page.waitForTimeout(1500);
+
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+  const grid = page.locator("#grid-container");
+
+  const result = await Promise.race([
+    joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
+    grid.waitFor({ timeout: 30_000 }).then(() => "auto" as const),
+  ]);
+
+  if (result === "join") {
+    // Grant media permission so the device list enumerates (needed for the mic to
+    // actually start). Camera permission is granted too, but we never enable the
+    // camera toggle, so no video track is published.
+    const allow = page.locator('[data-testid="prejoin-permission-allow"]');
+    if (await allow.isVisible().catch(() => false)) {
+      await allow.click();
+      await page
+        .locator('[data-testid="prejoin-permission-prompt"]')
+        .waitFor({ state: "hidden", timeout: 15_000 })
+        .catch(() => {
+          /* already granted / prompt absent */
+        });
+    }
+
+    // This is the FIRST joiner ⇒ host. Disable the Waiting Room (same rationale as
+    // joinMeeting — left ON it would park later joiners; harmless no-op for a
+    // single-publisher test, but keep the flow identical so a future receiver add
+    // does not regress).
+    const waitingRoomRow = page.locator(".settings-option-row", {
+      has: page.getByText("Waiting Room", { exact: true }),
+    });
+    const waitingRoomToggle = waitingRoomRow.getByRole("switch");
+    if (await waitingRoomToggle.isVisible().catch(() => false)) {
+      let settled: string | null = null;
+      await expect
+        .poll(
+          async () => {
+            const first = await waitingRoomToggle.getAttribute("aria-checked").catch(() => null);
+            await page.waitForTimeout(250);
+            const second = await waitingRoomToggle.getAttribute("aria-checked").catch(() => null);
+            if (first !== null && first === second) {
+              settled = second;
+              return true;
+            }
+            return false;
+          },
+          { timeout: 10_000, intervals: [250, 500] },
+        )
+        .toBe(true)
+        .catch(() => {
+          /* never settled within budget — fall through without toggling */
+        });
+      if (settled === "true") {
+        await waitingRoomToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+        await expect(waitingRoomToggle).toHaveAttribute("aria-checked", "false", {
+          timeout: 10_000,
+        });
+      }
+    }
+
+    // Ensure the camera stays OFF: aria-pressed must NOT be "true". We do NOT
+    // click it on (the inverse of joinMeeting). If a stale default rendered it
+    // ON, click it OFF so `want_cam` is false and the detector's camera-OFF gate
+    // holds.
+    const cameraToggle = page.locator('[data-testid="prejoin-camera-toggle"]');
+    if (await cameraToggle.isVisible().catch(() => false)) {
+      if ((await cameraToggle.getAttribute("aria-pressed")) === "true") {
+        await cameraToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+      }
+      await expect(cameraToggle).toHaveAttribute("aria-pressed", "false", { timeout: 5_000 });
+    }
+
+    // Ensure the MIC is ON so the publisher actually captures + encodes audio
+    // (the detector lives in the mic encoder's recovery Interval, which only runs
+    // while the mic is capturing).
+    const micToggle = page.locator('[data-testid="prejoin-mic-toggle"]');
+    if (await micToggle.isVisible().catch(() => false)) {
+      if ((await micToggle.getAttribute("aria-pressed")) !== "true") {
+        await micToggle.click().catch(() => {
+          /* toggle may have unmounted on a fast auto-join */
+        });
+      }
+    }
+
+    // Readiness: the mic SELECT renders only once the device list is enumerated,
+    // which is the same condition that makes `want_mic` true at join. Waiting on
+    // it (rather than the camera preview track, which never appears here) proves
+    // the mic will actually start.
+    await expect(page.locator("#prejoin-mic-select")).toBeVisible({ timeout: 15_000 });
 
     await page.waitForTimeout(500);
     await joinButton.click().catch(() => {
@@ -857,6 +1023,391 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
         ).toBeLessThanOrEqual(0);
         await rxPage.waitForTimeout(1000);
       }
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 3a. LOCAL CPU pressure steps the RECEIVED simulcast layer DOWN (issue #1569).
+  //
+  // WHAT #1569 CHANGED (RECEIVER-ONLY): the dioxus decode-budget loop
+  // (attendants.rs) now, on the SAME Down edge that already pauses/hides peer
+  // tiles (Stage 2), ALSO calls `VideoCallClient::apply_local_cpu_pressure_
+  // congestion()` (Stage 1). That seeds synthetic downlink congestion into every
+  // connected peer's receiver-side LayerChooser and publishes a lower
+  // LAYER_PREFERENCE — i.e. under LOCAL CPU/render pressure this client now
+  // requests a LOWER-RESOLUTION stream from its peers. Before #1569 the decode
+  // budget ONLY shed tiles; it never stepped the received layer down. The only
+  // pre-existing path that lowered received layers was the relay
+  // DOWNLINK_CONGESTION signal (a NETWORK trigger) — never local CPU.
+  //
+  // HOW THIS TEST OBSERVES IT (no network impairment, no toxiproxy):
+  //   1. A 2-context publisher+receiver call with a forced >1-layer ladder
+  //      (`capabilityMaxLayersOverride: 3`), exactly like test #3. The receiver
+  //      climbs above the base layer on a HEALTHY downlink.
+  //   2. We then drive the receiver's decode-budget loop to a sustained Down
+  //      edge purely with the deterministic test hook
+  //      `window.__videocall_inject_render_fps(LOW_FPS)` (registered when
+  //      MOCK_PEERS_ENABLED=true, which the e2e stack sets globally — it does NOT
+  //      block real peers; the real publisher is still a live connected peer in
+  //      the receiver's `connected_peers`). LOW_FPS sits below FPS_STEP_DOWN and
+  //      above FPS_SEVERE so the loop takes a single-tile Down step (no severe
+  //      multi-drop), and on that Down edge fires
+  //      `apply_local_cpu_pressure_congestion()`.
+  //   3. The OBSERVABLE SIGNAL is the same one tests #1/#3 read — the receiver's
+  //      `#perf-vu-recv-video-readout` layer index (`readVideoLayer().layerIndex`).
+  //      With #1569 present it must DROP toward base (the new Stage-1 actuator
+  //      published a lower preference). With #1569 reverted, sustained low FPS
+  //      still sheds tiles but NEVER lowers the received layer, so the index
+  //      would stay at the top rung — this test FAILS on revert. That is the
+  //      mutation-sensitive proof that the new layer-down path actually fired.
+  //
+  // Why the layer-down is feasible here (and why the prerequisites are real):
+  //   - `seed_downlink_congestion_for_connected_peers` only publishes a lower
+  //     preference for a peer whose `highest_available >= 1` (a >=2-layer video
+  //     ladder). The `capabilityMaxLayersOverride: 3` forces that ladder past the
+  //     low-core container clamp; the `layerCount <= 1` skip guard degrades to a
+  //     SKIP (not a false negative) if some future runner still clamps to 1.
+  //   - The DOWN step needs `SUSTAIN_SAMPLES` low samples and respects
+  //     `STEP_DOWN_COOLDOWN_MS`; the inject cadence below mirrors
+  //     decode-budget.spec.ts (the proven driver of this same loop).
+  //
+  // UN-FIXME rationale matches test #3: the serial-describe + launch-flag
+  // renderer mitigation lets the 2-context join survive on CI, and the override
+  // forces the multi-layer headroom the layer-down needs.
+  //
+  // Mirrors of dioxus-ui/src/components/decode_budget.rs (keep in sync; same
+  // consts decode-budget.spec.ts pins — a retune there must update both specs).
+  // -------------------------------------------------------------------------
+  test("local CPU pressure steps the received simulcast layer DOWN (#1569)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_cpu_down_${Date.now()}`;
+
+    // --- Decode-budget loop consts (mirror decode_budget.rs / decode-budget.spec.ts). ---
+    // FPS_SEVERE (12) is the median FPS at/below which a down-step drops MULTIPLE
+    // tiles; LOW_FPS below is kept strictly ABOVE it so the DOWN phase takes
+    // single-tile / single-rung steps (the severe multi-drop is covered by Rust
+    // unit tests, not this timing-sensitive E2E).
+    const FPS_STEP_DOWN = 24; // FPS at/below which the loop considers stepping DOWN
+    const SUSTAIN_SAMPLES = 3; // consecutive 1 Hz samples required before a step
+    const STEP_DOWN_COOLDOWN_MS = 2000; // min ms between two DOWN steps
+    // LOW_FPS sits in the MILD band (above SEVERE=12, below STEP_DOWN=24) so the
+    // DOWN phase takes single-tile / single-rung steps.
+    const LOW_FPS = FPS_STEP_DOWN - 6; // 18: < FPS_STEP_DOWN, > FPS_SEVERE (12)
+    // Slightly above the loop's 1 s bucket cadence so each injection lands in a
+    // fresh bucket and accumulates wall-time for the down cooldown.
+    const INJECT_INTERVAL_MS = 1200;
+    const COOLDOWN_DOWN_SAMPLES = Math.ceil(STEP_DOWN_COOLDOWN_MS / INJECT_INTERVAL_MS) + 1;
+    // A few SUSTAIN windows plus cooldown headroom for CI jitter: enough samples
+    // for at least one Down step (which fires the new layer-down call) to land.
+    const MAX_DOWN_SAMPLES = SUSTAIN_SAMPLES + 4 * COOLDOWN_DOWN_SAMPLES;
+
+    const injectFps = (page: Page, fps: number) =>
+      page.evaluate(
+        (v) =>
+          (
+            window as unknown as { __videocall_inject_render_fps?: (n: number) => void }
+          ).__videocall_inject_render_fps?.(v),
+        fps,
+      );
+    const hasInjectHook = (page: Page) =>
+      page.evaluate(
+        () =>
+          typeof (window as unknown as { __videocall_inject_render_fps?: unknown })
+            .__videocall_inject_render_fps === "function",
+      );
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub-cpu@videocall.rs",
+        "SimPublisherCpu",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-rx-cpu@videocall.rs",
+        "SimReceiverCpu",
+        uiURL,
+      );
+      // #1093 override forces a multi-layer ladder so the received layer has
+      // headroom to step DOWN (a single-layer runner has nothing below base).
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "SimPublisherCpu");
+      await joinMeeting(rxPage, meetingId, "SimReceiverCpu");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
+      // take effect; runs before the skip guard so a broken override fails loud.
+      await assertCapabilityOverrideActive(pubConsole);
+
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      await openPerformancePanel(rxPage);
+
+      // The CPU-pressure layer-down hook is gated on MOCK_PEERS_ENABLED. If the
+      // stack was brought up without it, the new path cannot be driven — skip
+      // rather than assert a false negative. (The e2e compose sets it true.)
+      if (!(await hasInjectHook(rxPage))) {
+        test.skip(
+          true,
+          "window.__videocall_inject_render_fps not registered (MOCK_PEERS_ENABLED off)",
+        );
+      }
+
+      // PHASE 1 — let the receiver climb ABOVE the base layer on a healthy
+      // downlink, so a DOWN step is actually observable (otherwise it is already
+      // pinned at 0 and there is nothing to step down). SKIP on a single-layer
+      // runner (capability ceiling) rather than assert a false negative.
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage)) !== null, {
+          timeout: 45_000,
+          intervals: [500, 1000, 2000],
+        })
+        .toBe(true);
+
+      const before = await readVideoLayer(rxPage);
+      const layerCount = before!.layerCount;
+      test.skip(
+        layerCount <= 1,
+        `single-layer ladder (count=${layerCount}); the received layer has no headroom ` +
+          "to step DOWN under CPU pressure on this runner (capability ceiling). " +
+          "See helpers/simulcast-config.ts",
+      );
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      const startIndex = (await readVideoLayer(rxPage))!.layerIndex;
+      expect(
+        startIndex,
+        "receiver must be above the base layer before we apply CPU pressure",
+      ).toBeGreaterThan(0);
+
+      // PHASE 2 — drive the decode-budget loop to a sustained Down edge purely
+      // with synthetic LOW FPS (no network impairment). On the Down edge the
+      // #1569 actuator publishes a LOWER received-layer preference, so the
+      // receiver's layer index must drop BELOW where it started — and, because
+      // LOW_FPS is held, eventually reach base (index 0). We feed samples until
+      // the index drops or we exhaust the budget.
+      await expect
+        .poll(
+          async () => {
+            await injectFps(rxPage, LOW_FPS);
+            await rxPage.waitForTimeout(INJECT_INTERVAL_MS);
+            // null readout (transient "Not receiving" while re-selecting a lower
+            // rung) counts as 0 = below the start index.
+            return (await readVideoLayer(rxPage))?.layerIndex ?? 0;
+          },
+          {
+            timeout: MAX_DOWN_SAMPLES * (INJECT_INTERVAL_MS + 500),
+            intervals: [INJECT_INTERVAL_MS],
+          },
+        )
+        .toBeLessThan(startIndex);
+
+      // The #1569 actuator steps the received layer down AT LEAST ONE RUNG below
+      // the start index under local CPU pressure (matching the host test, which
+      // proves 2->1, not 2->0): on a lossless transport the synthetic seed steps
+      // the chooser down exactly one rung and then no-ops, and the real {0,0}
+      // telemetry never drives `choose` further down, so the layer settles at
+      // ~startIndex - 1 (NOT necessarily base index 0) and does not climb back
+      // while the pressure holds. Hold the assertion across a few more injected
+      // samples to prove the lower preference is sticky under continued pressure.
+      for (let i = 0; i < SUSTAIN_SAMPLES + 2; i++) {
+        await injectFps(rxPage, LOW_FPS);
+        await rxPage.waitForTimeout(INJECT_INTERVAL_MS);
+        const idx = (await readVideoLayer(rxPage))?.layerIndex ?? 0;
+        expect(
+          idx,
+          `under sustained CPU pressure the received layer must stay at/below the ` +
+            `stepped-down rung (< start ${startIndex}); sample ${i}`,
+        ).toBeLessThan(startIndex);
+      }
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // 3b. Per-peer RECEIVE reason chip renders the "Your setting" DISPLAY text
+  //     (issue #1553 — `reason_chip_text` display path).
+  //
+  // #1553 fixed a receiver-side mis-attribution in the per-peer "reason" chip:
+  // the chip's DISPLAY text is produced by `reason_chip_text(DegradeReason)`
+  // (performance_settings.rs): Network → "Your network", Setting → "Your
+  // setting", Sender → "Sender". The pure attribution LOGIC
+  // (`layer_chooser.rs degrade_reason`) — including the #1553 regression case
+  // (a constrained receiver with a collapsed `avail_top` is "Network", not
+  // "Sender") — is locked by HOST unit tests in BOTH crates
+  // (`degrade_reason_*` in layer_chooser.rs and the `reason_chip_text(...)`
+  // string asserts in performance_settings.rs). This E2E covers the part those
+  // host tests CANNOT: that the DISPLAY string actually reaches the DOM through
+  // the per-peer disclosure render (`PeerRow` → `…-peer-{sid}-reason`).
+  //
+  // DRIVABILITY BOUNDARY (why "Your setting" and not "Your network"):
+  //   * "Your setting" (DegradeReason::Setting) is fully drivable from the DOM
+  //     with NO network impairment: this receiver drags its OWN video receive
+  //     max-layer thumb below the full-ladder top, so the snapshot producer
+  //     (`per_peer_received_snapshots`) feeds `user_max = bounds.video.max` and
+  //     `sel == user_max < full_ladder_top` → Setting. Deterministic.
+  //   * "Sender" needs a genuine single-layer/non-simulcast peer (`avail_top <
+  //     full_top && sel == avail_top && !constrained`) — state-dependent on the
+  //     runner's clamped ladder, not deterministically forced here.
+  //   * "Your network" (DegradeReason::Network — the literal #1553 bug state)
+  //     needs `constrained == true`, which only the per-receiver downlink
+  //     congestion infra (the `@impair` netsim/toxiproxy path, grep-inverted out
+  //     of the default suite) can force. It is NOT drivable in this plain
+  //     `make e2e-up` harness, so it stays covered by the host unit tests; this
+  //     E2E asserts the drivable "Your setting" branch of the SAME render path.
+  //
+  // This is the INTENDED reason assertion sketched in the §1b FIXME block below
+  // ("cap the receiver via perf-recv-video-range-max → 0, then assert the
+  // degraded peer's row shows a perf-reason-chip--setting chip"), made real on
+  // the 2-context harness for the ONE publisher the receiver sees.
+  //
+  // UN-FIXME rationale matches test #3: the serial-describe + launch-flag
+  // renderer mitigation lets the 2-context join survive on CI, and
+  // `capabilityMaxLayersOverride: 3` forces a >1-layer ladder so there is
+  // headroom for a manual cap to sit strictly below the full top (a single-layer
+  // ladder has full_top == 0, so no reason chip can ever render).
+  // -------------------------------------------------------------------------
+  test('per-peer receive reason chip shows "Your setting" when the receiver caps below the full ladder (#1553)', async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_simulcast_reason_${Date.now()}`;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub3b@videocall.rs",
+        "SimPublisher3b",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-rx3b@videocall.rs",
+        "SimReceiver3b",
+        uiURL,
+      );
+      // Force the full ladder on both ends so the receiver's cap can sit STRICTLY
+      // below the full top (the reason chip only renders below the full-ladder
+      // top; a single-layer runner would never show one).
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "SimPublisher3b");
+      await joinMeeting(rxPage, meetingId, "SimReceiver3b");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
+      // take effect; a clamped single-layer ladder has no full top to sit below,
+      // so the chip could never appear and the test would prove nothing.
+      await assertCapabilityOverrideActive(pubConsole);
+
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      const panel = await openPerformancePanel(rxPage);
+
+      // Wait until the receiver is decoding video so the ladder is known and the
+      // per-peer snapshot for the publisher has populated.
+      const before = await (async () => {
+        await expect
+          .poll(async () => (await readVideoLayer(rxPage)) !== null, {
+            timeout: 45_000,
+            intervals: [500, 1000, 2000],
+          })
+          .toBe(true);
+        return readVideoLayer(rxPage);
+      })();
+      const layerCount = before!.layerCount;
+      // Defence-in-depth (the override proof above should already guarantee >1):
+      // a single-layer ladder has full_top == 0, so a manual cap can never sit
+      // BELOW the top and no reason chip can render — skip rather than assert a
+      // false negative.
+      test.skip(
+        layerCount <= 1,
+        `single-layer ladder (count=${layerCount}); the reason chip cannot render ` +
+          "without a full top to sit below on this runner (capability ceiling).",
+      );
+
+      // DRIVE the "Setting" attribution: cap THIS receiver's video receive max to
+      // the base rung (index 0). `per_peer_received_snapshots` threads this bound
+      // as `user_max`; with `sel == user_max == 0 < full_top` the per-peer row's
+      // reason resolves to DegradeReason::Setting.
+      await pinReceiverToBaseLayer(rxPage, "video");
+
+      // The per-peer RECEIVE disclosure (issue #1131) is a native <details>,
+      // collapsed by default (rows are built lazily on expand). Open it.
+      const peersDetails = panel.locator('[data-testid="perf-recv-video-peers"]');
+      await expect(peersDetails).toBeVisible({ timeout: 15_000 });
+      const peersSummary = panel.locator('[data-testid="perf-recv-video-peers-summary"]');
+      await expect(peersSummary).toBeVisible({ timeout: 10_000 });
+      // Expand if not already open (the summary toggles the <details>).
+      if (!(await peersDetails.evaluate((el) => (el as HTMLDetailsElement).open))) {
+        await peersSummary.click();
+      }
+      await expect
+        .poll(async () => peersDetails.evaluate((el) => (el as HTMLDetailsElement).open), {
+          timeout: 10_000,
+          intervals: [250, 500],
+        })
+        .toBe(true);
+
+      // Exactly one publisher → exactly one per-peer video row. Its reason chip
+      // testid is `perf-recv-video-peer-{sessionId}-reason`; match by suffix so we
+      // don't need to know the session id.
+      const reasonChip = panel.locator(
+        '[data-testid$="-reason"][data-testid^="perf-recv-video-peer-"]',
+      );
+
+      // The chip appears once the chooser has clamped the decoded layer to the
+      // capped bound and the snapshot recomputes its reason. Poll for it.
+      await expect(reasonChip).toBeVisible({ timeout: 30_000 });
+
+      // #1553 ASSERTION: the chip renders the exact DISPLAY string from
+      // `reason_chip_text(DegradeReason::Setting)`. This is the part the host
+      // tests cannot prove — that the mapped string reaches the DOM. A regression
+      // that mislabels Setting (or swaps the Network/Sender strings the same
+      // mapping owns) fails here.
+      await expect(reasonChip).toHaveText("Your setting");
+
+      // …and the chip carries the MATCHING modifier class, so the text and the
+      // class can never silently diverge (`reason_chip_modifier(Setting)` ==
+      // "setting"). Pinning both pins the whole `DegradeReason → (text, class)`
+      // contract for the Setting branch at the DOM.
+      const chipClass = (await reasonChip.getAttribute("class")) || "";
+      expect(chipClass).toMatch(/\bperf-reason-chip--setting\b/);
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
@@ -1681,6 +2232,579 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// #1219 Half 2 — RELAY-SIDE downlink-congestion signal path validation (#1434)
+//
+// The per-receiver layer DIVERGENCE tests above (WS @impair + WT netsim) prove
+// the UI-side outcome: a congested receiver drops to a lower layer while the
+// healthy peer holds. But they do NOT prove the RELAY's Half 2 signal path
+// actually fired — the congestion COULD be detected purely client-side by the
+// layer chooser reacting to loss (which is the legacy #1080 path). Issue #1434
+// requires asserting the RELAY METRICS that prove the Half 2 relay-side
+// congestion detection + proactive shedding + LAYER_PREFERENCE durable path
+// fired end-to-end:
+//
+//   1. relay_receiver_downlink_congestion_total RISES (relay detected congestion)
+//   2. relay_downlink_shed_total RISES (relay proactively shed non-base packets)
+//   3. relay_layer_filtered_total RISES (receiver published LAYER_PREFERENCE
+//      stepping down → relay layer filter engaged the durable path)
+//   4. ISOLATION: healthy receiver metrics UNCHANGED
+//   5. AUDIO PROTECTION: audio NOT shed (audio always passes the pre-filter)
+//   6. RECOVERY: relay_receiver_downlink_recovered_total RISES after heal
+//
+// These tests EXTEND the existing impair harness (same 3-browser topology) but
+// add relay-metric assertions alongside the UI-layer assertions. They are
+// intentionally SEPARATE tests so a relay-metric regression does not mask a UI
+// regression (and vice versa).
+//
+// BOTH transports are covered: WS via toxiproxy (@impair), WT via netsim
+// (default suite). This is mandatory per #1434's stretch goal and the standing
+// fact that "both transports shed at 80%."
+// ---------------------------------------------------------------------------
+test.describe("#1219 Half 2 relay-side congestion validation (#1434)", () => {
+  test.describe.configure({ mode: "serial", timeout: 240_000 });
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  // -------------------------------------------------------------------------
+  // WS path: toxiproxy bandwidth clamp → relay detects congestion → sheds →
+  // receiver publishes LAYER_PREFERENCE → relay layer-filters. Tagged @impair.
+  // -------------------------------------------------------------------------
+  test("relay enters downlink congestion and sheds for WS receiver, healthy peer unaffected (#1434) @impair", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1434_ws_${Date.now()}`;
+
+    await assertProxyUp();
+    await healDownlink();
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1434-pub-ws@videocall.rs",
+        "Sim1434PubWS",
+        uiURL,
+      );
+      const healthyCtx = await createAuthenticatedContext(
+        healthyBrowser,
+        "sim-1434-healthy-ws@videocall.rs",
+        "Sim1434HealthyWS",
+        uiURL,
+      );
+      const degradedCtx = await createAuthenticatedContext(
+        degradedBrowser,
+        "sim-1434-degraded-ws@videocall.rs",
+        "Sim1434DegradedWS",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(healthyCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(degradedCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      // Route degraded receiver through toxiproxy, pinning to WS.
+      await routeDownlinkThroughProxy(degradedCtx);
+
+      const pubPage = await pubCtx.newPage();
+      const healthyPage = await healthyCtx.newPage();
+      const degradedPage = await degradedCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim1434PubWS");
+      await joinMeeting(healthyPage, meetingId, "Sim1434HealthyWS");
+      await joinMeeting(degradedPage, meetingId, "Sim1434DegradedWS");
+
+      await assertCapabilityOverrideActive(pubConsole);
+      await openPerformancePanel(healthyPage);
+      await openPerformancePanel(degradedPage);
+
+      // PHASE 1 — let both receivers climb above base on a healthy link.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage);
+            if (!healthy || !degraded) return -1;
+            return Math.min(healthy.layerCount, degraded.layerCount);
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(0);
+
+      const healthyStart = await readVideoLayer(healthyPage);
+      const degradedStart = await readVideoLayer(degradedPage);
+      test.skip(
+        (healthyStart?.layerCount ?? 1) <= 1 || (degradedStart?.layerCount ?? 1) <= 1,
+        "capability ceiling clamped to single layer; no ladder headroom to diverge",
+      );
+
+      // Wait for degraded receiver to climb above base before impairing.
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // Snapshot relay metrics BEFORE impairment (baseline for delta).
+      const beforeWs = await snapshotDownlinkCongestionMetrics("websocket", meetingId);
+      const layerFilteredBefore = beforeWs.layerFilteredTotal;
+
+      // PHASE 2 — impair the degraded receiver's downlink via toxiproxy.
+      await impairDownlink({ rateKb: 15 });
+
+      // PHASE 3a — RELAY REACTS: assert congestion_total RISES for the WS relay.
+      // The relay's windowed CongestionTracker should cross its threshold within
+      // seconds of the outbound channel filling. Poll until the counter increments.
+      await expect
+        .poll(
+          async () => {
+            const current = await readDownlinkCongestionTotal("websocket");
+            return current - beforeWs.congestionTotal;
+          },
+          {
+            timeout: 60_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 1: relay_receiver_downlink_congestion_total must RISE " +
+              "for the WS relay when a receiver's downlink is impaired",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3b — PROACTIVE SHEDDING: relay_downlink_shed_total RISES (non-base
+      // packets shed before try_send for the congested receiver).
+      await expect
+        .poll(
+          async () => {
+            const current = await readDownlinkShedTotal("websocket");
+            return current - beforeWs.shedTotal;
+          },
+          {
+            timeout: 30_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 2: relay_downlink_shed_total must RISE — the relay " +
+              "must proactively shed non-base packets for the congested receiver",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3c — DURABLE PATH: the congested receiver publishes LAYER_PREFERENCE
+      // stepping down, causing the relay's layer filter to engage. This is proven by
+      // relay_layer_filtered_total rising for this room.
+      await expect
+        .poll(
+          async () => {
+            const current = await readLayerFilteredTotal("websocket", meetingId);
+            return current - layerFilteredBefore;
+          },
+          {
+            timeout: 60_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 3: relay_layer_filtered_total must RISE — the " +
+              "congested receiver must publish LAYER_PREFERENCE stepping down, " +
+              "engaging the relay's durable layer filter",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3d — ISOLATION: the healthy receiver is still decoding above base.
+      // Its layer must not have been dragged down.
+      const healthyAfterImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyAfterImpair,
+        "#1434 isolation: healthy receiver must still be decoding",
+      ).not.toBeNull();
+      expect(
+        healthyAfterImpair!.layerIndex,
+        "#1434 isolation: healthy receiver must stay above base (unaffected by " +
+          "peer's downlink congestion)",
+      ).toBeGreaterThan(0);
+
+      // PHASE 3e — AUDIO PROTECTION: audio is NOT shed for the congested receiver.
+      // The audio readout on the degraded page should still report receiving audio
+      // (the Half 2 pre-filter only sheds non-base VIDEO/SCREEN, never AUDIO).
+      // Allow a generous window since audio may briefly blip under heavy loss.
+      await expect
+        .poll(
+          async () => {
+            const audio = await readAudioLayer(degradedPage);
+            return audio !== null;
+          },
+          {
+            timeout: 30_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 4 (audio protection): the degraded receiver must " +
+              "still be receiving AUDIO — the Half 2 shed path protects audio",
+          },
+        )
+        .toBe(true);
+
+      // PHASE 4 — RECOVERY: heal the downlink and assert the relay's recovery
+      // counter increments (the relief window elapses with no fresh overflow).
+      await healDownlink();
+
+      await expect
+        .poll(
+          async () => {
+            const current = await readDownlinkRecoveredTotal("websocket");
+            return current - beforeWs.recoveredTotal;
+          },
+          {
+            timeout: 90_000,
+            intervals: [3000, 5000, 8000],
+            message:
+              "#1434 assertion 5 (recovery): relay_receiver_downlink_recovered_total " +
+              "must RISE after the impairment is healed (relief window elapsed)",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // Also confirm the degraded receiver climbs back (UI recovery).
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 90_000,
+          intervals: [2000, 3000, 5000],
+        })
+        .toBeGreaterThan(0);
+    } finally {
+      await healDownlink();
+      await pubBrowser.close();
+      await healthyBrowser.close();
+      await degradedBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // WT path: client-side netsim hook → relay detects congestion → sheds →
+  // receiver publishes LAYER_PREFERENCE → relay layer-filters. No toxiproxy;
+  // runs in the default dioxus suite (NOT tagged @impair).
+  //
+  // The WT relay process (:5321) has the SAME Half 2 code path (the congestion
+  // detection runs in the transport-agnostic per-session NATS loop), so the
+  // same metric counters must fire. The only difference is that the LOSS is
+  // manufactured CLIENT-SIDE (netsim drops inbound packets) rather than
+  // RELAY-SIDE (toxiproxy fills the outbound channel). However, for the WT
+  // relay to enter congestion mode, the CLIENT must still signal backpressure
+  // upstream — which it does via QUIC flow control (window exhaustion on the
+  // receiving stream) when it cannot consume packets fast enough. The netsim
+  // hook drops packets AFTER receipt from the transport, so from the relay's
+  // perspective the client's receive window may still drain normally and the
+  // relay-side congestion detection may NOT fire as aggressively as the WS
+  // case. Therefore this test uses a MILDER assertion: it asserts either the
+  // relay-side congestion counters rise OR the durable LAYER_PREFERENCE path
+  // fires (which is the client-side chooser stepping down and publishing its
+  // preference, triggering relay layer filtering regardless of relay-side
+  // congestion state). The key invariant is still: layer filtering engages
+  // for the impaired receiver AND the healthy receiver is unaffected.
+  // -------------------------------------------------------------------------
+  test("relay layer-filters for WT receiver under netsim impairment, healthy peer unaffected (#1434)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1434_wt_${Date.now()}`;
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let degradedPage: Page | undefined;
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1434-pub-wt@videocall.rs",
+        "Sim1434PubWT",
+        uiURL,
+      );
+      const healthyCtx = await createAuthenticatedContext(
+        healthyBrowser,
+        "sim-1434-healthy-wt@videocall.rs",
+        "Sim1434HealthyWT",
+        uiURL,
+      );
+      const degradedCtx = await createAuthenticatedContext(
+        degradedBrowser,
+        "sim-1434-degraded-wt@videocall.rs",
+        "Sim1434DegradedWT",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(healthyCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(degradedCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const healthyPage = await healthyCtx.newPage();
+      degradedPage = await degradedCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim1434PubWT");
+      await joinMeeting(healthyPage, meetingId, "Sim1434HealthyWT");
+      await joinMeeting(degradedPage, meetingId, "Sim1434DegradedWT");
+
+      await assertCapabilityOverrideActive(pubConsole);
+      await openPerformancePanel(healthyPage);
+      await openPerformancePanel(degradedPage);
+
+      // PHASE 1 — let both receivers climb above base on a healthy link.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage!);
+            if (!healthy || !degraded) return -1;
+            return Math.min(healthy.layerCount, degraded.layerCount);
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(0);
+
+      const healthyStart = await readVideoLayer(healthyPage);
+      const degradedStart = await readVideoLayer(degradedPage);
+      test.skip(
+        (healthyStart?.layerCount ?? 1) <= 1 || (degradedStart?.layerCount ?? 1) <= 1,
+        "capability ceiling clamped to single layer; no ladder headroom to diverge",
+      );
+
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // Snapshot relay metrics BEFORE impairment.
+      // For WT, the relay process is :5321. Scrape the WT relay.
+      const beforeWt = await snapshotDownlinkCongestionMetrics("webtransport", meetingId);
+      const layerFilteredBefore = beforeWt.layerFilteredTotal;
+
+      // PHASE 2 — impair the degraded receiver's downlink via netsim.
+      await impairDownlinkNetsim(degradedPage);
+
+      // PHASE 3a — DURABLE PATH: the chooser steps down and publishes
+      // LAYER_PREFERENCE, which engages the relay's layer filter for this room.
+      // This is the primary assertion for the WT path: regardless of whether the
+      // relay itself enters congestion shedding mode (which depends on QUIC
+      // backpressure reaching the relay), the LAYER_PREFERENCE → layer filter
+      // path is the client-driven durable signal that proves #1219 Half 2's
+      // end-to-end loop.
+      await expect
+        .poll(
+          async () => {
+            const current = await readLayerFilteredTotal("webtransport", meetingId);
+            return current - layerFilteredBefore;
+          },
+          {
+            timeout: 90_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 WT assertion (durable path): relay_layer_filtered_total must " +
+              "RISE — the congested receiver's chooser must step down, publish " +
+              "LAYER_PREFERENCE, and cause the relay to filter higher layers",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3b — ISOLATION: the healthy receiver remains above base.
+      const healthyAfterImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyAfterImpair,
+        "#1434 WT isolation: healthy receiver must still be decoding",
+      ).not.toBeNull();
+      expect(
+        healthyAfterImpair!.layerIndex,
+        "#1434 WT isolation: healthy receiver must stay above base",
+      ).toBeGreaterThan(0);
+
+      // PHASE 3c — AUDIO PROTECTION: degraded receiver still receives audio.
+      await expect
+        .poll(
+          async () => {
+            const audio = await readAudioLayer(degradedPage!);
+            return audio !== null;
+          },
+          {
+            timeout: 30_000,
+            intervals: [2000, 3000, 5000],
+            message: "#1434 WT audio protection: degraded receiver must still receive AUDIO",
+          },
+        )
+        .toBe(true);
+
+      // PHASE 3d — RELAY CONGESTION (soft assertion): check if the WT relay's
+      // congestion counter also rose. Under netsim the loss is client-side, so
+      // relay-side congestion detection may not fire (QUIC window may still drain).
+      // We log but do NOT hard-fail if it did not rise — the durable path (3a) is
+      // the load-bearing assertion. If it DID rise, that proves the relay's own
+      // congestion tracker also engaged, which is the full Half 2 story.
+      const congestionAfter = await readDownlinkCongestionTotal("webtransport");
+      const congestionDelta = congestionAfter - beforeWt.congestionTotal;
+      if (congestionDelta > 0) {
+        // Full Half 2 relay-side path also fired — optimal coverage.
+        const shedAfter = await readDownlinkShedTotal("webtransport");
+        const shedDelta = shedAfter - beforeWt.shedTotal;
+        expect(
+          shedDelta,
+          "#1434 WT bonus: if relay entered congestion, shed_total should also rise",
+        ).toBeGreaterThan(0);
+      }
+      // (else: relay did not enter congestion mode, but layer-filter path fired —
+      // the client's chooser handled the step-down autonomously. Still valid.)
+
+      // PHASE 4 — heal and verify recovery (UI-side: degraded climbs back).
+      await healDownlinkNetsim(degradedPage);
+
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
+          timeout: 90_000,
+          intervals: [2000, 3000, 5000],
+        })
+        .toBeGreaterThan(0);
+    } finally {
+      if (degradedPage) {
+        await healDownlinkNetsim(degradedPage);
+      }
+      await pubBrowser.close();
+      await healthyBrowser.close();
+      await degradedBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Recovery stability: validate that after downlink impairment the receiver's
+  // layer does NOT oscillate (up/down flapping). This uses the WT netsim hook
+  // with `crushed_downlink` (40% loss). The key assertion is that after the
+  // initial step-down the layer should SETTLE, not bounce.
+  //
+  // The hysteresis in the layer chooser (consecutive-success counters or decay
+  // windows for step-UP) should prevent rapid oscillation. This test polls the
+  // layer over 30 seconds after step-down and asserts that the max observed
+  // index minus the min observed index is <= 1 (at most one step of jitter,
+  // not full-range flapping).
+  // -------------------------------------------------------------------------
+  test("recovery window does not oscillate under marginal loss — layer settles after step-down (#1434 comment)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1434_stable_${Date.now()}`;
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let rxPage: Page | undefined;
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1434-stab-pub@videocall.rs",
+        "Sim1434StabPub",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-1434-stab-rx@videocall.rs",
+        "Sim1434StabRx",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      rxPage = await rxCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim1434StabPub");
+      await joinMeeting(rxPage, meetingId, "Sim1434StabRx");
+
+      await assertCapabilityOverrideActive(pubConsole);
+      await openPerformancePanel(rxPage);
+
+      // Let the receiver climb above base.
+      await expect
+        .poll(
+          async () => {
+            const layer = await readVideoLayer(rxPage!);
+            return layer?.layerCount ?? 0;
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(1);
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // Impair the receiver — this will cause it to step down.
+      await impairDownlinkNetsim(rxPage);
+
+      // Wait for the initial step-down to take effect.
+      await expect
+        .poll(
+          async () => {
+            const layer = await readVideoLayer(rxPage!);
+            // Accept either layer 0 (stepped all the way down) or a lower layer
+            // than the top. The key is that it stepped DOWN.
+            if (!layer) return false;
+            return layer.layerIndex < layer.layerCount - 1;
+          },
+          { timeout: 60_000, intervals: [2000, 3000, 5000] },
+        )
+        .toBe(true);
+
+      // STABILITY OBSERVATION: now that the receiver has stepped down, observe
+      // its layer index over 30 seconds. Under a marginal impairment the chooser
+      // should SETTLE at the lower layer — not oscillate up and back down
+      // repeatedly. We track the set of unique layer indices observed.
+      const observedIndices: number[] = [];
+      const stabilityDurationMs = 30_000;
+      const pollIntervalMs = 3_000;
+      const iterations = Math.floor(stabilityDurationMs / pollIntervalMs);
+
+      for (let i = 0; i < iterations; i++) {
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        const layer = await readVideoLayer(rxPage);
+        if (layer) {
+          observedIndices.push(layer.layerIndex);
+        }
+      }
+
+      // Assert stability: the range of observed indices (max - min) must be <= 1.
+      // A range of 0 = perfectly stable (settled at one layer).
+      // A range of 1 = at most one step of jitter (acceptable transient).
+      // A range >= 2 = full oscillation (up/down flapping) — FAIL.
+      expect(
+        observedIndices.length,
+        "must have observed at least 5 layer readings during stability window",
+      ).toBeGreaterThanOrEqual(5);
+
+      const minIdx = Math.min(...observedIndices);
+      const maxIdx = Math.max(...observedIndices);
+      expect(
+        maxIdx - minIdx,
+        `#1434 stability: layer must settle after step-down, not oscillate. ` +
+          `Observed indices: [${observedIndices.join(", ")}] ` +
+          `(range ${maxIdx - minIdx}, max allowed = 1)`,
+      ).toBeLessThanOrEqual(1);
+    } finally {
+      if (rxPage) {
+        await healDownlinkNetsim(rxPage);
+      }
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Flag-OFF control — single-layer no-regression guard for #1082.
 //
 // IMPORTANT: the runtime default of `experimentalSimulcastMaxLayers` was flipped
@@ -1788,6 +2912,204 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
     } finally {
       await pubBrowser.close();
       await rxBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // #1398 — SINGLE-LAYER, AUDIO-ONLY uplink-distress bitrate downshift.
+  //
+  // WHAT IS UNDER TEST: an audio-only publisher (camera OFF) with single-layer
+  // audio has NO upper Opus layer to shed, so the layer-ceiling lever (#621) is
+  // a no-op for it. #1398 adds a mic-side uplink-distress detector (the recovery
+  // `Interval` in microphone_encoder.rs) that, on SUSTAINED publisher-uplink
+  // distress while the camera is OFF and audio is single-layer, steps the audio
+  // bitrate FLOOR down one tier (50000 → 32000 → 24000 → 16000 bps) and re-applies
+  // it LIVE to the running Opus encoder via the worklet `reconfigOpus` (ctl 4002 =
+  // OPUS_SET_BITRATE). The first cut from the `u32::MAX` fail-open sentinel lands
+  // on tier index 1 (32000 bps), because the TOP tier (50000) IS the healthy
+  // bitrate and would be a no-op cut (audio_congestion_bitrate_step_down).
+  //
+  // HOW THE TEST DRIVES IT (deterministic, no real network impairment):
+  // the netsim build (TRUNK_BUILD_FEATURES=netsim, always-on in the e2e stack —
+  // docker/docker-compose.e2e.yaml) exposes `window.__vcNetsim.bumpUplinkStall(n)`
+  // and `bumpWsDrop(n)`, which add `n` to the process-global transport counters
+  // the detector reads (`unistream_ready_stall_count` / `websocket_drop_count`).
+  // We bump BOTH axes so the test is transport-agnostic: the decision is an OR
+  // across the WT-saturation and WS-drop axes (`audio_uplink_step_down_decision`),
+  // and the bump functions increment the shared statics regardless of the elected
+  // transport. Audio thresholds (videocall-aq/src/constants.rs): per-axis delta
+  // ≥ 5 over a tumbling 4000 ms window, evaluated at the 1 Hz recovery tick. The
+  // window must CLOSE with delta ≥ threshold to fire, and the detector seeds its
+  // window snapshot from the CURRENT counter at start — so we bump generously
+  // (+10 per tick) across several seconds and poll for up to ~20 s, guaranteeing a
+  // window closes with a large delta. Recovery climbs the floor back up only one
+  // tier per minutes-long cooldown, so the downshift will not be undone mid-test.
+  //
+  // WHAT WE ASSERT ON — and WHY (the FIX-2 worklet ACK).
+  //
+  // The worklet line that ACTUALLY applies the downshift
+  //   `[encoderWorker] Opus live reconfig … bitRate=(32000|24000|16000)`
+  // is emitted from dioxus-ui/scripts/encoderWorker.min.js, which runs as a
+  // DEDICATED WEB WORKER (`ENVIRONMENT_IS_WORKER = typeof importScripts ===
+  // "function"`). Playwright's `page.on("console")` does NOT capture dedicated-
+  // worker console output, and a repo-wide grep found NO worker-console forwarding
+  // in the e2e harness (`page.on("worker")` / `worker.on("console")` appear
+  // nowhere in e2e/tests or e2e/helpers; `collectConsole` only wires
+  // `page.on("console")`). So the worklet line itself is NOT observable here —
+  // which is WHY FIX 2 surfaces an ACK on the MAIN thread instead.
+  //
+  // FIX-2 DESIGN (worklet ACK): the worklet now posts a message back to the main
+  // thread — `{ message: "opusReconfigured", bitRate: data.bitRate }` — ONLY when
+  // it has actually applied `setOpusControl(4002, data.bitRate)` (OPUS_SET_BITRATE),
+  // i.e. only from INSIDE the `reconfigOpus` case's `if (data.bitRate) { … }` block,
+  // alongside the ctl-4002 call. The main-thread mic encoder receives that ack and
+  // re-logs it as a `log::info!`, which DOES surface via `page.on("console")`
+  // (wasm `log::info!` → `console_log`):
+  //   `MicrophoneEncoder: worklet ACK opusReconfigured bitRate=<bps>`
+  // where `<bps>` is the bare applied bitrate integer (32000/24000/16000 for the
+  // downshift tiers — NO parens; it is a Rust format-string value, not the
+  // `bit_rate=Some(<n>)` Debug shape the send-path log uses). This ack is the
+  // load-bearing signal because it fires ONLY when the worklet truly applied the
+  // bitrate to the live Opus encoder.
+  //
+  // MUTATION GUARD: removing the worklet's `setOpusControl(4002, data.bitRate)`
+  // call (in encoderWorker.min.js's `reconfigOpus` case) ALSO removes the ack
+  // `postMessage` — it lives inside the SAME `if (data.bitRate)` block — so this
+  // assertion FAILS (no ctl 4002 → no ack postMessage → no main-thread `worklet
+  // ACK` log → the poll times out → expect fails). The pre-#1398 send-path-only
+  // assertion (DOWNSHIFT_RE on `live Opus reconfig applied`) stayed GREEN under
+  // that mutation because the main thread logs it after it SENDS the `reconfigOpus`
+  // worklet message, regardless of whether the worklet applied it; that is the gap
+  // this ack closes.
+  //
+  // We keep the send-path `DOWNSHIFT_RE` assertion too (a secondary sanity check
+  // that the main thread did dispatch the reconfig), but the FINAL gating
+  // `expect(...).toBe(true)` is the ACK. We accept 32000/24000/16000 (any
+  // sub-50000 tier) so the assertion is robust to an extra tick stepping past
+  // 32000 before the poll catches it. (50000 — a healthy reconfig — is excluded so
+  // the assertion proves a genuine DOWN-step, not a no-op top-tier re-apply.)
+  // -------------------------------------------------------------------------
+  test("single-layer audio-only publisher downshifts Opus bitrate on uplink distress (#1398)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_audio_uplink_downshift_${Date.now()}`;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "audio-uplink-pub@videocall.rs",
+        "AudioUplinkPublisher",
+        uiURL,
+      );
+      // Pin SINGLE-LAYER audio (n_audio_layers == 1) so the detector's
+      // single-layer gate (`detector_single_layer`) holds. Must run before the
+      // first navigation (route is context-scoped).
+      await pinSimulcastMaxLayers(pubCtx, 1);
+
+      const pubPage = await pubCtx.newPage();
+      // Capture the console BEFORE navigation so the mic-encoder reconfig log
+      // (main-thread `log::info!`) is collected once it fires.
+      const pubConsole = collectConsole(pubPage);
+
+      // Join AUDIO-ONLY: mic ON, camera OFF — the detector's camera-OFF gate.
+      await joinMeetingAudioOnly(pubPage, meetingId, "AudioUplinkPublisher");
+
+      // Guard: the netsim hook (incl. bumpUplinkStall/bumpWsDrop) must exist —
+      // otherwise the UI image was built WITHOUT the `netsim` feature and the
+      // test would silently never fire. Fail loud with a rebuild instruction.
+      const netsimReady = await pubPage.evaluate(
+        () =>
+          typeof window.__vcNetsim?.install === "function" &&
+          typeof (window.__vcNetsim as unknown as { bumpUplinkStall?: unknown }).bumpUplinkStall ===
+            "function" &&
+          typeof (window.__vcNetsim as unknown as { bumpWsDrop?: unknown }).bumpWsDrop ===
+            "function",
+      );
+      expect(
+        netsimReady,
+        "window.__vcNetsim.bumpUplinkStall/bumpWsDrop are missing — the dioxus UI image was built " +
+          "WITHOUT the `netsim` cargo feature. Rebuild with `make e2e-build` (the e2e stack sets " +
+          "TRUNK_BUILD_FEATURES=netsim; see docker/docker-compose.e2e.yaml).",
+      ).toBe(true);
+
+      // Let the call stabilize so the mic encoder + its recovery Interval are
+      // running before we drive distress.
+      await pubPage.waitForTimeout(3000);
+
+      // Drive SUSTAINED uplink distress on BOTH axes. The audio per-axis threshold
+      // is delta ≥ 5 over a tumbling 4000 ms window; bump +10 per second so a
+      // window always closes with a delta well above threshold. Poll for the
+      // main-thread WORKLET ACK log (the FIX-2 mutation-sensitive signal — it fires
+      // ONLY when the worklet actually applied ctl 4002), reporting a sub-50000 tier.
+      //
+      // ACK_RE is the load-bearing assertion: the worklet posts
+      // `{ message:"opusReconfigured", bitRate }` back ONLY from inside the same
+      // `if (data.bitRate)` block that calls `setOpusControl(4002, …)`, and the
+      // main thread re-logs it as `MicrophoneEncoder: worklet ACK opusReconfigured
+      // bitRate=<n>`. NOTE the value is a BARE integer (Rust format string), NOT
+      // `Some(<n>)` — so match `bitRate=(?:32000|24000|16000)` with no parens.
+      const ACK_RE =
+        /MicrophoneEncoder: worklet ACK opusReconfigured bitRate=(?:32000|24000|16000)/;
+      // DOWNSHIFT_RE is the SEND-path log (kept as a secondary sanity check that the
+      // main thread did dispatch the reconfig). It is NOT mutation-sensitive on its
+      // own — it logs after SEND regardless of worklet application — so it must NOT
+      // be the gating assertion. See the MUTATION GUARD comment above.
+      const DOWNSHIFT_RE =
+        /MicrophoneEncoder: live Opus reconfig applied.*bit_rate=Some\((?:32000|24000|16000)\)/;
+
+      let bumped = 0;
+      await expect
+        .poll(
+          async () => {
+            // Keep distress sustained across windows: one bump per poll iteration.
+            await pubPage.evaluate(() => {
+              const ns = window.__vcNetsim as unknown as {
+                bumpUplinkStall?: (n: number) => unknown;
+                bumpWsDrop?: (n: number) => unknown;
+              };
+              ns.bumpUplinkStall?.(10);
+              ns.bumpWsDrop?.(10);
+            });
+            bumped += 1;
+            // The WORKLET ACK is the success predicate: it proves the worklet
+            // applied OPUS_SET_BITRATE (ctl 4002), not merely that the main thread
+            // sent the reconfig message.
+            return pubConsole.some((line) => ACK_RE.test(line));
+          },
+          {
+            // ~20 s of sustained bumping at ~1 Hz (intervals reach 1000 ms): several
+            // 4000 ms windows close, each with delta ≥ 10 ≥ threshold(5).
+            timeout: 20_000,
+            intervals: [500, 1000],
+            message:
+              "expected the audio-only single-layer publisher to log the WORKLET ACK " +
+              "(MicrophoneEncoder: worklet ACK opusReconfigured bitRate=32000|24000|16000) " +
+              "proving the worklet applied OPUS_SET_BITRATE (ctl 4002) after sustained uplink " +
+              "distress (#1398). Its absence means the worklet never applied the live bitrate " +
+              "downshift — check the worklet's reconfigOpus ctl-4002 + ack, the mic-side detector " +
+              "gate, or the netsim bump.",
+          },
+        )
+        .toBe(true);
+
+      // SECONDARY sanity (NOT the gate): the main thread also logged the SEND-path
+      // reconfig. This pins that both halves fired — the detector dispatched the
+      // reconfig AND the worklet acked applying it — but the load-bearing assertion
+      // above is the ACK (DOWNSHIFT_RE alone stays green under the ctl-4002 removal
+      // mutation; see the MUTATION GUARD comment).
+      expect(
+        pubConsole.some((line) => DOWNSHIFT_RE.test(line)),
+        "expected the main thread to ALSO log the send-path reconfig " +
+          "(MicrophoneEncoder: live Opus reconfig applied … bit_rate=Some(32000|24000|16000))",
+      ).toBe(true);
+
+      // Sanity: we actually drove distress (the poll did bump), not a fluke.
+      expect(bumped, "test must have bumped the uplink counters at least once").toBeGreaterThan(0);
+    } finally {
+      await pubBrowser.close();
     }
   });
 });

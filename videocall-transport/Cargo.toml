@@ -20,6 +20,15 @@ rustc-args = ["--cfg", "web_sys_unstable_apis"]
 all-features = true
 targets = ["wasm32-unknown-unknown"]
 
+[features]
+# Netsim e2e support (issue #1398). Gates the `force_*` counter bumpers
+# (`force_unistream_ready_stall`, `force_websocket_drop`) used by the netsim e2e
+# harness to deterministically drive the uplink-distress counters the encoders
+# consult. OFF by default → zero production cost (the bumpers are compiled out).
+# Enabled transitively when `videocall-client`'s `netsim` feature is on (the
+# dioxus-ui e2e build sets `TRUNK_BUILD_FEATURES=netsim`).
+netsim = []
+
 [dependencies]
 anyhow = { workspace = true }
 futures = "0.3"

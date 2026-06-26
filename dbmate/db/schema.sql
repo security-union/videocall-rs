@@ -282,17 +282,17 @@ CREATE INDEX idx_meeting_participants_meeting_id ON public.meeting_participants 
 
 
 --
--- Name: idx_meeting_participants_meeting_id_admitted; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_meeting_participants_meeting_id_admitted_present; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_meeting_participants_meeting_id_admitted ON public.meeting_participants USING btree (meeting_id) WHERE ((status)::text = 'admitted'::text);
+CREATE INDEX idx_meeting_participants_meeting_id_admitted_present ON public.meeting_participants USING btree (meeting_id) WHERE (((status)::text = 'admitted'::text) AND (left_at IS NULL));
 
 
 --
--- Name: idx_meeting_participants_meeting_id_waiting; Type: INDEX; Schema: public; Owner: -
+-- Name: idx_meeting_participants_meeting_id_waiting_present; Type: INDEX; Schema: public; Owner: -
 --
 
-CREATE INDEX idx_meeting_participants_meeting_id_waiting ON public.meeting_participants USING btree (meeting_id) WHERE ((status)::text = 'waiting'::text);
+CREATE INDEX idx_meeting_participants_meeting_id_waiting_present ON public.meeting_participants USING btree (meeting_id) WHERE (((status)::text = 'waiting'::text) AND (left_at IS NULL));
 
 
 --
@@ -401,4 +401,5 @@ INSERT INTO public.schema_migrations (version) VALUES
     ('20260402143618'),
     ('20260416000000'),
     ('20260429000000'),
-    ('20260505130637');
+    ('20260505130637'),
+    ('20260619000000');

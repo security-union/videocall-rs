@@ -15,7 +15,7 @@ use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::rc::Rc;
 use std::sync::Arc;
-use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use videocall_types::protos::media_packet::MediaPacket;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
@@ -323,7 +323,11 @@ impl NetEqAudioPeerDecoder {
             ts_ms: now_ms(),
             metrics: vec![
                 metric!("stats_json", json_str.to_string()),
-                metric!("reporting_peer", current_user),
+                // `current_user` is a `&'static str`; borrow it (zero-alloc, #1421).
+                Metric {
+                    name: "reporting_peer",
+                    value: MetricValue::text_static(current_user),
+                },
                 metric!("target_peer", peer_id.to_string()),
             ],
         });
@@ -357,7 +361,10 @@ impl NetEqAudioPeerDecoder {
                 ts_ms: now_ms(),
                 metrics: vec![
                     metric!("jitter_buffer_delay_ms", jitter),
-                    metric!("reporting_peer", "current_user"),
+                    Metric {
+                        name: "reporting_peer",
+                        value: MetricValue::text_static("current_user"),
+                    },
                     metric!("target_peer", peer_id.to_string()),
                 ],
             });
@@ -373,7 +380,10 @@ impl NetEqAudioPeerDecoder {
                 ts_ms: now_ms(),
                 metrics: vec![
                     metric!("jitter_buffer_target_delay_ms", target),
-                    metric!("reporting_peer", "current_user"),
+                    Metric {
+                        name: "reporting_peer",
+                        value: MetricValue::text_static("current_user"),
+                    },
                     metric!("target_peer", peer_id.to_string()),
                 ],
             });
@@ -398,7 +408,10 @@ impl NetEqAudioPeerDecoder {
                 ts_ms: now_ms(),
                 metrics: vec![
                     metric!("audio_buffer_ms", buf),
-                    metric!("reporting_peer", "current_user"),
+                    Metric {
+                        name: "reporting_peer",
+                        value: MetricValue::text_static("current_user"),
+                    },
                     metric!("target_peer", peer_id.to_string()),
                 ],
             });
@@ -415,7 +428,10 @@ impl NetEqAudioPeerDecoder {
                 ts_ms: now_ms(),
                 metrics: vec![
                     metric!("packets_awaiting_decode", packets),
-                    metric!("reporting_peer", "current_user"),
+                    Metric {
+                        name: "reporting_peer",
+                        value: MetricValue::text_static("current_user"),
+                    },
                     metric!("target_peer", peer_id.to_string()),
                 ],
             });
@@ -431,7 +447,10 @@ impl NetEqAudioPeerDecoder {
                 ts_ms: now_ms(),
                 metrics: vec![
                     metric!("expand_rate", er),
-                    metric!("reporting_peer", "current_user"),
+                    Metric {
+                        name: "reporting_peer",
+                        value: MetricValue::text_static("current_user"),
+                    },
                     metric!("target_peer", peer_id.to_string()),
                 ],
             });

@@ -84,6 +84,61 @@ pub fn format_datetime(timestamp_ms: i64) -> String {
     format!("{month} {day}, {hours_12}:{minutes:02} {am_pm}")
 }
 
+/// Format a Unix-epoch timestamp (in milliseconds) as a fully-qualified,
+/// timezone-aware timestamp: date + time + zone, in the user's locale and
+/// local timezone, e.g. `"Jun 22, 2026, 3:07 PM PDT"`.
+///
+/// Unlike [`format_datetime`] (compact, zone-less), this is the format to use
+/// "anytime reporting date or time in a meeting" so the reader can unambiguously
+/// see *which* moment is meant, including the timezone label (e.g. `PDT`,
+/// `GMT+1`). Other callers depend on the compact shape of `format_datetime`, so
+/// the two are kept separate.
+///
+/// Implemented with the browser's `Intl.DateTimeFormat`, which carries the
+/// locale-resolved timezone name. Locale is left undefined (the runtime picks
+/// the user's locale) and the timezone defaults to the user's local zone, which
+/// is exactly what `timeZoneName: "short"` then surfaces.
+///
+/// On any JS-interop failure (no DOM / headless host, or an unexpected
+/// `Intl` result), this degrades gracefully to [`format_datetime`] — which
+/// still gives date + time, just without the zone — rather than panicking.
+pub fn format_datetime_zoned(timestamp_ms: i64) -> String {
+    use wasm_bindgen::{JsCast, JsValue};
+
+    // Build the Intl.DateTimeFormat options object. Each `Reflect::set` returns
+    // a Result; on any failure we bail to the zone-less fallback below.
+    fn build(timestamp_ms: i64) -> Result<String, JsValue> {
+        let options = js_sys::Object::new();
+        let set = |key: &str, value: &JsValue| -> Result<(), JsValue> {
+            js_sys::Reflect::set(&options, &JsValue::from_str(key), value).map(|_| ())
+        };
+        set("year", &JsValue::from_str("numeric"))?;
+        set("month", &JsValue::from_str("short"))?;
+        set("day", &JsValue::from_str("numeric"))?;
+        set("hour", &JsValue::from_str("numeric"))?;
+        set("minute", &JsValue::from_str("2-digit"))?;
+        // The timezone label (e.g. "PDT", "GMT+1") — the whole point of the
+        // "zoned" variant. Defaults to the user's local zone.
+        set("timeZoneName", &JsValue::from_str("short"))?;
+
+        // Undefined locales => the runtime uses the user's locale. Matches the
+        // js-sys `DateTimeFormat::default()` pattern.
+        let locales: js_sys::Array = JsValue::UNDEFINED.unchecked_into();
+        let formatter = js_sys::Intl::DateTimeFormat::new(&locales, &options);
+
+        let date = js_sys::Date::new(&JsValue::from_f64(timestamp_ms as f64));
+        // `format` is a getter that returns the bound formatting Function; call
+        // it with the Date to produce the localized string.
+        let format_fn = formatter.format();
+        let formatted = format_fn.call1(&JsValue::UNDEFINED, date.as_ref())?;
+        formatted
+            .as_string()
+            .ok_or_else(|| JsValue::from_str("Intl.DateTimeFormat returned a non-string"))
+    }
+
+    build(timestamp_ms).unwrap_or_else(|_| format_datetime(timestamp_ms))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +255,82 @@ mod tests {
         assert!(
             result.contains("AM") || result.contains("PM"),
             "expected AM or PM marker in '{result}'"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // format_datetime_zoned tests
+    //
+    // format_datetime_zoned delegates to the browser's `Intl.DateTimeFormat`,
+    // which only exists in a browser/Node runtime, so the meaningful assertion
+    // runs under wasm-pack (the macro emits a host-target stub that compiles but
+    // does not execute the Intl path).
+    //
+    // The runner's timezone is unknown, so we can't pin the exact zone token
+    // ("PDT" vs "GMT+1" vs "UTC"). To make this a real mutation-catching test —
+    // one that FAILS if `timeZoneName` were dropped from the options — we format
+    // the same instant with a zone-less control (the identical Intl options
+    // minus `timeZoneName`) and assert the zoned output carries strictly more
+    // information: it must be longer and must contain the control as a substring
+    // plus extra trailing zone characters. A plain `is_ascii_alphabetic` check
+    // would NOT catch the mutation, because the month abbreviation is alphabetic
+    // too — so we avoid that trap deliberately.
+    // -------------------------------------------------------------------------
+
+    /// Zone-less control: same Intl options as `format_datetime_zoned` minus
+    /// `timeZoneName`. Mirrors the production builder so the only difference
+    /// between the two outputs is the zone token itself.
+    fn format_datetime_zoneless_control(timestamp_ms: i64) -> String {
+        use wasm_bindgen::{JsCast, JsValue};
+        let options = js_sys::Object::new();
+        let set = |key: &str, value: &str| {
+            js_sys::Reflect::set(&options, &JsValue::from_str(key), &JsValue::from_str(value))
+                .unwrap();
+        };
+        set("year", "numeric");
+        set("month", "short");
+        set("day", "numeric");
+        set("hour", "numeric");
+        set("minute", "2-digit");
+        // Intentionally NO timeZoneName — this is the control.
+        let locales: js_sys::Array = JsValue::UNDEFINED.unchecked_into();
+        let formatter = js_sys::Intl::DateTimeFormat::new(&locales, &options);
+        let date = js_sys::Date::new(&JsValue::from_f64(timestamp_ms as f64));
+        formatter
+            .format()
+            .call1(&JsValue::UNDEFINED, date.as_ref())
+            .unwrap()
+            .as_string()
+            .unwrap()
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn format_datetime_zoned_includes_year() {
+        // 2024-04-28T17:00:00Z. UTC offsets span -12..+14h, so the calendar
+        // year is 2024 in every possible runner timezone for this instant.
+        let result = format_datetime_zoned(1_714_323_600_000);
+        assert!(
+            result.contains("2024"),
+            "expected the 4-digit year in zoned output '{result}'"
+        );
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn format_datetime_zoned_adds_zone_over_zoneless() {
+        // The zoned output must carry strictly more than the zone-less control:
+        // a trailing timeZoneName token. If `timeZoneName` were removed from the
+        // production options, the two strings would be equal and this fails.
+        let ts = 1_714_323_600_000; // 2024-04-28T17:00:00Z
+        let zoned = format_datetime_zoned(ts);
+        let zoneless = format_datetime_zoneless_control(ts);
+        assert!(
+            zoned.len() > zoneless.len(),
+            "zoned output '{zoned}' should be longer than zone-less '{zoneless}'"
+        );
+        assert!(
+            zoned.contains(&zoneless),
+            "zoned output '{zoned}' should contain the zone-less rendering '{zoneless}' \
+             plus a trailing zone token"
         );
     }
 }

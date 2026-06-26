@@ -3,11 +3,9 @@
 //! Dedicated meeting settings page — the full management hub for a meeting.
 
 use crate::auth::{check_session, redirect_to_login};
-use crate::components::toggle_switch::ToggleSwitch;
+use crate::components::meeting_format::format_datetime_zoned;
 use crate::constants::oauth_enabled;
-use crate::meeting_api::{
-    delete_meeting, end_meeting, get_meeting_info, update_meeting, MeetingInfo,
-};
+use crate::meeting_api::{delete_meeting, end_meeting, get_meeting_info, MeetingInfo};
 use crate::routing::Route;
 use dioxus::prelude::*;
 use web_sys::window;
@@ -37,8 +35,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let mut admitted_can_admit_toggle = use_signal(|| false);
     let mut end_on_host_leave_toggle = use_signal(|| true);
     let mut allow_guests_toggle = use_signal(|| false);
-    let mut saving = use_signal(|| false);
-    let mut toggle_error = use_signal(|| None::<String>);
+    let saving = use_signal(|| false);
+    let toggle_error = use_signal(|| None::<String>);
     let mut ending = use_signal(|| false);
     let mut deleting = use_signal(|| false);
 
@@ -84,6 +82,90 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     }
                 }
             });
+        });
+    }
+
+    // Periodic refresh of the live read-only stats (participant_count,
+    // waiting_count, state, duration). The backend now reports the ACTUAL
+    // currently-present participant count, but the page would otherwise show
+    // whatever it was at load time. A `use_future` poll keeps it current.
+    //
+    // Lifecycle / cleanup: `use_future` ties this loop to the component scope.
+    // When the user navigates away the scope unmounts, Dioxus drops the future,
+    // and the in-flight `TimeoutFuture::new(...).await` is cancelled — so the
+    // loop self-terminates. No manual timer handle to leak (mirrors the
+    // self-cancelling poll in `decode_budget_banner.rs`).
+    //
+    // Interval: 12s. This is a low-traffic settings page, not the media hot
+    // path; 12s keeps the count fresh without hammering the meeting-api.
+    //
+    // Stomping safety: we ONLY rewrite the read-only stat fields onto a clone
+    // of the current `meeting`. We deliberately do NOT touch the toggle-backed
+    // signals (waiting_room_toggle / admitted_can_admit_toggle /
+    // end_on_host_leave_toggle / allow_guests_toggle) — those are the live
+    // source of truth for the optimistic toggle UI, and re-syncing them here
+    // would clobber an in-flight edit. We also skip the refresh entirely while
+    // a toggle save is in flight (`saving()`), and stop polling once the
+    // meeting has ended (its count is final).
+    {
+        let meeting_id = id.clone();
+        use_future(move || {
+            let meeting_id = meeting_id.clone();
+            async move {
+                // 12s cadence — sensible for a low-traffic settings page.
+                const REFRESH_INTERVAL_MS: u32 = 12_000;
+                loop {
+                    gloo_timers::future::TimeoutFuture::new(REFRESH_INTERVAL_MS).await;
+
+                    // Don't poll before the first load resolves, while an error
+                    // is showing, or while a toggle save is in flight (avoid
+                    // racing the optimistic toggle UI). Use `.peek()` so these
+                    // reads inside the long-lived poll don't create reactive
+                    // subscriptions (mirrors `decode_budget_banner.rs`).
+                    if *loading.peek() || error.peek().is_some() || *saving.peek() {
+                        continue;
+                    }
+
+                    // Stop polling once the meeting has ended — its stats are
+                    // final and won't change.
+                    if meeting.peek().as_ref().map(|m| m.state == "ended") == Some(true) {
+                        break;
+                    }
+
+                    match get_meeting_info(&meeting_id).await {
+                        Ok(fresh) => {
+                            // Re-check guards after the await: a save may have
+                            // started, or the user may have ended the meeting,
+                            // while the request was in flight.
+                            if *saving.peek() {
+                                continue;
+                            }
+                            // Update ONLY the read-only stat fields on a clone
+                            // of the current meeting. This leaves the
+                            // toggle-backed booleans (and their signals)
+                            // untouched, so an in-flight optimistic toggle is
+                            // never stomped by a stale server snapshot.
+                            let current = meeting.peek().clone();
+                            if let Some(mut current) = current {
+                                current.state = fresh.state;
+                                current.participant_count = fresh.participant_count;
+                                current.waiting_count = fresh.waiting_count;
+                                current.started_at = fresh.started_at;
+                                current.ended_at = fresh.ended_at;
+                                current.host_display_name = fresh.host_display_name;
+                                meeting.set(Some(current));
+                            }
+                        }
+                        Err(e) => {
+                            // A transient refresh failure is non-fatal: keep the
+                            // last-known stats on screen and try again next tick.
+                            // Do NOT surface it as a page error (that would hide
+                            // the whole settings UI behind the error state).
+                            log::warn!("meeting stats refresh failed: {e}");
+                        }
+                    }
+                }
+            }
         });
     }
 
@@ -156,125 +238,16 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let duration_str = info
         .ended_at
         .map(|ended| format_duration(ended - info.started_at));
-    let started_str = format_time(info.started_at);
-    let ended_str = info.ended_at.map(format_time);
+    let started_str = format_datetime_zoned(info.started_at);
+    let ended_str = info.ended_at.map(format_datetime_zoned);
     let participant_count = info.participant_count;
     let waiting_count = info.waiting_count;
 
-    let meeting_id_toggle = id.clone();
     let meeting_id_join = id.clone();
     let meeting_id_end = id.clone();
     let meeting_id_delete = id.clone();
-
-    let meeting_id_toggle2 = id.clone();
-    let meeting_id_toggle3 = id.clone();
-    let meeting_id_toggle4 = id.clone();
     let meeting_id_guest_link = id.clone();
-
-    let on_toggle_waiting_room = move |new_val: bool| {
-        if saving() {
-            return;
-        }
-        toggle_error.set(None);
-        let prev_aca = admitted_can_admit_toggle();
-        waiting_room_toggle.set(new_val);
-        // When disabling waiting room, also disable admitted_can_admit
-        if !new_val {
-            admitted_can_admit_toggle.set(false);
-        }
-        saving.set(true);
-        let meeting_id = meeting_id_toggle.clone();
-        let aca = if new_val { None } else { Some(false) };
-        spawn(async move {
-            match update_meeting(&meeting_id, Some(new_val), aca, None, None).await {
-                Ok(updated) => {
-                    waiting_room_toggle.set(updated.waiting_room_enabled);
-                    admitted_can_admit_toggle.set(updated.admitted_can_admit);
-                    saving.set(false);
-                }
-                Err(e) => {
-                    log::error!("Failed to update waiting room: {e}");
-                    waiting_room_toggle.set(!new_val);
-                    admitted_can_admit_toggle.set(prev_aca);
-                    saving.set(false);
-                    toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                }
-            }
-        });
-    };
-
-    let on_toggle_admitted_can_admit = move |new_val: bool| {
-        if saving() || !waiting_room_toggle() {
-            return;
-        }
-        toggle_error.set(None);
-        admitted_can_admit_toggle.set(new_val);
-        saving.set(true);
-        let meeting_id = meeting_id_toggle2.clone();
-        spawn(async move {
-            match update_meeting(&meeting_id, None, Some(new_val), None, None).await {
-                Ok(updated) => {
-                    waiting_room_toggle.set(updated.waiting_room_enabled);
-                    admitted_can_admit_toggle.set(updated.admitted_can_admit);
-                    saving.set(false);
-                }
-                Err(e) => {
-                    log::error!("Failed to update admitted_can_admit: {e}");
-                    admitted_can_admit_toggle.set(!new_val);
-                    saving.set(false);
-                    toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                }
-            }
-        });
-    };
-
-    let on_toggle_end_on_host_leave = move |new_val: bool| {
-        if saving() {
-            return;
-        }
-        toggle_error.set(None);
-        end_on_host_leave_toggle.set(new_val);
-        saving.set(true);
-        let meeting_id = meeting_id_toggle3.clone();
-        spawn(async move {
-            match update_meeting(&meeting_id, None, None, Some(new_val), None).await {
-                Ok(updated) => {
-                    end_on_host_leave_toggle.set(updated.end_on_host_leave);
-                    saving.set(false);
-                }
-                Err(e) => {
-                    log::error!("Failed to update end_on_host_leave: {e}");
-                    end_on_host_leave_toggle.set(!new_val);
-                    saving.set(false);
-                    toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                }
-            }
-        });
-    };
-
-    let on_toggle_allow_guests = move |new_val: bool| {
-        if saving() {
-            return;
-        }
-        toggle_error.set(None);
-        allow_guests_toggle.set(new_val);
-        saving.set(true);
-        let meeting_id = meeting_id_toggle4.clone();
-        spawn(async move {
-            match update_meeting(&meeting_id, None, None, None, Some(new_val)).await {
-                Ok(updated) => {
-                    allow_guests_toggle.set(updated.allow_guests);
-                    saving.set(false);
-                }
-                Err(e) => {
-                    log::error!("Failed to update allow_guests: {e}");
-                    allow_guests_toggle.set(!new_val);
-                    saving.set(false);
-                    toggle_error.set(Some(format!("Failed to update setting: {e}")));
-                }
-            }
-        });
-    };
+    let meeting_id_options = id.clone();
 
     let on_join = move |_| {
         navigator.push(Route::Meeting {
@@ -444,8 +417,8 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     line { x1: "3", y1: "10", x2: "21", y2: "10" }
                 }
                 span { class: "settings-stat-label", if is_ended { "Time" } else { "Started" } }
-                span { class: "settings-stat-value",
-                    "{started_str}"
+                span { class: "settings-stat-value settings-stat-value--range",
+                    span { class: "settings-stat-time-part", "{started_str}" }
                     if let Some(ref ended) = ended_str {
                         span { class: "settings-stat-separator", " – {ended}" }
                     }
@@ -457,98 +430,14 @@ pub fn MeetingSettingsPage(id: String) -> Element {
         div { class: "settings-card",
             h3 { class: "settings-card-title", "Options" }
 
-            div { class: "settings-option-row",
-                span { class: "settings-option-label", "Waiting Room" }
-                div { class: "settings-option-controls",
-                    span {
-                        class: "settings-info-icon",
-                        title: "Participants must be admitted by the host before joining",
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg", width: "15", height: "15",
-                            view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                            stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                            circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "12", y1: "16", x2: "12", y2: "12" }
-                            line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
-                        }
-                    }
-                    ToggleSwitch {
-                        enabled: waiting_room_toggle(),
-                        on_toggle: on_toggle_waiting_room,
-                        disabled: saving(),
-                    }
-                }
-            }
-
-            div {
-                class: "settings-option-row",
-                style: if waiting_room_toggle() { "opacity: 1.0;" } else { "opacity: 0.4;" },
-                span { class: "settings-option-label", "Participants can admit others" }
-                div { class: "settings-option-controls",
-                    span {
-                        class: "settings-info-icon",
-                        title: "Allow admitted participants to also admit others from the waiting room",
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg", width: "15", height: "15",
-                            view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                            stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                            circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "12", y1: "16", x2: "12", y2: "12" }
-                            line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
-                        }
-                    }
-                    ToggleSwitch {
-                        enabled: admitted_can_admit_toggle(),
-                        on_toggle: on_toggle_admitted_can_admit,
-                        disabled: saving() || !waiting_room_toggle(),
-                    }
-                }
-            }
-
-            div { class: "settings-option-row",
-                span { class: "settings-option-label", "End meeting when host leaves" }
-                div { class: "settings-option-controls",
-                    span {
-                        class: "settings-info-icon",
-                        title: "When enabled, the meeting automatically ends for all participants when the host leaves",
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg", width: "15", height: "15",
-                            view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                            stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                            circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "12", y1: "16", x2: "12", y2: "12" }
-                            line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
-                        }
-                    }
-                    ToggleSwitch {
-                        enabled: end_on_host_leave_toggle(),
-                        on_toggle: on_toggle_end_on_host_leave,
-                        disabled: saving(),
-                    }
-                }
-            }
-
-            div { class: "settings-option-row",
-                span { class: "settings-option-label", "Allow Guests" }
-                div { class: "settings-option-controls",
-                    span {
-                        class: "settings-info-icon",
-                        title: "Allow guests (unauthenticated users) to join this meeting without signing in",
-                        svg {
-                            xmlns: "http://www.w3.org/2000/svg", width: "15", height: "15",
-                            view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                            stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                            circle { cx: "12", cy: "12", r: "10" }
-                            line { x1: "12", y1: "16", x2: "12", y2: "12" }
-                            line { x1: "12", y1: "8", x2: "12.01", y2: "8" }
-                        }
-                    }
-                    ToggleSwitch {
-                        enabled: allow_guests_toggle(),
-                        on_toggle: on_toggle_allow_guests,
-                        disabled: saving(),
-                    }
-                }
+            crate::components::meeting_options_controls::MeetingOptionsControls {
+                meeting_id: meeting_id_options.clone(),
+                waiting_room_toggle,
+                admitted_can_admit_toggle,
+                end_on_host_leave_toggle,
+                allow_guests_toggle,
+                saving,
+                toggle_error,
             }
 
             if allow_guests_toggle() {
@@ -566,17 +455,12 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                             .unwrap_or_default();
                         rsx! {
                             span {
-                                class: "settings-field-value settings-field-mono",
-                                style: "font-size: 0.75rem; word-break: break-all; user-select: all;",
+                                class: "settings-field-value settings-field-mono settings-guest-link",
+                                style: "user-select: all;",
                                 "{guest_link}"
                             }
                         }
                     }
-                }
-            }
-            if let Some(err) = toggle_error() {
-                p { class: "toggle-error",
-                    "{err}"
                 }
             }
         }
@@ -684,19 +568,4 @@ fn format_duration(duration_ms: i64) -> String {
     } else {
         format!("{seconds}s")
     }
-}
-
-fn format_time(timestamp_ms: i64) -> String {
-    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(timestamp_ms as f64));
-    let hours = date.get_hours();
-    let minutes = date.get_minutes();
-    let am_pm = if hours >= 12 { "PM" } else { "AM" };
-    let hours_12 = if hours == 0 {
-        12
-    } else if hours > 12 {
-        hours - 12
-    } else {
-        hours
-    };
-    format!("{hours_12}:{minutes:02} {am_pm}")
 }

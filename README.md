@@ -36,7 +36,7 @@ An open-source, ultra-low-latency video conferencing platform and API built with
   - [Prerequisites](#prerequisites)
   - [Docker Setup](#docker-setup)
   - [Nix Build System (WIP)](#nix-build-system-wip)
-  - [Manual Setup](#manual-setup)
+  - [Manual Setup (Experimental)](#manual-setup-experimental)
 - [Runtime Configuration](#runtime-configuration-frontend-configjs)
   - [Local (no Docker)](#local-no-docker-create-dioxus-uiscriptsconfigjs)
   - [Local/Docker](#localdocker-start-dioxussh)

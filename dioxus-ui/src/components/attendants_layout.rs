@@ -432,4 +432,72 @@ mod tests {
             compute_effective_density(DensityMode::Maximum, 20, AVAIL_W, AVAIL_H, GAP, 15, 20, VW);
         assert_eq!(result, DensityMode::Maximum);
     }
+
+    // -- presenter-aware shedding: active-speaker exemption (issue #1559) -----
+    //
+    // Presenter-aware shedding LOWERS the decode-budget cap (and hence
+    // `visible_count`) while screen-sharing under pressure. The active-speaker
+    // exemption is delivered by `promote_speakers` running against that LOWER
+    // `visible_count`: an active speaker ranked beyond the shrunken decoded
+    // window is swapped INWARD, displacing a NON-speaking visible tile — so the
+    // presenter still sees who is talking while non-speaker thumbnails are shed
+    // first. This pins that the exemption holds at the smaller cap the presenter
+    // bias produces.
+
+    #[test]
+    fn presenter_shrunk_window_still_retains_active_speaker() {
+        // 6 peers. Without sharing the budget would decode (say) 4; under a
+        // presenter shed the visible window shrinks to 2. peer_5 (overflow) is an
+        // ACTIVE speaker; peer_0 / peer_1 (visible) are NOT speaking.
+        let mut tiles = make_tiles(6);
+        let mut speech = HashMap::new();
+        speech.insert("peer_5".into(), 950.0); // now=1000, active_ms=500 → active
+        let join = HashMap::new();
+
+        // Lowered (presenter) visible window == 2.
+        promote_speakers(&mut tiles, 2, &speech, &join, 1000.0, 500.0);
+
+        // The active speaker is retained INSIDE the shrunken decoded window even
+        // though it ranked at index 5 (beyond the cap). This is the exemption: a
+        // presenter still decodes whoever is talking.
+        assert!(
+            tiles[..2].contains(&"peer_5".to_string()),
+            "an active speaker must stay decoded even at the shrunken presenter cap. tiles: {tiles:?}"
+        );
+        // A NON-speaking tile is the one shed out of the decoded window — the
+        // off-screen thumbnail is dropped first, not the speaker.
+        let shed_first = tiles[2..]
+            .iter()
+            .any(|t| speech.get(t).is_none_or(|&ts| 1000.0 - ts >= 500.0));
+        assert!(
+            shed_first,
+            "a non-speaking tile is shed out of the decoded window before the active speaker"
+        );
+    }
+
+    #[test]
+    fn presenter_shed_keeps_multiple_speakers_drops_silent_thumbnails() {
+        // 6 peers, presenter window shrunk to 2. TWO overflow speakers
+        // (peer_4, peer_5); peer_0/peer_1 visible and silent. Both speakers
+        // should be promoted, displacing both silent visible tiles.
+        let mut tiles = make_tiles(6);
+        let mut speech = HashMap::new();
+        speech.insert("peer_4".into(), 900.0);
+        speech.insert("peer_5".into(), 950.0);
+        let join = HashMap::new();
+
+        promote_speakers(&mut tiles, 2, &speech, &join, 1000.0, 500.0);
+
+        let visible = &tiles[..2];
+        assert!(
+            visible.contains(&"peer_4".to_string()) && visible.contains(&"peer_5".to_string()),
+            "both active speakers retained at the shrunken presenter cap. tiles: {tiles:?}"
+        );
+        // The displaced silent peers fall OUT of the decoded window.
+        assert!(
+            tiles[2..].contains(&"peer_0".to_string())
+                && tiles[2..].contains(&"peer_1".to_string()),
+            "silent visible thumbnails are shed first. tiles: {tiles:?}"
+        );
+    }
 }

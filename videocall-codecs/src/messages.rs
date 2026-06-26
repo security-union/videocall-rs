@@ -78,9 +78,20 @@ pub struct VideoStatsMessage {
     /// Consume via `increase()`/`rate()`, which tolerate the reset; a rising value proves the
     /// governor fired in the field.
     pub playout_skip_to_live_total: Option<u64>,
+    /// Content-staleness in ms (issue #1641): the content AGE of the video currently being painted
+    /// — how old (in capture/wall-clock terms) the released content is, drift-baselined so the
+    /// unsynchronized publisher/receiver clock offset cancels. Distinct from `playout_paint_lag_ms`,
+    /// which measures the worker→main queue DEPTH (count × interval): a stream draining at display
+    /// rate keeps that depth small and reads ~0 even for minutes-old content. Content age vs queue
+    /// depth: this surfaces the "video lagged by minutes while paint-lag/playout-latency read ~0"
+    /// case (#1631 M2). Unlike `playout_latency_ms` (capped at 1800ms) this can exceed 1800ms.
+    pub content_staleness_ms: Option<f64>,
 }
 
 impl VideoStatsMessage {
+    // 8 worker→main video-diagnostic fields (issue #1641 added content_staleness_ms as the 8th);
+    // bundling them into a struct just to dodge the lint would not improve this thin DTO ctor.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         from_peer: String,
         to_peer: String,
@@ -89,6 +100,7 @@ impl VideoStatsMessage {
         playout_stage1_span_ms: f64,
         playout_paint_lag_ms: f64,
         playout_skip_to_live_total: u64,
+        content_staleness_ms: f64,
     ) -> Self {
         Self {
             kind: "video_stats".to_string(),
@@ -99,6 +111,7 @@ impl VideoStatsMessage {
             playout_stage1_span_ms: Some(playout_stage1_span_ms),
             playout_paint_lag_ms: Some(playout_paint_lag_ms),
             playout_skip_to_live_total: Some(playout_skip_to_live_total),
+            content_staleness_ms: Some(content_staleness_ms),
         }
     }
 }
@@ -125,19 +138,34 @@ pub const REQUEST_KEYFRAME_KIND: &str = "request_keyframe";
 /// `from_peer` / `to_peer` mirror the worker's diagnostics context and are
 /// carried for log symmetry only; the main-side callback is per-decoder (already
 /// bound to one peer + media type), so it needs no identity from the wire.
+///
+/// `head_age_ms` (issue #1479) carries the head-of-line backlog age (ms) that
+/// tripped the freshness deadline and drove this proactive request. The main
+/// thread's per-receiver cross-sender PLI budget
+/// (`videocall_client::decode::pli_budget`) uses it as a staleness priority so
+/// that, when its global cap is reached, the STALEST contending stream's request
+/// is preserved and a fresher one is shed. `#[serde(default)]` keeps it optional
+/// on the wire: an old worker build (or any other message structurally
+/// deserializing into this shape) that omits the field decodes to `0.0`, so the
+/// serde-disambiguation contract (`kind`-based dispatch) is unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestKeyframeMessage {
     pub kind: String,
     pub from_peer: Option<String>,
     pub to_peer: Option<String>,
+    /// Head-of-line backlog age (ms) that tripped the freshness deadline (issue #1479).
+    /// Defaulted on the wire so older payloads / overlapping shapes still deserialize.
+    #[serde(default)]
+    pub head_age_ms: f64,
 }
 
 impl RequestKeyframeMessage {
-    pub fn new(from_peer: Option<String>, to_peer: Option<String>) -> Self {
+    pub fn new(from_peer: Option<String>, to_peer: Option<String>, head_age_ms: f64) -> Self {
         Self {
             kind: REQUEST_KEYFRAME_KIND.to_string(),
             from_peer,
             to_peer,
+            head_age_ms,
         }
     }
 }
@@ -168,6 +196,13 @@ pub struct FreshnessSkipMessage {
     pub keyframe_seq: Option<u64>,
     /// Stale frames evicted in this skip.
     pub dropped: u64,
+    /// `true` when this event is the keyframe-less hold-ceiling escalation (issue #1662): the
+    /// held-last-good freeze exceeded `MAX_KEYFRAME_LESS_HOLD_MS` and the receiver forced a
+    /// decoder-pipeline reset rather than continue holding indefinitely. `false` for a routine
+    /// skip-to-live or a below-ceiling keyframe-less hold. Surfaced so the field log can
+    /// distinguish a bounded-freeze escalation (the #1662 fix firing) from a routine freshness skip.
+    #[serde(default)]
+    pub escalated: bool,
 }
 
 impl FreshnessSkipMessage {
@@ -177,6 +212,7 @@ impl FreshnessSkipMessage {
         head_age_ms: f64,
         keyframe_seq: Option<u64>,
         dropped: u64,
+        escalated: bool,
     ) -> Self {
         Self {
             kind: FRESHNESS_SKIP_KIND.to_string(),
@@ -185,6 +221,7 @@ impl FreshnessSkipMessage {
             head_age_ms,
             keyframe_seq,
             dropped,
+            escalated,
         }
     }
 
@@ -199,7 +236,10 @@ impl FreshnessSkipMessage {
     /// formatting is pinned by host tests below rather than living only in the
     /// wasm-gated emit arm (which no host test can exercise). `head_age` rounds to
     /// whole milliseconds (`{:.0}`); a `keyframe_seq` of `None` is the keyframe-less
-    /// held-last-good case and renders as `none (held last-good)`.
+    /// held-last-good case and renders as `none (held last-good)`. The `escalated=`
+    /// token (issue #1662) is `true` only for the keyframe-less hold-ceiling escalation
+    /// (decoder-pipeline reset) and `false` for routine skips, so the field investigation
+    /// can grep the bounded-freeze escalations apart from ordinary freshness skips.
     pub fn console_line(&self) -> String {
         let from = self.from_peer.as_deref().unwrap_or_default();
         let to = self.to_peer.as_deref().unwrap_or_default();
@@ -208,8 +248,8 @@ impl FreshnessSkipMessage {
             .map(|s| s.to_string())
             .unwrap_or_else(|| "none (held last-good)".to_string());
         format!(
-            "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms dropped={} keyframe_seq={keyframe}",
-            self.head_age_ms, self.dropped
+            "[JITTER_BUFFER] freshness_skip {from}->{to}: head_age={:.0}ms dropped={} keyframe_seq={keyframe} escalated={}",
+            self.head_age_ms, self.dropped, self.escalated
         )
     }
 }
@@ -334,17 +374,17 @@ mod worker_log_disambiguation_tests {
         // fields (level/target/message) are absent from every other message, so none of them can
         // deserialize into WorkerLogMessage at all -> the branch is structurally unable to swallow
         // them, independent of the kind guard.
-        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4);
+        let vs = VideoStatsMessage::new("a".into(), "b".into(), 5, 1.0, 2.0, 3.0, 4, 5.0);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&vs).unwrap()).is_err()
         );
 
-        let fs = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7);
+        let fs = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7, false);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&fs).unwrap()).is_err()
         );
 
-        let rk = RequestKeyframeMessage::new(None, None);
+        let rk = RequestKeyframeMessage::new(None, None, 0.0);
         assert!(
             serde_json::from_str::<WorkerLogMessage>(&serde_json::to_string(&rk).unwrap()).is_err()
         );
@@ -372,6 +412,7 @@ mod freshness_skip_console_line_tests {
             1234.0,
             Some(42),
             7,
+            false,
         )
         .console_line();
         // The load-bearing grep prefix.
@@ -389,6 +430,12 @@ mod freshness_skip_console_line_tests {
             line.contains("keyframe_seq="),
             "missing keyframe_seq= token: {line}"
         );
+        // Escalation token (issue #1662): the field investigation greps it to separate
+        // bounded-freeze escalations from routine freshness skips.
+        assert!(
+            line.contains("escalated="),
+            "missing escalated= token: {line}"
+        );
         // Peer attribution rendered as from->to.
         assert!(
             line.contains("alice->bob"),
@@ -397,8 +444,25 @@ mod freshness_skip_console_line_tests {
     }
 
     #[test]
+    fn renders_escalated_flag() {
+        // Issue #1662: the keyframe-less hold-ceiling escalation renders `escalated=true`; a routine
+        // skip renders `escalated=false`. Both renderings are pinned because the field investigation
+        // greps the token to count bounded-freeze escalations apart from ordinary skips.
+        let escalated = FreshnessSkipMessage::new(None, None, 6000.0, None, 0, true).console_line();
+        assert!(
+            escalated.contains("escalated=true"),
+            "escalation must render escalated=true: {escalated}"
+        );
+        let routine = FreshnessSkipMessage::new(None, None, 1800.0, None, 7, false).console_line();
+        assert!(
+            routine.contains("escalated=false"),
+            "routine skip must render escalated=false: {routine}"
+        );
+    }
+
+    #[test]
     fn renders_keyframe_some_as_bare_sequence() {
-        let line = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7).console_line();
+        let line = FreshnessSkipMessage::new(None, None, 1800.0, Some(42), 7, false).console_line();
         assert!(
             line.contains("keyframe_seq=42"),
             "Some(42) should render as keyframe_seq=42: {line}"
@@ -413,7 +477,7 @@ mod freshness_skip_console_line_tests {
     fn renders_keyframe_none_as_held_last_good() {
         // The keyframe-less held case (#1020 evict-and-hold) is the distinct signal the
         // investigation distinguishes from a skip-to-live, so its rendering is pinned.
-        let line = FreshnessSkipMessage::new(None, None, 1800.0, None, 7).console_line();
+        let line = FreshnessSkipMessage::new(None, None, 1800.0, None, 7, false).console_line();
         assert!(
             line.contains("keyframe_seq=none (held last-good)"),
             "None should render as keyframe_seq=none (held last-good): {line}"
@@ -423,7 +487,7 @@ mod freshness_skip_console_line_tests {
     #[test]
     fn rounds_head_age_to_whole_millis() {
         // `{:.0}` rounds: 1234.6 -> 1235.
-        let line = FreshnessSkipMessage::new(None, None, 1234.6, Some(1), 0).console_line();
+        let line = FreshnessSkipMessage::new(None, None, 1234.6, Some(1), 0, false).console_line();
         assert!(
             line.contains("head_age=1235ms"),
             "head_age should round to 1235ms: {line}"
@@ -436,12 +500,44 @@ mod freshness_skip_console_line_tests {
 
     #[test]
     fn empty_peers_render_as_empty_arrow() {
-        // `None` peers (a skip forwarded before SetContext) render as `->`, matching the prior
-        // inline `unwrap_or_default()` behavior — keeps the line shape stable for the grep.
-        let line = FreshnessSkipMessage::new(None, None, 100.0, Some(5), 1).console_line();
+        // `None` peers (a skip forwarded before SetContext backfill) render as `->`,
+        // matching the prior inline `unwrap_or_default()` behavior — keeps the line
+        // shape stable for the grep. With issue #1640 this is now rare (SetContext is
+        // sent at peer creation), but can still occur if the freshness deadline trips
+        // on the very first frame before the postMessage delivering SetContext arrives.
+        let line = FreshnessSkipMessage::new(None, None, 100.0, Some(5), 1, false).console_line();
         assert!(
             line.contains("freshness_skip ->:"),
             "empty peers should render as `->`: {line}"
+        );
+    }
+
+    /// Issue #1640: both `from_peer` and `to_peer` are now session_id strings (u64).
+    /// This test pins the semantic contract: the arrow format `{from}->{to}` renders
+    /// numeric session_ids so that log-parsing scripts can treat both sides uniformly
+    /// (e.g. correlate `from_peer` to the local receiver's session_id and `to_peer`
+    /// to the publisher's session_id without guessing whether a field is an email).
+    #[test]
+    fn session_id_peers_render_as_numeric_arrow() {
+        // Simulates the post-#1640 runtime: from_peer = local session_id,
+        // to_peer = remote publisher session_id — both u64 strings.
+        let line = FreshnessSkipMessage::new(
+            Some("9876543210".into()),
+            Some("1234567890".into()),
+            500.0,
+            Some(7),
+            3,
+            false,
+        )
+        .console_line();
+        assert!(
+            line.contains("9876543210->1234567890"),
+            "session_id peers should render as numeric arrow: {line}"
+        );
+        // Grep-contract: the full prefix + arrow is parseable in one regex.
+        assert!(
+            line.starts_with("[JITTER_BUFFER] freshness_skip 9876543210->1234567890:"),
+            "prefix + session_id arrow must form a single grep-able prefix: {line}"
         );
     }
 }

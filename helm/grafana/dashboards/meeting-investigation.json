@@ -3691,6 +3691,152 @@
           "type": "timeseries"
         },
         {
+          "datasource": { "type": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 221 },
+          "id": 86,
+          "options": {
+            "legend": { "calcs": ["last", "min"], "displayMode": "table", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "expr": "videocall_received_layer{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} → {{from_peer}} {{media_kind}}", "refId": "A" }
+          ],
+          "title": "Receiver Layer Selection (per-peer)",
+          "description": "Which simulcast layer each receiver is subscribing to for each peer. 0=base, 1=mid, 2=high. Only constrained peers appear (below top layer). Empty = all receivers healthy.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 221 },
+          "id": 87,
+          "options": {
+            "legend": { "calcs": ["last", "min"], "displayMode": "table", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "expr": "videocall_audio_congestion_ceiling{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} ceiling", "refId": "A" },
+            { "expr": "videocall_encoder_effective_layers{meeting_id=~\"$meeting\", media_kind=\"audio\"}", "legendFormat": "{{display_name}} effective", "refId": "B" }
+          ],
+          "title": "Audio Congestion Ceiling",
+          "description": "Audio congestion-driven layer ceiling vs effective (configured) layers. ceiling < effective = audio layers are being shed under congestion. ceiling == effective = uncapped (healthy).",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "min": 0, "max": 1,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 0.2 }] },
+              "unit": "percentunit"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 229 },
+          "id": 88,
+          "options": {
+            "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "expr": "videocall_client_battery_level{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} level", "refId": "A" },
+            { "expr": "videocall_client_battery_charging{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} charging", "refId": "B" }
+          ],
+          "title": "Battery Level & Charging State",
+          "description": "Client battery level (0-1) and charging state (1=charging, 0=discharging). Helps distinguish power-throttle from CPU-throttle.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+              "unit": "Mbps"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 229 },
+          "id": 89,
+          "options": {
+            "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "expr": "videocall_client_network_downlink_max{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} downlinkMax", "refId": "A" }
+          ],
+          "title": "Network Downlink Max (Mbps)",
+          "description": "Max downlink speed of the connection medium in Mbps (navigator.connection.downlinkMax). wifi=54, ethernet=1000. Absent on Firefox/Safari.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "min": 0, "max": 1,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 237 },
+          "id": 90,
+          "options": {
+            "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "expr": "videocall_client_cpu_throttled{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}}", "refId": "A" }
+          ],
+          "title": "CPU Throttle Indicator",
+          "description": "1 when capability_score / hardware_concurrency < 150, indicating a restrictive power plan, thermal throttle, or heavy background load. 0 = normal.",
+          "type": "timeseries"
+        },
+        {
+          "datasource": { "type": "prometheus" },
+          "fieldConfig": {
+            "defaults": {
+              "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 1, "showPoints": "never", "stacking": { "mode": "none" } },
+              "min": 0,
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 237 },
+          "id": 91,
+          "options": {
+            "legend": { "calcs": ["last"], "displayMode": "table", "placement": "bottom" },
+            "tooltip": { "mode": "multi", "sort": "desc" }
+          },
+          "targets": [
+            { "expr": "videocall_client_network_type{meeting_id=~\"$meeting\"}", "legendFormat": "{{display_name}} {{network_type}}", "refId": "A" }
+          ],
+          "title": "Connection Medium Type",
+          "description": "Network connection type indicator (wifi/ethernet/cellular). Value=1 when that type is active for the client. navigator.connection.type — Chrome/Edge only.",
+          "type": "timeseries"
+        },
+        {
           "datasource": {
             "type": "prometheus"
           },

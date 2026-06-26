@@ -56,6 +56,7 @@ fn build_app_with_nats(pool: sqlx::PgPool, nats: async_nats::Client) -> axum::Ro
         cookie_name: "session".to_string(),
         cookie_secure: false,
         nats: Some(nats),
+        feed_tx: meeting_api::feed_events::new_feed_channel().0,
         service_version_urls: Vec::new(),
         http_client: reqwest::Client::new(),
         display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
@@ -224,9 +225,11 @@ async fn meeting_ended_by_host_consumer_marks_meeting_ended() {
     // Without this, there is a window between spawn() returning and the
     // task's subscribe() call completing where a published message is lost.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (feed_tx, _feed_rx) = meeting_api::feed_events::new_feed_channel();
     let _handle = meeting_api::nats_consumers::spawn_meeting_ended_by_host_consumer_inner(
         Some(nats.clone()),
         pool.clone(),
+        feed_tx,
         Some(ready_tx),
     )
     .expect("Consumer should be spawned when NATS is available");

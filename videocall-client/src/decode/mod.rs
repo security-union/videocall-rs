@@ -24,13 +24,14 @@ pub mod media_decoder_trait;
 pub mod neteq_audio_decoder;
 pub mod peer_decode_manager;
 pub mod peer_decoder;
+pub mod pli_budget;
 pub mod video_decoder_wrapper;
 
 pub use layer_chooser::{
     max_layers_for_kind, quality_state, DegradeReason, KindLayerBounds, PrefMediaKind,
     QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot,
 };
-pub use peer_decode_manager::{PeerDecodeManager, PeerReceiveDiag, PeerStatus};
+pub use peer_decode_manager::{PeerDecodeManager, PeerDeviceInfo, PeerReceiveDiag, PeerStatus};
 pub use peer_decoder::VideoPeerDecoder;
 
 use neteq_audio_decoder::NetEqAudioPeerDecoder;

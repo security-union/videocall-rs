@@ -15,6 +15,7 @@
 
 pub mod console_logs;
 pub mod dev;
+pub mod feed_stream;
 pub mod host;
 pub mod meetings;
 pub mod oauth;
@@ -133,6 +134,16 @@ pub fn router() -> Router<AppState> {
         // prefix. Returns the home-page feed: owned + admitted meetings,
         // deduplicated, with server-computed `is_owner` on every row.
         .route("/api/v1/meetings/feed", get(meetings::list_feed))
+        // Live homepage-feed change stream (SSE). Registered as the static
+        // `feed/stream` segment before `{meeting_id}` so axum routes the literal
+        // path. Emits a content-free `feed-changed` nudge whenever a meeting
+        // create/admit/join/end/leave changes what the feed shows; the client
+        // re-fetches `GET /api/v1/meetings` (debounced) on each nudge. See
+        // `feed_stream::feed_stream` for the full client contract (issue #1081).
+        .route(
+            "/api/v1/meetings/feed/stream",
+            get(feed_stream::feed_stream),
+        )
         .route("/api/v1/meetings/{meeting_id}", get(meetings::get_meeting))
         .route(
             "/api/v1/meetings/{meeting_id}",

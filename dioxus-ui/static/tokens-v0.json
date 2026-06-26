@@ -22,6 +22,18 @@
       { "token": "--radius-sm", "value": "6px", "maps_from": ["5px", "6px"] },
       { "token": "--radius-md", "value": "8px", "maps_from": ["8px"] },
       { "token": "--radius-lg", "value": "12px", "maps_from": ["12px"] },
+      { "token": "--fs-1", "value": "10px", "maps_from": ["10px", "0.625rem"] },
+      { "token": "--fs-2", "value": "11px", "maps_from": ["11px", "0.6875rem"] },
+      { "token": "--fs-3", "value": "12px", "maps_from": ["12px", "0.75rem"] },
+      { "token": "--fs-4", "value": "13px", "maps_from": ["13px", "0.8125rem"] },
+      { "token": "--fs-5", "value": "14px", "maps_from": ["14px", "0.875rem"] },
+      { "token": "--fs-6", "value": "15px", "maps_from": ["15px", "0.9375rem"] },
+      { "token": "--fs-7", "value": "16px", "maps_from": ["16px", "1rem"] },
+      { "token": "--fs-8", "value": "18px", "maps_from": ["18px", "1.125rem"] },
+      { "token": "--fs-9", "value": "20px", "maps_from": ["20px", "1.25rem"] },
+      { "token": "--fs-10", "value": "24px", "maps_from": ["24px", "1.5rem"] },
+      { "token": "--fs-11", "value": "28px", "maps_from": ["28px", "1.75rem"] },
+      { "token": "--fs-12", "value": "32px", "maps_from": ["32px", "2rem"] },
       { "token": "--motion-fast", "value": "0.15s", "maps_from": ["0.15s"] },
       { "token": "--motion-base", "value": "0.2s", "maps_from": ["0.2s"] }
     ]

@@ -46,6 +46,7 @@ fn build_app_with_nats(pool: sqlx::PgPool, nats: async_nats::Client) -> axum::Ro
         cookie_name: "session".to_string(),
         cookie_secure: false,
         nats: Some(nats),
+        feed_tx: meeting_api::feed_events::new_feed_channel().0,
         service_version_urls: Vec::new(),
         http_client: reqwest::Client::new(),
         display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(
@@ -145,9 +146,11 @@ async fn became_empty_consumer_marks_active_meeting_idle() {
     // Spawn the consumer with the ready-signal variant so we know the
     // subscription is live before publishing (no publish-before-subscribe race).
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (feed_tx, _feed_rx) = meeting_api::feed_events::new_feed_channel();
     let _handle = meeting_api::nats_consumers::spawn_meeting_became_empty_consumer_inner(
         Some(nats.clone()),
         pool.clone(),
+        feed_tx,
         Some(ready_tx),
     )
     .expect("Consumer should be spawned when NATS is available");
@@ -216,9 +219,11 @@ async fn became_empty_consumer_does_not_resurrect_ended_meeting() {
         .expect("end_meeting must succeed");
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
+    let (feed_tx, _feed_rx) = meeting_api::feed_events::new_feed_channel();
     let _handle = meeting_api::nats_consumers::spawn_meeting_became_empty_consumer_inner(
         Some(nats.clone()),
         pool.clone(),
+        feed_tx,
         Some(ready_tx),
     )
     .expect("Consumer should be spawned when NATS is available");

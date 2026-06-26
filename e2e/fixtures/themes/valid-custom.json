@@ -1,0 +1,32 @@
+{
+  "version": 1,
+  "name": "E2E Neon",
+  "color": {
+    "surface": {
+      "base": { "dark": "#111133", "light": "#eeeeff" },
+      "raised": { "dark": "#1a1a44", "light": "#ffffff" },
+      "elevated": { "dark": "#222255", "light": "#f7f7ff" }
+    },
+    "border": {
+      "default": { "dark": "#333366", "light": "#ccccee" },
+      "emphasis": { "dark": "#4444aa", "light": "#b3b3e6" }
+    },
+    "text": {
+      "primary": { "dark": "#e0e0ff", "light": "#111133" },
+      "secondary": { "dark": "#9999cc", "light": "#444477" },
+      "error": { "dark": "#ff8aa0", "light": "#cc0033" }
+    },
+    "brand": {
+      "accent": { "dark": "#7733ff", "light": "#5500cc" },
+      "accent-hover": { "dark": "#9955ff", "light": "#7733ff" }
+    },
+    "status": {
+      "success": { "dark": "#33ff99", "light": "#009944" },
+      "warning": { "dark": "#ffcc33", "light": "#cc8800" },
+      "error": { "dark": "#ff3366", "light": "#cc0033" }
+    },
+    "focus": {
+      "ring": { "dark": "#9b7bff", "light": "#5500cc" }
+    }
+  }
+}

@@ -28,6 +28,7 @@ use crate::auth::GuestObserver;
 use crate::db::meetings::MeetingRow;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
+use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
 use crate::search;
 use crate::state::AppState;
@@ -146,6 +147,15 @@ pub async fn join_meeting(
         if reactivating {
             db_meetings::activate(&state.db, meeting.id).await?;
             nats_events::publish_meeting_activated(state.nats.as_ref(), &meeting_id).await;
+            // Live homepage-feed nudge (issue #1081): the host (re)started the
+            // meeting (idle/ended -> active), which the feed shows. Only on a
+            // real reactivation — an already-active rejoin does not nudge.
+            feed_events::publish_feed_change(
+                state.nats.as_ref(),
+                &state.feed_tx,
+                FeedChange::new(meeting_id.clone(), FeedChangeReason::Joined),
+            )
+            .await;
         }
 
         let row = if reactivating {
@@ -320,6 +330,16 @@ async fn join_as_attendee(
             if !auto_admitted {
                 nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
             }
+            // Live homepage-feed nudge (issue #1081): this joiner auto-activated
+            // the meeting (idle/ended -> active) AND added a participant row
+            // (auto-admitted -> participant_count, or waiting -> waiting_count) —
+            // all shown in the feed.
+            feed_events::publish_feed_change(
+                state.nats.as_ref(),
+                &state.feed_tx,
+                FeedChange::new(meeting_id.to_string(), FeedChangeReason::Joined),
+            )
+            .await;
             resp.waiting_room_enabled = wr_enabled;
             resp.admitted_can_admit = meeting.admitted_can_admit;
             resp.end_on_host_leave = meeting.end_on_host_leave;
@@ -456,6 +476,16 @@ async fn join_as_attendee(
         // Notify the host that the waiting room list has changed.
         nats_events::publish_waiting_room_updated(state.nats.as_ref(), meeting_id).await;
     }
+    // Live homepage-feed nudge (issue #1081): a new participant row was added —
+    // auto-admitted bumps `participant_count`, a waiting joiner bumps
+    // `waiting_count`, both shown in the feed (the owner's row reflects the
+    // waiting count). One nudge per join keeps cardinality O(1).
+    feed_events::publish_feed_change(
+        state.nats.as_ref(),
+        &state.feed_tx,
+        FeedChange::new(meeting_id.to_string(), FeedChangeReason::Joined),
+    )
+    .await;
     resp.waiting_room_enabled = waiting_room_enabled;
     resp.admitted_can_admit = meeting.admitted_can_admit;
     resp.end_on_host_leave = meeting.end_on_host_leave;
@@ -653,10 +683,12 @@ pub async fn leave_meeting(
     // c) Non-host attendee leaves → end only when the room is now empty (last
     //    admitted participant out). Same invariant as leave_meeting_as_guest.
     let left_as_host = row.is_host;
+    let mut ended = false;
     if left_as_host {
         if meeting.end_on_host_leave {
             // Rule (a).
             db_meetings::end_meeting(&state.db, meeting.id).await?;
+            ended = true;
             nats_events::publish_meeting_ended(
                 state.nats.as_ref(),
                 &meeting_id,
@@ -670,8 +702,26 @@ pub async fn leave_meeting(
         let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
         if remaining == 0 {
             db_meetings::end_meeting(&state.db, meeting.id).await?;
+            ended = true;
         }
     }
+
+    // Live homepage-feed nudge (issue #1081): a leave always drops the present
+    // participant count (shown in the feed), and may have ended the meeting. One
+    // nudge per leave — `Ended` when the leave ended the meeting, else
+    // `ParticipantLeft` — since the client re-fetches the whole feed on any
+    // nudge regardless of reason.
+    let reason = if ended {
+        FeedChangeReason::Ended
+    } else {
+        FeedChangeReason::ParticipantLeft
+    };
+    feed_events::publish_feed_change(
+        state.nats.as_ref(),
+        &state.feed_tx,
+        FeedChange::new(meeting_id.clone(), reason),
+    )
+    .await;
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }
@@ -706,12 +756,28 @@ pub async fn leave_meeting_as_guest(
 
     // End the meeting if no admitted participants remain after the guest leaves.
     let remaining = db_participants::count_admitted(&state.db, meeting.id).await?;
+    let mut ended = false;
     if remaining == 0 {
         db_meetings::end_meeting(&state.db, meeting.id).await?;
+        ended = true;
     }
 
     // Notify the host that the waiting room list changed.
     nats_events::publish_waiting_room_updated(state.nats.as_ref(), &meeting_id).await;
+
+    // Live homepage-feed nudge (issue #1081): the guest leaving dropped the
+    // present count, and may have ended the meeting — both shown in the feed.
+    let reason = if ended {
+        FeedChangeReason::Ended
+    } else {
+        FeedChangeReason::ParticipantLeft
+    };
+    feed_events::publish_feed_change(
+        state.nats.as_ref(),
+        &state.feed_tx,
+        FeedChange::new(meeting_id.clone(), reason),
+    )
+    .await;
 
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }
@@ -1031,6 +1097,7 @@ mod tests {
             cookie_name: "session".to_string(),
             cookie_secure: false,
             nats: None,
+            feed_tx: crate::feed_events::new_feed_channel().0,
             service_version_urls: Vec::new(),
             http_client: reqwest::Client::new(),
             display_name_rate_limiter: std::sync::Arc::new(std::sync::Mutex::new(

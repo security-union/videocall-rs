@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 
@@ -122,20 +123,11 @@ test.describe("Two users in a meeting", () => {
       const guestPage = await guestCtx.newPage();
 
       // ---- HOST: go to home page, enter meeting ----
-      await hostPage.goto("/");
-      await hostPage.waitForTimeout(1500);
-
-      await hostPage.locator("#meeting-id").click();
-      await hostPage.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
-      // Display name is a controlled input -- clear before typing to handle any pre-fill
-      await hostPage.locator("#username").click();
-      await hostPage.locator("#username").fill("");
-      await hostPage.locator("#username").pressSequentially("HostUser", { delay: 50 });
-      await hostPage.waitForTimeout(500);
-      await hostPage.locator("#username").press("Enter");
-      await expect(hostPage).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
-        timeout: 10_000,
-      });
+      // Hydration-robust submit (helpers/join-meeting.ts): gates submission on
+      // the post-hydration submit button and treats the home form detaching as
+      // the "we joined" signal, which is robust to window.location lagging the
+      // rendered route under load (the reproduced cause of the join flake).
+      await fillAndSubmitJoinForm(hostPage, meetingId, "HostUser");
       await hostPage.waitForTimeout(1500);
 
       // Host joins the meeting
@@ -143,20 +135,9 @@ test.describe("Two users in a meeting", () => {
       expect(hostResult).toBe("in-meeting");
 
       // ---- GUEST: go to home page, enter meeting ----
-      await guestPage.goto("/");
-      await guestPage.waitForTimeout(1500);
-
-      await guestPage.locator("#meeting-id").click();
-      await guestPage.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
-      // Display name is a controlled input -- clear before typing to handle any pre-fill
-      await guestPage.locator("#username").click();
-      await guestPage.locator("#username").fill("");
-      await guestPage.locator("#username").pressSequentially("GuestUser", { delay: 50 });
-      await guestPage.waitForTimeout(500);
-      await guestPage.locator("#username").press("Enter");
-      await expect(guestPage).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
-        timeout: 10_000,
-      });
+      // Hydration-robust submit (helpers/join-meeting.ts) — same rationale as
+      // the host above.
+      await fillAndSubmitJoinForm(guestPage, meetingId, "GuestUser");
       await guestPage.waitForTimeout(1500);
 
       const guestResult = await joinMeetingFromPage(guestPage);

@@ -578,6 +578,10 @@ pub fn generate_for_peer(
     // `peer_tile` by `session_id == peer_id`). Cloned per popup call site
     // below so the popup's Layers section matches the perf dialog.
     let signal_receive_diag = signal_info.receive_diag;
+    // #1482: this peer's device/hardware info for the popup's compact "Device"
+    // line. Resolved upstream in `peer_tile` (same `session_id == peer_id`
+    // lookup), cloned per popup call site below.
+    let signal_device_info = signal_info.device_info;
     // Issue #1483: per-tile "WT"/"WS" transport badge. `Copy`, so it can be
     // passed to `transport_badge(...)` in each `.tile-top-icons` arm without
     // cloning. Already gated upstream: `Some(Wt | Ws)` only when the
@@ -689,11 +693,11 @@ pub fn generate_for_peer(
         let ss_name_id = format!("{}-name", &*ss_div_id);
         let ss_signal_btn_id = format!("{}-signal-btn", &*ss_div_id);
         let ss_anchor_id = ss_signal_btn_id.clone();
-        let ss_split_class = if show_signal_popup {
-            "split-screen-tile signal-popup-open"
-        } else {
-            "split-screen-tile"
-        };
+        // issue 932 (follow-up to PR 931): the popup now floats via a
+        // `position: fixed` portal that escapes the tile's `overflow: hidden`,
+        // so the legacy `signal-popup-open` overflow-visible toggle is dead and
+        // its class is no longer emitted.
+        let ss_split_class = "split-screen-tile";
         return rsx! {
             div {
                 id: "{ss_div_id}",
@@ -757,6 +761,7 @@ pub fn generate_for_peer(
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
                         let popup_receive_diag = signal_receive_diag.clone();
+                        let popup_device_info = signal_device_info.clone();
                         let popup_anchor = ss_anchor_id.clone();
                         rsx! {
                             SignalQualityPopup {
@@ -768,6 +773,7 @@ pub fn generate_for_peer(
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
                                 receive_diag: popup_receive_diag,
+                                device_info: popup_device_info,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -803,11 +809,9 @@ pub fn generate_for_peer(
         } else {
             "canvas-container"
         };
-        let split_peer_class = if show_signal_popup {
-            "split-peer-tile signal-popup-open"
-        } else {
-            "split-peer-tile"
-        };
+        // issue 932 (follow-up to PR 931): popup floats via a fixed-position
+        // portal, so the dead `signal-popup-open` overflow toggle is gone.
+        let split_peer_class = "split-peer-tile";
         // HCL follow-up 957 (@token-exempt): the signal-meter popup
         // anchors directly on the signal-quality button (id below) so
         // the popup overlays the button's top-left corner on first open.
@@ -1030,6 +1034,7 @@ pub fn generate_for_peer(
                         let popup_peer_name = peer_display_name.clone();
                         let popup_transport = signal_transport.clone();
                         let popup_receive_diag = signal_receive_diag.clone();
+                        let popup_device_info = signal_device_info.clone();
                         let popup_anchor = split_anchor_id.clone();
                         rsx! {
                             SignalQualityPopup {
@@ -1041,6 +1046,7 @@ pub fn generate_for_peer(
                                 anchor_id: popup_anchor,
                                 meter_mode: signal_meter_mode,
                                 receive_diag: popup_receive_diag,
+                                device_info: popup_device_info,
                                 free_position: signal_free_position,
                                 on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                 on_reanchor: move |_| on_reanchor_signal_popup.call(()),
@@ -1148,14 +1154,15 @@ pub fn generate_for_peer(
             // lets Dioxus diff the tile in place and REUSE the same `<canvas>`
             // node. The className is built to be byte-identical to the previous
             // behaviour: "grid-item" in the normal grid, "grid-item full-bleed"
-            // for the single surviving peer, each gaining " signal-popup-open"
-            // when the signal popup is open.
+            // for the single surviving peer.
+            //
+            // issue 932 (follow-up to PR 931): the former " signal-popup-open"
+            // suffix is dropped — the popup now floats via a `position: fixed`
+            // portal that escapes the tile's `overflow: hidden`, so the
+            // overflow-visible toggle that class drove is dead.
             let mut grid_item_class = String::from("grid-item");
             if full_bleed {
                 grid_item_class.push_str(" full-bleed");
-            }
-            if show_signal_popup {
-                grid_item_class.push_str(" signal-popup-open");
             }
             // HCL follow-up 957 (@token-exempt): anchor the popup on
             // the tile's signal-quality button (id below) so the popup
@@ -1427,6 +1434,7 @@ pub fn generate_for_peer(
                             let popup_peer_name = peer_display_name.clone();
                             let popup_transport = signal_transport.clone();
                             let popup_receive_diag = signal_receive_diag.clone();
+                            let popup_device_info = signal_device_info.clone();
                             let popup_anchor = grid_anchor_id.clone();
                             rsx! {
                                 SignalQualityPopup {
@@ -1438,6 +1446,7 @@ pub fn generate_for_peer(
                                     anchor_id: popup_anchor,
                                     meter_mode: signal_meter_mode,
                                     receive_diag: popup_receive_diag,
+                                    device_info: popup_device_info,
                                     free_position: signal_free_position,
                                     on_drag_commit: move |p| on_drag_commit_signal_popup.call(p),
                                     on_reanchor: move |_| on_reanchor_signal_popup.call(()),

@@ -25,6 +25,18 @@ pub fn websocket_drop_count() -> u64 {
     WEBSOCKET_DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// NETSIM-ONLY: synthetically bump the WS send-buffer drop counter by `n` (issue
+/// #1398). The real increment fires when `bufferedAmount > MAX_BUFFERED_AMOUNT`,
+/// which an e2e test cannot reliably induce on a localhost loopback. This
+/// feature-gated bumper lets the netsim e2e harness drive the SAME counter the
+/// encoders consult, exercising the mic-side single-layer audio uplink-distress
+/// detector's WS axis deterministically. Zero production cost: compiled out
+/// unless the `netsim` feature is on.
+#[cfg(feature = "netsim")]
+pub fn force_websocket_drop(n: u64) {
+    WEBSOCKET_DROP_COUNT.fetch_add(n, Ordering::Relaxed);
+}
+
 use gloo::events::EventListener;
 use js_sys::Uint8Array;
 use wasm_bindgen::JsCast;

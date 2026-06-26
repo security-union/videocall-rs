@@ -108,13 +108,13 @@ canvas {
 
 h2 {
   margin: 0;
-  font-size: 18px;
+  font-size: var(--fs-8);
   font-weight: 600;
 }
 
 h3 {
   margin: 20px 0 10px 0;
-  font-size: 16px;
+  font-size: var(--fs-7);
   font-weight: 500;
   color: var(--text-secondary);
 }
@@ -152,7 +152,7 @@ h3 {
 
 .peer-list li {
   margin-top: 10px;
-  font-size: 16px;
+  font-size: var(--fs-7);
   border-radius: 5px;
 }
 
@@ -160,7 +160,7 @@ h3 {
   display: flex;
   align-items: center;
   padding: 8px;
-  border-radius: var(--radius-sm, 5px);
+  border-radius: var(--radius-sm);
   transition: background-color 0.2s;
 }
 
@@ -197,7 +197,7 @@ h3 {
   align-items: center;
   justify-content: center;
   padding: 1px 7px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--warning);
   color: #000;
   /* @token-exempt: explicit black text on yellow warning badge for AA contrast */
@@ -223,7 +223,7 @@ h3 {
   bottom: 8px;
   right: 8px;
   padding: 2px 8px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background-color: var(--warning);
   color: #000;
   /* @token-exempt: explicit black text on yellow warning badge for AA contrast */
@@ -384,7 +384,7 @@ h3 {
   right: 0;
   background: var(--surface-elevated, #1e2030);
   border: 1px solid var(--border-subtle, rgba(255, 255, 255, 0.12));
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
   z-index: 100;
   min-width: 130px;
@@ -500,7 +500,7 @@ h3 {
   border: 2px solid var(--color-border-emphasis);
   border-radius: 10px;
   color: var(--text-secondary);
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
   font-weight: 600;
   gap: 4px;
 }
@@ -511,16 +511,18 @@ h3 {
   opacity: 0.7;
 }
 
-/* Issue #987, task 1a.4: off-budget avatar tiles. These peers are present and
-   audible but their video is not being decoded (the adaptive decode-budget
-   controller capped how many tiles decode to protect CPU). A dashed border and
-   slightly muted surface distinguishes "I'm not decoding your video" from a
-   normal camera-off tile, without hiding who is in the meeting. The tile reuses
-   the standard `.grid-item` + `.placeholder-content` markup; only the framing
-   differs. E2E queries `.grid-item.off-budget-tile` / `[data-off-budget=true]`. */
+/* Off-budget avatar tiles. These peers are present and audible but their video
+   is not being decoded (the adaptive decode-budget controller capped how many
+   tiles decode to protect CPU). issue 1142 FINAL DESIGN consolidated the tile
+   treatment to a SINGLE signal: a slightly muted surface, the dimmed
+   placeholder content (`.placeholder-content--paused`), and a centered PLAY
+   overlay (`.decode-play-overlay`). The earlier dashed border was dropped — the
+   muted surface + dim + PLAY are enough to read "paused by your device" without
+   the noisier dashed framing. The tile reuses the standard `.grid-item` +
+   `.placeholder-content` markup. E2E queries `.grid-item.off-budget-tile` /
+   `[data-off-budget=true]`, so the class and attribute are LOAD-BEARING — do
+   not remove them. */
 .grid-item.off-budget-tile {
-  border-style: dashed;
-  border-color: var(--color-border-emphasis);
   background-color: var(--surface);
 }
 
@@ -560,7 +562,7 @@ h3 {
   justify-content: center;
   padding: 0;
   border: none;
-  border-radius: var(--radius-pill, 999px);
+  border-radius: var(--radius-pill);
   background: var(--btn-warning-bg);
   color: var(--warning);
   box-shadow: 0 0 0 1px var(--btn-warning-border);
@@ -624,9 +626,9 @@ h3 {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-md, 10px);
+  border-radius: var(--radius-md);
   font-family: inherit;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
   cursor: pointer;
   color: var(--warning);
@@ -1139,7 +1141,7 @@ select {
 
 .diagnostics-data {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-3);
   white-space: pre-wrap;
 }
 
@@ -1186,7 +1188,7 @@ html[data-theme="dark"] #diagnostics-sidebar {
   margin: 20px 0 8px;
   padding-top: 16px;
   border-top: 1px solid var(--border);
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1222,7 +1224,7 @@ html[data-theme="dark"] #diagnostics-sidebar {
      (`.diag-disclosure-chev`) inside the summary so the open/closed affordance
      is consistent across browsers (Fix B), mirroring `.perf-peers__summary`. */
   list-style: none;
-  font-size: 16px;
+  font-size: var(--fs-7);
   font-weight: 600;
   color: var(--text-primary);
   padding: 4px 0;
@@ -1238,7 +1240,7 @@ html[data-theme="dark"] #diagnostics-sidebar {
 /* Subtle hover affordance on the clickable summary row. */
 .diag-disclosure-summary:hover {
   background: var(--glass-bg-hover);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 /* The explicit chevron points right when closed, rotates to point down when the
    `<details>` is open. Mirrors the `.perf-peers__chev` pattern. */
@@ -1267,7 +1269,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .diag-neteq-placeholder {
   margin: 0;
   color: var(--text-secondary);
-  font-size: 14px;
+  font-size: var(--fs-5);
 }
 /* Each folded raw-stats block (Reception / Sending / Encoder / Media Status)
    keeps its own sub-heading inside the one disclosure. */
@@ -1276,7 +1278,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 .diag-raw-block h4 {
   margin: 0 0 6px;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--text-secondary);
 }
@@ -1321,7 +1323,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 #diagnostics-sidebar .diagnostics-section h3 {
   color: var(--text-primary);
-  font-size: 16px;
+  font-size: var(--fs-7);
   margin-bottom: 10px;
   padding-bottom: 5px;
   border-bottom: 1px solid var(--glass-bg-hover);
@@ -1332,7 +1334,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    (iteration 3 polish). */
 #diagnostics-sidebar .diagnostics-data pre {
   font-family: monospace;
-  font-size: 13px;
+  font-size: var(--fs-4);
   white-space: pre-wrap;
   color: var(--diag-mono-text);
   background-color: var(--surface);
@@ -1370,7 +1372,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 #diagnostics-sidebar .sidebar-header h2 {
   margin: 0;
-  font-size: 18px;
+  font-size: var(--fs-8);
   color: var(--text-primary);
 }
 
@@ -1378,7 +1380,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: none;
   border: none;
   color: var(--text-primary);
-  font-size: 24px;
+  font-size: var(--fs-10);
   cursor: pointer;
   padding: 0 5px;
 }
@@ -1430,7 +1432,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .close-button {
   background: var(--glass-bg-hover);
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   width: 32px;
   height: 32px;
   display: flex;
@@ -1439,7 +1441,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   transition: all 0.2s ease;
   color: var(--text-primary);
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
 }
 
 .close-button:hover {
@@ -1492,9 +1494,26 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 /* Build Info Styles */
 .build-info-table {
   display: grid;
-  grid-template-columns: 1fr auto auto;
-  gap: 2px 10px;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 2px 6px;
   font-size: 0.85em;
+}
+
+/* issue 1480: build-info grid column count tracks whether github info
+   (Commit + Branch) is shown. --git = Component/Commit/Branch/Built (4 col);
+   --nogit = Component/Built (2 col). Cells use display:contents rows so the
+   grid column count must equal the spans rendered per row.
+   Fit/shrink rationale: Component is the only flexible column and shrinks via
+   minmax(0, 1fr) so it ellipsizes, while the three content columns (7-char
+   commit, branch, and the full ~19-20 char `YYYY-MM-DD HH:MM:SSZ` Built value)
+   stay `auto` and size to their content, so they remain fully visible within
+   the ~300px drawer — the longer seconds-precision Built still does not clip.
+   The column gap was reduced from 10px to 6px to claw back horizontal space. */
+.build-info-table--git {
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+}
+.build-info-table--nogit {
+  grid-template-columns: minmax(0, 1fr) auto;
 }
 
 .build-info-header {
@@ -1539,7 +1558,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .neteq-chart .chart-title {
-  font-size: 10px;
+  font-size: var(--fs-1);
   color: var(--text-secondary);
   margin-bottom: 5px;
   text-align: center;
@@ -1556,13 +1575,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin: 10px 0;
   text-align: center;
   background: var(--surface-elevated);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   padding: 15px;
   box-shadow: var(--shadow-sm);
 }
 
 .neteq-advanced-chart .chart-title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: bold;
   margin-bottom: 10px;
   color: var(--text-primary);
@@ -1585,7 +1604,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .neteq-advanced-chart .chart-title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 600;
   color: var(--text-primary);
   margin-bottom: 6px;
@@ -1602,7 +1621,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .neteq-status {
   background: var(--surface-elevated);
   padding: 16px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
@@ -1617,7 +1636,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 .neteq-status .status-stat {
   background: var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   padding: 12px 14px;
   display: flex;
   flex-direction: column;
@@ -1631,16 +1650,16 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-variant-numeric: tabular-nums;
 }
 .neteq-status .status-stat__label {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 600;
   color: var(--text-secondary);
 }
 .neteq-status .status-stat__unit {
-  font-size: 11px;
+  font-size: var(--fs-2);
   color: var(--text-tertiary);
 }
 .neteq-status .status-stat__reason {
-  font-size: 11px;
+  font-size: var(--fs-2);
   line-height: 1.3;
   margin-top: 2px;
   color: var(--text-secondary);
@@ -1661,11 +1680,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border-bottom: 1px solid var(--border);
 }
 .neteq-status .status-row__label {
-  font-size: 13px;
+  font-size: var(--fs-4);
   color: var(--text-secondary);
 }
 .neteq-status .status-row__value {
-  font-size: 16px;
+  font-size: var(--fs-7);
   font-weight: 600;
   color: var(--text-primary);
   font-variant-numeric: tabular-nums;
@@ -1678,7 +1697,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   align-items: baseline;
   gap: 4px 12px;
   padding-top: 4px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
 }
 .neteq-status .status-reorder__head {
@@ -1686,7 +1705,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-secondary);
   text-transform: uppercase;
   letter-spacing: 0.4px;
-  font-size: 11px;
+  font-size: var(--fs-2);
 }
 
 /* Quality tinting — VALUE color only; canonical tokens (Directive 5) */
@@ -1735,7 +1754,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin-bottom: 6px;
 }
 .neteq-charts-stack .diag-chart-head__title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 600;
   color: var(--text-primary);
 }
@@ -1751,7 +1770,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .chart-container {
   background: var(--surface-elevated);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
   padding: 10px;
 }
@@ -1763,7 +1782,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--border-emphasis);
   border-radius: 4px;
   color: var(--text-primary);
-  font-size: 14px;
+  font-size: var(--fs-5);
   margin: 8px 0;
   /* ≥44px tap target for the Peer Selection AND Transport Preference selects
      (both use this class) on touch devices (iteration 3 polish). */
@@ -1777,7 +1796,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-info {
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
   margin: 5px 0 0 0;
   font-style: italic;
@@ -1800,14 +1819,24 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border-left: 3px solid var(--success);
 }
 
+/* Right-hand cluster of a peer-summary row: transport badge + Buffer/Jitter
+   readout. Replaces an inline `display:flex; gap:8px; align-items:center` on
+   the wrapping div (issue 553, follow-up to PR 548 — repo convention prefers a
+   named class over an inline style). Same computed layout, no visual change. */
+.peer-summary-item__metrics {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+
 .peer-summary-item strong {
   color: var(--text-primary);
-  font-size: 13px;
+  font-size: var(--fs-4);
 }
 
 .peer-summary-item span {
   color: var(--text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-family: "Monaco", "Menlo", "Ubuntu Mono", monospace;
 }
 
@@ -1817,6 +1846,56 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .peer-summary .peer-stat.is-good { color: var(--diag-q-good); }
 .peer-summary .peer-stat.is-warn { color: var(--diag-q-warn); }
 .peer-summary .peer-stat.is-poor { color: var(--diag-q-poor); }
+
+/* issue 1656: contrast-safe severity chip primitives, SHARED by the Per-Peer
+   Summary triage chip and the Receive-breakdown lag chip. Severity hue is
+   DECOUPLED from legibility (WCAG AA at --fs-2 11px text needs 4.5:1, which the
+   saturated --diag-q-* tokens fail against --surface-elevated — see the
+   .simulcast-recv-peer-stats note). The VALUE text inherits the high-contrast
+   neutral --text-primary (~13.0:1 dark / 16.55:1 light; the dark figure reflects
+   the #diagnostics-sidebar dark remap of --text-primary to the settings-modal
+   near-opaque-white token composited over --surface-elevated, not plain white);
+   the severity HUE lives
+   only on the non-text DOT (a UI component, AA non-text floor 3:1). The
+   title/aria-label carries the reason, so meaning never depends on color (WCAG
+   1.4.1). The dot is decorative (aria-hidden in markup). */
+.peer-stat__value {
+  color: var(--text-primary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Specificity guard: inside the Per-Peer Summary, the generic
+   `.peer-summary-item span` rule (0,1,1) would otherwise out-specify
+   `.peer-stat__value` (0,1,0) and repaint the value --text-secondary. This
+   (0,2,0) override keeps the value text on the high-contrast --text-primary
+   in the summary context too (the receive-row context has no such ancestor
+   rule, so the base rule already wins there). */
+.peer-summary-item .peer-stat__value {
+  color: var(--text-primary);
+}
+
+.peer-stat__dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  margin-right: 2px;
+  vertical-align: baseline;
+  /* Fallback hue if an unexpected class lands here; overridden below. */
+  background: var(--text-tertiary);
+}
+
+.peer-stat__dot.is-good { background: var(--diag-q-good); }
+.peer-stat__dot.is-warn { background: var(--diag-q-warn); }
+.peer-stat__dot.is-poor { background: var(--diag-q-poor); }
+
+/* issue 1656 (BLOCKER 2): Per-Peer Summary triage chip (lag + recv/painted fps
+   gap). Inherits the secondary neutral container color for its label glue text;
+   the value spans override to --text-primary via .peer-stat__value. Kept inline
+   with the Buffer/Jitter cluster (flex sibling). */
+.peer-summary-item__lag {
+  white-space: nowrap;
+}
 
 @media (max-width: 37.5em) {
   .charts-grid {
@@ -1838,7 +1917,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 
   .peer-summary-item span {
-    font-size: 10px;
+    font-size: var(--fs-1);
   }
 }
 
@@ -1975,7 +2054,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .menu-button {
   background: var(--glass-bg-hover);
   border: none;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   width: 32px;
   height: 32px;
   display: flex;
@@ -2059,11 +2138,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   position: absolute;
   top: calc(100% + 0.5rem);
   right: 0;
-  background: rgba(30, 30, 30, 0.98)
-    /* @token-exempt: dark near-opaque, no matching token */
-  ;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  background: var(--fixed-dark-opaque);
+  backdrop-filter: blur(var(--effect-blur-lg));
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg));
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-lg);
   box-shadow:
@@ -2092,8 +2169,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.75rem 1rem;
   background: transparent;
   border: none;
-  color: var(--text-primary);
-  font-size: 0.875rem;
+  color: var(--on-dark-text);
+  font-size: var(--fs-5);
   text-align: left;
   cursor: pointer;
   display: flex;
@@ -2132,7 +2209,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-info-compact {
   padding: 0.75rem 1rem;
   border-bottom: 1px solid var(--glass-bg-hover);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
 }
 
 .info-row {
@@ -2365,7 +2442,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 4px;
   padding: 3px 8px 3px 4px;
   background: var(--overlay-heavy);
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   z-index: 5;
   opacity: 0;
   transform: translateY(4px);
@@ -2390,7 +2467,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .connection-quality-label {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 500;
   color: var(--text-on-glass-high);
   white-space: nowrap;
@@ -2455,7 +2532,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: transparent;
   border: none;
   color: var(--text-secondary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -2475,7 +2552,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meetings-list-toggle .meeting-count {
   margin-left: auto;
   color: var(--text-quaternary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
 }
 
 .meetings-list-content {
@@ -2493,7 +2570,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 1rem;
   text-align: center;
   color: var(--text-tertiary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
 }
 
 .meetings-auth-prompt {
@@ -2506,7 +2583,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .meetings-auth-text {
   color: var(--text-secondary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   margin: 0;
 }
@@ -2547,7 +2624,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button, 10px);
   color: var(--text-primary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   cursor: pointer;
   transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -2638,12 +2715,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background: var(--focus-ring);
   color: #fff
     /* @token-exempt: badge text on accent fill */
   ;
-  font-size: 0.625rem;
+  font-size: var(--fs-1);
   font-weight: 700;
   line-height: 1;
 }
@@ -2658,7 +2735,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button, 10px);
   color: var(--text-secondary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1),
     color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
@@ -2720,7 +2797,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.5rem;
   background: var(--surface-elevated);
   border: 1px solid var(--glass-border);
-  border-radius: var(--radius-card, 12px);
+  border-radius: var(--radius-card);
   box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
@@ -2773,7 +2850,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0;
   margin-bottom: 0.125rem;
   text-align: left;
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -2790,10 +2867,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin: 0;
   padding: 0.25rem;
   text-align: left;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   color: var(--text-secondary);
   cursor: pointer;
-  border-radius: var(--radius-button, 8px);
+  border-radius: var(--radius-button);
 }
 
 .meetings-filter-option:hover {
@@ -2825,9 +2902,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.5rem 0.625rem;
   background: transparent;
   border: none;
-  border-radius: var(--radius-button, 8px);
+  border-radius: var(--radius-button);
   color: var(--text-secondary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   cursor: pointer;
 }
 
@@ -2862,7 +2939,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button, 10px);
   color: var(--text-primary);
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -2953,20 +3030,20 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family:
     "SF Mono", "Fira Code", "Cascadia Code", ui-monospace, Menlo, monospace;
   font-weight: 600;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   letter-spacing: 0.02em;
   color: var(--text-primary);
   padding: 0.125rem 0.4375rem;
   background: var(--field-bg);
   border: 1px solid var(--join-meeting-id-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .meeting-state {
-  font-size: 0.625rem;
+  font-size: var(--fs-1);
   padding: 0.125rem 0.4375rem;
   border-radius: var(--radius-pill, 9999px);
   font-weight: 500;
@@ -2994,7 +3071,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: center;
   gap: 0.375rem;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-quaternary);
   flex-wrap: nowrap;
   overflow: hidden;
@@ -3038,7 +3115,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-on-glass-quaternary);
   padding: 0.5rem;
   margin-left: 0.5rem;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all 0.2s ease;
   flex-shrink: 0;
@@ -3093,14 +3170,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .meeting-time {
   color: var(--text-on-glass-faint);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   white-space: nowrap;
   flex-shrink: 0;
 }
 
 .meeting-time-separator {
   color: var(--text-on-glass-ghost);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   flex-shrink: 0;
 }
 
@@ -3108,12 +3185,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-info-tooltip-portal {
   position: fixed;
   background: var(--tooltip-portal-bg);
-  -webkit-backdrop-filter: blur(20px) saturate(140%);
-  backdrop-filter: blur(20px) saturate(140%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg)) saturate(140%);
+  backdrop-filter: blur(var(--effect-blur-lg)) saturate(140%);
   border: 1px solid var(--glass-bg-hover);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   padding: 0.3125rem 0.5rem;
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   color: var(--text-on-glass);
   white-space: nowrap;
   pointer-events: none;
@@ -3152,7 +3229,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .meeting-info-tooltip-label {
   color: var(--text-on-glass-fainter);
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   font-weight: 400;
 }
 
@@ -3240,7 +3317,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .waiting-room-card h2 {
   margin: 0 0 0.5rem 0;
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
   font-weight: 600;
 }
 
@@ -3259,7 +3336,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .waiting-room-error {
   color: var(--error-text-vivid);
   margin-bottom: 1rem;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
 }
 
 .waiting-room-spinner {
@@ -3308,9 +3385,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   left: 50%;
   transform: translateX(-50%);
   z-index: 9000;
-  background: rgba(30, 30, 30, 0.95)
-    /* @token-exempt: dark near-opaque, no matching token */
-  ;
+  background: var(--fixed-dark-strong);
   border-radius: var(--radius-lg);
   box-shadow: 0 4px 20px var(--shadow-error);
   min-width: 300px;
@@ -3327,8 +3402,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   padding: 0.875rem 1rem;
   background: transparent;
   border: none;
-  color: var(--text-primary);
-  font-size: 0.9375rem;
+  color: var(--on-dark-text);
+  font-size: var(--fs-6);
   cursor: pointer;
   transition: background-color 0.2s ease;
 }
@@ -3351,7 +3426,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-primary);
   padding: 0.125rem 0.5rem;
   border-radius: 10px;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   font-weight: 600;
   min-width: 20px;
   text-align: center;
@@ -3392,7 +3467,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .participant-email {
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   color: var(--text-on-glass-high);
   max-width: 200px;
   overflow: hidden;
@@ -3447,11 +3522,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .btn-admit-all {
   width: 100%;
   padding: 0.5rem 1rem;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   border: none;
   background: var(--success-bg-soft);
   color: var(--success);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   display: flex;
   align-items: center;
@@ -3502,7 +3577,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .rejected-card h2,
 .error-card h2 {
   margin: 1rem 0 0.5rem 0;
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
   font-weight: 600;
 }
 
@@ -3522,8 +3597,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   -ms-user-select: none;
   -webkit-appearance: none;
   background: var(--glass-bg);
-  -webkit-backdrop-filter: blur(12px) saturate(150%);
-  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
+  backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button);
   box-sizing: border-box;
@@ -3532,7 +3607,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   height: 44px;
   letter-spacing: 0.01em;
   outline: none;
@@ -3640,8 +3715,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   -ms-user-select: none;
   -webkit-appearance: none;
   background: var(--glass-bg);
-  -webkit-backdrop-filter: blur(12px) saturate(150%);
-  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
+  backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-button);
   box-sizing: border-box;
@@ -3650,7 +3725,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   height: 44px;
   letter-spacing: 0.01em;
   outline: none;
@@ -3718,8 +3793,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .generic-sign-in-button {
   -webkit-appearance: none;
   background: var(--oauth-blue-bg);
-  -webkit-backdrop-filter: blur(12px) saturate(150%);
-  backdrop-filter: blur(12px) saturate(150%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
+  backdrop-filter: blur(var(--effect-blur-surface)) saturate(150%);
   border: 1px solid var(--oauth-blue-border);
   border-radius: var(--radius-button);
   box-sizing: border-box;
@@ -3728,7 +3803,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   font-weight: 500;
   height: 44px;
   letter-spacing: 0.01em;
@@ -3768,7 +3843,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: none;
   color: var(--text-on-glass-faint);
   padding: 0.5rem;
-  border-radius: 0.375rem;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all 0.2s ease;
   flex-shrink: 0;
@@ -3797,7 +3872,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: none;
   border: none;
   color: var(--accent);
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   font-weight: 500;
   cursor: pointer;
   padding: 0.625rem 0.75rem;
@@ -3833,7 +3908,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-card-title {
   margin: 0 0 1.25rem 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
@@ -4009,7 +4084,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .prejoin-select-group label {
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -4097,7 +4172,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-secondary);
   font-family:
     "SF Mono", "Fira Code", "Cascadia Code", ui-monospace, Menlo, monospace;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   letter-spacing: 0.02em;
   line-height: 1.4;
@@ -4108,7 +4183,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .join-meeting-subtitle {
   margin: 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 400;
   line-height: 1.45;
   color: var(--text-secondary);
@@ -4121,7 +4196,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 
   .join-meeting-id {
-    font-size: 0.8125rem;
+    font-size: var(--fs-4);
     padding: 0.125rem 0.5rem;
   }
 }
@@ -4145,7 +4220,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-field-label {
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   font-weight: 500;
   color: var(--text-primary);
   flex-shrink: 0;
@@ -4153,7 +4228,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-field-value {
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   color: var(--text-secondary);
   text-align: right;
   min-width: 0;
@@ -4164,8 +4239,25 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-field-mono {
   font-family: "SF Mono", "Fira Code", "Cascadia Code", monospace;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   letter-spacing: 0.02em;
+}
+
+/* Guest join link (issue 1551): a full meeting URL can exceed the card width.
+   .settings-field-value sets `white-space: nowrap` + ellipsis for single-line
+   stat rows, which suppresses wrapping and made the link overflow its card.
+   This modifier restores wrapping for the long URL so it stays inside the card.
+   `min-width: 0` lets it shrink as a flex child of the column-layout row. */
+.settings-guest-link {
+  font-size: var(--fs-3);
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  min-width: 0;
+  max-width: 100%;
+  text-align: left;
 }
 
 .settings-field-compact {
@@ -4186,7 +4278,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-field .meeting-state {
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   padding: 0.1875rem 0.5625rem;
 }
 
@@ -4213,15 +4305,28 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-stat-label {
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   color: var(--text-tertiary);
 }
 
 .settings-stat-value {
   margin-left: auto;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 400;
   color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+/* Time row may render a "from – to" range; allow it to wrap between the two
+   timestamps (right-aligned) while each timestamp stays an atomic unit.
+   A no-range value has no internal break point, so it stays on one line. */
+.settings-stat-value--range {
+  white-space: normal;
+  text-align: right;
+}
+
+.settings-stat-time-part,
+.settings-stat-separator {
   white-space: nowrap;
 }
 
@@ -4258,7 +4363,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-option-label {
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   font-weight: 500;
   color: var(--text-primary);
 }
@@ -4300,17 +4405,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* Screen share split-layout — right-panel peer video tile.
-   The parent `.ss-peer-panel` is a flex-wrap container; each tile gets
-   `flex: 1 1 160px` so tiles grow to fill available width with a 160px
-   flex basis, collapsing to one column when the panel is narrow.
-   `aspect-ratio: 3 / 2` derives height from width. Off-budget tiles
+   The parent `.ss-peer-panel` is a CSS grid with auto-fill columns
+   (minmax(160px, 1fr)). Each tile spans one grid cell with
+   `aspect-ratio: 3 / 2` deriving height from width. Off-budget tiles
    render with `force_avatar: true` (avatar placeholder, no decode) —
    the decode budget caps live decoders just as the normal grid does
    (issue 987). */
 .split-peer-tile {
   position: relative;
-  flex: 1 1 160px;
-  max-width: 100%;
+  width: 100%;
   aspect-ratio: 3 / 2;
   min-width: 0;
   min-height: 0;
@@ -4348,16 +4451,20 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 /* ── Screen-share right panel ─────────────────────────────────────────
-   CSS flex-wrap panel. Tiles auto-wrap into as many columns as fit;
-   scrolls vertically when rows exceed height. */
+   CSS grid panel. auto-fill creates as many equal columns as fit:
+   - narrow panel (<330px content): 1 column, tiles full width
+   - wider panel (>=330px content): 2+ columns (threshold = 2*160+10 gap)
+   All tiles are always the same size (grid cells are uniform). */
 .ss-peer-panel {
   min-width: 0;
   height: 100%;
-  display: flex;
-  flex-wrap: wrap;
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-auto-rows: min-content;
   gap: 10px;
   padding: 14px;
-  align-content: flex-start;
+  align-content: start;
+  align-items: start;
   overflow-y: auto;
   overflow-x: hidden;
   box-sizing: border-box;
@@ -4378,13 +4485,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   top: 6px;
   left: 6px;
   padding: 3px 7px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   gap: 2px;
-  font-size: 13px;
-  max-width: 70%;
-  white-space: normal;
-  text-overflow: clip;
-  overflow: visible;
+  font-size: var(--fs-4);
+  max-width: calc(100% - 90px);
+  white-space: nowrap;
+  overflow: hidden;
   line-height: 1.3;
   display: inline-flex;
   flex-wrap: wrap;
@@ -4410,7 +4516,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   height: 40px;
 }
 .split-peer-tile .placeholder-text {
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
 }
 
 /* Top icon bar */
@@ -4480,16 +4586,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   right: calc(100% + 8px);
   top: 50%;
   transform: translateY(-50%);
-  background: rgba(30, 30, 30, 0.95)
-    /* @token-exempt: dark near-opaque, no matching token */
-  ;
-  backdrop-filter: blur(12px);
+  background: var(--fixed-dark-strong);
+  backdrop-filter: blur(var(--effect-blur-surface));
   border: 1px solid var(--settings-tooltip-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   padding: 0.5rem 0.75rem;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   line-height: 1.4;
-  color: var(--text-secondary);
+  color: var(--on-dark-text-secondary);
   white-space: normal;
   width: max-content;
   max-width: 200px;
@@ -4519,7 +4623,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 0.5rem;
   width: 100%;
   height: 40px;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 600;
 }
 
@@ -4552,7 +4656,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-danger-label {
-  font-size: 0.6875rem;
+  font-size: var(--fs-2);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -4583,7 +4687,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 1rem;
   min-height: 200px;
   color: var(--text-secondary);
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
 }
 
 .settings-loading-state .loading-spinner {
@@ -4605,13 +4709,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-empty-state h2 {
   margin: 0.5rem 0 0;
-  font-size: 1.25rem;
+  font-size: var(--fs-9);
   font-weight: 600;
   color: var(--text-primary);
 }
 
 .settings-empty-state p {
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   color: var(--text-tertiary);
   max-width: 280px;
 }
@@ -4629,12 +4733,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 
   .settings-field-label {
-    font-size: 0.875rem;
+    font-size: var(--fs-5);
     margin-right: 1.5rem;
   }
 
   .settings-field-value {
-    font-size: 0.875rem;
+    font-size: var(--fs-5);
   }
 }
 
@@ -4725,15 +4829,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    ~10% bleed-through and was barely perceptible; bumping the fill to near-opaque
    removes the GPU cost with negligible visual change.
 
-   The banner surface is ALWAYS dark (a flat near-opaque dark fill in both
-   themes), so its foreground colours MUST be literal light-on-dark — NOT the
-   `--text-on-glass-strong` token, which flips to near-black under
-   html[data-theme="light"] and would render the text + ✕ invisible on the dark
-   surface. We therefore use literal rgba(255,255,255,0.95) for body text and the
-   dismiss glyph, matching how the amber accent is already a literal. Contrast on
-   the near-opaque dark surface: white text ≈ 15–16:1, amber accent ≈ 7–8:1
-   (the more-opaque fill only RAISES contrast vs the prior ~0.9 surface, since
-   less page background bleeds through) — both well past 4.5:1, in BOTH themes. */
+   The banner surface is ALWAYS dark (--fixed-dark-heavy in both themes), so its
+   foreground colours use --on-dark-text-high — NOT theme-flipping tokens like
+   --text-on-glass-strong, which go near-black under html[data-theme="light"]
+   and would render text invisible on the dark surface. Contrast on the
+   near-opaque dark surface: white text ≈ 15–16:1, amber accent ≈ 7–8:1 — both
+   well past 4.5:1, in BOTH themes. */
 .decode-budget-banner {
   position: absolute;
   top: 12px;
@@ -4745,24 +4846,15 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 10px;
   max-width: min(560px, calc(100% - 24px));
   padding: 8px 10px 8px 14px;
-  background: rgba(30, 30, 30, 0.97)
-    /* @token-exempt: flat near-opaque dark banner surface. No backdrop-filter
-       blur (#1197): the banner only renders under decode-budget pressure, when
-       the GPU is already the bottleneck, so a compositing blur would add cost
-       exactly when it hurts most. The fill is near-opaque (was 0.9 + blur), so
-       dropping the blur is visually ~indistinguishable. */;
+  background: var(--fixed-dark-heavy);
   border: 1px solid var(--btn-warning-border);
-  border-radius: var(--radius-lg, 14px);
+  border-radius: var(--radius-lg);
   box-shadow: 0 8px 32px var(--shadow-card-deep);
-  /* @token-exempt: literal light-on-dark; the surface is hardcoded dark in both
-     themes, so the theme-flipping --text-on-glass-strong token must NOT be used
-     here (it would go near-black in light mode -> invisible). ≈14.5:1 on the
-     dark surface. */
-  color: rgba(255, 255, 255, 0.95);
+  color: var(--on-dark-text-high);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 500;
   line-height: 1.3;
   animation: decode-banner-enter 0.3s cubic-bezier(0.16, 1, 0.3, 1);
@@ -4796,14 +4888,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: var(--radius-md, 10px);
+  border-radius: var(--radius-md);
   cursor: pointer;
   font-family: inherit;
 }
 
 .decode-budget-banner-action {
   padding: 0 14px;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--warning);
   background: var(--btn-warning-bg);
@@ -4818,9 +4910,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .decode-budget-banner-dismiss {
   min-width: 44px;
   padding: 0;
-  /* @token-exempt: literal light-on-dark to stay visible on the hardcoded dark
-     banner surface in light mode (see the banner's color note above). */
-  color: rgba(255, 255, 255, 0.95);
+  color: var(--on-dark-text-high);
   background: transparent;
   border: 1px solid transparent;
 }
@@ -4867,7 +4957,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   .decode-budget-banner {
     gap: 8px;
     padding: 6px 8px 6px 12px;
-    font-size: 12px;
+    font-size: var(--fs-3);
   }
   .decode-budget-banner-text {
     display: none;
@@ -4877,7 +4967,191 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
   .decode-budget-banner-action {
     padding: 0 10px;
-    font-size: 12px;
+    font-size: var(--fs-3);
+  }
+}
+
+/* ── Decode-paused pill (issue 1142 FINAL DESIGN) ──────────────────────
+   The persistent "N videos paused" signpost. It is the steady-state counterpart
+   to the onset banner above; the two never co-exist on screen (the pill
+   suppresses while the banner is visible — see decode_paused_pill.rs).
+
+   Unlike the banner — which is a hardcoded-dark surface and so MUST use literal
+   light-on-dark colors (the issue 1189 trap) — the pill is a GLASS surface. It uses
+   the theme-aware glass + text tokens, so it reads correctly in BOTH light and
+   dark themes with no literal colors. In grid mode it anchors above the controls
+   dock via --controls-dock-clearance; in screen-share mode the dock is not the
+   bottom anchor, so it moves to the top (see the .has-screen-share override). */
+.decode-paused-pill {
+  position: absolute;
+  /* Grid-mode default: pinned bottom-center, just above the controls dock. */
+  bottom: var(--controls-dock-clearance);
+  top: auto;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 55;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  height: auto;
+  min-height: 36px;
+  padding: 0 6px 0 12px;
+  max-width: min(420px, calc(100% - 24px));
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-bg);
+  box-shadow: var(--shadow-sm);
+  font-family: inherit;
+  animation: decode-pill-enter 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.decode-paused-pill:hover {
+  background: var(--glass-bg-hover);
+}
+
+/* Screen-share mode: the controls dock is not the bottom anchor, so move the
+   pill to the top. Higher specificity (#grid-container.has-screen-share) than
+   the bare `.decode-paused-pill` and the ≤639px `.decode-paused-pill` rule, so
+   it wins on mobile in SS mode too. */
+#grid-container.has-screen-share .decode-paused-pill {
+  top: 12px;
+  bottom: auto;
+}
+
+.decode-paused-pill-icon {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+  color: var(--text-on-glass-muted);
+}
+
+/* Full label, shown >639px. */
+.decode-paused-pill-label {
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-4);
+  font-weight: 500;
+}
+
+/* Compact "N paused" — hidden on wider viewports, shown ≤639px. */
+.decode-paused-pill-count {
+  display: none;
+  flex: 1;
+  min-width: 0;
+  color: var(--text-secondary);
+  font-size: var(--fs-4);
+  font-weight: 600;
+}
+
+.decode-paused-pill-action {
+  flex-shrink: 0;
+  /* a11y: a real ≥44px touch hit target. min-height (not a fixed height) sets
+     the rendered button height to 44px; the pill bar uses height:auto +
+     min-height:36px so it grows to CONTAIN this 44px action without the button
+     overhanging — same height:auto+padding technique as .decode-budget-banner. */
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  padding: 0 12px;
+  border-radius: var(--radius-pill);
+  color: var(--warning);
+  background: var(--btn-warning-bg);
+  border: 1px solid var(--btn-warning-border);
+  font-family: inherit;
+  font-size: var(--fs-4);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.decode-paused-pill-action-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+.decode-paused-pill-action:hover {
+  background: var(--btn-warning-bg-hover);
+  border-color: var(--btn-warning-border-hover);
+}
+
+.decode-paused-pill-action:focus-visible {
+  outline: 2px solid var(--warning);
+  outline-offset: 2px;
+}
+
+/* Light theme: --warning (#ff9f0a) on the pale light btn-warning-bg over the
+   light glass fails WCAG AA (~1.85:1). The pill uses theme-aware glass (unlike
+   the always-dark banner), so the light case must use the darkened --warning-text
+   (#a85800, ~4.66:1 as text, ~5.17:1 as border). Issue 1142. */
+html[data-theme="light"] .decode-paused-pill-action {
+  color: var(--warning-text);
+  border-color: var(--warning-text);
+}
+
+/* Enter: cross-fade + a 2px lift. The transform must KEEP the centering
+   translateX(-50%) in every frame or the pill would jump horizontally. */
+@keyframes decode-pill-enter {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* Reduced motion: fade only, no lift — but KEEP translateX(-50%) so the pill
+   stays centered, and reset any hover transform (mirrors the
+   `.decode-play-overlay` reduced-motion technique). */
+@media (prefers-reduced-motion: reduce) {
+  .decode-paused-pill {
+    animation: decode-pill-enter-reduced 0.15s ease-out;
+  }
+  @keyframes decode-pill-enter-reduced {
+    from {
+      opacity: 0;
+      transform: translateX(-50%);
+    }
+    to {
+      opacity: 1;
+      transform: translateX(-50%);
+    }
+  }
+}
+
+/* Mobile ≤639px: tighter chrome, swap the full label for the compact count,
+   and raise the grid-mode bottom anchor to clear the mobile controls dock. The
+   dock shrinks at @media (max-width: 640px) (NOT 568px) to button 2.75rem ≈44px
+   + padding 0.75rem×2 (24px) + 2px border ≈70px tall, at bottom: 1rem (16px), so
+   its top edge is ≈86px; pill bottom 98px = 86px + ~12px gap. At exactly 640px
+   the pill uses the desktop 112px clearance while the dock is already mobile
+   (top ~86px), so the pill sits comfortably above it — the 639/640 one-pixel
+   breakpoint offset is harmless. The SS-mode `top:12px` override above has higher
+   specificity, so it still wins in screen-share mode. */
+@media (max-width: 639px) {
+  .decode-paused-pill {
+    min-height: 34px;
+    padding: 0 5px 0 10px;
+    gap: 7px;
+    max-width: calc(100% - 16px);
+    bottom: 98px;
+  }
+  .decode-paused-pill-label {
+    display: none;
+  }
+  .decode-paused-pill-count {
+    display: inline-block;
+    font-size: var(--fs-3);
+  }
+  .decode-paused-pill-action {
+    font-size: var(--fs-3);
   }
 }
 
@@ -4901,26 +5175,17 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: center;
   gap: 10px;
-  background: rgba(30, 30, 30, 0.88)
-    /* @token-exempt: dark near-opaque, no matching token */
-  ;
-  backdrop-filter: blur(20px);
-  -webkit-backdrop-filter: blur(20px);
+  background: var(--fixed-dark);
+  backdrop-filter: blur(var(--effect-blur-lg));
+  -webkit-backdrop-filter: blur(var(--effect-blur-lg));
   border: 1px solid var(--glass-bg-hover);
   border-radius: var(--radius-lg);
   padding: 10px 16px;
-  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-     both themes (rgba(30,30,30,0.88) above), so the theme-flipping --text-primary
-     token must NOT be used here — it goes near-black under
-     html[data-theme="light"] and would render the toast text invisible on the
-     dark surface. This literal equals --text-primary's dark value (opaque white)
-     so dark mode is byte-identical; white on rgb(30,30,30) ≈ 16:1, well past
-     4.5:1. */
-  color: #ffffff;
+  color: var(--on-dark-text);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
     sans-serif;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 500;
   line-height: 1.3;
   box-shadow:
@@ -4935,7 +5200,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex-shrink: 0;
   width: 28px;
   height: 28px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -4954,13 +5219,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-left .toast-icon svg {
-  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-     both themes, so --toast-action-neutral must NOT be used — it flips near-black
-     (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this icon glyph
-     invisible on the dark chip. Literal equals the token's dark value so dark mode
-     is unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
-     ≈ 6-7:1, past 4.5:1. */
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--on-dark-text-muted);
 }
 
 .peer-toast .toast-text {
@@ -4970,13 +5229,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .peer-toast .toast-name {
   font-weight: 600;
-  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-     both themes, so --text-on-glass-strong must NOT be used — it flips near-black
-     (rgba(0,0,0,0.92)) under html[data-theme="light"], rendering the participant
-     name invisible on the dark surface (the reported issue 1189 bug). Literal
-     equals the token's dark value so dark mode is unchanged; white 0.95 on
-     rgb(30,30,30) ≈ 14.5:1, well past 4.5:1. */
-  color: rgba(255, 255, 255, 0.95);
+  color: var(--on-dark-text-high);
 }
 
 .peer-toast.toast-joined .toast-action {
@@ -4985,13 +5238,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-left .toast-action {
-  /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-     both themes, so --text-on-glass-faint must NOT be used — it flips near-black
-     (rgba(0,0,0,0.44)) under html[data-theme="light"], rendering this faint
-     secondary text invisible on the dark surface. Literal equals the token's dark
-     value so dark mode is unchanged; preserves the dimmer secondary weight. White
-     0.5 on rgb(30,30,30) ≈ 6-7:1, still past 4.5:1. */
-  color: rgba(255, 255, 255, 0.5);
+  color: var(--on-dark-text-muted);
   font-weight: 400;
 }
 
@@ -5013,13 +5260,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-loading .toast-icon svg {
-    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-       both themes, so --toast-action-neutral must NOT be used — it flips near-black
-       (rgba(0,0,0,0.45)) under html[data-theme="light"], rendering this loading
-       glyph invisible on the dark chip. Literal equals the token's dark value so
-       dark mode is unchanged; preserves the dim neutral weight. White 0.5 on
-       rgb(30,30,30) ≈ 6-7:1, past 4.5:1. */
-    color: rgba(255, 255, 255, 0.5);
+    color: var(--on-dark-text-muted);
     animation: screen-share-spin 1s linear infinite;
 }
 
@@ -5036,14 +5277,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .peer-toast.toast-error .toast-icon svg {
-    /* @token-exempt: literal light-on-dark; the toast surface is hardcoded dark in
-       both themes. --danger is UNDEFINED in this codebase, so this fell through to
-       --toast-action-neutral, which flips near-black (rgba(0,0,0,0.45)) under
-       html[data-theme="light"], rendering the error glyph invisible on the dark
-       chip. Literal equals the (fallen-through) token's dark value so dark mode is
-       unchanged; preserves the dim neutral weight. White 0.5 on rgb(30,30,30)
-       ≈ 6-7:1, past 4.5:1. */
-    color: rgba(255, 255, 255, 0.5);
+    color: var(--on-dark-text-muted);
 }
 
 @keyframes screen-share-spin {
@@ -5123,14 +5357,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
   .peer-toast {
     padding: 8px 12px;
-    font-size: 12px;
+    font-size: var(--fs-3);
     border-radius: 10px;
   }
 
   .peer-toast .toast-icon {
     width: 24px;
     height: 24px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
   }
 
   .peer-toast .toast-icon svg {
@@ -5204,7 +5438,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin: 0 0 14px;
   padding: 18px 30px 18px;
 
-  font-size: 28px;
+  font-size: var(--fs-11);
   font-weight: 420;
   line-height: 1;
   letter-spacing: -0.028em;
@@ -5243,7 +5477,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   justify-content: center;
   padding: 0;
   border: none;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: var(--settings-modal-close-bg);
   color: var(--settings-modal-close-text);
   cursor: pointer;
@@ -5271,9 +5505,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   margin: 0 14px;
   padding: 0 16px;
 
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
 
-  font-size: 15px;
+  font-size: var(--fs-6);
   font-weight: 560;
   letter-spacing: -0.012em;
   text-align: left;
@@ -5400,7 +5634,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-section-description {
   margin: -4px 0 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 400;
   line-height: 1.55;
   letter-spacing: -0.002em;
@@ -5417,7 +5651,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px dashed var(--settings-placeholder-border);
   background: var(--settings-placeholder-bg);
   color: var(--text-tertiary);
-  font-size: 0.9375rem;
+  font-size: var(--fs-6);
   line-height: 1.5;
 }
 
@@ -5441,7 +5675,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-section .device-setting-group label {
   color: var(--text-primary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 600;
   margin-bottom: 10px;
 }
@@ -5473,7 +5707,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     box-shadow 0.2s ease,
     background 0.2s ease;
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-family: inherit;
   text-align: left;
 }
@@ -5532,8 +5766,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--settings-popover-border);
   border-top: none;
   border-radius: 0 0 10px 10px;
-  backdrop-filter: blur(16px) saturate(1.1);
-  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow:
     inset 0 1px 0 var(--glass-select-menu-inset),
     0 8px 24px var(--glass-select-menu-shadow);
@@ -5544,10 +5778,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .glass-select-option {
   padding: 10px 12px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text-primary);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-5);
   transition: background 0.15s ease;
   white-space: nowrap;
   overflow: hidden;
@@ -5599,7 +5833,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .transport-preference-note {
   margin: 8px 0 0;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
   font-style: italic;
 }
@@ -5631,7 +5865,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   /* Override the default 600 / 10px-bottom-margin label styling used by the
      dropdowns above — this label sits inline with a toggle, not above an
      input. */
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   margin-bottom: 0;
   cursor: pointer;
@@ -5640,7 +5874,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .sticky-protocol-hint {
   margin: 0;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   line-height: 1.4;
   color: var(--text-secondary);
 }
@@ -5681,7 +5915,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-info-panel-title {
   margin: 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
   letter-spacing: 0.01em;
   color: var(--text-primary);
@@ -5689,7 +5923,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .settings-info-panel-text {
   margin: 0;
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   line-height: 1.45;
   color: var(--text-secondary);
 }
@@ -5707,7 +5941,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .transport-segmented-label {
   display: block;
   color: var(--text-primary);
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 600;
   margin-bottom: 10px;
 }
@@ -5722,7 +5956,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   /* inner inset frame */
   background: var(--settings-panel-bg);
   border: 1px solid var(--settings-panel-border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   /* full pill */
   box-shadow: var(--settings-panel-shadow);
   isolation: isolate;
@@ -5734,12 +5968,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   appearance: none;
   background: transparent;
   border: none;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   color: rgba(255, 255, 255, 0.62);
   /* @token-exempt: calm secondary */
   cursor: pointer;
   font-family: inherit;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 500;
   letter-spacing: 0.01em;
   padding: 8px 12px;
@@ -5859,11 +6093,11 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   -webkit-backdrop-filter: none;
   backdrop-filter: none;
   border: 1px solid var(--settings-modal-border);
-  border-radius: var(--radius-button, 9px);
+  border-radius: var(--radius-button);
   color: var(--text-primary);
   cursor: pointer;
   font-family: inherit;
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 600;
   letter-spacing: 0.01em;
   height: 36px;
@@ -6000,7 +6234,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 .appearance-section-title--sm {
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
 }
 
@@ -6024,7 +6258,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
   max-width: 560px;
 
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 400;
   line-height: 1.55;
   letter-spacing: -0.01em;
@@ -6047,7 +6281,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .appearance-control-label {
   /* Quiet control label — regular weight, primary color so it stays
      readable while sitting clearly below section titles. */
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 400;
   letter-spacing: -0.003em;
   color: var(--text-primary);
@@ -6078,7 +6312,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: block;
   width: 36px;
   height: 20px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: rgba(90, 90, 96, 0.88);
   /* @token-exempt: theme variant */
   border: none;
@@ -6095,7 +6329,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   left: 2px;
   width: 16px;
   height: 16px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: #ffffff;
   /* @token-exempt: theme variant */
   border: none;
@@ -6140,7 +6374,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   height: 24px;
   flex: 0 0 auto;
   margin: 0;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1.5px solid var(--settings-swatch-border);
   background-color: var(--glow-color,
       #888);
@@ -6182,7 +6416,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   justify-content: center;
   background: var(--error);
   border: none;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   color: var(--text-primary);
   cursor: pointer;
   opacity: 0;
@@ -6230,8 +6464,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   ;
   border: 1px solid var(--add-color-popover-border);
   border-radius: 10px;
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(var(--effect-blur-surface));
+  -webkit-backdrop-filter: blur(var(--effect-blur-surface));
 }
 
 .custom-color-popover-row {
@@ -6243,7 +6477,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .custom-color-preview {
   width: 24px;
   height: 24px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1px solid var(--add-color-popover-border);
   background-color: var(--glow-color,
       #888);
@@ -6256,12 +6490,12 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   flex: 1;
   min-width: 0;
   padding: 6px 10px;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-family: monospace;
   color: var(--text-primary);
   background: var(--settings-input-bg);
   border: 1px solid var(--settings-input-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   outline: none;
   box-shadow: none;
   caret-color: var(--text-primary);
@@ -6281,12 +6515,12 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .custom-color-add-btn {
   padding: 6px 14px;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--text-primary);
   background: var(--glass-bg-hover);
   border: 1px solid var(--add-color-btn-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   white-space: nowrap;
   transition:
@@ -6349,7 +6583,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .custom-color-modal-title {
   margin: 0;
-  font-size: 1rem;
+  font-size: var(--fs-7);
   font-weight: 600;
   color: var(--text-primary);
   letter-spacing: -0.005em;
@@ -6357,7 +6591,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .custom-color-modal-subtitle {
   margin: 0;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   color: var(--text-secondary);
   line-height: 1.35;
 }
@@ -6375,7 +6609,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   justify-content: center;
   padding: 0;
   border: none;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
@@ -6536,7 +6770,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 .color-picker-hex-label {
-  font-size: 0.625rem;
+  font-size: var(--fs-1);
   font-weight: 600;
   letter-spacing: 0.04em;
   text-transform: uppercase;
@@ -6557,7 +6791,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   justify-content: center;
   padding: 0;
   border: 1px solid var(--glass-border);
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
@@ -6614,12 +6848,12 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .custom-color-cancel-btn {
   padding: 6px 14px;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--text-secondary);
   background: transparent;
   border: 1px solid var(--add-color-btn-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   cursor: pointer;
   white-space: nowrap;
   transition: background 0.14s ease, border-color 0.14s ease, color 0.14s ease;
@@ -6648,7 +6882,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 /* Error message for settings inputs */
 .input-error-message {
   color: var(--error-text);
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   margin-top: 0.25rem;
   display: block;
 }
@@ -6664,14 +6898,14 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .slider-header label,
 .preview-label {
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 400;
   letter-spacing: -0.003em;
   color: var(--text-primary);
 }
 
 .slider-value {
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   color: var(--text-secondary);
 }
 
@@ -6719,7 +6953,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .speaker-highlight-preview-caption {
   margin-top: 10px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   line-height: 1.25;
   color: var(--text-tertiary);
   white-space: normal;
@@ -6769,7 +7003,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .slider-row-label,
 .appearance-slider-label {
-  font-size: 0.875rem;
+  font-size: var(--fs-5);
   font-weight: 400;
   letter-spacing: -0.003em;
   color: var(--text-primary);
@@ -6777,7 +7011,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .slider-row-value,
 .appearance-slider-value {
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 500;
   color: var(--text-secondary);
   font-variant-numeric: tabular-nums;
@@ -6799,7 +7033,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   appearance: none;
   width: var(--speaker-control-width);
   height: 4px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: linear-gradient(to right,
       rgba(235, 232, 240, 0.72) 0%
       /* @token-exempt: theme variant */
@@ -6832,7 +7066,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .appearance-slider::-webkit-slider-runnable-track {
   height: 4px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: transparent;
 }
 
@@ -6841,7 +7075,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   width: 14px;
   height: 14px;
   margin-top: -5px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1px solid rgba(255, 255, 255, 0.72);
   /* @token-exempt: theme variant */
   background: radial-gradient(120% 120% at 30% 20%,
@@ -6864,14 +7098,14 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .appearance-slider::-moz-range-track {
   height: 4px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: transparent;
 }
 
 .appearance-slider::-moz-range-thumb {
   width: 14px;
   height: 14px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1px solid rgba(255, 255, 255, 0.72);
   /* @token-exempt: theme variant */
   background: radial-gradient(120% 120% at 30% 20%,
@@ -6924,7 +7158,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   /* inner inset frame */
   background: var(--settings-panel-bg);
   border: 1px solid var(--settings-panel-border);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   /* full pill */
   box-shadow: var(--settings-panel-shadow);
   width: fit-content;
@@ -6938,7 +7172,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   background: transparent;
   border: none;
   /* no per-button outline */
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   /* matches slab; active pill nests cleanly */
   color: rgba(255, 255, 255, 0.62);
   /* @token-exempt: calm secondary */
@@ -6950,7 +7184,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   height: 32px;
   min-width: 92px;
   padding: 0 18px;
-  font-size: 0.8125rem;
+  font-size: var(--fs-4);
   font-weight: 500;
   letter-spacing: -0.005em;
   box-shadow: none;
@@ -7006,6 +7240,120 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   .theme-icon-button {
     transition: none;
   }
+}
+
+/* ============================================================
+   Theme source row — custom import / reset controls
+   Uses @token-exempt literal colors so a hostile custom theme
+   cannot hide the escape hatch (reset button).
+   ============================================================ */
+
+.theme-source-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.theme-source-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.theme-source-active {
+  font-size: 0.8125rem;
+  font-weight: 500;
+  max-width: 200px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: rgba(255, 255, 255, 0.82); /* @token-exempt: active label (dark) */
+}
+
+.theme-import-btn {
+  display: inline-flex;
+  align-items: center;
+  padding: 5px 14px;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.72); /* @token-exempt: ghost button text (dark) */
+  background: rgba(255, 255, 255, 0.06); /* @token-exempt: ghost pill bg (dark) */
+  border: 1px solid rgba(255, 255, 255, 0.12); /* @token-exempt: ghost pill border (dark) */
+  border-radius: var(--radius-pill);
+  cursor: pointer;
+  transition:
+    background 200ms ease,
+    color 200ms ease;
+}
+
+.theme-import-btn:hover {
+  background: rgba(255, 255, 255, 0.1); /* @token-exempt: ghost pill hover (dark) */
+  color: rgba(255, 255, 255, 0.92); /* @token-exempt: ghost pill hover text (dark) */
+}
+
+.theme-import-btn:focus-visible,
+.theme-import-btn:focus-within {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(110, 168, 254, 0.6); /* @token-exempt: focus ring (dark) */
+}
+
+.theme-reset-btn {
+  -webkit-appearance: none;
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  color: #0a84ff; /* @token-exempt: accent link (dark) — NOT overridable by theme tokens */
+  cursor: pointer;
+  text-decoration: none;
+}
+
+.theme-reset-btn:hover {
+  text-decoration: underline;
+}
+
+.theme-reset-btn:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px rgba(110, 168, 254, 0.6); /* @token-exempt: focus ring (dark) */
+  border-radius: 3px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .theme-import-btn {
+    transition: none;
+  }
+}
+
+/* Light-mode overrides for theme source row */
+html[data-theme="light"] .theme-source-active {
+  color: rgba(0, 0, 0, 0.82); /* @token-exempt: active label (light) */
+}
+
+html[data-theme="light"] .theme-import-btn {
+  color: rgba(0, 0, 0, 0.62); /* @token-exempt: ghost button text (light) */
+  background: rgba(0, 0, 0, 0.04); /* @token-exempt: ghost pill bg (light) */
+  border-color: rgba(0, 0, 0, 0.1); /* @token-exempt: ghost pill border (light) */
+}
+
+html[data-theme="light"] .theme-import-btn:hover {
+  background: rgba(0, 0, 0, 0.07); /* @token-exempt: ghost pill hover (light) */
+  color: rgba(0, 0, 0, 0.88); /* @token-exempt: ghost pill hover text (light) */
+}
+
+html[data-theme="light"] .theme-import-btn:focus-visible,
+html[data-theme="light"] .theme-import-btn:focus-within {
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.5); /* @token-exempt: focus ring (light) */
+}
+
+html[data-theme="light"] .theme-reset-btn {
+  color: #005ec4; /* @token-exempt: accent link (light) — NOT overridable by theme tokens */
+}
+
+html[data-theme="light"] .theme-reset-btn:focus-visible {
+  box-shadow: 0 0 0 2px rgba(10, 132, 255, 0.5); /* @token-exempt: focus ring (light) */
 }
 
 html[data-theme="light"] .device-settings-modal-overlay {
@@ -7160,7 +7508,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   max-height: 120px;
   align-self: stretch;
   aspect-ratio: 16 / 9;
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   border: 1px solid var(--settings-divider-soft);
   background: var(--appearance-preview-tile-bg);
 }
@@ -7281,7 +7629,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
     flex: 0 0 auto;
     white-space: nowrap;
     padding: 8px 12px;
-    border-radius: 999px;
+    border-radius: var(--radius-pill);
   }
 
 
@@ -7290,7 +7638,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   }
 
   .settings-section-title {
-    font-size: 1rem;
+    font-size: var(--fs-7);
   }
 
   .settings-placeholder {
@@ -7377,15 +7725,12 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   z-index: 9400;
 }
 
-/* Legacy `.signal-popup-open` overflow-visible escape was needed when
-   the popup was an absolutely-positioned child of `.canvas-container`.
-   In portal mode it is no longer required, but we keep the rule (with
-   the same effect) so any third-party theme that still relies on it
-   keeps working. */
-.grid-item.signal-popup-open,
-.split-peer-tile.signal-popup-open {
-  overflow: visible;
-}
+/* The legacy `.signal-popup-open` overflow-visible escape (PR 931 / issue 932)
+   was removed: it was only needed when the popup was an absolutely-positioned
+   child of `.canvas-container`. The popup now floats via the
+   `position: fixed` `.signal-quality-popup-portal` above, which escapes the
+   tile's `overflow: hidden` regardless of the tile's own overflow, so the rule
+   and its class application were dead. */
 
 .signal-quality-popup .popup-header {
   display: flex;
@@ -7395,7 +7740,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .signal-quality-popup .popup-title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 600;
 }
 
@@ -7410,15 +7755,14 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 /* Transport badge in the signal-quality popup header.
- * Mirrors the diagnostics popup (`diagnostics_cm_styles.css`) so the WT/WS pill
- * looks identical in both surfaces. The diagnostics popup ships its CSS as an
- * inline `<style>` block scoped to that modal, so this duplicates the same
- * three rules at global scope to make the classes available wherever the badge
- * is reused. */
+ * Higher-specificity, theme-aware variant of the global `.connection-type` /
+ * `.type-*` pill defined just below. Scoped to `.signal-quality-popup` so the
+ * popup header pill picks up the token-driven (bi-theme) colors; the global
+ * rules below cover every other surface (the diagnostics drawer). */
 .signal-quality-popup .connection-type {
   padding: 2px 8px;
   border-radius: 4px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   line-height: 1;
   letter-spacing: 0.02em;
@@ -7437,12 +7781,45 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border: 1px solid var(--transport-badge-border);
 }
 
+/* Connection-type WT/WS pill — global home (issue 551 / issue 552, follow-up to
+ * PR 548). These unscoped rules previously lived ONLY in the diagnostics popup's
+ * inline `<style>` block (`diagnostics_cm_styles.css`). Being unscoped, that
+ * inline copy leaked to the whole document whenever the diagnostics drawer was
+ * mounted, and it was a second, separate definition of these selectors. Lifted
+ * here so the selectors are defined ONCE at global scope and apply wherever the
+ * badge renders (diagnostics drawer Reception + Per-Peer Summary). The
+ * higher-specificity `.signal-quality-popup .type-*` rules above still win
+ * inside the signal popup, so that surface is unchanged.
+ *
+ * Values are byte-identical to the former inline rules (the drawer historically
+ * rendered this pill with these fixed literals in BOTH themes), so the lift is
+ * purely structural with no rendered change. Tokenizing bg/border the way the
+ * signal popup does would flip the drawer pill light under the light theme — a
+ * visual change beyond this cleanup's scope.
+ * @token-exempt: preserves the existing fixed pill literals so the lift stays
+ * style-neutral (tokenization is a separate, behavior-changing follow-up). */
+.connection-type {
+  padding: 2px 8px;
+  border-radius: 4px;
+  font-size: var(--fs-2);
+}
+.type-websocket {
+  background: var(--surface);
+  color: var(--accent-hover);
+  border: 1px solid var(--border);
+}
+.type-webtransport {
+  background: var(--surface);
+  color: var(--accent-hover);
+  border: 1px solid var(--border);
+}
+
 .signal-quality-popup .popup-close {
   background: none;
   border: none;
   color: var(--signal-popup-close-text);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-5);
   width: 28px;
   height: 28px;
   display: flex;
@@ -7469,7 +7846,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border: none;
   color: var(--signal-popup-close-text);
   cursor: pointer;
-  font-size: 14px;
+  font-size: var(--fs-5);
   width: 28px;
   height: 28px;
   display: flex;
@@ -7615,7 +7992,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 /* The 2-hour retention caption, shown only when a peer's deque is at cap. */
 .neteq-chart-cap-note {
   margin-top: 6px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-style: italic;
   color: var(--text-tertiary);
 }
@@ -7633,7 +8010,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   flex-wrap: wrap;
   gap: 12px;
   margin-top: 8px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   color: var(--text-secondary);
 }
 
@@ -7711,7 +8088,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   margin-top: 6px;
   padding: 8px 10px;
   background: var(--glass-bg);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   font-size: 8pt;
   line-height: 1.3;
   color: var(--text-tertiary);
@@ -7738,7 +8115,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border-top: 1px solid var(--signal-popup-border);
 }
 .signal-popup-layers__head {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -7757,6 +8134,29 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
    dialog puts the peer name; capitalize the first letter for readability. */
 .signal-popup-layer-row__kind {
   text-transform: capitalize;
+}
+/* Compact per-peer device / hardware line (issue 1482). One dot-separated
+   summary at the bottom of the signal-quality popup; mirrors the Layers
+   section's header treatment and top border so it reads as a sibling block. */
+.signal-popup-device {
+  margin-top: 8px;
+  padding-top: 8px;
+  border-top: 1px solid var(--signal-popup-border);
+}
+.signal-popup-device__head {
+  display: block;
+  font-size: var(--fs-2);
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+  margin-bottom: 4px;
+}
+.signal-popup-device__line {
+  display: block;
+  font-size: var(--fs-2);
+  color: var(--text-tertiary);
+  word-break: break-word;
 }
 .signal-chart-tooltip {
   position: fixed;
@@ -7807,7 +8207,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .search-modal-input {
   width: 100%;
   background: transparent;
-  font-size: 18px;
+  font-size: var(--fs-8);
   color: var(--text-primary);
   outline: none;
   border: none;
@@ -7861,7 +8261,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .search-modal-row-id {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 500;
   color: var(--text-primary);
   white-space: nowrap;
@@ -7870,7 +8270,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .search-modal-row-host {
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
   margin-top: 2px;
 }
@@ -7880,7 +8280,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   flex-shrink: 0;
   border-radius: var(--radius-pill);
   padding: 3px 10px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.05em;
@@ -7909,7 +8309,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 1.5rem;
+  font-size: var(--fs-10);
   font-weight: 600;
   color: var(--text-on-glass-soft);
 }
@@ -7931,8 +8331,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   padding: 14px 18px;
   z-index: 9100;
   min-width: 200px;
-  backdrop-filter: blur(16px) saturate(1.1);
-  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow: var(--glass-popover-shadow);
 }
 
@@ -7950,12 +8350,12 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border: none;
   color: var(--text-tertiary);
   cursor: pointer;
-  font-size: 1rem;
+  font-size: var(--fs-7);
   padding: 0 4px;
 }
 
 .mock-peers-popover-body label {
-  font-size: 0.75rem;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
   margin-bottom: 6px;
   display: block;
@@ -7972,7 +8372,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   text-align: center;
   background: var(--mock-input-bg);
   border: 1px solid var(--mock-input-border);
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   color: var(--text-primary);
   padding: 4px;
   font-size: 0.9rem;
@@ -7981,7 +8381,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .mock-peers-step {
   width: 30px;
   height: 30px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
   border: 1px solid var(--mock-input-border);
   background: var(--mock-input-bg);
   color: var(--text-primary);
@@ -8008,8 +8408,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   display: flex;
   gap: 8px;
   z-index: 9100;
-  backdrop-filter: blur(16px) saturate(1.1);
-  -webkit-backdrop-filter: blur(16px) saturate(1.1);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   box-shadow: var(--glass-popover-shadow);
 }
 
@@ -8019,7 +8419,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   align-items: center;
   gap: 4px;
   padding: 8px 12px;
-  border-radius: 8px;
+  border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-secondary);
   cursor: pointer;
@@ -8038,12 +8438,12 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .density-option-label {
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
 }
 
 .density-option-range {
-  font-size: 11px;
+  font-size: var(--fs-2);
   opacity: 0.6;
 }
 
@@ -8126,7 +8526,7 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   justify-content: center;
   gap: 12px;
 
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   border: 1px solid rgba(255, 255, 255, 0.48);
   /* @token-exempt: theme variant */
 
@@ -8173,7 +8573,7 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
 
   color: rgba(255, 255, 255, 0.96);
   /* @token-exempt: theme variant */
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 700;
   letter-spacing: 0.18em;
   text-transform: uppercase;
@@ -8353,8 +8753,8 @@ html[data-theme="dark"] .settings-modal {
     0 18px 48px rgba(0, 0, 0, 0.34);
   /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
-  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(130%) contrast(102%);
 }
 
 .settings-sidebar-title-icon {
@@ -8483,8 +8883,8 @@ html[data-theme="light"] .settings-modal {
     0 18px 48px rgba(90, 105, 130, 0.14);
   /* @token-exempt: theme variant */
 
-  backdrop-filter: blur(16px) saturate(130%) contrast(102%);
-  -webkit-backdrop-filter: blur(16px) saturate(130%) contrast(102%);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(130%) contrast(102%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(130%) contrast(102%);
 }
 
 html[data-theme="light"] .settings-layout {
@@ -8509,8 +8909,8 @@ html[data-theme="light"] .settings-panel {
     rgba(232, 233, 240, 0.95) 100% /* @token-exempt: theme variant */
   );
 
-  backdrop-filter: blur(16px) saturate(120%);
-  -webkit-backdrop-filter: blur(16px) saturate(120%);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(120%);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(120%);
 }
 
 html[data-theme="light"] .settings-panel::before,
@@ -8594,6 +8994,7 @@ html[data-theme="light"] .settings-divider {
   flex-shrink: 0;
 }
 
+
 /* ──────────────────────────────────────────────────────────────────
    Unified Performance settings panel — SEND quality bounds (#961) AND
    RECEIVE layer bounds (issue 989 simulcast): per-kind CARDS each split into a
@@ -8611,7 +9012,7 @@ html[data-theme="light"] .settings-divider {
    the meaning is legible without opening the "?" popover. */
 .perf-side__consequence,
 .perf-stream-consequence {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 500;
   color: var(--text-secondary);
 }
@@ -8631,7 +9032,7 @@ html[data-theme="light"] .settings-divider {
   align-items: center;
   gap: 6px;
   padding: 6px 2px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
   border-bottom: 1px solid var(--border);
 }
@@ -8652,7 +9053,7 @@ html[data-theme="light"] .settings-divider {
   padding: 10px 14px;
   background: var(--surface-elevated);
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: var(--radius-lg);
   /* Enable container queries so the columns collapse based on the card's own
      width (independent of the viewport). */
   container-type: inline-size;
@@ -8664,7 +9065,7 @@ html[data-theme="light"] .settings-divider {
    here — flex gap + child margins are additive. */
 
 .perf-kind-card__title {
-  font-size: 14px;
+  font-size: var(--fs-5);
   font-weight: 600;
   color: var(--text-primary);
   margin-bottom: 4px;
@@ -8715,7 +9116,7 @@ html[data-theme="light"] .settings-divider {
 }
 
 .perf-side__title {
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 600;
   color: var(--text-primary);
   display: inline-flex;
@@ -8798,7 +9199,7 @@ html[data-theme="light"] .settings-divider {
 }
 
 .perf-meter__readout {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
   line-height: 1.2;
@@ -8824,7 +9225,7 @@ html[data-theme="light"] .settings-divider {
 /* The always-visible per-card summary line (the §3 live copy). */
 .perf-summary-line {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-variant-numeric: tabular-nums;
   color: var(--text-tertiary);
 }
@@ -8856,7 +9257,7 @@ html[data-theme="light"] .settings-divider {
   border: 1px dashed var(--border-emphasis);
 }
 .perf-rung__label {
-  font-size: 10px;
+  font-size: var(--fs-1);
   line-height: 1;
   color: var(--text-tertiary);
   font-variant-numeric: tabular-nums;
@@ -8875,7 +9276,7 @@ html[data-theme="light"] .settings-divider {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
   cursor: pointer;
   list-style: none;
@@ -8888,7 +9289,7 @@ html[data-theme="light"] .settings-divider {
 .perf-peers__summary:focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 .perf-peers__chev {
   flex: 0 0 auto;
@@ -8918,7 +9319,7 @@ details.perf-peers[open] .perf-peers__chev {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   line-height: 1.4;
   min-width: 0;
   font-variant-numeric: tabular-nums;
@@ -8944,7 +9345,7 @@ details.perf-peers[open] .perf-peers__chev {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 12px;
+  font-size: var(--fs-3);
   line-height: 1;
 }
 .perf-q-dot--optimal {
@@ -8961,11 +9362,11 @@ details.perf-peers[open] .perf-peers__chev {
    border-color + faint background from the per-state quality var. ── */
 .perf-reason-chip {
   flex: 0 0 auto;
-  font-size: 11px;
+  font-size: var(--fs-2);
   line-height: 1.3;
   font-weight: 500;
   padding: 0 6px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   color: var(--text-primary);
   border: 1px solid;
   white-space: nowrap;
@@ -8999,7 +9400,7 @@ details.perf-peers[open] .perf-peers__chev {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  font-size: 13px;
+  font-size: var(--fs-4);
   font-weight: 700;
   line-height: 1;
   color: var(--text-secondary);
@@ -9075,13 +9476,13 @@ details.perf-peers[open] .perf-peers__chev {
 
 .perf-help-popover-text {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--fs-4);
   line-height: 1.5;
   color: var(--text-secondary);
 }
 
 .perf-fixed-badge {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
@@ -9107,7 +9508,7 @@ details.perf-peers[open] .perf-peers__chev {
   align-items: center;
   height: 22px;
   padding: 0 8px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-weight: 500;
   line-height: 1;
   color: var(--accent);
@@ -9148,7 +9549,7 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .perf-range-end-label {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-variant-numeric: tabular-nums;
   color: var(--text-tertiary);
   flex-shrink: 0;
@@ -9337,7 +9738,7 @@ details.perf-peers[open] .perf-peers__chev {
 
 .perf-range-value {
   margin: 0;
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-variant-numeric: tabular-nums;
   color: var(--text-secondary);
 }
@@ -9353,13 +9754,13 @@ details.perf-peers[open] .perf-peers__chev {
    Performance panel's expandable footers). ── */
 .simulcast-effective {
   margin: 0 0 8px;
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
 }
 
 .simulcast-note {
   margin: 0 0 8px;
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-style: italic;
   color: var(--text-quaternary);
 }
@@ -9372,14 +9773,14 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .simulcast-send-title {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 600;
   color: var(--text-secondary);
 }
 
 .simulcast-send-static,
 .simulcast-send-header {
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-tertiary);
 }
 
@@ -9409,7 +9810,7 @@ details.perf-peers[open] .perf-peers__chev {
   padding: 4px 6px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-variant-numeric: tabular-nums;
 }
 
@@ -9422,8 +9823,78 @@ details.perf-peers[open] .perf-peers__chev {
   opacity: 0.5;
 }
 
+/* issue 1607: the LED dot sits to the LEFT of the quality letter on its own
+   header row so the on/off state reads at a glance. */
+.simulcast-rung-head {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
 .simulcast-rung-id {
   font-weight: 600;
+  color: var(--text-secondary);
+}
+
+/* issue 1607: simulcast layer LED — an unambiguous on/off dot shared by the SEND
+   ladder rungs and the RECEIVE per-peer rows. ON = filled green (the layer is
+   actually being sent / received); OFF = hollow grey ring (the layer is shed /
+   not received). The shed rung also dims (see `.is-shed` above), but the hollow
+   dot is the primary affordance so "off" never reads as "on, slightly faded". */
+.simulcast-led {
+  display: inline-block;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex: 0 0 auto;
+  box-sizing: border-box;
+}
+
+.simulcast-led.is-on {
+  background: var(--success);
+  border: 1px solid var(--success);
+  box-shadow: 0 0 3px var(--success-glow-vivid);
+}
+
+.simulcast-led.is-off {
+  /* hollow ring on the panel surface: no fill, grey border. */
+  background: transparent;
+  border: 1px solid var(--text-tertiary);
+  opacity: 0.7;
+}
+
+/* issue 1607: compact LED strip for the RECEIVE per-peer rows (one dot per
+   ladder layer, lit for the layer that peer is currently decoding). */
+.simulcast-led-row {
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  margin-bottom: 1px;
+}
+
+.simulcast-recv-peer-line {
+  display: block;
+}
+
+/* issue 1656: per-peer VIDEO readout (recv/painted fps pair + content-staleness chip).
+   WCAG AA (issue 1656): legibility is DECOUPLED from severity hue. At --fs-2
+   (11px, "small" text) the AA floor is 4.5:1, which the saturated --diag-q-*
+   severity tokens FAIL against --surface-elevated (e.g. dark poor 4.09:1, light
+   good 3.31:1). So the numeric VALUE text renders in the neutral --text-primary
+   (~13.0:1 dark / 16.55:1 light — passes; the dark figure reflects the
+   #diagnostics-sidebar dark remap of --text-primary to the settings-modal
+   near-opaque-white token composited over --surface-elevated, not plain white),
+   and severity is carried ONLY by a
+   non-text status DOT filled with the canonical --diag-q-* token (a dot is a
+   non-text UI component, AA non-text floor 3:1). The `title`/aria-label carries
+   the reason, so meaning never depends on color alone (WCAG 1.4.1). The
+   container default is --text-secondary (6.30:1 dark / 5.69:1 light — passes),
+   NOT the old --text-tertiary (4.27:1 dark / 3.10:1 light — failed AA). */
+.simulcast-recv-peer-stats {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  font-size: var(--fs-2);
   color: var(--text-secondary);
 }
 
@@ -9440,7 +9911,7 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .simulcast-recv-title {
-  font-size: 12px;
+  font-size: var(--fs-3);
   font-weight: 600;
   color: var(--text-secondary);
 }
@@ -9452,19 +9923,77 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 .simulcast-recv-kind-head {
-  font-size: 12px;
+  font-size: var(--fs-3);
   color: var(--text-secondary);
 }
 
 .simulcast-recv-peer {
-  font-size: 11px;
+  font-size: var(--fs-2);
   color: var(--text-tertiary);
   padding-left: 8px;
 }
 
 .simulcast-recv-more {
-  font-size: 11px;
+  font-size: var(--fs-2);
   font-style: italic;
   color: var(--text-tertiary);
   padding-left: 8px;
+}
+
+/* Per-peer device / hardware block (issue 1482). Lives at the bottom of the
+   "Receiving (per peer)" diagnostics breakdown; matches the simulcast-recv
+   typography so it reads as part of the same section. */
+.diag-device {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 6px;
+}
+
+/* issue 1606: the per-peer hardware section is now a collapsible
+   `<details class="diag-disclosure diag-device">` (collapsed by default to save
+   vertical space with many attendees). A `<details>` must lay out as a block so
+   the native summary toggle works; the flex column above is meant for the legacy
+   plain-div form, so neutralize it here. The 4px row rhythm is preserved by the
+   per-peer blocks' own `gap`/padding, and the summary inherits the shared
+   `.diag-disclosure-summary` typography for visual parity with the drawer's
+   other disclosures. */
+details.diag-device {
+  display: block;
+}
+
+.diag-device-title {
+  font-size: var(--fs-3);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.diag-device-peer {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 8px;
+}
+
+.diag-device-peer-label {
+  font-size: var(--fs-2);
+  font-weight: 600;
+  color: var(--text-tertiary);
+}
+
+.diag-device-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: var(--fs-2);
+  color: var(--text-tertiary);
+  padding-left: 8px;
+}
+
+.diag-device-row-label {
+  color: var(--text-secondary);
+}
+
+.diag-device-row-value {
+  font-variant-numeric: tabular-nums;
 }

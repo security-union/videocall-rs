@@ -31,6 +31,10 @@
 //! window.__vcNetsim.install("crushed_downlink", "down");
 //! // Remove ALL netsim shaping (uplink + downlink):
 //! window.__vcNetsim.clear();
+//! // Synthetically bump the publisher-uplink-distress counters the encoders
+//! // read, so the single-layer audio uplink-distress detector fires (#1398):
+//! window.__vcNetsim.bumpUplinkStall(8); // WT slow-ready() saturation events
+//! window.__vcNetsim.bumpWsDrop(6);      // WS send-buffer drops
 //! ```
 //!
 //! ### Why `window.*` registration, not a `#[wasm_bindgen]` export
@@ -156,6 +160,48 @@ fn register_on_window() -> bool {
         clear_hook();
     });
 
+    // bumpUplinkStall(n: number) -> bool  (issue #1398)
+    // Synthetically increments the process-global WT uplink-saturation counter
+    // (`unistream_ready_stall_count`) by `n`. The real increment happens on a
+    // slow `writer.ready()` deep in the `.await`-blocking media send path, which
+    // a localhost-loopback e2e cannot reliably induce; this lets the netsim e2e
+    // drive the SAME counter the encoders read so the mic-side single-layer audio
+    // uplink-distress detector fires deterministically. `n` is coerced from a JS
+    // number; a non-number / negative is treated as 0 (a no-op bump → false).
+    let bump_uplink_stall = Closure::<dyn Fn(JsValue) -> JsValue>::new(|n: JsValue| -> JsValue {
+        let count = n.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64);
+        match count {
+            Some(c) => {
+                videocall_transport::webtransport::force_unistream_ready_stall(c);
+                info!("__vcNetsim.bumpUplinkStall: +{c} WT ready-stall events");
+                JsValue::from_bool(true)
+            }
+            None => {
+                warn!("__vcNetsim.bumpUplinkStall: argument must be a non-negative number");
+                JsValue::from_bool(false)
+            }
+        }
+    });
+
+    // bumpWsDrop(n: number) -> bool  (issue #1398)
+    // The WebSocket analogue of `bumpUplinkStall`: increments the WS send-buffer
+    // drop counter (`websocket_drop_count`) by `n` so the detector's WS axis can
+    // be exercised on a WS-transport e2e run.
+    let bump_ws_drop = Closure::<dyn Fn(JsValue) -> JsValue>::new(|n: JsValue| -> JsValue {
+        let count = n.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64);
+        match count {
+            Some(c) => {
+                videocall_transport::websocket::force_websocket_drop(c);
+                info!("__vcNetsim.bumpWsDrop: +{c} WS send-buffer drops");
+                JsValue::from_bool(true)
+            }
+            None => {
+                warn!("__vcNetsim.bumpWsDrop: argument must be a non-negative number");
+                JsValue::from_bool(false)
+            }
+        }
+    });
+
     let set_ok = js_sys::Reflect::set(
         &obj,
         &JsValue::from_str("install"),
@@ -168,6 +214,20 @@ fn register_on_window() -> bool {
             clear.as_ref().unchecked_ref(),
         )
     })
+    .and_then(|_| {
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("bumpUplinkStall"),
+            bump_uplink_stall.as_ref().unchecked_ref(),
+        )
+    })
+    .and_then(|_| {
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("bumpWsDrop"),
+            bump_ws_drop.as_ref().unchecked_ref(),
+        )
+    })
     .and_then(|_| js_sys::Reflect::set(&window, &JsValue::from_str("__vcNetsim"), &obj))
     .is_ok();
 
@@ -178,12 +238,14 @@ fn register_on_window() -> bool {
 
     // Leak the closures so they outlive this function for the tab's
     // lifetime — the window object now holds them and may call back at
-    // any time. This is a one-time, bounded leak (two closures per tab,
+    // any time. This is a one-time, bounded leak (four closures per tab,
     // installed once via the `Once` in `install_window_hook`).
     install.forget();
     clear.forget();
+    bump_uplink_stall.forget();
+    bump_ws_drop.forget();
 
-    info!("netsim: window.__vcNetsim installed (install/clear)");
+    info!("netsim: window.__vcNetsim installed (install/clear/bumpUplinkStall/bumpWsDrop)");
     true
 }
 

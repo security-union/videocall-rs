@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 
 /**
  * E2E regression test for HCL issue #1189 (item 1): peer join/leave toast text
@@ -82,20 +83,11 @@ async function createAuthenticatedContext(
 }
 
 async function navigateToMeeting(page: Page, meetingId: string, username: string): Promise<void> {
-  await page.goto("/");
-  await page.waitForTimeout(1500);
-
-  await page.locator("#meeting-id").click();
-  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 50 });
-  // Display name is a controlled input -- clear before typing to handle any pre-fill.
-  await page.locator("#username").click();
-  await page.locator("#username").fill("");
-  await page.locator("#username").pressSequentially(username, { delay: 50 });
-  await page.waitForTimeout(500);
-  await page.locator("#username").press("Enter");
-  await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
-    timeout: 10_000,
-  });
+  // Hydration-robust submit (helpers/join-meeting.ts): gates on the
+  // post-hydration submit button and waits for the home form to detach (the
+  // route-changed signal that is robust to the History-API URL lag under load),
+  // instead of a fixed wait + single Enter + URL poll.
+  await fillAndSubmitJoinForm(page, meetingId, username);
   await page.waitForTimeout(1500);
 }
 

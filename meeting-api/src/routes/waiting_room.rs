@@ -25,6 +25,7 @@ use videocall_meeting_types::{
 use crate::auth::AuthUser;
 use crate::db::{meetings as db_meetings, participants as db_participants};
 use crate::error::AppError;
+use crate::feed_events::{self, FeedChange, FeedChangeReason};
 use crate::nats_events;
 use crate::search;
 use crate::state::AppState;
@@ -117,6 +118,16 @@ pub async fn admit_participant(
     // Re-push the meeting doc so SearchV2 picks up the new ACL principal.
     search::spawn_repush(&state, meeting.id, meeting_id.clone());
 
+    // Live homepage-feed nudge (issue #1081): admitting a participant changes
+    // the present-participant count and may have reactivated the meeting
+    // (idle->active via the `activate` above) — both shown in the feed.
+    feed_events::publish_feed_change(
+        state.nats.as_ref(),
+        &state.feed_tx,
+        FeedChange::new(meeting_id.clone(), FeedChangeReason::Joined),
+    )
+    .await;
+
     Ok(Json(APIResponse::ok(row.into_participant_status(None))))
 }
 
@@ -157,6 +168,17 @@ pub async fn admit_all(
     // Re-push the meeting doc — potentially many new principals at once.
     if admitted_count > 0 {
         search::spawn_repush(&state, meeting.id, meeting_id.clone());
+
+        // Live homepage-feed nudge (issue #1081): one nudge for the whole batch
+        // (NOT per participant — keeps nudge cardinality O(1), not
+        // O(participants)). Only when at least one was admitted, so a no-op
+        // admit-all (empty waiting room) does not nudge.
+        feed_events::publish_feed_change(
+            state.nats.as_ref(),
+            &state.feed_tx,
+            FeedChange::new(meeting_id.clone(), FeedChangeReason::Joined),
+        )
+        .await;
     }
 
     Ok(Json(APIResponse::ok(AdmitAllResponse {

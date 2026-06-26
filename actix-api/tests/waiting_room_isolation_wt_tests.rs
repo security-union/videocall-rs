@@ -919,6 +919,7 @@ async fn test_wt_observer_receives_only_allowlisted_packets() {
         PacketType::AES_KEY,
         PacketType::RSA_PUB_KEY,
         PacketType::DIAGNOSTICS,
+        PacketType::HEALTH,
     ];
 
     for ptype in blocked_types {

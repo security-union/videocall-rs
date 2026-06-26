@@ -568,7 +568,7 @@ fn handle_peer_list_diagnostics(
             let mut is_speaking: Option<bool> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
                     ("audio_enabled", MetricValue::U64(v)) => audio_enabled = Some(*v != 0),
                     ("video_enabled", MetricValue::U64(v)) => video_enabled = Some(*v != 0),
                     ("is_speaking", MetricValue::U64(v)) => is_speaking = Some(*v != 0),
@@ -610,7 +610,7 @@ fn handle_peer_list_diagnostics(
             let mut speaking: Option<bool> = None;
             for m in &evt.metrics {
                 match (m.name, &m.value) {
-                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.clone()),
+                    ("to_peer", MetricValue::Text(p)) => to_peer = Some(p.to_string()),
                     ("speaking", MetricValue::U64(v)) => speaking = Some(*v != 0),
                     _ => {}
                 }

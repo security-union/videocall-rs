@@ -152,11 +152,14 @@ use super::super::client::VideoCallClient;
 use super::classify_encode_error::{
     classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
 };
-use super::encoder_state::{keyframe_tick_decision, EncoderState, KeyframeTickInput};
+use super::encoder_state::{
+    keyframe_tick_decision, periodic_keyframe_due, EncoderState, KeyframeTickInput,
+};
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    simulcast_layers, AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD, VIDEO_QUALITY_TIERS,
+    simulcast_layers, AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD,
+    PERIODIC_KEYFRAME_MAX_INTERVAL_MS, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -488,6 +491,17 @@ pub struct CameraEncoder {
     /// The encode loop `.swap(false)`-consumes this each frame; a duplicate arm is
     /// idempotent and only matters when a PLI is pending.
     keyframe_cooldown_reset: Rc<AtomicBool>,
+    /// Camera video-at-floor flag (issue #1611): `true` when the camera AQ's
+    /// video quality is fully exhausted — tier at the user-capped step-down floor
+    /// AND active simulcast layers at 1. Stored unconditionally by the camera AQ
+    /// control loop AFTER every `tick()` so it is always current, and shared into
+    /// the [`MicrophoneEncoder`] so the mic-side uplink-distress detector's
+    /// backstop gate can open even with the camera on (the "camera-on but video
+    /// can't shed further → audio may shed" path).
+    ///
+    /// `Arc` (not `Rc`) because it crosses from the camera encoder into the mic
+    /// encoder, matching the camera-enabled-flag wiring pattern.
+    video_at_floor_flag: Arc<AtomicBool>,
     /// User-configurable adaptive-quality tier bounds (issue #961). Written by
     /// the UI via [`Self::set_quality_tier_bounds`], read by the encoder control
     /// loop (which applies them live to the `EncoderBitrateController`) and on
@@ -1069,6 +1083,12 @@ impl CameraEncoder {
         on_error: Callback<String>,
         max_layers: u32,
     ) -> Self {
+        // Reset the WT uplink-saturation threshold to floor (250ms) to prevent
+        // leaking a raised threshold from a prior CameraEncoder that was dropped
+        // while screen-sharing (issue #1618 suggested fix). Ensures a clean
+        // single-stream baseline for every new encoder instance.
+        videocall_transport::webtransport::reset_ready_stall_threshold();
+
         let default_tier = &VIDEO_QUALITY_TIERS[0];
         let default_audio_tier = &AUDIO_QUALITY_TIERS[0];
         Self {
@@ -1100,6 +1120,9 @@ impl CameraEncoder {
             // Issue #1311: no reset pending at construction; armed by a re-election
             // (quality task) or a reconnect (client `Connected` callback).
             keyframe_cooldown_reset: Rc::new(AtomicBool::new(false)),
+            // Issue #1611: camera video NOT exhausted at construction (fresh encoder
+            // starts at the default tier, which is above the floor).
+            video_at_floor_flag: Arc::new(AtomicBool::new(false)),
             quality_bounds: Rc::new(RefCell::new(SharedQualityBounds::default())),
             max_layers,
             // Simulcast ACTIVE-layer state (issue #989 / #1140 / #1141). Cold-start
@@ -1191,6 +1214,8 @@ impl CameraEncoder {
         // CONSUMES it per frame to clear `last_keyframe_emit_ms`. Both spawn_local
         // tasks share this same `CameraEncoder`-owned atom.
         let keyframe_cooldown_reset_quality = self.keyframe_cooldown_reset.clone();
+        // Issue #1611: the QUALITY task stores this each tick AFTER `tick()`.
+        let video_at_floor_flag = self.video_at_floor_flag.clone();
         // #961 (send quality bounds) + #1082 (simulcast layers) both feed the
         // encoder control loop — clone both sides' shared state.
         let quality_bounds = self.quality_bounds.clone();
@@ -1356,6 +1381,42 @@ impl CameraEncoder {
                 if screen_active != prev_screen_active {
                     prev_screen_active = screen_active;
                     encoder_control.notify_screen_sharing(screen_active);
+
+                    // Frame-rate-aware WT uplink-saturation threshold (issue #1618).
+                    // When dual-streaming, the combined uplink burst density is higher
+                    // and the same writer.ready() stall catches more concurrent frames
+                    // (K-amplification). Raise the threshold to 8× the screen share's
+                    // TOP-TIER (best-case) frame interval so bursty-but-healthy links
+                    // do not false-positive. Reset to floor when the screen share stops.
+                    // The screen share top tier is 10fps (100ms IFI); 8 × 100 = 800ms.
+                    // This is a FIXED bound, not recomputed as the screen degrades (the
+                    // screen can degrade to 5fps/200ms under congestion). WS publishers
+                    // execute this write but never read the value (the WT stall counter
+                    // is held flat at 0 for WS — see block below at line ~1500).
+                    if screen_active {
+                        // Use the screen share top-tier fps (10) as the fixed bound.
+                        // SCREEN_QUALITY_TIERS[0] is "high" (top tier, 10fps, 100ms IFI).
+                        let screen_ifi_ms = 1000.0
+                            / f64::from(
+                                crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS[0]
+                                    .target_fps,
+                            );
+                        let threshold = 8.0 * screen_ifi_ms;
+                        videocall_transport::webtransport::set_ready_stall_threshold_ms(threshold);
+                        log::info!(
+                            "CameraEncoder: WT stall threshold raised to {:.0}ms (dual-stream, \
+                             screen IFI={:.0}ms)",
+                            threshold,
+                            screen_ifi_ms,
+                        );
+                    } else {
+                        // Reset to floor (250ms) — single-stream camera only.
+                        videocall_transport::webtransport::reset_ready_stall_threshold();
+                        log::info!(
+                            "CameraEncoder: WT stall threshold reset to floor (single-stream)",
+                        );
+                    }
+
                     log::info!(
                         "CameraEncoder: screen sharing {} — camera tier coordination applied",
                         if screen_active { "ACTIVE" } else { "INACTIVE" },
@@ -1551,6 +1612,12 @@ impl CameraEncoder {
                 encoder_control.tick(now);
                 let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
+                // Issue #1611: unconditionally store whether camera video is
+                // exhausted (tier at user-capped floor AND active layers at 1).
+                // The mic encoder's backstop gate reads this to open even with
+                // the camera on when video can't shed further.
+                video_at_floor_flag.store(encoder_control.video_at_floor(), Ordering::Release);
+
                 // Write encoder decision inputs to shared atomics for health
                 // reporting. Issue #1184: the dead receiver-FPS-derived ratios
                 // (`encoder_fps_ratio` / `encoder_bitrate_ratio`) and their
@@ -1725,6 +1792,43 @@ impl CameraEncoder {
     /// The camera encoder's diagnostics loop reads it to coordinate bandwidth.
     pub fn screen_sharing_flag(&self) -> Rc<AtomicBool> {
         self.screen_sharing_active.clone()
+    }
+
+    /// Returns the camera ENABLED flag (`Arc<AtomicBool>`): the camera-on/off
+    /// signal (issue #1398).
+    ///
+    /// This is the SAME `EncoderState::enabled` atom that [`Self::set_enabled`]
+    /// writes (`set_enabled(true)` → camera ON, `set_enabled(false)` / `stop()`
+    /// → camera OFF). The `Host` toggles it directly: it calls
+    /// `camera.set_enabled(true)` when video is on and `camera.set_enabled(false)`
+    /// (plus `stop()`) when video is off (audio-only). So `false` is an
+    /// UNAMBIGUOUS, always-current "camera off / audio-only" indication — unlike
+    /// the shared audio-tier atoms, whose values (top-tier 50 kbps / index 0) are
+    /// indistinguishable between "camera off" and "camera on and healthy".
+    ///
+    /// Shared into the [`MicrophoneEncoder`] (via
+    /// [`MicrophoneEncoder::set_camera_active_signal`]) so the mic-side
+    /// single-layer uplink-distress detector (#1398) can GATE itself to
+    /// camera-off: the mic bitrate-floor lever and the camera AQ loop's audio
+    /// downshift are then mutually exclusive (no compounding). `Arc` (not `Rc`)
+    /// because the atom is `EncoderState`'s `Arc<AtomicBool>` and it crosses into
+    /// the mic encoder, matching the congestion-flag wiring.
+    pub fn camera_enabled_flag(&self) -> Arc<AtomicBool> {
+        self.state.enabled.clone()
+    }
+
+    /// Returns the camera video-at-floor flag (`Arc<AtomicBool>`): `true` when
+    /// the camera AQ's video quality is fully exhausted (tier at user-capped
+    /// floor AND active simulcast layers at 1) (issue #1611).
+    ///
+    /// Shared into the [`MicrophoneEncoder`] (via
+    /// [`MicrophoneEncoder::set_camera_video_exhausted_signal`]) so the mic-side
+    /// uplink-distress detector's backstop gate can open even with the camera on
+    /// when video can't shed further — the "camera-on but video exhausted →
+    /// audio may shed" path. Updated unconditionally by the camera AQ control
+    /// loop on every tick (AFTER `encoder_control.tick()`).
+    pub fn video_at_floor_flag(&self) -> Arc<AtomicBool> {
+        self.video_at_floor_flag.clone()
     }
 
     /// Returns the current video quality tier index (0 = best, 7 = minimal).
@@ -3317,13 +3421,13 @@ impl CameraEncoder {
                             // never lost; added recovery latency is bounded by the
                             // cooldown. The periodic GOP keyframe is never gated.
                             let now_ms = window().performance().unwrap().now();
-                            // Use tier-controlled keyframe interval instead of the
-                            // static constant, allowing adaptive quality to adjust it.
-                            // Using `%` instead of `.is_multiple_of()` for compatibility
-                            // with Rust toolchains older than 1.87.
-                            #[allow(clippy::manual_is_multiple_of)]
-                            let is_periodic_keyframe = local_keyframe_interval > 0
-                                && video_frame_counter % local_keyframe_interval == 0;
+                            let is_periodic_keyframe = periodic_keyframe_due(
+                                video_frame_counter,
+                                local_keyframe_interval,
+                                now_ms,
+                                last_keyframe_emit_ms,
+                                PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                            );
                             // Resolve the keyframe decision via the shared single
                             // source of truth (issue #1347 item 2: the camera AND
                             // screen loops call the same pure `keyframe_tick_decision`,
@@ -3707,11 +3811,12 @@ mod tests {
         camera_encoder_restarts_other, clamp_layer_count, encoders_to_build,
         format_layer_transition, frame_is_healthy, initial_active_layer_count,
         is_fatal_encoder_error_message, keyframe_tick_decision, layer_ceiling_to_count,
-        loop_is_superseded, next_single_layer_pin, record_camera_restart, shed_reason,
-        should_pin_single_layer_low, should_teardown_shed_layer, wt_drop_step_down_decision,
-        wt_saturation_step_down_decision, KeyframeTickInput, LayerView, SimulcastLayerInfo,
-        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
-        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        loop_is_superseded, next_single_layer_pin, periodic_keyframe_due, record_camera_restart,
+        shed_reason, should_pin_single_layer_low, should_teardown_shed_layer,
+        wt_drop_step_down_decision, wt_saturation_step_down_decision, KeyframeTickInput, LayerView,
+        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
+        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
+        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use crate::adaptive_quality_constants::{
         WS_SELF_CONGESTION_DROP_THRESHOLD, WS_SELF_CONGESTION_WINDOW_MS,
@@ -4595,6 +4700,119 @@ mod tests {
         assert!(
             !decision.step_down,
             "a flat-at-0 saturation counter must never step down (WS users / healthy WT)"
+        );
+    }
+
+    /// Issue #1510: the wall-clock periodic keyframe ceiling fires when elapsed
+    /// time since the last keyframe exceeds the cap, even when the frame-count
+    /// modulo has not triggered. Calls the PRODUCTION `periodic_keyframe_due`
+    /// function (the same one the camera/screen encode loops call).
+    ///
+    /// Mutation guards:
+    /// - Removing the `wallclock_periodic` disjunction from `periodic_keyframe_due`
+    ///   prevents the wall-clock trigger → `periodic_at[1]` would be 50 → FAILS.
+    /// - Setting `PERIODIC_KEYFRAME_MAX_INTERVAL_MS` too high makes the wall-clock
+    ///   check never fire within the simulated window → FAILS.
+    #[test]
+    fn wallclock_periodic_keyframe_fires_at_low_fps() {
+        use crate::adaptive_quality_constants::PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+
+        let keyframe_interval_frames: u32 = 50; // "minimal" tier
+        let actual_fps = 7.0_f64; // CPU-bound, well below nominal 10fps
+        let frame_interval_ms = 1000.0 / actual_fps;
+        let cd = FORCED_KEYFRAME_COOLDOWN_MS;
+
+        let mut last_keyframe_emit_ms: Option<f64> = None;
+        let mut now = 0.0_f64;
+        let mut periodic_at: Vec<u32> = Vec::new();
+
+        for frame in 0u32..60 {
+            let is_periodic = periodic_keyframe_due(
+                frame,
+                keyframe_interval_frames,
+                now,
+                last_keyframe_emit_ms,
+                PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+            );
+
+            let decision = keyframe_tick_decision(KeyframeTickInput {
+                now_ms: now,
+                pli_pending: false,
+                is_periodic,
+                cooldown_reset: false,
+                last_keyframe_emit_ms,
+                cooldown_ms: cd,
+            });
+
+            if decision.want_keyframe {
+                periodic_at.push(frame);
+            }
+            last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
+            now += frame_interval_ms;
+        }
+
+        assert_eq!(periodic_at[0], 0, "frame 0 must emit a periodic keyframe");
+        assert!(
+            periodic_at.len() >= 2,
+            "the wall-clock ceiling must trigger at least one extra periodic keyframe \
+             before the frame-counted boundary at frame 50"
+        );
+        let wallclock_fire = periodic_at[1];
+        assert!(
+            wallclock_fire < 50,
+            "wall-clock periodic must fire before the frame-counted boundary (frame 50), \
+             but fired at frame {wallclock_fire}"
+        );
+        let fire_time_ms = wallclock_fire as f64 * frame_interval_ms;
+        assert!(
+            fire_time_ms >= PERIODIC_KEYFRAME_MAX_INTERVAL_MS
+                && fire_time_ms < PERIODIC_KEYFRAME_MAX_INTERVAL_MS + frame_interval_ms * 2.0,
+            "wall-clock periodic should fire within two frames of {PERIODIC_KEYFRAME_MAX_INTERVAL_MS}ms, \
+             but fired at {fire_time_ms:.1}ms (frame {wallclock_fire})"
+        );
+    }
+
+    /// Issue #1510 / Blocker 2: after a reconnect clears `last_keyframe_emit_ms`
+    /// to `None` mid-session (frame_counter > 0), the wall-clock ceiling must
+    /// still emit a keyframe immediately — not wait for the next frame-count modulo.
+    ///
+    /// Mutation guard: removing the `None => frame_counter > 0` arm from
+    /// `periodic_keyframe_due` makes it return `false` here → FAILS.
+    #[test]
+    fn wallclock_periodic_fires_immediately_after_reconnect_clears_clock() {
+        use crate::adaptive_quality_constants::PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+
+        let keyframe_interval_frames: u32 = 150; // full_hd tier
+                                                 // Mid-session: frame counter is well past 0 but nowhere near the next modulo.
+        let frame_counter: u32 = 73;
+        let now_ms = 10_000.0; // 10s into the session
+
+        // Reconnect cleared last_keyframe_emit_ms to None.
+        let result = periodic_keyframe_due(
+            frame_counter,
+            keyframe_interval_frames,
+            now_ms,
+            None, // reconnect cleared this
+            PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+        );
+        assert!(
+            result,
+            "after a reconnect clears the keyframe clock (None) mid-session \
+             (frame {frame_counter} > 0), periodic_keyframe_due must return true \
+             to re-arm the wall-clock ceiling immediately"
+        );
+
+        // Verify frame 0 also fires (first-ever frame, not a reconnect).
+        let first_frame = periodic_keyframe_due(
+            0,
+            keyframe_interval_frames,
+            0.0,
+            None,
+            PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+        );
+        assert!(
+            first_frame,
+            "frame 0 must fire via the frame-count modulo (0 % 150 == 0)"
         );
     }
 }

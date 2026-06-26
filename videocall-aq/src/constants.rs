@@ -82,7 +82,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 2500,
         min_bitrate_kbps: 1500,
         max_bitrate_kbps: 2500,
-        keyframe_interval_frames: 150, // ~5s at 30fps
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "hd_plus",
@@ -92,7 +92,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 2000,
         min_bitrate_kbps: 1200,
         max_bitrate_kbps: 2500,
-        keyframe_interval_frames: 150, // ~5s at 30fps
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "hd",
@@ -102,7 +102,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 1500,
         min_bitrate_kbps: 800,
         max_bitrate_kbps: 2000,
-        keyframe_interval_frames: 150, // ~5s at 30fps
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "standard",
@@ -112,7 +112,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 900,
         min_bitrate_kbps: 500,
         max_bitrate_kbps: 1500,
-        keyframe_interval_frames: 150, // ~5s at 30fps
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "medium",
@@ -122,7 +122,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 600,
         min_bitrate_kbps: 300,
         max_bitrate_kbps: 1000,
-        keyframe_interval_frames: 125, // ~5s at 25fps
+        keyframe_interval_frames: 125, // ~5s at 25fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "low",
@@ -132,7 +132,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 400,
         min_bitrate_kbps: 200,
         max_bitrate_kbps: 600,
-        keyframe_interval_frames: 100, // ~5s at 20fps
+        keyframe_interval_frames: 100, // ~5s at 20fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "very_low",
@@ -142,7 +142,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 250,
         min_bitrate_kbps: 100,
         max_bitrate_kbps: 400,
-        keyframe_interval_frames: 75, // ~5s at 15fps
+        keyframe_interval_frames: 75, // ~5s at 15fps; wall-clock cap guarantees ≤5s
     },
     VideoQualityTier {
         label: "minimal",
@@ -152,7 +152,7 @@ pub const VIDEO_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 150,
         min_bitrate_kbps: 50,
         max_bitrate_kbps: 250,
-        keyframe_interval_frames: 50, // ~5s at 10fps
+        keyframe_interval_frames: 50, // ~5s at 10fps; wall-clock cap guarantees ≤5s
     },
 ];
 
@@ -462,7 +462,7 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 2500,
         min_bitrate_kbps: 1500,
         max_bitrate_kbps: 4000,
-        keyframe_interval_frames: 30, // ~3s at 10fps — frequent keyframes for text readability
+        keyframe_interval_frames: 30, // ~3s at 10fps (text readability); wall-clock cap ≤3s
     },
     VideoQualityTier {
         label: "medium",
@@ -472,7 +472,7 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 1200,
         min_bitrate_kbps: 700,
         max_bitrate_kbps: 2000,
-        keyframe_interval_frames: 24, // ~3s at 8fps
+        keyframe_interval_frames: 24, // ~3s at 8fps (text readability); wall-clock cap ≤3s
     },
     VideoQualityTier {
         label: "low",
@@ -482,12 +482,74 @@ pub const SCREEN_QUALITY_TIERS: &[VideoQualityTier] = &[
         ideal_bitrate_kbps: 500,
         min_bitrate_kbps: 250,
         max_bitrate_kbps: 1000,
-        keyframe_interval_frames: 15, // ~3s at 5fps
+        keyframe_interval_frames: 15, // ~3s at 5fps (text readability); wall-clock cap ≤3s
     },
 ];
 
 /// Maximum number of SCREEN simulcast layers (issue #989, Phase 3).
 pub const SCREEN_SIMULCAST_MAX_LAYERS: usize = 3;
+
+/// Initial number of ACTIVE screen simulcast layers seeded at (re)share start
+/// (issue #1553).
+///
+/// # Why this exists (issue #1553)
+/// The screen path used to seed `active_layer_count == 1` (base rung only) and
+/// relied on the headroom-probe ramp ([`LAYER_PROBE_CLEAR_WINDOW_MS`]) to earn
+/// every upper rung. That ramp demands the encoder queue be **uninterruptedly**
+/// clear for 6 s per rung; on a busy share in a large (~15-peer) meeting the
+/// queue never stays clear that long, so the share stalled permanently on the
+/// base rung — `low` (720p / 500 kbps / 5 fps) — and looked FUZZY forever.
+///
+/// # Decision: start OPTIMISTIC, shed DOWN on real backpressure (Option B)
+/// Seed the screen ladder at this many active rungs instead of 1, so a clear
+/// share gets a solid baseline from frame one without waiting on the 6 s ramp.
+/// At the `2`-rung seed the ladder is `[low, high]` (see
+/// [`simulcast_screen_layers`] just below: `n == 2 => [low, high]`), so the
+/// publisher emits the base `low` (720p / 500 kbps) AND the top `high`
+/// (1080p / 2500 kbps) rung — ≈ 3000 kbps across TWO simultaneous encodes (one
+/// of them the full 1080p) immediately. The EXISTING shed-down machinery
+/// (`drop_top_layer` under sustained encoder backpressure / congestion) still
+/// reduces active toward the floor (1) under genuine congestion, and the ramp
+/// can still earn the deferred MIDDLE rung up to the full 3-rung ceiling when
+/// uplink allows.
+///
+/// # Why `2` and not the full ladder (the #1200 tradeoff)
+/// Issue #1200 deliberately removed the "all rungs hot from frame one" cold
+/// start (active == n == 3 → `[low, medium, high]`, ~4.2 Mbps across THREE
+/// simultaneous encodes the instant a share begins) because that slam was too
+/// aggressive. Seeding at `2` is the middle ground that honors BOTH issues:
+/// - **#1553**: publishing the sharp `high` (1080p) rung immediately is exactly
+///   what de-fuzzes the shared content for a healthy receiver — the whole point
+///   of the issue — instead of stalling at the base rung waiting on the 6 s ramp.
+/// - **#1200**: 2 is strictly fewer than the 3-rung ladder, so it does NOT
+///   reintroduce the all-rungs-hot slam. What the seed leaves OFF is the THIRD
+///   simultaneous encode — the MIDDLE `medium` rung (720p / 1200 kbps), present
+///   only in the full `[low, medium, high]` ladder — NOT the 1080p top. The
+///   honest comparison is "2 encodes (incl. the 1080p `high`) / ≈ 3000 kbps" at
+///   the seed vs "3 encodes / ≈ 4200 kbps" for the #1200 slam; the deferred
+///   `medium` rung is earned by the ramp (or restored after a shed).
+///
+/// Clamped against the actual ladder size by the seed method (a `1`-layer /
+/// single-stream session stays at active 1), so this never exceeds the ceiling.
+pub const SCREEN_INITIAL_ACTIVE_LAYERS: usize = 2;
+
+// The optimistic seed must be ≥ 1 (the base rung is always published) and must
+// not exceed the screen ladder ceiling (otherwise the "middle ground vs #1200"
+// intent collapses into the full all-rungs-hot slam #1200 removed). Asserting at
+// COMPILE time so a future retune that violates either bound fails the build.
+const _: () = assert!(
+    SCREEN_INITIAL_ACTIVE_LAYERS >= 1,
+    "screen initial-active seed must include at least the base rung"
+);
+const _: () = assert!(
+    SCREEN_INITIAL_ACTIVE_LAYERS <= SCREEN_SIMULCAST_MAX_LAYERS,
+    "screen initial-active seed must not exceed the screen ladder ceiling"
+);
+const _: () = assert!(
+    SCREEN_INITIAL_ACTIVE_LAYERS < SCREEN_SIMULCAST_MAX_LAYERS,
+    "screen initial-active seed must be strictly below the ceiling — seeding the \
+     full ladder reintroduces the all-rungs-hot cold-start slam removed by #1200"
+);
 
 /// Resolve the SCREEN simulcast layer tiers for an `n`-layer ladder
 /// (issue #989, Phase 3), **lowest layer first** (index == `layer_id`).
@@ -556,6 +618,13 @@ pub struct AudioQualityTier {
     pub bitrate_kbps: u32,
     pub enable_dtx: bool,
     pub enable_fec: bool,
+    /// Expected packet-loss percentage (0-100) passed to the Opus encoder
+    /// (`OPUS_SET_PACKET_LOSS_PERC`). libopus scales how much redundant FEC
+    /// data it embeds by this hint, so it is only meaningful when
+    /// `enable_fec` is true. The top ("high") tier keeps 0 (FEC off); the
+    /// degraded tiers escalate the hint so the encoder embeds proportionally
+    /// more recovery data as the network worsens.
+    pub packet_loss_perc: u32,
 }
 
 /// Audio quality tiers, ordered from highest (index 0) to lowest.
@@ -565,24 +634,30 @@ pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
         bitrate_kbps: 50,
         enable_dtx: true,
         enable_fec: false,
+        // No FEC at the top tier: the link is healthy, so spend no overhead.
+        packet_loss_perc: 0,
     },
     AudioQualityTier {
         label: "medium",
         bitrate_kbps: 32,
         enable_dtx: true,
         enable_fec: true, // enable FEC under moderate loss
+        // First degraded tier: tell Opus to expect ~10% loss (issue #619 range).
+        packet_loss_perc: 10,
     },
     AudioQualityTier {
         label: "low",
         bitrate_kbps: 24,
         enable_dtx: true,
         enable_fec: true,
+        packet_loss_perc: 15,
     },
     AudioQualityTier {
         label: "emergency",
         bitrate_kbps: 16,
         enable_dtx: true,
         enable_fec: true,
+        packet_loss_perc: 20,
     },
 ];
 
@@ -1008,6 +1083,18 @@ pub const CAMERA_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 /// Periodic keyframes ensure recovery from packet loss on screen share streams.
 pub const SCREEN_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 
+/// Wall-clock ceiling on the camera periodic keyframe interval (milliseconds).
+/// The frame-counted `keyframe_interval_frames` only guarantees ~5s at the tier's
+/// nominal fps. Under CPU load or at low AQ tiers the actual fps drops and the
+/// frame-counted floor stretches to 10–17s. This wall-clock cap guarantees a
+/// periodic keyframe at least every 5s regardless of actual encode rate (issue #1510).
+pub const PERIODIC_KEYFRAME_MAX_INTERVAL_MS: f64 = 5000.0;
+
+/// Wall-clock ceiling for screen-share periodic keyframes (milliseconds).
+/// Screen tiers use a ~3s nominal GOP for text readability. The screen-specific
+/// cap preserves that 3s design intent under low-fps conditions (issue #1510).
+pub const SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS: f64 = 3000.0;
+
 /// Max time to wait for a keyframe before requesting one (milliseconds).
 /// After packet loss is detected, if no keyframe arrives within this window, send PLI.
 pub const KEYFRAME_REQUEST_TIMEOUT_MS: u64 = 1000;
@@ -1425,6 +1512,22 @@ pub const AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS: f64 = CLIMB_COOLDOWN_BASE_MS;
 /// 20 Hz VAD interval, which would wake 20× as often for a minutes-long cooldown).
 pub const AUDIO_CONGESTION_RECOVERY_TICK_MS: u32 = 1000;
 
+/// Poll cadence (milliseconds) of the live Opus FEC ctl-reconfig timer (issue
+/// #1567). The mic encoder runs a 1 Hz timer that reads the current audio tier,
+/// derives `(enable_fec, packet_loss_perc)`, and — ONLY when that pair changed
+/// since the last reconfig — posts a `reconfigOpus` message to the live encoder
+/// worklet so inband FEC actually engages on a mid-call AQ tier drop (and
+/// disengages on recovery).
+///
+/// 1 Hz is the chosen RATE-LIMIT: it caps reconfigs at one per second, so a
+/// flapping tier cannot flood the worklet, while still engaging FEC within ~1 s
+/// of a drop — far faster than packet-loss concealment matters at human
+/// timescales. Combined with the change-detection in `audio_fec_reconfig_change`
+/// (suppress when unchanged), a stable tier sends ZERO reconfigs. Matches
+/// [`AUDIO_CONGESTION_RECOVERY_TICK_MS`] so the two mic-side 1 Hz timers share a
+/// cadence and a wakeup budget on battery-constrained devices.
+pub const AUDIO_FEC_RECONFIG_TICK_MS: u32 = 1000;
+
 // ---------------------------------------------------------------------------
 // Client-Side WebSocket Backpressure Self-Detection
 // ---------------------------------------------------------------------------
@@ -1558,9 +1661,13 @@ const _: () = assert!(
 /// the count of 3. A bursty-but-recovering link that never parks a frame past
 /// 250ms will not shed; one that parks several frames past 250ms then recovers
 /// WILL shed one rung (arguably a correct early shed, but a real quality drop).
+/// The threshold IS now frame-rate-aware (issue #1618): when dual-streaming
+/// (camera + screen), the producer-side `READY_STALL_THRESHOLD_MS` is raised
+/// to a fixed `8 × screen_top_tier_frame_interval_ms` (800ms for 10fps top tier),
+/// preventing K-amplification false positives on healthy links. This is a FIXED
+/// bound, not recomputed as either stream degrades.
 /// VALIDATE the bursty-recovery case on the #1080 netsim before relying on this
-/// to replace the relay CONGESTION signal (#1219); the threshold may need to be
-/// frame-rate-aware.
+/// to replace the relay CONGESTION signal (#1219).
 pub const WT_SATURATION_STALL_THRESHOLD: u64 = 3;
 
 /// Tumbling window (ms) for counting client-side WT slow-`ready()` events.
@@ -1583,6 +1690,124 @@ const _: () = assert!(
     "WT saturation threshold must require more than one slow ready() so a single \
      transient stall (a reordered packet / brief cwnd dip on a lossy link) \
      cannot shed a layer."
+);
+
+// ---------------------------------------------------------------------------
+// Single-Layer AUDIO Uplink-Distress Self-Detection (#1398)
+// ---------------------------------------------------------------------------
+//
+// A SINGLE-LAYER audio publisher (device capability-gated to 1 audio layer, or
+// audio simulcast disabled) has no upper layer to shed under congestion, so the
+// only available downshift is lowering the ONE running Opus stream's bitrate
+// live (#1398). The CAMERA's AQ loop already self-detects publisher-uplink
+// distress directly from the process-global transport counters — slow
+// `writer.ready()` (`unistream_ready_stall_count`, WT bandwidth cliff) and WS
+// send-buffer overflows (`websocket_drop_count`) — via `evaluate_self_congestion`
+// with the WT/WS constants above. But that loop only runs while the CAMERA is
+// on; an AUDIO-ONLY publisher has no such detector. #1398 therefore re-targets
+// the audio bitrate floor onto the SAME live uplink counters, evaluated by a
+// mic-side detector that runs even when the camera is off.
+//
+// These constants are the AUDIO analogue of the video WT/WS constants, but
+// deliberately NOT a verbatim copy: AUDIO must shed AFTER VIDEO. The relationship
+// is expressed against the existing video constants (drift-resistant, with the
+// compile-time invariants below) rather than as bare literals.
+//
+// Why "after video", and why the WINDOW (not the count) does the heavy lifting:
+//   The WT stall counter is a WEAK discriminator. A single sustained `ready()`
+//   stall with K frames in flight produces ~K increments at once (see
+//   WT_SATURATION_STALL_THRESHOLD's note), so a slightly higher COUNT threshold
+//   (+2) is only a coarse nudge — it does not reliably make audio fire after
+//   video. The dominant lever is the WINDOW: a longer tumbling window requires
+//   the distress to PERSIST across more ticks before the audio detector fires,
+//   so a transient cliff that the video detector already shed for (over its
+//   shorter window) is given time to recover before audio — which costs more
+//   per-bit to the call — is touched. Hence the audio windows are MULTIPLES of
+//   the video windows (2x saturation, 4x WS), and that temporal ordering — not
+//   the +2 count — is what implements "audio sheds after video".
+
+/// Number of client-side WT slow-`ready()` (uplink-saturation) events within
+/// [`AUDIO_UPLINK_SATURATION_WINDOW_MS`] that trips the SINGLE-LAYER audio
+/// bitrate downshift (#1398). Two above the video saturation threshold so audio
+/// requires marginally more evidence than video; the longer window does the
+/// real "after video" work (see the module note above).
+pub const AUDIO_UPLINK_SATURATION_STALL_THRESHOLD: u64 = WT_SATURATION_STALL_THRESHOLD + 2;
+
+/// Number of client-side WS send-buffer drops within
+/// [`AUDIO_UPLINK_WS_WINDOW_MS`] that trips the SINGLE-LAYER audio bitrate
+/// downshift (#1398). Two above the WS self-congestion threshold.
+pub const AUDIO_UPLINK_WS_DROP_THRESHOLD: u64 = WS_SELF_CONGESTION_DROP_THRESHOLD + 2;
+
+/// Tumbling window (ms) for the audio WT-saturation detector (#1398). TWICE the
+/// video saturation window: the audio detector must see the cliff persist across
+/// roughly double the ticks the video detector needs before it sheds, so a
+/// transient cliff already handled by video recovers before audio is touched.
+pub const AUDIO_UPLINK_SATURATION_WINDOW_MS: f64 = 2.0 * WT_SATURATION_WINDOW_MS;
+
+/// Tumbling window (ms) for the audio WS-backpressure detector (#1398). FOUR
+/// times the video WS window: WS overflows are softer/faster-edged than WT
+/// stalls, so a wider multiplier is needed to give the same "audio after video"
+/// temporal separation.
+pub const AUDIO_UPLINK_WS_WINDOW_MS: f64 = 4.0 * WS_SELF_CONGESTION_WINDOW_MS;
+
+/// Number of client-side WT persistent-unistream media-frame DROPS within
+/// [`AUDIO_UPLINK_WT_DROP_WINDOW_MS`] that trips the SINGLE-LAYER audio bitrate
+/// downshift (#1398). Two above the video WT-drop threshold
+/// ([`WT_SELF_CONGESTION_DROP_THRESHOLD`]) so audio requires marginally more
+/// evidence than video; the wider window does the real "after video" work (see
+/// the module note above). This is the AUDIO analogue of the camera AQ's
+/// WT-DROP self-shed axis (`wt_drop_step_down_decision`) — the THIRD uplink
+/// axis (alongside saturation and WS) that the mic-side detector ORs over, so a
+/// hard unistream-reset cliff (drop counter climbing, not slow-`ready()`) sheds
+/// audio just as the camera sheds video on the same counter.
+pub const AUDIO_UPLINK_WT_DROP_THRESHOLD: u64 = WT_SELF_CONGESTION_DROP_THRESHOLD + 2;
+
+/// Tumbling window (ms) for the audio WT-DROP detector (#1398). TWICE the video
+/// WT-drop window ([`WT_SELF_CONGESTION_WINDOW_MS`]), NOT 4x like the WS window.
+/// RATIONALE (matching the saturation 2x note): a WT unistream DROP is a
+/// HARD-EDGED stream-reset/write-failure event — the same hard-edged class as
+/// the WT slow-`ready()` saturation signal, and unlike the soft/faster-edged WS
+/// send-buffer overflow. Hard-edged WT signals are already sparse and persist
+/// across multiple ticks before they fire video, so a 2x window gives the same
+/// "audio after video" temporal separation that the saturation axis gets at 2x;
+/// the 4x multiplier the WS axis needs is specific to WS's softer edge.
+pub const AUDIO_UPLINK_WT_DROP_WINDOW_MS: f64 = 2.0 * WT_SELF_CONGESTION_WINDOW_MS;
+
+// --- Compile-time invariants (#1398) ---
+// Audio must shed STRICTLY AFTER video on both axes. These pin the
+// "audio-after-video" contract at build time so a future edit to the video
+// constants that would let audio shed first (or simultaneously) fails the build,
+// not a meeting. Mirrors the #1104 / #1219-prereq invariant asserts above.
+const _: () = assert!(
+    AUDIO_UPLINK_SATURATION_STALL_THRESHOLD > WT_SATURATION_STALL_THRESHOLD,
+    "audio saturation threshold must exceed the video one so audio requires \
+     more stall evidence than video before shedding (audio sheds after video)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_WS_DROP_THRESHOLD > WS_SELF_CONGESTION_DROP_THRESHOLD,
+    "audio WS drop threshold must exceed the video one (audio sheds after video)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_SATURATION_WINDOW_MS > WT_SATURATION_WINDOW_MS,
+    "audio saturation window must be WIDER than the video one: the longer window \
+     (not the +2 count) is what makes audio shed after video, because the WT \
+     stall counter is a weak count discriminator (see the module note)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_WS_WINDOW_MS > WS_SELF_CONGESTION_WINDOW_MS,
+    "audio WS window must be WIDER than the video one (audio sheds after video)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_WT_DROP_THRESHOLD > WT_SELF_CONGESTION_DROP_THRESHOLD,
+    "audio WT-drop threshold must exceed the video one so audio requires more \
+     unistream-drop evidence than video before shedding (audio sheds after video)."
+);
+const _: () = assert!(
+    AUDIO_UPLINK_WT_DROP_WINDOW_MS > WT_SELF_CONGESTION_WINDOW_MS,
+    "audio WT-drop window must be WIDER than the video one (audio sheds after \
+     video). It is 2x (not 4x like WS): a WT drop is hard-edged like the WT \
+     saturation signal, so it gets the same 2x separation the saturation axis \
+     gets — see the AUDIO_UPLINK_WT_DROP_WINDOW_MS doc."
 );
 
 /// Pure decision helper for the client-side self-congestion self-trigger
@@ -1641,6 +1866,48 @@ pub struct SelfCongestionDecision {
     /// count once the window rolls.
     pub new_snapshot: u64,
 }
+
+// =====================================================================
+// Per-receiver cross-sender proactive-PLI budget (issue #1479, option b)
+// =====================================================================
+//
+// These bound how many PROACTIVE keyframe requests (PLIs) a single receiver may
+// emit ACROSS ALL of its senders within a sliding window. They back the
+// `PliBudget` in `videocall_client::decode::pli_budget`, which sits ABOVE the
+// transport-agnostic `emit_keyframe_request` packet builder (so it applies
+// identically to WebTransport and WebSocket).
+//
+// DEFENSE-IN-DEPTH, NOT A TIGHT THROTTLE. The authoritative limiter is the
+// RELAY's per-receiver `KEYFRAME_REQUEST_MAX_PER_SEC = 32` cap (server-side,
+// `actix-api/src/constants.rs`), which already coalesces this receiver's PLIs
+// across senders. This client budget deliberately mirrors that 32/s cap rather
+// than tightening it: the server stays the binding limit, and the client is a
+// co-equal shadow that is a NO-OP in normal multi-sender recovery (a benign
+// ceiling that only sheds genuinely-redundant same-window 2nd+ pokes once the
+// shared cap is reached). It must NEVER be tighter than the relay, or it would
+// shadow a guarantee the server upholds and risk shedding legitimate recovery.
+
+/// Sliding window (ms) over which the per-receiver cross-sender proactive-PLI
+/// budget counts ALLOWED requests (issue #1479). Matches the relay's 1s
+/// `KEYFRAME_REQUEST` limiter window so the client shadow ages entries out on
+/// the same cadence the server does. Wall-clock based, so a reconnect /
+/// cold-start / tab-resume self-heals: once `now_ms` jumps past the window,
+/// every stale entry is pruned and the budget is effectively empty again.
+pub const KEYFRAME_REQUEST_WINDOW_MS: u64 = 1000;
+
+/// Maximum ALLOWED proactive PLIs per receiver across ALL senders within
+/// `KEYFRAME_REQUEST_WINDOW_MS` (issue #1479). Deliberately EQUAL to the relay's
+/// `KEYFRAME_REQUEST_MAX_PER_SEC = 32` (NOT tighter): the SERVER remains the
+/// authoritative/binding limit and this client cap is a co-equal defense-in-depth
+/// ceiling. In normal multi-sender recovery this is a NO-OP — a sender's FIRST
+/// request in each window is ALWAYS allowed (wedge-proof + the #1662 escalation
+/// exemption), and each sender is already paced to <=1 proactive PLI/s by the
+/// #1494 per-sender backoff in `jitter_buffer.rs`, so reaching 32 distinct
+/// senders' firsts within one window requires a 32-way simultaneous freeze. Only
+/// a SECOND+ same-window poke from a sender that already fired this window can be
+/// shed, and only once the cap is reached — at which point staleness priority
+/// preserves the stalest contender. It is a benign ceiling, never a tight throttle.
+pub const KEYFRAME_REQUEST_MAX_PER_WINDOW: usize = 32;
 
 #[cfg(test)]
 mod tests {
@@ -2552,6 +2819,53 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- issue #619: Opus FEC + packet-loss-% tier wiring -------------------
+
+    #[test]
+    fn test_audio_tier_packet_loss_perc_in_range() {
+        // OPUS_SET_PACKET_LOSS_PERC accepts 0-100; an out-of-range value would
+        // be silently clamped/rejected by libopus, so pin it here.
+        for tier in AUDIO_QUALITY_TIERS {
+            assert!(
+                tier.packet_loss_perc <= 100,
+                "audio tier '{}': packet_loss_perc {} must be 0-100",
+                tier.label,
+                tier.packet_loss_perc,
+            );
+        }
+    }
+
+    #[test]
+    fn test_audio_tier_loss_perc_implies_fec() {
+        // A non-zero packet-loss hint only does anything when inband FEC is on
+        // (libopus uses it to scale FEC redundancy). If a tier ever sets a loss
+        // hint without enabling FEC, that's wasted intent — fail loudly.
+        for tier in AUDIO_QUALITY_TIERS {
+            if tier.packet_loss_perc > 0 {
+                assert!(
+                    tier.enable_fec,
+                    "audio tier '{}' has packet_loss_perc {} but FEC is off; \
+                     the loss hint only matters with FEC enabled",
+                    tier.label, tier.packet_loss_perc,
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_audio_top_tier_is_healthy() {
+        // The top (index 0) tier represents a healthy link: no FEC overhead and
+        // a 0% loss hint. This is also the tier the mic encoder inits at, so it
+        // defines default-state audio. Pin it so a future edit can't silently
+        // turn on FEC overhead for everyone at init.
+        let top = &AUDIO_QUALITY_TIERS[0];
+        assert!(!top.enable_fec, "top audio tier must keep FEC off");
+        assert_eq!(
+            top.packet_loss_perc, 0,
+            "top audio tier must have a 0% loss hint"
+        );
     }
 
     // =====================================================================

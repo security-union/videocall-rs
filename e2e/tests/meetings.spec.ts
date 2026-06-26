@@ -6,6 +6,7 @@ import {
   joinMeeting,
   endMeeting,
   deleteAllOwnedMeetings,
+  fetchMeetingState,
 } from "../helpers/meeting-api";
 
 // Selectors for the inline label-row error pattern. The error <span> lives
@@ -752,6 +753,71 @@ test.describe("Meetings list (merged feed)", () => {
     // confidence.
   });
 
+  test("list state pill updates live after a server-side transition without reload", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    // SSE is the primary live path: the homepage subscribes to the meetings
+    // stream and re-renders the `.meeting-state` pill as server-side state
+    // transitions arrive. Issue #1628 adds a low-frequency `use_future`
+    // fallback poll (FALLBACK_POLL_INTERVAL_MS = 25_000) in
+    // `dioxus-ui/src/components/meetings_list.rs` that silently re-fetches
+    // `GET /api/v1/meetings/feed` and calls `meetings.set(...)` WITHOUT
+    // flipping `loading`, so the list converges on the server's live
+    // per-meeting `state` even if SSE never delivers in the e2e env. That
+    // 25s fallback is what makes this test deterministic: we pick a 35s
+    // assertion timeout that comfortably exceeds the 25s poll interval.
+    //
+    // The load-bearing part is that the pill flips from "Active" to "Ended"
+    // with NO `page.reload()` / `page.goto()` between the initial and final
+    // assertions — the list updates itself. This would FAIL on the pre-fix
+    // code: without the poll (and with SSE silent in the e2e env), the row
+    // would stay stuck on "Active" until a manual refresh.
+    const email = `meetings-live-update-${Date.now()}@videocall.rs`;
+    const name = "MeetingsLiveUpdateUser";
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    // Seed: one meeting, driven ACTIVE via the join-as-host path.
+    const id = `e2e_meetings_live_${Date.now()}`;
+    await createMeeting(email, name, { meetingId: id, waitingRoomEnabled: false });
+    await joinMeeting(email, name, id, name);
+
+    // Confirm the seed actually produced an ACTIVE row server-side before we
+    // load the page (the host-join activation is observable in the feed).
+    await expect.poll(() => fetchMeetingState(email, name, id)).toBe("active");
+
+    await page.goto("/");
+    await waitForMeetingsRowCount(page, 1);
+
+    // Initial UI state: the single row renders the "Active" pill.
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-active`)).toHaveText(
+      "Active",
+    );
+
+    // Drive the SERVER-SIDE transition WITHOUT touching the page. From here
+    // until the final assertion there is NO reload/goto — the list must
+    // converge on its own via the fallback poll (and SSE, when available).
+    await endMeeting(email, name, id);
+
+    // Confirm the server transitioned to `ended` before asserting the UI.
+    // The active→ended path settles through an async NATS round-trip, so we
+    // poll the feed rather than asserting immediately.
+    await expect.poll(() => fetchMeetingState(email, name, id)).toBe("ended");
+
+    // Load-bearing assertion: the pill flips to "Ended" with no reload/goto.
+    // The 35s timeout comfortably exceeds the 25s fallback-poll interval.
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-ended`)).toHaveText(
+      "Ended",
+      { timeout: 35_000 },
+    );
+    await expect(page.locator(`${MEETINGS_SECTION} .meeting-state.state-active`)).toHaveCount(0, {
+      timeout: 35_000,
+    });
+
+    await deleteAllOwnedMeetings(email, name);
+  });
+
   test("Owner icon appears only on owned rows (and never on guest rows)", async ({
     context,
     baseURL,
@@ -1248,5 +1314,148 @@ test.describe("Meeting-list section expand/collapse persistence", () => {
     // `save_bool` only fires on user-initiated toggles, by design.
     const newKeyBefore = await page.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
     expect(newKeyBefore).toBeNull();
+  });
+});
+
+// Issue #1601: on the meeting settings page, an ENDED meeting's Activity card
+// renders the "Time" stat as a `from – to` range (e.g.
+// `Jun 22, 2026, 10:00 AM EDT – Jun 22, 2026, 10:32 AM EDT`). The value span
+// used to inherit `.settings-stat-value { white-space: nowrap }`, so the long
+// range stayed on one line and OVERFLOWED the compact card horizontally. The
+// fix gives the ended-Time value the `.settings-stat-value--range` modifier
+// (`white-space: normal; text-align: right`) and wraps each timestamp in an
+// atomic `.settings-stat-time-part` / `.settings-stat-separator` nowrap unit,
+// so the value wraps between the two timestamps (each timestamp staying intact)
+// instead of overflowing. Single-value rows (Participants, Duration, and the
+// non-ended "Started" case) keep the bare nowrap `.settings-stat-value`.
+//
+// These assertions are written to FAIL on the un-fixed CSS: under
+// `white-space: nowrap` the long range cannot wrap, so at a narrow viewport it
+// (a) renders on a single line — same height as the single-line "Participants"
+// value — and (b) overflows the card's content box. Reverting the production
+// CSS to nowrap breaks both checks below; they are not satisfiable on one line.
+test.describe("Meeting settings – ended Time range wraps without overflow (issue 1601)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test("ended meeting Time range wraps after the from-time and does not overflow the card", async ({
+    context,
+    baseURL,
+    page,
+  }) => {
+    const email = `time-range-wrap-${Date.now()}@videocall.rs`;
+    const name = "TimeRangeWrapUser";
+    // The settings page fetches meeting info in-browser as the cookie identity,
+    // so the injected session must own the seeded meeting to load its Activity
+    // card. Use the SAME email/name for the cookie and the REST seeding calls.
+    await injectSessionCookie(context, { baseURL, email, name });
+
+    // Seed an ENDED meeting (host-join activates it, then end sets ended_at +
+    // state="ended"). With both started_at and ended_at present, the Activity
+    // card's Time row renders the `from – to` range and the "Duration" row.
+    const meetingId = `e2e_time_range_wrap_${Date.now()}`;
+    await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
+    await joinMeeting(email, name, meetingId, name);
+    await endMeeting(email, name, meetingId);
+
+    // Force a narrow viewport so the ~50-char range CANNOT fit on one line.
+    // This makes the wrap (fixed) vs. overflow (un-fixed) divergence
+    // deterministic regardless of the default desktop width: without the fix
+    // the line cannot wrap and must overflow; with the fix it wraps to 2 lines.
+    await page.setViewportSize({ width: 380, height: 800 });
+
+    await page.goto(`/meeting/${meetingId}/settings`);
+    await expect(page.getByText("Activity")).toBeVisible({ timeout: 15_000 });
+
+    // The ended-meeting row is labelled "Time" (the non-ended case is "Started").
+    const timeRow = page.locator(".settings-stat-row").filter({ hasText: "Time" });
+    await expect(timeRow).toBeVisible({ timeout: 10_000 });
+
+    // The range value carries the modifier class added by the fix.
+    const rangeValue = timeRow.locator(".settings-stat-value--range");
+    await expect(rangeValue).toBeVisible({ timeout: 5_000 });
+
+    // It is a genuine `from – to` range: two atomic timestamp parts joined by
+    // the en-dash separator. (One part = the from-time, the separator span =
+    // " – {ended}".) If this row only had a single timestamp there would be
+    // nothing to wrap and the test would be meaningless, so assert the range
+    // structure is present first.
+    const fromPart = rangeValue.locator(".settings-stat-time-part");
+    const separator = rangeValue.locator(".settings-stat-separator");
+    await expect(fromPart).toHaveCount(1);
+    await expect(separator).toHaveCount(1);
+    await expect(separator).toContainText("–");
+
+    // ── Regression assertion 1: no horizontal overflow ──
+    // The stat row is a `display: flex` (block-level) container, so its
+    // scrollWidth/clientWidth are reliable (unlike a pure-inline <span>). Under
+    // the un-fixed nowrap CSS the long single line forces the flex row's
+    // content wider than its card-constrained box, so scrollWidth exceeds
+    // clientWidth. The fix wraps the value so the row's content fits its box.
+    const rowOverflows = await timeRow.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+    expect(rowOverflows, "ended Time row must not overflow the card").toBe(false);
+
+    // The range value's rendered box must stay within the card's content box
+    // (right edge containment). bounding-rect math is reliable for the inline
+    // value span where scrollWidth/clientWidth are not. Under nowrap the single
+    // long line pushes the value's right edge past the card's right content
+    // edge; the fix wraps it so the box stays inside the card.
+    const card = timeRow.locator("xpath=ancestor::div[contains(@class,'settings-card')][1]");
+    const cardRight = await card.evaluate((el) => {
+      const r = el.getBoundingClientRect();
+      const cs = getComputedStyle(el);
+      // Inner content right edge = box right minus right border + right padding.
+      return r.right - parseFloat(cs.borderRightWidth) - parseFloat(cs.paddingRight);
+    });
+    const valueRight = await rangeValue.evaluate(
+      (el) => (el as HTMLElement).getBoundingClientRect().right,
+    );
+    expect(
+      valueRight,
+      `ended Time range right edge (${valueRight}) must stay within the card content edge (${cardRight})`,
+    ).toBeLessThanOrEqual(cardRight + 1);
+
+    // ── Regression assertion 2: the value actually wrapped to >1 line ──
+    // Calibrate a single-line baseline from the "Participants" stat value in
+    // the same card (same font-size, guaranteed single line — bare
+    // .settings-stat-value, no range). The wrapped Time range must be
+    // meaningfully taller (≈2 lines). Under nowrap the range stays on ONE line,
+    // so its height would match the baseline and this assertion would fail.
+    const baselineValue = page
+      .locator(".settings-stat-row")
+      .filter({ hasText: "Participants" })
+      .locator(".settings-stat-value");
+    await expect(baselineValue).toBeVisible({ timeout: 5_000 });
+
+    const baselineHeight = await baselineValue.evaluate(
+      (el) => (el as HTMLElement).getBoundingClientRect().height,
+    );
+    const rangeHeight = await rangeValue.evaluate(
+      (el) => (el as HTMLElement).getBoundingClientRect().height,
+    );
+    // ≥1.5× the single-line height proves it occupies more than one line
+    // without demanding an exact 2.0× (line-box rounding / descenders vary).
+    expect(
+      rangeHeight,
+      `ended Time range must wrap to >1 line (range=${rangeHeight}px, single-line baseline=${baselineHeight}px)`,
+    ).toBeGreaterThan(baselineHeight * 1.5);
+
+    // ── Assertion 3: each timestamp is an atomic, intact unit ──
+    // Both atomic parts carry `white-space: nowrap`, so each timestamp is a
+    // single unbreakable unit and the wrap can only happen BETWEEN them. We
+    // assert the computed style is nowrap (so a future refactor that drops the
+    // nowrap on the parts — allowing a mid-date break — would fail here) and
+    // that each part renders a complete date string (year present), confirming
+    // no character-level fragmentation of a timestamp.
+    const fromWhiteSpace = await fromPart.evaluate((el) => getComputedStyle(el).whiteSpace);
+    expect(fromWhiteSpace, "from-time must be an atomic nowrap unit").toBe("nowrap");
+    const separatorWhiteSpace = await separator.evaluate((el) => getComputedStyle(el).whiteSpace);
+    expect(separatorWhiteSpace, "ended-time must be an atomic nowrap unit").toBe("nowrap");
+
+    // Each part is a complete localized datetime (contains the 4-digit year),
+    // so neither timestamp was split across the wrap boundary.
+    await expect(fromPart).toContainText(/\b20\d{2}\b/);
+    await expect(separator).toContainText(/\b20\d{2}\b/);
   });
 });

@@ -23,7 +23,7 @@ use crate::routing::Route;
 use context::{
     apply_and_save_theme, apply_theme_to_dom, load_display_name_from_storage,
     load_theme_from_storage, load_transport_preference, migrate_legacy_storage,
-    register_prefers_color_scheme_listener, DisplayNameCtx, ThemePreferenceCtx,
+    register_prefers_color_scheme_listener, CustomThemeCtx, DisplayNameCtx, ThemePreferenceCtx,
     TransportPreferenceCtx,
 };
 use dioxus::prelude::*;
@@ -80,6 +80,9 @@ fn App() -> Element {
 
     let theme = use_signal(load_theme_from_storage);
     use_context_provider(|| ThemePreferenceCtx(theme));
+
+    let custom_theme = use_signal(crate::theme_file::custom_theme_display_name);
+    use_context_provider(|| CustomThemeCtx(custom_theme));
 
     // Keep html[data-theme] in sync whenever the user changes the signal.
     // Skip the first firing: initialize_document_theme() already applied the

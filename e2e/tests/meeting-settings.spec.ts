@@ -219,6 +219,43 @@ test.describe("Meeting settings – Options toggles", () => {
       afterToggle,
     );
   });
+
+  // Issue 1551 (bug 1): the guest join link is a full meeting URL and used to
+  // overflow its card because `.settings-field-value` forces `white-space:
+  // nowrap`. The `.settings-guest-link` modifier restores wrapping so the URL
+  // stays inside the card. We assert the link wraps (no horizontal overflow)
+  // and that the wrapping CSS is actually applied.
+  test("guest join link wraps and does not overflow its card", async ({ page }) => {
+    const meetingId = `e2e_guest_link_wrap_${Date.now()}`;
+    await createMeetingAndOpenSettings(page, meetingId, "guest-link-user");
+
+    // Enable "Allow Guests" so the join-link row renders.
+    const allowGuestsToggle = optionToggle(page, "Allow Guests");
+    await expect(allowGuestsToggle).toBeVisible();
+    if ((await allowGuestsToggle.getAttribute("aria-checked")) !== "true") {
+      await allowGuestsToggle.click();
+      await expect(allowGuestsToggle).toHaveAttribute("aria-checked", "true", { timeout: 5_000 });
+    }
+
+    const link = page.locator(".settings-guest-link");
+    await expect(link).toBeVisible({ timeout: 5_000 });
+
+    // The link must contain the full guest URL (a long string that would
+    // overflow without wrapping).
+    await expect(link).toContainText(`/meeting/${meetingId}/guest`);
+
+    // Wrapping CSS must be applied: not the single-line nowrap from
+    // `.settings-field-value`.
+    const whiteSpace = await link.evaluate((el) => getComputedStyle(el).whiteSpace);
+    expect(whiteSpace).not.toBe("nowrap");
+    const overflowWrap = await link.evaluate((el) => getComputedStyle(el).overflowWrap);
+    expect(overflowWrap).toBe("anywhere");
+
+    // No horizontal overflow: the rendered content fits within the element's
+    // own box (which is itself constrained to the card width).
+    const overflows = await link.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+    expect(overflows).toBe(false);
+  });
 });
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
@@ -479,10 +516,15 @@ async function navigateToMeetingFromHome(
   await page.locator("#username").pressSequentially(username, { delay: 50 });
   await page.locator("#username").press("Enter");
   await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+  // Accept any of the three valid post-navigation states: the pre-join
+  // Start/Join button, the waiting-room message, or — if the prejoin flow
+  // auto-advanced — the in-meeting grid itself. Without the grid fallback the
+  // helper hangs whenever a peer skips the prejoin screen.
   await expect(
     page
       .getByRole("button", { name: /Start Meeting|Join Meeting/ })
-      .or(page.getByText("Waiting to be admitted")),
+      .or(page.getByText("Waiting to be admitted"))
+      .or(page.locator("#grid-container")),
   ).toBeVisible({
     timeout: 20_000,
   });
@@ -652,6 +694,232 @@ test.describe("Meeting settings – admitted_can_admit live propagation", () => 
       await hostBrowser.close();
       await participantBrowser.close();
       await waitingGuestBrowser.close();
+    }
+  });
+});
+
+/** Locate the "Participants" stat value on the settings Activity card. */
+function participantsStatValue(page: Page): Locator {
+  return page
+    .locator(".settings-stat-row")
+    .filter({ hasText: "Participants" })
+    .locator(".settings-stat-value");
+}
+
+test.describe("Meeting settings – live participant count refresh (issue 1551)", () => {
+  test.describe.configure({ timeout: 180_000 });
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  // Issue 1551 (bug 2): the Activity "Participants" count was fetched once at
+  // page load and never refreshed. The page now polls `get_meeting_info` on a
+  // 12s interval and updates the read-only stats in place. We open the host's
+  // settings page, have a second browser peer join the live meeting, and assert
+  // the count rises WITHOUT a reload within the poll window.
+  test("Activity participant count updates while a peer joins, without reload", async ({
+    baseURL,
+  }) => {
+    test.skip(!baseURL?.includes("3001"), "Meeting settings tests are Dioxus-only");
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_live_count_${Date.now()}`;
+
+    const hostBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const peerBrowser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        hostBrowser,
+        "live-count-host@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
+      const peerCtx = await createAuthenticatedContext(
+        peerBrowser,
+        "live-count-peer@videocall.rs",
+        "PeerUser",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const peerPage = await peerCtx.newPage();
+
+      // Host joins the live meeting in its own tab and STAYS there for the whole
+      // test. The host must remain present in the grid so the meeting never goes
+      // idle/host-less — otherwise a joining peer has no host to admit it and
+      // the participant-count dynamics become racy (count could drop to 0 before
+      // the peer arrives). This mirrors the proven host+peer sequence used by the
+      // passing "admitted_can_admit live propagation" test above.
+      await navigateToMeetingFromHome(hostPage, meetingId, "HostUser");
+      await expect(joinMeetingWhenReady(hostPage)).resolves.toBe("in-meeting");
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Open the settings page in a SEPARATE tab so the host's meeting tab keeps
+      // the meeting active. The Activity count read here should already be >= 1
+      // with the host present.
+      const settingsPage = await hostCtx.newPage();
+      await settingsPage.goto(`/meeting/${meetingId}/settings`);
+      await expect(settingsPage.getByText("Options")).toBeVisible({ timeout: 10_000 });
+
+      const countValue = participantsStatValue(settingsPage);
+      await expect(countValue).toBeVisible({ timeout: 5_000 });
+      const initialCount = parseInt((await countValue.textContent())?.trim() || "0", 10);
+
+      // A second peer joins the live meeting. Waiting-room default is ON and the
+      // host is present, so the peer deterministically lands in the waiting room
+      // and is admitted from the host's meeting tab (which is in the grid and has
+      // the Admit UI). Admitting moves the peer to present and bumps the count.
+      await navigateToMeetingFromHome(peerPage, meetingId, "PeerUser");
+      const peerJoinState = await joinMeetingWhenReady(peerPage);
+      if (peerJoinState === "waiting") {
+        const admit = hostPage.getByTitle("Admit").first();
+        await expect(admit).toBeVisible({ timeout: 20_000 });
+        await admit.dispatchEvent("click");
+
+        const peerJoinButton = peerPage.getByRole("button", {
+          name: /Start Meeting|Join Meeting/,
+        });
+        const peerGrid = peerPage.locator("#grid-container");
+        const peerTransition = await Promise.race([
+          peerJoinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
+          peerGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
+        ]);
+        if (peerTransition === "join") {
+          await ensureJoinedFromTransition(peerJoinButton, peerGrid);
+        }
+      }
+      await expect(peerPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // The settings page (never reloaded) must reflect the higher count once a
+      // poll tick (12s) fires. Allow generous slack for poll + network.
+      await expect
+        .poll(async () => parseInt((await countValue.textContent())?.trim() || "0", 10), {
+          timeout: 40_000,
+        })
+        .toBeGreaterThan(initialCount);
+    } finally {
+      await hostBrowser.close();
+      await peerBrowser.close();
+    }
+  });
+});
+
+test.describe("Meeting settings – in-call Meeting Options panel", () => {
+  test.describe.configure({ timeout: 240_000 });
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  /** Open the host's in-call Meeting Options panel and set the Waiting Room
+   *  toggle to `on`, then close the panel. Asserts the toggle reached the
+   *  requested state before closing. */
+  async function setWaitingRoomFromInCallPanel(hostPage: Page, on: boolean): Promise<void> {
+    const optionsButton = hostPage.locator('[data-testid="open-meeting-options"]');
+    await expect(optionsButton).toBeVisible({ timeout: 10_000 });
+    await optionsButton.click();
+
+    const wrToggle = settingsToggle(hostPage, "Waiting Room");
+    await expect(wrToggle).toBeVisible({ timeout: 5_000 });
+    const want = on ? "true" : "false";
+    if ((await wrToggle.getAttribute("aria-checked")) !== want) {
+      await wrToggle.click();
+      await expect(wrToggle).toHaveAttribute("aria-checked", want, { timeout: 5_000 });
+    }
+
+    await hostPage.getByRole("button", { name: "Done" }).click();
+    await expect(wrToggle).not.toBeVisible({ timeout: 5_000 });
+  }
+
+  // The host changes meeting options live from INSIDE the call (without going
+  // to the separate settings page / another tab) via the new Meeting Options
+  // control. This test is discriminating in BOTH directions so it cannot pass
+  // on a no-op panel: because the waiting room defaults to ON, we first switch
+  // it OFF in-call and prove a joiner is AUTO-ADMITTED (only true if OFF
+  // actually reached the server), then switch it back ON in-call and prove a
+  // later joiner is PLACED IN THE WAITING ROOM with the host getting the admit
+  // prompt — the headline scenario.
+  test("host toggles the waiting room live from the in-call panel and joiners follow the new state", async ({
+    baseURL,
+  }) => {
+    test.skip(!baseURL?.includes("3001"), "In-call options panel is Dioxus-only");
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_incall_opts_${Date.now()}`;
+
+    const hostBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const earlyPeerBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const latePeerBrowser = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        hostBrowser,
+        "incall-opts-host@videocall.rs",
+        "HostUser",
+        uiURL,
+      );
+      const earlyPeerCtx = await createAuthenticatedContext(
+        earlyPeerBrowser,
+        "incall-opts-early@videocall.rs",
+        "EarlyPeer",
+        uiURL,
+      );
+      const latePeerCtx = await createAuthenticatedContext(
+        latePeerBrowser,
+        "incall-opts-late@videocall.rs",
+        "LatePeer",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+      const earlyPeerPage = await earlyPeerCtx.newPage();
+      const latePeerPage = await latePeerCtx.newPage();
+
+      // Host starts the meeting and lands in the grid.
+      await navigateToMeetingFromHome(hostPage, meetingId, "HostUser");
+      await expect(joinMeetingWhenReady(hostPage)).resolves.toBe("in-meeting");
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // ── Direction 1: switch waiting room OFF in-call → joiner auto-admits ──
+      // The default is ON, so an auto-admit here can ONLY happen if the in-call
+      // panel actually persisted waiting_room=false to the server.
+      await setWaitingRoomFromInCallPanel(hostPage, false);
+
+      await navigateToMeetingFromHome(earlyPeerPage, meetingId, "EarlyPeer");
+      await expect(joinMeetingWhenReady(earlyPeerPage)).resolves.toBe("in-meeting");
+      await expect(earlyPeerPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // ── Direction 2: switch waiting room ON in-call → later joiner waits ──
+      await setWaitingRoomFromInCallPanel(hostPage, true);
+
+      await navigateToMeetingFromHome(latePeerPage, meetingId, "LatePeer");
+      await expect(joinMeetingWhenReady(latePeerPage)).resolves.toBe("waiting");
+      await expect(latePeerPage.getByText("Waiting to be admitted")).toBeVisible({
+        timeout: 10_000,
+      });
+
+      // The host receives the admit prompt (the "message to allow peer into
+      // meeting") and admits the waiting peer.
+      const admitButton = hostPage.getByTitle("Admit").first();
+      await expect(admitButton).toBeVisible({ timeout: 20_000 });
+      await admitButton.dispatchEvent("click");
+
+      const lateJoinButton = latePeerPage.getByRole("button", {
+        name: /Start Meeting|Join Meeting/,
+      });
+      const lateGrid = latePeerPage.locator("#grid-container");
+      const lateTransition = await Promise.race([
+        lateJoinButton.waitFor({ timeout: 20_000 }).then(() => "join" as const),
+        lateGrid.waitFor({ timeout: 20_000 }).then(() => "grid" as const),
+      ]);
+      if (lateTransition === "join") {
+        await ensureJoinedFromTransition(lateJoinButton, lateGrid);
+      }
+      await expect(lateGrid).toBeVisible({ timeout: 15_000 });
+    } finally {
+      await hostBrowser.close();
+      await earlyPeerBrowser.close();
+      await latePeerBrowser.close();
     }
   });
 });

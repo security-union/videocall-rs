@@ -23,7 +23,7 @@ use actix_web::{web, App, HttpResponse, HttpServer, Responder};
 use tracing::{error, info};
 
 use sec_api::actors::chat_server::ChatServer;
-use sec_api::metrics::metrics_responder;
+use sec_api::metrics::{metrics_responder, spawn_scheduler_lag_probe};
 use sec_api::server_diagnostics::ServerDiagnostics;
 use sec_api::session_manager::SessionManager;
 use sec_api::version;
@@ -33,6 +33,21 @@ async fn health_responder() -> impl Responder {
     HttpResponse::Ok().body("Ok")
 }
 
+// This relay runs on a SINGLE-THREADED runtime by necessity.
+//
+// `#[actix_rt::main]` builds a current-thread tokio runtime (actix-rt never
+// reads `worker_threads` / the `TOKIO_WORKER_THREADS` env var). It must be
+// single-threaded because the per-session `WtChatSession` actor and its
+// WebTransport stream/datagram I/O are driven on the actix `LocalSet` via
+// `spawn_local` (see `webtransport::mod` connection-accept loop), which a
+// multi-threaded runtime cannot host. Consequently `TOKIO_WORKER_THREADS` is
+// INERT for this binary — setting it in deploy config does nothing, and
+// thread count cannot relieve outbound back-pressure here.
+//
+// Scaling past one core (multi-Arbiter sharding / off-thread parse — issue
+// #1639 options a/b) is future work, gated on the #1637 scheduler-lag
+// instrumentation. Issue #1639 option (c) only removed the inert env and
+// documented this ceiling.
 #[actix_rt::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -70,6 +85,30 @@ async fn main() {
     tokio::spawn(async move {
         tracker_task.run_message_loop(tracker_receiver).await;
     });
+
+    // #1637 (epic #1636, INSURANCE SIGNAL): tokio scheduler-lag probe.
+    //
+    // This relay runs on a SINGLE-THREADED `#[actix_rt::main]` runtime, so a long
+    // synchronous span or fan-out burst on that one thread stalls EVERY task at
+    // once — the latent Gun #2 (#1639). The cgroup CPU average cannot resolve such
+    // a sub-second stall (a 200ms freeze vanishes in a multi-second average). The
+    // only way to see it is to measure how late a timer that SHOULD fire on THIS
+    // runtime actually fires.
+    //
+    // The probe spawn + loop live in `metrics::spawn_scheduler_lag_probe` /
+    // `run_scheduler_lag_probe` (library fns, so the `actix_rt::spawn` + loop +
+    // `.observe()` wiring is unit-testable — an inline spawn here would not be,
+    // leaving it unguarded; mirrors `webtransport::spawn_connection_path_sampler`).
+    // It spawns on `actix_rt` ON PURPOSE: the probe must live on the SAME
+    // single-thread runtime whose lag we want to measure — a probe on any other
+    // thread would measure that thread's scheduler, not the relay's. See
+    // `run_scheduler_lag_probe` for the deadline-based measurement (correct under
+    // both MissedTickBehavior variants) and the histogram-vs-gauge rationale. This
+    // `main() -> spawn_scheduler_lag_probe()` line is the irreducible composition
+    // boundary (like the NATS-connect / health-bind / webtransport::start calls
+    // around it — `main` is not unit-tested).
+    const SCHEDULER_LAG_PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+    spawn_scheduler_lag_probe(SCHEDULER_LAG_PROBE_INTERVAL);
 
     // Health server setup
     let health_listen = std::env::var("HEALTH_LISTEN_URL")

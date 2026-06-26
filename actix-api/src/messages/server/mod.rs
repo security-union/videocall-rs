@@ -128,19 +128,27 @@ pub struct ActivateConnection {
 }
 
 /// Sent from a session's NATS loop when it receives a PARTICIPANT_LIST_REQUEST
-/// event. The ChatServer re-publishes this session's PARTICIPANT_JOINED so the
-/// requesting joiner learns about this peer.
+/// event, so the ChatServer re-announces this session's PARTICIPANT_JOINED and
+/// the requesting joiner learns about this peer.
 ///
-/// The reply is published to the requester's per-session subject
-/// (`room.{room}.{requester_session}`) so that, although every session receives
-/// it via the room wildcard subscription, only the requester forwards it to its
-/// client (see the MEETING unicast filter in `handle_msg`).
+/// The handler does NOT publish immediately. It records this responder once
+/// (tracking distinct requesters) and arms one trailing
+/// [`PARTICIPANT_REBROADCAST_COALESCE_MS`] timer; when it fires, the flush
+/// re-announces once — broadcast for a wave (≥2 distinct requesters), unicast to
+/// the lone requester otherwise — so a reconnection wave's M per-requester
+/// publishes collapse to one. `requester_session` is both the arm-gate and the
+/// unicast target: a requester on THIS instance was already served by the
+/// in-memory replay in JoinRoom, so it does not arm (single-server stays
+/// zero-cost).
+///
+/// [`PARTICIPANT_REBROADCAST_COALESCE_MS`]: crate::constants::PARTICIPANT_REBROADCAST_COALESCE_MS
 #[derive(ActixMessage)]
 #[rtype(result = "()")]
 pub struct RebroadcastPresence {
     /// The responding peer's own session (the peer being announced).
     pub session: SessionId,
-    /// The joiner that asked for the participant list; the reply is addressed
-    /// to this session.
+    /// The joiner that asked for the participant list. Gates arming (a local
+    /// requester is already served by the in-memory replay) and is the unicast
+    /// target for a single-join re-announce.
     pub requester_session: SessionId,
 }

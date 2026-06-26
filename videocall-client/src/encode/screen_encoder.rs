@@ -53,13 +53,15 @@ use super::super::client::VideoCallClient;
 use super::classify_encode_error::{
     classify_encode_error, restart_reason_from_message, EncodeErrorBucket, RestartReason,
 };
-use super::encoder_state::{keyframe_tick_decision, EncoderState, KeyframeTickInput};
+use super::encoder_state::{
+    keyframe_tick_decision, periodic_keyframe_due, EncoderState, KeyframeTickInput,
+};
 use super::transform::transform_screen_chunk;
 use crate::crypto::aes::Aes128State;
 
 use crate::adaptive_quality_constants::{
     simulcast_screen_layers, BITRATE_CHANGE_THRESHOLD, DEFAULT_SCREEN_TIER_INDEX,
-    ENCODER_PLI_COOLDOWN_MS, SCREEN_QUALITY_TIERS,
+    ENCODER_PLI_COOLDOWN_MS, SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS, SCREEN_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 // Reuse the SEND-side simulcast diagnostics types defined alongside the camera
@@ -597,6 +599,25 @@ pub struct ScreenEncoder {
     /// **Initialized to [`u32::MAX`] = fail-open (Auto / no user cap).** The base
     /// layer is always published (the AQ side floors the cap at 1).
     shared_user_layer_ceiling: Rc<AtomicU32>,
+    /// Screen video-at-floor flag (issue #1611): `true` when the screen AQ's
+    /// video quality is fully exhausted — tier at the user-capped step-down floor
+    /// AND active simulcast layers at 1. Stored AFTER every `tick()` while
+    /// sharing, and CLEARED synchronously on share-start (rising edge) to prevent
+    /// a stale `true` from a prior session leaking into a fresh share. Shared
+    /// into the [`MicrophoneEncoder`] so the mic-side backstop gate can open when
+    /// screen video can't shed further.
+    ///
+    /// `Arc` (not `Rc`) because it crosses encoder boundaries into the mic.
+    screen_at_floor_flag: Arc<AtomicBool>,
+    /// Screen-sharing-active flag mirrored as `Arc<AtomicBool>` (issue #1611).
+    /// Written at the same points as the `Rc<AtomicBool>` `screen_sharing_active`:
+    /// share start (`run_screen_encoding` → `true`), normal stop (`stop()` → `false`),
+    /// failure teardown (`cleanup_on_error` → `false`), and final cleanup (end of
+    /// `run_screen_encoding` → `false`). Exists solely because the mic encoder
+    /// trait requires `Arc` and the primary flag is `Rc`. On wasm32 the distinction
+    /// is academic (single-threaded), but the type system enforces it. The host
+    /// passes this to the mic via [`MicrophoneEncoder::set_screen_sharing_active_signal`].
+    screen_sharing_active_arc: Arc<AtomicBool>,
     /// Liveness token bounding the AQ control-loop `spawn_local` future (issue
     /// #1108). The encoder holds the only strong reference; `set_encoder_control`
     /// captures a [`Weak`] and breaks its 1 Hz `tick` loop once `upgrade()`
@@ -606,6 +627,18 @@ pub struct ScreenEncoder {
     /// only — the encode loop (`run_screen_encoding`) already exits on
     /// `enabled == false`.
     control_loop_liveness: Rc<()>,
+}
+
+/// Clear both screen-sharing flags (Rc + Arc mirror) atomically (issue #1611).
+///
+/// Called from all teardown paths: `stop()`, `cleanup_on_error` closure, and
+/// final `run_screen_encoding` cleanup. Exists as a module-scope helper so the
+/// regression test can invoke the SAME dual-store the production code uses —
+/// test-only hand-written stores would be tautological (the anti-pattern named
+/// in CLAUDE.md adversarial check 2).
+fn clear_screen_sharing_flags(rc: &Rc<AtomicBool>, arc: &Arc<AtomicBool>) {
+    rc.store(false, Ordering::Release);
+    arc.store(false, Ordering::Release);
 }
 
 impl ScreenEncoder {
@@ -674,6 +707,12 @@ impl ScreenEncoder {
             // User SEND layer-ceiling (perf-panel). Fail-open: u32::MAX = Auto /
             // no user cap until the panel writes a layer count.
             shared_user_layer_ceiling: Rc::new(AtomicU32::new(u32::MAX)),
+            // Issue #1611: screen video NOT exhausted at construction (no share
+            // running yet). Cleared synchronously on share-start to prevent
+            // staleness from a prior session.
+            screen_at_floor_flag: Arc::new(AtomicBool::new(false)),
+            // Issue #1611: Arc mirror of screen_sharing_active for mic encoder.
+            screen_sharing_active_arc: Arc::new(AtomicBool::new(false)),
             // AQ control-loop liveness token (issue #1108). Sole strong owner;
             // the self-tick loop holds a Weak and exits when this drops.
             control_loop_liveness: Rc::new(()),
@@ -724,9 +763,40 @@ impl ScreenEncoder {
         self.shared_union_requested_layer.clone()
     }
 
+    /// Returns the screen video-at-floor flag (`Arc<AtomicBool>`): `true` when
+    /// the screen AQ's video quality is fully exhausted (tier at user-capped
+    /// floor AND active simulcast layers at 1) (issue #1611).
+    ///
+    /// Shared into the [`MicrophoneEncoder`] (via
+    /// [`MicrophoneEncoder::set_screen_video_exhausted_signal`]) so the mic-side
+    /// uplink-distress detector's backstop gate can open when screen video can't
+    /// shed further. Updated by the screen AQ control loop every tick AFTER
+    /// `encoder_control.tick()` while sharing, and cleared synchronously on the
+    /// share-start rising edge to prevent stale-`true` leakage across sessions.
+    pub fn screen_at_floor_flag(&self) -> Arc<AtomicBool> {
+        self.screen_at_floor_flag.clone()
+    }
+
+    /// Returns the `Arc<AtomicBool>` mirror of `screen_sharing_active` for the
+    /// mic encoder (issue #1611). Written at the same points as the `Rc`
+    /// version; exists solely because the mic trait requires `Arc`.
+    pub fn screen_sharing_active_arc(&self) -> Arc<AtomicBool> {
+        self.screen_sharing_active_arc.clone()
+    }
+
     /// Returns the shared tier transitions buffer for health reporting.
     pub fn shared_tier_transitions(&self) -> Rc<RefCell<Vec<TierTransitionRecord>>> {
         self.shared_tier_transitions.clone()
+    }
+
+    /// Returns the ACTIVE screen simulcast layer-count atomic (#1561).
+    pub fn shared_active_layer_count(&self) -> Rc<AtomicU32> {
+        self.shared_active_layer_count.clone()
+    }
+
+    /// Returns the effective screen simulcast layer count (#1561).
+    pub fn effective_screen_layer_count(&self) -> u32 {
+        self.effective_layer_count()
     }
 
     /// Set user-configurable SCREEN-SHARE quality tier bounds (issue #961
@@ -917,6 +987,10 @@ impl ScreenEncoder {
         // screen encoder control loop — clone both sides' shared state.
         let quality_bounds = self.quality_bounds.clone();
         let n_layers = self.effective_layer_count() as usize;
+        log::info!(
+            "ScreenEncoder: effective simulcast layers = {}",
+            self.effective_layer_count()
+        );
         let shared_active_layer_count = self.shared_active_layer_count.clone();
         // Issue #1229: the AQ loop must observe share start/stop edges so it can
         // (a) NOT drift the layer ramp up while idle and (b) re-arm cold start
@@ -938,6 +1012,8 @@ impl ScreenEncoder {
         // count the UI wrote and forwards it to the controller's user cap each
         // tick, composed as a further `min` alongside the union cap and the ramp.
         let shared_user_layer_ceiling = self.shared_user_layer_ceiling.clone();
+        // Issue #1611: the QUALITY task stores this each tick AFTER `tick()`.
+        let screen_at_floor_flag = self.screen_at_floor_flag.clone();
         // Liveness sentinel (issue #1108): a Weak to the encoder-owned token. The
         // loop breaks once this fails to upgrade (ScreenEncoder dropped on Host
         // unmount), so the immortal `spawn_local` future doesn't leak per remount.
@@ -960,19 +1036,41 @@ impl ScreenEncoder {
             // controller is `is_screen`, so its per-layer PIDs use the SCREEN
             // ladder. n_layers == 1 leaves it single-stream (byte-identical).
             //
-            // EARN-UP COLD START (issue #1200): use
-            // `set_simulcast_ceiling_start_at_base`, NOT `set_simulcast_layers`.
-            // The latter seeds `active_layer_count == n` (all rungs hot from
-            // frame one — ~4.2 Mbps / 3 encodes immediately), which is what the
-            // screen path used to do. Mirroring the camera (#1140/#1141), we now
-            // configure the device CEILING to `n_layers` but START the active
-            // count at the BASE rung (1); the headroom-probe ramp in
-            // `EncoderBitrateController::tick` earns the upper rungs up to the
-            // ceiling only when backpressure + uplink budget allow. The
-            // receiver-side LayerChooser already handles an upper layer that
-            // appears late, so a late-earned 1080p rung is delivered correctly.
+            // OPTIMISTIC SEED — start high, shed down (issue #1553).
+            //
+            // History: #1200 removed the all-rungs-hot `set_simulcast_layers`
+            // seed (active == n == 3 → ~4.2 Mbps / 3 simultaneous encodes from
+            // frame one) as too aggressive, replacing it with start-at-base
+            // (active == 1) + the headroom-probe ramp (mirroring the camera,
+            // #1140/#1141). But that ramp earns each upper rung only after the
+            // encoder queue is UNINTERRUPTEDLY clear for `LAYER_PROBE_CLEAR_WINDOW_MS`
+            // = 6 s, and on a busy share in a large (~15-peer) meeting the queue
+            // never stays clear that long — so the screen never climbed past the
+            // base rung and stayed permanently FUZZY (issue #1553).
+            //
+            // Option B fix: seed an OPTIMISTIC baseline of
+            // `SCREEN_INITIAL_ACTIVE_LAYERS` (= 2) via
+            // `set_simulcast_ceiling_start_optimistic`, so a clear share reaches
+            // a solid baseline immediately without depending on the 6 s ramp. At
+            // 2 active rungs the screen ladder is `[low, high]` (per
+            // `simulcast_screen_layers(2)`), so the publisher emits the base
+            // `low` (720p/500) AND the top `high` (1080p/2500) rung — ≈ 3000 kbps
+            // across two encodes (one the full 1080p) from frame one. Publishing
+            // the sharp 1080p rung up front is exactly what de-fuzzes the content
+            // for a healthy receiver (the #1553 goal). We do NOT seed the full
+            // 3-rung `[low, medium, high]` ladder — that would reintroduce the
+            // #1200 slam (3 encodes ≈ 4200 kbps); what stays OFF at the seed is
+            // the THIRD encode, the MIDDLE `medium` (720p/1200) rung, earned by
+            // the ramp (or restored by the shed-protected `earned_active_ceiling`
+            // after a transient cut). Under GENUINE sustained backpressure the
+            // existing shed-down machinery (`drop_top_layer`) still floors active
+            // back to 1. The receiver-side LayerChooser handles a rung that
+            // appears or disappears at any time, so this is delivered correctly.
             if n_layers > 1 {
-                encoder_control.set_simulcast_ceiling_start_at_base(n_layers);
+                encoder_control.set_simulcast_ceiling_start_optimistic(
+                    n_layers,
+                    crate::adaptive_quality_constants::SCREEN_INITIAL_ACTIVE_LAYERS,
+                );
                 let mut atomics = shared_layer_bitrates_bps.borrow_mut();
                 if atomics.len() != n_layers {
                     *atomics = (0..n_layers).map(|_| Rc::new(AtomicU32::new(0))).collect();
@@ -1064,18 +1162,37 @@ impl ScreenEncoder {
                 let share_started = !was_sharing && now_sharing;
                 let share_stopped = was_sharing && !now_sharing;
                 was_sharing = now_sharing;
-                // RISING EDGE: a fresh share just began. Re-arm the controller's
-                // cold start so `active_layer_count` resets to the base rung (1),
-                // undoing any idle drift from a prior session. Done BEFORE this
-                // tick's `tick()`/write block so the freshly-armed base count is
-                // what gets written this iteration. Guarded by `n_layers > 1` to
-                // match the construction-time `set_simulcast_ceiling_start_at_base`
-                // guard — single-stream mode stays byte-identical.
+                // RISING EDGE: a fresh share just began. Re-seed the controller
+                // at the SAME optimistic baseline as construction
+                // (`SCREEN_INITIAL_ACTIVE_LAYERS`, issue #1553), so `active_layer_count`
+                // (and `earned_active_ceiling`) resets to the optimistic seed —
+                // undoing any DRIFT-DOWN from a prior session that ended shed near
+                // the floor, so the re-share is not stuck fuzzy waiting on the 6 s
+                // ramp. It also undoes any drift-UP, so a prior session that earned
+                // the top rung does not carry a stale full ladder into a fresh
+                // share. Done BEFORE this tick's `tick()`/write block so the
+                // freshly-seeded count is what gets written this iteration. Guarded
+                // by `n_layers > 1` to match the construction-time
+                // `set_simulcast_ceiling_start_optimistic` guard — single-stream
+                // mode stays byte-identical.
                 if share_started {
+                    // Issue #1611 (exactness item #3): synchronously CLEAR the
+                    // screen-at-floor flag on the rising edge so a stale `true`
+                    // from a prior exhausted session cannot leak into a fresh
+                    // share. The flag will be re-evaluated AFTER this tick's
+                    // `encoder_control.tick()` in the `now_sharing` block below.
+                    // Must happen BEFORE any async operation (the AQ re-seed is
+                    // below) — the mic detector could sample this on the same
+                    // 1 Hz tick; staleness would open the gate prematurely.
+                    screen_at_floor_flag.store(false, Ordering::Release);
                     if n_layers > 1 {
-                        encoder_control.set_simulcast_ceiling_start_at_base(n_layers);
+                        encoder_control.set_simulcast_ceiling_start_optimistic(
+                            n_layers,
+                            crate::adaptive_quality_constants::SCREEN_INITIAL_ACTIVE_LAYERS,
+                        );
                         log::info!(
-                            "ScreenEncoder: (re)share started — re-armed AQ cold start at base rung (ceiling {n_layers})"
+                            "ScreenEncoder: (re)share started — re-seeded AQ at optimistic baseline ({} active of ceiling {n_layers})",
+                            crate::adaptive_quality_constants::SCREEN_INITIAL_ACTIVE_LAYERS,
                         );
                     }
                     // Issue #1229 (telemetry purity): drain and DISCARD any pending
@@ -1331,13 +1448,26 @@ impl ScreenEncoder {
                     encoder_control.tick(now);
                     let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
+                    // Issue #1611: unconditionally store whether screen video is
+                    // exhausted (tier at user-capped floor AND active layers at 1).
+                    // Placed AFTER tick() so the value is always current; mirrors
+                    // the camera pattern.
+                    screen_at_floor_flag.store(encoder_control.video_at_floor(), Ordering::Release);
+
                     // Screen simulcast (issue #989, Phase 3b): publish the active
                     // layer count + per-layer target bitrates to the encode loop
                     // every tick. Skipped entirely in single-stream mode, so the
                     // legacy behavior is byte-identical.
                     if encoder_control.is_simulcast() {
                         let active = encoder_control.active_layer_count() as u32;
-                        shared_active_layer_count.store(active, Ordering::Relaxed);
+                        let prev_active = shared_active_layer_count.swap(active, Ordering::Relaxed);
+                        if prev_active != active {
+                            log::info!(
+                                "ScreenEncoder: active layers {} -> {}",
+                                prev_active,
+                                active
+                            );
+                        }
                         let per_layer = encoder_control.layer_target_bitrates_kbps();
                         let atomics = shared_layer_bitrates_bps.borrow();
                         for (i, atomic) in atomics.iter().enumerate() {
@@ -1543,8 +1673,8 @@ impl ScreenEncoder {
     /// It sets the encoder flags, notifies the client at the protocol level,
     /// and synchronously stops all media tracks.
     pub fn stop(&mut self) {
-        // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
-        self.screen_sharing_active.store(false, Ordering::Release);
+        // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
+        clear_screen_sharing_flags(&self.screen_sharing_active, &self.screen_sharing_active_arc);
 
         // Signal the encoding loop to exit
         self.state.stop();
@@ -1617,20 +1747,33 @@ impl ScreenEncoder {
         self.current_bitrate
             .store(tier.ideal_bitrate_kbps, Ordering::Relaxed);
 
-        // Issue #1229: on every (re)share, synchronously reset the active screen
-        // layer count to the BASE rung when simulcast is active, so the encode
+        // Issue #1229 + #1553: on every (re)share, synchronously reset the active
+        // screen layer count to the OPTIMISTIC baseline (`SCREEN_INITIAL_ACTIVE_LAYERS`,
+        // clamped to the effective ladder) when simulcast is active, so the encode
         // loop (a SEPARATE spawn_local future that reads `shared_active_layer_count`
-        // at setup ~run_screen_encoding and per-frame) starts at base from frame
-        // one — not the construction-time FULL count (`clamp_screen_layer_count(max_layers)`)
-        // nor a value drifted up by a prior session's AQ loop. The AQ control loop
-        // independently re-arms the controller on the sharing rising edge (see
+        // at setup ~run_screen_encoding and per-frame, line ~2629) emits that
+        // baseline from frame one — not a value drifted by a prior session's AQ
+        // loop (drifted DOWN near the floor after a congested session, or UP to the
+        // full ladder after a clear one). The AQ control loop independently re-seeds
+        // the controller at the same baseline on the sharing rising edge (see
         // `set_encoder_control`); this write closes the cross-future race where the
-        // encode loop could read the stale-high count before the AQ loop's first
-        // post-edge tick writes the fresh base value. No-op semantics in
-        // single-stream mode: the encode loop ignores `shared_active_layer_count`
-        // unless `simulcast` (n_layers > 1), so writing 1 here is byte-identical.
-        if self.effective_layer_count() > 1 {
-            self.shared_active_layer_count.store(1, Ordering::Relaxed);
+        // encode loop could read the stale count before the AQ loop's first
+        // post-edge tick writes the fresh value.
+        //
+        // Before #1553 this seeded the BASE rung (1) and relied on the 6 s headroom
+        // ramp to climb, which never climbed on a busy share in a large meeting →
+        // permanently fuzzy. Seeding the optimistic baseline here is the encode-loop
+        // half of the Option B fix (the controller half is the
+        // `set_simulcast_ceiling_start_optimistic` seed in the AQ loop). No-op
+        // semantics in single-stream mode: the encode loop ignores
+        // `shared_active_layer_count` unless simulcast (n_layers > 1), so this branch
+        // is gated off and the path stays byte-identical.
+        let effective = self.effective_layer_count();
+        if effective > 1 {
+            let seed = (crate::adaptive_quality_constants::SCREEN_INITIAL_ACTIVE_LAYERS as u32)
+                .clamp(1, effective);
+            self.shared_active_layer_count
+                .store(seed, Ordering::Relaxed);
         }
 
         // Issue #903: seed the publisher-side encoder-state metadata so the
@@ -1714,6 +1857,7 @@ impl ScreenEncoder {
         let keyframe_cooldown_reset = self.keyframe_cooldown_reset.clone();
         let active_video_track = self.active_video_track.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
+        let screen_sharing_active_arc = self.screen_sharing_active_arc.clone();
         let shared_target_bitrate = self.shared_screen_encoder_target_bitrate_kbps.clone();
         let shared_adaptive_tier = self.shared_screen_adaptive_tier.clone();
         let shared_cause_hint = self.shared_screen_cause_hint.clone();
@@ -1749,6 +1893,7 @@ impl ScreenEncoder {
                 keyframe_cooldown_reset,
                 active_video_track,
                 screen_sharing_active,
+                screen_sharing_active_arc,
                 shared_target_bitrate,
                 shared_adaptive_tier,
                 shared_cause_hint,
@@ -1803,6 +1948,7 @@ impl ScreenEncoder {
         let keyframe_cooldown_reset = self.keyframe_cooldown_reset.clone();
         let active_video_track = self.active_video_track.clone();
         let screen_sharing_active = self.screen_sharing_active.clone();
+        let screen_sharing_active_arc = self.screen_sharing_active_arc.clone();
         let shared_target_bitrate = self.shared_screen_encoder_target_bitrate_kbps.clone();
         let shared_adaptive_tier = self.shared_screen_adaptive_tier.clone();
         let shared_cause_hint = self.shared_screen_cause_hint.clone();
@@ -1926,6 +2072,7 @@ impl ScreenEncoder {
                 keyframe_cooldown_reset,
                 active_video_track,
                 screen_sharing_active,
+                screen_sharing_active_arc,
                 shared_target_bitrate,
                 shared_adaptive_tier,
                 shared_cause_hint,
@@ -1976,6 +2123,8 @@ impl ScreenEncoder {
         keyframe_cooldown_reset: Rc<AtomicBool>,
         active_video_track: Rc<RefCell<Option<MediaStreamTrack>>>,
         screen_sharing_active: Rc<AtomicBool>,
+        // Issue #1611: Arc mirror of screen_sharing_active for the mic encoder.
+        screen_sharing_active_arc: Arc<AtomicBool>,
         // Issue #903: publisher-side encoder state read at frame-stamping
         // time and stamped onto every `VideoMetadata`. The values are
         // updated by `set_encoder_control` whenever AQ acts; the output
@@ -2005,6 +2154,8 @@ impl ScreenEncoder {
         // Signal camera encoder ASAP after capture is confirmed so it begins
         // stepping down during encoder setup, not after encoding starts.
         screen_sharing_active.store(true, Ordering::Release);
+        // Issue #1611: mirror to the Arc copy the mic encoder reads.
+        screen_sharing_active_arc.store(true, Ordering::Release);
 
         screen_stream.borrow_mut().replace(screen_to_share.clone());
 
@@ -2023,8 +2174,8 @@ impl ScreenEncoder {
             }
             // Reset enabled flag
             enabled.store(false, Ordering::Release);
-            // Clear screen-sharing flag so camera drops its ceiling
-            screen_sharing_active.store(false, Ordering::Release);
+            // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
+            clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
             // Emit Failed event
             if let Some(ref callback) = on_state_change {
                 callback.emit(ScreenShareEvent::Failed(error_msg));
@@ -2302,6 +2453,8 @@ impl ScreenEncoder {
                 // Signal camera encoder ASAP after capture is confirmed so it begins
                 // stepping down during encoder setup, not after encoding starts.
                 screen_sharing_active.store(true, Ordering::Release);
+                // Issue #1611: mirror to the Arc copy the mic encoder reads.
+                screen_sharing_active_arc.store(true, Ordering::Release);
 
                 screen_stream.borrow_mut().replace(acquired_stream.clone());
 
@@ -3160,12 +3313,13 @@ impl ScreenEncoder {
                             .performance()
                             .expect("Performance API not available")
                             .now();
-                        // Use tier-controlled keyframe interval.
-                        // Using `%` instead of `.is_multiple_of()` for compatibility
-                        // with Rust toolchains older than 1.87.
-                        #[allow(clippy::manual_is_multiple_of)]
-                        let is_periodic_keyframe = local_keyframe_interval > 0
-                            && screen_frame_counter % local_keyframe_interval == 0;
+                        let is_periodic_keyframe = periodic_keyframe_due(
+                            screen_frame_counter,
+                            local_keyframe_interval,
+                            now,
+                            last_keyframe_emit_ms,
+                            SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                        );
                         // Resolve the keyframe decision via the shared single source of
                         // truth (issue #1347 item 2: the screen AND camera loops call
                         // the same pure `keyframe_tick_decision`, which the host tests
@@ -3469,8 +3623,8 @@ impl ScreenEncoder {
             }
         }
 
-        // Clear screen-sharing flag so the camera encoder removes its quality ceiling.
-        screen_sharing_active.store(false, Ordering::Release);
+        // Clear screen-sharing flags (Rc + Arc) atomically (issue #1611)
+        clear_screen_sharing_flags(&screen_sharing_active, &screen_sharing_active_arc);
 
         // Emit Stopped event if we haven't already (onended handler might have already fired)
         // Check enabled flag - if it's still true, onended hasn't fired yet
@@ -3490,6 +3644,7 @@ mod tests {
 
     use super::cause_hint_from_trigger;
     use super::clamp_screen_layer_count;
+    use super::clear_screen_sharing_flags;
     use super::is_fatal_encoder_error_message;
     use super::keyframe_tick_decision;
     use super::record_screen_restart;
@@ -3838,22 +3993,33 @@ mod tests {
         );
     }
 
-    /// Issue #1229: on every (re)share, `apply_initial_tier` must synchronously
-    /// reset `shared_active_layer_count` to the BASE rung (1) when simulcast is
-    /// active (`max_layers > 1`). This closes the cross-future race where the
-    /// encode loop (a separate `spawn_local`) could read a stale-high active count
-    /// — either the construction-time FULL seed (`clamp_screen_layer_count(max_layers)`)
-    /// or a value drifted up by a prior session's AQ ramp — before the AQ control
-    /// loop's first post-rising-edge tick writes the fresh base value.
+    /// Issue #1229 + #1553: on every (re)share, `apply_initial_tier` must
+    /// synchronously seed `shared_active_layer_count` to the OPTIMISTIC baseline
+    /// (`SCREEN_INITIAL_ACTIVE_LAYERS`, clamped to the effective ladder) when
+    /// simulcast is active (`max_layers > 1`). This closes the cross-future race
+    /// where the encode loop (a separate `spawn_local`) could read a count drifted
+    /// by a prior session's AQ loop — DOWN near the floor after a congested
+    /// session, or UP to the full ladder after a clear one — before the AQ control
+    /// loop's first post-rising-edge tick writes the fresh value.
     ///
-    /// This pins the screen-side seed directly (the `videocall-aq` test only
-    /// exercises the controller's `set_simulcast_ceiling_start_at_base`). Mutation
-    /// guard: deleting the `shared_active_layer_count.store(1, ...)` in
-    /// `apply_initial_tier` leaves the stored-high value (3) in place and fails the
-    /// assert. We store a HIGH value (3) first to stand in for the drifted/full
-    /// count, then prove the seed forces it back to base.
+    /// Before #1553 this seeded the BASE rung (1) and relied on the 6 s ramp to
+    /// climb, which never climbed on a busy share in a large meeting → permanently
+    /// fuzzy. The fix seeds the optimistic baseline here (2 → the `[low, high]`
+    /// ladder: base `low` + the top `high`/1080p rung, middle `medium` deferred)
+    /// so the encode loop emits the sharp 1080p rung from frame one.
+    ///
+    /// This pins the screen-side seed directly (the `videocall-aq` test exercises
+    /// the controller's `set_simulcast_ceiling_start_optimistic`). The expected
+    /// value references the real constant (NOT a literal), so a retune of
+    /// `SCREEN_INITIAL_ACTIVE_LAYERS` updates this test in lockstep. Mutation
+    /// guard: we store a drifted-DOWN value (1) AND, in a second pass, a
+    /// drifted-UP value (3) before the call, then prove the seed forces it to the
+    /// optimistic baseline either way — deleting or weakening the
+    /// `shared_active_layer_count.store(seed, ...)` in `apply_initial_tier` leaves
+    /// the drifted value in place and fails one of the asserts.
     #[test]
-    fn apply_initial_tier_seeds_active_layer_count_to_base_when_simulcast() {
+    fn apply_initial_tier_seeds_active_layer_count_to_optimistic_baseline_when_simulcast() {
+        use crate::adaptive_quality_constants::SCREEN_INITIAL_ACTIVE_LAYERS;
         let client = build_test_client();
         let mut encoder = ScreenEncoder::new(
             client,
@@ -3861,27 +4027,42 @@ mod tests {
             Callback::from(|_: String| {}),
             Callback::from(|_: ScreenShareEvent| {}),
             Rc::new(AtomicBool::new(false)),
-            3, // max_layers (simulcast — exercises the new cold-start seed branch)
+            3, // max_layers (simulcast — exercises the optimistic seed branch)
         );
 
-        // Construction already seeds the FULL count for simulcast; assert that so
-        // the test is meaningful (the seed must move it DOWN, not be a no-op).
+        // The seed clamps the constant to the effective ladder (3 here).
+        let expected = (SCREEN_INITIAL_ACTIVE_LAYERS as u32).clamp(1, 3);
+        // Sanity: with the current constant (2) and a 3-rung ladder the seed is a
+        // genuine middle value — below the full ladder (so it is not the #1200
+        // all-rungs slam) and above the base (so the share is not stuck fuzzy).
+        assert!(
+            (1..3).contains(&expected),
+            "optimistic seed must sit strictly between base (1) and the full \
+             3-rung ladder for this test to exercise both drift directions"
+        );
+
+        // Drift DOWN: stand in for a prior session that ended shed near the floor.
+        encoder
+            .shared_active_layer_count
+            .store(1, Ordering::Relaxed);
+        encoder.apply_initial_tier(0);
         assert_eq!(
             encoder.shared_active_layer_count.load(Ordering::Relaxed),
-            3,
-            "precondition: simulcast construction seeds the full active layer count"
+            expected,
+            "simulcast (re)share must seed the optimistic baseline, lifting a \
+             drifted-down count back up (#1553)"
         );
-        // Stand in for a count drifted up by a prior session's AQ ramp.
+
+        // Drift UP: stand in for a prior session that earned the full ladder.
         encoder
             .shared_active_layer_count
             .store(3, Ordering::Relaxed);
-
         encoder.apply_initial_tier(0);
-
         assert_eq!(
             encoder.shared_active_layer_count.load(Ordering::Relaxed),
-            1,
-            "simulcast (re)share must cold-start the active layer count at the base rung (#1229)"
+            expected,
+            "simulcast (re)share must seed the optimistic baseline, pulling a \
+             drifted-up full-ladder count back down (#1553)"
         );
     }
 
@@ -4214,6 +4395,45 @@ mod tests {
             !next.want_keyframe,
             "after the one-shot reset is consumed, the screen coalescer resumes \
              suppressing PLIs inside the cooldown window"
+        );
+    }
+
+    /// Issue #1611 regression test — `clear_screen_sharing_flags` must store
+    /// BOTH flags (Rc + Arc). Without the Arc store, the mic's audio-after-video
+    /// detector sees a stale-true screen-active signal on failure teardown.
+    ///
+    /// This test invokes the PRODUCTION helper (`clear_screen_sharing_flags`)
+    /// used by `stop()`, `cleanup_on_error`, and final cleanup — NOT hand-written
+    /// stores (which would be tautological per CLAUDE.md adversarial check 2).
+    /// Removing the `arc.store` line from the helper **provably breaks this test**.
+    #[test]
+    fn screen_sharing_active_arc_mirrors_rc_on_all_paths() {
+        use std::sync::Arc;
+
+        let rc_flag = Rc::new(AtomicBool::new(false));
+        let arc_flag = Arc::new(AtomicBool::new(false));
+
+        // Simulate teardown paths (stop / cleanup_on_error / final cleanup):
+        // set both flags true (share was active), then invoke the production
+        // helper that MUST clear both atomically.
+        rc_flag.store(true, Ordering::Release);
+        arc_flag.store(true, Ordering::Release);
+
+        // Invoke the PRODUCTION helper (same one stop/cleanup_on_error/final use)
+        clear_screen_sharing_flags(&rc_flag, &arc_flag);
+
+        // Both flags MUST now be false. If the helper's `arc.store(false)` is
+        // removed (or never added), this assertion FAILS — proving the test guards
+        // the production code, not its own inline copy.
+        assert!(
+            !rc_flag.load(Ordering::Acquire),
+            "Rc must be false after clear_screen_sharing_flags"
+        );
+        assert!(
+            !arc_flag.load(Ordering::Acquire),
+            "Arc MUST be false after clear_screen_sharing_flags — stale-true would \
+             wedge the audio-after-video detector. REGRESSION: if this fails, the \
+             helper is missing the arc.store(false) line at screen_encoder.rs:~643"
         );
     }
 }

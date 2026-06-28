@@ -34,3 +34,6 @@ anyhow = "1.0.75"
 wasm-bindgen-futures = { version = "0.4.30" }
 wasm-bindgen = "0.2.108"
 web-transport-quinn = "0.8.1"
+
+[patch.crates-io]
+audiopus_sys = { git = 'https://github.com/sevenc-nanashi/audiopus_sys', rev = '00e9d16' }

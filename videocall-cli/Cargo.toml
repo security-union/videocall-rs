@@ -43,3 +43,6 @@ videocall-nokhwa = { path = "nokhwa", version = "0.10.9", features = ["input-nat
 path = "../videocall-types"
 version = "5.0.0"
 
+[patch.crates-io]
+audiopus_sys = { git = 'https://github.com/sevenc-nanashi/audiopus_sys', rev = '00e9d16' }
+

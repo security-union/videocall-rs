@@ -31,7 +31,7 @@ use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
 /// Maximum encoded Opus packet size in bytes for a 20 ms mono VoIP frame.
-/// 4000 is the conventional libopus upper bound and leaves ample headroom.
+/// 4000 is the conventional Opus max-packet upper bound and leaves headroom.
 const MAX_OPUS_PACKET: usize = 4000;
 
 pub struct MicrophoneDaemon {

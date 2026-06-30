@@ -39,37 +39,31 @@ The diff across videocall.rs was almost boring. Swap the decoder backend in our 
 
 Then I plugged in an external USB webcam mic and streamed a real call. 48 kHz stereo in, down-mixed to mono, 50 Opus frames a second, encoded in pure Rust, decoded clean by a browser on the other end. Zero C in the audio path. It just worked.
 
-And here's the part that should make you sit up.
-
 ## ropus is AI-generated
 
 A human didn't sit down and hand-port libopus. An AI read the C and wrote the Rust. Then it checked its own work against the original's conformance vectors until the output matched the C reference byte for byte.
 
-Read that again. **An AI produced a bit-exact reimplementation of one of the most widely deployed audio codecs on Earth, in a memory-safe language, that passes the spec's own torture tests.**
+**An AI produced a bit-exact reimplementation of one of the most widely deployed audio codecs on Earth, in a memory-safe language, that passes the spec's own torture tests.**
 
-This is not autocomplete. This is not "it wrote a function." This is a full, verifiable replacement of a load-bearing C library, and the proof that it's correct isn't vibes — it's that the bits coming out are identical to the bits the C produces. Codecs are the perfect target for this, because correctness is *defined* by a test suite. You don't have to trust the AI. You have to trust the conformance vectors, and those have been around for fifteen years.
+This is not autocomplete. This is not "it wrote a function." This is a full, verifiable replacement of a real C library, and the proof that it works isn't vibes — the bits coming out are identical to the bits the C produces. Codecs are the perfect target for this, because correctness is *defined* by a test suite. You don't have to trust the AI. You trust the conformance vectors, and those have been around for fifteen years.
 
-## Why this is a trend, not a one-off
+## Why this is a trend
 
-Here's my prediction, and I'll be blunt about it: **the shared library is dying, and AI is what kills it.**
+My prediction: **the shared library is dying, and AI is what kills it.**
 
 Every reason we put up with `libfoo.so` was a cost-of-rewriting argument. "We can't reimplement libvpx / libopus / libwebp / libpng / zlib, it's too much work, it's too easy to get wrong." That argument had a price tag of months-to-years of expert time. The price tag just dropped to days, and the correctness bar is enforced by the original library's own tests.
 
 So what happens? You stop linking C. You generate a native, memory-safe port, you pin it against the upstream conformance suite, and you delete the FFI. Your `Cargo.lock` stops having `-sys` crates in it. Your Dockerfile stops having `apt install`. Your project compiles to wasm because there's no C left to not-compile. Your supply chain shrinks to source you can actually read. The unsafe FFI boundary — the thing the borrow checker was helpless against — is just *gone*.
 
-This isn't "AI writes new code." Everyone's bored of that take. This is **AI deletes old code** — specifically, it deletes the gnarliest, least-loved, most-load-bearing C in your stack, and hands you back something that runs everywhere and passes the same tests.
+This isn't "AI writes new code." Everyone's bored of that take. This is **AI deletes old code** — the gnarliest, least-loved C in your stack — and hands you back something that runs everywhere and passes the same tests.
 
-## The honest caveats
+## Where this breaks
 
-I'm cocky, not dishonest. A few things have to be true for this to work, and they were true here:
-
-- **There has to be a conformance suite.** Opus has one. So does most of the codec/crypto/compression world. If correctness is defined by a test corpus, AI porting is verifiable. If it's defined by "looks right," don't.
-- **Performance has to land.** ropus runs roughly at parity with C on encode and decode. A pure port that's 5x slower is a toy. Check this, don't assume it.
-- **You verify against the original, not the AI.** The trust anchor is the spec's vectors. The AI is just the thing that grinds until the vectors pass.
+I'm cocky, not dishonest, so here's the fine print. You need a conformance suite. Opus has one; so does most of the codec, crypto, and compression world. If correctness is pinned by a test corpus, an AI port is verifiable. If it's "looks right," don't bother. Performance has to actually land — ropus runs about at parity with C, and a pure port that's 5x slower is a toy, so measure it before you celebrate. And the trust anchor is the original's vectors, never the model. The AI is just the thing that grinds until they pass.
 
 ## Respect to the author
 
-ropus is the work of **Martin Davidson ([@0x4D44](https://github.com/0x4D44/ropus))**, and I want to be loud about this, because the AI angle buries the lede on the human one. Pointing a model at libopus and getting Rust out is the easy 20%. Building the thing that *proves* the Rust is bit-exact is the other 80%: a differential FFI harness, all seven of xiph's conformance binaries compiling against a C-ABI shim and passing, the RFC 6716 vectors pinned, fuzz campaigns, and engineering journals documenting every decision. That's the unglamorous, load-bearing work, and it's exactly what turns "an AI wrote a codec" from a scary tweet into something you'd put in production. The model is a power tool. Martin is the engineer who knew what to build with it. Go star the repo.
+ropus is the work of **Martin Davidson ([@0x4D44](https://github.com/0x4D44/ropus))**, and I want to be loud about this, because the AI angle buries the lede on the human one. Pointing a model at libopus and getting Rust out is the easy 20%. Building the thing that *proves* the Rust is bit-exact is the other 80%: a differential FFI harness, all seven of xiph's conformance binaries compiling against a C-ABI shim and passing, the RFC 6716 vectors pinned, fuzz campaigns, and engineering journals documenting every decision. That's the unglamorous work nobody tweets about, and it's exactly what turns "an AI wrote a codec" from a scary headline into something you'd put in production. The model is a power tool. Martin is the engineer who knew what to build with it. Go star the repo.
 
 ## The takeaway
 

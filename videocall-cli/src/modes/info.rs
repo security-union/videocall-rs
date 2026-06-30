@@ -62,19 +62,26 @@ fn list_audio_devices() -> anyhow::Result<()> {
 
     let host = cpal::default_host();
     let default_name = host.default_input_device().and_then(|d| d.name().ok());
-    let devices: Vec<String> = host
-        .input_devices()?
-        .filter_map(|d| d.name().ok())
-        .collect();
+    let devices: Vec<_> = host.input_devices()?.collect();
 
     println!("There are {} available audio input devices.", devices.len());
-    for name in &devices {
-        let marker = if Some(name) == default_name.as_ref() {
+    for device in &devices {
+        let Ok(name) = device.name() else { continue };
+        let marker = if Some(&name) == default_name.as_ref() {
             " (default)"
         } else {
             ""
         };
         println!("{name}{marker}");
+        match device.default_input_config() {
+            Ok(cfg) => println!(
+                "    default: {} Hz, {} ch, {:?}",
+                cfg.sample_rate().0,
+                cfg.channels(),
+                cfg.sample_format()
+            ),
+            Err(e) => println!("    default: <unavailable: {e}>"),
+        }
     }
     println!(
         "\nPass one of these to `stream --audio-device <NAME>`, \

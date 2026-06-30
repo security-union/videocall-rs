@@ -50,6 +50,10 @@ hound = { version = "3.5", optional = true }
 rand = { version = "0.9.1", optional = true, default-features = false, features = ["thread_rng"] }
 cpal = { version = "0.15", optional = true }
 opus = { version = "0.3", default-features = false, optional = true }
+# Pure-Rust Opus (xiph/opus port, bit-exact, BSD-3). Opt-in alternative to the
+# C `opus` crate as the native decode backend, selected via the `ropus-codec`
+# feature. No C toolchain requirement and a wasm-clean core.
+ropus = { version = "0.12", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 env_logger = { version = "0.10", optional = true }
 web-time = "1.1.0"
@@ -76,6 +80,9 @@ web = [
     "matomo-logger/worker",
 ]
 native = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
+# Use the pure-Rust `ropus` codec as the native Opus decode backend instead of
+# the C `opus` crate. Opt-in and additive: the default build is unchanged.
+ropus-codec = ["dep:ropus"]
 
 [dev-dependencies]
 env_logger = "0.10"

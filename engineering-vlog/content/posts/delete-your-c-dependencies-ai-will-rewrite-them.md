@@ -19,7 +19,7 @@ This is the part where most people add `apt install` to a Dockerfile and move on
 
 ## The actual problem
 
-libopus is great software. That's not the point. The point is that *the way we consume it* is a 1995 idea wearing a 2026 hat.
+libopus is great software. The way we consume it is a 1995 idea wearing a 2026 hat.
 
 A shared library is a binary blob you don't build, sitting at a path you don't control, at a version your distro picked, exposed through an FFI boundary your borrow checker can't see. You write `unsafe` and pray the struct layout matches. Your "Rust" project is now a Rust project plus a C toolchain plus cmake plus pkg-config plus a `-sys` crate that was last published when people still cared about Python 2.
 
@@ -45,7 +45,7 @@ A human didn't sit down and hand-port libopus. An AI read the C and wrote the Ru
 
 **An AI produced a bit-exact reimplementation of one of the most widely deployed audio codecs on Earth, in a memory-safe language, that passes the spec's own torture tests.**
 
-This is not autocomplete. This is not "it wrote a function." This is a full, verifiable replacement of a real C library, and the proof that it works isn't vibes — the bits coming out are identical to the bits the C produces. Codecs are the perfect target for this, because correctness is *defined* by a test suite. You don't have to trust the AI. You trust the conformance vectors, and those have been around for fifteen years.
+It is a full, verifiable replacement of a real C library. The bits coming out are identical to the bits the C produces. Codecs are the perfect target, because correctness is *defined* by a test suite. You verify the port against the conformance vectors, and those have been around for fifteen years.
 
 ## Why this is a trend
 
@@ -55,11 +55,11 @@ Every reason we put up with `libfoo.so` was a cost-of-rewriting argument. "We ca
 
 So what happens? You stop linking C. You generate a native, memory-safe port, you pin it against the upstream conformance suite, and you delete the FFI. Your `Cargo.lock` stops having `-sys` crates in it. Your Dockerfile stops having `apt install`. Your project compiles to wasm because there's no C left to not-compile. Your supply chain shrinks to source you can actually read. The unsafe FFI boundary — the thing the borrow checker was helpless against — is just *gone*.
 
-This isn't "AI writes new code." Everyone's bored of that take. This is **AI deletes old code** — the gnarliest, least-loved C in your stack — and hands you back something that runs everywhere and passes the same tests.
+Everyone's bored of "AI writes new code." The move here is **AI deletes old code** — the gnarliest, least-loved C in your stack — and hands you back something that runs everywhere and passes the same tests.
 
 ## Where this breaks
 
-I'm cocky, not dishonest, so here's the fine print. You need a conformance suite. Opus has one; so does most of the codec, crypto, and compression world. If correctness is pinned by a test corpus, an AI port is verifiable. If it's "looks right," don't bother. Performance has to actually land — ropus runs about at parity with C, and a pure port that's 5x slower is a toy, so measure it before you celebrate. And the trust anchor is the original's vectors, never the model. The AI is just the thing that grinds until they pass.
+Here's the fine print. You need a conformance suite. Opus has one; so does most of the codec, crypto, and compression world. If correctness is pinned by a test corpus, an AI port is verifiable. If it's "looks right," don't bother. Performance has to actually land — ropus runs about at parity with C, and a pure port that's 5x slower is a toy, so measure it before you celebrate. The trust anchor is the original's vectors. The AI just grinds until they pass.
 
 ## Respect to the author
 
@@ -67,9 +67,9 @@ ropus is the work of **Martin Davidson ([@0x4D44](https://github.com/0x4D44/ropu
 
 ## The takeaway
 
-We didn't patch our libopus problem. We deleted the category. There is no native Opus library in videocall.rs anymore — not in the crates, not in the lockfile, not in the Nix shell, not in the Docker image. The thing that broke my builds for a year is not pinned to a newer version. It's *not there.*
+We deleted the category. There is no native Opus library in videocall.rs anymore — not in the crates, not in the lockfile, not in the Nix shell, not in the Docker image. The dependency that broke my builds for a year is gone.
 
-Shared library dependencies were never a feature. They were a workaround for the fact that rewriting good C was expensive. It isn't anymore.
+Shared library dependencies were a workaround for expensive rewrites. The rewrite is cheap now.
 
 Go look at your `Cargo.lock`. Count the `-sys` crates. That's your to-delete list.
 

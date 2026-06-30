@@ -49,7 +49,10 @@ ringbuf = "0.3"
 hound = { version = "3.5", optional = true }
 rand = { version = "0.9.1", optional = true, default-features = false, features = ["thread_rng"] }
 cpal = { version = "0.15", optional = true }
-opus = { version = "0.3", default-features = false, optional = true }
+# Pure-Rust Opus (xiph/opus port, bit-exact, BSD-3). Replaces the C `opus`
+# crate (libopus/audiopus-sys) as the native Opus codec — no C toolchain,
+# wasm-clean core, single `wide` dependency.
+ropus = { version = "0.12", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 env_logger = { version = "0.10", optional = true }
 web-time = "1.1.0"
@@ -75,7 +78,7 @@ web = [
     "once_cell",
     "matomo-logger/worker",
 ]
-native = ["cpal", "clap", "opus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
+native = ["cpal", "clap", "ropus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
 
 [dev-dependencies]
 env_logger = "0.10"

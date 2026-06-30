@@ -86,6 +86,11 @@ NV12:
 
 4. Start streaming:
 
+> ⚠️ **The meeting must already exist.** Create the call first from a browser at
+> [videocall.rs](https://videocall.rs) — the CLI can only *join* an existing call,
+> it can no longer create one. If the call's creator is the CLI, it will not work;
+> a browser user has to create it.
+
 ```
 videocall-cli \
   stream \

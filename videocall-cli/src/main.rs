@@ -77,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
                     println!("No camera selected. Available cameras:");
                     get_info(Info {
                         list_cameras: true,
+                        list_audio_devices: false,
                         list_formats: None,
                         list_resolutions: None,
                     })

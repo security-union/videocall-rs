@@ -25,7 +25,7 @@ url = "2.3.1"
 
 # Audio processing (from neteq_player.rs pattern)
 hound = "3.5"  # WAV file reading
-opus = "0.3.0"  # Opus encoding
+ropus = "0.12"  # Pure-Rust Opus encoding (replaces C libopus/audiopus-sys)
 
 # Video processing (exact same as videocall-cli)
 image = "0.25.5"  # JPEG processing

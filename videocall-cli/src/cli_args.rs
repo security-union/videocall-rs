@@ -27,6 +27,10 @@ use videocall_nokhwa::utils::FrameFormat;
 ///
 /// This cli connects to the videocall.rs and streams audio and video to the specified meeting.
 ///
+/// NOTE: the meeting must be created first from a browser at https://videocall.rs.
+/// The CLI can only JOIN an existing call — it cannot create one. A call created
+/// by the CLI will not work.
+///
 /// You can watch the video at https://videocall.rs/meeting/{meeting_id}
 #[derive(Parser, Debug)]
 #[clap(name = "client")]
@@ -61,7 +65,10 @@ impl FromStr for IndexKind {
 
 #[derive(Subcommand, Debug)]
 pub enum Mode {
-    /// Stream audio and video to the specified meeting.
+    /// Stream audio and video to an EXISTING meeting.
+    ///
+    /// The meeting must be created first by a user in a browser at
+    /// https://videocall.rs. The CLI can only join a call, not create one.
     Stream(Stream),
 
     /// Information mode to list cameras, formats, and resolutions.
@@ -82,6 +89,12 @@ pub struct Stream {
     #[clap(long = "user-id")]
     pub user_id: String,
 
+    /// Meeting (call) ID to join.
+    ///
+    /// IMPORTANT: the call must already exist — create it first from a browser
+    /// at https://videocall.rs. The CLI can no longer create a call itself (the
+    /// API changed); if the call's creator is the CLI, it will not work — a
+    /// browser user has to create it.
     #[clap(long = "meeting-id")]
     pub meeting_id: String,
 
@@ -100,6 +113,13 @@ pub struct Stream {
     #[clap(long = "video-device-index", short = 'v')]
     pub video_device_index: Option<IndexKind>,
 
+    /// Microphone to capture, by exact device name. Use `default` for the
+    /// system default input device.
+    ///
+    /// List available names with:
+    ///   videocall-cli info --list-audio-devices
+    ///
+    /// If omitted, no audio is captured (video-only).
     #[clap(long = "audio-device", short = 'a')]
     pub audio_device: Option<String>,
 
@@ -171,6 +191,10 @@ pub struct Info {
     /// List available cameras.
     #[clap(long = "list-cameras", group = "info")]
     pub list_cameras: bool,
+
+    /// List available audio input devices (names usable with `stream --audio-device`).
+    #[clap(long = "list-audio-devices", group = "info")]
+    pub list_audio_devices: bool,
 
     /// List supported formats for a specific camera using the index from `list-cameras`
     #[clap(long = "list-formats", group = "info")]

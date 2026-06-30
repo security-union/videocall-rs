@@ -91,7 +91,6 @@
           pkgs.nasm
         ] ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
           pkgs.libvpx
-          pkgs.libopus
           pkgs.alsa-lib
           pkgs.libclang
         ];

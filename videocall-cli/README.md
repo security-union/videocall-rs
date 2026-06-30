@@ -38,6 +38,12 @@ sudo apt install build-essential pkg-config libclang-dev libvpx-dev libasound2-d
 ```
 
 #### macOS (experimental ⚠️)
+First make sure the Xcode Command Line Tools are installed — they provide the C compiler and SDK headers needed to build native dependencies. (Homebrew's installer also pulls these in automatically if you don't have them yet.)
+
+```sh
+xcode-select --install
+```
+
 On macOS the native build pulls audio/video from CoreAudio and AVFoundation, so the Linux-only ALSA (`libasound2`) and V4L (`libv4l`) packages aren't needed. Install the rest with [Homebrew](https://brew.sh):
 
 ```sh

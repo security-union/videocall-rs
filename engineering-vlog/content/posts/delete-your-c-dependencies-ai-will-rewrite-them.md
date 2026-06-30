@@ -67,6 +67,10 @@ I'm cocky, not dishonest. A few things have to be true for this to work, and the
 - **Performance has to land.** ropus runs roughly at parity with C on encode and decode. A pure port that's 5x slower is a toy. Check this, don't assume it.
 - **You verify against the original, not the AI.** The trust anchor is the spec's vectors. The AI is just the thing that grinds until the vectors pass.
 
+## Respect to the author
+
+ropus is the work of **Martin Davidson ([@0x4D44](https://github.com/0x4D44/ropus))**, and I want to be loud about this, because the AI angle buries the lede on the human one. Pointing a model at libopus and getting Rust out is the easy 20%. Building the thing that *proves* the Rust is bit-exact is the other 80%: a differential FFI harness, all seven of xiph's conformance binaries compiling against a C-ABI shim and passing, the RFC 6716 vectors pinned, fuzz campaigns, and engineering journals documenting every decision. That's the unglamorous, load-bearing work, and it's exactly what turns "an AI wrote a codec" from a scary tweet into something you'd put in production. The model is a power tool. Martin is the engineer who knew what to build with it. Go star the repo.
+
 ## The takeaway
 
 We didn't patch our libopus problem. We deleted the category. There is no native Opus library in videocall.rs anymore — not in the crates, not in the lockfile, not in the Nix shell, not in the Docker image. The thing that broke my builds for a year is not pinned to a newer version. It's *not there.*

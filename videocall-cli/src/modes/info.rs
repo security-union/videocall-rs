@@ -35,6 +35,10 @@ pub async fn get_info(info: Info) -> anyhow::Result<()> {
         }
     }
 
+    if info.list_audio_devices {
+        list_audio_devices()?;
+    }
+
     if let Some(index) = info.list_formats {
         let index = match index {
             IndexKind::String(s) => CameraIndex::String(s.clone()),
@@ -47,6 +51,35 @@ pub async fn get_info(info: Info) -> anyhow::Result<()> {
         camera_compatible_formats(&mut camera);
     }
 
+    Ok(())
+}
+
+/// List audio input devices via `cpal` (the same backend the microphone
+/// producer uses). The printed names are exactly what `stream --audio-device`
+/// expects; `--audio-device default` always selects the host default.
+fn list_audio_devices() -> anyhow::Result<()> {
+    use cpal::traits::{DeviceTrait, HostTrait};
+
+    let host = cpal::default_host();
+    let default_name = host.default_input_device().and_then(|d| d.name().ok());
+    let devices: Vec<String> = host
+        .input_devices()?
+        .filter_map(|d| d.name().ok())
+        .collect();
+
+    println!("There are {} available audio input devices.", devices.len());
+    for name in &devices {
+        let marker = if Some(name) == default_name.as_ref() {
+            " (default)"
+        } else {
+            ""
+        };
+        println!("{name}{marker}");
+    }
+    println!(
+        "\nPass one of these to `stream --audio-device <NAME>`, \
+         or use `--audio-device default`."
+    );
     Ok(())
 }
 

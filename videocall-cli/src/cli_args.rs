@@ -100,6 +100,13 @@ pub struct Stream {
     #[clap(long = "video-device-index", short = 'v')]
     pub video_device_index: Option<IndexKind>,
 
+    /// Microphone to capture, by exact device name. Use `default` for the
+    /// system default input device.
+    ///
+    /// List available names with:
+    ///   videocall-cli info --list-audio-devices
+    ///
+    /// If omitted, no audio is captured (video-only).
     #[clap(long = "audio-device", short = 'a')]
     pub audio_device: Option<String>,
 
@@ -171,6 +178,10 @@ pub struct Info {
     /// List available cameras.
     #[clap(long = "list-cameras", group = "info")]
     pub list_cameras: bool,
+
+    /// List available audio input devices (names usable with `stream --audio-device`).
+    #[clap(long = "list-audio-devices", group = "info")]
+    pub list_audio_devices: bool,
 
     /// List supported formats for a specific camera using the index from `list-cameras`
     #[clap(long = "list-formats", group = "info")]

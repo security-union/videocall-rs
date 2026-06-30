@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0](https://github.com/security-union/videocall-rs/compare/bot-v1.1.3...bot-v1.2.0) - 2026-06-30
+
+### Added
+
+- remove C libopus (audiopus-sys) across the board — pure-Rust ropus codec ([#872](https://github.com/security-union/videocall-rs/pull/872))
+
+### Fixed
+
+- resolve clippy warnings and fmt issues across workspace ([#794](https://github.com/security-union/videocall-rs/pull/794))
+
 ## [1.1.3](https://github.com/security-union/videocall-rs/compare/bot-v1.1.2...bot-v1.1.3) - 2026-02-23
 
 ### Other

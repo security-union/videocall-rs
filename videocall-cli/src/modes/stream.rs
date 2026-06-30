@@ -30,6 +30,17 @@ use videocall_cli::producers::{
 };
 
 pub async fn stream(opt: Stream) {
+    // The CLI can only JOIN an existing call. The meeting must be created first
+    // by a user from a browser at https://videocall.rs — the API no longer lets
+    // the CLI create a call, so if nobody created it in the browser this stream
+    // will not be visible to anyone.
+    println!(
+        "NOTE: joining meeting '{}'. The call must already exist — a user has to \
+         create it first from a browser at https://videocall.rs. The CLI can only \
+         join an existing call, it cannot create one.",
+        opt.meeting_id
+    );
+
     // Parse resolution
     let resolution: Vec<&str> = opt.resolution.split('x').collect();
     if resolution.len() != 2 {

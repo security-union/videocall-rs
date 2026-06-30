@@ -15,7 +15,8 @@ members = [
     "neteq",
     "videocall-diagnostics",
     "videocall-transport",
-    "matomo-logger"
+    "matomo-logger",
+    "videocall-bench"
 ]
 
 exclude = [

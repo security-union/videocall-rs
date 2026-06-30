@@ -17,7 +17,7 @@
  */
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use protobuf::{Message, MessageField};
+use protobuf::Message;
 use ropus::{Application, Channels, Encoder};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -26,7 +26,7 @@ use std::time::Duration;
 use tokio::sync::mpsc::Sender;
 use tracing::{error, info};
 use videocall_types::protos::media_packet::media_packet::MediaType;
-use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
+use videocall_types::protos::media_packet::{AudioMetadata, MediaPacket};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
@@ -150,7 +150,8 @@ fn start_microphone(
                     while acc.len() >= frame_size {
                         match encoder.encode_float(&acc[..frame_size], &mut out) {
                             Ok(n) => {
-                                if let Err(e) = send_audio_packet(&out[..n], &wt_tx, &email) {
+                                if let Err(e) = send_audio_packet(&out[..n], &wt_tx, &email, frames)
+                                {
                                     error!("Failed to send audio: {e}");
                                 }
                             }
@@ -213,8 +214,13 @@ fn start_microphone(
 }
 
 /// Wrap an encoded Opus frame in a media packet and queue it for transport.
-fn send_audio_packet(opus: &[u8], wt_tx: &Sender<Vec<u8>>, email: &str) -> anyhow::Result<()> {
-    let packet = transform_audio_chunk(opus.to_vec(), email.to_string(), 0)?;
+fn send_audio_packet(
+    opus: &[u8],
+    wt_tx: &Sender<Vec<u8>>,
+    email: &str,
+    sequence: u64,
+) -> anyhow::Result<()> {
+    let packet = transform_audio_chunk(opus.to_vec(), email.to_string(), sequence)?;
     let bytes = packet.write_to_bytes()?;
     wt_tx.try_send(bytes)?;
     Ok(())
@@ -234,13 +240,20 @@ fn transform_audio_chunk(
             data,
             user_id: user_id_bytes.to_vec(),
             frame_type: String::from("key"),
-            timestamp: get_micros_now(),
-            // TODO: Duration of the audio in microseconds.
+            // Milliseconds — the NetEq decoder treats `timestamp` as ms (it
+            // subtracts an Opus frame duration in ms during RED recovery).
+            timestamp: get_millis_now(),
             duration: 0.0,
-            video_metadata: MessageField(Some(Box::new(VideoMetadata {
+            // Audio packets MUST carry `audio_metadata` (not `video_metadata`):
+            // the receiver skips any audio packet without it. The empty
+            // `audio_format` marks this as plain Opus (non-RED). The monotonic
+            // `sequence` is required for the jitter buffer to order/dedupe
+            // frames — previously hard-coded to 0, which collapsed all packets.
+            audio_metadata: Some(AudioMetadata {
                 sequence,
                 ..Default::default()
-            }))),
+            })
+            .into(),
             ..Default::default()
         }
         .write_to_bytes()?,
@@ -248,8 +261,8 @@ fn transform_audio_chunk(
     })
 }
 
-fn get_micros_now() -> f64 {
+fn get_millis_now() -> f64 {
     let now = std::time::SystemTime::now();
     let duration = now.duration_since(std::time::UNIX_EPOCH).unwrap();
-    duration.as_micros() as f64
+    duration.as_millis() as f64
 }

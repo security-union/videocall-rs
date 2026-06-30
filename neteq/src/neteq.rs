@@ -387,7 +387,7 @@ impl NetEq {
         let pre_buffer_ms = self.current_buffer_size_ms();
         let pre_target_delay = self.delay_manager.target_delay_ms();
         let pre_packet_count = self.packet_buffer.len();
-        log::debug!(
+        log::trace!(
             "get_audio pre-decision: buffer={pre_buffer_ms}ms, target={pre_target_delay}ms, packets={pre_packet_count}"
         );
         // -----------------------------------------------------

@@ -20,53 +20,19 @@ use super::AudioDecoder;
 use crate::Result;
 
 // -----------------------------------------------------------------------------
-// Native decode backend (non-wasm), selected at compile time:
-//   * default           -> libopus via the C `opus` crate
-//   * `ropus-codec`      -> pure-Rust `ropus` (no C toolchain; wasm-clean core)
+// Native decode backend (non-wasm): pure-Rust `ropus`.
 //
-// Both expose the same minimal `OpusBackend` surface (`new` + `decode_float`),
-// so the `NativeOpusDecoder` wrapper and its `AudioDecoder` impl below are
-// backend-agnostic and written exactly once.
+// `OpusBackend` is a tiny surface (`new` + `decode_float`) so the
+// `NativeOpusDecoder` wrapper and its `AudioDecoder` impl below stay agnostic
+// of the codec crate.
 // -----------------------------------------------------------------------------
 
-#[cfg(all(not(target_arch = "wasm32"), not(feature = "ropus-codec")))]
-mod backend {
-    use crate::{NetEqError, Result};
-    use opus::{Channels, Decoder};
-
-    /// libopus decode backend (C, via the `opus` crate).
-    pub struct OpusBackend(Decoder);
-
-    impl OpusBackend {
-        pub fn new(sample_rate: u32, channels: u8) -> Result<Self> {
-            Decoder::new(sample_rate, channels_enum(channels)?)
-                .map(Self)
-                .map_err(|e| NetEqError::DecoderError(format!("Opus init: {e}")))
-        }
-
-        /// Decode one packet into `out`; returns samples decoded per channel.
-        pub fn decode_float(&mut self, encoded: &[u8], out: &mut [f32]) -> Result<usize> {
-            self.0
-                .decode_float(encoded, out, false)
-                .map_err(|e| NetEqError::DecoderError(format!("Opus decode: {e}")))
-        }
-    }
-
-    fn channels_enum(channels: u8) -> Result<Channels> {
-        match channels {
-            1 => Ok(Channels::Mono),
-            2 => Ok(Channels::Stereo),
-            n => Err(NetEqError::InvalidChannelCount(n)),
-        }
-    }
-}
-
-#[cfg(all(not(target_arch = "wasm32"), feature = "ropus-codec"))]
+#[cfg(not(target_arch = "wasm32"))]
 mod backend {
     use crate::{NetEqError, Result};
     use ropus::{Channels, DecodeMode, Decoder};
 
-    /// Pure-Rust decode backend (`ropus`).
+    /// Pure-Rust Opus decode backend (`ropus`).
     pub struct OpusBackend(Decoder);
 
     impl OpusBackend {
@@ -94,8 +60,7 @@ mod backend {
 }
 
 // `ropus::Decoder` does not implement `Debug`, so give the backend an opaque
-// manual impl. This keeps `NativeOpusDecoder`'s derived `Debug` working
-// identically for both backends.
+// manual impl. This keeps `NativeOpusDecoder`'s derived `Debug` working.
 #[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for backend::OpusBackend {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -107,10 +72,7 @@ impl std::fmt::Debug for backend::OpusBackend {
 use backend::OpusBackend;
 
 #[cfg(not(target_arch = "wasm32"))]
-/// Synchronous native Opus decoder.
-///
-/// Wraps a compile-time-selected [`OpusBackend`]: libopus (the C `opus` crate)
-/// by default, or the pure-Rust `ropus` codec under the `ropus-codec` feature.
+/// Synchronous native Opus decoder, backed by the pure-Rust `ropus` codec.
 #[derive(Debug)]
 pub struct NativeOpusDecoder {
     inner: OpusBackend,

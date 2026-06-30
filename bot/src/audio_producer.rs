@@ -16,8 +16,8 @@
  * conditions.
  */
 
-use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
 use protobuf::Message;
+use ropus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -130,7 +130,8 @@ impl AudioProducer {
         interval_timer.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         // Create Opus encoder
-        let mut opus_encoder = OpusEncoder::new(sample_rate, OpusChannels::Mono, OpusApp::Voip)?;
+        let mut opus_encoder =
+            OpusEncoder::builder(sample_rate, OpusChannels::Mono, OpusApp::Voip).build()?;
         info!(
             "Audio producer started for {} ({}Hz, {}ch, {}ms packets)",
             user_id, sample_rate, channels, 20

@@ -17,8 +17,8 @@
  */
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use opus::Channels;
 use protobuf::{Message, MessageField};
+use ropus::{Application, Channels, Encoder};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -29,6 +29,10 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::{MediaPacket, VideoMetadata};
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+/// Maximum encoded Opus packet size in bytes for a 20 ms mono VoIP frame.
+/// 4000 is the conventional libopus upper bound and leaves ample headroom.
+const MAX_OPUS_PACKET: usize = 4000;
 
 pub struct MicrophoneDaemon {
     stop: Arc<AtomicBool>,
@@ -100,8 +104,8 @@ fn start_microphone(
         cpal::SampleFormat::I16,
     );
 
-    let mut encoder = opus::Encoder::new(48000, Channels::Mono, opus::Application::Voip)?;
-    info!("Opus encoder created {:?}", encoder);
+    let mut encoder = Encoder::builder(48000, Channels::Mono, Application::Voip).build()?;
+    info!("Opus encoder created (ropus pure-Rust, 48 kHz mono, VoIP)");
 
     let err_fn = move |err| {
         error!("an error occurred on stream: {}", err);
@@ -145,11 +149,13 @@ fn start_microphone(
 
 fn encode_and_send_i16(
     input: &[i16],
-    encoder: &mut opus::Encoder,
+    encoder: &mut Encoder,
     wt_tx: &Sender<Vec<u8>>,
     email: String,
 ) -> anyhow::Result<()> {
-    let output = encoder.encode_vec(input, 960)?;
+    let mut buf = [0u8; MAX_OPUS_PACKET];
+    let n = encoder.encode(input, &mut buf)?;
+    let output = buf[..n].to_vec();
     let output = transform_audio_chunk(output, email, 0);
     let output_bytes = output?.write_to_bytes()?;
     tracing::info!("Queueing AUDIO packet: {} bytes", output_bytes.len());

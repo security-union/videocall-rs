@@ -1,0 +1,3 @@
+db: "${DATABASE_URL}"
+migrations_dir: "./sqlite/migrations"
+schema_file: "./sqlite/schema.sql"

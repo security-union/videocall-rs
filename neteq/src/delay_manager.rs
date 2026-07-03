@@ -358,8 +358,8 @@ impl DelayManager {
         log::debug!(
             "Target delay updated: {}ms max {}ms min {}ms",
             self.target_level_ms,
-            self.effective_minimum_delay_ms,
-            self.effective_maximum_delay_ms
+            self.effective_maximum_delay_ms,
+            self.effective_minimum_delay_ms
         );
     }
 

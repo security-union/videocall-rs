@@ -373,7 +373,8 @@ impl Handler<ActivateConnection> for ChatServer {
         // connection during RTT election).
         //
         // Skip the broadcast for sessions marked in suppress_join_broadcast
-        // (reconnection sessions and observer sessions).
+        // (observer sessions only; reconnection sessions ARE re-broadcast so
+        // peers repopulate their identity caches for the new session_id).
         let suppressed = self.suppress_join_broadcast.remove(&session);
         if was_testing && !suppressed {
             // Look up the session's room, user_id, and display_name from room_members.
@@ -531,9 +532,12 @@ impl Handler<ClientMessage> for ChatServer {
 
         let packet_bytes =
             if let Ok(mut packet_wrapper) = PacketWrapper::parse_from_bytes(&msg.data) {
-                if packet_wrapper.session_id == 0 {
-                    packet_wrapper.session_id = session;
-                }
+                // Stamp the connection's authoritative session id unconditionally.
+                // The relay assigned this id; a client has no legitimate reason to
+                // send a different (or forged non-zero) one. Overwriting closes a
+                // peer-tile-hijack where a forged non-zero session_id would be
+                // relayed verbatim and adopted by peers.
+                packet_wrapper.session_id = session;
                 match packet_wrapper.write_to_bytes() {
                     Ok(bytes) => bytes,
                     Err(e) => {
@@ -583,15 +587,21 @@ impl Handler<JoinRoom> for ChatServer {
         }
 
         // --- Reconnection grace period: cancel pending departure ---
-        // If the same user_id is reconnecting to the same room within
-        // the grace window, suppress both PARTICIPANT_LEFT (already deferred)
-        // and the PARTICIPANT_JOINED that would normally follow.
+        // If the same user_id is reconnecting to the same room within the grace
+        // window, cancel the deferred PARTICIPANT_LEFT for the OLD session. The
+        // PARTICIPANT_JOINED for the NEW session is still broadcast (see below)
+        // so peers repopulate identity for the new session_id.
         let departure_key = (room.clone(), user_id.clone());
         let is_reconnection = if let Some(pending) = self.pending_departures.remove(&departure_key)
         {
             ctx.cancel_future(pending.spawn_handle);
 
-            // Clean up stale room_members entry from the old session
+            // Clean up stale room_members entry from the old session so the new
+            // session is the only tracked entry for this user. Note: peers'
+            // OLD-session tile is not explicitly retired here — it is reaped by
+            // the pre-existing ~15s heartbeat timeout on the client. A
+            // session-scoped silent-retire packet would retire it immediately;
+            // deferred as a follow-up to keep this change minimal.
             if let Some(members) = self.room_members.get_mut(&room) {
                 members.retain(|(sid, _, _)| *sid != pending.old_session);
             }
@@ -606,10 +616,19 @@ impl Handler<JoinRoom> for ChatServer {
             false
         };
 
-        // Mark reconnection and observer sessions so ActivateConnection does not
-        // broadcast PARTICIPANT_JOINED for them. Reconnection sessions never
-        // "left" from peers' perspective; observers are never announced.
-        if is_reconnection || observer {
+        // Mark observer sessions so ActivateConnection does not broadcast
+        // PARTICIPANT_JOINED for them — observers are never announced.
+        //
+        // Reconnection sessions are deliberately NOT suppressed: the roster
+        // (PARTICIPANT_JOINED) is the sole source of peer identity on clients,
+        // and a reconnection assigns a NEW session_id. If we suppressed the
+        // broadcast, every peer would resolve the new session_id to an empty
+        // user_id/display_name (blank identity, broken host detection and
+        // moderation targeting). Re-broadcasting repopulates peers' caches for
+        // the new session; the client's own event dedup (keyed by user_id)
+        // suppresses the redundant "joined" toast. The OLD session's departure
+        // remains cancelled above, so no PARTICIPANT_LEFT/JOINED churn occurs.
+        if observer {
             self.suppress_join_broadcast.insert(session);
         }
 
@@ -693,14 +712,15 @@ impl Handler<JoinRoom> for ChatServer {
             // events from Testing connections during RTT election — only
             // the elected (activated) connection announces itself.
             //
-            // Reconnection joins also skip the broadcast (the user never
-            // "left" from peers' perspective), and observer joins are
-            // never broadcast either.
+            // Reconnection joins are still broadcast (with the new session_id)
+            // so peers repopulate their identity caches; only observer joins
+            // are never broadcast.
             if is_reconnection {
                 info!(
-                    "Suppressing PARTICIPANT_JOINED for reconnecting user {} in room {} \
-                     (deferred broadcast also skipped)",
-                    user_id_clone, room_clone
+                    "Deferring PARTICIPANT_JOINED for reconnecting user {} in room {} \
+                     until ActivateConnection (new session {}) — re-broadcast repopulates \
+                     peers' identity caches for the new session",
+                    user_id_clone, room_clone, session_id
                 );
             } else if observer {
                 info!(
@@ -1281,6 +1301,114 @@ mod tests {
     }
 
     // ==========================================================================
+    // TEST: Broadcast path overwrites a forged non-zero session_id
+    //
+    // A malicious client can serialize a PacketWrapper with an arbitrary
+    // non-zero session_id. The relay must overwrite it with the connection's
+    // authoritative session before publishing, so peers cannot be tricked into
+    // adopting a forged session_id (peer-tile-hijack). This test FAILS on the
+    // pre-fix code, which only stamped session_id when it was 0.
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_broadcast_overwrites_forged_session_id() {
+        use crate::messages::server::Packet;
+        use protobuf::Message as _;
+        use std::sync::Arc;
+        use tokio::sync::Mutex as AsyncMutex;
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
+        use videocall_types::protos::packet_wrapper::PacketWrapper;
+
+        let _pool = get_test_pool().await;
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let session_id = 1006u64;
+        let forged_session_id = 9999u64;
+        let room = "test-room-forged".to_string();
+
+        chat_server
+            .send(Connect {
+                id: session_id,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect should succeed");
+        chat_server
+            .send(ActivateConnection {
+                session: session_id,
+            })
+            .await
+            .expect("ActivateConnection should succeed");
+
+        // The relay publishes to room.{room}.{authoritative_session}.
+        let subject = format!("room.{room}.{session_id}").replace(' ', "_");
+        let received: Arc<AsyncMutex<Option<Vec<u8>>>> = Arc::new(AsyncMutex::new(None));
+        let received_clone = received.clone();
+        let mut sub = nats_client
+            .subscribe(subject.clone())
+            .await
+            .expect("Failed to subscribe");
+
+        tokio::spawn(async move {
+            if let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(500), sub.next()).await
+            {
+                *received_clone.lock().await = Some(msg.payload.to_vec());
+            }
+        });
+
+        // Client sends a packet carrying a FORGED non-zero session_id.
+        let forged = PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            session_id: forged_session_id,
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        chat_server
+            .send(ClientMessage {
+                session: session_id,
+                room: room.clone(),
+                msg: Packet {
+                    data: Arc::new(forged.write_to_bytes().unwrap()),
+                },
+                user: "test@example.com".to_string(),
+            })
+            .await
+            .expect("Message delivery should succeed");
+
+        sleep(Duration::from_millis(600)).await;
+
+        let payload = received
+            .lock()
+            .await
+            .clone()
+            .expect("Broadcast should have published a packet");
+        let published =
+            PacketWrapper::parse_from_bytes(&payload).expect("Published bytes must parse");
+        assert_eq!(
+            published.session_id, session_id,
+            "Relay must overwrite the forged session_id ({forged_session_id}) with the \
+             authoritative session ({session_id})"
+        );
+    }
+
+    // ==========================================================================
     // TEST: ActivateConnection handler is idempotent
     // ==========================================================================
     #[actix_rt::test]
@@ -1635,6 +1763,156 @@ mod tests {
         assert!(
             participant_joined_received.load(Ordering::Relaxed),
             "Non-observer join + activate SHOULD publish PARTICIPANT_JOINED to NATS"
+        );
+    }
+
+    // ==========================================================================
+    // TEST: Reconnection re-broadcasts identity-bearing PARTICIPANT_JOINED
+    //
+    // The PARTICIPANT_JOINED roster is now the SOLE source of peer identity on
+    // clients. A reconnection within the grace window assigns a NEW session_id.
+    // The server MUST still broadcast PARTICIPANT_JOINED for the new session so
+    // peers repopulate their identity caches (session_id -> {user_id,
+    // display_name}); otherwise the reconnected peer shows blank identity and
+    // host detection / moderation targeting break.
+    //
+    // FAILS on the pre-fix code, which added reconnection sessions to
+    // suppress_join_broadcast so ActivateConnection skipped their broadcast.
+    // ==========================================================================
+    #[actix_rt::test]
+    #[serial]
+    async fn test_reconnection_rebroadcasts_participant_joined_identity() {
+        use crate::messages::server::Disconnect;
+        use std::sync::{Arc, Mutex};
+        use tokio::time::{sleep, Duration};
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+
+        let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
+        let nats_client = async_nats::connect(&nats_url)
+            .await
+            .expect("Failed to connect to NATS");
+
+        let chat_server = ChatServer::new(nats_client.clone()).await.start();
+
+        struct DummySession;
+        impl Actor for DummySession {
+            type Context = actix::Context<Self>;
+        }
+        impl Handler<Message> for DummySession {
+            type Result = ();
+            fn handle(&mut self, _msg: Message, _ctx: &mut Self::Context) {}
+        }
+
+        let dummy = DummySession.start();
+        let old_session = 7001u64;
+        let new_session = 7002u64;
+        let room = "test-room-reconnect".to_string();
+        let user = "recon-user@example.com".to_string();
+
+        // Collect (session_id, target_user_id) of every PARTICIPANT_JOINED
+        // published to the room's system subject.
+        let system_subject = format!("room.{}.system", room.replace(' ', "_"));
+        let joined_events = Arc::new(Mutex::new(Vec::<(u64, String)>::new()));
+        let joined_clone = joined_events.clone();
+        let mut sub = nats_client
+            .subscribe(system_subject)
+            .await
+            .expect("Failed to subscribe to system subject");
+
+        tokio::spawn(async move {
+            while let Ok(Some(msg)) =
+                tokio::time::timeout(Duration::from_millis(2000), sub.next()).await
+            {
+                if let Ok(wrapper) =
+                    <PacketWrapper as ProtobufMessage>::parse_from_bytes(&msg.payload)
+                {
+                    if let Ok(inner) = MeetingPacket::parse_from_bytes(&wrapper.data) {
+                        if inner.event_type == MeetingEventType::PARTICIPANT_JOINED.into() {
+                            let uid = String::from_utf8_lossy(&inner.target_user_id).into_owned();
+                            joined_clone.lock().unwrap().push((inner.session_id, uid));
+                        }
+                    }
+                }
+            }
+        });
+
+        // --- Original connection joins and activates ---
+        chat_server
+            .send(Connect {
+                id: old_session,
+                addr: dummy.clone().recipient(),
+            })
+            .await
+            .expect("Connect (old) should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: old_session,
+                room: room.clone(),
+                user_id: user.clone(),
+                display_name: user.clone(),
+                observer: false,
+            })
+            .await
+            .expect("JoinRoom (old) should succeed")
+            .expect("JoinRoom (old) inner ok");
+        chat_server
+            .send(ActivateConnection {
+                session: old_session,
+            })
+            .await
+            .expect("ActivateConnection (old) should succeed");
+
+        sleep(Duration::from_millis(200)).await;
+
+        // --- Disconnect: starts the grace-period pending departure ---
+        chat_server
+            .send(Disconnect {
+                session: old_session,
+                room: room.clone(),
+                user_id: user.clone(),
+                display_name: user.clone(),
+                observer: false,
+            })
+            .await
+            .expect("Disconnect should succeed");
+
+        // --- Reconnect within the grace window as a NEW session_id ---
+        chat_server
+            .send(Connect {
+                id: new_session,
+                addr: dummy.recipient(),
+            })
+            .await
+            .expect("Connect (new) should succeed");
+        chat_server
+            .send(JoinRoom {
+                session: new_session,
+                room: room.clone(),
+                user_id: user.clone(),
+                display_name: user.clone(),
+                observer: false,
+            })
+            .await
+            .expect("JoinRoom (reconnect) should succeed")
+            .expect("JoinRoom (reconnect) inner ok");
+        chat_server
+            .send(ActivateConnection {
+                session: new_session,
+            })
+            .await
+            .expect("ActivateConnection (new) should succeed");
+
+        // Wait for the collector to drain both publishes.
+        sleep(Duration::from_millis(2500)).await;
+
+        let events = joined_events.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|(sid, uid)| *sid == new_session && *uid == user),
+            "Reconnection MUST re-broadcast an identity-bearing PARTICIPANT_JOINED for the new \
+             session {new_session} (target_user_id={user}); collected events: {events:?}"
         );
     }
 

@@ -200,9 +200,19 @@ test.describe("Two users in a meeting", () => {
       await expect(hostPeer.first()).toBeVisible({ timeout: 30_000 });
       await expect(guestPeer.first()).toBeVisible({ timeout: 30_000 });
 
-      // ---- ASSERT: peer tile shows display_name as text, user_id as tooltip ----
-      // The floating name overlay on each peer tile should show the display name,
-      // with the user_id (email) available as a tooltip via the title attribute.
+      // ---- ASSERT: remote peer identity is delivered by the SERVER ROSTER ----
+      // Peer identity (display name + email/user_id) is NO LONGER carried on the
+      // per-packet media envelope. Each client stamps only its server-assigned
+      // session_id on outbound packets; the human identity is learned exactly once
+      // from the server-authored PARTICIPANT_JOINED roster (session_id -> {email,
+      // display_name}) and cached client-side, keyed by session_id.
+      //
+      // The floating-name overlay renders that roster-sourced identity: the visible
+      // text is the roster `display_name`, and the `title` (tooltip) attribute is the
+      // roster `user_id` (email). Because the media envelopes no longer carry the
+      // email at all, the ONLY source that can populate a correct remote email in the
+      // title is the PARTICIPANT_JOINED roster. Asserting the correct remote email
+      // renders below therefore proves the roster path — not the payload — supplies it.
       // The host tile includes a "Host: " prefix in the title attribute.
       const guestNameOnHost = hostPage.locator(".floating-name", {
         hasText: "GuestUser",
@@ -211,14 +221,18 @@ test.describe("Two users in a meeting", () => {
         hasText: "HostUser",
       });
 
-      // Check that the guest's display name is visible on the host side.
-      // The guest is not the host, so the title is just the user_id.
+      // Host side sees the guest's roster identity: display_name "GuestUser" as the
+      // visible label and the guest's email in the tooltip. The guest is not the host,
+      // so the title is exactly the roster user_id (email) with no "Host: " prefix.
       await expect(guestNameOnHost.first()).toBeVisible({ timeout: 10_000 });
+      await expect(guestNameOnHost.first()).toContainText("GuestUser");
       await expect(guestNameOnHost.first()).toHaveAttribute("title", "guest@videocall.rs");
 
-      // Check that the host's display name is visible on the guest side.
-      // The host tile has a "Host: " prefix in the title attribute.
+      // Guest side sees the host's roster identity: display_name "HostUser" as the
+      // visible label and the host's email in the tooltip. The host tile carries a
+      // "Host: " prefix on the title attribute.
       await expect(hostNameOnGuest.first()).toBeVisible({ timeout: 10_000 });
+      await expect(hostNameOnGuest.first()).toContainText("HostUser");
       await expect(hostNameOnGuest.first()).toHaveAttribute(
         "title",
         /^(Host: )?host@videocall\.rs$/,

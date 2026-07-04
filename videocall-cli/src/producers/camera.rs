@@ -81,7 +81,8 @@ pub fn transform_video_chunk(frame: &Frame, user_id: &str) -> PacketWrapper {
     let data = media_packet.write_to_bytes().unwrap();
     PacketWrapper {
         data,
-        user_id: user_id_bytes.to_vec(),
+        // Envelope user_id left empty; peer identity is delivered via the
+        // server-authored PARTICIPANT_JOINED roster, not the per-packet wire.
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }

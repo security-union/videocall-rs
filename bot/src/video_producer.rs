@@ -152,7 +152,8 @@ impl VideoProducer {
                 // Wrap in packet wrapper
                 let packet_wrapper = PacketWrapper {
                     packet_type: PacketType::MEDIA.into(),
-                    user_id: user_id.clone().into_bytes(),
+                    // Envelope user_id left empty; peer identity is delivered via
+                    // the server-authored PARTICIPANT_JOINED roster.
                     data: media_packet.write_to_bytes()?,
                     ..Default::default()
                 };

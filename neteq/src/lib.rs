@@ -22,6 +22,15 @@
 //! This library provides functionality to handle network jitter, packet reordering,
 //! and adaptive buffering for real-time audio applications.
 
+#[cfg(all(feature = "native-libopus", feature = "native-ropus"))]
+compile_error!("native-libopus and native-ropus cannot both be enabled");
+
+#[cfg(all(
+    feature = "native",
+    not(any(feature = "native-libopus", feature = "native-ropus"))
+))]
+compile_error!("the native feature requires native-libopus or native-ropus");
+
 pub mod buffer;
 pub mod buffer_level_filter;
 pub mod codec;

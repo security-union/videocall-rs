@@ -49,9 +49,9 @@ ringbuf = "0.3"
 hound = { version = "3.5", optional = true }
 rand = { version = "0.9.1", optional = true, default-features = false, features = ["thread_rng"] }
 cpal = { version = "0.15", optional = true }
-# Pure-Rust Opus (xiph/opus port, bit-exact, BSD-3). Replaces the C `opus`
-# crate (libopus/audiopus-sys) as the native Opus codec — no C toolchain,
-# wasm-clean core, single `wide` dependency.
+# Native Opus backends. Xiph libopus is the default; ropus can be selected for
+# a Rust implementation without linking libopus.
+opus = { version = "0.3", default-features = false, optional = true }
 ropus = { version = "0.12", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 env_logger = { version = "0.10", optional = true }
@@ -64,7 +64,7 @@ once_cell = { version = "1.19", optional = true }
 matomo-logger = { path = "../matomo-logger", optional = true, version = "0.1.0" }
 
 [features]
-default = ["native", "audio_files"]
+default = ["native-libopus", "audio_files"]
 audio_files = ["hound"]
 web = [
     "wasm-bindgen",
@@ -78,7 +78,9 @@ web = [
     "once_cell",
     "matomo-logger/worker",
 ]
-native = ["cpal", "clap", "ropus", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
+native = ["cpal", "clap", "rand", "axum", "tokio", "tower", "tower-http", "env_logger"]
+native-libopus = ["native", "dep:opus"]
+native-ropus = ["native", "dep:ropus"]
 
 [dev-dependencies]
 env_logger = "0.10"
@@ -95,5 +97,4 @@ required-features = ["native", "audio_files"]
 [[bin]]
 name = "dashboard_server"
 required-features = ["native"]
-
 

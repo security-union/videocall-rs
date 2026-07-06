@@ -20,59 +20,26 @@ use super::AudioDecoder;
 use crate::Result;
 
 // -----------------------------------------------------------------------------
-// Native decode backend (non-wasm): pure-Rust `ropus`.
+// Native decode backend (non-wasm): Xiph libopus or pure-Rust `ropus`.
 //
 // `OpusBackend` is a tiny surface (`new` + `decode_float`) so the
 // `NativeOpusDecoder` wrapper and its `AudioDecoder` impl below stay agnostic
 // of the codec crate.
 // -----------------------------------------------------------------------------
 
-#[cfg(not(target_arch = "wasm32"))]
-mod backend {
-    use crate::{NetEqError, Result};
-    use ropus::{Channels, DecodeMode, Decoder};
+#[cfg(feature = "native-libopus")]
+mod libopus;
+#[cfg(feature = "native-ropus")]
+#[path = "native_opus/ropus.rs"]
+mod ropus_backend;
 
-    /// Pure-Rust Opus decode backend (`ropus`).
-    pub struct OpusBackend(Decoder);
-
-    impl OpusBackend {
-        pub fn new(sample_rate: u32, channels: u8) -> Result<Self> {
-            Decoder::new(sample_rate, channels_enum(channels)?)
-                .map(Self)
-                .map_err(|e| NetEqError::DecoderError(format!("ropus init: {e}")))
-        }
-
-        /// Decode one packet into `out`; returns samples decoded per channel.
-        pub fn decode_float(&mut self, encoded: &[u8], out: &mut [f32]) -> Result<usize> {
-            self.0
-                .decode_float(encoded, out, DecodeMode::Normal)
-                .map_err(|e| NetEqError::DecoderError(format!("ropus decode: {e}")))
-        }
-    }
-
-    fn channels_enum(channels: u8) -> Result<Channels> {
-        match channels {
-            1 => Ok(Channels::Mono),
-            2 => Ok(Channels::Stereo),
-            n => Err(NetEqError::InvalidChannelCount(n)),
-        }
-    }
-}
-
-// `ropus::Decoder` does not implement `Debug`, so give the backend an opaque
-// manual impl. This keeps `NativeOpusDecoder`'s derived `Debug` working.
-#[cfg(not(target_arch = "wasm32"))]
-impl std::fmt::Debug for backend::OpusBackend {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("OpusBackend").finish_non_exhaustive()
-    }
-}
+#[cfg(feature = "native-libopus")]
+use libopus::OpusBackend;
+#[cfg(all(not(feature = "native-libopus"), feature = "native-ropus"))]
+use ropus_backend::OpusBackend;
 
 #[cfg(not(target_arch = "wasm32"))]
-use backend::OpusBackend;
-
-#[cfg(not(target_arch = "wasm32"))]
-/// Synchronous native Opus decoder, backed by the pure-Rust `ropus` codec.
+/// Synchronous native Opus decoder using the selected native backend.
 #[derive(Debug)]
 pub struct NativeOpusDecoder {
     inner: OpusBackend,
@@ -112,6 +79,50 @@ impl AudioDecoder for NativeOpusDecoder {
         let decoded_samples = self.inner.decode_float(encoded, &mut buf)?;
         buf.truncate(decoded_samples * self.channels as usize);
         Ok(buf)
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_a_mono_silence_packet() {
+        let sample_rate = 48_000;
+        let samples = vec![0.0; 960];
+        let encoded = encode_float(sample_rate, &samples);
+        let mut decoder = NativeOpusDecoder::new(sample_rate, 1).unwrap();
+
+        let decoded = decoder.decode(&encoded).unwrap();
+
+        assert_eq!(decoded.len(), samples.len());
+        assert!(decoded.iter().all(|sample| sample.is_finite()));
+    }
+
+    #[cfg(feature = "native-libopus")]
+    fn encode_float(sample_rate: u32, samples: &[f32]) -> Vec<u8> {
+        let mut encoder =
+            opus::Encoder::new(sample_rate, opus::Channels::Mono, opus::Application::Audio)
+                .unwrap();
+        let mut encoded = vec![0; 4_000];
+        let len = encoder.encode_float(samples, &mut encoded).unwrap();
+        encoded.truncate(len);
+        encoded
+    }
+
+    #[cfg(all(not(feature = "native-libopus"), feature = "native-ropus"))]
+    fn encode_float(sample_rate: u32, samples: &[f32]) -> Vec<u8> {
+        let mut encoder = ropus::Encoder::builder(
+            sample_rate,
+            ropus::Channels::Mono,
+            ropus::Application::Audio,
+        )
+        .build()
+        .unwrap();
+        let mut encoded = vec![0; 4_000];
+        let len = encoder.encode_float(samples, &mut encoded).unwrap();
+        encoded.truncate(len);
+        encoded
     }
 }
 

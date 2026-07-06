@@ -29,7 +29,10 @@ use cpal::BufferSize;
 
 use neteq::codec::OpusDecoder;
 use neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
+#[cfg(feature = "native-libopus")]
+use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
 use rand::Rng;
+#[cfg(feature = "native-ropus")]
 use ropus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
 
 // This example does the following:
@@ -216,6 +219,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         OpusChannels::Stereo
     };
+    #[cfg(feature = "native-libopus")]
+    let mut opus_encoder = OpusEncoder::new(sample_rate, ch_enum, OpusApp::Audio)?;
+    #[cfg(feature = "native-ropus")]
     let mut opus_encoder = OpusEncoder::builder(sample_rate, ch_enum, OpusApp::Audio).build()?;
 
     let mut chunk_index_iter = wav_samples.chunks(packet_samples).enumerate();

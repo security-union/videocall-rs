@@ -20,16 +20,28 @@ Rust NetEQ is a pure-Rust, libWebRTC-inspired jitter buffer designed for profess
 
 ```toml
 [dependencies]
-neteq = "0.1"
+neteq = "0.9"
 ```
 
 Insert RTP payloads as they arrive, call `get_audio()` every 10 ms, and let the buffer handle the rest.  Full runnable snippets live in the [examples](examples) directory — open `basic_usage.rs` first.
+
+Native builds use the Xiph libopus implementation by default. To use the
+Rust ropus implementation instead, disable default features and select the
+`native-ropus` backend explicitly:
+
+```toml
+[dependencies]
+neteq = { version = "0.9", default-features = false, features = ["native-ropus"] }
+```
+
+Add `audio_files` to that feature list when using the WAV-based examples. The
+`native-libopus` and `native-ropus` features are mutually exclusive.
 
 ### Web Applications (WASM + WebWorker)
 
 ```toml
 [dependencies]
-neteq = { version = "0.1", features = ["web"], default-features = false }
+neteq = { version = "0.9", features = ["web"], default-features = false }
 ```
 
 For browser environments, NetEq ships with:
@@ -184,4 +196,3 @@ This NetEQ implementation is algorithmically inspired by and compatible with the
 - Available at: https://webrtc.googlesource.com/src/
 
 This Rust implementation is an independent rewrite and is not a derivative work of the WebRTC source code.
-

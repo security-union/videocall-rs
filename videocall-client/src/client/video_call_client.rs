@@ -25,7 +25,9 @@ use super::layer_preference_sender::LayerPreferenceSender;
 use super::viewport_sender::{ViewportSender, VIEWPORT_DEBOUNCE_MS};
 use crate::crypto::aes::Aes128State;
 use crate::crypto::rsa::RsaWrapper;
-use crate::decode::layer_chooser::{PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot};
+use crate::decode::layer_chooser::{
+    PrefMediaKind, ReceiveLayerBounds, ReceivedLayerSnapshot, TileHint,
+};
 use crate::decode::peer_decode_manager::{PeerDecodeError, PeerDeviceInfo, PeerReceiveDiag};
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
 use crate::diagnostics::{DiagnosticManager, SenderDiagnosticManager};
@@ -412,6 +414,17 @@ struct Inner {
     sender_diagnostics: Option<Rc<SenderDiagnosticManager>>,
     health_reporter: Option<Rc<RefCell<HealthReporter>>>,
     own_session_id: Option<u64>,
+    /// Issue #1700: the `own_session_id` the reconnect handler last snapped the
+    /// decode guards to `highest_available` against. The inline reconnect reconcile
+    /// snaps guards UP to highest_available ONLY when this differs from the current
+    /// `own_session_id` — i.e. on a genuinely FRESH relay session (new session_id →
+    /// empty recorded LAYER_PREFERENCE map → relay fails open → highest_available is
+    /// what it forwards). On the re-election abort/fallback path the session is
+    /// UNCHANGED (the relay still holds the OLD recorded prefs), so snapping the
+    /// guard up would make it LEAD the still-stale wire → the #1695 exact-match
+    /// freeze. `None` until the first reconcile. Updated to the session the handler
+    /// reconciled against on every Connected.
+    last_reconnect_reconciled_session: Option<u64>,
     /// Bounded set of session_ids this client has held in the current page load.
     /// Used to match incoming CONGESTION signals — the server stamps the throttled
     /// sender's session_id on the wire, and the client receives every CONGESTION
@@ -776,6 +789,77 @@ fn send_layer_preference_via(
     }
 }
 
+/// THE single chokepoint for publishing a `LAYER_PREFERENCE` change AND keeping
+/// every decode guard in sync with what the relay will forward (issue #1695).
+///
+/// INVARIANT: after this returns, for every (peer, kind ∈ {Video, Screen, Audio})
+/// the decode guard == `last_sent[(sid,kind)]`-if-recorded-else-`highest_available`
+/// == the layer the relay exact-match (or fail-open) forwards. AUDIO is reconciled
+/// too (issue #1695): it is in the same relay exact-match filter, so a rate-limited
+/// audio pref change would otherwise leave the audio guard leading the audio wire →
+/// drop. Audio reconciles the guard but (being keyframe-less) requests no keyframe.
+///
+/// This is THE chokepoint: every LAYER_PREFERENCE publish site MUST call this so
+/// the guard can never lead the wire. A future 6th publish site that calls
+/// `take_if_changed` directly (without this helper) re-introduces the #1256
+/// guard/wire desync — DO NOT add one.
+///
+/// ORDERING IS LOAD-BEARING: `last_sent` is read AFTER `take_if_changed`, because
+/// an ACCEPTED send promotes `last_sent` to the just-sent map. Reading it BEFORE
+/// would reconcile the guard to the PRE-send map and re-desync for a cycle.
+///
+/// All five callers pass a `&mut Inner`. The four that hold a `RefMut<Inner>`
+/// pass `&mut inner` — `DerefMut` coercion turns `&mut RefMut<Inner>` into the
+/// `&mut Inner` parameter in argument position (clippy's `explicit_auto_deref`
+/// confirms `&mut *inner` would be redundant here); `seed_local_congestion_and_publish`
+/// already has `self: &mut Inner` and passes `self`.
+///
+/// RETURNS `true` when `take_if_changed` ACCEPTED the publish (the desired map
+/// changed AND was not rate-limited by the 200ms `LAYER_PREFERENCE_MIN_UPDATE_MS`
+/// limiter) and a LAYER_PREFERENCE packet was sent; `false` when the publish was
+/// rate-limited / suppressed / unchanged (no packet went out). This is the signal
+/// the #1701 size-lid keyframe gate in `set_peer_tile_hints` keys off: it emits the
+/// size-lid up-switch PLI ONLY when the up-raise actually reached the wire. The
+/// down-reconcile + its keyframe drain below run on EVERY call regardless of the
+/// return value (the #1695 guard==wire invariant is unconditional); only the
+/// caller's size-lid PLI is conditioned on acceptance.
+fn publish_and_reconcile(
+    inner: &mut Inner,
+    desired: &std::collections::HashMap<(u64, PrefMediaKind), u32>,
+    now_ms: u64,
+) -> bool {
+    let accepted = if let Some(entries) = inner
+        .layer_preference_sender
+        .take_if_changed(desired, now_ms)
+    {
+        let user_id = inner.options.user_id.clone();
+        let cc = inner.connection_controller.clone();
+        send_layer_preference_via(&cc, &user_id, entries);
+        true
+    } else {
+        false
+    };
+    // Read `last_sent` AFTER `take_if_changed` (an accepted send promoted it to the
+    // just-sent map). CLONE the ≤64-entry canonical map so the immutable sender
+    // borrow ends before the `&mut peer_decode_manager` call below — the SAME
+    // snapshot-to-avoid-aliasing convention used for `bounds` at the monitor tick
+    // (see the `inner.receive_layer_bounds` snapshot comment ~line 1725).
+    let wire = inner.layer_preference_sender.last_sent().cloned();
+    let ups = inner
+        .peer_decode_manager
+        .reconcile_decode_guards_to_wire(wire.as_ref(), now_ms);
+    // Drain keyframe requests AFTER the &mut reconcile loop returned owned tuples
+    // (its &mut borrow ended); `send_keyframe_request` takes `&self`. An up-switch
+    // whose publish was rate-limited may waste-then-re-request a keyframe; it
+    // self-heals on the next push/tick.
+    for (user_id, sid, mt) in &ups {
+        inner
+            .peer_decode_manager
+            .send_keyframe_request(user_id, *sid, *mt);
+    }
+    accepted
+}
+
 /// Arm the CAMERA forced-keyframe cooldown reset on a (re)connect (issue #1311,
 /// hardened in #1352).
 ///
@@ -985,6 +1069,12 @@ fn handle_connected_reconnect_resets(
     screen_keyframe_cooldown_reset: &Rc<RefCell<Option<Rc<AtomicBool>>>>,
     audio_congestion_bitrate_floor: &Arc<AtomicU32>,
     audio_detector_reconnect_reseed: &Arc<AtomicBool>,
+    // Issue #1700: the wall clock is read at the production dispatch boundary (the
+    // `ConnectionState::Connected` arm) and INJECTED here so this handler stays
+    // clock-free and host-testable — the same convention as
+    // `seed_local_congestion_and_publish`. Used by the inline decode-guard reconcile
+    // below (`highest_available(now_ms)` reads availability windows against it).
+    now_ms: u64,
 ) {
     // On (re)connect the relay also allocated a fresh empty layer-preference map
     // for the new session_id (fail-open -> every layer forwarded). Clear the
@@ -1003,6 +1093,47 @@ fn handle_connected_reconnect_resets(
     if let Some(inner) = Weak::upgrade(inner) {
         if let Ok(mut inner) = inner.try_borrow_mut() {
             inner.layer_preference_sender.reset_for_reconnect();
+
+            // Issue #1700 (+ re-election-fallback fix): snap every decode guard to
+            // highest_available ONLY on a genuinely FRESH relay session. A fresh session
+            // (full reconnect, or a re-election that PROCEEDED to a new winner) gets a new
+            // `own_session_id` and an empty recorded LAYER_PREFERENCE map → the relay fails
+            // open and forwards every layer, so highest_available is exactly what it
+            // forwards and the snap is correct (cuts the ~5s quality-restore stall). On the
+            // re-election ABORT/FALLBACK path the manager reverts to the OLD connection and
+            // re-emits `Connected` WITHOUT changing `own_session_id` — the relay still holds
+            // the OLD recorded prefs (e.g. a peer capped to L0), so snapping the guard UP to
+            // highest_available would make it LEAD the still-stale wire → the relay
+            // exact-match-forwards only the old layer → the guard rejects every frame → the
+            // #1695 ≤5s freeze. So we gate on a session CHANGE: snap only when own_session_id
+            // differs from the session we last reconciled against. On a same-session
+            // fallback we skip the snap entirely — guards stay at their existing reconciled
+            // values, which already match the relay's still-recorded prefs (guard==wire
+            // preserved, the BASE behavior that was always safe here). reset_for_reconnect
+            // above cleared `last_sent`, but on the fallback that only desyncs the client's
+            // belief, not the guard — the next ~5s tick re-publishes and re-reconciles.
+            // `own_session_id` is `Copy` (Option<u64>); read it into a local BEFORE the
+            // `&mut inner.peer_decode_manager` reconcile call to avoid an aliasing borrow.
+            let current_session = inner.own_session_id;
+            let fresh_session = current_session != inner.last_reconnect_reconciled_session;
+            if fresh_session {
+                let ups = inner
+                    .peer_decode_manager
+                    .reconcile_decode_guards_to_wire(None, now_ms);
+                for (user_id, sid, mt) in &ups {
+                    inner
+                        .peer_decode_manager
+                        .send_keyframe_request(user_id, *sid, *mt);
+                }
+            }
+            // Record the session we (possibly) reconciled against so a subsequent
+            // same-session Connected (re-election fallback) is recognized as NOT fresh.
+            // The &mut borrow from reconcile has ended, so this Copy write is safe. Always
+            // update — even when own_session_id is None or unchanged — so the field tracks
+            // the latest observed session. (Unconditional is correct: on a same-session
+            // fallback current_session == last_reconnect_reconciled_session already, so this
+            // is a no-op; on a fresh session it advances the watermark.)
+            inner.last_reconnect_reconciled_session = current_session;
 
             // Relay layer-union cap reset (issue #1108, Stage 3). The NEW
             // relay/session starts with an empty receiver set -> no union yet ->
@@ -1200,6 +1331,22 @@ fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Opti
             .peer_decode_manager
             .seed_early_congestion_for_connected_peers(now_ms, &bounds);
 
+        // #1256: the seed helpers write the decode guard LID-UNAWARE (they fold the
+        // user `bounds` but not the size lid). Re-lid the guards so guard == the
+        // lid-aware wire `current_desired_preferences` is about to publish — otherwise
+        // a small-capped peer whose chooser the seed flips to L1 would have guard=L1
+        // / wire=L0 and freeze until the next 5s tick. apply_size_lid_to_decode_guards
+        // only LOWERS to the lid (never undoes the seed's congestion step below it),
+        // calls no choose(), and returns visibility-gated up-switches to keyframe.
+        let up = inner
+            .peer_decode_manager
+            .apply_size_lid_to_decode_guards(now_ms, &bounds);
+        for (user_id, sid, mt) in &up {
+            inner
+                .peer_decode_manager
+                .send_keyframe_request(user_id, *sid, *mt);
+        }
+
         // Publish the resulting desired map through the existing sender so
         // dedup/rate-limit invariants hold. The map is clamped to the user's
         // bounds and gated to layers below each kind's highest-available, mirroring
@@ -1208,14 +1355,7 @@ fn arm_early_seed_timer(inner_weak: Weak<RefCell<Inner>>, slot: &Rc<RefCell<Opti
         let desired = inner
             .peer_decode_manager
             .current_desired_preferences(now_ms, &bounds);
-        if let Some(entries) = inner
-            .layer_preference_sender
-            .take_if_changed(&desired, now_ms)
-        {
-            let user_id = inner.options.user_id.clone();
-            let cc = inner.connection_controller.clone();
-            send_layer_preference_via(&cc, &user_id, entries);
-        }
+        publish_and_reconcile(&mut inner, &desired, now_ms);
     });
 
     *slot_borrow = Some(interval);
@@ -1367,6 +1507,7 @@ impl VideoCallClient {
                     last_known_server: None,
                 },
                 own_session_id: None,
+                last_reconnect_reconciled_session: None,
                 session_id_history: std::collections::VecDeque::new(),
                 aes: aes.clone(),
                 rsa: Rc::new(RsaWrapper::new(options.enable_e2ee)),
@@ -1615,6 +1756,10 @@ impl VideoCallClient {
                                 &screen_keyframe_cooldown_reset,
                                 &audio_congestion_bitrate_floor,
                                 &audio_detector_reconnect_reseed,
+                                // #1700: read the wall clock at the dispatch boundary and
+                                // inject it so the handler's inline decode-guard reconcile
+                                // is clock-free / host-testable.
+                                js_sys::Date::now() as u64,
                             );
 
                             // On (re)connect the session_id changed and the
@@ -1717,14 +1862,7 @@ impl VideoCallClient {
                                         reporter.update_received_layers(&desired);
                                     }
                                 }
-                                if let Some(entries) = inner
-                                    .layer_preference_sender
-                                    .take_if_changed(&desired, now_ms)
-                                {
-                                    let user_id = inner.options.user_id.clone();
-                                    let cc = inner.connection_controller.clone();
-                                    send_layer_preference_via(&cc, &user_id, entries);
-                                }
+                                publish_and_reconcile(&mut inner, &desired, now_ms);
                             }
                             Err(_) => {
                                 // Transient borrow conflict — another callback
@@ -2210,16 +2348,92 @@ impl VideoCallClient {
             let desired = inner
                 .peer_decode_manager
                 .tick_layer_choosers(now_ms, &bounds);
-            if let Some(entries) = inner
-                .layer_preference_sender
-                .take_if_changed(&desired, now_ms)
-            {
-                let user_id = inner.options.user_id.clone();
-                let cc = inner.connection_controller.clone();
-                send_layer_preference_via(&cc, &user_id, entries);
-            }
+            publish_and_reconcile(&mut inner, &desired, now_ms);
         } else {
             warn!("set_receive_layer_bounds: inner busy, bounds not applied this call");
+        }
+    }
+
+    /// Push the per-peer rendered-tile-size hints (issue #1256 Phase 1). Keyed by
+    /// session_id; `TileHint::Capped { device_px_h }` lets the receiver LID the
+    /// requested simulcast layer to the smallest layer covering the tile,
+    /// `TileHint::Uncapped` (or an absent peer) applies no lid. Applies IMMEDIATELY:
+    /// it lowers/raises each peer's decode guard via
+    /// [`PeerDecodeManager::apply_size_lid_to_decode_guards`] (which composes the lid
+    /// with the chooser's EXISTING pick — it does NOT call `choose()`), requests a
+    /// keyframe on any up-switch, and re-sends the (now-lidded) LAYER_PREFERENCE via
+    /// the READ-ONLY [`PeerDecodeManager::current_desired_preferences`] path — so a
+    /// tile-size change takes effect without waiting for the next monitor tick.
+    /// AUDIO is never size-capped. No wire/protobuf/relay change — the lid rides the
+    /// existing per-receiver LAYER_PREFERENCE clamp seam.
+    ///
+    /// Why NOT `tick_layer_choosers` here (issue #1256 resize-cadence fix): the UI
+    /// pushes this on EVERY render off the RAW (un-debounced) resize listener, so a
+    /// resize drag produces ~10-100 pushes within ONE ~1s loss window. The chooser's
+    /// `choose()` DOWN path has no dwell gate — it steps down ONE rung per call, fed
+    /// the SAME congested `last_video_downlink` sample (only overwritten on ~1s
+    /// rollover) — so routing this through the tick would over-collapse an
+    /// already-congested receiver (2 calls flatten a 3-layer stream to base) and bank
+    /// the sticky latch + churn the clean-window counters far faster than the intended
+    /// 5s cadence, then pay the ~15s-per-rung climb-back. The guard-apply path advances
+    /// NO chooser hysteresis, so it is idempotent: N calls in one window re-assert the
+    /// SAME lid against the SAME chooser state, never compounding. The 5s monitor tick
+    /// still owns `choose()`-driven adaptation AND its own lid fold + keyframe-on-
+    /// up-switch (unchanged). `set_receive_layer_bounds` keeps using `tick_layer_choosers`
+    /// because it is human-CLICK-paced (not a continuous drag), so it is not the same risk.
+    ///
+    /// Returns `true` when the inner borrow SUCCEEDED: the hint was applied to the
+    /// decode guards and a preference publish was ATTEMPTED. The publish itself may
+    /// have been a no-op or rate-limited by `take_if_changed` (the 200ms
+    /// `LAYER_PREFERENCE_MIN_UPDATE_MS` limiter), in which case the wire re-syncs on
+    /// the next monitor tick — `true` does NOT guarantee a packet went out, only that
+    /// the guard was lidded and the publish path ran. Returns `false` ONLY when the
+    /// inner borrow was CONTENDED (a `try_borrow_mut` conflict) and nothing was
+    /// applied. The UI dedup MUST only record the hint map as delivered when this
+    /// returns `true`, so a dropped push is retried on the next render instead of
+    /// stranding a stale size cap (issue #1256 — a resize-to-small that loses the
+    /// borrow race would otherwise keep pulling the high layer indefinitely).
+    pub fn set_peer_tile_hints(&self, hints: std::collections::HashMap<u64, TileHint>) -> bool {
+        if let Ok(mut inner) = self.inner.try_borrow_mut() {
+            inner.peer_decode_manager.set_peer_tile_hints(hints);
+            let now_ms = js_sys::Date::now() as u64;
+            let bounds = inner.receive_layer_bounds;
+            // #1256 resize-cadence fix: apply the lid to the decode guards WITHOUT
+            // calling choose() (no congestion down-step / sticky banking on a resize
+            // drag's N pushes). The 5s monitor tick still owns choose()-driven
+            // adaptation AND its own lid fold + keyframe-on-up-switch (unchanged).
+            let up_switches = inner
+                .peer_decode_manager
+                .apply_size_lid_to_decode_guards(now_ms, &bounds);
+            // Publish the (lid-aware, durable) preference via the READ-ONLY path so the
+            // wire cap survives the early-seed/congestion republishers (P1) — and so
+            // this push advances NO chooser hysteresis. Compute the desired map BEFORE
+            // the &mut publish (this read-only call borrows the manager immutably).
+            let desired = inner
+                .peer_decode_manager
+                .current_desired_preferences(now_ms, &bounds);
+            // #1701: emit the size-lid up-switch keyframe requests ONLY if the paired publish
+            // was ACCEPTED (the up-raise actually reached the wire). On the RAW ~60Hz resize
+            // feed a grow that re-crosses a size-cap boundary within 200ms gets its publish
+            // rate-limited by take_if_changed → the reconcile inside publish_and_reconcile
+            // pulls the guard back DOWN to the stale wire, so the up-switch PLI would be wasted
+            // (relay drops it) plus seq-reanchor churn. Suppress that wasted PLI. The
+            // down-reconcile inside publish_and_reconcile STILL runs every call (it is NOT
+            // gated) — the guard never leads the wire (#1695 invariant preserved), the tile
+            // shows live low-res, never freezes. When the publish IS accepted the wire moved
+            // up and the PLI is justified, so we still send it.
+            let publish_accepted = publish_and_reconcile(&mut inner, &desired, now_ms);
+            if publish_accepted {
+                for (user_id, sid, mt) in &up_switches {
+                    inner
+                        .peer_decode_manager
+                        .send_keyframe_request(user_id, *sid, *mt);
+                }
+            }
+            true
+        } else {
+            warn!("set_peer_tile_hints: inner busy, hints not applied this call");
+            false
         }
     }
 
@@ -3127,19 +3341,22 @@ impl Inner {
         let seeded = self
             .peer_decode_manager
             .seed_downlink_congestion_for_connected_peers(now_ms, &bounds, exempt_speakers);
+        // #1256: re-lid the guards so guard == the lid-aware wire before publish
+        // (see the early-seed timer for the rationale). Only lowers to the lid; no
+        // choose(); returns visibility-gated up-switches to keyframe.
+        let up = self
+            .peer_decode_manager
+            .apply_size_lid_to_decode_guards(now_ms, &bounds);
+        for (user_id, sid, mt) in &up {
+            self.peer_decode_manager
+                .send_keyframe_request(user_id, *sid, *mt);
+        }
         // Publish the resulting (possibly held) preference via the existing
         // change-detected sender, exactly as `set_receive_layer_bounds` does.
         let desired = self
             .peer_decode_manager
             .current_desired_preferences(now_ms, &bounds);
-        if let Some(entries) = self
-            .layer_preference_sender
-            .take_if_changed(&desired, now_ms)
-        {
-            let user_id = self.options.user_id.clone();
-            let cc = self.connection_controller.clone();
-            send_layer_preference_via(&cc, &user_id, entries);
-        }
+        publish_and_reconcile(self, &desired, now_ms);
         seeded
     }
 
@@ -4526,6 +4743,41 @@ mod disconnect_tests {
             "send_packet must be cleared after disconnect()"
         );
     }
+
+    /// #1256: set_peer_tile_hints must return `false` when `inner` is already borrowed
+    /// (the push is dropped on contention) and `true` on a clean apply. The UI dedup
+    /// keys off this to retry a dropped push instead of stranding a stale size cap.
+    ///
+    /// MUTATION: making the method always return `true` (or dropping the `else { false }`)
+    /// breaks the contended-false assertion; making it always return `false` breaks the
+    /// clean-true assertion.
+    #[wasm_bindgen_test]
+    fn set_peer_tile_hints_returns_false_when_inner_borrowed() {
+        use crate::decode::layer_chooser::TileHint;
+        use std::collections::HashMap;
+        let client = VideoCallClient::new(build_test_options());
+        let hints: HashMap<u64, TileHint> =
+            HashMap::from([(1u64, TileHint::Capped { device_px_h: 360 })]);
+        // Clean apply: no outstanding borrow -> true.
+        assert!(
+            client.set_peer_tile_hints(hints.clone()),
+            "set_peer_tile_hints must return true when it applies the push"
+        );
+        // Contended: hold a live mutable borrow on `inner` so the internal try_borrow_mut
+        // fails -> the push is dropped and the method returns false.
+        {
+            let _guard = client.inner.borrow_mut();
+            assert!(
+                !client.set_peer_tile_hints(hints.clone()),
+                "set_peer_tile_hints must return false when inner is already borrowed (push dropped)"
+            );
+        }
+        // After the guard drops, a fresh call applies again -> true (the drop was transient).
+        assert!(
+            client.set_peer_tile_hints(hints),
+            "set_peer_tile_hints must return true again once the borrow is released"
+        );
+    }
 }
 
 #[cfg(all(test, target_arch = "wasm32"))]
@@ -4896,6 +5148,7 @@ mod cooldown_reset_hardening_tests {
     use super::arm_camera_keyframe_cooldown_reset;
     use super::arm_keyframe_cooldown_reset_slot;
     use super::handle_connected_reconnect_resets;
+    use super::publish_and_reconcile;
     use super::VideoCallClient;
     use super::VideoCallClientOptions;
     use std::cell::RefCell;
@@ -5042,6 +5295,140 @@ mod cooldown_reset_hardening_tests {
         );
     }
 
+    /// #1695 END-TO-END WIRING: the decode guard must not lead the RATE-LIMITED
+    /// `LAYER_PREFERENCE` wire. This drives the REAL production chokepoint
+    /// `publish_and_reconcile` (the SAME free function every publish site calls)
+    /// against a real host-built `Inner`, exercising the actual
+    /// `take_if_changed -> last_sent -> reconcile_decode_guards_to_wire` sequence —
+    /// NOT a hand-fabricated `last_sent` map. The existing
+    /// `reconcile_decode_guards_to_wire_pins_guard_to_wire_not_above`
+    /// (peer_decode_manager.rs) guards the reconcile METHOD in isolation; this guards
+    /// the WIRING: that `publish_and_reconcile` reconciles the guard to the
+    /// rate-limited (stale) `last_sent`, the integration the bug actually depends on.
+    ///
+    /// Scenario (the real #1256/#1695 bug):
+    ///   t=1000  publish_and_reconcile(desired={(sid,Video):0}) — first send is
+    ///           ACCEPTED, promoting `last_sent` to L0; reconcile pins guard to L0.
+    ///   (lid)   `apply_size_lid_to_decode_guards` (the PRODUCTION method that, in
+    ///           `seed_local_congestion_and_publish`, immediately raises the
+    ///           exact-match guard) raises the guard to the top (L2) — the guard now
+    ///           LEADS the wire, which is still L0.
+    ///   t=1100  publish_and_reconcile(desired={(sid,Video):2}) — only 100ms later, so
+    ///           `take_if_changed` is RATE-LIMITED (<200ms): it returns None WITHOUT
+    ///           promoting `last_sent` (still L0). `publish_and_reconcile` then reads
+    ///           that stale `last_sent` and reconciles the guard back DOWN to L0.
+    /// The relay forwards only L0; the exact-match guard must accept L0, not reject it
+    /// at L2 (the ≤5s freeze this fix removes).
+    ///
+    /// MUTATION: reverting EITHER production behavior breaks this test —
+    ///   (a) delete the `reconcile_decode_guards_to_wire(...)` call from
+    ///       `publish_and_reconcile` (the exact wiring revert Codex described): the
+    ///       guard stays at the leading L2 and the final `selected_video_layer() == 0`
+    ///       assertion FAILS; AND
+    ///   (b) make `take_if_changed` PROMOTE `last_sent` on its rate-limit branch (so
+    ///       the wire jumps to L2): the `last_sent` precondition assertion (still L0)
+    ///       FAILS, and the guard reconciles UP to L2 so `selected_video_layer() == 0`
+    ///       FAILS too.
+    /// The existing isolated reconcile test passes under BOTH reverts (it bypasses
+    /// `publish_and_reconcile` and hand-builds `last_sent`), which is precisely the
+    /// coverage gap this test closes.
+    ///
+    /// HOST `#[test]` (not `#[wasm_bindgen_test]`) so it runs in per-PR CI under
+    /// `cargo test -p videocall-client --lib`. `connection_controller` is `None` on
+    /// the test client, so `send_layer_preference_via` is a harmless no-op (logs and
+    /// returns) — the network send is irrelevant to the guard==wire invariant.
+    #[test]
+    fn publish_and_reconcile_pulls_guard_to_rate_limited_wire() {
+        use std::collections::HashMap;
+
+        let client = build_test_client();
+        let mut inner = client.inner.borrow_mut();
+
+        // A CONNECTED peer with a learned 3-layer ladder (highest_available == 2).
+        let sid = 700u64;
+        inner
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(sid);
+        let open = ReceiveLayerBounds::default();
+
+        // ---- t=1000: first publish of a LOW cap (L0) is ACCEPTED. This drives the
+        // REAL take_if_changed: first send (last_sent was None) is never rate-limited,
+        // so it promotes last_sent to {(sid,Video):0} and stamps the rate-limit clock.
+        let mut desired_low: HashMap<(u64, PrefMediaKind), u32> = HashMap::new();
+        desired_low.insert((sid, PrefMediaKind::Video), 0);
+        publish_and_reconcile(&mut inner, &desired_low, 1000);
+        // After the accepted publish the wire (last_sent) records L0 for this source.
+        assert_eq!(
+            inner
+                .layer_preference_sender
+                .last_sent()
+                .and_then(|m| m.get(&(sid, PrefMediaKind::Video)).copied()),
+            Some(0),
+            "precondition: the first publish was accepted and recorded L0 on the wire"
+        );
+        // ...and the guard was reconciled to that wire (L0).
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&sid)
+                .unwrap()
+                .selected_video_layer(),
+            0,
+            "precondition: guard reconciled to the accepted wire layer (L0)"
+        );
+
+        // ---- The lid's immediate up-raise: the PRODUCTION method that, inside
+        // `seed_local_congestion_and_publish`, raises the exact-match guard right
+        // before the paired publish. With open bounds and an unconstrained fresh
+        // chooser it raises the guard to the publisher's top (L2). The guard now LEADS
+        // the wire (guard=L2, last_sent=L0) — exactly the #1256 desync window.
+        let _ = inner
+            .peer_decode_manager
+            .apply_size_lid_to_decode_guards(1100, &open);
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&sid)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "precondition: the size-lid raise put the guard at the top (L2), leading the L0 wire"
+        );
+
+        // ---- t=1100 (only 100ms after the accepted send, < 200ms
+        // LAYER_PREFERENCE_MIN_UPDATE_MS): publish the UP-switch to L2. The REAL
+        // take_if_changed is RATE-LIMITED → returns None WITHOUT promoting last_sent.
+        // publish_and_reconcile then reconciles the guard to that stale wire (L0).
+        let mut desired_up: HashMap<(u64, PrefMediaKind), u32> = HashMap::new();
+        desired_up.insert((sid, PrefMediaKind::Video), 2);
+        publish_and_reconcile(&mut inner, &desired_up, 1100);
+
+        // CRUX (a): the wire was NOT promoted — the rate-limited up-switch left
+        // last_sent at L0. This pins the no-promote-on-rate-limit production behavior;
+        // mutating take_if_changed to promote on rate-limit breaks this.
+        assert_eq!(
+            inner
+                .layer_preference_sender
+                .last_sent()
+                .and_then(|m| m.get(&(sid, PrefMediaKind::Video)).copied()),
+            Some(0),
+            "#1695: a rate-limited up-switch must NOT promote the wire (still L0)"
+        );
+        // CRUX (b): the guard was pulled DOWN to the rate-limited wire (L0), NOT left
+        // leading at L2. Deleting the reconcile call from publish_and_reconcile leaves
+        // the guard at L2 and breaks this — the wiring revert Codex named.
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&sid)
+                .unwrap()
+                .selected_video_layer(),
+            0,
+            "#1695: publish_and_reconcile must pull the guard DOWN to the rate-limited \
+             wire (L0), not leave it leading at L2 (the <=5s freeze this fix removes)"
+        );
+    }
+
     #[test]
     fn connected_reset_helper_arms_real_slot_while_real_inner_is_borrowed() {
         let client = build_test_client();
@@ -5058,6 +5445,7 @@ mod cooldown_reset_hardening_tests {
             &client.screen_keyframe_cooldown_reset,
             &client.audio_congestion_bitrate_floor,
             &client.audio_detector_reconnect_reseed,
+            1100,
         );
 
         assert!(
@@ -5114,6 +5502,7 @@ mod cooldown_reset_hardening_tests {
             &client.screen_keyframe_cooldown_reset,
             &client.audio_congestion_bitrate_floor,
             &client.audio_detector_reconnect_reseed,
+            1100,
         );
 
         // The floor must be fail-open DESPITE the held borrow.
@@ -5356,6 +5745,7 @@ mod cooldown_reset_hardening_tests {
             &client.screen_keyframe_cooldown_reset,
             &client.audio_congestion_bitrate_floor,
             &client.audio_detector_reconnect_reseed,
+            1100,
         );
 
         assert_eq!(
@@ -5385,6 +5775,283 @@ mod cooldown_reset_hardening_tests {
                 .load(Ordering::Acquire),
             "reconnect must set the detector reconnect-reseed flag so the mic \
              detector re-seeds its windows on the fresh session (#1398 reconnect P1)"
+        );
+    }
+
+    /// Issue #1700: on a genuinely FRESH relay session (full reconnect, or a
+    /// re-election that PROCEEDED to a new winner) the handler must INLINE-reconcile
+    /// every decode guard to `highest_available` (the layer the fresh empty relay
+    /// session fails-open-forwards), not leave it pinned at its pre-reconnect
+    /// (possibly low/base) layer until the next early-seed/~5s monitor tick. Because
+    /// `reset_for_reconnect` clears `last_sent` to None, the inline
+    /// `reconcile_decode_guards_to_wire(None, …)` pulls each guard to
+    /// `highest_available` — exactly the same guard==wire invariant the #1695
+    /// `publish_and_reconcile` chokepoint maintains, applied at reset time.
+    ///
+    /// FRESH-SESSION SETUP (the re-election-fallback fix gate, #1700): the snap is
+    /// gated on `own_session_id != last_reconnect_reconciled_session`. A virgin
+    /// `build_test_client` has BOTH at `None` (equal → not fresh → snap skipped), so
+    /// this test sets `own_session_id = Some(42)` and leaves
+    /// `last_reconnect_reconciled_session` at its `None` default to model a real
+    /// session change (42 != None → fresh → snap fires). This is the FRESH branch of
+    /// the gate; the same-session fallback branch is covered by
+    /// `reconnect_same_session_fallback_does_not_snap_guard_above_wire`.
+    ///
+    /// We drive the peer's guard DOWN to L0 (via a real accepted low-cap publish
+    /// through `publish_and_reconcile`, mirroring
+    /// `publish_and_reconcile_pulls_guard_to_rate_limited_wire`), DROP the inner
+    /// borrow so the handler's own `try_borrow_mut` succeeds, then run the real
+    /// reconnect handler and assert the guard SNAPPED back up to the publisher's top
+    /// (L2 = `highest_available` for the zero-loss top peer).
+    ///
+    /// MUTATION CONTRACT: delete the inline
+    /// `reconcile_decode_guards_to_wire(None, …)` call (and its drain loop) from
+    /// `handle_connected_reconnect_resets` → the guard stays at the pre-reconnect L0
+    /// and the `selected_video_layer() == 2` assertion FAILS.
+    #[test]
+    fn reconnect_inline_reconcile_snaps_guard_to_highest_available() {
+        use std::collections::HashMap;
+
+        let client = build_test_client();
+
+        // A CONNECTED peer with a learned 3-layer ladder (highest_available == 2).
+        let sid = 700u64;
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .insert_zero_loss_top_peer_for_test(sid);
+
+            // FRESH-SESSION SETUP (#1700 gate): own_session_id is a NEW session (42)
+            // while last_reconnect_reconciled_session stays at its None default, so the
+            // handler sees own_session_id != last_reconnect_reconciled_session → fresh →
+            // the snap fires. Without this, a virgin client has both at None (equal →
+            // not fresh) and the gated snap would be skipped. (Private Inner field,
+            // accessible from this same module — the other tests here touch private
+            // fields like peer_decode_manager directly too.)
+            inner.own_session_id = Some(42);
+
+            // Drive the guard DOWN to a non-top value so the reconnect snap is
+            // observable: a first publish of a LOW cap (L0) is accepted (last_sent was
+            // None → never rate-limited), and publish_and_reconcile reconciles the
+            // guard to that accepted wire (L0).
+            let mut desired_low: HashMap<(u64, PrefMediaKind), u32> = HashMap::new();
+            desired_low.insert((sid, PrefMediaKind::Video), 0);
+            publish_and_reconcile(&mut inner, &desired_low, 1000);
+            assert_eq!(
+                inner
+                    .peer_decode_manager
+                    .get(&sid)
+                    .unwrap()
+                    .selected_video_layer(),
+                0,
+                "precondition: guard driven DOWN to L0 by the accepted low-cap publish"
+            );
+            // The borrow MUST be dropped before calling the handler: it upgrades the
+            // Weak and does its OWN try_borrow_mut — holding a borrow makes it skip the
+            // inner block (logging "inner busy"), which would DEFEAT this test.
+        }
+
+        // The real Connected/reconnect reset path (issue #1700 inline reconcile lives
+        // inside its try_borrow_mut block).
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+            &client.audio_congestion_bitrate_floor,
+            &client.audio_detector_reconnect_reseed,
+            // now_ms within the zero-loss peer's 4000ms availability window
+            // (observations at t=1000) so highest_available == 2 (the top).
+            1100,
+        );
+
+        let inner = client.inner.borrow();
+        // #1700: the inline reconcile (None wire → unwrap_or_else(highest_available))
+        // snapped the guard from the pre-reconnect L0 up to the top (L2). A peer at top
+        // has NO last_sent entry, and reset_for_reconnect cleared last_sent to None
+        // anyway, so the None-wire reconcile correctly pulls the guard to
+        // highest_available == 2 (the layer the fresh empty relay session
+        // fails-open-forwards). Deleting the inline reconcile leaves the guard at L0
+        // and FAILS this.
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&sid)
+                .unwrap()
+                .selected_video_layer(),
+            2,
+            "#1700: reconnect must inline-reconcile the guard UP to highest_available \
+             (L2), not leave it stranded at the pre-reconnect L0 for up to one ~5s tick"
+        );
+        // Proves we exercised the RESET path (not a tick): reset_for_reconnect cleared
+        // the wire. (A peer at top also has no last_sent entry, so this stays None.)
+        assert!(
+            inner.layer_preference_sender.last_sent().is_none(),
+            "#1700: reset_for_reconnect must have cleared the wire — confirms the snap \
+             came from the reset path's None-wire reconcile, not a stale tick"
+        );
+    }
+
+    /// Issue #1700 (re-election abort/fallback fix): on a SAME-session `Connected`
+    /// re-emit the handler must NOT snap the decode guard up to `highest_available`.
+    /// The RTT-watchdog re-election abort/fallback path
+    /// (`connection_manager.rs` ~1751-1844) reverts to the OLD connection, restores
+    /// `ElectionState::Elected` with the OLD connection_id, and calls `report_state()`
+    /// (→ emits `ConnectionState::Connected`) and `return`s WITHOUT ever touching
+    /// `own_session_id` — so the relay session is UNCHANGED and still holds the OLD
+    /// recorded LAYER_PREFERENCE prefs (e.g. a peer capped to L0). The state is
+    /// `Connected` (not `Failed`), so `clear_all_peers` does NOT run and the peer's
+    /// guard + chooser survive. If the handler snapped the guard UP to
+    /// `highest_available` (L2) here, it would LEAD the still-stale wire (relay still
+    /// forwards only L0) → exact-match relay forwards only L0 → the guard rejects every
+    /// L0 frame → the #1695 ≤5s freeze. The fix gates the snap on a session CHANGE:
+    /// when `own_session_id == last_reconnect_reconciled_session` (the fallback case)
+    /// the snap is skipped and the guard is left at its existing reconciled value.
+    ///
+    /// We drive the guard to L0 via the REAL `publish_and_reconcile` chokepoint (its
+    /// accepted `last_sent={(sid,Video):0}` models the relay's still-recorded L0 wire),
+    /// set BOTH `own_session_id` and `last_reconnect_reconciled_session` to the SAME
+    /// value (99) to model the unchanged session, then run the real reconnect handler
+    /// and assert the guard is STILL L0 (NOT snapped to L2).
+    ///
+    /// MUTATION CONTRACT: remove the `if fresh_session` gate (make the reconcile
+    /// unconditional, the buggy 3471ca88 behavior) → the guard snaps to L2 and this
+    /// `== 0` assertion FAILS.
+    ///
+    /// NOTE: `reset_for_reconnect` clears `last_sent` to None INSIDE the handler, so we
+    /// deliberately do NOT assert on `last_sent` here — that is cleared regardless of
+    /// the gate. The load-bearing invariant is purely that the GUARD did not move up.
+    #[test]
+    fn reconnect_same_session_fallback_does_not_snap_guard_above_wire() {
+        use std::collections::HashMap;
+
+        let client = build_test_client();
+
+        // A CONNECTED peer with a learned 3-layer ladder (highest_available == 2).
+        let sid = 700u64;
+        {
+            let mut inner = client.inner.borrow_mut();
+            inner
+                .peer_decode_manager
+                .insert_zero_loss_top_peer_for_test(sid);
+
+            // Drive the guard DOWN to L0 via the REAL chokepoint: a first publish of a
+            // LOW cap (L0) is accepted (last_sent was None → never rate-limited), and
+            // publish_and_reconcile reconciles the guard to that accepted wire (L0).
+            // This last_sent={(sid,Video):0} models the relay STILL forwarding only L0
+            // for the unchanged session.
+            let mut desired_low: HashMap<(u64, PrefMediaKind), u32> = HashMap::new();
+            desired_low.insert((sid, PrefMediaKind::Video), 0);
+            publish_and_reconcile(&mut inner, &desired_low, 1000);
+            assert_eq!(
+                inner
+                    .peer_decode_manager
+                    .get(&sid)
+                    .unwrap()
+                    .selected_video_layer(),
+                0,
+                "precondition: guard driven DOWN to L0 by the accepted low-cap publish"
+            );
+
+            // SAME-SESSION SETUP (the re-election abort/fallback case): own_session_id
+            // is UNCHANGED relative to the last reconcile — model that by setting BOTH
+            // to the same value (99). own_session_id == last_reconnect_reconciled_session
+            // → NOT fresh → the handler must SKIP the snap. (Private Inner fields,
+            // accessible from this same module.)
+            inner.own_session_id = Some(99);
+            inner.last_reconnect_reconciled_session = Some(99);
+
+            // Borrow dropped before the handler (it does its own try_borrow_mut).
+        }
+
+        // The real Connected/reconnect reset path. On a SAME-session re-emit the gated
+        // inline reconcile must NOT fire.
+        handle_connected_reconnect_resets(
+            &Rc::downgrade(&client.inner),
+            &client.early_seed_timer,
+            &client.camera_keyframe_cooldown_reset,
+            &client.screen_keyframe_cooldown_reset,
+            &client.audio_congestion_bitrate_floor,
+            &client.audio_detector_reconnect_reseed,
+            1100,
+        );
+
+        let inner = client.inner.borrow();
+        // The guard must be UNMOVED at L0 — NOT snapped up to highest_available (L2).
+        // Removing the `if fresh_session` gate (the buggy unconditional reconcile)
+        // snaps it to L2 and FAILS this.
+        assert_eq!(
+            inner
+                .peer_decode_manager
+                .get(&sid)
+                .unwrap()
+                .selected_video_layer(),
+            0,
+            "#1700 re-election fallback: same-session Connected must NOT snap the guard \
+             above the relay's still-recorded wire (L0) — snapping to L2 reintroduces \
+             the #1695 freeze"
+        );
+    }
+
+    /// Issue #1701: `publish_and_reconcile` must report whether the paired publish was
+    /// ACCEPTED (true = take_if_changed sent a packet) vs RATE-LIMITED/suppressed
+    /// (false). This bool is the load-bearing signal the #1701 size-lid keyframe gate
+    /// in `set_peer_tile_hints` keys off: it emits the size-lid up-switch PLI ONLY
+    /// when the up-raise actually reached the wire, suppressing the wasted PLI/seq
+    /// re-anchor churn on a rate-limited resize-grow (the reconcile pulls the guard
+    /// back DOWN to the stale wire, so the PLI would be dropped by the relay).
+    ///
+    /// We pin the production signal directly at its true seam (we cannot set a peer
+    /// visible+enabled from this module — the `connected_peers` map is private to
+    /// PeerDecodeManager — so the global keyframe counter is not drivable here; the
+    /// bool return IS the signal the suppression depends on, per CLAUDE.md "test the
+    /// production signal the change keys off").
+    ///
+    /// MUTATION CONTRACT: make `publish_and_reconcile` always return `true` (drop the
+    /// accepted/false branch) → the t=1100 `== false` assertion FAILS; the suppression
+    /// in `set_peer_tile_hints` would then emit the wasted PLI on every rate-limited
+    /// resize-grow push.
+    #[test]
+    fn publish_and_reconcile_reports_rate_limited_as_not_accepted() {
+        use std::collections::HashMap;
+
+        let client = build_test_client();
+        let mut inner = client.inner.borrow_mut();
+
+        // A CONNECTED peer with a learned 3-layer ladder (highest_available == 2).
+        let sid = 700u64;
+        inner
+            .peer_decode_manager
+            .insert_zero_loss_top_peer_for_test(sid);
+
+        // t=1000: first publish of a LOW cap (L0). last_sent was None → never
+        // rate-limited → ACCEPTED, a packet is sent, last_sent promoted.
+        let mut desired_low: HashMap<(u64, PrefMediaKind), u32> = HashMap::new();
+        desired_low.insert((sid, PrefMediaKind::Video), 0);
+        assert!(
+            publish_and_reconcile(&mut inner, &desired_low, 1000),
+            "#1701: the first publish (last_sent None) is accepted → must return true"
+        );
+
+        // t=1100 (only 100ms later, < 200ms LAYER_PREFERENCE_MIN_UPDATE_MS): a publish
+        // of a DIFFERENT desired (up to L2). take_if_changed is RATE-LIMITED → returns
+        // None → no packet → publish_and_reconcile must return FALSE. THIS is the
+        // signal that gates the wasted size-lid PLI in set_peer_tile_hints.
+        let mut desired_up: HashMap<(u64, PrefMediaKind), u32> = HashMap::new();
+        desired_up.insert((sid, PrefMediaKind::Video), 2);
+        assert!(
+            !publish_and_reconcile(&mut inner, &desired_up, 1100),
+            "#1701: a rate-limited (<200ms) up-switch publish must return false — the \
+             signal that SUPPRESSES the wasted size-lid PLI on a resize-grow"
+        );
+
+        // t=1400 (>200ms after the last accepted send): the same up value is now NOT
+        // rate-limited and IS a change vs the L0 wire → ACCEPTED again → true.
+        assert!(
+            publish_and_reconcile(&mut inner, &desired_up, 1400),
+            "#1701: once the 200ms limiter clears, the up-switch publish is accepted \
+             again → returns true (and the size-lid PLI would be justified)"
         );
     }
 }

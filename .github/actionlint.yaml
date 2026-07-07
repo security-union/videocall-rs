@@ -1,3 +1,9 @@
 self-hosted-runner:
   labels:
     - docker
+    # Custom self-hosted runner labels used across our workflows. Registering
+    # them here stops actionlint from reporting every `runs-on: [..., <label>]`
+    # as an unknown-label false positive (it cannot know our private runners).
+    - hcl-ci      # videocallci.fnxlabs.com general CI runners
+    - hcl-ci-bvt  # videocallci BVT (browser verification test) runners
+    - ascend      # Ascend/conceptcar7 self-hosted runner

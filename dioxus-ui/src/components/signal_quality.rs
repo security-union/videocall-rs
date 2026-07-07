@@ -2311,7 +2311,7 @@ pub fn SignalQualityPopup(props: SignalQualityPopupProps) -> Element {
                         }
                     }
                 }
-                p { style: "color: {theme_color::TEXT_SUBTLE}; font-size: 12px;", "No data yet." }
+                p { style: "color: {theme_color::TEXT_SUBTLE}; font-size: var(--fs-3);", "No data yet." }
             }
         };
     }

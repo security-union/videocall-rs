@@ -58,7 +58,7 @@ pub fn UpdateDisplayNameModal(
                     h3 { style: "margin-top:0;", "Edit your display name" }
 
                     p {
-                        style: "color:#AEAEB2; margin-top:0.25rem;",
+                        style: "color:var(--text-secondary); margin-top:var(--space-1);",
                         "Your new name will be visible to other participants in real-time."
                     }
 
@@ -144,11 +144,11 @@ pub fn UpdateDisplayNameModal(
                         }
 
                         if let Some(err) = error_message() {
-                            p { style: "color:#FF453A; margin-top:6px; font-size:12px;", "{err}" }
+                            p { style: "color:var(--error); margin-top:6px; font-size:var(--fs-3);", "{err}" }
                         }
 
                         div {
-                            style: "display:flex; gap:8px; justify-content:flex-end; margin-top:12px;",
+                            style: "display:flex; gap:var(--space-2); justify-content:flex-end; margin-top:var(--space-3);",
 
                             button {
                                 r#type: "button",

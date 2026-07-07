@@ -442,9 +442,10 @@ pub fn MeetingSettingsPage(id: String) -> Element {
 
             if allow_guests_toggle() {
                 div { class: "settings-option-row",
-                    style: "flex-direction: column; align-items: flex-start; gap: 0.25rem;",
+                    style: "flex-direction: column; align-items: flex-start; gap: var(--space-1);",
                     span {
                         class: "settings-option-label",
+                        // @token-exempt: 0.8rem falls between --fs-3 (12px) and --fs-4 (13px)
                         style: "font-size: 0.8rem; color: var(--text-subtle, rgba(255,255,255,0.5));",
                         "Guest join link:"
                     }

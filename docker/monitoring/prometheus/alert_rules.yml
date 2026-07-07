@@ -88,3 +88,51 @@ groups:
     annotations:
       summary: "Audio playout latency > 1800ms (threshold needs NetEQ tuning)"
       description: "{{ $labels.peer_name }} as seen by {{ $labels.reporter_name }} (session {{ $labels.session_id }}) audio is {{ $value | printf \"%.0f\" }}ms behind live. Threshold inherited from video, pending NetEQ tuning (#1360)."
+
+# =====================================================================
+# videocall.relay_viewport (#1437)
+#
+# This alert INTENTIONALLY derives the camera-blackout signature from the
+# filtered-vs-forwarded ratio rather than from the relay_viewport_set_size
+# gauge. That gauge still exists (it is set on the viewport-update path and
+# swept on room drain), but it is per-room LAST-WRITER-WINS across the
+# receivers in a room and so cannot distinguish a legitimately idle room from a
+# collapsed one. The ratio of the two per-room counters is unambiguous:
+# relay_viewport_filtered_total{room} (intentional off-screen VIDEO drops) and
+# relay_viewport_forwarded_total{room} (VIDEO that passed the filter). A room
+# that is dropping VIDEO while forwarding ~none is a total blackout for that
+# room. relay_viewport_nonvideo_at_drop_branch_total{room} is the #1437
+# invariant tripwire — it must ALWAYS be 0; any increase means the #988
+# is_video guard regressed.
+# =====================================================================
+- name: videocall.relay_viewport
+  rules:
+  # Blackout signature: VIDEO drops are climbing while forwarded is ~zero. A
+  # healthy room forwards many VIDEO packets/sec, so forwarded < 0.1/s while
+  # drops are nonzero means effectively NOTHING is getting through for that
+  # room = total camera blackout. The 0.1/s epsilon (not == 0) avoids flapping
+  # on a single straggler packet and tolerates rate()-window edge effects.
+  - alert: ViewportBlackout
+    expr: rate(relay_viewport_filtered_total[5m]) > 0 and rate(relay_viewport_forwarded_total[5m]) < 0.1
+    for: 5m
+    labels:
+      severity: critical
+      component: relay-viewport
+    annotations:
+      summary: "Viewport blackout in room {{ $labels.room }}"
+      description: "Room {{ $labels.room }} is dropping VIDEO via the viewport filter ({{ $value }}/s filtered) while forwarding effectively none — total camera blackout for the room (#988/#1437)."
+
+  # Invariant breach: the #1437 tripwire incremented. This counter must ALWAYS
+  # be 0; any nonzero means a non-VIDEO packet reached the viewport drop branch,
+  # i.e. the #988 is_video guard regressed. `for: 1m` debounces a single scrape
+  # blip; severity critical because a structural-invariant breach is a bug, not
+  # a tuning issue.
+  - alert: ViewportNonVideoInvariantBreach
+    expr: increase(relay_viewport_nonvideo_at_drop_branch_total[5m]) > 0
+    for: 1m
+    labels:
+      severity: critical
+      component: relay-viewport-invariant
+    annotations:
+      summary: "Viewport non-VIDEO invariant breach in room {{ $labels.room }}"
+      description: "A non-VIDEO packet reached the viewport drop branch in room {{ $labels.room }} — the #988 is_video guard regressed (#1437). This counter must ALWAYS be 0; observed increase {{ $value }}."

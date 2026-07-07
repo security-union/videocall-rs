@@ -928,6 +928,53 @@ pub fn clamp_observed_layer_id(kind: PrefMediaKind, raw_layer_id: u32) -> u32 {
     raw_layer_id.min(max_layers_for_kind(kind).saturating_sub(1))
 }
 
+/// A per-peer rendered-tile-size hint pushed by the UI (issue #1256 Phase 1).
+/// `Capped { device_px_h }` = the tile is a fixed-size grid thumbnail of this
+/// device-pixel height, so the receiver may LID the requested simulcast layer to
+/// the smallest layer whose native height covers the tile. `Uncapped` = the tile
+/// is pinned / a screen-share panel (or the peer is unknown), so no size lid is
+/// applied and the chooser's full downlink-driven selection stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TileHint {
+    Capped { device_px_h: u32 },
+    Uncapped,
+}
+
+/// Margin by which a tile may exceed a layer's native height before the next
+/// layer up is forced (issue #1256). The tile may be up to 10% taller than a
+/// layer's native height before forcing the next layer up — absorbs boundary
+/// hover/flap so a tile sitting right at a layer boundary does not oscillate.
+pub const SIZE_CAP_MARGIN: f64 = 0.10;
+
+/// Map a rendered device-pixel tile height to the smallest simulcast layer index
+/// that "covers" it (issue #1256 Phase 1). Pure + host-tested.
+///
+/// Returns the smallest layer `i` in `0..=highest_available` whose native height
+/// (from [`received_layer_snapshot`]) times `(1.0 + SIZE_CAP_MARGIN)` is >=
+/// `tile_h_px`. If no layer satisfies it (tile taller than the top layer) returns
+/// `highest_available`. Always within `[0, highest_available]`.
+///
+/// - AUDIO is never size-capped: returns `highest_available` unconditionally
+///   (defensive; the caller never invokes this for audio).
+/// - `tile_h_px == 0` (unknown size) returns `highest_available` (don't cap).
+pub fn size_cap_layer(
+    tile_h_px: u32,
+    highest_available: u32,
+    layer_count: u32,
+    kind: PrefMediaKind,
+) -> u32 {
+    if matches!(kind, PrefMediaKind::Audio) || tile_h_px == 0 {
+        return highest_available;
+    }
+    for i in 0..=highest_available {
+        let native_h = received_layer_snapshot(kind, i, layer_count).height;
+        if native_h as f64 * (1.0 + SIZE_CAP_MARGIN) >= tile_h_px as f64 {
+            return i;
+        }
+    }
+    highest_available
+}
+
 /// Resolve a [`ReceivedLayerSnapshot`] for `kind` at the given decoded
 /// `layer_index`, mapping the layer to its resolution/bitrate via the per-kind
 /// ladder (issue #989, Phase 4). `layer_count` is the number of layers the
@@ -2192,5 +2239,98 @@ mod tests {
             2,
             "clamped observe keeps availability within the 3-layer video ladder"
         );
+    }
+
+    // --- #1256 Phase 1: size_cap_layer boundary table (T1) ---
+    //
+    // Camera ladder (lowest-first): L0 = 640x360, L1 = 960x540, L2 = 1280x720
+    // (confirmed in videocall-aq/src/constants.rs). SIZE_CAP_MARGIN = 0.10, so the
+    // L0 boundary is 360 * 1.1 = 396px, the L1 boundary is 540 * 1.1 = 594px.
+    // Expected indices are asserted as LITERALS (not recomputed via
+    // received_layer_snapshot) so the assertion is an independent source of truth.
+    #[test]
+    fn size_cap_layer_boundary_table() {
+        // Tile == L0 native height -> L0 covers it comfortably (396 >= 360).
+        assert_eq!(size_cap_layer(360, 2, 3, PrefMediaKind::Video), 0);
+
+        // Tile EXACTLY at the L0 margin boundary (360 * 1.1 = 396): L0 still covers
+        // it BECAUSE of the margin. This is the tightest margin guard — dropping the
+        // `* (1.0 + SIZE_CAP_MARGIN)` factor makes the bare comparison `360 >= 396`
+        // false, so L0 falls through to L1 (=> 1) and this assertion fails first.
+        // (NOTE: the `>=` vs `>` distinction is NOT observable for integer tile
+        // heights — `360.0 * 1.1` evaluates to 396.00000000000006 in f64, strictly
+        // greater than 396.0, so both comparisons return L0 here.)
+        assert_eq!(size_cap_layer(396, 2, 3, PrefMediaKind::Video), 0);
+
+        // 360 * 1.1 = 396 >= 378 -> the 10% margin absorbs the overshoot, L0 still
+        // covers. Guards the margin: dropping `* (1.0 + SIZE_CAP_MARGIN)` (i.e.
+        // comparing bare native_h=360 >= 378) makes L0 fail -> L1 (=> 1).
+        assert_eq!(size_cap_layer(378, 2, 3, PrefMediaKind::Video), 0);
+
+        // 396 < 432 -> L0 fails even WITH the margin; L1 (540*1.1=594 >= 432) covers.
+        assert_eq!(size_cap_layer(432, 2, 3, PrefMediaKind::Video), 1);
+
+        // Exact L1 native height -> L1 covers.
+        assert_eq!(size_cap_layer(540, 2, 3, PrefMediaKind::Video), 1);
+
+        // Exact L2 native height -> only L2 (720*1.1=792 >= 720) covers.
+        assert_eq!(size_cap_layer(720, 2, 3, PrefMediaKind::Video), 2);
+
+        // Taller than the top layer -> falls through to highest_available. Guards
+        // the fall-through return: a `return 0` (always-cap-to-base) mutation breaks
+        // this (would yield 0 instead of 2).
+        assert_eq!(size_cap_layer(9999, 2, 3, PrefMediaKind::Video), 2);
+
+        // highest_available == 0: only L0 is allowed, so even a huge tile is pinned
+        // to 0 (the loop range `0..=0` only ever yields 0). Guards the clamp to the
+        // available top.
+        assert_eq!(size_cap_layer(360, 0, 3, PrefMediaKind::Video), 0);
+
+        // Wants L2 by size but highest_available == 1 -> clamped to 1 (the loop
+        // never reaches index 2). Guards the [0, highest_available] clamp.
+        assert_eq!(size_cap_layer(720, 1, 3, PrefMediaKind::Video), 1);
+
+        // AUDIO passthrough: never size-capped, returns highest_available even for a
+        // tiny tile. Guards the audio early-return: removing it would cap audio to 0.
+        assert_eq!(size_cap_layer(50, 2, 3, PrefMediaKind::Audio), 2);
+
+        // tile_h_px == 0 (unknown size) -> don't cap, return highest_available.
+        // Guards the `tile_h_px == 0` early-return.
+        assert_eq!(size_cap_layer(0, 2, 3, PrefMediaKind::Video), 2);
+    }
+
+    // The result is ALWAYS within [0, highest_available] for any tile height —
+    // size_cap_layer must never under- or over-shoot the available range.
+    #[test]
+    fn size_cap_layer_always_within_available_range() {
+        let highest = 2u32;
+        for h in [
+            0u32,
+            1,
+            100,
+            359,
+            360,
+            361,
+            539,
+            540,
+            719,
+            720,
+            5000,
+            u32::MAX,
+        ] {
+            let chosen = size_cap_layer(h, highest, 3, PrefMediaKind::Video);
+            assert!(
+                chosen <= highest,
+                "tile {h}px chose layer {chosen} > highest_available {highest}"
+            );
+        }
+        // And for a 1-layer-available peer, every tile maps to layer 0.
+        for h in [0u32, 1, 360, 720, u32::MAX] {
+            assert_eq!(
+                size_cap_layer(h, 0, 3, PrefMediaKind::Video),
+                0,
+                "tile {h}px with only L0 available must clamp to 0"
+            );
+        }
     }
 }

@@ -70,7 +70,7 @@ pub fn Login() -> Element {
                     h1 { class: "login-title", "videocall.rs" }
                     div {
                         style: "display: flex; flex-direction: column; \
-                                align-items: center; gap: 1rem; padding: 1rem 0;",
+                                align-items: center; gap: var(--space-4); padding: var(--space-4) 0;",
                         div {
                             style: "width: 36px; height: 36px; \
                                     border: 3px solid rgba(255,255,255,0.2); \

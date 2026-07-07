@@ -67,7 +67,7 @@ Every change must satisfy the applicable rules below. These are derived from rec
 
 | If your change... | You MUST... |
 |---|---|
-| **Fixes a bug or changes runtime behavior** | Include a regression test that **FAILS on the un-fixed code**. Reverting the production change must break the test. A test that passes on both the fixed and unfixed code proves nothing. |
+| **Fixes a bug or changes runtime behavior** | Include a regression test that **FAILS on the un-fixed code**. Reverting the production change must break the test. A test that passes on both the fixed and unfixed code proves nothing. **Before declaring a side effect untestable, grep the changed file for `#[cfg(test)]` seams, `RefCell`/interior-mutable fields, and existing test accessors — the recorded data is often already there and only needs a 3-line accessor to expose it. "The decoder is a noop" does not mean the call-site arguments are unobservable.** |
 | **Changes user-facing behavior** (click flow, rendered state, toast, control, overlay, route) | Include a Playwright E2E spec in `e2e/tests/` covering the new flow. "Covered" means the spec has **run green** (local docker e2e stack or scoped CI dispatch) — written-but-never-run does not count. An untagged spec (no `@bvt`) does not run in per-PR CI; validate it another way. |
 | **Includes a new or modified test** | The test must call or import the **production function/path** it claims to guard — not re-implement the logic inline. A test that computes the expected value the same way the production code does is testing its own copy, not the production code. |
 | **Adds or modifies a comment/doc-comment making a behavioral claim** | The claim must be **traceable to code that delivers it**. "Fires regardless of X" requires a code path that provably fires regardless of X. If the claim doesn't match the code, either fix the code or fix the comment — never ship the contradiction. |
@@ -76,7 +76,7 @@ Every change must satisfy the applicable rules below. These are derived from rec
 | **Keys off a "congestion," "pressure," "full," or "backpressure" signal** | Trace the signal to the actual queue/buffer where real backpressure surfaces. Actix mailbox `Full` is a burst absorber, NOT a receiver's downlink. Verify both transports (WS + WT). |
 | **Adds recovery/exit hysteresis (consecutive-success counters, cooldown timers)** | Verify it cannot **wedge** under the condition that triggers it. Strictly-consecutive success counters reset under ongoing contention and can pin a healthy entity indefinitely. Prefer windowed/decaying/time-bounded exits. |
 | **Is a test-reliability or de-flake change** | Demonstrate the spec **actually runs green** after the fix (local docker or CI dispatch). A de-flake PR that hasn't been run proves nothing about reliability. |
-| **Has a merge conflict with the base branch** | Rebase clean before requesting review. Red CI from a merge conflict is a blocker regardless of code quality. |
+| **Has a merge conflict with the base branch** | Resolve by **merging** the base branch (`git merge github01/PR-staging`) — do NOT rebase. Force-push is blocked on this repository; rebasing rewrites history and requires a force-push, which will fail and force creation of a new PR. A plain `git merge` adds a merge commit without rewriting history and can be pushed normally. |
 
 ## Source Code Rules
 
@@ -109,3 +109,14 @@ This is mandatory for every agent making code changes — not optional. CI will 
 **Why this rule exists:** the recurring defect in this repo's PRs has not been missing knowledge — it is verification discipline. Plausible-looking artifacts (a warning, a test, a doc claim, a CI step) get shipped without proving they do their job, and a reviewer catches them later. The `code-reviewer` agent must be run in genuinely adversarial mode — instruct it to perform checks 1–3 above, not just style/correctness at a glance. Author-mode optimism ("this looks right") is the bias to counteract. Treat a self-review that returns "PASS" while these checks were not actually performed as a review that did not happen.
 
 This applies to every agent and to direct edits, and to every file type — code, tests, docs, CI, shell, and infra config. It is part of the definition of "complete," alongside passing linters and tests.
+
+## Responding To A REQUEST_CHANGES Verdict
+
+When fixing a PR after a `CHANGES_REQUESTED` review, these four steps are **mandatory** after pushing the fix commit(s):
+
+1. **Post a PR comment** summarizing what was fixed and how each blocker was addressed. Include the commit SHA(s), a one-line description of each change, and (for test fixes) confirmation that mutation sensitivity was verified.
+2. **Remove blocking labels** (`NEEDS CHANGES`, `NEEDS TESTS`, `RESOLVE CONFLICTS`) as applicable.
+3. **Add `READY FOR REVIEW`**.
+4. **Re-request review** from the reviewer who requested changes (`gh api --method POST repos/OWNER/REPO/pulls/PR/requested_reviewers -f "reviewers[]=LOGIN"`).
+
+Do not leave a PR in `NEEDS CHANGES` / `NEEDS TESTS` state after pushing a fix without completing all four steps.

@@ -612,11 +612,12 @@ impl SessionLogic {
     ///
     /// Returns the action the transport should take.
     /// Observer sessions can still send RTT and health packets but all media
-    /// data packets are silently dropped.
+    /// data and KeyframeRequest packets are silently dropped.
     ///
     /// This is the **inbound** half of the waiting-room isolation enforcement.
-    /// The **outbound** half lives in `ChatServer::handle_msg()` which drops all
-    /// non-allowlisted packets before they reach observer sessions.
+    /// The **outbound** half lives in `chat_server::handle_msg()` (a free
+    /// function, not a method on the actor) which drops all non-allowlisted
+    /// packets before they reach observer sessions.
     /// See `handle_msg` doc comment for the full three-layer enforcement model.
     pub fn handle_inbound(&mut self, data: &[u8]) -> InboundAction {
         // Track received data
@@ -648,7 +649,7 @@ impl SessionLogic {
                 // device/hardware metrics (peer_device_info). Previously returned
                 // Processed, which consumed the packet and starved the per-peer
                 // Device UI of data. HEALTH carries no media and is unencrypted; the
-                // outbound observer allowlist in ChatServer::handle_msg still drops it
+                // outbound observer allowlist in chat_server::handle_msg still drops it
                 // for waiting-room observers, so isolation is preserved.
                 // No observer guard here (unlike Data/KeyframeRequest): an observer
                 // may publish HEALTH and it is forwarded — intentional, as HEALTH is

@@ -358,7 +358,7 @@ pub fn MeetingPage(id: String) -> Element {
     if !auth_checked() && oauth_enabled().unwrap_or(false) {
         return rsx! {
             div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
-                p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
+                p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: var(--fs-7);",
                     "Checking authentication..."
                 }
             }
@@ -752,9 +752,9 @@ pub fn MeetingPage(id: String) -> Element {
                     div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                         div {
                             class: "loading-spinner",
-                            style: "width: 40px; height: 40px; margin-bottom: 1rem;",
+                            style: "width: 40px; height: 40px; margin-bottom: var(--space-4);",
                         }
-                        p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
+                        p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: var(--fs-7);",
                             "Joining as "
                             strong { "{display_name}" }
                             "..."
@@ -767,10 +767,10 @@ pub fn MeetingPage(id: String) -> Element {
                     rsx! {
                         div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                             div { class: "card-apple p-8", style: "max-width: 400px; width: 90%;",
-                                h2 { style: "color: {theme_color::TEXT_PRIMARY}; text-align: center; margin-bottom: 0.5rem;",
+                                h2 { style: "color: {theme_color::TEXT_PRIMARY}; text-align: center; margin-bottom: var(--space-2);",
                                     "Enter your display name"
                                 }
-                                p { style: "color: {theme_color::TEXT_ON_GLASS_MUTED}; text-align: center; font-size: 0.875rem; margin-bottom: 1.5rem;",
+                                p { style: "color: {theme_color::TEXT_ON_GLASS_MUTED}; text-align: center; font-size: var(--fs-5); margin-bottom: 1.5rem;",
                                     "Choose a name to join the meeting"
                                 }
                                 form {
@@ -803,7 +803,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     button {
                                         r#type: "submit",
                                         class: "btn-apple btn-primary w-full",
-                                        style: "margin-top: 1rem;",
+                                        style: "margin-top: var(--space-4);",
                                         "Join Meeting"
                                     }
                                 }
@@ -816,9 +816,9 @@ pub fn MeetingPage(id: String) -> Element {
                         div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
                             div {
                                 class: "loading-spinner",
-                                style: "width: 40px; height: 40px; margin-bottom: 1rem;",
+                                style: "width: 40px; height: 40px; margin-bottom: var(--space-4);",
                             }
-                            p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
+                            p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: var(--fs-7);",
                                 "Joining as "
                                 strong { "{display_name}" }
                                 "..."

@@ -4,12 +4,10 @@
  */
 
 use crate::components::canvas_generator::{calculate_glow_params, DEFAULT_TILE_BORDER_COLOR};
-use crate::components::density::{DensityMode, DENSITY_MODES};
+use crate::components::color_picker::HsvColorPicker;
 use crate::context::{
     apply_theme_to_dom, load_custom_colors_from_storage, save_custom_colors_to_storage,
-    save_decode_budget_override, save_density_mode, save_dock_autohide, save_dock_position,
-    AppearanceSettings, AppearanceSettingsCtx, AutohideCtx, CustomThemeCtx, DecodeBudgetCtx,
-    DecodeBudgetOverride, DensityModeCtx, DockPosition, DockPositionCtx, GlowColor, Theme,
+    AppearanceSettings, AppearanceSettingsCtx, CustomThemeCtx, GlowColor, Theme,
     ThemePreferenceCtx, MAX_CUSTOM_COLORS,
 };
 use crate::theme::color as theme_color;
@@ -17,6 +15,7 @@ use crate::theme_file::{
     clear_custom_theme, custom_theme_display_name, persist_custom_theme_json, ThemeFileError,
     MAX_THEME_JSON_BYTES,
 };
+use crate::util::color_math::parse_hex;
 use dioxus::prelude::*;
 use wasm_bindgen::JsCast;
 
@@ -31,24 +30,89 @@ fn focus_add_btn() {
     }
 }
 
+/// Cycle keyboard focus within the color-picker modal on Tab / Shift+Tab.
+///
+/// Without this, Tab from the last focusable element in the dialog moves
+/// focus to the Brightness slider that lives immediately after the modal in
+/// DOM order — the scrim blocks mouse clicks but does NOT block keyboard
+/// focus, so the user ends up driving a control they can't see. Returns
+/// `true` when focus wrapped (caller should `prevent_default`).
+fn trap_tab_in_color_modal(shift: bool) -> bool {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return false;
+    };
+    let modal = match document.query_selector(".custom-color-modal") {
+        Ok(Some(el)) => el,
+        _ => return false,
+    };
+    let nodes = match modal
+        .query_selector_all("button:not([disabled]), input:not([disabled]), [tabindex=\"0\"]")
+    {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    let count = nodes.length();
+    if count == 0 {
+        return false;
+    }
+    let first: web_sys::HtmlElement = match nodes.item(0).and_then(|n| n.dyn_into().ok()) {
+        Some(el) => el,
+        None => return false,
+    };
+    let last: web_sys::HtmlElement = match nodes.item(count - 1).and_then(|n| n.dyn_into().ok()) {
+        Some(el) => el,
+        None => return false,
+    };
+    let active = document.active_element();
+    // Compare via Node::is_same_node — each `.item(i)` returns a fresh JsValue
+    // wrapper, but they all reference the same underlying DOM node as the
+    // active element, so identity by DOM node is the correct check.
+    let first_node: &web_sys::Node = first.as_ref();
+    let last_node: &web_sys::Node = last.as_ref();
+    let is_first = active
+        .as_ref()
+        .map(|el| {
+            let n: &web_sys::Node = el.as_ref();
+            n.is_same_node(Some(first_node))
+        })
+        .unwrap_or(false);
+    let is_last = active
+        .as_ref()
+        .map(|el| {
+            let n: &web_sys::Node = el.as_ref();
+            n.is_same_node(Some(last_node))
+        })
+        .unwrap_or(false);
+    // Also wrap when focus has escaped the modal entirely (e.g. the dialog
+    // container itself was focused via onmounted and the user Shift+Tabs).
+    let modal_node: &web_sys::Node = modal.as_ref();
+    let active_in_modal = active
+        .as_ref()
+        .map(|el| {
+            let n: &web_sys::Node = el.as_ref();
+            modal_node.contains(Some(n))
+        })
+        .unwrap_or(false);
+    if shift && (is_first || !active_in_modal) {
+        let _ = last.focus();
+        return true;
+    }
+    if !shift && (is_last || !active_in_modal) {
+        let _ = first.focus();
+        return true;
+    }
+    false
+}
+
 #[component]
 pub fn AppearanceSettingsPanel() -> Element {
     let mut theme_ctx = use_context::<ThemePreferenceCtx>();
     let mut appearance_ctx = use_context::<AppearanceSettingsCtx>();
-    // Fallback signals for when contexts are not provided (e.g. in tests).
-    // Hooks must be called unconditionally, so we always create them.
-    let fallback_dock = use_signal(|| DockPosition::Bottom);
-    let fallback_autohide = use_signal(|| true);
-    let fallback_density = use_signal(|| DensityMode::Auto);
-    let fallback_decode_budget = use_signal(DecodeBudgetOverride::default);
-    let mut dock_position_ctx =
-        try_use_context::<DockPositionCtx>().unwrap_or(DockPositionCtx(fallback_dock));
-    let mut autohide_ctx =
-        try_use_context::<AutohideCtx>().unwrap_or(AutohideCtx(fallback_autohide));
-    let mut density_ctx =
-        try_use_context::<DensityModeCtx>().unwrap_or(DensityModeCtx(fallback_density));
-    let mut decode_budget_ctx =
-        try_use_context::<DecodeBudgetCtx>().unwrap_or(DecodeBudgetCtx(fallback_decode_budget));
+    // Fallback signals for when contexts are not provided (e.g. in tests or
+    // isolated component previews). Hooks must be called unconditionally, so we
+    // always create them — but any writes the panel makes through these fallback
+    // signals stay local to this component instance and do NOT propagate to
+    // attendants.rs or any other reader. Production always provides the real context.
     let appearance = (appearance_ctx.0)();
     let preview_style = preview_glow_style(&appearance);
     let brightness_slider_style = slider_fill_style(appearance.glow_brightness);
@@ -574,78 +638,178 @@ pub fn AppearanceSettingsPanel() -> Element {
                                             }
                                         }
                                     }
-                                    // Inline custom color popover
+                                    // Custom color modal dialog (centered overlay with backdrop)
                                     if show_picker() {
-                                        // Click-outside overlay (behind the popover)
                                         div {
-                                            class: "settings-overlay-backdrop",
+                                            class: "custom-color-modal-overlay",
+                                            role: "presentation",
                                             onmousedown: move |_| {
                                                 show_picker.set(false);
+                                                color_input.set(String::new());
+                                                input_error.set(false);
                                                 focus_add_btn();
                                             },
-                                        }
-                                        div {
-                                            class: "custom-color-popover settings-popover-surface",
-                                            onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
-                                            {
-                                                let preview_color = GlowColor::from_hex(&color_input());
-                                                rsx! {
-                                                    div { class: "custom-color-popover-row",
-                                                        if let Some(c) = preview_color {
-                                                            div {
-                                                                class: "custom-color-preview",
-                                                                style: format!("--glow-color: {}", c.to_hex()),
-                                                            }
+                                            onkeydown: move |evt: KeyboardEvent| {
+                                                if evt.key() == Key::Escape {
+                                                    show_picker.set(false);
+                                                    color_input.set(String::new());
+                                                    input_error.set(false);
+                                                    focus_add_btn();
+                                                }
+                                            },
+                                            div {
+                                                class: "custom-color-popover custom-color-modal",
+                                                role: "dialog",
+                                                "aria-modal": "true",
+                                                "aria-labelledby": "custom-color-modal-title",
+                                                // Make the dialog itself focusable so we can move
+                                                // keyboard focus into it on open. Without this the
+                                                // keydown handler below is unreachable while focus
+                                                // is still on the "+" button behind the scrim
+                                                // (it's a DOM sibling, not an ancestor, so Escape
+                                                // never bubbles here). Mirrors the about/search
+                                                // modal accessibility pattern.
+                                                tabindex: "-1",
+                                                onmounted: move |element| {
+                                                    let element = element.data();
+                                                    spawn(async move {
+                                                        let _ = element.set_focus(true).await;
+                                                    });
+                                                },
+                                                onmousedown: move |evt: Event<MouseData>| evt.stop_propagation(),
+                                                onclick: move |evt: Event<MouseData>| evt.stop_propagation(),
+                                                onkeydown: move |evt: KeyboardEvent| {
+                                                    match evt.key() {
+                                                        Key::Escape => {
+                                                            show_picker.set(false);
+                                                            color_input.set(String::new());
+                                                            input_error.set(false);
+                                                            focus_add_btn();
                                                         }
-                                                        input {
-                                                            class: if input_error() { "custom-color-input error" } else { "custom-color-input" },
-                                                            r#type: "text",
-                                                            placeholder: "#RRGGBB",
-                                                            maxlength: "7",
-                                                            spellcheck: "false",
-                                                            autocomplete: "off",
-                                                            value: "{color_input}",
-                                                            oninput: move |evt: Event<FormData>| {
-                                                                color_input.set(evt.value());
-                                                                input_error.set(false);
-                                                            },
-                                                            onkeydown: move |evt: KeyboardEvent| {
-                                                                if evt.key() == Key::Escape {
-                                                                    show_picker.set(false);
-                                                                    focus_add_btn();
+                                                        Key::Tab
+                                                            if trap_tab_in_color_modal(
+                                                                evt.modifiers().shift(),
+                                                            ) =>
+                                                        {
+                                                            evt.prevent_default();
+                                                        }
+                                                        _ => {}
+                                                    }
+                                                },
+                                                {
+                                                    // Seed the picker's HSV state from whichever color was
+                                                    // selected when the modal opened. Once mounted the
+                                                    // picker owns the marker positions and writes back into
+                                                    // `color_input` directly.
+                                                    let initial_rgb = appearance.glow_color.to_rgb();
+                                                    rsx! {
+                                                        div { class: "custom-color-modal-header",
+                                                            div { class: "custom-color-modal-heading",
+                                                                h3 {
+                                                                    id: "custom-color-modal-title",
+                                                                    class: "custom-color-modal-title",
+                                                                    "Choose Custom Color"
                                                                 }
-                                                            },
-                                                        }
-                                                        button {
-                                                            class: "custom-color-add-btn",
-                                                            onclick: move |evt: Event<MouseData>| {
-                                                                evt.stop_propagation();
-                                                                if let Some(new_color) = GlowColor::from_hex(&color_input()) {
-                                                                    let colors = custom_colors();
-                                                                    if !colors.contains(&new_color) {
-                                                                        let mut colors = colors;
-                                                                        colors.push(new_color);
-                                                                        save_custom_colors_to_storage(&colors);
-                                                                        custom_colors.set(colors);
-                                                                    }
-                                                                    appearance_ctx
-                                                                        .0
-                                                                        .set(AppearanceSettings {
-                                                                            glow_color: new_color,
-                                                                            ..appearance_ctx.0()
-                                                                        });
+                                                                p { class: "custom-color-modal-subtitle",
+                                                                    "Select a color for the glow highlight."
+                                                                }
+                                                            }
+                                                            button {
+                                                                class: "custom-color-modal-close",
+                                                                r#type: "button",
+                                                                "aria-label": "Close",
+                                                                onclick: move |evt: Event<MouseData>| {
+                                                                    evt.stop_propagation();
                                                                     show_picker.set(false);
                                                                     color_input.set(String::new());
                                                                     input_error.set(false);
-                                                                } else {
-                                                                    input_error.set(true);
+                                                                    focus_add_btn();
+                                                                },
+                                                                svg {
+                                                                    view_box: "0 0 24 24",
+                                                                    width: "16",
+                                                                    height: "16",
+                                                                    "aria-hidden": "true",
+                                                                    path {
+                                                                        d: "M6 6L18 18M18 6L6 18",
+                                                                        stroke: "currentColor",
+                                                                        stroke_width: "2",
+                                                                        stroke_linecap: "round",
+                                                                    }
                                                                 }
-                                                            },
-                                                            "Add"
+                                                            }
                                                         }
-                                                    }
-                                                    if input_error() {
-                                                        p { class: "input-error-message", "Invalid format - use #RRGGBB (e.g. #FF5500)" } // @token-exempt: user-facing help text, not a CSS color
+                                                        div { class: "custom-color-modal-body",
+                                                            HsvColorPicker {
+                                                                initial_rgb,
+                                                                hex_input: color_input,
+                                                                input_error,
+                                                            }
+                                                            // Reserved 18px error slot — keep the height
+                                                            // even when no error to avoid layout shift.
+                                                            div {
+                                                                id: "color-picker-hex-error",
+                                                                class: "input-error-slot",
+                                                                if input_error() {
+                                                                    p {
+                                                                        class: "input-error-message",
+                                                                        "Invalid format - use #RRGGBB (e.g. #FF5500)" // @token-exempt: example hex in format hint
+                                                                    }
+                                                                }
+                                                            }
+                                                            div { class: "custom-color-modal-actions",
+                                                                button {
+                                                                    class: "custom-color-cancel-btn",
+                                                                    r#type: "button",
+                                                                    onclick: move |evt: Event<MouseData>| {
+                                                                        evt.stop_propagation();
+                                                                        show_picker.set(false);
+                                                                        color_input.set(String::new());
+                                                                        input_error.set(false);
+                                                                        focus_add_btn();
+                                                                    },
+                                                                    "Cancel"
+                                                                }
+                                                                button {
+                                                                    class: "custom-color-add-btn",
+                                                                    r#type: "button",
+                                                                    // Gate the Add button on the SAME lenient validator the
+                                                                    // picker uses for its error state (`parse_hex`, which trims
+                                                                    // whitespace and accepts a missing `#`). Using the strict
+                                                                    // `GlowColor::from_hex` here — while the picker only reports
+                                                                    // errors via `parse_hex` — creates a silent dead state
+                                                                    // (no error message, Add greyed out) for inputs like
+                                                                    // `ABCDEF` or `#FF0000 `.
+                                                                    disabled: parse_hex(&color_input()).is_none(),
+                                                                    onclick: move |evt: Event<MouseData>| {
+                                                                        evt.stop_propagation();
+                                                                        if let Some((r, g, b)) = parse_hex(&color_input()) {
+                                                                            // Single source of truth: preset detection with
+                                                                            // Custom fallback lives in `GlowColor::from_rgb`.
+                                                                            let new_color = GlowColor::from_rgb(r, g, b);
+                                                                            let colors = custom_colors();
+                                                                            if !colors.contains(&new_color) {
+                                                                                let mut colors = colors;
+                                                                                colors.push(new_color);
+                                                                                save_custom_colors_to_storage(&colors);
+                                                                                custom_colors.set(colors);
+                                                                            }
+                                                                            appearance_ctx.0.set(AppearanceSettings {
+                                                                                glow_color: new_color,
+                                                                                ..appearance_ctx.0()
+                                                                            });
+                                                                            show_picker.set(false);
+                                                                            color_input.set(String::new());
+                                                                            input_error.set(false);
+                                                                            focus_add_btn();
+                                                                        } else {
+                                                                            input_error.set(true);
+                                                                        }
+                                                                    },
+                                                                    "Add"
+                                                                }
+                                                            }
+                                                        }
                                                     }
                                                 }
                                             }
@@ -733,238 +897,6 @@ pub fn AppearanceSettingsPanel() -> Element {
                         }
                     }
             }
-
-            hr { class: "appearance-section-divider" }
-
-            // ── Section 3: Dock Settings ─────────────────────────────────────
-            section { class: "appearance-section",
-                div { class: "appearance-section-header",
-                    h3 { class: "appearance-section-title", "Dock Settings" }
-                }
-
-                // Position selector — reuses transport-segmented styling
-                div { class: "device-setting-group",
-                    span { class: "transport-segmented-label", "Position" }
-                    div {
-                        class: "transport-segmented",
-                        role: "radiogroup",
-                        "aria-label": "Action bar position",
-                        for (pos, label) in [(DockPosition::Bottom, "Bottom"), (DockPosition::Left, "Left"), (DockPosition::Right, "Right")] {
-                            button {
-                                r#type: "button",
-                                role: "radio",
-                                "aria-checked": if dock_position_ctx.0() == pos { "true" } else { "false" },
-                                class: if dock_position_ctx.0() == pos { "transport-segmented-option selected" } else { "transport-segmented-option" },
-                                onclick: move |_| {
-                                    dock_position_ctx.0.set(pos);
-                                    save_dock_position(pos);
-                                },
-                                "{label}"
-                            }
-                        }
-                    }
-                }
-
-                // Autohide toggle
-                div { class: "appearance-section-header dock-autohide-row",
-                    label { class: "appearance-section-title appearance-section-title--sm", "Auto-hide" }
-                    label {
-                        class: "glow-switch",
-                        "aria-label": "Toggle action bar auto-hide",
-                        input {
-                            r#type: "checkbox",
-                            checked: autohide_ctx.0(),
-                            onchange: move |evt: Event<FormData>| {
-                                let checked = evt.checked();
-                                autohide_ctx.0.set(checked);
-                                save_dock_autohide(checked);
-                            },
-                        }
-                        span { class: "glow-switch-track" }
-                    }
-                }
-            }
-
-            hr { class: "appearance-section-divider" }
-
-            // ── Section 4: Tiling ────────────────────────────────────────────
-            section { class: "appearance-section",
-                div { class: "appearance-section-header",
-                    h3 { class: "appearance-section-title", "Tiling" }
-                }
-
-                div { class: "device-setting-group",
-                    span { class: "transport-segmented-label", "Density" }
-                    div {
-                        class: "transport-segmented",
-                        role: "radiogroup",
-                        "aria-label": "Tile density mode",
-                        for mode in DENSITY_MODES {
-                            button {
-                                r#type: "button",
-                                role: "radio",
-                                "aria-checked": if density_ctx.0() == mode { "true" } else { "false" },
-                                class: if density_ctx.0() == mode { "transport-segmented-option selected" } else { "transport-segmented-option" },
-                                onclick: move |_| {
-                                    density_ctx.0.set(mode);
-                                    save_density_mode(mode);
-                                },
-                                "{mode.label()}"
-                            }
-                        }
-                    }
-                }
-
-                // Video-tiles (decode-budget) override — sits directly under
-                // Density and reuses the same segmented control vocabulary.
-                div { class: "device-setting-group",
-                    span { class: "transport-segmented-label", "Video tiles" }
-                    div {
-                        id: "decode-budget-override",
-                        class: "transport-segmented",
-                        role: "radiogroup",
-                        "aria-label": "Number of video tiles to decode",
-                        for option in DECODE_BUDGET_OPTIONS {
-                            {
-                                let is_selected = decode_budget_ctx.0() == option;
-                                rsx! {
-                                    button {
-                                        r#type: "button",
-                                        role: "radio",
-                                        "data-testid": decode_budget_testid(option),
-                                        "aria-checked": if is_selected { "true" } else { "false" },
-                                        "aria-label": decode_budget_aria_label(option),
-                                        class: if is_selected { "transport-segmented-option selected" } else { "transport-segmented-option" },
-                                        onclick: move |_| {
-                                            decode_budget_ctx.0.set(option);
-                                            save_decode_budget_override(option);
-                                        },
-                                        "{decode_budget_label(option)}"
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    p { class: "appearance-section-helper",
-                        "Auto reduces video tiles on slower devices to keep playback smooth — off-budget participants stay audible and appear as avatars. A fixed number always shows that many video tiles."
-                    }
-
-                    // Issue #1466: persistent "show all paused videos" escape
-                    // hatch. This is the reliable GLOBAL recovery control —
-                    // always reachable in Settings, independent of the banner's
-                    // transient `pressured && avatar_count > 0` gate (the banner
-                    // can be backed off / not showing), and distinct from the
-                    // per-tile PLAY button (which un-pauses ONE peer). It is a
-                    // toggle so the user is never stuck: when the override is
-                    // already non-Auto (any Fixed(n) or All) it offers "Back to
-                    // automatic" (→ Auto); otherwise it offers "Show all videos"
-                    // (→ All) — wording aligned with the banner's "Show all
-                    // videos" action (#1466 S1). Both write the shared `DecodeBudgetCtx`
-                    // signal AND persist via `save_decode_budget_override`,
-                    // exactly like the picker above, so the change survives reloads.
-                    {
-                        let current = decode_budget_ctx.0();
-                        let is_overridden = current != DecodeBudgetOverride::Auto;
-                        let (target, label, aria) = if is_overridden {
-                            (
-                                DecodeBudgetOverride::Auto,
-                                "Back to automatic",
-                                "Return video tiles to automatic",
-                            )
-                        } else {
-                            (
-                                DecodeBudgetOverride::All,
-                                "Show all videos",
-                                "Show all videos",
-                            )
-                        };
-                        rsx! {
-                            button {
-                                r#type: "button",
-                                class: "decode-budget-show-all-btn",
-                                "data-testid": "decode-budget-show-all-persistent",
-                                "aria-label": aria,
-                                onclick: move |_| {
-                                    decode_budget_ctx.0.set(target);
-                                    save_decode_budget_override(target);
-                                },
-                                "{label}"
-                            }
-                        }
-                    }
-                }
-            }
-
-            hr { class: "appearance-section-divider" }
-
-            // ── Section 5: Preferences ───────────────────────────────────────
-            section { class: "appearance-section",
-                div { class: "appearance-section-header",
-                    h3 { class: "appearance-section-title", "Preferences" }
-                }
-
-                // Entry/exit notifications toggle
-                div { class: "appearance-section-header dock-autohide-row",
-                    div { class: "appearance-section-heading-stack",
-                        label {
-                            class: "appearance-section-title appearance-section-title--sm",
-                            r#for: "join-leave-notifications-toggle",
-                            "Entry/exit notifications"
-                        }
-                        p { class: "appearance-section-helper",
-                            "Show a message when participants join or leave."
-                        }
-                    }
-                    label {
-                        class: "glow-switch",
-                        "aria-label": "Toggle entry and exit notifications",
-                        input {
-                            id: "join-leave-notifications-toggle",
-                            r#type: "checkbox",
-                            checked: appearance.show_join_leave_notifications,
-                            onchange: move |evt: Event<FormData>| {
-                                let enabled = evt.checked();
-                                appearance_ctx.0.set(AppearanceSettings {
-                                    show_join_leave_notifications: enabled,
-                                    ..appearance_ctx.0()
-                                });
-                            },
-                        }
-                        span { class: "glow-switch-track" }
-                    }
-                }
-
-                // Entry/exit sounds toggle
-                div { class: "appearance-section-header dock-autohide-row",
-                    div { class: "appearance-section-heading-stack",
-                        label {
-                            class: "appearance-section-title appearance-section-title--sm",
-                            r#for: "join-leave-sounds-toggle",
-                            "Entry/exit sounds"
-                        }
-                        p { class: "appearance-section-helper",
-                            "Play a sound when participants join or leave."
-                        }
-                    }
-                    label {
-                        class: "glow-switch",
-                        "aria-label": "Toggle entry and exit sounds",
-                        input {
-                            id: "join-leave-sounds-toggle",
-                            r#type: "checkbox",
-                            checked: appearance.play_join_leave_sounds,
-                            onchange: move |evt: Event<FormData>| {
-                                let enabled = evt.checked();
-                                appearance_ctx.0.set(AppearanceSettings {
-                                    play_join_leave_sounds: enabled,
-                                    ..appearance_ctx.0()
-                                });
-                            },
-                        }
-                        span { class: "glow-switch-track" }
-                    }
-                }
-            }
                 }
             }
         }
@@ -982,56 +914,6 @@ fn is_light_theme() -> bool {
         .and_then(|e| e.get_attribute("data-theme"))
         .map(|t| t == "light")
         .unwrap_or(false)
-}
-
-/// Manual decode-budget choices offered in the "Video tiles" control.
-///
-/// `Auto` (the default) hands the tile count to the adaptive control loop in
-/// `attendants.rs`. The fixed values are a short, sensible progression bounded
-/// by the layout caps: every value is `<= CANVAS_LIMIT` (30) and the control
-/// loop further clamps each choice to the natural tile count for the current
-/// viewport, so picking a number larger than the grid can show is harmless. The
-/// chosen counts (4 / 6 / 9 / 16) mirror the tile-count vocabulary the density
-/// modes already describe (Standard ~4/~9, Auto ~6/~12, Dense ~16).
-// Issue #1466 (S1): "All" was dropped from the SEGMENTED picker — it was
-// redundant with the always-visible "Show all videos" persistent toggle below,
-// which sets the same `DecodeBudgetOverride::All`. The `All` enum variant and
-// all its handling (label/aria/testid/parse/serialize/effective_cap) stay
-// intact; only the picker option is removed.
-const DECODE_BUDGET_OPTIONS: [DecodeBudgetOverride; 5] = [
-    DecodeBudgetOverride::Auto,
-    DecodeBudgetOverride::Fixed(4),
-    DecodeBudgetOverride::Fixed(6),
-    DecodeBudgetOverride::Fixed(9),
-    DecodeBudgetOverride::Fixed(16),
-];
-
-/// Short button label for a decode-budget option.
-fn decode_budget_label(option: DecodeBudgetOverride) -> String {
-    match option {
-        DecodeBudgetOverride::Auto => "Auto".to_string(),
-        DecodeBudgetOverride::All => "All".to_string(),
-        DecodeBudgetOverride::Fixed(n) => n.to_string(),
-    }
-}
-
-/// Descriptive `aria-label` for a decode-budget option so screen readers
-/// announce the bare numbers meaningfully.
-fn decode_budget_aria_label(option: DecodeBudgetOverride) -> String {
-    match option {
-        DecodeBudgetOverride::Auto => "Automatic video tile count".to_string(),
-        DecodeBudgetOverride::All => "Show all video tiles".to_string(),
-        DecodeBudgetOverride::Fixed(n) => format!("Show {n} video tiles"),
-    }
-}
-
-/// Stable `data-testid` for a decode-budget option (consumed by 1a.6 E2E).
-fn decode_budget_testid(option: DecodeBudgetOverride) -> String {
-    match option {
-        DecodeBudgetOverride::Auto => "decode-budget-auto".to_string(),
-        DecodeBudgetOverride::All => "decode-budget-all".to_string(),
-        DecodeBudgetOverride::Fixed(n) => format!("decode-budget-{n}"),
-    }
 }
 
 /// Compute a static glow style for the appearance preview tile.

@@ -40,15 +40,16 @@ pub fn MeetingEndedOverlay(
                     fill: "none",
                     stroke: "#ff6b6b",
                     stroke_width: "2",
-                    style: "margin: 0 auto 1rem;",
+                    style: "margin: 0 auto var(--space-4);",
                     circle { cx: "12", cy: "12", r: "10" }
                     line { x1: "15", y1: "9", x2: "9", y2: "15" }
                     line { x1: "9", y1: "9", x2: "15", y2: "15" }
                 }
-                h4 { style: "margin-top:0; margin-bottom: 0.5rem;", "Meeting Ended" }
+                h4 { style: "margin-top:0; margin-bottom: var(--space-2);", "Meeting Ended" }
                 p {
                     class: "meeting-ended-message",
-                    style: "font-size: 1rem; margin: 1.5rem 0; color: #666;",
+                    // @token-exempt: muted text on overlay + 1.5rem margin has no matching token
+                    style: "font-size: var(--fs-7); margin: 1.5rem 0; color: #666;",
                     "{message}"
                 }
                 button {

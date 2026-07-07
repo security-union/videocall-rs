@@ -1,5 +1,3 @@
-#![recursion_limit = "256"]
-
 use actix_web::{web, App, HttpResponse, HttpServer, Result};
 use async_nats::{Client, Message};
 use futures::StreamExt;

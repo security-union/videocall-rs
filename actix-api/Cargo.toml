@@ -73,4 +73,5 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 meeting-api = { path = "../meeting-api" }
 tempfile = "3"
+rcgen = "0.13"
 

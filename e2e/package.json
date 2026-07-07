@@ -13,7 +13,7 @@
     "typecheck": "tsc --noEmit",
     "ci:lint": "eslint . && prettier --check . && tsc --noEmit",
     "bot": "tsx bots-app/src/cli.ts",
-    "test:unit": "vitest run bots-app/"
+    "test:unit": "vitest run"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

@@ -35,6 +35,7 @@
 //! // read, so the single-layer audio uplink-distress detector fires (#1398):
 //! window.__vcNetsim.bumpUplinkStall(8); // WT slow-ready() saturation events
 //! window.__vcNetsim.bumpWsDrop(6);      // WS send-buffer drops
+//! window.__vcNetsim.bumpWtDrop(6);      // WT write-drop (teardown) events
 //! ```
 //!
 //! ### Why `window.*` registration, not a `#[wasm_bindgen]` export
@@ -202,6 +203,30 @@ fn register_on_window() -> bool {
         }
     });
 
+    // bumpWtDrop(n: number) -> bool  (issue #1616, follow-up to #1398)
+    // The third uplink-distress axis: increments the WT write-drop counter
+    // (`unistream_drop_count`) by `n`. The real increment happens when an
+    // established unistream write fails (a teardown-class drop) deep in the
+    // `.await`-blocking media send path, which a localhost-loopback e2e cannot
+    // reliably induce; this drives the SAME counter the mic-side detector reads
+    // so its WT-drop axis can be exercised in isolation (the detector ORs WT
+    // ready-stall, WS drop, and WT write-drop). Same coercion contract as the
+    // siblings above: a non-number / negative is treated as 0 (a no-op → false).
+    let bump_wt_drop = Closure::<dyn Fn(JsValue) -> JsValue>::new(|n: JsValue| -> JsValue {
+        let count = n.as_f64().filter(|v| *v >= 0.0).map(|v| v as u64);
+        match count {
+            Some(c) => {
+                videocall_transport::webtransport::force_unistream_drop(c);
+                info!("__vcNetsim.bumpWtDrop: +{c} WT write-drop events");
+                JsValue::from_bool(true)
+            }
+            None => {
+                warn!("__vcNetsim.bumpWtDrop: argument must be a non-negative number");
+                JsValue::from_bool(false)
+            }
+        }
+    });
+
     let set_ok = js_sys::Reflect::set(
         &obj,
         &JsValue::from_str("install"),
@@ -228,6 +253,13 @@ fn register_on_window() -> bool {
             bump_ws_drop.as_ref().unchecked_ref(),
         )
     })
+    .and_then(|_| {
+        js_sys::Reflect::set(
+            &obj,
+            &JsValue::from_str("bumpWtDrop"),
+            bump_wt_drop.as_ref().unchecked_ref(),
+        )
+    })
     .and_then(|_| js_sys::Reflect::set(&window, &JsValue::from_str("__vcNetsim"), &obj))
     .is_ok();
 
@@ -238,14 +270,17 @@ fn register_on_window() -> bool {
 
     // Leak the closures so they outlive this function for the tab's
     // lifetime — the window object now holds them and may call back at
-    // any time. This is a one-time, bounded leak (four closures per tab,
+    // any time. This is a one-time, bounded leak (five closures per tab,
     // installed once via the `Once` in `install_window_hook`).
     install.forget();
     clear.forget();
     bump_uplink_stall.forget();
     bump_ws_drop.forget();
+    bump_wt_drop.forget();
 
-    info!("netsim: window.__vcNetsim installed (install/clear/bumpUplinkStall/bumpWsDrop)");
+    info!(
+        "netsim: window.__vcNetsim installed (install/clear/bumpUplinkStall/bumpWsDrop/bumpWtDrop)"
+    );
     true
 }
 

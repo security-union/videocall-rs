@@ -5,12 +5,14 @@ on:
     paths:
       - 'engineering-vlog/**'
       - 'docker/Dockerfile.engineering-vlog'
+      - '.github/workflows/upload-engineering-vlog-docker-hub.yaml'
   push:
     branches:
       - main
     paths:
       - 'engineering-vlog/**'
       - 'docker/Dockerfile.engineering-vlog'
+      - '.github/workflows/upload-engineering-vlog-docker-hub.yaml'
   workflow_dispatch:
 
 jobs:
@@ -34,7 +36,13 @@ jobs:
 
       - name: Extract branch name
         id: extract_branch
-        run: echo "::set-output name=branch::${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+        # Sanitize the ref into a valid Docker tag: branch names contain '/'
+        # (e.g. blog/foo, feat/bar), which is illegal in a tag. Replace every
+        # character that isn't [alnum _ . -] with '-'.
+        run: |
+          branch="${GITHUB_HEAD_REF:-${GITHUB_REF#refs/heads/}}"
+          branch="$(printf '%s' "$branch" | tr -c '[:alnum:]_.-' '-')"
+          echo "::set-output name=branch::${branch}"
 
       - name: Build and push Engineering Vlog Docker image
         uses: docker/build-push-action@3b5e8027fcad23fda98b2e3ac259d8d67585f671

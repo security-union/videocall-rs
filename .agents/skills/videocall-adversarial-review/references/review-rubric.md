@@ -37,7 +37,7 @@ For every new or modified test:
 1. Read the body and assertions, not only the name.
 2. Confirm it calls/imports the production path rather than duplicating its algorithm.
 3. Confirm it exercises the changed branch and realistic failure mode.
-4. Establish mutation sensitivity by reverting or otherwise disabling the production fix when practical. If not practical, explain precisely why the pre-fix behavior fails the assertion.
+4. Establish mutation sensitivity by reverting or otherwise disabling the production fix when practical. If not practical, explain precisely why the pre-fix behavior fails the assertion. **Before declaring a side effect untestable, grep the file for `#[cfg(test)]` seams, `RefCell`, interior-mutable fields, and existing test accessors — the data is often already recorded and just needs a 3-line accessor. "The decoder is a noop" does not mean the call-site arguments are unobservable.**
 5. Check fixtures and expected values are independent of the constant or implementation being guarded.
 6. Compile test targets. For Rust, plain `cargo check` does not compile all `#[cfg(test)]` and integration-test code; use `cargo check --tests`, `cargo test --no-run`, or run the tests.
 7. For E2E, ensure the test traverses the actual user flow and ran green in the local stack or a scoped CI dispatch.

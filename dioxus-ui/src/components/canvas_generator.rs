@@ -711,7 +711,7 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{ss_name_title}",
                         dir: "auto",
-                        "{ss_name}"
+                        span { class: "floating-name-text", "{ss_name}" }
                         if is_guest {
                             span { class: "guest-badge", "Guest" }
                         }
@@ -922,7 +922,7 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{title_vo}",
                         dir: "auto",
-                        "{peer_display_name_vo}"
+                        span { class: "floating-name-text", "{peer_display_name_vo}" }
                         if is_host {
                             CrownIcon {}
                         }
@@ -1110,7 +1110,7 @@ pub fn generate_for_peer(
                         class: "floating-name",
                         title: "{ss_name}",
                         dir: "auto",
-                        "{ss_name}"
+                        span { class: "floating-name-text", "{ss_name}" }
                         if is_guest {
                             span { class: "guest-badge", "Guest" }
                         }
@@ -1324,7 +1324,7 @@ pub fn generate_for_peer(
                             class: "floating-name",
                             title: "{title_grid}",
                             dir: "auto",
-                            "{peer_display_name_grid}"
+                            span { class: "floating-name-text", "{peer_display_name_grid}" }
                             if is_host {
                                 CrownIcon {}
                             }

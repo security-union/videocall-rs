@@ -32,15 +32,6 @@ impl DockPosition {
             DockPosition::Right => "dock-right",
         }
     }
-
-    #[allow(dead_code)]
-    pub fn next(self) -> Self {
-        match self {
-            DockPosition::Bottom => DockPosition::Left,
-            DockPosition::Left => DockPosition::Right,
-            DockPosition::Right => DockPosition::Bottom,
-        }
-    }
 }
 
 /// Context for the action bar dock position (Bottom / Left / Right).
@@ -369,15 +360,8 @@ impl GlowColor {
             "plum" => Some(GlowColor::Plum),
             "mint-green" => Some(GlowColor::MintGreen),
             other if other.starts_with("custom:") => {
-                let hex = &other[7..];
-                if hex.len() == 6 && hex.chars().all(|c| c.is_ascii_hexdigit()) {
-                    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
-                    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
-                    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
-                    Some(GlowColor::Custom { r, g, b })
-                } else {
-                    None
-                }
+                let (r, g, b) = crate::util::color_math::parse_hex(&other[7..])?;
+                Some(GlowColor::Custom { r, g, b })
             }
             _ => None,
         }
@@ -394,28 +378,36 @@ impl GlowColor {
         }
     }
 
+    #[allow(dead_code)] // strict-form entry point kept as public API; tests cover it
     pub fn from_hex(hex: &str) -> Option<Self> {
-        if hex.len() == 7 && hex.starts_with('#') && hex[1..].chars().all(|c| c.is_ascii_hexdigit())
-        {
-            let r = u8::from_str_radix(&hex[1..3], 16).ok()?;
-            let g = u8::from_str_radix(&hex[3..5], 16).ok()?;
-            let b = u8::from_str_radix(&hex[5..7], 16).ok()?;
-            let presets = [
-                GlowColor::White,
-                GlowColor::Cyan,
-                GlowColor::Magenta,
-                GlowColor::Plum,
-                GlowColor::MintGreen,
-            ];
-            for preset in presets {
-                if preset.to_rgb() == (r, g, b) {
-                    return Some(preset);
-                }
-            }
-            Some(GlowColor::Custom { r, g, b })
-        } else {
-            None
+        // Strict form: exactly `#RRGGBB`. Callers with lenient input (trimmed
+        // whitespace, missing `#`) should parse via `color_math::parse_hex`
+        // and hand the RGB to `from_rgb` instead.
+        if hex.len() != 7 || !hex.starts_with('#') {
+            return None;
         }
+        let (r, g, b) = crate::util::color_math::parse_hex(hex)?;
+        Some(Self::from_rgb(r, g, b))
+    }
+
+    /// Return the preset that matches `(r, g, b)` if any, otherwise wrap in
+    /// `GlowColor::Custom`. Single source of truth for preset-vs-custom
+    /// disambiguation — call this instead of stringifying to hex and going
+    /// back through `from_hex`.
+    pub fn from_rgb(r: u8, g: u8, b: u8) -> Self {
+        let presets = [
+            GlowColor::White,
+            GlowColor::Cyan,
+            GlowColor::Magenta,
+            GlowColor::Plum,
+            GlowColor::MintGreen,
+        ];
+        for preset in presets {
+            if preset.to_rgb() == (r, g, b) {
+                return preset;
+            }
+        }
+        GlowColor::Custom { r, g, b }
     }
 }
 
@@ -1549,20 +1541,6 @@ mod tests {
     }
 
     #[test]
-    fn dock_position_next_cycles() {
-        assert_eq!(DockPosition::Bottom.next(), DockPosition::Left);
-        assert_eq!(DockPosition::Left.next(), DockPosition::Right);
-        assert_eq!(DockPosition::Right.next(), DockPosition::Bottom);
-    }
-
-    #[test]
-    fn dock_position_next_full_roundtrip() {
-        let start = DockPosition::Bottom;
-        let result = start.next().next().next();
-        assert_eq!(result, start);
-    }
-
-    #[test]
     fn density_mode_labels() {
         assert_eq!(DensityMode::Auto.label(), "Auto");
         assert_eq!(DensityMode::Standard.label(), "Standard");
@@ -1805,5 +1783,91 @@ mod tests {
     fn speaker_selection_supported_tracks_capability_flag() {
         assert!(speaker_selection_supported(true));
         assert!(!speaker_selection_supported(false));
+    }
+
+    // ── GlowColor parser consolidation ──────────────────────────────────────
+    // These pin the invariant that `from_rgb` is the single source of truth
+    // for preset-vs-Custom disambiguation and that `from_hex` delegates to
+    // `parse_hex` + `from_rgb` for the actual parsing. Reverting the
+    // consolidation (e.g. re-inlining a duplicate preset table into
+    // `from_hex`) is still allowed to pass these — the point is to catch
+    // behavioural drift between the entry points.
+
+    #[test]
+    fn glow_color_from_rgb_detects_presets() {
+        assert_eq!(GlowColor::from_rgb(255, 255, 255), GlowColor::White);
+        assert_eq!(GlowColor::from_rgb(12, 175, 255), GlowColor::Cyan);
+        assert_eq!(GlowColor::from_rgb(255, 0, 191), GlowColor::Magenta);
+        assert_eq!(GlowColor::from_rgb(221, 160, 221), GlowColor::Plum);
+        assert_eq!(GlowColor::from_rgb(91, 207, 159), GlowColor::MintGreen);
+    }
+
+    #[test]
+    fn glow_color_from_rgb_falls_back_to_custom() {
+        assert_eq!(
+            GlowColor::from_rgb(0x12, 0x34, 0x56),
+            GlowColor::Custom {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56,
+            }
+        );
+    }
+
+    #[test]
+    fn glow_color_from_hex_is_strict_and_matches_from_rgb() {
+        // Strict format required by from_hex.
+        // @token-exempt: hex literal is test input, not a rendered color
+        assert_eq!(GlowColor::from_hex("#5bcf9f"), Some(GlowColor::MintGreen));
+        assert_eq!(
+            // @token-exempt: hex literal is test input, not a rendered color
+            GlowColor::from_hex("#123456"),
+            Some(GlowColor::Custom {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56,
+            })
+        );
+
+        // Anything not in `#RRGGBB` form is rejected — lenient callers must
+        // go through `color_math::parse_hex` first, then `from_rgb`.
+        // @token-exempt: hex literals are test inputs, not rendered colors
+        assert_eq!(GlowColor::from_hex("5bcf9f"), None);
+        // @token-exempt: hex literals are test inputs, not rendered colors
+        assert_eq!(GlowColor::from_hex("#5bcf9"), None);
+        assert_eq!(GlowColor::from_hex(""), None);
+        // @token-exempt: hex literals are test inputs, not rendered colors
+        assert_eq!(GlowColor::from_hex(" #5bcf9f "), None);
+
+        // When the strict form parses, the result must match from_rgb —
+        // otherwise the two entry points have drifted.
+        // @token-exempt: hex literals are test inputs, not rendered colors
+        for hex in ["#FFFFFF", "#0CAFFF", "#DDA0DD", "#5bcf9f", "#ABCDEF"] {
+            let via_hex = GlowColor::from_hex(hex).unwrap();
+            let (r, g, b) = crate::util::color_math::parse_hex(hex).unwrap();
+            assert_eq!(via_hex, GlowColor::from_rgb(r, g, b));
+        }
+    }
+
+    #[test]
+    fn glow_color_from_storage_shares_parse_hex() {
+        // The `custom:...` branch was previously an inline hex parser; it
+        // now delegates to `color_math::parse_hex`. Verify both a canonical
+        // form and a form that only `parse_hex`'s permissiveness accepts
+        // (which storage never emits, but must not crash on).
+        assert_eq!(
+            GlowColor::from_storage("custom:123456"),
+            Some(GlowColor::Custom {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56,
+            })
+        );
+        assert_eq!(GlowColor::from_storage("custom:zzzzzz"), None);
+        // Preset names still round-trip.
+        assert_eq!(
+            GlowColor::from_storage("mint-green"),
+            Some(GlowColor::MintGreen)
+        );
     }
 }

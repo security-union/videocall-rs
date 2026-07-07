@@ -2070,4 +2070,231 @@ mod tests {
             "bad-signature id_token at exchange must yield 401, not 500"
         );
     }
+
+    // ---------------------------------------------------------------------------
+    // logout fallback-chain rungs (issue #1592)
+    //
+    // The `logout` handler computes its redirect target via a 4-rung fallback
+    // chain when no provider `end_session_endpoint` is configured (oauth.rs
+    // lines 736-741):
+    //   Rung 1: provider end_session_endpoint  -> build_end_session_url(...)
+    //   Rung 2: after_logout_url               (.and_then)
+    //   Rung 3: after_login_url                (.or_else map, non-Option String)
+    //   Rung 4: "/" default                    (.unwrap_or("/"))
+    // The existing handler tests exercise Rung 1 (end-session) and the Rung 4
+    // "/" default via `oauth = None`, but collapse the intermediate rungs. The
+    // tests below pin Rungs 2 and 3 INDIVIDUALLY (Rung 4 is already isolated by
+    // `logout_redirects_to_app_root_when_no_end_session_endpoint`, the only
+    // `oauth = None` path that reaches `.unwrap_or("/")`), plus the hint-only
+    // redirect arm of `should_redirect`, so a mutation to one rung reddens
+    // exactly one test. Each drives the PRODUCTION `logout` handler through the
+    // router and asserts the exact `Location` it returns (never re-derived inline).
+    // ---------------------------------------------------------------------------
+
+    /// Rung 3 (after_login_url): no provider end-session endpoint AND no
+    /// after_logout_url -> the fallback chain falls through to after_login_url.
+    ///
+    /// `after_login_url` is set to a value distinct from both "/" (Rung 4) and
+    /// any after_logout_url (Rung 2) so the asserted Location can ONLY come from
+    /// the after_login_url rung.
+    #[tokio::test]
+    async fn logout_falls_back_to_after_login_url_when_no_end_session_and_no_after_logout() {
+        use tower::ServiceExt;
+        // Build the config directly so after_login_url can be a distinct,
+        // non-"/" value (minimal_oauth_config hardcodes it to
+        // "https://app.example.com/").
+        let cfg = crate::config::OAuthConfig {
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            redirect_url: "https://app.example.com/auth/callback".to_string(),
+            issuer: Some("https://provider.example.com".to_string()),
+            auth_url: "https://provider.example.com/auth".to_string(),
+            token_url: "https://provider.example.com/token".to_string(),
+            jwks_url: None,
+            userinfo_url: None,
+            scopes: "openid email profile".to_string(),
+            after_login_url: "https://app.example.com/after-login".to_string(),
+            allowed_redirect_urls: vec![],
+            end_session_endpoint: None,
+            after_logout_url: None,
+            browser_pkce: false,
+            resource_server_audience: None,
+        };
+        let state = make_handler_state(Some(cfg));
+        let app = axum::Router::new()
+            .route("/logout", axum::routing::get(logout))
+            .with_state(state);
+
+        // Session cookie present -> should_redirect = true via has_session.
+        let req = axum::http::Request::builder()
+            .uri("/logout")
+            .header(header::COOKIE, "session=some-token")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "session present + no end_session_endpoint -> redirect (303)"
+        );
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("Location header must be present")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            location, "https://app.example.com/after-login",
+            "with no end_session_endpoint and no after_logout_url, the fallback \
+             chain must resolve to after_login_url (Rung 3), not \"/\" (Rung 4)"
+        );
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("Set-Cookie clear header must be present")
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "logout must clear the session cookie, got: {set_cookie}"
+        );
+    }
+
+    /// Rung 2 (`after_logout_url`): when no `end_session_endpoint` is configured
+    /// but `after_logout_url` IS set, the fallback chain must PREFER it over
+    /// `after_login_url` (Rung 3).
+    ///
+    /// This is the rung the existing tests leave unpinned: the prior
+    /// `after_login_url` test (above) sets `after_logout_url: None` to reach Rung
+    /// 3, and the existing `..._app_root_when_no_end_session_endpoint` test uses
+    /// `oauth = None` to reach the `/` default — neither exercises the
+    /// `.and_then(|o| o.after_logout_url.as_deref())` arm (oauth.rs:739) being
+    /// TAKEN. We give `after_logout_url` and `after_login_url` DISTINCT sentinels
+    /// so the asserted Location can ONLY come from Rung 2; mutating the
+    /// `after_logout_url` arm to fall through reddens exactly this test (the
+    /// Location would become the `after_login_url` sentinel instead).
+    ///
+    /// (The `/` default rung itself is already pinned by
+    /// `logout_redirects_to_app_root_when_no_end_session_endpoint`, which uses
+    /// `oauth = None` — the ONLY config that reaches `.unwrap_or("/")`, since
+    /// `after_login_url` is a non-`Option` `String` that always yields `Some`. A
+    /// second `/`-default test could not isolate it from that one, so we pin the
+    /// genuinely-uncovered Rung 2 instead.)
+    #[tokio::test]
+    async fn logout_prefers_after_logout_url_over_after_login_url() {
+        use tower::ServiceExt;
+        let cfg = crate::config::OAuthConfig {
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            redirect_url: "https://app.example.com/auth/callback".to_string(),
+            issuer: Some("https://provider.example.com".to_string()),
+            auth_url: "https://provider.example.com/auth".to_string(),
+            token_url: "https://provider.example.com/token".to_string(),
+            jwks_url: None,
+            userinfo_url: None,
+            scopes: "openid email profile".to_string(),
+            // DISTINCT sentinels: Rung 2 must win over Rung 3.
+            after_login_url: "https://app.example.com/after-login".to_string(),
+            allowed_redirect_urls: vec![],
+            end_session_endpoint: None,
+            after_logout_url: Some("https://app.example.com/after-logout".to_string()),
+            browser_pkce: false,
+            resource_server_audience: None,
+        };
+        let state = make_handler_state(Some(cfg));
+        let app = axum::Router::new()
+            .route("/logout", axum::routing::get(logout))
+            .with_state(state);
+
+        // Session cookie present -> should_redirect = true via has_session.
+        let req = axum::http::Request::builder()
+            .uri("/logout")
+            .header(header::COOKIE, "session=some-token")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "session present + no end_session_endpoint -> fallback redirect (303)"
+        );
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("Location header must be present")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            location, "https://app.example.com/after-logout",
+            "with after_logout_url set, Rung 2 must win over after_login_url (Rung 3)"
+        );
+        let set_cookie = resp
+            .headers()
+            .get(header::SET_COOKIE)
+            .expect("Set-Cookie clear header must be present")
+            .to_str()
+            .unwrap();
+        assert!(
+            set_cookie.contains("Max-Age=0"),
+            "logout must clear the session cookie, got: {set_cookie}"
+        );
+    }
+
+    /// Hint-only redirect path: `should_redirect = has_session ||
+    /// id_token_hint.is_some()`. With NO session cookie but an `id_token_hint`
+    /// query param, the redirect arm must still fire (303, not 200), proving the
+    /// `|| id_token_hint.is_some()` term carries the decision. With no
+    /// end_session_endpoint, the target is the fallback chain (after_login_url
+    /// here). This pins the browser-PKCE logout path the issue calls out.
+    #[tokio::test]
+    async fn logout_hint_only_no_cookie_takes_fallback_redirect() {
+        use tower::ServiceExt;
+        let cfg = crate::config::OAuthConfig {
+            client_id: "test-client".to_string(),
+            client_secret: None,
+            redirect_url: "https://app.example.com/auth/callback".to_string(),
+            issuer: Some("https://provider.example.com".to_string()),
+            auth_url: "https://provider.example.com/auth".to_string(),
+            token_url: "https://provider.example.com/token".to_string(),
+            jwks_url: None,
+            userinfo_url: None,
+            scopes: "openid email profile".to_string(),
+            after_login_url: "https://app.example.com/after-login".to_string(),
+            allowed_redirect_urls: vec![],
+            end_session_endpoint: None,
+            after_logout_url: None,
+            browser_pkce: false,
+            resource_server_audience: None,
+        };
+        let state = make_handler_state(Some(cfg));
+        let app = axum::Router::new()
+            .route("/logout", axum::routing::get(logout))
+            .with_state(state);
+
+        // No Cookie header: should_redirect can ONLY be true via id_token_hint.
+        let req = axum::http::Request::builder()
+            .uri("/logout?id_token_hint=eyJtest")
+            .body(AxumBody::empty())
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+
+        assert_eq!(
+            resp.status(),
+            StatusCode::SEE_OTHER,
+            "id_token_hint alone (no cookie) must trigger the redirect arm (303, \
+             not 200) — proves the `|| id_token_hint.is_some()` term fired"
+        );
+        let location = resp
+            .headers()
+            .get(header::LOCATION)
+            .expect("Location header must be present for hint-only logout")
+            .to_str()
+            .unwrap();
+        assert_eq!(
+            location, "https://app.example.com/after-login",
+            "no end_session_endpoint -> fallback chain resolves to after_login_url"
+        );
+    }
 }

@@ -592,8 +592,8 @@ async fn device_settings_modal_renders_expected_navigation_tabs() {
     let nav_buttons = mount.query_selector_all(".settings-nav-button").unwrap();
     assert_eq!(
         nav_buttons.length(),
-        4,
-        "should render exactly four nav buttons (Audio, Video, Network, Appearance)"
+        5,
+        "should render exactly five nav buttons (Audio, Video, Network, Appearance, Preferences)"
     );
 
     let text = mount.text_content().unwrap_or_default();
@@ -601,6 +601,10 @@ async fn device_settings_modal_renders_expected_navigation_tabs() {
     assert!(text.contains("Video"), "should render Video nav");
     assert!(text.contains("Network"), "should render Network nav");
     assert!(text.contains("Appearance"), "should render Appearance nav");
+    assert!(
+        text.contains("Preferences"),
+        "should render Preferences nav"
+    );
     assert!(
         !text.contains("Performance"),
         "should not render a Performance nav or any performance affordance (panel moved to the Diagnostics drawer, #1131)"

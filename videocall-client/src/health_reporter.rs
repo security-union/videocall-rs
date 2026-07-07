@@ -2877,7 +2877,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,
@@ -3190,7 +3190,7 @@ mod tests {
             0,
             0,
             0,
-            0.0, // encoder_p75_peer_fps
+            0.0, // encoder_queue_depth_report
             0.0, // encoder_target_bitrate_kbps
             0,
             false,

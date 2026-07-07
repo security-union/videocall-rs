@@ -213,7 +213,7 @@ fn SettingsGlassSelect(
 }
 
 // The `Performance` tab was removed in #1131: the Performance controls moved
-// into the Diagnostics drawer. The tablist is now four tabs. (The transitional
+// into the Diagnostics drawer. The tablist is now five tabs. (The transitional
 // "moved to Diagnostics" redirect row was also removed; users find Performance
 // in the drawer, and the "performance" deep link routes there via attendants.)
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -222,6 +222,7 @@ enum SettingsSection {
     Video,
     Network,
     Appearance,
+    Preferences,
 }
 
 impl SettingsSection {
@@ -231,6 +232,7 @@ impl SettingsSection {
             SettingsSection::Video => "Video",
             SettingsSection::Network => "Network",
             SettingsSection::Appearance => "Appearance",
+            SettingsSection::Preferences => "Preferences",
         }
     }
 
@@ -240,6 +242,7 @@ impl SettingsSection {
             SettingsSection::Video => "settings-tab-video",
             SettingsSection::Network => "settings-tab-network",
             SettingsSection::Appearance => "settings-tab-appearance",
+            SettingsSection::Preferences => "settings-tab-preferences",
         }
     }
 
@@ -249,6 +252,7 @@ impl SettingsSection {
             SettingsSection::Video => "settings-panel-video",
             SettingsSection::Network => "settings-panel-network",
             SettingsSection::Appearance => "settings-panel-appearance",
+            SettingsSection::Preferences => "settings-panel-preferences",
         }
     }
 
@@ -258,15 +262,17 @@ impl SettingsSection {
             SettingsSection::Video => "settings-nav-video",
             SettingsSection::Network => "settings-nav-network",
             SettingsSection::Appearance => "settings-nav-appearance",
+            SettingsSection::Preferences => "settings-nav-preferences",
         }
     }
 
-    fn all() -> [SettingsSection; 4] {
+    fn all() -> [SettingsSection; 5] {
         [
             SettingsSection::Audio,
             SettingsSection::Video,
             SettingsSection::Network,
             SettingsSection::Appearance,
+            SettingsSection::Preferences,
         ]
     }
 
@@ -275,16 +281,18 @@ impl SettingsSection {
             SettingsSection::Audio => SettingsSection::Video,
             SettingsSection::Video => SettingsSection::Network,
             SettingsSection::Network => SettingsSection::Appearance,
-            SettingsSection::Appearance => SettingsSection::Audio,
+            SettingsSection::Appearance => SettingsSection::Preferences,
+            SettingsSection::Preferences => SettingsSection::Audio,
         }
     }
 
     fn prev(self) -> Self {
         match self {
-            SettingsSection::Audio => SettingsSection::Appearance,
+            SettingsSection::Audio => SettingsSection::Preferences,
             SettingsSection::Video => SettingsSection::Audio,
             SettingsSection::Network => SettingsSection::Video,
             SettingsSection::Appearance => SettingsSection::Network,
+            SettingsSection::Preferences => SettingsSection::Appearance,
         }
     }
 }
@@ -313,6 +321,7 @@ pub fn DeviceSettingsModal(
     // happen — fall back to the default Audio tab defensively rather than panic.
     let requested = match initial_section.as_deref() {
         Some("appearance") => SettingsSection::Appearance,
+        Some("preferences") => SettingsSection::Preferences,
         Some("network") => SettingsSection::Network,
         Some("video") => SettingsSection::Video,
         _ => SettingsSection::Audio,
@@ -322,7 +331,7 @@ pub fn DeviceSettingsModal(
     let mut active_section = use_signal(move || requested);
     // Defensive: detect parent-driven section switches while the modal stays
     // mounted. Currently unreachable (the fullscreen overlay prevents clicking
-    // "Dock Settings…" while open), but guards against future callers that may
+    // "Action Bar…" while open), but guards against future callers that may
     // change `initial_section` without a key remount.
     let initial_section_clone = initial_section.clone();
     let mut prev_section_prop = use_signal(move || initial_section_clone);
@@ -733,6 +742,16 @@ pub fn DeviceSettingsModal(
                                     crate::components::appearance_settings_panel::AppearanceSettingsPanel {}
                                 }
                             },
+                            SettingsSection::Preferences => rsx! {
+                                div {
+                                    id: SettingsSection::Preferences.panel_id(),
+                                    class: "settings-section",
+                                    role: "tabpanel",
+                                    "aria-labelledby": SettingsSection::Preferences.tab_id(),
+
+                                    crate::components::preferences_settings_panel::PreferencesSettingsPanel {}
+                                }
+                            },
                         }
                     }
                 }
@@ -850,6 +869,27 @@ fn render_nav_icon(section: SettingsSection) -> Element {
                 path { d: "M20.5 14.2a6 6 0 1 1-6.7-6.7 4.6 4.6 0 0 0 6.7 6.7z" }
             }
         },
+        SettingsSection::Preferences => rsx! {
+            svg {
+                class: "settings-nav-icon",
+                view_box: "0 0 24 24",
+                width: "18",
+                height: "18",
+                "aria-hidden": "true",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "1.6",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                // Three horizontal sliders
+                line { x1: "4", y1: "6", x2: "20", y2: "6" }
+                circle { cx: "8", cy: "6", r: "2", fill: "currentColor", stroke: "none" }
+                line { x1: "4", y1: "12", x2: "20", y2: "12" }
+                circle { cx: "16", cy: "12", r: "2", fill: "currentColor", stroke: "none" }
+                line { x1: "4", y1: "18", x2: "20", y2: "18" }
+                circle { cx: "10", cy: "18", r: "2", fill: "currentColor", stroke: "none" }
+            }
+        },
     }
 }
 
@@ -864,33 +904,38 @@ fn find_device_by_id(devices: &[MediaDeviceInfo], device_id: &str) -> Option<Dev
 mod tests {
     use super::*;
 
-    /// The tablist is now FOUR tabs — Performance was removed (#1131). If a
-    /// Performance variant is reintroduced into `all()` this length flips,
-    /// catching an accidental revert.
+    /// The tablist is now FIVE tabs — Performance was removed (#1131) and
+    /// Preferences was added. If a Performance variant is reintroduced into
+    /// `all()` this length flips, catching an accidental revert.
     #[test]
-    fn tablist_has_four_sections_without_performance() {
+    fn tablist_has_five_sections_without_performance() {
         let all = SettingsSection::all();
-        assert_eq!(all.len(), 4, "tablist must have exactly 4 tabs");
+        assert_eq!(all.len(), 5, "tablist must have exactly 5 tabs");
         let titles: Vec<&str> = all.iter().map(|s| s.title()).collect();
-        assert_eq!(titles, ["Audio", "Video", "Network", "Appearance"]);
+        assert_eq!(
+            titles,
+            ["Audio", "Video", "Network", "Appearance", "Preferences"]
+        );
         assert!(
             !titles.contains(&"Performance"),
             "Performance tab must not be in the tablist (it moved to Diagnostics)"
         );
     }
 
-    /// `next()` cycles through exactly the four sections and wraps. Audio→Video
-    /// is the post-removal edge (it used to be Video→Performance); this fails if
-    /// the cycle is wired back through a Performance variant.
+    /// `next()` cycles through all five sections and wraps.
     #[test]
-    fn next_cycles_four_sections_and_wraps() {
+    fn next_cycles_five_sections_and_wraps() {
         assert_eq!(SettingsSection::Audio.next(), SettingsSection::Video);
         assert_eq!(SettingsSection::Video.next(), SettingsSection::Network);
         assert_eq!(SettingsSection::Network.next(), SettingsSection::Appearance);
-        assert_eq!(SettingsSection::Appearance.next(), SettingsSection::Audio);
+        assert_eq!(
+            SettingsSection::Appearance.next(),
+            SettingsSection::Preferences
+        );
+        assert_eq!(SettingsSection::Preferences.next(), SettingsSection::Audio);
     }
 
-    /// `prev()` is the exact inverse of `next()` over the four-section ring.
+    /// `prev()` is the exact inverse of `next()` over the five-section ring.
     #[test]
     fn prev_is_inverse_of_next() {
         for s in SettingsSection::all() {

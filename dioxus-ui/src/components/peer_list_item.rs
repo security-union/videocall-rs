@@ -48,7 +48,7 @@ pub fn PeerListItem(
         effective_tooltip
     };
 
-    let mic_class = if speaking {
+    let mic_class = if speaking && !muted {
         "peer_item_mic speaking"
     } else {
         "peer_item_mic"
@@ -56,7 +56,7 @@ pub fn PeerListItem(
 
     let appearance_ctx = use_context::<AppearanceSettingsCtx>();
     let appearance = (appearance_ctx.0)();
-    let mic_style = if speaking && appearance.glow_enabled {
+    let mic_style = if speaking && !muted && appearance.glow_enabled {
         let hex = appearance.glow_color.to_hex();
         format!("color: {hex};")
     } else {

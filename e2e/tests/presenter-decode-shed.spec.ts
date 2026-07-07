@@ -215,12 +215,21 @@ test.describe("Presenter-aware decode shedding (#1559)", () => {
   };
 
   // The Screen Share control is `button.video-control-button` carrying a
-  // `span.tooltip` of "Share Screen" (idle) / "Stop Screen Share" (active) —
-  // see video_control_buttons.rs ScreenShareButton. Match the IDLE tooltip
-  // EXACTLY (not a substring of "Stop Screen Share") so start/stop are distinct.
+  // `span.tooltip` whose `.tooltip-title` is "Screen share — Share Screen"
+  // (idle) or "Screen share — Stop Screen Share" (active), plus a
+  // `.tooltip-desc` description span — see video_control_buttons.rs
+  // ScreenShareButton. Use a case-insensitive substring (Playwright's
+  // `hasText: "Share Screen"`) that appears in the idle title but NOT in
+  // the active title: "Stop Screen Share" does not contain "Share Screen"
+  // as a substring (the order is reversed), and neither tooltip's
+  // description text contains the phrase, so start/stop stay distinct.
+  // An anchored regex (`/^Share Screen$/`) cannot be used here because the
+  // tooltip now wraps the label in a `.tooltip-title` span plus a
+  // `.tooltip-desc` span, so `.tooltip`'s full textContent concatenates
+  // both children and can never equal just "Share Screen".
   const idleShareBtn = (page: Page) =>
     page.locator(".video-controls-container button.video-control-button", {
-      has: page.locator(".tooltip", { hasText: /^Share Screen$/ }),
+      has: page.locator(".tooltip", { hasText: "Share Screen" }),
     });
   const activeShareBtn = (page: Page) =>
     page.locator(".video-controls-container button.video-control-button", {

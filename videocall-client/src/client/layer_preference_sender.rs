@@ -189,6 +189,31 @@ impl LayerPreferenceSender {
         Some(entries)
     }
 
+    /// The canonical desired-layer map last written to the wire (issue #1695).
+    ///
+    /// This is what this client last PUT on the wire as its per-(source,kind)
+    /// preference — i.e. the set of layers the relay will EXACT-MATCH forward once it
+    /// has recorded them. `None` means nothing sent yet on the current connection
+    /// (relay still fails open → forwards every layer). A `(sid,kind)` ABSENT from the
+    /// map means "no preference recorded for that source" → the relay forwards ALL its
+    /// layers (fail-open). Read by
+    /// [`crate::decode::peer_decode_manager::PeerDecodeManager::reconcile_decode_guards_to_wire`]
+    /// AFTER `take_if_changed` (an accepted send promotes `last_sent` to the
+    /// just-sent map) so the decode guard is reconciled to the layer the relay
+    /// will actually forward.
+    ///
+    /// BOUND (pre-existing, NOT introduced or worsened by #1695): the relay applies
+    /// its OWN ~200ms min-interval to recorded preferences and silently DROPS (keeps
+    /// its old map) a too-soon update, with no relay→client signal. If a client
+    /// preference is dropped by the relay limiter, this `last_sent` (which the
+    /// reconcile pins the guard to) can momentarily disagree with the relay's recorded
+    /// map until the next changed-and-accepted publish. Reconciling the guard to
+    /// `last_sent` makes guard == client-last-sent — the best the client can do
+    /// without a relay ack, and what the guard already tracked before #1695.
+    pub(crate) fn last_sent(&self) -> Option<&BTreeMap<PrefKey, u32>> {
+        self.last_sent.as_ref()
+    }
+
     /// Forget what was last sent so the next change re-sends unconditionally.
     /// Call on (re)connect: the relay allocated a fresh empty preference map for
     /// the new session_id, so we must repopulate it. Also clears the rate-limit

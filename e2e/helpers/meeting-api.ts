@@ -142,6 +142,46 @@ export async function endMeeting(
 }
 
 /**
+ * Transfer host from the calling (current host) user to `targetUserId` via
+ * `POST /api/v1/meetings/{id}/transfer-host`.
+ *
+ * The endpoint's `require_host` gate authorizes the CALLER, then atomically
+ * promotes the target and demotes the caller in one DB transaction (the only
+ * sanctioned self-demotion), publishing `HOST_GRANTED(target)` then
+ * `HOST_REVOKED(caller)` over NATS (meeting-api/src/routes/host.rs).
+ *
+ * The target `user_id` is the participant's JWT `sub`, which for the e2e
+ * session tokens is the user's EMAIL (see `generateSessionToken` in
+ * `helpers/auth.ts`) — pass the target's e2e email here.
+ *
+ * This helper exists so a test can move host WHILE the caller's media
+ * transport is severed: the browser never receives the `HOST_REVOKED` packet
+ * (it is delivered over the media session the relay drops when the transport is
+ * down), so the caller's host state drifts until it is reconciled on reconnect.
+ */
+export async function transferHost(
+  callerEmail: string,
+  callerName: string,
+  meetingId: string,
+  targetUserId: string,
+): Promise<void> {
+  const res = await fetch(`${API_URL}/api/v1/meetings/${meetingId}/transfer-host`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Cookie: authCookie(callerEmail, callerName),
+    },
+    body: JSON.stringify({ user_id: targetUserId }),
+  });
+  if (!res.ok) {
+    const txt = await res.text();
+    throw new Error(
+      `POST /api/v1/meetings/${meetingId}/transfer-host failed (${res.status}): ${txt}`,
+    );
+  }
+}
+
+/**
  * Fetch the authenticated user's home feed via `GET /api/v1/meetings/feed`
  * and return the `state` ("idle" | "active" | "ended") of the meeting with the
  * given `meetingId`, or `null` when that meeting is not present in the feed.

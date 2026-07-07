@@ -122,7 +122,7 @@ async fn peer_list_item_muted_renders_mic_icon() {
 }
 
 #[wasm_bindgen_test]
-async fn peer_list_item_speaking_and_muted_has_speaking_class() {
+async fn peer_list_item_speaking_and_muted_suppresses_speaking_class() {
     let mount = create_mount_point();
     fn wrapper() -> Element {
         let appearance_settings = use_signal(AppearanceSettings::default);
@@ -134,8 +134,8 @@ async fn peer_list_item_speaking_and_muted_has_speaking_class() {
 
     let mic_div = mount.query_selector(".peer_item_mic").unwrap().unwrap();
     assert!(
-        mic_div.class_list().contains("speaking"),
-        "mic div should have 'speaking' class even when muted (speaking prop is true)"
+        !mic_div.class_list().contains("speaking"),
+        "mic div should NOT have 'speaking' class when muted, even if speaking=true"
     );
 
     cleanup(&mount);

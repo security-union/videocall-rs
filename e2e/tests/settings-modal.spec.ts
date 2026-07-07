@@ -412,6 +412,16 @@ test.describe("Device settings modal", () => {
     const popover = page.locator(".custom-color-popover");
     await expect(popover).toBeVisible();
 
+    // Regression guard for #487 / issue #694: the "+" button must open the
+    // full visual HSV color picker (saturation/value square + hue slider),
+    // not the plain text-only popover it fell back to after the color picker
+    // was deleted in commit 252cabd (via PR #882 "light-and-dark-themes").
+    // These assertions FAIL on that broken state and PASS on the restored
+    // modal; do not remove them without re-confirming the picker still ships.
+    await expect(page.locator(".custom-color-modal-overlay")).toBeVisible();
+    await expect(popover.locator(".color-picker-sv-square")).toBeVisible();
+    await expect(popover.locator(".color-picker-hue-track")).toBeVisible();
+
     // Hex text input
     await expect(popover.locator(".custom-color-input")).toBeVisible();
     await expect(popover.locator(".custom-color-input")).toHaveAttribute("placeholder", "#RRGGBB");
@@ -421,11 +431,229 @@ test.describe("Device settings modal", () => {
     await expect(popover.locator(".custom-color-add-btn")).toHaveText("Add");
   });
 
-  // FIXME(#694): Color picker feature tests — not yet validated against
-  // current DOM. Unblock: run in headed mode to confirm selectors.
-  test.fixme("typing a valid hex in the text input updates the hue slider value", async ({
+  // Regression for the hex validator mismatch: the picker reports errors via
+  // the lenient `parse_hex` (trims whitespace, `#` optional) but the Add
+  // button previously gated on the strict `GlowColor::from_hex` (exactly 7
+  // chars starting with `#`). Inputs like `ABCDEF` or `#FF0000 ` produced
+  // NO error message AND a disabled Add button — a silent dead state. Both
+  // gates now share `parse_hex`, so these inputs must yield: no error shown,
+  // Add enabled. FAILS on the pre-fix code where Add stays disabled.
+  test("Add button gate matches the picker's own hex validator (no silent dead state)", async ({
     page,
   }) => {
+    const meetingId = `e2e_custom_color_validator_parity_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("validator-parity-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    await page.locator('[aria-label="Add custom color"]').click();
+
+    const popover = page.locator(".custom-color-popover");
+    await expect(popover).toBeVisible();
+
+    const colorInput = popover.locator(".custom-color-input");
+    const addColorBtn = popover.locator(".custom-color-add-btn");
+
+    // Input 1: no leading `#`. Accepted by parse_hex, rejected by the old
+    // strict validator. Pre-fix: Add disabled + no error → dead state.
+    await colorInput.fill("ABCDEF");
+    await expect(popover.locator(".input-error-message")).toHaveCount(0);
+    await expect(addColorBtn).toBeEnabled();
+
+    // Input 2: valid hex with trailing whitespace. parse_hex trims it; the
+    // old strict validator saw length 8 and rejected. Same silent dead state.
+    await colorInput.fill("#FF0000 ");
+    await expect(popover.locator(".input-error-message")).toHaveCount(0);
+    await expect(addColorBtn).toBeEnabled();
+
+    // Truly invalid input still surfaces an error and disables Add.
+    await colorInput.fill("nope");
+    await expect(popover.locator(".input-error-message")).toBeVisible();
+    await expect(addColorBtn).toBeDisabled();
+
+    // Clicking Add on a leniently-valid value creates the swatch and closes
+    // the modal — proving the onclick path also uses the lenient validator.
+    await colorInput.fill("ABCDEF");
+    await addColorBtn.click();
+    await expect(popover).toHaveCount(0);
+    await expect(page.locator('[aria-label*="Select custom highlight #ABCDEF"]')).toBeVisible();
+  });
+
+  // Regression for the focus-trap a11y bug: without a focus trap, Tab from
+  // the last focusable element in the modal moves focus to the Brightness
+  // slider that lives immediately after the modal in DOM order (the scrim
+  // blocks mouse clicks but does NOT block keyboard focus). This test
+  // FAILS on the un-fixed code because focus escapes to
+  // `.appearance-slider`.
+  test("Tab and Shift+Tab wrap focus inside the color picker modal (no escape to background)", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_custom_color_focus_trap_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("focus-trap-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), {
+      timeout: 10_000,
+    });
+
+    const joinButton = page.getByRole("button", {
+      name: /Start Meeting|Join Meeting/,
+    });
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({
+      timeout: 15_000,
+    });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({
+      timeout: 10_000,
+    });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    await page.locator('[aria-label="Add custom color"]').click();
+    const popover = page.locator(".custom-color-popover");
+    await expect(popover).toBeVisible();
+
+    // Type a valid hex so the Add button is enabled and therefore in the
+    // focusable set — this locks the "last focusable" position.
+    await popover.locator(".custom-color-input").fill("#123456");
+    await expect(popover.locator(".custom-color-add-btn")).toBeEnabled();
+
+    // Focus the last focusable in the modal (Add button) and press Tab.
+    // Without the trap, focus jumps to a Brightness slider outside the
+    // dialog; with the trap, it wraps to the first focusable (close btn).
+    await popover.locator(".custom-color-add-btn").focus();
+    await page.keyboard.press("Tab");
+    const afterTabInsideModal = await page.evaluate(
+      () => !!document.activeElement?.closest(".custom-color-modal"),
+    );
+    expect(afterTabInsideModal).toBe(true);
+    // The specific wrap target: first focusable is the close button.
+    const afterTabIsClose = await page.evaluate(() =>
+      document.activeElement?.classList.contains("custom-color-modal-close"),
+    );
+    expect(afterTabIsClose).toBe(true);
+
+    // Now Shift+Tab from the close button must wrap to the last focusable
+    // (Add button), not escape backwards into the panel behind the scrim.
+    await page.keyboard.press("Shift+Tab");
+    const afterShiftTabInsideModal = await page.evaluate(
+      () => !!document.activeElement?.closest(".custom-color-modal"),
+    );
+    expect(afterShiftTabInsideModal).toBe(true);
+    const afterShiftTabIsAdd = await page.evaluate(() =>
+      document.activeElement?.classList.contains("custom-color-add-btn"),
+    );
+    expect(afterShiftTabIsAdd).toBe(true);
+
+    // Regression symptom: assert focus is NOT on any background control
+    // (sliders behind the scrim).
+    const focusedIsAppearanceSlider = await page.evaluate(
+      () => document.activeElement?.classList.contains("appearance-slider") ?? false,
+    );
+    expect(focusedIsAppearanceSlider).toBe(false);
+  });
+
+  // Regression for the focus-on-open a11y bug: after clicking "+", focus
+  // used to stay on the "+" button (a DOM sibling of the dialog), so an
+  // immediate Escape did NOT close the modal because the keydown handler
+  // lives on the dialog. The modal now has tabindex="-1" and calls
+  // set_focus(true) onmounted. FAILS on the pre-fix code because Escape
+  // is swallowed by the "+" button and the modal stays open.
+  test("pressing Escape immediately after opening the picker closes the modal", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_custom_color_escape_focus_${Date.now()}`;
+
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially("escape-focus-user", { delay: 80 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+    await expect(joinButton).toBeVisible({ timeout: 20_000 });
+    await joinButton.click();
+
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    await page.locator('[aria-label="Add custom color"]').click();
+
+    const popover = page.locator(".custom-color-popover");
+    await expect(popover).toBeVisible();
+
+    // Focus must have moved off the "+" button and into the dialog. Assert
+    // the active element is inside the modal — this is the direct DOM
+    // symptom of the fix; without it, activeElement stays on "+".
+    const activeInsideDialog = await page.evaluate(
+      () => !!document.activeElement?.closest(".custom-color-modal"),
+    );
+    expect(activeInsideDialog).toBe(true);
+
+    // Press Escape without clicking inside the modal first. The dialog's
+    // onkeydown handler must catch this and close the modal.
+    await page.keyboard.press("Escape");
+    await expect(popover).toHaveCount(0);
+    await expect(page.locator(".custom-color-modal-overlay")).toHaveCount(0);
+
+    // Focus returns to the "+" button (existing focus_add_btn contract).
+    const focusedId = await page.evaluate(() => document.activeElement?.id);
+    expect(focusedId).toBe("add-custom-color-btn");
+  });
+
+  // Regression coverage for #487 / #694: the modal HSV color picker was
+  // deleted by commit 252cabd (via PR #882) and restored on this branch.
+  // These tests exercise the picker's DOM contract; if the picker regresses
+  // to a text-only popover they fail because .color-picker-* selectors go
+  // away. `settings-modal.spec.ts` is untagged — validate via `/run-e2e
+  // dioxus` dispatch or the local docker e2e stack; per-PR CI does not run
+  // untagged specs.
+  test("typing a valid hex in the text input updates the hue slider value", async ({ page }) => {
     const meetingId = `e2e_custom_color_picker_sync_${Date.now()}`;
 
     await page.goto("/");
@@ -487,9 +715,7 @@ test.describe("Device settings modal", () => {
     expect(Number(await hueTrack.getAttribute("aria-valuenow"))).toBeLessThanOrEqual(22);
   });
 
-  test.fixme("hue slider supports keyboard navigation (ArrowDown increases hue)", async ({
-    page,
-  }) => {
+  test("hue slider supports keyboard navigation (ArrowDown increases hue)", async ({ page }) => {
     const meetingId = `e2e_custom_color_hue_kbd_${Date.now()}`;
 
     await page.goto("/");
@@ -545,7 +771,7 @@ test.describe("Device settings modal", () => {
     expect(after - before).toBeLessThanOrEqual(3);
   });
 
-  test.fixme("Cancel button closes the modal without adding a swatch", async ({ page }) => {
+  test("Cancel button closes the modal without adding a swatch", async ({ page }) => {
     const meetingId = `e2e_custom_color_cancel_${Date.now()}`;
 
     await page.goto("/");
@@ -591,14 +817,14 @@ test.describe("Device settings modal", () => {
     // No swatch was added
     const swatchCountAfter = await page.locator(".color-swatches .color-swatch").count();
     expect(swatchCountAfter).toBe(swatchCountBefore);
-    await expect(page.locator('[aria-label*="Select custom glow #ABCDEF"]')).toHaveCount(0);
+    await expect(page.locator('[aria-label*="Select custom highlight #ABCDEF"]')).toHaveCount(0);
 
     // Focus returns to the add button
     const focusedElementId = await page.evaluate(() => document.activeElement?.id);
     expect(focusedElementId).toBe("add-custom-color-btn");
   });
 
-  test.fixme("custom color popover closes when clicking outside and focus returns to add button", async ({
+  test("custom color popover closes when clicking outside and focus returns to add button", async ({
     page,
   }) => {
     const meetingId = `e2e_popover_click_outside_${Date.now()}`;
@@ -646,10 +872,7 @@ test.describe("Device settings modal", () => {
     expect(focusedElementId).toBe("add-custom-color-btn");
   });
 
-  // FIXME(#694): Color picker feature — Add button is disabled for invalid
-  // input (by design), so the test flow of click-then-assert-error is wrong.
-  // Unblock: assert button.toBeDisabled() instead of clicking it.
-  test.fixme("invalid custom color input shows error and does not add swatch", async ({ page }) => {
+  test("invalid custom color input shows error and does not add swatch", async ({ page }) => {
     const meetingId = `e2e_custom_color_invalid_${Date.now()}`;
 
     await page.goto("/");
@@ -708,10 +931,7 @@ test.describe("Device settings modal", () => {
     expect(swatchCountAfter).toBe(swatchCountBefore);
   });
 
-  // FIXME(#694): Color picker feature — not yet validated against current DOM.
-  test.fixme("valid custom color adds swatch, selects it, and it can be reselected", async ({
-    page,
-  }) => {
+  test("valid custom color adds swatch, selects it, and it can be reselected", async ({ page }) => {
     const meetingId = `e2e_custom_color_valid_${Date.now()}`;
 
     await page.goto("/");
@@ -755,18 +975,18 @@ test.describe("Device settings modal", () => {
     await expect(popover).toHaveCount(0);
 
     // A new custom swatch appears and is automatically selected
-    const customSwatch = page.locator('[aria-label*="Select custom glow #12ABEF"]');
+    const customSwatch = page.locator('[aria-label*="Select custom highlight #12ABEF"]');
     await expect(customSwatch).toBeVisible();
     await expect(customSwatch).toHaveAttribute("aria-pressed", "true");
 
     // Previously selected preset (default Mint Green) is deselected
-    await expect(page.locator('[aria-label="Select Mint Green glow"]')).toHaveAttribute(
+    await expect(page.locator('[aria-label="Select Mint Green highlight"]')).toHaveAttribute(
       "aria-pressed",
       "false",
     );
 
     // Switch to a preset, then reselect the custom color
-    const cyanSwatch = page.locator('[aria-label="Select Cyan glow"]');
+    const cyanSwatch = page.locator('[aria-label="Select Cyan highlight"]');
     await cyanSwatch.click();
     await expect(cyanSwatch).toHaveAttribute("aria-pressed", "true");
     await expect(customSwatch).toHaveAttribute("aria-pressed", "false");
@@ -777,14 +997,13 @@ test.describe("Device settings modal", () => {
 
     // Preview tile uses fixed-intensity glow — selecting custom #12ABEF
     // (rgb 18, 171, 239) must appear in the inline style.
-    const previewTile = page.locator(".appearance-preview-area .preview-tile");
+    const previewTile = page.locator(".speaker-highlight-preview .preview-tile");
     await expect(previewTile).toBeVisible();
     await expect(previewTile).toHaveAttribute("style", /rgba\(18, 171, 239/);
     await expect(previewTile).toHaveClass(/preview-tile-pulsing/);
   });
 
-  // FIXME(#694): Color picker feature — not yet validated against current DOM.
-  test.fixme("custom color can be deleted via delete button", async ({ page }) => {
+  test("custom color can be deleted via delete button", async ({ page }) => {
     const meetingId = `e2e_custom_color_delete_${Date.now()}`;
 
     await page.goto("/");
@@ -823,7 +1042,7 @@ test.describe("Device settings modal", () => {
     await addColorBtn.click();
 
     // Verify custom swatch was created and is selected
-    const customSwatch = page.locator('[aria-label*="Select custom glow #FF5733"]').first();
+    const customSwatch = page.locator('[aria-label*="Select custom highlight #FF5733"]').first();
     await expect(customSwatch).toBeVisible();
     await expect(customSwatch).toHaveAttribute("aria-pressed", "true");
 
@@ -845,7 +1064,7 @@ test.describe("Device settings modal", () => {
     expect(swatchCountAfter).toBe(swatchCountBefore - 1);
 
     // Verify user is switched back to default color (Mint Green) after deletion
-    const mintSwatch = page.locator('[aria-label="Select Mint Green glow"]');
+    const mintSwatch = page.locator('[aria-label="Select Mint Green highlight"]');
     await expect(mintSwatch).toHaveAttribute("aria-pressed", "true");
   });
 

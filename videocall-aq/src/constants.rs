@@ -176,6 +176,27 @@ pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 /// indices into the existing `VIDEO_QUALITY_TIERS` rather than duplicating the
 /// tier values, so there is one place to tune.
 ///
+/// ## These are INDEPENDENT simulcast encodes — NOT nested SVC layers
+///
+/// Each `layer_id` is a SEPARATE, self-contained encode of the whole frame at
+/// that resolution/bitrate. Layer 2 is NOT layer 0 + 1 + an enhancement on top;
+/// it is its own complete stream. Decode and relay-forwarding are therefore
+/// **exact-match on `layer_id`, not cumulative ("layer N and below")**:
+///   * the relay forwards ONLY the one `layer_id` a receiver requested for a
+///     source (see the `chat_server.rs` forwarding filter), never `0..=N`; and
+///   * the receiver decode guard accepts ONLY packets whose `layer_id` equals
+///     its currently-selected layer (see `peer_decode_manager.rs`); a packet of
+///     any other layer is dropped.
+///
+/// Consequence — do NOT reason about this as SVC: if a receiver's selected
+/// layer and the layer the relay is forwarding ever DISAGREE, the receiver gets
+/// NOTHING decodable and the tile FREEZES on its last-good frame; it does NOT
+/// fall back to a lower-quality frame. So a selected layer must never lead the
+/// requested-layer wire state (issue #1695). The "base layer is always
+/// forwarded / shed the top layer" language elsewhere is the PUBLISHER's view
+/// (it produces a stack and sheds from the top) — it does not make the wire
+/// layers nested.
+///
 /// The full 3-layer ladder, ordered **lowest layer first** (`layer_id` ==
 /// position in the slice), is:
 ///

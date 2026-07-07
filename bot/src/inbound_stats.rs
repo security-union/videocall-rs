@@ -252,6 +252,24 @@ impl InboundStats {
             kr.on_peer_seen(&sender);
         }
 
+        // Whether THIS packet is VIDEO. The relay VIEWPORT filter applies to
+        // VIDEO only (constants.rs::viewport_should_drop, gated by the is_video
+        // branch in chat_server.rs), so the viewport sender uses is_video to arm
+        // its reconnect re-assert exclusively on off-viewport VIDEO — the
+        // observable fail-open symptom. AUDIO / SCREEN are never viewport-
+        // filtered, so an off-viewport packet of those kinds is expected on a
+        // healthy connection and must NOT arm the re-assert (HCL #1006). RTT is
+        // already intercepted and returned above, so it never reaches here.
+        //
+        // NOTE: this gating is VIEWPORT-only. The LAYER_PREFERENCE filter is
+        // per-(source,kind) and applies to VIDEO/SCREEN/AUDIO, and the bot cannot
+        // observe the per-layer of an inbound packet — so layer-preference
+        // fail-open is NOT detectable from inbound media. The layer-preference
+        // sender therefore keeps its original re-assert-every-reset-window
+        // behaviour (heals fail-open within one window at the cost of a periodic
+        // control packet); #1006 is scoped to the VIEWPORT re-assert only.
+        let is_video = media.media_type.enum_value() == Ok(MediaType::VIDEO);
+
         // Feed the relay-stamped source session_id to the viewport sender so it
         // can emit VIEWPORT control packets like a real client (#988). The
         // relay stamps `wrapper.session_id` to the publisher's session on
@@ -259,7 +277,7 @@ impl InboundStats {
         // ignores). This mirrors how the browser derives peers from
         // `PacketWrapper.session_id` on the decode path.
         if let Some(ref mut vs) = self.viewport_sender {
-            vs.on_source_seen(wrapper.session_id);
+            vs.on_source_seen(wrapper.session_id, is_video);
         }
 
         // Feed the same relay-stamped source session_id to the layer-preference
@@ -428,15 +446,21 @@ impl InboundStats {
         //
         // reset-vs-first-connect: this hook is the 10s diagnostic-window reset,
         // NOT a dedicated reconnect callback, so it also fires during a healthy
-        // connection. `resend_on_reconnect` is therefore idempotent and guarded:
-        // it no-ops until a viewport has actually been established (`has_sent`),
-        // so a bot that just connected and has not yet rendered anyone never
-        // double-sends, and it is rate-limited (MIN_RESEND_INTERVAL) so the 10s
-        // cadence cannot spam identical packets. The `known_sources` set is
-        // preserved across reset (it is take/restored above), so the re-assert
-        // reflects exactly the subset the bot was rendering. Net effect: any
-        // subscription loss is healed within one reset window, while a steady
-        // connection re-asserts a tiny control packet at most once per window.
+        // connection. To avoid re-asserting an unchanged viewport every window
+        // (HCL #1006 — that blunts relay_viewport_updates_total{outcome=accepted}
+        // as the "client re-subscribed after a flap" signal),
+        // `resend_on_reconnect` is GATED on the observable fail-open symptom:
+        // inbound VIDEO from a source outside the last-sent viewport (the relay
+        // viewport-filters VIDEO only, so off-viewport video means its copy of
+        // our subscription is gone). On a steady connection with an unchanged
+        // visible set the relay forwards NO off-viewport video, so this re-asserts
+        // ZERO times after the initial send. It is additionally guarded on
+        // `has_sent` (a bot that has not yet rendered anyone never double-sends)
+        // and rate-limited (MIN_RESEND_INTERVAL, now a secondary burst guard). The
+        // `known_sources` set is preserved across reset (take/restored above), so
+        // an armed re-assert reflects exactly the subset the bot was rendering.
+        // Net effect: a fail-open (re-election / failover) is healed within one
+        // reset window; a steady connection stays silent.
         if let Some(ref mut vs) = self.viewport_sender {
             vs.resend_on_reconnect();
         }
@@ -446,6 +470,14 @@ impl InboundStats {
         // reconnect leaves it empty (fail-open → the bot silently receives the
         // full ladder again). `resend_on_reconnect` is idempotent, guarded on
         // `has_sent`, and rate-limited, exactly like the viewport re-assert.
+        //
+        // NOTE: unlike the viewport re-assert above, this is NOT gated on an
+        // observed fail-open symptom. Layer-preference fail-open is per-(source,
+        // kind) and the bot cannot observe the per-layer of an inbound packet,
+        // so there is no inbound signal that distinguishes "relay forgot my
+        // layer preference" from a healthy connection. It therefore retains the
+        // re-assert-every-window behaviour (heals within one window at the cost
+        // of a periodic control packet); #1006's symptom-gating is VIEWPORT-only.
         if let Some(ref mut lps) = self.layer_preference_sender {
             lps.resend_on_reconnect();
         }

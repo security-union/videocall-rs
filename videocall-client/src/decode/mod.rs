@@ -29,7 +29,7 @@ pub mod video_decoder_wrapper;
 
 pub use layer_chooser::{
     max_layers_for_kind, quality_state, DegradeReason, KindLayerBounds, PrefMediaKind,
-    QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot,
+    QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot, TileHint,
 };
 pub use peer_decode_manager::{PeerDecodeManager, PeerDeviceInfo, PeerReceiveDiag, PeerStatus};
 pub use peer_decoder::VideoPeerDecoder;

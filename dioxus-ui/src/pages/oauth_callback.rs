@@ -377,25 +377,26 @@ pub fn OAuthCallback(query_params: String) -> Element {
                 CallbackStatus::Loading => rsx! {
                     div { style: "text-align: center;",
                         div { style: "width: 48px; height: 48px; border: 4px solid rgba(255,255,255,0.2); border-top-color: #7928CA; border-radius: 50%; animation: spin 0.8s linear infinite; margin: 0 auto 24px;" }
-                        p { style: "color: rgba(255,255,255,0.7); font-size: 1rem;", "Completing sign-in\u{2026}" }
+                        p { style: "color: var(--on-dark-text-secondary); font-size: var(--fs-7);", "Completing sign-in\u{2026}" }
                         style { "@keyframes spin {{ to {{ transform: rotate(360deg); }} }}" }
                     }
                 },
                 CallbackStatus::Success => rsx! {
                     div { style: "text-align: center;",
                         p { style: "color: #4ade80; font-size: 1.2rem;", "Sign-in successful!" }
-                        p { style: "color: rgba(255,255,255,0.5); font-size: 0.9rem;", "Redirecting\u{2026}" }
+                        p { style: "color: var(--on-dark-text-muted); font-size: 0.9rem;", "Redirecting\u{2026}" }
                     }
                 },
                 CallbackStatus::Error(msg) => rsx! {
                     div { style: "text-align: center; max-width: 480px; padding: 2rem;",
-                        div { style: "font-size: 2rem; margin-bottom: 1rem;", "\u{26a0}\u{fe0f}" }
-                        h2 { style: "margin-bottom: 0.75rem; font-size: 1.25rem;", "Sign-in failed" }
+                        div { style: "font-size: var(--fs-12); margin-bottom: var(--space-4);", "\u{26a0}\u{fe0f}" }
+                        h2 { style: "margin-bottom: var(--space-3); font-size: var(--fs-9);", "Sign-in failed" }
                         p { style: "color: rgba(255,255,255,0.65); font-size: 0.9rem; margin-bottom: 1.5rem; line-height: 1.5;",
                             "{msg}"
                         }
                         button {
-                            style: "background: #7928CA; color: #fff; border: none; padding: 0.6rem 1.5rem; border-radius: 8px; cursor: pointer; font-size: 1rem;",
+                            // @token-exempt: OAuth brand color (#7928CA), no matching token
+                            style: "background: #7928CA; color: #fff; border: none; padding: 0.6rem 1.5rem; border-radius: var(--radius-md); cursor: pointer; font-size: var(--fs-7);",
                             onclick: move |_| {
                                 if let Err(e) = window().location().set_href("/login") {
                                     log::error!("Failed to navigate to /login: {e:?}");

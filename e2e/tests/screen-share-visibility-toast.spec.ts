@@ -126,7 +126,7 @@ async function clickScreenShareButton(page: Page): Promise<void> {
   const btn = page.locator(
     '.video-controls-container button[title="Screen Share"], ' +
       '.video-controls-container button[title="Share Screen"], ' +
-      ".video-controls-container .controls-secondary button:first-child",
+      ".video-controls-container .action-bar-slot-wrapper.slot-secondary button:first-child",
   );
   await expect(btn.first()).toBeVisible({ timeout: 10_000 });
   await btn.first().click();

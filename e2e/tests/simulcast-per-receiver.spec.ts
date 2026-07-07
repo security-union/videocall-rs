@@ -203,6 +203,11 @@ import {
   readLayerFilteredTotal,
   snapshotDownlinkCongestionMetrics,
 } from "../helpers/relay-metrics";
+import {
+  sampleChecksumSeries,
+  longestFrozenRunMs,
+  distinctChecksumsInWindow,
+} from "../helpers/frame-liveness";
 import { waitForServices } from "../helpers/wait-for-services";
 
 // ---------------------------------------------------------------------------
@@ -1721,6 +1726,390 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
   });
 
   // -------------------------------------------------------------------------
+  // 7. Pin/enlarge a peer tile: RECOVERY + SUSTAINED-freeze smoke guard
+  //    (issue #1702; context: #1695, a regression of #1256, fixed by #1698).
+  //
+  // ⚠️ SCOPE — READ THIS FIRST. This E2E does NOT and CANNOT catch the ≤5s
+  // self-healing #1695 transient (proof below: that freeze fits UNDER this
+  // spec's sustained-freeze ceiling and recovers before the window ends, so the
+  // assertions stay green even on the UNFIXED #1695 build). The DETERMINISTIC
+  // #1695 guard is the host test `publish_and_reconcile_pulls_guard_to_rate_
+  // limited_wire` (video_call_client.rs:5255). What THIS spec guards is narrower:
+  // (a) a pin-driven layer up-switch RECOVERS (frames resume), and (b) the tile
+  // shows no SUSTAINED freeze (a permanently-stranded decode guard or a
+  // keyframe-starvation regression like the #1662 ~28s class). The "#1695" in the
+  // context below explains the BUG that motivated the pin path; it is NOT a claim
+  // that this test reproduces that bug.
+  //
+  // ## The bug that MOTIVATES this path (the #1695 ≤5s decode-guard freeze)
+  //
+  // #1256 added a SIZE-AWARE receiver layer cap: a small grid thumbnail is
+  // capped to a low simulcast layer; a pinned/enlarged tile is `TileHint::
+  // Uncapped` so it pulls the FULL layer. Pinning a peer therefore drives an
+  // UP-switch of that peer's decode layer. The UI delivers it via
+  // `VideoCallClient::set_peer_tile_hints`
+  // (videocall-client/src/client/video_call_client.rs:2319), which calls
+  // `apply_size_lid_to_decode_guards` — RAISING the exact-match decode guard to
+  // the new (higher) layer IMMEDIATELY — then publishes the paired
+  // LAYER_PREFERENCE.
+  //
+  // #1695: when that publish lands within `LAYER_PREFERENCE_MIN_UPDATE_MS`
+  // (200ms, layer_preference_sender.rs:87) of a PRIOR accepted publish for the
+  // same (peer, Video) key, `take_if_changed` RATE-LIMITS it and returns None
+  // WITHOUT promoting `last_sent` (the wire). The relay is exact-match, so it
+  // keeps forwarding the OLD low layer (L0) while the guard now demands the high
+  // layer (L2): the guard rejects every forwarded L0 frame and the tile FREEZES
+  // until the next ~5s monitor tick re-syncs guard↔wire. PR #1698 fixed it by
+  // reconciling the guard DOWN to the rate-limited wire after EVERY publish
+  // (`publish_and_reconcile` → `reconcile_decode_guards_to_wire`), so the guard
+  // never leads the wire and L0 frames keep decoding through the transient.
+  //
+  // ## What this E2E asserts (and what it deliberately does NOT)
+  //
+  // FRAME-LIVENESS RECOVERY, not "never holds". The freeze symptom is the tile
+  // PAINTING NO NEW FRAME. We sample the pinned tile's `<canvas>` `getImageData`
+  // checksum (REUSING the existing frame-liveness primitive from
+  // `wt-persistent-streams-freeze-regression.spec.ts:325` — the `ctx.getImageData`
+  // 32x32-patch checksum, factored into `helpers/frame-liveness.ts`; the earlier
+  // #1698 note that "no frame-liveness primitive exists" is INACCURATE — it has
+  // existed in that spec since the WT persistent-streams work).
+  //
+  // CALIBRATION DISCOVERED ON THE LIVE STACK (2026-06-27): a pin-driven layer
+  // UP-SWITCH legitimately holds the last frame for up to ONE publisher GOP (~5s
+  // on camera, jitter_buffer.rs:149) while the newly-requested higher layer's
+  // keyframe arrives (the keyframe-less hold, jitter_buffer.rs:155-158). A run
+  // against the #1698-FIXED stack measured a ~4.5s pixel hold — by design, NOT a
+  // bug. That benign one-GOP hold is PIXEL-INDISTINGUISHABLE from the ≤5s #1695
+  // freeze, so a "no identical run > ~2s" assertion fails on EVERY correct build.
+  //
+  // WHY THIS SPEC CANNOT CATCH THE ≤5s #1695 FREEZE (the honest boundary):
+  // the #1695 failure on the UNFIXED build is a SELF-HEALING ≤5s frozen tile —
+  // it re-syncs at the next ~5s monitor tick. That means, even with #1698
+  // reverted, the freeze (i) fits UNDER this spec's one-GOP-plus-slack
+  // sustained-freeze ceiling (8000ms) AND (ii) recovers before the ~11s window's
+  // recovery tail — so BOTH assertions below would stay GREEN on the very bug
+  // #1695 names. Raising the ceiling under 5s is impossible (it would fail the
+  // benign one-GOP wait); raising the window past 5s lets the bug recover and
+  // pass. Frame-liveness alone therefore CANNOT resolve the sub-5s #1695
+  // transient on this localhost+2-peer harness — which is why the rate-limit race
+  // is not deterministically forced here (next section) and why this test is
+  // SCOPED + NAMED as a recovery/sustained-freeze smoke guard, NOT a #1695
+  // reproduction. The deterministic #1695 guard is the host test cited above.
+  //
+  // WHAT A PIXEL SIGNAL CAN ENFORCE HERE (and all this spec claims): after the
+  // pin the tile RECOVERS (paints changing frames again by the end of a window
+  // comfortably longer than one GOP) and never holds for MORE than
+  // one-GOP-plus-slack — which separates a healthy up-switch from a SUSTAINED
+  // freeze (a permanently-stranded decode guard, or a keyframe-starvation
+  // regression like #1662's ~28s stall).
+  //
+  // ### RATE-LIMIT RACE: NOT deterministically forced here — documented lever
+  //
+  // The freeze ONLY manifests when the pin's up-switch publish lands < 200ms
+  // after a PRIOR accepted publish for the SAME (peer, Video) key, so
+  // `take_if_changed` rate-limits it and strands guard>wire. Forcing that window
+  // deterministically from a browser is NOT possible on this harness because:
+  //   * The 200ms `LAYER_PREFERENCE_MIN_UPDATE_MS` clock (`last_sent_ms`) lives
+  //     inside the wasm `LayerPreferenceSender` and is NOT exposed on any
+  //     `window.__videocall_*` debug hook (grep of videocall-client/src +
+  //     dioxus-ui/src: the only hooks are capability-score, render-FPS /
+  //     longtask injection, and a STANDALONE freshness test-decoder — none read
+  //     or drive `last_sent_ms`, the live decode guard, or the wire map). So the
+  //     test cannot OBSERVE the window to fire the pin inside it, nor pin "twice
+  //     <200ms apart" with any guarantee the first pin produced an ACCEPTED
+  //     publish (a no-op/identical map advances no clock).
+  //   * Sub-200ms action timing across the Playwright→browser→wasm boundary is
+  //     not reliable enough to land inside the window on demand without flaking.
+  // The DETERMINISTIC proof of the race already lives in the mutation-sensitive
+  // HOST test `publish_and_reconcile_pulls_guard_to_rate_limited_wire`
+  // (video_call_client.rs:5255), which drives the real `publish_and_reconcile`
+  // chokepoint at t=1000 (accept L0) → lid-raise guard to L2 → t=1100 (rate-
+  // limited up-switch) and asserts the guard is pulled back to L0; it FAILS on
+  // either #1698 revert. THIS spec is therefore a SMOKE-LEVEL guard: it exercises
+  // the real UI→client→relay→decode pin path end-to-end and proves the tile
+  // RECOVERS with no SUSTAINED freeze — value the host test cannot give — but it
+  // does NOT reproduce or catch the ≤5s #1695 desync race (per the boundary
+  // above; it is untagged → does not run in per-PR CI; the host test is the
+  // synchronous per-PR guard for #1695).
+  //
+  // The LEVER that WOULD let this spec force the race deterministically (a
+  // follow-up, mirroring #1457/#1355's documented-lever outcome): a MOCK_PEERS-
+  // gated debug hook `window.__videocall_inject_layer_pref_clock(peer_sid, kind,
+  // last_sent_ms)` (or a hook to read it) so the test can prime an accepted
+  // publish, then pin while the 200ms window is provably open and assert the
+  // tile DOES freeze on pre-#1698 / stays live on the fix. Until that hook
+  // exists, the host test owns the race and this owns the end-to-end liveness.
+  //
+  // UN-FIXME rationale matches the SEND tests above: the serial-describe +
+  // launch-flag renderer mitigation lets the 2-context join survive on CI, and
+  // `capabilityMaxLayersOverride: 3` forces a >1-layer ladder so the pin's
+  // size-cap → Uncapped up-switch actually has higher layers to move to (a
+  // single-layer runner has nothing to up-switch, so the bug could not arise and
+  // the test would prove nothing — hence the `layerCount <= 1` skip guard).
+  // -------------------------------------------------------------------------
+  test("pinning a peer tile recovers and shows no SUSTAINED freeze (smoke; #1702 — NOT the ≤5s race)", async ({
+    baseURL,
+  }) => {
+    // Two 60s adaptation polls (baseline climb + shrink cap) + joins + ~11s of
+    // post-pin sampling can approach the describe's 180s budget on a slow runner;
+    // give explicit headroom so a slow-but-passing run is not killed mid-assertion.
+    test.setTimeout(240_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_pin_freeze_${Date.now()}`;
+
+    // Frame-liveness sampling across the pin event.
+    //
+    // CRITICAL CALIBRATION (verified empirically against the #1698-FIXED live
+    // stack, 2026-06-27): a pin-driven layer UP-SWITCH legitimately holds the
+    // last frame for up to ONE publisher GOP while the newly-requested higher
+    // layer's keyframe arrives. The camera GOP is "at most every 5s"
+    // (jitter_buffer.rs:149), and the jitter buffer's keyframe-less hold
+    // (jitter_buffer.rs:155-158) holds the last-good frame, by design, until that
+    // keyframe — a measured ~4.5s pixel hold ON THE CORRECT BUILD. So a
+    // "no identical-pixel run > ~2s" assertion is WRONG: it fails on every correct
+    // build (the benign keyframe wait is pixel-indistinguishable from the #1695
+    // freeze), and conversely a threshold raised past 5s would also pass on the
+    // BUGGY build (the #1695 freeze is itself ≤5s). Frame-liveness alone CANNOT
+    // separate the ≤5s #1695 transient from the benign one-GOP up-switch wait on
+    // this localhost+2-peer harness — confirming this spec's documented "race not
+    // deterministically forced here" stance.
+    //
+    // WHAT THIS SPEC THEREFORE ASSERTS (smoke-level, still valuable): the tile
+    // RECOVERS — it is painting CHANGING frames again by the END of a window
+    // comfortably longer than one GOP. That distinguishes the benign one-GOP wait
+    // (recovers ≤~5s → tail window is live) from a SUSTAINED freeze regression
+    // (e.g. a permanently-stranded guard, or #1662-style keyframe starvation that
+    // ran to ~28s) where the tail stays frozen. We sample ~11s at ~400ms cadence
+    // and require the last ~4s window to show >1 distinct checksum (live again),
+    // and the WHOLE-window frozen run to stay under a one-GOP-plus-slack ceiling
+    // so a tens-of-seconds stall still trips.
+    const SAMPLE_WINDOW_MS = 11_000;
+    const SAMPLE_INTERVAL_MS = 400;
+    // Recovery tail: the last RECOVERY_TAIL_MS of the window must be live again.
+    const RECOVERY_TAIL_MS = 4_000;
+    // A SUSTAINED-freeze ceiling: one GOP (~5s) + generous slack. The benign
+    // up-switch keyframe wait (~4.5s measured) sits under this; a multi-GOP /
+    // tens-of-seconds stall (a real regression) exceeds it.
+    const MAX_FROZEN_RUN_MS = 8_000;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-pub7@videocall.rs",
+        "SimPublisher7",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-rx7@videocall.rs",
+        "SimReceiver7",
+        uiURL,
+      );
+      // Force the full ladder on BOTH ends: the publisher must encode >1 layer,
+      // and the receiver must be allowed to climb. Without a multi-layer ladder
+      // the pin's size-cap→Uncapped up-switch has nothing to move to and the
+      // #1695 guard>wire desync cannot arise (the freeze is a multi-layer-only
+      // bug). The #1093 override replaces the low-core CI capability clamp.
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const rxPage = await rxCtx.newPage();
+
+      // Capture the publisher console BEFORE navigation (capability-ceiling boot log).
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "SimPublisher7");
+      await joinMeeting(rxPage, meetingId, "SimReceiver7");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — fail (not skip) if the override did not
+      // take effect, BEFORE the skip guard. A clamped single-layer ladder would
+      // make the pin a no-op for the layer cap and the test would prove nothing.
+      await assertCapabilityOverrideActive(pubConsole);
+
+      // The receiver must see the publisher's tile before we can pin it.
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      // The #1695 freeze only arises when the pin drives a REAL up-switch
+      // (low → high decode layer); pinning an already-top tile moves nothing and
+      // never strands guard>wire. So we must FIRST cap the tile to the BASE layer,
+      // then pin to force the L0→top up-switch — the exact #1256/#1695 trigger.
+      // We replicate the proven cap mechanism from the #1256 size-cap test in this
+      // same file: a HiDPI runner (dpr 2) would double the tile's device-px height
+      // and lift the size cap off the base, masking the trigger — so require dpr 1
+      // and fail loud rather than silently pass on a runner where the cap can't
+      // engage. (The #1256 test documents the 640x480→~340px→L0 boundary math.)
+      const rxDpr = await rxPage.evaluate(() => window.devicePixelRatio);
+      expect(
+        rxDpr,
+        "this test needs devicePixelRatio === 1 so the shrunk receiver viewport caps " +
+          "the tile to the base layer (a HiDPI runner would lift the cap and the pin " +
+          "would not up-switch — no #1695 trigger). See the #1256 size-cap test.",
+      ).toBe(1);
+
+      // Read the layer via the Diagnostics drawer (same readout the SEND tests
+      // use). PHASE 0 — at the DEFAULT (large) viewport the sole-tile receiver
+      // climbs ABOVE the base on a healthy link, establishing the multi-rung
+      // ladder headroom the cap+up-switch need. Skip (not fail) if it never climbs
+      // — that means the runner clamped the publisher to a single layer.
+      await openPerformancePanel(rxPage);
+      let sawHighBaseline = false;
+      await expect
+        .poll(
+          async () => {
+            const s = await readVideoLayer(rxPage);
+            if (s && s.layerCount > 1 && s.layerIndex >= 1) sawHighBaseline = true;
+            return sawHighBaseline;
+          },
+          { timeout: 60_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBe(true)
+        .catch(() => {
+          /* never reached a high baseline within budget — handled by the skip below */
+        });
+      test.skip(
+        !sawHighBaseline,
+        "capability ceiling clamped the publisher to a single layer (the large-tile " +
+          "receiver never climbed above the base); no ladder headroom for the size cap " +
+          "to be below, so the pin cannot drive the #1695 up-switch. See simulcast-config.ts",
+      );
+
+      // PHASE A — SHRINK ⇒ SIZE CAP ENGAGED. Shrink the receiver viewport so its
+      // single remote tile becomes a ~340 device-px thumbnail and the #1256 size
+      // lid caps the requested layer to the BASE (index 0) on the healthy link.
+      await rxPage.setViewportSize({ width: 640, height: 480 });
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage))?.layerIndex ?? 99, {
+          timeout: 60_000,
+          intervals: [1000, 2000, 3000],
+          message:
+            "the shrunk-viewport tile must cap to the base layer (index 0) before the " +
+            "pin, so the pin then drives a real L0→top up-switch (the #1695 trigger)",
+        })
+        .toBe(0);
+
+      // Resolve the pin button. There is exactly ONE remote tile (the publisher;
+      // `display_peers` filters out the receiver's own session, attendants.rs),
+      // so the first `#grid-container .grid-item` is the publisher's tile. The pin
+      // button (`button.pin-icon`, canvas_generator.rs) is `visibility: hidden`
+      // until its `.grid-item` parent is hovered (style.css
+      // `.grid-item:hover .pin-icon`), so a normal hover-then-click is flaky.
+      // REUSE the proven DOM-dispatch click from the #1256 size-cap test in this
+      // same file (which pins this exact button): `el.click()` fires the Dioxus
+      // onclick (`on_toggle_pin`) regardless of CSS visibility/animation.
+      const gridTile = rxPage.locator("#grid-container .grid-item").first();
+      await expect(gridTile).toBeVisible({ timeout: 10_000 });
+      const pinButton = gridTile.locator("button.pin-icon");
+      await expect(pinButton).toHaveCount(1, { timeout: 10_000 });
+
+      // BASELINE: prove the capped tile is still LIVE before the pin (decoding the
+      // base layer, a moving synthetic-camera frame), so a post-pin freeze is
+      // attributable to the pin, not to a tile that never painted. Require MORE
+      // THAN ONE distinct checksum across a short pre-pin window — the pixels are
+      // actually changing. (A frozen-run check over a sub-window would be vacuous:
+      // a window shorter than MAX_FROZEN_RUN_MS can never produce a run that long.)
+      const preSeries = await sampleChecksumSeries(rxPage, 2_000, SAMPLE_INTERVAL_MS, 0);
+      const preDistinct = new Set(preSeries.map((s) => s.checksum).filter((c) => c !== null)).size;
+      expect(
+        preDistinct,
+        "the capped peer tile must be painting CHANGING frames before the pin (baseline " +
+          "liveness) — if it is already static the post-pin freeze assertion is meaningless",
+      ).toBeGreaterThan(1);
+
+      // ACT: pin the peer. This drives toggle_pin → pinned_peer_id → the
+      // attendants.rs render that maps this peer to TileHint::Uncapped, LIFTING the
+      // base-layer size lid and calling set_peer_tile_hints — the #1256 path that
+      // raises the decode guard to the top layer and publishes the up-switch
+      // LAYER_PREFERENCE. If that publish is rate-limited (<200ms after a prior
+      // accepted publish for this key), the guard leads the wire = the #1695 freeze.
+      await pinButton.evaluate((el: HTMLElement) => el.click());
+
+      // Sample the peer tile's pixels across a window LONGER than one publisher
+      // GOP, starting immediately after the pin. The pin up-switches the decode
+      // layer, which legitimately holds the last frame until the new layer's
+      // keyframe arrives (≤ one ~5s GOP); we then assert the tile RECOVERS — see
+      // the calibration note on the constants above for why a "never holds"
+      // assertion is unsound on this harness.
+      const series = await sampleChecksumSeries(rxPage, SAMPLE_WINDOW_MS, SAMPLE_INTERVAL_MS, 0);
+      const sampled = series.filter((s) => s.checksum !== null).length;
+      const frozenRun = longestFrozenRunMs(series);
+      const distinct = new Set(series.map((s) => s.checksum).filter((c) => c !== null)).size;
+      const tailFrom = SAMPLE_WINDOW_MS - RECOVERY_TAIL_MS;
+      const tailDistinct = distinctChecksumsInWindow(series, tailFrom, SAMPLE_WINDOW_MS + 1);
+      console.log(
+        `[#1702] post-pin liveness: ${sampled}/${series.length} sampled, ` +
+          `${distinct} distinct checksums overall, longest frozen run ${frozenRun}ms ` +
+          `(sustained-freeze ceiling ${MAX_FROZEN_RUN_MS}ms); recovery-tail ` +
+          `[${tailFrom}-${SAMPLE_WINDOW_MS}ms] distinct=${tailDistinct}`,
+      );
+
+      // We must have actually sampled the tile (a null-only series proves
+      // nothing). Require a healthy majority of non-null samples.
+      expect(
+        sampled,
+        "the pinned tile must be sampleable across the window (canvas present + readable)",
+      ).toBeGreaterThanOrEqual(Math.ceil(series.length / 2));
+
+      // RECOVERY ASSERTION (smoke-level): by the END of the window the tile must
+      // be painting CHANGING frames again — the up-switch completed (keyframe
+      // arrived) and frames resumed. A SUSTAINED freeze (a permanently-stranded
+      // guard, or a keyframe-starvation regression like #1662's ~28s stall) leaves
+      // the tail static (≤1 distinct checksum) and FAILS here. The benign ≤5s
+      // one-GOP up-switch wait recovers well inside the 11s window so the last 4s
+      // are live.
+      expect(
+        tailDistinct,
+        `the pinned peer tile did NOT recover: the last ${RECOVERY_TAIL_MS}ms of the ` +
+          `post-pin window showed ${tailDistinct} distinct frame(s) (need > 1 = changing). ` +
+          "A one-GOP keyframe wait recovers inside this window; a tail still frozen here is a " +
+          "SUSTAINED freeze (stranded decode guard / keyframe starvation) — the #1662-class " +
+          "regression. (This does NOT catch the self-healing ≤5s #1695 transient, which would " +
+          "recover before the tail; that is the host test's job — see the header.)",
+      ).toBeGreaterThan(1);
+
+      // SUSTAINED-FREEZE CEILING: no single identical-pixel run may exceed one GOP
+      // plus slack. The benign up-switch keyframe wait (~4.5s measured on the
+      // fixed build) sits under this; a multi-GOP / tens-of-seconds stall trips it.
+      // This is the coarse upper bound that a frame-liveness signal CAN enforce on
+      // this harness (it cannot resolve the sub-5s #1695 transient — see the
+      // constants note and the RATE-LIMIT RACE section in the test header).
+      expect(
+        frozenRun,
+        `the pinned peer tile held identical pixels for ${frozenRun}ms after the pin, ` +
+          `exceeding the one-GOP-plus-slack ceiling (${MAX_FROZEN_RUN_MS}ms) — a SUSTAINED ` +
+          "freeze, not the benign single-GOP up-switch keyframe wait.",
+      ).toBeLessThan(MAX_FROZEN_RUN_MS);
+
+      // PIN-FIRED CONFIRMATION (mirrors the #1256 size-cap test's PHASE B, same
+      // file): the productive proof the pin actually fired is the received-layer
+      // index up-switching ABOVE the base — i.e. `on_toggle_pin → set_peer_tile_
+      // hints → apply_size_lid_to_decode_guards` lifted the size lid. We assert
+      // this AFTER the liveness sampling so the up-switch poll cannot consume the
+      // ≤5s freeze window before we measure it. We do NOT gate on the
+      // `.grid-item-pinned` CSS class: at the 640px receiver viewport the canvas
+      // div ALSO carries a mobile pin onclick (is_mobile_viewport() < 768,
+      // canvas_generator.rs:1243), so the class is not a reliable single-path
+      // signal; the layer up-switch is the production-meaningful one.
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage))?.layerIndex ?? -1, {
+          timeout: 45_000,
+          intervals: [1000, 2000, 3000],
+          message:
+            "pinning the peer must lift the size lid and up-switch the received layer " +
+            "ABOVE the base (index >= 1) — proof the pin fired and drove the #1695 up-switch",
+        })
+        .toBeGreaterThanOrEqual(1);
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // 1b. Per-peer RECEIVE breakdown — now in the Diagnostics "Simulcast layers"
   // section (#1095 §6 MOVE; the old in-panel `perf-recv-{kind}-diag-*` footer was
   // REMOVED).
@@ -2227,6 +2616,806 @@ test.describe("Per-receiver simulcast (flag-on)", () => {
       await pubBrowser.close();
       await healthyBrowser.close();
       await degradedBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // #1256 Phase 1 — SIZE-AWARE receiver simulcast layer cap.
+  //
+  // The feature: a receiver LIDs the requested simulcast layer to the rendered
+  // tile size. A peer shown as a SMALL grid thumbnail pulls a LOWER layer (the
+  // smallest whose native height covers the tile); when that peer is PINNED the
+  // tile grows, the lid lifts, and the receiver up-switches above the base layer
+  // (and requests a keyframe so it sharpens). The lid rides the EXISTING
+  // per-receiver LAYER_PREFERENCE clamp seam, so the receiver's per-peer layer
+  // SELECTION changes with NO wire/relay change — observable directly via the
+  // SAME `readVideoLayer()` received-quality readout the #989/#1434 tests read.
+  // (The READOUT is the authoritative client-side proof of the selected layer;
+  // we deliberately do NOT cross-check `relay_layer_filtered_total` here — that
+  // room-scoped counter only increments when the relay drops layers a receiver
+  // did NOT select, and on the WebSocket path the default 2-peer stack forwards
+  // all layers and decrements nothing, so it is not a reliable signal for this
+  // healthy-link, single-receiver scenario.)
+  //
+  // CRITICAL DISTINCTION from every other layer-divergence test in this file:
+  // there is NO network impairment. The whole point of #1256 is that a HEALTHY
+  // receiver on a good link caps by SIZE, not by congestion. On a healthy link
+  // the chooser would otherwise fail open to `highest_available` (the top layer)
+  // and the receiver would decode 720p for a tiny thumbnail — the waste #1256
+  // fixes. So this test asserts the receiver settles at the BASE layer with ZERO
+  // impairment, then climbs above the base once the peer is pinned.
+  //
+  // PRODUCING A SMALL TILE (verified empirically against this stack — see the
+  // observed readouts in the PR notes). `display_peers` (attendants.rs) FILTERS
+  // OUT the local user's own session, so a publisher + ONE receiver gives the
+  // receiver exactly ONE remote grid tile. The per-peer tile-size hint is
+  // `compute_layout(tile_count, avail_w, avail_h, gap).tile_w / TILE_AR *
+  // devicePixelRatio` device-px tall (attendants.rs, #1256 block) — it is
+  // computed for EVERY non-screen-share tile regardless of the full-bleed CSS
+  // exception. We shrink the RECEIVER viewport to 640x480 so that single tile's
+  // device-px height settles at ~340px. The camera ladder is L0=640x360 /
+  // L1=960x540 / L2=1280x720 with a 10% size-cap margin (the L0 boundary is
+  // 360*1.1=396px), so a ~340px tile caps to L0 (the BASE) — verified: at this
+  // viewport the readout reads "640x360" (index 0), and at the default 1280x720
+  // viewport the same receiver reads "1280x720" (the top). We assert
+  // `devicePixelRatio === 1` first: a HiDPI runner (dpr 2) would double the
+  // device-px height to ~680px and lift the cap to the top, masking the feature
+  // — so we fail loud rather than silently pass.
+  //
+  // UNTAGGED (no @bvt): like the #1434/#1108 WT default-suite tests above, this
+  // runs only in the default `dioxus` suite (NOT per-PR CI) and is validated on
+  // the local docker e2e stack. It needs NO toxiproxy/netsim profile.
+  // -------------------------------------------------------------------------
+  test("size-aware cap: a small-grid receiver pulls a LOWER layer than when the peer is pinned; pinning up-switches to the top (#1256)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1256_size_cap_${Date.now()}`;
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let rxPage: Page | undefined;
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1256-pub@videocall.rs",
+        "Sim1256Pub",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-1256-rx@videocall.rs",
+        "Sim1256Rx",
+        uiURL,
+      );
+      // Full 3-rung ladder on BOTH ends so the size lid has headroom to lower
+      // the requested layer below the top (the #1093 override replaces the
+      // device-sniffed capability ceiling that would otherwise clamp a low-core
+      // CI container to a single layer — no headroom, nothing to cap).
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      rxPage = await rxCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      // Join at the DEFAULT viewport (1280x720) first. A LARGE single tile sizes
+      // above the L1 boundary so the receiver fails open to a HIGH layer, which in
+      // turn makes the publisher's receiver-driven AQ keep the upper rungs ACTIVE
+      // (with no receiver pulling them they get shed) — establishing the ladder
+      // headroom this test needs BEFORE we shrink to demonstrate the cap. (Setting
+      // the small viewport pre-join instead makes the lone receiver cap to base
+      // immediately, the publisher sheds the upper rungs, and there is never a
+      // >1-layer ladder to be "below".)
+      await joinMeeting(pubPage, meetingId, "Sim1256Pub");
+      await joinMeeting(rxPage, meetingId, "Sim1256Rx");
+
+      // POSITIVE OVERRIDE PROOF (#1093) — assert the full ladder is actually
+      // emitted BEFORE the skip guard, so a silently-broken override fails loud
+      // instead of skipping on a clamped single layer (testing nothing).
+      await assertCapabilityOverrideActive(pubConsole);
+
+      // DPR GUARD: the device-px tile height = CSS height x devicePixelRatio. The
+      // 640x480 viewport (below) caps to L0 ONLY at dpr 1; a HiDPI runner (dpr 2)
+      // would double the height past the top layer's boundary and lift the cap to
+      // the top, masking the feature. Fail loud rather than silently pass.
+      const rxDpr = await rxPage.evaluate(() => window.devicePixelRatio);
+      expect(
+        rxDpr,
+        "#1256 requires devicePixelRatio === 1 on the receiver so the 640x480 " +
+          "viewport produces a sub-top tile height; a HiDPI runner would mask the cap",
+      ).toBe(1);
+
+      // The receiver must see the publisher's tile (peers connected).
+      await expect(rxPage.locator("#grid-container .canvas-container").first()).toBeVisible({
+        timeout: 30_000,
+      });
+
+      await openPerformancePanel(rxPage);
+
+      // PHASE 0 — BASELINE (large tile climbs ABOVE the base layer). On the
+      // healthy link with a full-bleed tile the receiver must reach a HIGH layer
+      // (index >= 1) on a multi-rung ladder. This both (a) proves the LARGE tile
+      // is NOT capped to the base (the necessary counterpart to Phase A's cap) and
+      // (b) confirms ladder headroom exists. We poll for that condition DIRECTLY
+      // (not merely "decoding started") so the wait does not return on the first
+      // base-layer frame before the climb completes; the publisher's receiver-
+      // driven AQ ramps the upper rungs over a few seconds. Skip (NOT fail) if it
+      // never reaches a high layer within the window — that means the runner
+      // clamped the publisher to a single layer, leaving no rung above the base
+      // for a size cap to be below.
+      let sawHighBaseline = false;
+      await expect
+        .poll(
+          async () => {
+            const s = await readVideoLayer(rxPage!);
+            if (s && s.layerCount > 1 && s.layerIndex >= 1) sawHighBaseline = true;
+            return sawHighBaseline;
+          },
+          { timeout: 60_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBe(true)
+        .catch(() => {
+          /* never reached a high baseline within budget — handled by the skip below */
+        });
+      test.skip(
+        !sawHighBaseline,
+        "capability ceiling clamped the publisher to a single layer (the large-tile " +
+          "receiver never climbed above the base); no ladder headroom above the base " +
+          "for a size cap to be below (see helpers/simulcast-config.ts)",
+      );
+
+      // PHASE A — SHRINK ⇒ SIZE CAP ENGAGED. Shrink the receiver viewport so its
+      // single remote tile becomes a ~340 device-px thumbnail (caps to L0). The
+      // window `resize` listener (attendants.rs) bumps `viewport_version`, so the
+      // layout — and the per-peer tile-size hint pushed via set_peer_tile_hints —
+      // recomputes, and the lid lowers the requested layer. On a HEALTHY link the
+      // chooser would otherwise stay at `highest_available` (the high baseline
+      // above), so the index dropping to the BASE (0) can ONLY be the rendered-
+      // tile-size lid — the load-bearing #1256 assertion, with NO congestion. We
+      // assert on the INDEX (count-independent: the lid pins the lowest rung
+      // regardless of how many rungs the publisher currently has active).
+      await rxPage.setViewportSize({ width: 640, height: 480 });
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? 99, {
+          timeout: 60_000,
+          intervals: [1000, 2000, 3000],
+          message:
+            "#1256 PHASE A: after shrinking the receiver viewport, the small-grid " +
+            "tile on a HEALTHY link must cap its requested layer to the BASE " +
+            "(index 0) — the size lid lowered it with no congestion",
+        })
+        .toBe(0);
+
+      const capped = await readVideoLayer(rxPage);
+      expect(capped, "#1256 PHASE A: receiver must still be decoding").not.toBeNull();
+      expect(
+        capped!.layerIndex,
+        `#1256 PHASE A: small tile capped to base layer (got index ${capped!.layerIndex})`,
+      ).toBe(0);
+
+      // PHASE B — PIN ⇒ UP-SWITCH ABOVE THE LID. Pinning the publisher's tile
+      // marks that peer Uncapped (pinned / screen-share / maximized are never
+      // size-capped), so the size lid LIFTS and the receiver up-switches above the
+      // base layer (requesting a keyframe so the higher layer sharpens). We assert
+      // the index climbs to AT LEAST 1 (strictly above the base lid): that is the
+      // unambiguous proof of the lid lift, robust to the publisher's active-layer
+      // count oscillating between 2 and 3 (asserting an exact top index would
+      // flake when the publisher is momentarily down to 2 active layers).
+      //
+      // The pin button (`button.pin-icon`, canvas_generator.rs) is
+      // `visibility: hidden` until its `.grid-item` parent is hovered (style.css
+      // `.grid-item:hover .pin-icon`) AND the full-bleed single tile pulses a
+      // speaking-glow animation, so a normal hover-then-click is flaky. We
+      // dispatch the click directly on the button via the DOM — this fires the
+      // Dioxus onclick (`on_toggle_pin`) regardless of CSS visibility/animation.
+      const gridTile = rxPage.locator("#grid-container .grid-item").first();
+      await expect(gridTile).toBeVisible({ timeout: 10_000 });
+      const pinButton = gridTile.locator("button.pin-icon");
+      await expect(pinButton).toHaveCount(1, { timeout: 10_000 });
+      await pinButton.evaluate((el: HTMLElement) => el.click());
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? -1, {
+          timeout: 45_000,
+          intervals: [1000, 2000, 3000],
+          message:
+            "#1256 PHASE B: pinning the peer must lift the size lid and up-switch the " +
+            "receiver ABOVE the base layer (index >= 1)",
+        })
+        .toBeGreaterThanOrEqual(1);
+
+      // PHASE C — UNPIN ⇒ CAP BACK DOWN. Unpinning re-applies the size lid (the
+      // tile is a small thumbnail again), so the requested layer drops back to the
+      // base. Same DOM-dispatch click on the (now toggled) pin button.
+      await pinButton.evaluate((el: HTMLElement) => el.click());
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? 99, {
+          timeout: 60_000,
+          intervals: [1000, 2000, 3000],
+          message:
+            "#1256 PHASE C: unpinning must re-apply the size lid and cap the small " +
+            "tile back to the base layer (index 0)",
+        })
+        .toBe(0);
+    } finally {
+      await pubBrowser.close();
+      await rxBrowser.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// #1219 Half 2 — RELAY-SIDE downlink-congestion signal path validation (#1434)
+//
+// The per-receiver layer DIVERGENCE tests above (WS @impair + WT netsim) prove
+// the UI-side outcome: a congested receiver drops to a lower layer while the
+// healthy peer holds. But they do NOT prove the RELAY's Half 2 signal path
+// actually fired — the congestion COULD be detected purely client-side by the
+// layer chooser reacting to loss (which is the legacy #1080 path). Issue #1434
+// requires asserting the RELAY METRICS that prove the Half 2 relay-side
+// congestion detection + proactive shedding + LAYER_PREFERENCE durable path
+// fired end-to-end:
+//
+//   1. relay_receiver_downlink_congestion_total RISES (relay detected congestion)
+//   2. relay_downlink_shed_total RISES (relay proactively shed non-base packets)
+//   3. relay_layer_filtered_total RISES (receiver published LAYER_PREFERENCE
+//      stepping down → relay layer filter engaged the durable path)
+//   4. ISOLATION: healthy receiver metrics UNCHANGED
+//   5. AUDIO PROTECTION: audio NOT shed (audio always passes the pre-filter)
+//   6. RECOVERY: relay_receiver_downlink_recovered_total RISES after heal
+//
+// These tests EXTEND the existing impair harness (same 3-browser topology) but
+// add relay-metric assertions alongside the UI-layer assertions. They are
+// intentionally SEPARATE tests so a relay-metric regression does not mask a UI
+// regression (and vice versa).
+//
+// BOTH transports are covered: WS via toxiproxy (@impair), WT via netsim
+// (default suite). This is mandatory per #1434's stretch goal and the standing
+// fact that "both transports shed at 80%."
+// ---------------------------------------------------------------------------
+test.describe("#1219 Half 2 relay-side congestion validation (#1434)", () => {
+  test.describe.configure({ mode: "serial", timeout: 240_000 });
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  // -------------------------------------------------------------------------
+  // WS path: toxiproxy bandwidth clamp → relay detects congestion → sheds →
+  // receiver publishes LAYER_PREFERENCE → relay layer-filters. Tagged @impair.
+  // -------------------------------------------------------------------------
+  test("relay enters downlink congestion and sheds for WS receiver, healthy peer unaffected (#1434) @impair", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1434_ws_${Date.now()}`;
+
+    await assertProxyUp();
+    await healDownlink();
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1434-pub-ws@videocall.rs",
+        "Sim1434PubWS",
+        uiURL,
+      );
+      const healthyCtx = await createAuthenticatedContext(
+        healthyBrowser,
+        "sim-1434-healthy-ws@videocall.rs",
+        "Sim1434HealthyWS",
+        uiURL,
+      );
+      const degradedCtx = await createAuthenticatedContext(
+        degradedBrowser,
+        "sim-1434-degraded-ws@videocall.rs",
+        "Sim1434DegradedWS",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(healthyCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(degradedCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      // Route degraded receiver through toxiproxy, pinning to WS.
+      await routeDownlinkThroughProxy(degradedCtx);
+
+      const pubPage = await pubCtx.newPage();
+      const healthyPage = await healthyCtx.newPage();
+      const degradedPage = await degradedCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim1434PubWS");
+      await joinMeeting(healthyPage, meetingId, "Sim1434HealthyWS");
+      await joinMeeting(degradedPage, meetingId, "Sim1434DegradedWS");
+
+      await assertCapabilityOverrideActive(pubConsole);
+      await openPerformancePanel(healthyPage);
+      await openPerformancePanel(degradedPage);
+
+      // PHASE 1 — let both receivers climb above base on a healthy link.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage);
+            if (!healthy || !degraded) return -1;
+            return Math.min(healthy.layerCount, degraded.layerCount);
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(0);
+
+      const healthyStart = await readVideoLayer(healthyPage);
+      const degradedStart = await readVideoLayer(degradedPage);
+      test.skip(
+        (healthyStart?.layerCount ?? 1) <= 1 || (degradedStart?.layerCount ?? 1) <= 1,
+        "capability ceiling clamped to single layer; no ladder headroom to diverge",
+      );
+
+      // Wait for degraded receiver to climb above base before impairing.
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // Snapshot relay metrics BEFORE impairment (baseline for delta).
+      const beforeWs = await snapshotDownlinkCongestionMetrics("websocket", meetingId);
+      const layerFilteredBefore = beforeWs.layerFilteredTotal;
+
+      // PHASE 2 — impair the degraded receiver's downlink via toxiproxy.
+      await impairDownlink({ rateKb: 15 });
+
+      // PHASE 3a — RELAY REACTS: assert congestion_total RISES for the WS relay.
+      // The relay's windowed CongestionTracker should cross its threshold within
+      // seconds of the outbound channel filling. Poll until the counter increments.
+      await expect
+        .poll(
+          async () => {
+            const current = await readDownlinkCongestionTotal("websocket");
+            return current - beforeWs.congestionTotal;
+          },
+          {
+            timeout: 60_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 1: relay_receiver_downlink_congestion_total must RISE " +
+              "for the WS relay when a receiver's downlink is impaired",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3b — PROACTIVE SHEDDING: relay_downlink_shed_total RISES (non-base
+      // packets shed before try_send for the congested receiver).
+      await expect
+        .poll(
+          async () => {
+            const current = await readDownlinkShedTotal("websocket");
+            return current - beforeWs.shedTotal;
+          },
+          {
+            timeout: 30_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 2: relay_downlink_shed_total must RISE — the relay " +
+              "must proactively shed non-base packets for the congested receiver",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3c — DURABLE PATH: the congested receiver publishes LAYER_PREFERENCE
+      // stepping down, causing the relay's layer filter to engage. This is proven by
+      // relay_layer_filtered_total rising for this room.
+      await expect
+        .poll(
+          async () => {
+            const current = await readLayerFilteredTotal("websocket", meetingId);
+            return current - layerFilteredBefore;
+          },
+          {
+            timeout: 60_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 3: relay_layer_filtered_total must RISE — the " +
+              "congested receiver must publish LAYER_PREFERENCE stepping down, " +
+              "engaging the relay's durable layer filter",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3d — ISOLATION: the healthy receiver is still decoding above base.
+      // Its layer must not have been dragged down.
+      const healthyAfterImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyAfterImpair,
+        "#1434 isolation: healthy receiver must still be decoding",
+      ).not.toBeNull();
+      expect(
+        healthyAfterImpair!.layerIndex,
+        "#1434 isolation: healthy receiver must stay above base (unaffected by " +
+          "peer's downlink congestion)",
+      ).toBeGreaterThan(0);
+
+      // PHASE 3e — AUDIO PROTECTION: audio is NOT shed for the congested receiver.
+      // The audio readout on the degraded page should still report receiving audio
+      // (the Half 2 pre-filter only sheds non-base VIDEO/SCREEN, never AUDIO).
+      // Allow a generous window since audio may briefly blip under heavy loss.
+      await expect
+        .poll(
+          async () => {
+            const audio = await readAudioLayer(degradedPage);
+            return audio !== null;
+          },
+          {
+            timeout: 30_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 assertion 4 (audio protection): the degraded receiver must " +
+              "still be receiving AUDIO — the Half 2 shed path protects audio",
+          },
+        )
+        .toBe(true);
+
+      // PHASE 4 — RECOVERY: heal the downlink and assert the relay's recovery
+      // counter increments (the relief window elapses with no fresh overflow).
+      await healDownlink();
+
+      await expect
+        .poll(
+          async () => {
+            const current = await readDownlinkRecoveredTotal("websocket");
+            return current - beforeWs.recoveredTotal;
+          },
+          {
+            timeout: 90_000,
+            intervals: [3000, 5000, 8000],
+            message:
+              "#1434 assertion 5 (recovery): relay_receiver_downlink_recovered_total " +
+              "must RISE after the impairment is healed (relief window elapsed)",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // Also confirm the degraded receiver climbs back (UI recovery).
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage))?.layerIndex ?? 0, {
+          timeout: 90_000,
+          intervals: [2000, 3000, 5000],
+        })
+        .toBeGreaterThan(0);
+    } finally {
+      await healDownlink();
+      await pubBrowser.close();
+      await healthyBrowser.close();
+      await degradedBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // WT path: client-side netsim hook → relay detects congestion → sheds →
+  // receiver publishes LAYER_PREFERENCE → relay layer-filters. No toxiproxy;
+  // runs in the default dioxus suite (NOT tagged @impair).
+  //
+  // The WT relay process (:5321) has the SAME Half 2 code path (the congestion
+  // detection runs in the transport-agnostic per-session NATS loop), so the
+  // same metric counters must fire. The only difference is that the LOSS is
+  // manufactured CLIENT-SIDE (netsim drops inbound packets) rather than
+  // RELAY-SIDE (toxiproxy fills the outbound channel). However, for the WT
+  // relay to enter congestion mode, the CLIENT must still signal backpressure
+  // upstream — which it does via QUIC flow control (window exhaustion on the
+  // receiving stream) when it cannot consume packets fast enough. The netsim
+  // hook drops packets AFTER receipt from the transport, so from the relay's
+  // perspective the client's receive window may still drain normally and the
+  // relay-side congestion detection may NOT fire as aggressively as the WS
+  // case. Therefore this test uses a MILDER assertion: it asserts either the
+  // relay-side congestion counters rise OR the durable LAYER_PREFERENCE path
+  // fires (which is the client-side chooser stepping down and publishing its
+  // preference, triggering relay layer filtering regardless of relay-side
+  // congestion state). The key invariant is still: layer filtering engages
+  // for the impaired receiver AND the healthy receiver is unaffected.
+  // -------------------------------------------------------------------------
+  test("relay layer-filters for WT receiver under netsim impairment, healthy peer unaffected (#1434)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1434_wt_${Date.now()}`;
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const healthyBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const degradedBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let degradedPage: Page | undefined;
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1434-pub-wt@videocall.rs",
+        "Sim1434PubWT",
+        uiURL,
+      );
+      const healthyCtx = await createAuthenticatedContext(
+        healthyBrowser,
+        "sim-1434-healthy-wt@videocall.rs",
+        "Sim1434HealthyWT",
+        uiURL,
+      );
+      const degradedCtx = await createAuthenticatedContext(
+        degradedBrowser,
+        "sim-1434-degraded-wt@videocall.rs",
+        "Sim1434DegradedWT",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(healthyCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(degradedCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      const healthyPage = await healthyCtx.newPage();
+      degradedPage = await degradedCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim1434PubWT");
+      await joinMeeting(healthyPage, meetingId, "Sim1434HealthyWT");
+      await joinMeeting(degradedPage, meetingId, "Sim1434DegradedWT");
+
+      await assertCapabilityOverrideActive(pubConsole);
+      await openPerformancePanel(healthyPage);
+      await openPerformancePanel(degradedPage);
+
+      // PHASE 1 — let both receivers climb above base on a healthy link.
+      await expect
+        .poll(
+          async () => {
+            const healthy = await readVideoLayer(healthyPage);
+            const degraded = await readVideoLayer(degradedPage!);
+            if (!healthy || !degraded) return -1;
+            return Math.min(healthy.layerCount, degraded.layerCount);
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(0);
+
+      const healthyStart = await readVideoLayer(healthyPage);
+      const degradedStart = await readVideoLayer(degradedPage);
+      test.skip(
+        (healthyStart?.layerCount ?? 1) <= 1 || (degradedStart?.layerCount ?? 1) <= 1,
+        "capability ceiling clamped to single layer; no ladder headroom to diverge",
+      );
+
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // Snapshot relay metrics BEFORE impairment.
+      // For WT, the relay process is :5321. Scrape the WT relay.
+      const beforeWt = await snapshotDownlinkCongestionMetrics("webtransport", meetingId);
+      const layerFilteredBefore = beforeWt.layerFilteredTotal;
+
+      // PHASE 2 — impair the degraded receiver's downlink via netsim.
+      await impairDownlinkNetsim(degradedPage);
+
+      // PHASE 3a — DURABLE PATH: the chooser steps down and publishes
+      // LAYER_PREFERENCE, which engages the relay's layer filter for this room.
+      // This is the primary assertion for the WT path: regardless of whether the
+      // relay itself enters congestion shedding mode (which depends on QUIC
+      // backpressure reaching the relay), the LAYER_PREFERENCE → layer filter
+      // path is the client-driven durable signal that proves #1219 Half 2's
+      // end-to-end loop.
+      await expect
+        .poll(
+          async () => {
+            const current = await readLayerFilteredTotal("webtransport", meetingId);
+            return current - layerFilteredBefore;
+          },
+          {
+            timeout: 90_000,
+            intervals: [2000, 3000, 5000],
+            message:
+              "#1434 WT assertion (durable path): relay_layer_filtered_total must " +
+              "RISE — the congested receiver's chooser must step down, publish " +
+              "LAYER_PREFERENCE, and cause the relay to filter higher layers",
+          },
+        )
+        .toBeGreaterThan(0);
+
+      // PHASE 3b — ISOLATION: the healthy receiver remains above base.
+      const healthyAfterImpair = await readVideoLayer(healthyPage);
+      expect(
+        healthyAfterImpair,
+        "#1434 WT isolation: healthy receiver must still be decoding",
+      ).not.toBeNull();
+      expect(
+        healthyAfterImpair!.layerIndex,
+        "#1434 WT isolation: healthy receiver must stay above base",
+      ).toBeGreaterThan(0);
+
+      // PHASE 3c — AUDIO PROTECTION: degraded receiver still receives audio.
+      await expect
+        .poll(
+          async () => {
+            const audio = await readAudioLayer(degradedPage!);
+            return audio !== null;
+          },
+          {
+            timeout: 30_000,
+            intervals: [2000, 3000, 5000],
+            message: "#1434 WT audio protection: degraded receiver must still receive AUDIO",
+          },
+        )
+        .toBe(true);
+
+      // PHASE 3d — RELAY CONGESTION (soft assertion): check if the WT relay's
+      // congestion counter also rose. Under netsim the loss is client-side, so
+      // relay-side congestion detection may not fire (QUIC window may still drain).
+      // We log but do NOT hard-fail if it did not rise — the durable path (3a) is
+      // the load-bearing assertion. If it DID rise, that proves the relay's own
+      // congestion tracker also engaged, which is the full Half 2 story.
+      const congestionAfter = await readDownlinkCongestionTotal("webtransport");
+      const congestionDelta = congestionAfter - beforeWt.congestionTotal;
+      if (congestionDelta > 0) {
+        // Full Half 2 relay-side path also fired — optimal coverage.
+        const shedAfter = await readDownlinkShedTotal("webtransport");
+        const shedDelta = shedAfter - beforeWt.shedTotal;
+        expect(
+          shedDelta,
+          "#1434 WT bonus: if relay entered congestion, shed_total should also rise",
+        ).toBeGreaterThan(0);
+      }
+      // (else: relay did not enter congestion mode, but layer-filter path fired —
+      // the client's chooser handled the step-down autonomously. Still valid.)
+
+      // PHASE 4 — heal and verify recovery (UI-side: degraded climbs back).
+      await healDownlinkNetsim(degradedPage);
+
+      await expect
+        .poll(async () => (await readVideoLayer(degradedPage!))?.layerIndex ?? 0, {
+          timeout: 90_000,
+          intervals: [2000, 3000, 5000],
+        })
+        .toBeGreaterThan(0);
+    } finally {
+      if (degradedPage) {
+        await healDownlinkNetsim(degradedPage);
+      }
+      await pubBrowser.close();
+      await healthyBrowser.close();
+      await degradedBrowser.close();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Recovery stability: validate that after downlink impairment the receiver's
+  // layer does NOT oscillate (up/down flapping). This uses the WT netsim hook
+  // with `crushed_downlink` (40% loss). The key assertion is that after the
+  // initial step-down the layer should SETTLE, not bounce.
+  //
+  // The hysteresis in the layer chooser (consecutive-success counters or decay
+  // windows for step-UP) should prevent rapid oscillation. This test polls the
+  // layer over 30 seconds after step-down and asserts that the max observed
+  // index minus the min observed index is <= 1 (at most one step of jitter,
+  // not full-range flapping).
+  // -------------------------------------------------------------------------
+  test("recovery window does not oscillate under marginal loss — layer settles after step-down (#1434 comment)", async ({
+    baseURL,
+  }) => {
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_1434_stable_${Date.now()}`;
+
+    const pubBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    const rxBrowser = await chromium.launch({ args: BROWSER_ARGS });
+    let rxPage: Page | undefined;
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "sim-1434-stab-pub@videocall.rs",
+        "Sim1434StabPub",
+        uiURL,
+      );
+      const rxCtx = await createAuthenticatedContext(
+        rxBrowser,
+        "sim-1434-stab-rx@videocall.rs",
+        "Sim1434StabRx",
+        uiURL,
+      );
+      await enableSimulcastFlag(pubCtx, 3, { capabilityMaxLayersOverride: 3 });
+      await enableSimulcastFlag(rxCtx, 3, { capabilityMaxLayersOverride: 3 });
+
+      const pubPage = await pubCtx.newPage();
+      rxPage = await rxCtx.newPage();
+
+      const pubConsole = collectConsole(pubPage);
+
+      await joinMeeting(pubPage, meetingId, "Sim1434StabPub");
+      await joinMeeting(rxPage, meetingId, "Sim1434StabRx");
+
+      await assertCapabilityOverrideActive(pubConsole);
+      await openPerformancePanel(rxPage);
+
+      // Let the receiver climb above base.
+      await expect
+        .poll(
+          async () => {
+            const layer = await readVideoLayer(rxPage!);
+            return layer?.layerCount ?? 0;
+          },
+          { timeout: 45_000, intervals: [1000, 2000, 3000] },
+        )
+        .toBeGreaterThan(1);
+
+      await expect
+        .poll(async () => (await readVideoLayer(rxPage!))?.layerIndex ?? 0, {
+          timeout: 30_000,
+          intervals: [1000, 2000, 3000],
+        })
+        .toBeGreaterThan(0);
+
+      // Impair the receiver — this will cause it to step down.
+      await impairDownlinkNetsim(rxPage);
+
+      // Wait for the initial step-down to take effect.
+      await expect
+        .poll(
+          async () => {
+            const layer = await readVideoLayer(rxPage!);
+            // Accept either layer 0 (stepped all the way down) or a lower layer
+            // than the top. The key is that it stepped DOWN.
+            if (!layer) return false;
+            return layer.layerIndex < layer.layerCount - 1;
+          },
+          { timeout: 60_000, intervals: [2000, 3000, 5000] },
+        )
+        .toBe(true);
+
+      // STABILITY OBSERVATION: now that the receiver has stepped down, observe
+      // its layer index over 30 seconds. Under a marginal impairment the chooser
+      // should SETTLE at the lower layer — not oscillate up and back down
+      // repeatedly. We track the set of unique layer indices observed.
+      const observedIndices: number[] = [];
+      const stabilityDurationMs = 30_000;
+      const pollIntervalMs = 3_000;
+      const iterations = Math.floor(stabilityDurationMs / pollIntervalMs);
+
+      for (let i = 0; i < iterations; i++) {
+        await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+        const layer = await readVideoLayer(rxPage);
+        if (layer) {
+          observedIndices.push(layer.layerIndex);
+        }
+      }
+
+      // Assert stability: the range of observed indices (max - min) must be <= 1.
+      // A range of 0 = perfectly stable (settled at one layer).
+      // A range of 1 = at most one step of jitter (acceptable transient).
+      // A range >= 2 = full oscillation (up/down flapping) — FAIL.
+      expect(
+        observedIndices.length,
+        "must have observed at least 5 layer readings during stability window",
+      ).toBeGreaterThanOrEqual(5);
+
+      const minIdx = Math.min(...observedIndices);
+      const maxIdx = Math.max(...observedIndices);
+      expect(
+        maxIdx - minIdx,
+        `#1434 stability: layer must settle after step-down, not oscillate. ` +
+          `Observed indices: [${observedIndices.join(", ")}] ` +
+          `(range ${maxIdx - minIdx}, max allowed = 1)`,
+      ).toBeLessThanOrEqual(1);
+    } finally {
+      if (rxPage) {
+        await healDownlinkNetsim(rxPage);
+      }
+      await pubBrowser.close();
+      await rxBrowser.close();
     }
   });
 });
@@ -3108,6 +4297,108 @@ test.describe("Simulcast flag OFF (pinned to 1) — single-layer no-regression",
 
       // Sanity: we actually drove distress (the poll did bump), not a fluke.
       expect(bumped, "test must have bumped the uplink counters at least once").toBeGreaterThan(0);
+    } finally {
+      await pubBrowser.close();
+    }
+  });
+
+  // #1616 — WT WRITE-DROP axis in ISOLATION (follow-up to #1398).
+  //
+  // The #1398 detector ORs THREE publisher-uplink-distress axes: WT ready-stall
+  // (`unistream_ready_stall_count`), WS send-buffer drop (`websocket_drop_count`),
+  // and WT write-drop (`unistream_drop_count`). The test above drives the first
+  // two via bumpUplinkStall/bumpWsDrop; the third axis previously had a netsim
+  // bumper gap (#1616) and was host-unit-tested only. This test drives ONLY
+  // `bumpWtDrop` (no stall, no WS drop) and asserts the SAME worklet ACK, so the
+  // WT-drop axis has deterministic e2e coverage into the identical
+  // floor → ctl-4002 → worklet → ACK pipeline.
+  //
+  // Mutation-coupled like the sibling: the ACK log fires ONLY when the worklet
+  // applied OPUS_SET_BITRATE (ctl 4002), so reverting the ctl-4002 downshift
+  // breaks this WT-drop assertion too (not just the other two axes).
+  //
+  // UNTAGGED (no @bvt): like the #1398 test above, this needs the netsim-built UI
+  // (TRUNK_BUILD_FEATURES=netsim) and so runs on the local docker e2e stack /
+  // scoped dispatch, not per-PR CI.
+  test("single-layer audio-only publisher downshifts Opus bitrate on WT write-drop distress alone (#1616)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_audio_uplink_wtdrop_${Date.now()}`;
+
+    const pubBrowser: Browser = await chromium.launch({ args: BROWSER_ARGS });
+    try {
+      const pubCtx = await createAuthenticatedContext(
+        pubBrowser,
+        "audio-uplink-wtdrop-pub@videocall.rs",
+        "AudioUplinkWtDropPublisher",
+        uiURL,
+      );
+      // SINGLE-LAYER audio so the detector's single-layer gate holds; must run
+      // before the first navigation (route is context-scoped).
+      await pinSimulcastMaxLayers(pubCtx, 1);
+
+      const pubPage = await pubCtx.newPage();
+      const pubConsole = collectConsole(pubPage);
+
+      // AUDIO-ONLY: mic ON, camera OFF — the detector's camera-OFF gate.
+      await joinMeetingAudioOnly(pubPage, meetingId, "AudioUplinkWtDropPublisher");
+
+      // Guard: the bumpWtDrop hook specifically must exist — otherwise the UI was
+      // built WITHOUT the `netsim` feature (or predates #1616) and the test would
+      // silently never fire. Fail loud with a rebuild instruction.
+      const wtDropReady = await pubPage.evaluate(
+        () => typeof window.__vcNetsim?.bumpWtDrop === "function",
+      );
+      expect(
+        wtDropReady,
+        "window.__vcNetsim.bumpWtDrop is missing — the dioxus UI image was built WITHOUT the " +
+          "`netsim` cargo feature or predates #1616. Rebuild with `make e2e-build` (the e2e stack " +
+          "sets TRUNK_BUILD_FEATURES=netsim; see docker/docker-compose.e2e.yaml).",
+      ).toBe(true);
+
+      // Let the call stabilize so the mic encoder + its recovery Interval run.
+      await pubPage.waitForTimeout(3000);
+
+      // Same ACK signal as the #1398 test: the worklet posts opusReconfigured
+      // ONLY from inside the ctl-4002 block, re-logged on the main thread as a
+      // BARE integer (Rust format string). This is the load-bearing assertion.
+      const ACK_RE =
+        /MicrophoneEncoder: worklet ACK opusReconfigured bitRate=(?:32000|24000|16000)/;
+
+      let bumped = 0;
+      await expect
+        .poll(
+          async () => {
+            // Drive ONLY the WT write-drop axis (+10/iteration > the delta≥5 per
+            // 4000 ms window threshold). Deliberately NO bumpUplinkStall / no
+            // bumpWsDrop, so a pass proves the WT-drop axis alone trips the OR.
+            await pubPage.evaluate(() => {
+              window.__vcNetsim?.bumpWtDrop?.(10);
+            });
+            bumped += 1;
+            return pubConsole.some((line) => ACK_RE.test(line));
+          },
+          {
+            timeout: 20_000,
+            intervals: [500, 1000],
+            message:
+              "expected the audio-only single-layer publisher to log the WORKLET ACK " +
+              "(MicrophoneEncoder: worklet ACK opusReconfigured bitRate=32000|24000|16000) after " +
+              "sustained WT write-drop distress driven via bumpWtDrop ALONE (#1616). Its absence " +
+              "means the WT-drop axis did not trip the #1398 detector OR the worklet never applied " +
+              "ctl-4002 — check force_unistream_drop → unistream_drop_count, the detector's WT-drop " +
+              "axis, and the worklet reconfigOpus ack.",
+          },
+        )
+        .toBe(true);
+
+      // Sanity: we actually drove the WT-drop axis (the poll did bump).
+      expect(
+        bumped,
+        "test must have bumped the WT write-drop counter at least once",
+      ).toBeGreaterThan(0);
     } finally {
       await pubBrowser.close();
     }

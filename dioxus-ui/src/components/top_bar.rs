@@ -28,6 +28,7 @@ pub fn TopBar() -> Element {
     rsx! {
         div {
             class: "top-bar",
+            // @token-exempt: pinned-dark translucent backdrop — all foreground/border must use on-dark or literal values, not theme-aware tokens; padding 6px/10px fall between token steps
             style: "position:fixed; top:0; left:0; right:0; display:flex; align-items:center; justify-content:space-between; padding:6px 10px; background:rgba(28,28,30,0.6); backdrop-filter:saturate(180%) blur(10px); border-bottom:1px solid #38383A; z-index:100;",
             div {
                 class: "flex items-center align-middle",
@@ -71,7 +72,7 @@ pub fn TopBar() -> Element {
                 }
                 span {
                     class: "text-caption",
-                    style: "margin-right:8px; color:#AEAEB2;",
+                    style: "margin-right:var(--space-2); color:var(--on-dark-text-secondary);",
                     "Made with \u{2764}\u{FE0F} by awesome developers from all over the world \u{1F30F}, hosted by Security Union \u{1F6E1}\u{FE0F}."
                 }
             }

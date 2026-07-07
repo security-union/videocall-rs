@@ -2000,7 +2000,7 @@ fn NetEqStatusAndCharts(
         } else {
             section { class: "diagnostics-section", "aria-labelledby": "diag-h-neteq-history",
                 h3 { id: "diag-h-neteq-history", "NetEQ Buffer / Jitter History" }
-                div { style: "display:flex; gap:12px; align-items:center;",
+                div { style: "display:flex; gap:var(--space-3); align-items:center;",
                     NetEqChart { data: buffer_history.clone(), chart_type: ChartType::Buffer, width: 140, height: 80 }
                     NetEqChart { data: jitter_history.clone(), chart_type: ChartType::Jitter, width: 140, height: 80 }
                 }

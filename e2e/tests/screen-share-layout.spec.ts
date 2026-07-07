@@ -492,4 +492,93 @@ test.describe("Screen-share split-layout", () => {
       await browser2.close();
     }
   });
+
+  // ──────────────────────────────────────────────────────────────────────
+  // 4. Lone peer tile is not cropped at max drag on a narrow viewport
+  //
+  // Regression for #1594: the old `minmax(160px, 1fr)` grid floor could
+  // not shrink below 160px, so at max drag (~85%) on a ~1100px viewport
+  // the single tile overflowed the panel and was cropped by
+  // `overflow-x: hidden`. The fix uses `minmax(min(160px, 100%), 1fr)`
+  // so the floor tracks the available width.
+  // ──────────────────────────────────────────────────────────────────────
+  test("lone peer tile is not cropped at max drag on a narrow viewport (#1594)", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_ss_layout_crop_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "SSCropHost",
+      "SSCropGuest",
+      { mockDisplayMedia: true },
+    );
+
+    try {
+      // Narrow viewport to trigger the bug reliably.
+      await hostPage.setViewportSize({ width: 1100, height: 800 });
+      await hostPage.waitForTimeout(500);
+
+      await expect(hostPage.locator("#grid-container .grid-item")).toHaveCount(1, {
+        timeout: 30_000,
+      });
+
+      // Guest triggers screen share.
+      await guestPage.mouse.move(400, 400);
+      await guestPage.waitForTimeout(300);
+      const shareButton = guestPage.locator("button.video-control-button", {
+        has: guestPage.locator(".tooltip", { hasText: "Share Screen" }),
+      });
+      await expect(shareButton).toBeVisible({ timeout: 10_000 });
+      await shareButton.click();
+
+      await expect(hostPage.locator(".split-screen-tile")).toBeVisible({
+        timeout: 15_000,
+      });
+
+      const rightPanel = hostPage.locator("#grid-container > div").nth(2);
+      await expect(rightPanel).toHaveClass(/ss-peer-panel/);
+
+      // Drag the resize handle to max ratio (~85% of viewport width).
+      const handle = hostPage.locator(".screen-share-resize-handle");
+      const handleBox = await handle.boundingBox();
+      const viewport = hostPage.viewportSize();
+      if (!handleBox || !viewport) {
+        throw new Error("resize handle or viewport unavailable");
+      }
+      const startX = handleBox.x + handleBox.width / 2;
+      const startY = handleBox.y + handleBox.height / 2;
+      const targetX = Math.floor(viewport.width * 0.85);
+      await hostPage.mouse.move(startX, startY);
+      await hostPage.mouse.down();
+      await hostPage.mouse.move(targetX, startY, { steps: 20 });
+      await hostPage.mouse.up();
+      await hostPage.waitForTimeout(500);
+
+      // The tile must not overflow the panel horizontally.
+      // scrollWidth > clientWidth means content is clipped.
+      const overflow = await rightPanel.evaluate((el) => el.scrollWidth - el.clientWidth);
+      expect(overflow).toBeLessThanOrEqual(1);
+
+      // Corroborate: tile right edge <= panel content-box right edge.
+      const { tileRight, panelContentRight } = await rightPanel.evaluate((el) => {
+        const tile = el.querySelector(".split-peer-tile");
+        if (!tile) return { tileRight: 0, panelContentRight: 0 };
+        const tileRect = tile.getBoundingClientRect();
+        const panelRect = el.getBoundingClientRect();
+        const paddingRight = parseFloat(getComputedStyle(el).paddingRight) || 0;
+        return {
+          tileRight: tileRect.right,
+          panelContentRight: panelRect.right - paddingRight,
+        };
+      });
+      expect(tileRight).toBeLessThanOrEqual(panelContentRight + 1);
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
 });

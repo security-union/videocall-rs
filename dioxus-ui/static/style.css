@@ -113,7 +113,7 @@ h2 {
 }
 
 h3 {
-  margin: 20px 0 10px 0;
+  margin: var(--space-5) 0 10px 0;
   font-size: var(--fs-7);
   font-weight: 500;
   color: var(--text-secondary);
@@ -159,7 +159,7 @@ h3 {
 .peer_item {
   display: flex;
   align-items: center;
-  padding: 8px;
+  padding: var(--space-2);
   border-radius: var(--radius-sm);
   transition: background-color 0.2s;
 }
@@ -207,7 +207,7 @@ h3 {
   letter-spacing: 0.02em;
   white-space: nowrap;
   flex-shrink: 0;
-  margin-left: 4px;
+  margin-left: var(--space-1);
 }
 
 /* Guest badge on the floating-name overlay on video tiles */
@@ -222,7 +222,7 @@ h3 {
   position: absolute;
   bottom: 8px;
   right: 8px;
-  padding: 2px 8px;
+  padding: 2px var(--space-2);
   border-radius: var(--radius-md);
   background-color: var(--warning);
   color: #000;
@@ -245,7 +245,7 @@ h3 {
   background: none;
   border: none;
   cursor: pointer;
-  padding: 2px 4px;
+  padding: 2px var(--space-1);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -270,7 +270,7 @@ h3 {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-bottom: 4px;
+  margin-bottom: var(--space-1);
 }
 
 .in-call-header h3 {
@@ -286,7 +286,7 @@ h3 {
   border: none;
   color: var(--text-tertiary, #888);
   font-size: 0.75em;
-  padding: 2px 4px;
+  padding: 2px var(--space-1);
   border-radius: 4px;
   cursor: pointer;
   transition:
@@ -388,16 +388,16 @@ h3 {
   box-shadow: 0 4px 16px rgba(0, 0, 0, 0.45);
   z-index: 100;
   min-width: 130px;
-  padding: 4px 0;
+  padding: var(--space-1) 0;
   overflow: visible;
 }
 
 .tile-context-menu-item {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
-  padding: 8px 12px;
+  padding: var(--space-2) var(--space-3);
   background: none;
   border: none;
   color: var(--text-primary, #fff);
@@ -433,8 +433,8 @@ h3 {
   grid-template-rows: repeat(3, 1fr);
   /* fallback; Rust overrides */
   /* Desktop gap/padding — keep in sync with attendants.rs (vw >= 568.0 branch) */
-  gap: 16px;
-  padding: 20px 20px 84px 20px;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-5) 84px var(--space-5);
   box-sizing: border-box;
   overflow: hidden;
 }
@@ -502,7 +502,7 @@ h3 {
   color: var(--text-secondary);
   font-size: var(--fs-10);
   font-weight: 600;
-  gap: 4px;
+  gap: var(--space-1);
 }
 
 .grid-overflow-badge span {
@@ -656,8 +656,8 @@ h3 {
 
 @media (max-width: 568px) {
   #grid-container {
-    gap: 8px;
-    padding: 8px 8px 72px 8px;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-2) 72px var(--space-2);
   }
 
   /* Host video adjustments */
@@ -727,7 +727,7 @@ h3 {
 
   #peer-list-container .sidebar-header,
   #diagnostics-sidebar .sidebar-header {
-    padding: 20px !important;
+    padding: var(--space-5) !important;
     background-color: var(--surface) !important;
     border-bottom: 2px solid var(--border) !important;
   }
@@ -753,12 +753,12 @@ h3 {
 
   #peer-list-container .sidebar-content,
   #diagnostics-sidebar .sidebar-content {
-    padding: 20px !important;
+    padding: var(--space-5) !important;
   }
 
   .peer_item {
     padding: 15px !important;
-    margin-bottom: 8px !important;
+    margin-bottom: var(--space-2) !important;
     border-radius: var(--radius-md) !important;
     background-color: var(--field-bg) !important;
   }
@@ -877,6 +877,13 @@ canvas {
   user-select: none;
 }
 
+.floating-name-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
 .floating-name:hover,
 .floating-name:focus {
   background-color: rgba(0,
@@ -899,7 +906,7 @@ canvas {
   display: inline-block;
   width: 16px;
   height: 16px;
-  margin-right: 4px;
+  margin-right: var(--space-1);
   vertical-align: middle;
   color: var(--warning);
   flex-shrink: 0;
@@ -943,7 +950,7 @@ canvas {
 .device-selector {
   width: calc(100% - 10px);
   margin: 3px 5px;
-  padding: 4px;
+  padding: var(--space-1);
   border-radius: 3px;
   border: 1px solid var(--border);
   background-color: var(--device-selector-bg);
@@ -951,7 +958,7 @@ canvas {
 }
 
 .device-selector-wrapper {
-  padding: 8px 5px 5px 5px;
+  padding: var(--space-2) 5px 5px 5px;
   background-color: var(--device-wrapper-bg);
   flex-shrink: 0;
   border-top: 1px solid var(--border);
@@ -987,7 +994,7 @@ select {
   align-items: center;
   background-color: var(--bg);
   color: var(--text-primary);
-  padding: 8px;
+  padding: var(--space-2);
 }
 
 /* ============================================================
@@ -1185,8 +1192,8 @@ html[data-theme="dark"] #diagnostics-sidebar {
    (Quality controls / Live stream state / Connection & system). NOT headings —
    the per-section <h3>s are the real headings. (#1131 §5) */
 .diag-group-label {
-  margin: 20px 0 8px;
-  padding-top: 16px;
+  margin: var(--space-5) 0 var(--space-2);
+  padding-top: var(--space-4);
   border-top: 1px solid var(--border);
   font-size: var(--fs-2);
   font-weight: 600;
@@ -1197,7 +1204,7 @@ html[data-theme="dark"] #diagnostics-sidebar {
 
 /* The first group needs no top border/extra top padding (it leads the body). */
 .diag-group-label--first {
-  margin-top: 4px;
+  margin-top: var(--space-1);
   padding-top: 0;
   border-top: none;
 }
@@ -1209,7 +1216,7 @@ html[data-theme="dark"] #diagnostics-sidebar {
 .diag-section-head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 .diag-section-head h3 {
   margin: 0;
@@ -1227,7 +1234,7 @@ html[data-theme="dark"] #diagnostics-sidebar {
   font-size: var(--fs-7);
   font-weight: 600;
   color: var(--text-primary);
-  padding: 4px 0;
+  padding: var(--space-1) 0;
   /* ≥44px keyboard/touch target for the summary row. */
   min-height: 44px;
   display: flex;
@@ -1262,7 +1269,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .diag-disclosure[open] > .diag-disclosure-summary {
   margin-bottom: 10px;
   border-bottom: 1px solid var(--glass-bg-hover);
-  padding-bottom: 8px;
+  padding-bottom: var(--space-2);
 }
 /* "Select a specific peer…" placeholder shown for the NetEq section when the
    "All Peers" aggregate is selected (S2). */
@@ -1274,7 +1281,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 /* Each folded raw-stats block (Reception / Sending / Encoder / Media Status)
    keeps its own sub-heading inside the one disclosure. */
 .diag-raw-block + .diag-raw-block {
-  margin-top: 12px;
+  margin-top: var(--space-3);
 }
 .diag-raw-block h4 {
   margin: 0 0 6px;
@@ -1397,7 +1404,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
      `.perf-simulcast-strip` / `.perf-kind-card`. */
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 .diagnostics-sidebar {
@@ -1408,7 +1415,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   height: 100vh;
   background-color: var(--overlay-opaque);
   color: var(--text-primary);
-  padding: 20px;
+  padding: var(--space-5);
   box-shadow: var(--shadow-sm);
   z-index: 1000;
   transition: transform 0.3s ease-in-out;
@@ -1419,7 +1426,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 20px;
+  margin-bottom: var(--space-5);
   border-bottom: 1px solid var(--scrollbar-thumb-active);
   padding-bottom: 10px;
 }
@@ -1455,7 +1462,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .diagnostics-section {
-  margin-bottom: 20px;
+  margin-bottom: var(--space-5);
   padding: 10px;
   background-color: var(--glass-bg-hover);
   border-radius: 5px;
@@ -1524,7 +1531,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-tertiary);
   font-weight: 600;
   border-bottom: 1px solid var(--border);
-  padding-bottom: 4px;
+  padding-bottom: var(--space-1);
   margin-bottom: 2px;
 }
 
@@ -1590,7 +1597,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .neteq-advanced-chart .no-data {
   color: var(--text-tertiary);
   font-style: italic;
-  padding: 20px;
+  padding: var(--space-5);
 }
 
 /* The advanced charts are now a fixed-Y-axis + growing-width scrollable form
@@ -1620,24 +1627,24 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    remapped). No .settings-modal ancestor dependency either way. */
 .neteq-status {
   background: var(--surface-elevated);
-  padding: 16px;
+  padding: var(--space-4);
   border-radius: var(--radius-md);
   box-shadow: var(--shadow-sm);
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 /* Tier 1 — primary stats (Buffer | Target) */
 .neteq-status .status-primary {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 12px;
+  gap: var(--space-3);
 }
 .neteq-status .status-stat {
   background: var(--border);
   border-radius: var(--radius-md);
-  padding: 12px 14px;
+  padding: var(--space-3) 14px;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1669,14 +1676,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .neteq-status .status-secondary {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 6px 16px;
+  gap: 6px var(--space-4);
 }
 .neteq-status .status-row {
   display: flex;
   justify-content: space-between;
   align-items: baseline;
-  gap: 8px;
-  padding: 4px 0;
+  gap: var(--space-2);
+  padding: var(--space-1) 0;
   border-bottom: 1px solid var(--border);
 }
 .neteq-status .status-row__label {
@@ -1695,8 +1702,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 4px 12px;
-  padding-top: 4px;
+  gap: var(--space-1) var(--space-3);
+  padding-top: var(--space-1);
   font-size: var(--fs-3);
   color: var(--text-tertiary);
 }
@@ -1736,7 +1743,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .neteq-charts-stack {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 .neteq-charts-stack .chart-container {
@@ -1764,7 +1771,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .charts-grid {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-  gap: 20px;
+  gap: var(--space-5);
   padding: 0 10px;
 }
 
@@ -1777,13 +1784,13 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .peer-selector {
   width: 100%;
-  padding: 8px 12px;
+  padding: var(--space-2) var(--space-3);
   background: var(--border);
   border: 1px solid var(--border-emphasis);
   border-radius: 4px;
   color: var(--text-primary);
   font-size: var(--fs-5);
-  margin: 8px 0;
+  margin: var(--space-2) 0;
   /* ≥44px tap target for the Peer Selection AND Transport Preference selects
      (both use this class) on touch devices (iteration 3 polish). */
   min-height: 44px;
@@ -1805,7 +1812,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .peer-summary {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
   margin-top: 10px;
 }
 
@@ -1813,7 +1820,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 12px;
+  padding: var(--space-2) var(--space-3);
   background: var(--border);
   border-radius: 4px;
   border-left: 3px solid var(--success);
@@ -1825,7 +1832,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    named class over an inline style). Same computed layout, no visual change. */
 .peer-summary-item__metrics {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   align-items: center;
 }
 
@@ -1912,7 +1919,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
   .peer-summary-item {
     flex-direction: column;
-    gap: 4px;
+    gap: var(--space-1);
     text-align: center;
   }
 
@@ -2166,7 +2173,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .context-menu-item {
   width: 100%;
-  padding: 0.75rem 1rem;
+  padding: var(--space-3) var(--space-4);
   background: transparent;
   border: none;
   color: var(--on-dark-text);
@@ -2175,7 +2182,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: var(--space-3);
   transition: all 0.15s ease;
   border-bottom: 1px solid var(--field-bg);
 }
@@ -2207,7 +2214,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 /* Meeting Info Panel */
 .meeting-info-compact {
-  padding: 0.75rem 1rem;
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--glass-bg-hover);
   font-size: var(--fs-4);
 }
@@ -2216,7 +2223,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0.25rem 0;
+  padding: var(--space-1) 0;
 }
 
 .info-label {
@@ -2342,7 +2349,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 
   .device-settings-header {
-    padding: 20px !important;
+    padding: var(--space-5) !important;
     background: transparent !important;
     border-bottom: 1px solid var(--glass-bg) !important;
   }
@@ -2353,7 +2360,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 
   .device-settings-content {
-    padding: 20px !important;
+    padding: var(--space-5) !important;
     max-height: none !important;
   }
 
@@ -2439,8 +2446,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   right: 28px;
   display: flex;
   align-items: center;
-  gap: 4px;
-  padding: 3px 8px 3px 4px;
+  gap: var(--space-1);
+  padding: 3px var(--space-2) 3px var(--space-1);
   background: var(--overlay-heavy);
   border-radius: var(--radius-lg);
   z-index: 5;
@@ -2498,7 +2505,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    ============================================================ */
 
 .meetings-list-container {
-  margin-top: 0.75rem;
+  margin-top: var(--space-3);
   background: var(--surface-tint-3,
       rgba(255, 255, 255, 0.03));
   /* @token-exempt: legacy var() fallback for very-faint glass */
@@ -2516,7 +2523,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.5rem;
+  gap: var(--space-2);
   overflow: visible;
 }
 
@@ -2527,8 +2534,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.75rem 1rem;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
   background: transparent;
   border: none;
   color: var(--text-secondary);
@@ -2567,7 +2574,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meetings-error,
 .meetings-empty,
 .meetings-auth-prompt {
-  padding: 1rem;
+  padding: var(--space-4);
   text-align: center;
   color: var(--text-tertiary);
   font-size: var(--fs-4);
@@ -2577,8 +2584,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 1rem;
-  padding: 1.5rem 1rem;
+  gap: var(--space-4);
+  padding: 1.5rem var(--space-4);
 }
 
 .meetings-auth-text {
@@ -2592,7 +2599,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
 }
 
 .loading-spinner {
@@ -2614,7 +2621,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--error);
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: var(--space-2);
 }
 
 .retry-btn {
@@ -2639,9 +2646,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 0.5rem;
+  gap: var(--space-2);
   flex: 0 0 auto;
-  padding-right: 0.75rem;
+  padding-right: var(--space-3);
 }
 
 .meetings-toolbar-group {
@@ -2654,7 +2661,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   position: relative;
   display: flex;
   align-items: center;
-  gap: 0.25rem;
+  gap: var(--space-1);
 }
 
 /* Lift the trigger buttons above the popover backdrop (z 9290) GLOBALLY, so a
@@ -2711,7 +2718,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   right: -5px;
   min-width: 16px;
   height: 16px;
-  padding: 0 4px;
+  padding: 0 var(--space-1);
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -2794,14 +2801,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   max-width: min(280px, calc(100vw - 24px));
   max-height: min(360px, calc(100vh - 120px));
   overflow-y: auto;
-  padding: 0.5rem;
+  padding: var(--space-2);
   background: var(--surface-elevated);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-card);
   box-shadow: var(--shadow-md);
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: var(--space-3);
   animation: meetings-popover-in 0.14s cubic-bezier(0.4, 0, 0.2, 1);
 }
 
@@ -2838,7 +2845,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex-direction: column;
   align-items: stretch;
   text-align: left;
-  gap: 0.25rem;
+  gap: var(--space-1);
 }
 
 .meetings-filter-legend {
@@ -2862,10 +2869,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex-direction: row;
   align-items: center;
   justify-content: flex-start;
-  gap: 0.5rem;
+  gap: var(--space-2);
   width: 100%;
   margin: 0;
-  padding: 0.25rem;
+  padding: var(--space-1);
   text-align: left;
   font-size: var(--fs-4);
   color: var(--text-secondary);
@@ -2892,14 +2899,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .meetings-sort-popover {
   min-width: 180px;
-  padding: 0.25rem;
+  padding: var(--space-1);
   gap: 0;
 }
 
 .meetings-sort-option {
   width: 100%;
   text-align: left;
-  padding: 0.5rem 0.625rem;
+  padding: var(--space-2) 0.625rem;
   background: transparent;
   border: none;
   border-radius: var(--radius-button);
@@ -2968,7 +2975,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
   .meetings-filter-option {
     min-height: 44px;
-    padding: 0.5rem;
+    padding: var(--space-2);
   }
 
   .meetings-filter-option input {
@@ -3000,7 +3007,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .meeting-item {
-  padding: 0.625rem 1rem;
+  padding: 0.625rem var(--space-4);
   border-bottom: 1px solid var(--diag-info-border);
   cursor: pointer;
   transition: background-color 0.2s cubic-bezier(0.4, 0, 0.2, 1);
@@ -3020,7 +3027,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-info {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
   flex-shrink: 0;
   min-width: 0;
   overflow: hidden;
@@ -3087,7 +3094,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-participants {
   display: flex;
   align-items: center;
-  gap: 0.25rem;
+  gap: var(--space-1);
 }
 
 .meeting-password {
@@ -3113,8 +3120,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: transparent;
   border: none;
   color: var(--text-on-glass-quaternary);
-  padding: 0.5rem;
-  margin-left: 0.5rem;
+  padding: var(--space-2);
+  margin-left: var(--space-2);
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all 0.2s ease;
@@ -3147,7 +3154,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-duration {
   display: flex;
   align-items: center;
-  gap: 0.25rem;
+  gap: var(--space-1);
   color: var(--text-on-glass-faint);
   white-space: nowrap;
   flex-shrink: 0;
@@ -3161,7 +3168,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-waiting {
   display: flex;
   align-items: center;
-  gap: 0.25rem;
+  gap: var(--space-1);
   color: var(--brand-gold-soft-2);
   font-weight: 500;
   white-space: nowrap;
@@ -3189,7 +3196,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   backdrop-filter: blur(var(--effect-blur-lg)) saturate(140%);
   border: 1px solid var(--glass-bg-hover);
   border-radius: var(--radius-md);
-  padding: 0.3125rem 0.5rem;
+  padding: 0.3125rem var(--space-2);
   font-size: var(--fs-2);
   color: var(--text-on-glass);
   white-space: nowrap;
@@ -3223,7 +3230,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 0.75rem;
+  gap: var(--space-3);
   padding: 0.0625rem 0;
 }
 
@@ -3272,7 +3279,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .meeting-info-tooltip-label--owner {
   display: inline-flex;
   align-items: center;
-  gap: 0.25rem;
+  gap: var(--space-1);
   color: var(--brand-gold);
   font-weight: 500;
 }
@@ -3316,7 +3323,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .waiting-room-card h2 {
-  margin: 0 0 0.5rem 0;
+  margin: 0 0 var(--space-2) 0;
   font-size: var(--fs-10);
   font-weight: 600;
 }
@@ -3325,7 +3332,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   color: var(--text-primary);
   font-size: 1.1rem;
   font-weight: 600;
-  margin-bottom: 0.25rem;
+  margin-bottom: var(--space-1);
 }
 
 .waiting-room-message {
@@ -3335,14 +3342,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .waiting-room-error {
   color: var(--error-text-vivid);
-  margin-bottom: 1rem;
+  margin-bottom: var(--space-4);
   font-size: var(--fs-5);
 }
 
 .waiting-room-spinner {
   display: flex;
   justify-content: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
   margin-bottom: 2rem;
 }
 
@@ -3398,8 +3405,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   width: 100%;
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  padding: 0.875rem 1rem;
+  gap: var(--space-3);
+  padding: 0.875rem var(--space-4);
   background: transparent;
   border: none;
   color: var(--on-dark-text);
@@ -3424,7 +3431,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .waiting-badge {
   background: var(--error);
   color: var(--text-primary);
-  padding: 0.125rem 0.5rem;
+  padding: 0.125rem var(--space-2);
   border-radius: 10px;
   font-size: var(--fs-3);
   font-weight: 600;
@@ -3442,7 +3449,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0.75rem 1rem;
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid var(--field-bg);
 }
 
@@ -3477,7 +3484,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .participant-actions {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--space-2);
 }
 
 .btn-admit,
@@ -3514,14 +3521,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .admit-all-container {
-  padding: 0.5rem 0.75rem;
+  padding: var(--space-2) var(--space-3);
   border-bottom: 1px solid var(--glass-bg-hover);
-  margin-bottom: 0.25rem;
+  margin-bottom: var(--space-1);
 }
 
 .btn-admit-all {
   width: 100%;
-  padding: 0.5rem 1rem;
+  padding: var(--space-2) var(--space-4);
   border-radius: var(--radius-sm);
   border: none;
   background: var(--success-bg-soft);
@@ -3531,7 +3538,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
   cursor: pointer;
   transition: all 0.2s ease;
 }
@@ -3576,7 +3583,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .rejected-card h2,
 .error-card h2 {
-  margin: 1rem 0 0.5rem 0;
+  margin: var(--space-4) 0 var(--space-2) 0;
   font-size: var(--fs-10);
   font-weight: 600;
 }
@@ -3612,7 +3619,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   letter-spacing: 0.01em;
   outline: none;
   overflow: hidden;
-  padding: 0 20px;
+  padding: 0 var(--space-5);
   position: relative;
   text-align: center;
   transition:
@@ -3730,7 +3737,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   letter-spacing: 0.01em;
   outline: none;
   overflow: hidden;
-  padding: 0 20px;
+  padding: 0 var(--space-5);
   position: relative;
   text-align: center;
   transition:
@@ -3842,7 +3849,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   background: transparent;
   border: none;
   color: var(--text-on-glass-faint);
-  padding: 0.5rem;
+  padding: var(--space-2);
   border-radius: var(--radius-sm);
   cursor: pointer;
   transition: all 0.2s ease;
@@ -3875,7 +3882,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-size: var(--fs-6);
   font-weight: 500;
   cursor: pointer;
-  padding: 0.625rem 0.75rem;
+  padding: 0.625rem var(--space-3);
   margin-left: -0.75rem;
   border-radius: var(--radius-button, 10px);
   min-height: 44px;
@@ -3897,7 +3904,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   border: 1px solid var(--settings-card-border);
   border-radius: var(--radius-card, 16px);
   padding: 1.5rem;
-  margin-bottom: 1rem;
+  margin-bottom: var(--space-4);
   box-shadow: inset 0 1px 0 var(--settings-card-inset);
   transition: border-color 0.25s cubic-bezier(0.4, 0, 0.2, 1);
 }
@@ -3907,7 +3914,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-card-title {
-  margin: 0 0 1.25rem 0;
+  margin: 0 0 var(--space-5) 0;
   font-size: var(--fs-4);
   font-weight: 600;
   text-transform: uppercase;
@@ -3916,11 +3923,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-card-compact {
-  padding: 1rem 1.5rem;
+  padding: var(--space-4) 1.5rem;
 }
 
 .settings-card-compact .settings-card-title {
-  margin-bottom: 0.75rem;
+  margin-bottom: var(--space-3);
 }
 
 /* ----------------------------------------------------------------
@@ -3929,8 +3936,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .prejoin-preview {
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
-  margin-bottom: 1rem;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
 }
 
 .prejoin-video-frame {
@@ -3960,7 +3967,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
   color: var(--text-tertiary);
 }
 
@@ -3972,9 +3979,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0.75rem;
+  gap: var(--space-3);
   text-align: center;
-  padding: 0.5rem 0;
+  padding: var(--space-2) 0;
 }
 
 .prejoin-permission-text {
@@ -3985,7 +3992,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 .prejoin-controls-row {
   display: flex;
-  gap: 0.5rem;
+  gap: var(--space-2);
   justify-content: center;
 }
 
@@ -3997,7 +4004,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   gap: 0.4rem;
   min-height: 44px;
   /* WCAG 2.5.8 / Apple HIG tap target */
-  padding: 0.5rem 0.75rem;
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-input, 12px);
   border: 1px solid var(--settings-card-border);
   background: var(--settings-card-bg);
@@ -4080,7 +4087,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .prejoin-select-group {
   display: flex;
   flex-direction: column;
-  gap: 0.25rem;
+  gap: var(--space-1);
 }
 
 .prejoin-select-group label {
@@ -4094,7 +4101,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   width: 100%;
   min-height: 44px;
   /* WCAG 2.5.8 / Apple HIG tap target */
-  padding: 0.5rem 0.75rem;
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-input, 12px);
   border: 1px solid var(--settings-card-border);
   background: var(--settings-card-bg);
@@ -4136,9 +4143,9 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 0.5rem;
-  padding: 0.25rem 0 1rem 0;
-  margin: 0 0 1.25rem 0;
+  gap: var(--space-2);
+  padding: var(--space-1) 0 var(--space-4) 0;
+  margin: 0 0 var(--space-5) 0;
   border-bottom: 1px solid var(--join-meeting-divider);
   text-align: center;
 }
@@ -4148,7 +4155,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex-wrap: wrap;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem 0.625rem;
+  gap: var(--space-2) 0.625rem;
   margin: 0;
   font-size: 1.375rem;
   font-weight: 600;
@@ -4197,7 +4204,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
   .join-meeting-id {
     font-size: var(--fs-4);
-    padding: 0.125rem 0.5rem;
+    padding: 0.125rem var(--space-2);
   }
 }
 
@@ -4264,7 +4271,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0.5rem 0;
+  padding: var(--space-2) 0;
   border-bottom: 1px solid var(--glass-bg);
 }
 
@@ -4285,7 +4292,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .settings-stat-row {
   display: flex;
   align-items: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
   padding: 0.375rem 0;
   border-bottom: 1px solid var(--glass-bg);
 }
@@ -4371,7 +4378,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .settings-option-controls {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: var(--space-3);
 }
 
 /* Screen share split-layout tile — fills the entire left share area */
@@ -4406,7 +4413,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 /* Screen share split-layout — right-panel peer video tile.
    The parent `.ss-peer-panel` is a CSS grid with auto-fill columns
-   (minmax(160px, 1fr)). Each tile spans one grid cell with
+   (minmax(min(160px, 100%), 1fr)). Each tile spans one grid cell with
    `aspect-ratio: 3 / 2` deriving height from width. Off-budget tiles
    render with `force_avatar: true` (avatar placeholder, no decode) —
    the decode budget caps live decoders just as the normal grid does
@@ -4459,7 +4466,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   min-width: 0;
   height: 100%;
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(160px, 100%), 1fr));
   grid-auto-rows: min-content;
   gap: 10px;
   padding: 14px;
@@ -4590,7 +4597,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   backdrop-filter: blur(var(--effect-blur-surface));
   border: 1px solid var(--settings-tooltip-border);
   border-radius: var(--radius-md);
-  padding: 0.5rem 0.75rem;
+  padding: var(--space-2) var(--space-3);
   font-size: var(--fs-3);
   line-height: 1.4;
   color: var(--on-dark-text-secondary);
@@ -4609,7 +4616,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-action-row {
-  margin-bottom: 0.75rem;
+  margin-bottom: var(--space-3);
 }
 
 .settings-action-row:last-child {
@@ -4620,7 +4627,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 0.5rem;
+  gap: var(--space-2);
   width: 100%;
   height: 40px;
   font-size: var(--fs-5);
@@ -4645,8 +4652,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 .settings-danger-zone {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
-  margin: 1.25rem 0;
+  gap: var(--space-3);
+  margin: var(--space-5) 0;
 }
 
 .settings-danger-divider {
@@ -4684,7 +4691,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 1rem;
+  gap: var(--space-4);
   min-height: 200px;
   color: var(--text-secondary);
   font-size: var(--fs-6);
@@ -4701,14 +4708,14 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.75rem;
+  gap: var(--space-3);
   min-height: 200px;
   text-align: center;
   color: var(--text-secondary);
 }
 
 .settings-empty-state h2 {
-  margin: 0.5rem 0 0;
+  margin: var(--space-2) 0 0;
   font-size: var(--fs-9);
   font-weight: 600;
   color: var(--text-primary);
@@ -4724,12 +4731,12 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   text-align: center;
   color: var(--error);
   font-size: 0.8rem;
-  margin-top: 0.5rem;
+  margin-top: var(--space-2);
 }
 
 @media (max-width: 48em) {
   .settings-card {
-    padding: 1.25rem;
+    padding: var(--space-5);
   }
 
   .settings-field-label {
@@ -4744,7 +4751,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 @media (max-width: 30em) {
   .settings-card {
-    padding: 1rem;
+    padding: var(--space-4);
     border-radius: var(--radius-input, 12px);
   }
 
@@ -4756,11 +4763,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   }
 
   .settings-field {
-    padding: 0.75rem 0;
+    padding: var(--space-3) 0;
   }
 
   .settings-field-label {
-    margin-right: 0.75rem;
+    margin-right: var(--space-3);
   }
 }
 
@@ -4845,7 +4852,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   align-items: center;
   gap: 10px;
   max-width: min(560px, calc(100% - 24px));
-  padding: 8px 10px 8px 14px;
+  padding: var(--space-2) 10px var(--space-2) 14px;
   background: var(--fixed-dark-heavy);
   border: 1px solid var(--btn-warning-border);
   border-radius: var(--radius-lg);
@@ -4955,8 +4962,8 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    compact phrase keeps minimal context since the tooltip is hover-only. */
 @media (max-width: 639px) {
   .decode-budget-banner {
-    gap: 8px;
-    padding: 6px 8px 6px 12px;
+    gap: var(--space-2);
+    padding: 6px var(--space-2) 6px var(--space-3);
     font-size: var(--fs-3);
   }
   .decode-budget-banner-text {
@@ -4992,10 +4999,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   z-index: 55;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   height: auto;
   min-height: 36px;
-  padding: 0 6px 0 12px;
+  padding: 0 6px 0 var(--space-3);
   max-width: min(420px, calc(100% - 24px));
   border-radius: var(--radius-pill);
   border: 1px solid var(--glass-border);
@@ -5057,7 +5064,7 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   align-items: center;
   justify-content: center;
   gap: 6px;
-  padding: 0 12px;
+  padding: 0 var(--space-3);
   border-radius: var(--radius-pill);
   color: var(--warning);
   background: var(--btn-warning-bg);
@@ -5165,7 +5172,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   z-index: 1100;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
   pointer-events: none;
   max-width: 360px;
   width: calc(100% - 32px);
@@ -5180,7 +5187,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   -webkit-backdrop-filter: blur(var(--effect-blur-lg));
   border: 1px solid var(--glass-bg-hover);
   border-radius: var(--radius-lg);
-  padding: 10px 16px;
+  padding: 10px var(--space-4);
   color: var(--on-dark-text);
   font-family:
     -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto,
@@ -5356,7 +5363,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   }
 
   .peer-toast {
-    padding: 8px 12px;
+    padding: var(--space-2) var(--space-3);
     font-size: var(--fs-3);
     border-radius: 10px;
   }
@@ -5395,7 +5402,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   position: relative;
   z-index: 2;
 
-  margin: 4px;
+  margin: var(--space-1);
   padding: 40px 54px 48px 44px;
 
   border-radius: var(--settings-panel-radius);
@@ -5406,6 +5413,34 @@ html[data-theme="light"] .decode-paused-pill-action {
 
   min-width: 0;
   min-height: 0;
+
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+.settings-panel::-webkit-scrollbar {
+  width: 10px;
+}
+
+.settings-panel::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.settings-panel::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border: 3px solid transparent;
+  background-clip: padding-box;
+  border-radius: 999px;
+}
+
+.settings-panel::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  background-clip: padding-box;
+}
+
+.settings-panel::-webkit-scrollbar-thumb:active {
+  background: var(--scrollbar-thumb-active);
+  background-clip: padding-box;
 }
 
 
@@ -5427,7 +5462,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 .settings-nav {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .settings-sidebar-title {
@@ -5503,7 +5538,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   height: 44px;
   min-width: 0;
   margin: 0 14px;
-  padding: 0 16px;
+  padding: 0 var(--space-4);
 
   border-radius: var(--radius-pill);
 
@@ -5537,7 +5572,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   width: 16px;
   height: 16px;
   flex-shrink: 0;
-  margin-right: 12px;
+  margin-right: var(--space-3);
   color: currentColor;
   opacity: 0.78;
   transition: color 0.2s ease;
@@ -5590,7 +5625,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 .settings-section-title-with-icon .settings-nav-icon {
   width: 20px;
   height: 20px;
-  margin-right: 4px;
+  margin-right: var(--space-1);
   color: currentColor;
   flex-shrink: 0;
 }
@@ -5605,7 +5640,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 .settings-section-title-with-icon .settings-nav-icon {
   width: 20px;
   height: 20px;
-  margin-right: 4px;
+  margin-right: var(--space-1);
   color: currentColor;
   flex-shrink: 0;
 }
@@ -5620,8 +5655,8 @@ html[data-theme="light"] .decode-paused-pill-action {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  margin: 40px 0 12px;
+  gap: var(--space-3);
+  margin: 40px 0 var(--space-3);
 }
 
 .settings-section-title-row:first-child {
@@ -5646,7 +5681,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   display: flex;
   align-items: center;
   min-height: 120px;
-  padding: 16px 18px;
+  padding: var(--space-4) 18px;
   border-radius: 14px;
   border: 1px dashed var(--settings-placeholder-border);
   background: var(--settings-placeholder-bg);
@@ -5696,7 +5731,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 12px;
+  padding: var(--space-3);
   background: transparent;
   border: 1px solid var(--settings-input-border);
   border-radius: 10px;
@@ -5749,7 +5784,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   flex-shrink: 0;
   opacity: 0.5;
   transition: transform 0.2s ease;
-  margin-left: 8px;
+  margin-left: var(--space-2);
 }
 
 .glass-select-trigger.open .glass-select-chevron {
@@ -5771,13 +5806,13 @@ html[data-theme="light"] .decode-paused-pill-action {
   box-shadow:
     inset 0 1px 0 var(--glass-select-menu-inset),
     0 8px 24px var(--glass-select-menu-shadow);
-  padding: 4px;
+  padding: var(--space-1);
   overflow-y: auto;
   max-height: 200px;
 }
 
 .glass-select-option {
-  padding: 10px 12px;
+  padding: 10px var(--space-3);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
   cursor: pointer;
@@ -5813,7 +5848,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .glass-select-separator {
   height: 1px;
-  margin: 4px 8px;
+  margin: var(--space-1) var(--space-2);
   background: var(--glass-border);
 }
 
@@ -5832,7 +5867,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 }
 
 .transport-preference-note {
-  margin: 8px 0 0;
+  margin: var(--space-2) 0 0;
   font-size: var(--fs-3);
   color: var(--text-secondary);
   font-style: italic;
@@ -5850,7 +5885,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 .sticky-protocol-row-inner {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: var(--space-4);
   justify-content: space-between;
 }
 
@@ -5885,7 +5920,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   display: flex;
   align-items: flex-start;
   gap: 10px;
-  padding: 12px 14px;
+  padding: var(--space-3) 14px;
   border-radius: 10px;
   border: 1px solid var(--settings-modal-border);
   background: var(--settings-info-panel-bg);
@@ -5976,7 +6011,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   font-size: var(--fs-5);
   font-weight: 500;
   letter-spacing: 0.01em;
-  padding: 8px 12px;
+  padding: var(--space-2) var(--space-3);
   text-align: center;
   white-space: nowrap;
   box-shadow: none;
@@ -6077,7 +6112,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-4);
   flex-wrap: wrap;
 }
 
@@ -6201,7 +6236,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-4);
 
   margin: 0;
 
@@ -6275,7 +6310,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .appearance-control-group {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .appearance-control-label {
@@ -6362,7 +6397,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: flex;
   align-items: flex-start;
   width: var(--speaker-control-width);
-  gap: 8px;
+  gap: var(--space-2);
   flex-wrap: wrap;
   overflow: hidden;
   padding: 2px 0;
@@ -6458,7 +6493,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 
 .custom-color-popover {
   margin-top: 10px;
-  padding: 10px 12px;
+  padding: 10px var(--space-3);
   background: var(--add-color-popover-bg)
     /* @token-exempt: custom-color popover bg, themed via token */
   ;
@@ -6471,7 +6506,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .custom-color-popover-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .custom-color-preview {
@@ -6560,7 +6595,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   min-width: 300px;
   width: 100%;
   max-width: min(400px, calc(100vw - 32px));
-  padding: 14px 16px 12px;
+  padding: 14px var(--space-4) var(--space-3);
   box-shadow: 0 18px 48px rgba(0, 0, 0, 0.45);
   /* @token-exempt: modal elevation */
 }
@@ -6570,14 +6605,14 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-3);
   margin-bottom: 10px;
 }
 
 .custom-color-modal-heading {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
   min-width: 0;
 }
 
@@ -6631,7 +6666,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .custom-color-modal-body {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 /* ── Custom HSV color picker ─────────────────────────────────────────────── */
@@ -6688,13 +6723,18 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 /* Vertical hue slider sits to the right of the SV square. The wrap padding
-   provides a wider invisible hit area for touch users. */
+   provides a wider invisible hit area for touch users. Pointer handlers are
+   attached to the wrap in the Dioxus component, so `touch-action: none` must
+   live here — not just on the track — for the padding to be usable without
+   the browser hijacking the drag for scrolling. */
 .color-picker-hue-wrap--vertical {
   flex-shrink: 0;
   display: flex;
   align-items: stretch;
-  padding: 0 8px;
+  padding: 0 var(--space-2);
   margin: 0 -8px;
+  touch-action: none;
+  cursor: pointer;
 }
 
 .color-picker-hue-track--vertical {
@@ -6746,7 +6786,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   background: var(--surface-hover, rgba(255, 255, 255, 0.04));
   /* @token-exempt: var() fallback for subtle-glass tint */
   border: 1px solid var(--glass-border);
@@ -6842,7 +6882,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .custom-color-modal-actions {
   display: flex;
   justify-content: flex-end;
-  gap: 8px;
+  gap: var(--space-2);
   margin-top: 0;
 }
 
@@ -6883,7 +6923,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .input-error-message {
   color: var(--error-text);
   font-size: var(--fs-3);
-  margin-top: 0.25rem;
+  margin-top: var(--space-1);
   display: block;
 }
 
@@ -6893,7 +6933,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .slider-header label,
@@ -6968,7 +7008,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 @media (max-width: 700px) {
   .speaker-highlight-layout {
     grid-template-columns: minmax(0, 1fr);
-    row-gap: 16px;
+    row-gap: var(--space-4);
   }
 
   .speaker-highlight-preview {
@@ -6987,7 +7027,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: grid;
   grid-template-columns:
     var(--speaker-label-width) var(--speaker-control-width) var(--speaker-value-width);
-  column-gap: 12px;
+  column-gap: var(--space-3);
   align-items: center;
   margin: 0;
 }
@@ -6996,7 +7036,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .appearance-control-content {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
   min-width: auto;
   overflow: visible;
 }
@@ -7180,7 +7220,7 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: var(--space-2);
   height: 32px;
   min-width: 92px;
   padding: 0 18px;
@@ -7251,8 +7291,8 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 .theme-source-row {
   display: flex;
   align-items: center;
-  gap: 12px;
-  margin-top: 12px;
+  gap: var(--space-3);
+  margin-top: var(--space-3);
 }
 
 .theme-source-controls {
@@ -7628,13 +7668,13 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
     width: auto;
     flex: 0 0 auto;
     white-space: nowrap;
-    padding: 8px 12px;
+    padding: var(--space-2) var(--space-3);
     border-radius: var(--radius-pill);
   }
 
 
   .settings-panel {
-    padding: 16px;
+    padding: var(--space-4);
   }
 
   .settings-section-title {
@@ -7694,7 +7734,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   background: var(--signal-popup-bg);
   border: 1px solid var(--signal-popup-border);
   border-radius: var(--radius-lg);
-  padding: 16px;
+  padding: var(--space-4);
   box-shadow: var(--signal-popup-shadow);
   color: var(--text-primary);
   font-family:
@@ -7736,7 +7776,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  margin-bottom: 12px;
+  margin-bottom: var(--space-3);
 }
 
 .signal-quality-popup .popup-title {
@@ -7750,7 +7790,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .signal-quality-popup .popup-header-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   flex-shrink: 0;
 }
 
@@ -7760,7 +7800,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
  * popup header pill picks up the token-driven (bi-theme) colors; the global
  * rules below cover every other surface (the diagnostics drawer). */
 .signal-quality-popup .connection-type {
-  padding: 2px 8px;
+  padding: 2px var(--space-2);
   border-radius: 4px;
   font-size: var(--fs-2);
   font-weight: 600;
@@ -7799,7 +7839,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
  * @token-exempt: preserves the existing fixed pill literals so the lift stays
  * style-neutral (tokenization is a separate, behavior-changing follow-up). */
 .connection-type {
-  padding: 2px 8px;
+  padding: 2px var(--space-2);
   border-radius: 4px;
   font-size: var(--fs-2);
 }
@@ -8008,8 +8048,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .signal-chart-legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
-  margin-top: 8px;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
   font-size: var(--fs-2);
   color: var(--text-secondary);
 }
@@ -8017,7 +8057,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .signal-chart-legend .legend-item {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
   cursor: pointer;
   user-select: none;
 }
@@ -8040,7 +8080,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .signal-chart-legend span {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
 }
 
 .signal-chart-legend .dot {
@@ -8086,7 +8126,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 
 .legend-help-text {
   margin-top: 6px;
-  padding: 8px 10px;
+  padding: var(--space-2) 10px;
   background: var(--glass-bg);
   border-radius: var(--radius-sm);
   font-size: 8pt;
@@ -8110,8 +8150,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
    Only the section wrapper + header are popup-specific layout. All color comes
    from the reused classes' `--perf-q-*` / `--text-*` tokens — no raw literals. */
 .signal-popup-layers {
-  margin-top: 8px;
-  padding-top: 8px;
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
   border-top: 1px solid var(--signal-popup-border);
 }
 .signal-popup-layers__head {
@@ -8120,7 +8160,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   letter-spacing: 0.02em;
   text-transform: uppercase;
   color: var(--text-secondary);
-  margin-bottom: 4px;
+  margin-bottom: var(--space-1);
 }
 .signal-popup-layers__list {
   list-style: none;
@@ -8139,8 +8179,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
    summary at the bottom of the signal-quality popup; mirrors the Layers
    section's header treatment and top border so it reads as a sibling block. */
 .signal-popup-device {
-  margin-top: 8px;
-  padding-top: 8px;
+  margin-top: var(--space-2);
+  padding-top: var(--space-2);
   border-top: 1px solid var(--signal-popup-border);
 }
 .signal-popup-device__head {
@@ -8150,7 +8190,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   letter-spacing: 0.02em;
   text-transform: uppercase;
   color: var(--text-secondary);
-  margin-bottom: 4px;
+  margin-bottom: var(--space-1);
 }
 .signal-popup-device__line {
   display: block;
@@ -8163,7 +8203,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   background: var(--tooltip-bg);
   border: 1px solid var(--tooltip-border);
   border-radius: 4px;
-  padding: 4px 7px;
+  padding: var(--space-1) 7px;
   font-size: 8px;
   line-height: 1.5;
   color: var(--tooltip-text);
@@ -8201,7 +8241,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   display: flex;
   align-items: center;
   border-bottom: 1px solid var(--color-border-emphasis);
-  padding: 12px 16px;
+  padding: var(--space-3) var(--space-4);
 }
 
 .search-modal-input {
@@ -8216,11 +8256,11 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .search-modal-results {
   max-height: 60vh;
   overflow-y: auto;
-  padding: 8px;
+  padding: var(--space-2);
 }
 
 .search-modal-state {
-  padding: 16px 0;
+  padding: var(--space-4) 0;
   text-align: center;
   color: var(--text-tertiary);
 }
@@ -8234,7 +8274,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   align-items: center;
   justify-content: space-between;
   padding: 10px 14px;
-  margin-bottom: 4px;
+  margin-bottom: var(--space-1);
   border-radius: var(--radius-md);
   text-decoration: none;
   color: inherit;
@@ -8276,7 +8316,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 }
 
 .search-modal-badge {
-  margin-left: 12px;
+  margin-left: var(--space-3);
   flex-shrink: 0;
   border-radius: var(--radius-pill);
   padding: 3px 10px;
@@ -8299,19 +8339,6 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .search-modal-badge-idle {
   background: var(--search-badge-idle-bg);
   color: var(--search-badge-idle-text);
-}
-
-/* ============================================================
-   Overflow Badge (+N more in meeting)
-   ============================================================ */
-
-.overflow-badge {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  font-size: var(--fs-10);
-  font-weight: 600;
-  color: var(--text-on-glass-soft);
 }
 
 /* ============================================================
@@ -8351,7 +8378,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   color: var(--text-tertiary);
   cursor: pointer;
   font-size: var(--fs-7);
-  padding: 0 4px;
+  padding: 0 var(--space-1);
 }
 
 .mock-peers-popover-body label {
@@ -8364,7 +8391,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .mock-peers-count-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
 }
 
 .mock-peers-count-row input[type="number"] {
@@ -8374,7 +8401,7 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   border: 1px solid var(--mock-input-border);
   border-radius: var(--radius-sm);
   color: var(--text-primary);
-  padding: 4px;
+  padding: var(--space-1);
   font-size: 0.9rem;
 }
 
@@ -8404,9 +8431,9 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   background: var(--glass-popover-bg);
   border: 1px solid var(--glass-popover-border);
   border-radius: var(--radius-lg);
-  padding: 12px;
+  padding: var(--space-3);
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   z-index: 9100;
   backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
   -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
@@ -8417,8 +8444,8 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 4px;
-  padding: 8px 12px;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-md);
   background: transparent;
   color: var(--text-secondary);
@@ -8524,7 +8551,7 @@ body:has(.density-popover) #invite-overlay.invite-glass-card {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 12px;
+  gap: var(--space-3);
 
   border-radius: var(--radius-pill);
   border: 1px solid rgba(255, 255, 255, 0.48);
@@ -8803,7 +8830,7 @@ html[data-theme="dark"] .settings-panel::after {
 html:not([data-theme]) .settings-nav,
 html[data-theme="dark"] .settings-nav,
 html[data-theme="light"] .settings-nav {
-  padding: 4px 56px 0 18px;
+  padding: var(--space-1) 56px 0 18px;
 }
 
 /* NAV BUTTONS */
@@ -8831,7 +8858,7 @@ html[data-theme="dark"] .settings-nav-button.active {
   border: none;
   height: 1px;
 
-  margin: 8px 0 0;
+  margin: var(--space-2) 0 0;
 
   background: rgba(255, 255, 255, 0.07); /* @token-exempt: theme variant */
 }
@@ -8989,7 +9016,7 @@ html[data-theme="light"] .settings-divider {
 .settings-section-title-with-icon .settings-nav-icon {
   width: 20px;
   height: 20px;
-  margin-right: 4px;
+  margin-right: var(--space-1);
   color: currentColor;
   flex-shrink: 0;
 }
@@ -9068,7 +9095,7 @@ html[data-theme="light"] .settings-divider {
   font-size: var(--fs-5);
   font-weight: 600;
   color: var(--text-primary);
-  margin-bottom: 4px;
+  margin-bottom: var(--space-1);
 }
 
 /* Two side-by-side columns (Send | Receive). Collapses to one column below the
@@ -9080,7 +9107,7 @@ html[data-theme="light"] .settings-divider {
 .perf-card-cols {
   display: grid;
   grid-template-columns: 1fr 1fr;
-  gap: 16px;
+  gap: var(--space-4);
 }
 
 @container (max-width: 560px) {
@@ -9094,7 +9121,7 @@ html[data-theme="light"] .settings-divider {
 .perf-side {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
   padding-left: 10px;
   border-left: 3px solid var(--border);
   min-width: 0;
@@ -9111,7 +9138,7 @@ html[data-theme="light"] .settings-divider {
 .perf-side__head {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   flex-wrap: wrap;
 }
 
@@ -9128,7 +9155,7 @@ html[data-theme="light"] .settings-divider {
 .perf-dir-arrow {
   flex: 0 0 auto;
   vertical-align: -2px;
-  margin-right: 4px;
+  margin-right: var(--space-1);
 }
 .perf-side--send .perf-dir-arrow {
   color: var(--success);
@@ -9219,7 +9246,7 @@ html[data-theme="light"] .settings-divider {
   display: flex;
   align-items: baseline;
   flex-wrap: wrap;
-  gap: 4px 10px;
+  gap: var(--space-1) 10px;
 }
 
 /* The always-visible per-card summary line (the §3 live copy). */
@@ -9236,7 +9263,7 @@ html[data-theme="light"] .settings-divider {
 .perf-rungs {
   display: flex;
   align-items: flex-end;
-  gap: 8px;
+  gap: var(--space-2);
   margin-top: 2px;
   min-height: 16px;
 }
@@ -9306,7 +9333,7 @@ details.perf-peers[open] .perf-peers__chev {
   }
 }
 .perf-peers__list {
-  margin: 4px 0 0;
+  margin: var(--space-1) 0 0;
   padding: 0;
   list-style: none;
   max-height: 168px;
@@ -9467,7 +9494,7 @@ details.perf-peers[open] .perf-peers__chev {
   max-width: calc(100vw - 16px);
   max-height: calc(100vh - 16px);
   overflow-y: auto;
-  padding: 12px 14px;
+  padding: var(--space-3) 14px;
   background: var(--surface-overlay);
   border: 1px solid var(--border-emphasis);
   border-radius: var(--radius-md);
@@ -9486,7 +9513,7 @@ details.perf-peers[open] .perf-peers__chev {
   font-weight: 600;
   letter-spacing: 0.02em;
   text-transform: uppercase;
-  padding: 2px 8px;
+  padding: 2px var(--space-2);
   border-radius: var(--radius-pill);
   color: var(--accent);
   background: var(--field-bg);
@@ -9507,7 +9534,7 @@ details.perf-peers[open] .perf-peers__chev {
   display: inline-flex;
   align-items: center;
   height: 22px;
-  padding: 0 8px;
+  padding: 0 var(--space-2);
   font-size: var(--fs-2);
   font-weight: 500;
   line-height: 1;
@@ -9753,13 +9780,13 @@ details.perf-peers[open] .perf-peers__chev {
    per-layer SEND ladder + per-peer RECEIVE breakdown relocated from the
    Performance panel's expandable footers). ── */
 .simulcast-effective {
-  margin: 0 0 8px;
+  margin: 0 0 var(--space-2);
   font-size: var(--fs-3);
   color: var(--text-tertiary);
 }
 
 .simulcast-note {
-  margin: 0 0 8px;
+  margin: 0 0 var(--space-2);
   font-size: var(--fs-2);
   font-style: italic;
   color: var(--text-quaternary);
@@ -9768,7 +9795,7 @@ details.perf-peers[open] .perf-peers__chev {
 .simulcast-send {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
   margin-bottom: 10px;
 }
 
@@ -9797,7 +9824,7 @@ details.perf-peers[open] .perf-peers__chev {
 }
 .simulcast-send-ladder {
   display: flex;
-  gap: 4px;
+  gap: var(--space-1);
   margin-top: 2px;
 }
 
@@ -9807,7 +9834,7 @@ details.perf-peers[open] .perf-peers__chev {
   gap: 1px;
   flex: 1 1 0;
   min-width: 44px;
-  padding: 4px 6px;
+  padding: var(--space-1) 6px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
   font-size: var(--fs-2);
@@ -9828,7 +9855,7 @@ details.perf-peers[open] .perf-peers__chev {
 .simulcast-rung-head {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
 }
 
 .simulcast-rung-id {
@@ -9893,7 +9920,7 @@ details.perf-peers[open] .perf-peers__chev {
 .simulcast-recv-peer-stats {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px 10px;
+  gap: var(--space-1) 10px;
   font-size: var(--fs-2);
   color: var(--text-secondary);
 }
@@ -9930,14 +9957,221 @@ details.perf-peers[open] .perf-peers__chev {
 .simulcast-recv-peer {
   font-size: var(--fs-2);
   color: var(--text-tertiary);
-  padding-left: 8px;
+  padding-left: var(--space-2);
 }
 
 .simulcast-recv-more {
   font-size: var(--fs-2);
   font-style: italic;
   color: var(--text-tertiary);
-  padding-left: 8px;
+  padding-left: var(--space-2);
+}
+
+/* === Action Bar Customization Mode === */
+
+/* --- Backdrop overlay --- */
+.customize-backdrop {
+  position: fixed;
+  inset: 0;
+  background: color-mix(in oklab, var(--bg) 40%, transparent);
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  z-index: 8999;
+  pointer-events: none;
+  opacity: 0;
+  animation: customize-backdrop-in 300ms ease forwards;
+}
+
+@keyframes customize-backdrop-in {
+  to { opacity: 1; }
+}
+
+/* --- Elevate the bar in customize mode --- */
+.video-controls-container.customize-mode {
+  z-index: 9100;
+  border-color: color-mix(in srgb, var(--accent) 30%, var(--border));
+  background: color-mix(in oklab, var(--surface) 92%, transparent);
+  box-shadow:
+    0 20px 40px -8px color-mix(in oklab, var(--bg) 70%, transparent),
+    0 0 0 1px color-mix(in srgb, var(--accent) 20%, transparent),
+    inset 0 1px 0 color-mix(in oklab, var(--text-primary) 8%, transparent);
+}
+
+.video-controls-container.customize-mode.dock-bottom {
+  transform: translateX(-50%) translateY(-4px);
+}
+
+.video-controls-container.customize-mode.dock-left {
+  transform: translateY(-50%) translateX(4px);
+}
+
+.video-controls-container.customize-mode.dock-right {
+  transform: translateY(-50%) translateX(-4px);
+}
+
+/* --- Slot wrappers --- */
+.action-bar-slot-wrapper {
+  position: relative;
+  display: inline-flex;
+  transition: transform 200ms cubic-bezier(0.2, 0.7, 0.3, 1), box-shadow 200ms ease;
+}
+
+/* During active drag, the nav must not clip the floating preview. */
+.video-controls-container.drag-active {
+  overflow: visible;
+}
+
+/* In customize mode, every slot is grabbable. The live-slots model moves
+   slots in the array during drag; the dragged slot becomes a placeholder
+   (is-drag-placeholder class hides content). No transforms are used. */
+.video-controls-container.customize-mode .action-bar-slot-wrapper {
+  box-shadow: 0 0 8px 2px color-mix(in srgb, var(--accent) 25%, transparent);
+  border-radius: 50%;
+  cursor: grab;
+  transition: box-shadow 200ms ease;
+}
+
+/* Ensure the dragged slot can extend beyond the bar (the cursor may roam
+   to a neighbor outside the slot box). The host-controls nav (`.host`)
+   and its `.controls` child both clip with `overflow: hidden`, so un-clip
+   the whole chain while in customize mode. */
+#host-controls-nav.host,
+#host-controls-nav.host .controls,
+#host-controls-nav.host .video-controls-container.customize-mode,
+#host-controls-nav.host .video-controls-container.customize-mode.drag-active {
+  overflow: visible !important;
+}
+
+#host-controls-nav .video-controls-container.customize-mode {
+  touch-action: none;
+  user-select: none;
+}
+
+/* --- Remove button (glass redesign) ---
+ * Box sized to 24x24px to meet the WCAG 2.5.8 minimum touch-target size; the
+ * "−" glyph stays visually small via `font-size`. Negative offsets bumped so
+ * the visible position relative to the slot corner stays roughly identical
+ * to the prior 18×18 button.
+ */
+.action-bar-remove-btn {
+  position: absolute;
+  top: -8px;
+  right: -8px;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: color-mix(in oklab, var(--text-primary) 8%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  border: 1px solid var(--glass-border);
+  /* Solid `var(--error)` (not a color-mix-to-transparent) so the glyph meets
+   * WCAG 1.4.11 (3:1) against the dark surface even at the 0.9 default
+   * opacity below. Hover bumps it to 1.0. */
+  color: var(--error);
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  z-index: 10;
+  padding: 0;
+  box-shadow: 0 2px 6px color-mix(in oklab, var(--bg) 20%, transparent);
+  opacity: 0.9;
+  transition: opacity 0.2s ease, background 0.2s ease, box-shadow 0.2s ease, transform 0.15s ease;
+}
+
+.action-bar-slot-wrapper:hover .action-bar-remove-btn {
+  opacity: 1;
+}
+
+.action-bar-remove-btn:hover {
+  background: color-mix(in oklab, var(--error) 15%, transparent);
+  border-color: color-mix(in oklab, var(--error) 40%, transparent);
+  color: var(--error);
+  box-shadow: 0 0 8px color-mix(in oklab, var(--error) 30%, transparent);
+  transform: scale(1.1);
+}
+
+/* --- Done button integrated into dock-position-wrapper --- */
+.customize-mode .dock-position-wrapper .action-bar-done-trigger {
+  background: color-mix(in srgb, var(--accent) 20%, var(--surface-overlay));
+  border: 1px solid color-mix(in srgb, var(--accent) 50%, transparent);
+  color: var(--accent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 25%, transparent);
+  transition: background 0.2s ease, box-shadow 0.2s ease;
+}
+
+.customize-mode .dock-position-wrapper .action-bar-done-trigger:hover {
+  background: color-mix(in srgb, var(--accent) 35%, var(--surface-overlay));
+  box-shadow: 0 0 14px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+
+/* In customize mode, the Leave Meeting (HangUp) button MUST be inert —
+   editing the layout is not a moment to terminate the call. The Rust
+   `onclick` already guards with `if customize_mode() { return; }`; this
+   CSS makes the dead-state visually obvious and prevents pointer events
+   from reaching the underlying button at all. The wrapper is fixed at
+   `order: 99` so it always sits at the end of the bar. */
+.video-controls-container.customize-mode .hangup-wrapper {
+  pointer-events: none;
+  opacity: 0.4;
+  filter: grayscale(0.6);
+}
+
+/* --- Drag placeholder: hides dragged slot content, keeps flex gap --- */
+.action-bar-slot-wrapper.is-drag-placeholder > * {
+  visibility: hidden;
+}
+
+/* --- Floating drag preview (position: absolute child of nav) --- */
+.action-bar-drag-preview {
+  position: absolute;
+  pointer-events: none;
+  z-index: 50;
+  will-change: transform;
+  filter: drop-shadow(0 8px 16px var(--overlay-backdrop));
+  transform-origin: center;
+  opacity: 0.95;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* --- Pointer-events backstop in customize mode ---
+   Inner control buttons must NOT fire their actions during customization.
+   Only drag (on the wrapper) and the remove button remain interactive. */
+.video-controls-container.customize-mode .action-bar-slot-wrapper > .video-control-button {
+  pointer-events: none;
+}
+
+/* Re-enable pointer-events on remove button so it stays clickable */
+.video-controls-container.customize-mode .action-bar-slot-wrapper > .action-bar-remove-btn {
+  pointer-events: auto;
+}
+
+/* --- Accessibility: reduced motion --- */
+@media (prefers-reduced-motion: reduce) {
+  .customize-backdrop {
+    animation: none;
+    opacity: 1;
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+  }
+
+  .video-controls-container.customize-mode .action-bar-slot-wrapper {
+    transition: none;
+  }
+}
+
+/* --- Accessibility: reduced transparency (drop the GPU-heavy blur entirely) --- */
+@media (prefers-reduced-transparency: reduce) {
+  .customize-backdrop {
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    background: var(--overlay-heavy);
+  }
 }
 
 /* Per-peer device / hardware block (issue 1482). Lives at the bottom of the
@@ -9946,7 +10180,7 @@ details.perf-peers[open] .perf-peers__chev {
 .diag-device {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-1);
   margin-top: 6px;
 }
 
@@ -9972,7 +10206,7 @@ details.diag-device {
   display: flex;
   flex-direction: column;
   gap: 2px;
-  padding-left: 8px;
+  padding-left: var(--space-2);
 }
 
 .diag-device-peer-label {
@@ -9984,10 +10218,10 @@ details.diag-device {
 .diag-device-row {
   display: flex;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-2);
   font-size: var(--fs-2);
   color: var(--text-tertiary);
-  padding-left: 8px;
+  padding-left: var(--space-2);
 }
 
 .diag-device-row-label {

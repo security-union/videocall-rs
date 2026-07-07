@@ -270,6 +270,9 @@ pub fn forget_room_metrics(room: &str) {
 
     // relay_viewport_set_size{room} — the #988 gauge previously swept inline.
     let _ = RELAY_VIEWPORT_SET_SIZE.remove_label_values(&[room]);
+    // relay_room_membership_divergence{room} (#1202): single-label `room` gauge,
+    // one tuple — GC'd on room drain like its viewport-set-size sibling.
+    let _ = RELAY_ROOM_MEMBERSHIP_DIVERGENCE.remove_label_values(&[room]);
 }
 
 /// Remove a single session's `relay_session_drops_total` series across the FULL
@@ -1247,6 +1250,23 @@ lazy_static! {
         &["room"]
     )
     .expect("Failed to create relay_viewport_set_size metric");
+
+    /// Cross-instance membership divergence per room (issue #1202).
+    ///
+    /// The relay runs as two binaries (ws + wt), each a separate ChatServer actor
+    /// holding only its LOCAL slice of `room_members`. This gauge SETs, per room,
+    /// the count of mirrored `origin: Remote` rows currently held — sessions
+    /// observed on the OTHER relay binary's PARTICIPANT_JOINED broadcasts. A value
+    /// > 0 means the room is split across the ws/wt binaries (the exact condition
+    /// that caused the #1202 layer-hint base-pin); 0 means every member of the
+    /// room is local to this binary. Set by the periodic layer-preference sweep
+    /// and removed on room drain (`forget_room_metrics`).
+    pub static ref RELAY_ROOM_MEMBERSHIP_DIVERGENCE: GaugeVec = register_gauge_vec!(
+        "relay_room_membership_divergence",
+        "Count of remote-origin room_members rows mirrored from other relay instances, per room (#1202); >0 means this room is split across the ws/wt relay binaries",
+        &["room"]
+    )
+    .expect("Failed to create relay_room_membership_divergence metric");
 
     /// VIEWPORT control-packet update outcomes, per room (HCL #988).
     ///

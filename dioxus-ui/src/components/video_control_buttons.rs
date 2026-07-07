@@ -46,7 +46,10 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                     path { d: "M19 10v2a7 7 0 0 1-14 0v-2" }
                     line { x1: "12", y1: "19", x2: "12", y2: "22" }
                 }
-                span { class: "tooltip", "Mute" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Microphone — Mute" }
+                    span { class: "tooltip-desc", "Turn off your microphone so others can't hear you." }
+                }
             } else if available {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -61,7 +64,10 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                     line { x1: "12", y1: "19", x2: "12", y2: "22" }
                     line { x1: "3", y1: "3", x2: "21", y2: "21" }
                 }
-                span { class: "tooltip", "Unmute" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Microphone — Unmute" }
+                    span { class: "tooltip-desc", "Turn your microphone back on so others can hear you." }
+                }
             } else {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -76,7 +82,10 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                     path { d: "M17 16.95A7 7 0 0 1 5 12v-2m14 0v2a7 7 0 0 1-.11 1.23" }
                     line { x1: "12", y1: "19", x2: "12", y2: "22" }
                 }
-                span { class: "tooltip", "Unmute" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Microphone — Unmute" }
+                    span { class: "tooltip-desc", "No microphone detected. Connect or grant access to a mic, then try again." }
+                }
                 span { class: "device-warning", "!" }
             }
         }
@@ -118,7 +127,10 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                     polygon { points: "23 7 16 12 23 17 23 7" }
                     rect { x: "1", y: "5", width: "15", height: "14", rx: "2", ry: "2" }
                 }
-                span { class: "tooltip", "Stop Video" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Camera — Stop Video" }
+                    span { class: "tooltip-desc", "Turn off your camera so others can't see you." }
+                }
             } else if available {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -132,7 +144,10 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                     rect { x: "1", y: "5", width: "15", height: "14", rx: "2", ry: "2" }
                     line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
-                span { class: "tooltip", "Start Video" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Camera — Start Video" }
+                    span { class: "tooltip-desc", "Turn on your camera so others can see you." }
+                }
             } else {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -145,7 +160,10 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                     path { d: "M16 16v1a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V7a2 2 0 0 1 2-2h2m5.66 0H14a2 2 0 0 1 2 2v3.34l1 1L23 7v10" }
                     line { x1: "1", y1: "1", x2: "23", y2: "23" }
                 }
-                span { class: "tooltip", "Start Video" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Camera — Start Video" }
+                    span { class: "tooltip-desc", "No camera detected. Connect or grant access to a camera, then try again." }
+                }
                 span { class: "device-warning", "!" }
             }
         }
@@ -191,9 +209,15 @@ pub fn ScreenShareButton(
                 line { x1: "12", y1: "17", x2: "12", y2: "21" }
             }
             if active {
-                span { class: "tooltip", "Stop Screen Share" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Screen share — Stop Screen Share" }
+                    span { class: "tooltip-desc", "Stop sharing your screen with everyone in the call." }
+                }
             } else {
-                span { class: "tooltip", "Share Screen" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Screen share — Share Screen" }
+                    span { class: "tooltip-desc", "Show a window or your entire screen to everyone in the call." }
+                }
             }
         }
     }
@@ -227,7 +251,10 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
                     path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
                     path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
                 }
-                span { class: "tooltip", "Close Peers" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Participants — Close Peers" }
+                    span { class: "tooltip-desc", "Hide the participant list." }
+                }
             } else {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -242,7 +269,10 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
                     path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
                     path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
                 }
-                span { class: "tooltip", "Open Peers" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Participants — Open Peers" }
+                    span { class: "tooltip-desc", "See who's in the call and per-peer host controls." }
+                }
             }
         }
     }
@@ -273,7 +303,10 @@ pub fn DiagnosticsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Eleme
                     stroke_linejoin: "round",
                     path { d: "M2 12h2l3.5-7L12 19l2.5-5H20" }
                 }
-                span { class: "tooltip", "Close Diagnostics" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Diagnostics — Close Diagnostics" }
+                    span { class: "tooltip-desc", "Hide the live connection-quality and stats panel." }
+                }
             } else {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -285,7 +318,10 @@ pub fn DiagnosticsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Eleme
                     stroke_linejoin: "round",
                     path { d: "M2 12h2l3.5-7L12 19l2.5-5H20" }
                 }
-                span { class: "tooltip", "Open Diagnostics" }
+                span { class: "tooltip",
+                    span { class: "tooltip-title", "Diagnostics — Open Diagnostics" }
+                    span { class: "tooltip-desc", "View live connection quality, bitrate, packet loss, and codec stats." }
+                }
             }
         }
     }
@@ -303,10 +339,20 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
         "video-control-button"
     };
 
-    let tooltip = if open {
-        "Close Settings"
+    // Descriptive role prefix ("Device settings — …") names what the button
+    // controls; the action verb after the em-dash names what clicking does.
+    // Note: this does NOT preserve substring compatibility for callers that
+    // matched the old plain title "Settings" — verify each call site (e2e
+    // selectors, screen readers, analytics) before assuming so. The
+    // production e2e selector for this button is `data-testid="open-settings"`
+    // below, which is stable across tooltip text changes.
+    let (tooltip_title, tooltip_desc) = if open {
+        ("Device settings — Close", "Hide the device settings panel.")
     } else {
-        "Device Settings"
+        (
+            "Device settings",
+            "Switch your microphone, camera, or speaker, and tune audio/video options.",
+        )
     };
 
     rsx! {
@@ -327,7 +373,10 @@ pub fn DeviceSettingsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
                 path { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" }
             }
 
-            span { class: "tooltip", "{tooltip}" }
+            span { class: "tooltip",
+                span { class: "tooltip-title", "{tooltip_title}" }
+                span { class: "tooltip-desc", "{tooltip_desc}" }
+            }
         }
     }
 }
@@ -347,10 +396,21 @@ pub fn MeetingOptionsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
         "video-control-button"
     };
 
-    let tooltip = if open {
-        "Close Meeting Options"
+    // Descriptive role prefix ("Meeting options — …") names what the button
+    // controls; the action verb after the em-dash names what clicking does.
+    // Note: this does NOT preserve substring compatibility for callers that
+    // matched the old plain title "Meeting Options" — verify each call site
+    // (e2e selectors, screen readers, analytics) before assuming so. The
+    // production e2e selector for this button is
+    // `data-testid="open-meeting-options"` below, which is stable across
+    // tooltip text changes.
+    let (tooltip_title, tooltip_desc) = if open {
+        ("Meeting options — Close", "Hide the meeting options panel.")
     } else {
-        "Meeting Options"
+        (
+            "Meeting options",
+            "Toggle the waiting room, choose who can admit guests, and control end-on-host-leave.",
+        )
     };
 
     rsx! {
@@ -372,7 +432,10 @@ pub fn MeetingOptionsButton(open: bool, onclick: EventHandler<MouseEvent>) -> El
                 path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
             }
 
-            span { class: "tooltip", "{tooltip}" }
+            span { class: "tooltip",
+                span { class: "tooltip-title", "{tooltip_title}" }
+                span { class: "tooltip-desc", "{tooltip_desc}" }
+            }
         }
     }
 }
@@ -404,7 +467,10 @@ pub fn MockPeersButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element
                 line { x1: "19", y1: "8", x2: "19", y2: "14" }
                 line { x1: "22", y1: "11", x2: "16", y2: "11" }
             }
-            span { class: "tooltip", "Mock Peers" }
+            span { class: "tooltip",
+                span { class: "tooltip-title", "Mock peers" }
+                span { class: "tooltip-desc", "Add synthetic test participants to preview grid layouts without a second browser." }
+            }
         }
     }
 }
@@ -437,7 +503,10 @@ pub fn DensityModeButton(label: String, open: bool, onclick: EventHandler<MouseE
                 rect { x: "3", y: "13", width: "8", height: "8", rx: "1" }
                 rect { x: "13", y: "13", width: "8", height: "8", rx: "1" }
             }
-            span { class: "tooltip", "Layout: {label}" }
+            span { class: "tooltip",
+                span { class: "tooltip-title", "Layout density: {label}" }
+                span { class: "tooltip-desc", "Switch how tightly participant tiles are packed on screen." }
+            }
         }
     }
 }
@@ -452,7 +521,10 @@ pub fn HangUpButton(onclick: EventHandler<MouseEvent>) -> Element {
         button {
             class: "video-control-button danger",
             onclick: move |evt| onclick.call(evt),
-            span { class: "tooltip", "Hang Up" }
+            span { class: "tooltip",
+                span { class: "tooltip-title", "Hang up" }
+                span { class: "tooltip-desc", "Leave the call. Other participants stay connected." }
+            }
             svg {
                 xmlns: "http://www.w3.org/2000/svg",
                 width: "24",

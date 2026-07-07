@@ -7,7 +7,8 @@ pub fn CrownIcon() -> Element {
     rsx! {
         span {
             class: "host-indicator",
-            style: "color: #888; font-size: 0.85em; margin-left: 4px;",
+            // @token-exempt: subtle host indicator, #888 has no matching token
+            style: "color: #888; font-size: 0.85em; margin-left: var(--space-1);",
             "(Host)"
         }
     }

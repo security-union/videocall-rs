@@ -659,6 +659,63 @@ test.describe("Speaker highlight glow on video tiles", () => {
   });
 
   // ──────────────────────────────────────────────────────────────────────
+  // 6b. Peer-list mic icon — muted peer must NOT show speaking glow
+  //
+  // Regression: the speaking flag and muted flag are independent signals.
+  // Before the fix, a muted peer whose VAD hadn't cleared would show the
+  // mic icon with the "speaking" CSS class (green glow) in the peer list,
+  // contradicting the muted state.
+  // ──────────────────────────────────────────────────────────────────────
+  test("peer-list mic icon does not show speaking class when peer is muted", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(150_000);
+    const uiURL = baseURL || "http://localhost:80";
+    const meetingId = `e2e_mutemic_${Date.now()}`;
+
+    const { hostPage, guestPage, browser1, browser2 } = await setupTwoUserMeeting(
+      uiURL,
+      meetingId,
+      "MuteMicHost",
+      "MuteMicGuest",
+      {
+        guestFakeAudioFile: SPEAKING_AUDIO_FIXTURE,
+      },
+    );
+
+    try {
+      await ensureMicrophoneEnabled(guestPage);
+
+      // Wait for the guest to be detected as speaking on the host side
+      await waitForTileToSpeak(hostPage);
+
+      // Open the peer list
+      await hostPage.locator(".video-controls-container").hover();
+      const peerBtn = hostPage.locator(".video-controls-container button", {
+        has: hostPage.locator('.tooltip:has-text("Open Peers")'),
+      });
+      await peerBtn.first().click();
+      await expect(hostPage.locator("#peer-list-container")).toHaveClass(/visible/, {
+        timeout: 5_000,
+      });
+
+      // The guest's peer_item_mic should have "speaking" class while unmuted
+      const guestMicIcon = hostPage.locator(".peer_item_mic").last();
+      await expect(guestMicIcon).toBeVisible({ timeout: 5_000 });
+      await expect(guestMicIcon).toHaveClass(/speaking/, { timeout: 15_000 });
+
+      // Now mute the guest
+      await muteMicrophone(guestPage);
+
+      // The mic icon must lose the "speaking" class once muted
+      await expect(guestMicIcon).not.toHaveClass(/speaking/, { timeout: 15_000 });
+    } finally {
+      await browser1.close();
+      await browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────
   // 7. Host controls nav structural pattern — class + inline style
   //
   // Verifies #host-controls-nav carries both a CSS class and an inline

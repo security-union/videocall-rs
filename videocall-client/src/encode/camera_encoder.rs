@@ -615,6 +615,23 @@ pub struct CameraEncoder {
     /// mid-call (it is NOT latched at cold start). In simulcast mode
     /// (`effective_layers > 1`) this stays `false` and the gate is a no-op.
     single_layer_low_pin: Rc<AtomicBool>,
+    /// Per-encoder "currently holds a global uplink-saturation threshold raise"
+    /// flag (issue #1670). `true` when THIS encoder's AQ loop has raised the
+    /// process-global threshold above the floor for a dual-stream (screen-share)
+    /// session and has not yet released it.
+    ///
+    /// The AQ loop sets it `true` on the screen-RAISE edge (and calls
+    /// [`note_threshold_raised`](videocall_transport::webtransport::note_threshold_raised)),
+    /// and `false` on the screen-STOP edge (and calls
+    /// [`note_threshold_raise_released`](videocall_transport::webtransport::note_threshold_raise_released)).
+    /// The encoder's `Drop` decrements the global owner count IFF this flag is
+    /// still `true` — i.e. the loop was torn down (Host unmount) while raised, so
+    /// the STOP edge never ran. A single shared atomic consulted by BOTH the loop
+    /// edges and `Drop` (via `swap`) is the single source of truth, so they can
+    /// never both decrement the global count for one raise (no leaked/negative
+    /// count). `Rc` (single-threaded wasm); the loop holds a clone and the
+    /// encoder owns the strong ref + the `Drop`.
+    screen_threshold_raised: Rc<AtomicBool>,
     /// "Loop already running" canary (issue #1295). Mirrors the mic encoder's
     /// `codecs[0].is_instantiated()` canary, which the camera lacks. Set
     /// synchronously in `start()` right before `spawn_local`; cleared by the
@@ -1056,6 +1073,73 @@ fn wt_saturation_step_down_decision(
     )
 }
 
+/// Compute the camera's `video_at_floor` flag value for one AQ tick.
+///
+/// On the camera-ENABLE rising edge (`!prev_enabled && now_enabled`) this force-
+/// clears to `false`: the mic encoder's audio-after-video backstop gate samples
+/// `video_at_floor_flag` on the SAME 1 Hz detector tick (wired via
+/// `microphone.set_camera_video_exhausted_signal(camera.video_at_floor_flag())`),
+/// and `EncoderBitrateController::video_at_floor()` does NOT read the camera
+/// `enabled` flag — so a camera that was disabled while at the floor would leave
+/// a STALE `true` that opens the audio backstop prematurely on the first tick
+/// after re-enable. Clearing on the rising edge closes that leak; the live
+/// detector re-asserts on the next tick if video is genuinely still at floor.
+/// Otherwise (steady enabled, steady disabled, or the falling edge) the detector
+/// value passes through unchanged. This is the SINGLE source of truth for the
+/// per-tick flag value — the AQ loop has exactly one writer of
+/// `video_at_floor_flag`, and it stores this fn's result.
+#[inline]
+fn video_at_floor_on_tick(prev_enabled: bool, now_enabled: bool, detector_at_floor: bool) -> bool {
+    if !prev_enabled && now_enabled {
+        // Rising edge: force-clear so a stale at-floor reading from the disabled
+        // period cannot open the mic backstop on the same tick the camera returns.
+        false
+    } else {
+        detector_at_floor
+    }
+}
+
+/// Compute the delta to apply to the global raised-threshold owner count when a
+/// single encoder's per-encoder "currently raised" flag transitions. Rising
+/// (`!was_raised && now_raised`) registers one owner (+1); falling (`was_raised
+/// && !now_raised`) releases one (-1); no transition is a no-op (0). Tying the
+/// global count to per-encoder TRANSITIONS (not raw edges) makes double-counting
+/// impossible: an encoder that raised, stopped, then dropped has already returned
+/// to `was_raised == false`, so Drop applies no further delta (#1670 wedge-free).
+#[inline]
+fn apply_raise_transition(was_raised: bool, now_raised: bool) -> i32 {
+    match (was_raised, now_raised) {
+        (false, true) => 1,
+        (true, false) => -1,
+        _ => 0,
+    }
+}
+
+/// Synchronously clear `video_at_floor_flag` on the camera ENABLE rising edge
+/// (issue #1678, pre-submit follow-up). Stores `false` IFF this `set_enabled`
+/// call actually flipped the flag (`changed`) to enabled (`now_enabled`) — i.e.
+/// a real disabled -> enabled transition.
+///
+/// This is the SYNCHRONOUS counterpart to the in-loop rising-edge clear in
+/// [`video_at_floor_on_tick`]: the mic backstop detector runs on its own ~1 Hz
+/// loop and can sample `video_at_floor_flag` in the window between the Host
+/// flipping `enabled` true and the camera AQ loop's next tick. Clearing here, at
+/// the same synchronous point the `enabled` atom flips, closes that cross-loop
+/// window so a stale `true` from a prior distress episode cannot open the audio
+/// backstop on the re-enable. Extracted as a free fn taking the flag directly so
+/// the store can be unit-tested on the native host (the full `CameraEncoder` is
+/// wasm-bound).
+#[inline]
+fn clear_video_at_floor_on_enable_edge(
+    video_at_floor_flag: &Arc<AtomicBool>,
+    changed: bool,
+    now_enabled: bool,
+) {
+    if changed && now_enabled {
+        video_at_floor_flag.store(false, Ordering::Release);
+    }
+}
+
 impl CameraEncoder {
     /// Construct a camera encoder, with arguments:
     ///
@@ -1087,7 +1171,18 @@ impl CameraEncoder {
         // leaking a raised threshold from a prior CameraEncoder that was dropped
         // while screen-sharing (issue #1618 suggested fix). Ensures a clean
         // single-stream baseline for every new encoder instance.
-        videocall_transport::webtransport::reset_ready_stall_threshold();
+        //
+        // GUARDED variant (issue #1670): the reset is SKIPPED when a live encoder
+        // still holds a raise. A `Host` re-mount constructs a fresh CameraEncoder
+        // while the PRIOR encoder's AQ loop may still be running (its liveness
+        // token has not dropped yet) and still holding a raised threshold from an
+        // active screen share; an UNCONDITIONAL reset here would clobber that live
+        // raise back to the floor and make the still-running dual-stream loop
+        // shed video on spurious saturation. The screen-STOP edge and the
+        // encoder's `Drop` reset/release UNCONDITIONALLY (force floor), so a
+        // genuinely dropped-while-raised prior encoder still yields a clean floor
+        // for the next fresh single-stream construct — #1667's leak stays fixed.
+        videocall_transport::webtransport::reset_ready_stall_threshold_on_construction();
 
         let default_tier = &VIDEO_QUALITY_TIERS[0];
         let default_audio_tier = &AUDIO_QUALITY_TIERS[0];
@@ -1165,6 +1260,10 @@ impl CameraEncoder {
             // control loop sets it once it observes single-stream mode + >3
             // peers. No effect in simulcast mode.
             single_layer_low_pin: Rc::new(AtomicBool::new(false)),
+            // Issue #1670: a fresh encoder holds no global threshold raise. The AQ
+            // loop sets this on the screen-RAISE edge and clears it on STOP; Drop
+            // releases it if still set on teardown.
+            screen_threshold_raised: Rc::new(AtomicBool::new(false)),
             loop_running: Arc::new(AtomicBool::new(false)),
             loop_device_id: Rc::new(RefCell::new(None)),
             loop_epoch: Arc::new(AtomicU64::new(0)),
@@ -1257,6 +1356,11 @@ impl CameraEncoder {
         // mid-tick — the `None` arm is a correctness fail-safe, not a hot path.
         let peer_count_client = self.client.clone();
         let single_layer_low_pin = self.single_layer_low_pin.clone();
+        // Issue #1670: per-encoder "currently holds a global threshold raise"
+        // flag, shared with `Drop`. The loop flips it on the screen RAISE/STOP
+        // edges (and adjusts the global owner count); `Drop` consults it to
+        // self-heal the count if the loop is torn down while still raised.
+        let screen_threshold_raised = self.screen_threshold_raised.clone();
         wasm_bindgen_futures::spawn_local(async move {
             let mut encoder_control = EncoderBitrateController::new(
                 current_bitrate.load(Ordering::Relaxed),
@@ -1293,6 +1397,14 @@ impl CameraEncoder {
                 }
             }
             let mut prev_screen_active = false;
+            // Issue #1678: track the previous camera-enabled state so the AQ loop
+            // can detect the camera-ENABLE rising edge itself and force-clear the
+            // `video_at_floor_flag` for that tick (see `video_at_floor_on_tick`).
+            // Seed from the LIVE value (mirroring the screen loop's `was_sharing`
+            // seed) so a loop that begins life with the camera already enabled
+            // does NOT treat its first tick as a spurious rising edge. Acquire to
+            // match the screen-side load ordering.
+            let mut was_enabled = enabled.load(Ordering::Acquire);
             let mut last_ws_drop_snapshot: u64 =
                 videocall_transport::websocket::websocket_drop_count();
             let mut ws_drop_window_start_ms: f64 = js_sys::Date::now();
@@ -1409,12 +1521,44 @@ impl CameraEncoder {
                             threshold,
                             screen_ifi_ms,
                         );
-                    } else {
-                        // Reset to floor (250ms) — single-stream camera only.
-                        videocall_transport::webtransport::reset_ready_stall_threshold();
-                        log::info!(
-                            "CameraEncoder: WT stall threshold reset to floor (single-stream)",
-                        );
+                    }
+                    // NOTE: the STOP edge does NOT floor the threshold here. Flooring
+                    // is the responsibility of the owner-count release below, which
+                    // floors ONLY when it releases the LAST owner (1 -> 0). An
+                    // unconditional floor on this STOP edge would be WRONG when two
+                    // encoders overlap during a Host remount while screen-sharing:
+                    // each owns its own `screen_sharing_active` flag, so one encoder
+                    // can see its flag fall to false (this STOP edge) while a SECOND
+                    // encoder still holds a raise (owner count 2 -> 1). An
+                    // unconditional floor would clobber the surviving dual-stream
+                    // encoder back to 250 ms and reintroduce spurious WT saturation
+                    // sheds (caught by Codex in pre-submit). Routing the floor through
+                    // the last-owner release is the single correct chokepoint.
+
+                    // Issue #1670: keep the GLOBAL raised-threshold owner count in
+                    // sync with THIS encoder's raise state so a remount's fresh
+                    // construct does not clobber a still-active raise (and so a
+                    // drop-while-raised self-heals via `Drop`). For threshold
+                    // purposes a raise is held iff screen share is active, so
+                    // `now_raised == screen_active`. We drive the GLOBAL count off
+                    // per-encoder TRANSITIONS (via `apply_raise_transition`) rather
+                    // than raw edges so it can never be double-counted: rising
+                    // registers one owner (+1), falling releases one (-1). The
+                    // release floors the threshold iff it released the LAST owner, so
+                    // the STOP edge floors only when no sibling encoder still holds a
+                    // raise. The per-encoder flag is the single source of truth shared
+                    // with `Drop`, so the STOP edge here and a teardown `Drop` cannot
+                    // both release the same raise.
+                    let was_raised = screen_threshold_raised.load(Ordering::Acquire);
+                    let now_raised = screen_active;
+                    let delta = apply_raise_transition(was_raised, now_raised);
+                    if delta != 0 {
+                        screen_threshold_raised.store(now_raised, Ordering::Release);
+                        if delta > 0 {
+                            videocall_transport::webtransport::note_threshold_raised();
+                        } else {
+                            videocall_transport::webtransport::note_threshold_raise_released();
+                        }
                     }
 
                     log::info!(
@@ -1612,11 +1756,22 @@ impl CameraEncoder {
                 encoder_control.tick(now);
                 let output_wasted = Some(encoder_control.last_target_bitrate_kbps());
 
-                // Issue #1611: unconditionally store whether camera video is
-                // exhausted (tier at user-capped floor AND active layers at 1).
-                // The mic encoder's backstop gate reads this to open even with
-                // the camera on when video can't shed further.
-                video_at_floor_flag.store(encoder_control.video_at_floor(), Ordering::Release);
+                // Issue #1611 / #1678: store whether camera video is exhausted (tier at
+                // user-capped floor AND active layers at 1) for the mic encoder's
+                // audio-after-video backstop gate, which reads this on the same 1 Hz tick.
+                // The per-tick value flows through `video_at_floor_on_tick` — the SINGLE
+                // writer of `video_at_floor_flag` in this loop — which passes the detector
+                // value through in steady state but force-clears on the camera-ENABLE rising
+                // edge so a stale `true` from a disabled-while-at-floor period cannot open the
+                // backstop prematurely (#1678, mirroring the screen rising-edge clear).
+                let now_enabled = enabled.load(Ordering::Acquire);
+                let at_floor = video_at_floor_on_tick(
+                    was_enabled,
+                    now_enabled,
+                    encoder_control.video_at_floor(),
+                );
+                was_enabled = now_enabled;
+                video_at_floor_flag.store(at_floor, Ordering::Release);
 
                 // Write encoder decision inputs to shared atomics for health
                 // reporting. Issue #1184: the dead receiver-FPS-derived ratios
@@ -2134,7 +2289,27 @@ impl CameraEncoder {
     ///
     /// Disabling encoding after it has started will cause it to stop.
     pub fn set_enabled(&mut self, value: bool) -> bool {
-        self.state.set_enabled(value)
+        let changed = self.state.set_enabled(value);
+        // Issue #1678: on the camera disable -> re-enable RISING edge, clear the
+        // `video_at_floor_flag` SYNCHRONOUSLY here — not only on the next camera
+        // AQ tick (~1 Hz later). The mic backstop detector runs on its OWN
+        // independent loop and reads (`camera_active`, `camera_video_exhausted`)
+        // = (this same `EncoderState::enabled` atom, `video_at_floor_flag`). The
+        // Host flips `enabled` true here; if the mic detector's interval fires in
+        // the window before the camera AQ tick re-evaluates, it would observe a
+        // STALE `true` from a prior distress episode together with the now-true
+        // `camera_active` and open the audio backstop on the very re-enable tick
+        // this fix targets (caught in pre-submit). Clearing on the rising edge
+        // closes that cross-loop window; the live detector re-asserts on the next
+        // camera AQ tick if video is genuinely still at floor. (`video_at_floor_on_tick`
+        // applies the same rising-edge clear in-loop for re-enables that route
+        // through this method. The one path that bypasses BOTH — `start()`'s raw
+        // `state.set_enabled(true)` during a device switch, where the loop also
+        // seeds `was_enabled = true` and sees no in-loop edge — is benign: a
+        // device switch happens while the camera is RUNNING, so the flag carries
+        // a LIVE at-floor reading, not the stale-from-disabled value this guards.)
+        clear_video_at_floor_on_enable_edge(&self.video_at_floor_flag, changed, value);
+        changed
     }
 
     /// Selects a camera:
@@ -3802,21 +3977,42 @@ impl CameraEncoder {
     }
 }
 
+impl Drop for CameraEncoder {
+    fn drop(&mut self) {
+        // Issue #1670: if this encoder's AQ loop was torn down (Host unmount)
+        // while it still held a raised uplink-saturation threshold — i.e. the
+        // screen-STOP edge never ran to release it — release the global owner
+        // count here so a dropped-while-raised loop self-heals and cannot pin
+        // the threshold raised forever (the #1667 bug in reverse). The
+        // per-encoder flag is the single source of truth shared with the loop:
+        // if the loop already released on a STOP edge, the flag is false and
+        // this is a no-op (no double-decrement). `note_threshold_raise_released`
+        // ALSO floors the threshold when this is the LAST live owner (count
+        // 1 -> 0), so a drop-while-raised with no surviving raiser leaves the
+        // threshold at the floor — not merely the count at 0. (A surviving
+        // replacement that constructed while count > 0 skipped its own guarded
+        // reset, so the floor must come from here, not a later constructor.)
+        if self.screen_threshold_raised.swap(false, Ordering::AcqRel) {
+            videocall_transport::webtransport::note_threshold_raise_released();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::RestartReason;
     use super::{
-        build_simulcast_layers, camera_encoder_restarts_closed_codec,
+        apply_raise_transition, build_simulcast_layers, camera_encoder_restarts_closed_codec,
         camera_encoder_restarts_configure, camera_encoder_restarts_memory,
-        camera_encoder_restarts_other, clamp_layer_count, encoders_to_build,
-        format_layer_transition, frame_is_healthy, initial_active_layer_count,
+        camera_encoder_restarts_other, clamp_layer_count, clear_video_at_floor_on_enable_edge,
+        encoders_to_build, format_layer_transition, frame_is_healthy, initial_active_layer_count,
         is_fatal_encoder_error_message, keyframe_tick_decision, layer_ceiling_to_count,
         loop_is_superseded, next_single_layer_pin, periodic_keyframe_due, record_camera_restart,
         shed_reason, should_pin_single_layer_low, should_teardown_shed_layer,
-        wt_drop_step_down_decision, wt_saturation_step_down_decision, KeyframeTickInput, LayerView,
-        SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS,
-        SIMULCAST_MAX_SUPPORTED_LAYERS, SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD,
-        SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
+        video_at_floor_on_tick, wt_drop_step_down_decision, wt_saturation_step_down_decision,
+        KeyframeTickInput, LayerView, SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS,
+        SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use crate::adaptive_quality_constants::{
         WS_SELF_CONGESTION_DROP_THRESHOLD, WS_SELF_CONGESTION_WINDOW_MS,
@@ -4813,6 +5009,124 @@ mod tests {
         assert!(
             first_frame,
             "frame 0 must fire via the frame-count modulo (0 % 150 == 0)"
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #1678: the camera's per-tick `video_at_floor` flag must force-clear
+    // on the camera-ENABLE rising edge so a STALE `true` left from a
+    // disabled-while-at-floor period cannot open the mic audio-after-video
+    // backstop on the SAME 1 Hz tick the camera returns. `video_at_floor_on_tick`
+    // is the SINGLE source of truth for the stored value (the loop has exactly
+    // one writer). All other transitions pass the live detector value through.
+    // ─────────────────────────────────────────────────────────────────────
+    #[test]
+    fn video_at_floor_on_tick_clears_on_camera_enable_rising_edge() {
+        // RISING edge (disabled -> enabled): force-clear even if the detector
+        // still reads at-floor. THE FIX — without it a stale `true` from the
+        // disabled period would open the mic backstop on the re-enable tick.
+        assert!(
+            !video_at_floor_on_tick(false, true, true),
+            "camera-enable rising edge must force-clear video_at_floor (#1678)",
+        );
+        // Steady ENABLED: detector value passes through (true stays true).
+        assert!(
+            video_at_floor_on_tick(true, true, true),
+            "steady enabled must pass the detector's at-floor through",
+        );
+        // Steady ENABLED: detector value passes through (false stays false).
+        assert!(
+            !video_at_floor_on_tick(true, true, false),
+            "steady enabled must pass the detector's not-at-floor through",
+        );
+        // Steady DISABLED (not an edge): pass through — the disabled state is not
+        // a rising edge and the detector value flows unchanged.
+        assert!(
+            video_at_floor_on_tick(false, false, true),
+            "steady disabled is not a rising edge — detector value passes through",
+        );
+        // FALLING edge (enabled -> disabled): pass through. Only the RISING edge
+        // clears; a falling edge does not (the detector continues to drive).
+        assert!(
+            video_at_floor_on_tick(true, false, true),
+            "falling edge must NOT clear — only the rising edge force-clears",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #1678 (pre-submit follow-up): the SYNCHRONOUS clear on `set_enabled`.
+    // `video_at_floor_on_tick` only clears on the next ~1 Hz camera AQ tick; the
+    // mic backstop detector runs on its OWN loop and can read the flag in the
+    // window before that tick. `clear_video_at_floor_on_enable_edge` performs the
+    // store at the same synchronous point the `enabled` atom flips. This test
+    // exercises the actual atomic store (not just a predicate): mutating the fn
+    // to drop the `store(false)` (or to fire on the wrong edge) turns it red.
+    // ─────────────────────────────────────────────────────────────────────
+    #[test]
+    fn clear_video_at_floor_on_enable_edge_clears_only_on_real_rising_edge() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        // Pre-seed the flag `true` (a prior at-floor distress episode while the
+        // camera was disabled).
+        let flag = Arc::new(AtomicBool::new(true));
+
+        // Disable -> enable rising edge (changed=true, now_enabled=true): MUST
+        // clear synchronously. THE FIX — without the store the mic detector could
+        // read the stale `true` before the next camera AQ tick.
+        clear_video_at_floor_on_enable_edge(&flag, true, true);
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "real enable rising edge must clear video_at_floor synchronously (#1678)",
+        );
+
+        // A no-op set_enabled(true) (already enabled, changed=false): must NOT
+        // touch the flag — only a genuine transition clears.
+        flag.store(true, Ordering::Release);
+        clear_video_at_floor_on_enable_edge(&flag, false, true);
+        assert!(
+            flag.load(Ordering::Acquire),
+            "no-op set_enabled(true) (changed=false) must NOT clear the flag",
+        );
+
+        // A disable (now_enabled=false): must NOT clear — the falling edge leaves
+        // the flag to the live detector / steady state.
+        flag.store(true, Ordering::Release);
+        clear_video_at_floor_on_enable_edge(&flag, true, false);
+        assert!(
+            flag.load(Ordering::Acquire),
+            "set_enabled(false) must NOT clear video_at_floor (only the enable edge does)",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #1670: `apply_raise_transition` maps a per-encoder raise-flag
+    // TRANSITION to the global owner-count delta. Driving the count off
+    // transitions (not raw edges) makes double-counting impossible — an encoder
+    // that raised, stopped, then dropped is already back at `was_raised == false`
+    // so `Drop` applies no further delta.
+    // ─────────────────────────────────────────────────────────────────────
+    #[test]
+    fn apply_raise_transition_counts_only_real_transitions() {
+        assert_eq!(
+            apply_raise_transition(false, true),
+            1,
+            "rising (not-raised -> raised) must register one owner (+1)",
+        );
+        assert_eq!(
+            apply_raise_transition(true, false),
+            -1,
+            "falling (raised -> not-raised) must release one owner (-1)",
+        );
+        assert_eq!(
+            apply_raise_transition(false, false),
+            0,
+            "no transition (stays not-raised) must be a no-op (0)",
+        );
+        assert_eq!(
+            apply_raise_transition(true, true),
+            0,
+            "no transition (stays raised) must be a no-op (0)",
         );
     }
 }

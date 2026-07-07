@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 pub mod about_modal;
+pub mod action_bar_layout;
 pub mod appearance_settings_panel;
 pub mod attendants;
 mod attendants_layout;
 pub mod browser_compatibility;
 pub mod call_timer;
 pub mod capability_check;
+pub mod color_picker;
 pub mod config_error;
 pub mod connection_quality_indicator;
 pub mod decode_budget;
@@ -33,6 +35,7 @@ pub mod neteq_chart;
 pub mod okta_sign_in_button;
 pub mod peer_list_item;
 pub mod performance_settings;
+pub mod preferences_settings_panel;
 pub mod search_modal;
 pub mod signal_quality;
 pub mod toggle_switch;

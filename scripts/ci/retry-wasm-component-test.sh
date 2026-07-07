@@ -55,10 +55,36 @@ fi
 # (e.g. "--test device_selector" or "--lib").
 TEST_LABEL="$*"
 
+# Snapshot the chrome/chromedriver PIDs that already exist BEFORE this script
+# launches anything (#1271). The runner [self-hosted, linux, x64, hcl-ci] is
+# shared, and the workflow concurrency group only serializes runs of the SAME
+# PR — a different PR's component-tests job can be running concurrently with its
+# own Chrome processes. The old blanket `pkill -f chrome` killed those too,
+# surfacing as a spurious flake in the unrelated job. We record the pre-existing
+# PIDs here and, in cleanup, kill ONLY processes NOT in this baseline.
+#
+# Scope this buys us: any Chrome/chromedriver that was ALREADY running when we
+# started (the common cross-PR case — that job launched its browser before us)
+# is in the baseline and is never touched. The residual it does NOT cover: a
+# cross-PR job that launches its browser DURING our run window appears as a
+# post-baseline PID and could still be killed. That race is far narrower than
+# the unconditional pkill it replaces (it requires a concurrent job to spawn
+# Chrome inside our few-minute window), and eliminating it entirely would need
+# positive ownership tagging (e.g. a per-run --user-data-dir marker) that
+# wasm-bindgen-test-runner does not let us inject.
+#
+# Why a PID baseline and not a process-group / cgroup kill: chromedriver starts
+# Chrome via a path that detaches it (new session/process group), so a PGID kill
+# from this script does not reliably reach the browser — which is exactly why
+# the original cleanup fell back to a name match. A PID-set diff stays robust to
+# that detachment while still preserving every browser that predated this run.
+pgrep -f 'chrome' >/tmp/.wasm-retry-chrome-baseline-$$ 2>/dev/null || : >/tmp/.wasm-retry-chrome-baseline-$$
+BASELINE_PIDS_FILE="/tmp/.wasm-retry-chrome-baseline-$$"
+
 # Temp file used to capture each attempt's output for marker inspection while it
 # is also streamed live to the CI log. Cleaned up on exit.
 ATTEMPT_LOG="$(mktemp -t wasm-retry-XXXXXX.log)"
-trap 'rm -f "${ATTEMPT_LOG}"' EXIT
+trap 'rm -f "${ATTEMPT_LOG}" "${BASELINE_PIDS_FILE}"' EXIT
 
 # Returns 0 (true) if the given output + rc match the known harness-flake
 # signature and the attempt should be retried; returns 1 (false) otherwise.
@@ -79,6 +105,15 @@ is_flake() {
   # Harness reported its own internal timeout in the captured output. These
   # markers are emitted by wasm-bindgen-test-runner / the renderer driver and
   # are distinct from any test assertion text.
+  #
+  # MARKER-COLLISION INVARIANT (#1271): these two literal strings must remain
+  # test-content-free — no test (its name, its assertion output, or a string it
+  # prints/asserts on) may ever contain them verbatim. If one did, a GENUINE
+  # failure whose output happened to include the literal would be misclassified
+  # as flake and retried. That is bounded waste, not masking (the final
+  # `exit "$rc"` below still propagates the real code after the retry budget is
+  # spent), but it would slow CI and muddy triage. Keep these markers unique to
+  # the harness.
   if grep -qF 'Failed to detect test as having been run' <<<"$output"; then
     return 0
   fi
@@ -89,12 +124,22 @@ is_flake() {
   return 1
 }
 
-# Kill any lingering headless-Chrome / chromedriver processes so renderer state
-# does not accumulate across attempts (folds in the per-step cleanup the
-# workflow previously did inline). Always succeeds.
+# Kill any lingering headless-Chrome / chromedriver processes THIS script
+# spawned so renderer state does not accumulate across attempts (folds in the
+# per-step cleanup the workflow previously did inline). Always succeeds.
+#
+# Scoped to PIDs not present in the pre-run baseline (#1271): a concurrent
+# cross-PR job's Chrome that was already running when we started is in the
+# baseline and is left untouched; only processes we started are killed.
 cleanup_browser() {
-  pkill -f chromedriver || true
-  pkill -f chrome || true
+  local pid
+  # chromedriver first (it would otherwise respawn the browser), then chrome.
+  for pid in $(pgrep -f 'chromedriver' 2>/dev/null || true); do
+    grep -qx "$pid" "${BASELINE_PIDS_FILE}" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  done
+  for pid in $(pgrep -f 'chrome' 2>/dev/null || true); do
+    grep -qx "$pid" "${BASELINE_PIDS_FILE}" 2>/dev/null || kill "$pid" 2>/dev/null || true
+  done
   sleep 2
 }
 

@@ -92,7 +92,7 @@
 }
 .video-placeholder .placeholder-text {
   display: block;
-  margin-top: 0.5rem;
+  margin-top: var(--space-2);
   color: var(--text-secondary);
 }
 /* Prevent pinch zoom specifically */
@@ -1603,7 +1603,7 @@ html[data-theme="light"] #invite-overlay p {
   align-items: center;
   justify-content: center;
   height: 44px;
-  padding: 0 1.25rem;
+  padding: 0 var(--space-5);
   font-size: var(--fs-6);
   font-weight: 600;
   border-radius: var(--radius-button);
@@ -1652,7 +1652,7 @@ html[data-theme="light"] #invite-overlay p {
 
 .btn-sm {
   height: 36px;
-  padding: 0 0.75rem;
+  padding: 0 var(--space-3);
   font-size: var(--fs-4);
 }
 
@@ -1687,7 +1687,7 @@ html[data-theme="light"] #invite-overlay p {
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
   border-radius: var(--radius-card);
-  padding: 1.25rem;
+  padding: var(--space-5);
   -webkit-backdrop-filter: blur(var(--glass-blur))
     saturate(var(--glass-saturate));
   backdrop-filter: blur(var(--glass-blur)) saturate(var(--glass-saturate));
@@ -1750,7 +1750,7 @@ html[data-theme="light"] #invite-overlay p {
 .error-message {
   color: var(--error);
   font-weight: 600;
-  margin-bottom: 1rem;
+  margin-bottom: var(--space-4);
   font-size: var(--fs-6);
 }
 
@@ -1758,7 +1758,7 @@ html[data-theme="light"] #invite-overlay p {
   max-width: 100%;
   border-radius: var(--radius-input);
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.25);
-  margin-top: 0.75rem;
+  margin-top: var(--space-3);
 }
 
 /* Home page — hero container */
@@ -1844,10 +1844,10 @@ html[data-theme="light"] #invite-overlay p {
 
 @media (max-width: 768px) {
   .hero-container {
-    padding: 1rem 0;
+    padding: var(--space-4) 0;
   }
   .hero-content {
-    margin: 0.75rem auto;
+    margin: var(--space-3) auto;
     padding: 1.5rem;
   }
 }
@@ -1946,7 +1946,7 @@ html[data-theme="light"] #invite-overlay p {
   align-items: center;
   justify-content: center;
   height: 40px;
-  padding: 0 1rem;
+  padding: 0 var(--space-4);
   border-radius: var(--radius-button);
   background: var(--glass-bg);
   color: var(--text-primary);
@@ -2024,7 +2024,7 @@ html[data-theme="light"] #invite-overlay p {
   transform: translateY(-50%);
   flex-direction: column;
   border-radius: 1.8rem;
-  padding: 1.25rem 0.6rem;
+  padding: var(--space-5) 0.6rem;
 }
 .video-controls-container.dock-left.controls-hidden {
   transform: translateY(-50%) translateX(-70%);
@@ -2044,7 +2044,7 @@ html[data-theme="light"] #invite-overlay p {
   transform: translateY(-50%);
   flex-direction: column;
   border-radius: 1.8rem;
-  padding: 1.25rem 0.6rem;
+  padding: var(--space-5) 0.6rem;
 }
 .video-controls-container.dock-right.controls-hidden {
   transform: translateY(-50%) translateX(70%);
@@ -2069,50 +2069,31 @@ html[data-theme="light"] #invite-overlay p {
     inset 0 1px rgba(255, 255, 255, 0.07);
 }
 
-/* === (в) Narrow by default, expand on hover === */
-.controls-secondary {
-  display: flex;
-  gap: inherit;
-  overflow: hidden;
-  transition:
-    max-width 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    max-height 0.45s cubic-bezier(0.4, 0, 0.2, 1),
-    opacity 0.35s cubic-bezier(0.4, 0, 0.2, 1);
+/* === (в) Secondary slots hidden by default; expand on hover/customize ===
+   The action-bar slots are now ALL direct flex children of
+   `.video-controls-container` (no wrapping `.controls-secondary`) so flex
+   `order:` resolves in a single context — required for drag-reorder to
+   work. Each secondary slot is tagged `.slot-secondary` and toggled
+   individually: hidden when the bar is collapsed, shown when it is
+   expanded (`.controls-expanded` / `:hover`) or being customized. */
+.action-bar-slot-wrapper.slot-secondary {
+  display: none;
 }
 
-/* Horizontal (bottom dock): collapse width */
-.dock-bottom .controls-secondary {
-  flex-direction: row;
-  max-width: 0;
-  opacity: 0;
-}
-.dock-bottom.controls-expanded .controls-secondary,
-.dock-bottom:hover .controls-secondary {
-  max-width: 600px;
-  opacity: 1;
-  /* Allow the dock-position dropdown menu (an absolutely-positioned child
-     of .dock-position-wrapper, which now lives inside .controls-secondary
-     so it sits next to the tile-layout / density button) to pop ABOVE the
-     action bar without being clipped by the collapse-time overflow:hidden. */
-  overflow: visible;
+.video-controls-container.controls-expanded .action-bar-slot-wrapper.slot-secondary,
+.video-controls-container:hover .action-bar-slot-wrapper.slot-secondary,
+.video-controls-container.customize-mode .action-bar-slot-wrapper.slot-secondary {
+  display: inline-flex;
 }
 
-/* Vertical (left/right dock): collapse height */
-.dock-left .controls-secondary,
-.dock-right .controls-secondary {
-  flex-direction: column;
-  max-height: 0;
-  opacity: 0;
+/* HangUp ("Leave") wrapper — always visible at the end of the bar. */
+.hangup-wrapper {
+  display: inline-flex;
 }
-.dock-left.controls-expanded .controls-secondary,
-.dock-right.controls-expanded .controls-secondary,
-.dock-left:hover .controls-secondary,
-.dock-right:hover .controls-secondary {
-  max-height: 500px;
-  opacity: 1;
-  /* See note above — allow the dock dropdown to overflow sideways without
-     being clipped when the controls are fully expanded. */
-  overflow: visible;
+
+/* Mock-peers debug button wrapper — visible when the feature flag is on. */
+.action-bar-mock-peers-wrapper {
+  display: inline-flex;
 }
 
 /* Dock position dropdown — reuses glass-select design */
@@ -2179,7 +2160,14 @@ html[data-theme="light"] #invite-overlay p {
   color: white;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   cursor: pointer;
-  overflow: hidden;
+  /* `overflow: visible` lets the absolutely-positioned `.tooltip` child
+   * render ABOVE the button. With `position: relative` + `overflow: hidden`
+   * (the previous value), the tooltip — which floats at
+   * `bottom: calc(100% + 0.5rem)` — was clipped to the button box and
+   * never appeared on hover. The inner `::before` gradient uses
+   * `inset: 0` and `border-radius: inherit`, so it stays inside the
+   * rounded border without needing the button to clip it. */
+  overflow: visible;
   box-shadow:
     0 4px 10px rgba(0, 0, 0, 0.3),
     inset 0 1px rgba(255, 255, 255, 0.05);
@@ -2302,30 +2290,99 @@ html[data-theme="light"] #invite-overlay p {
 
 .video-control-button .tooltip {
   position: absolute;
-  bottom: -2.5rem;
+  /* Float the tooltip ABOVE the button. The previous `bottom: -2.5rem`
+   * placed it below, which pushed it off the viewport for the default
+   * dock-bottom action bar (the dock sits ~20px from the bottom edge). */
+  bottom: calc(100% + 0.5rem);
   left: 50%;
   transform: translateX(-50%) scale(0.95);
-  padding: 0.4rem 0.8rem;
+  padding: 0.45rem 0.75rem;
   background-color: rgba(13, 19, 31, 0.95);
   color: white;
   font-size: var(--fs-3);
   font-weight: 500;
   border-radius: var(--radius-md);
-  white-space: nowrap;
+  /* Multi-line descriptive tooltip: wrap rather than force everything onto
+   * one line so the optional `.tooltip-desc` description doesn't overflow
+   * the viewport. */
+  white-space: normal;
+  width: max-content;
+  max-width: 240px;
+  text-align: center;
+  line-height: 1.3;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   opacity: 0;
   visibility: hidden;
+  pointer-events: none;
   transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   box-shadow:
     0 4px 12px rgba(0, 0, 0, 0.3),
     0 0 0 1px rgba(121, 40, 202, 0.1);
   border: 1px solid rgba(255, 255, 255, 0.05);
   transform-origin: bottom center;
+  z-index: 1;
 }
 
-.video-control-button:hover .tooltip {
+.video-control-button .tooltip .tooltip-title {
+  font-weight: 600;
+}
+
+.video-control-button .tooltip .tooltip-desc {
+  font-weight: 400;
+  font-size: var(--fs-2);
+  opacity: 0.82;
+}
+
+.video-control-button:hover .tooltip,
+.video-control-button:focus-visible .tooltip {
   opacity: 1;
   visibility: visible;
   transform: translateX(-50%) scale(1);
+}
+
+/* Side-dock tooltip placement. The default tooltip is centered above the
+ * button (`bottom: calc(100% + 0.5rem); left: 50%`), which works for the
+ * bottom dock but clips at the viewport edge when the action bar is anchored
+ * to `left: 16px` (dock-left) or `right: 16px` (dock-right): a 240px-wide
+ * tooltip centered on a button ~16px from the edge has ~104px hanging off
+ * the screen. Mirror the dock menu's side-anchoring strategy
+ * (`.dock-left/.dock-right .dock-position-wrapper .glass-select-menu` above)
+ * so tooltips open to the side away from the viewport edge. Only Bottom/
+ * Left/Right exist — there is no dock-top. */
+.video-controls-container.dock-left .video-control-button .tooltip {
+  bottom: auto;
+  left: calc(100% + 0.5rem);
+  top: 50%;
+  transform: translateY(-50%) scale(0.95);
+  transform-origin: left center;
+}
+.video-controls-container.dock-left .video-control-button:hover .tooltip,
+.video-controls-container.dock-left .video-control-button:focus-visible .tooltip {
+  transform: translateY(-50%) scale(1);
+}
+
+.video-controls-container.dock-right .video-control-button .tooltip {
+  bottom: auto;
+  right: calc(100% + 0.5rem);
+  left: auto;
+  top: 50%;
+  transform: translateY(-50%) scale(0.95);
+  transform-origin: right center;
+}
+.video-controls-container.dock-right .video-control-button:hover .tooltip,
+.video-controls-container.dock-right .video-control-button:focus-visible .tooltip {
+  transform: translateY(-50%) scale(1);
+}
+
+/* Suppress tooltips while the action bar is in customize mode — buttons are
+ * non-interactive there (drag/remove only), and tooltips would just add noise
+ * while reordering. The `customize-mode` class is applied to
+ * `.video-controls-container` from `attendants.rs` (search the file for
+ * `cust = if customize_mode()`); it is not dead. */
+.video-controls-container.customize-mode .video-control-button .tooltip {
+  display: none;
 }
 
 @media (max-width: 640px) {
@@ -2333,8 +2390,8 @@ html[data-theme="light"] #invite-overlay p {
     bottom: 1rem;
   }
   .video-controls-container {
-    padding: 0.75rem 1.25rem;
-    gap: 0.75rem;
+    padding: var(--space-3) var(--space-5);
+    gap: var(--space-3);
   }
 
   .video-control-button {
@@ -2458,7 +2515,7 @@ html[data-theme="light"] #invite-overlay p {
 .hero-title {
   font-size: var(--fs-12);
   font-weight: 700;
-  margin-bottom: 0.25rem;
+  margin-bottom: var(--space-1);
   color: var(--text-primary);
   display: inline-block;
   letter-spacing: -0.02em;
@@ -2469,7 +2526,7 @@ html[data-theme="light"] #invite-overlay p {
   font-weight: 400;
   color: var(--text-tertiary);
   letter-spacing: 0.04em;
-  margin-bottom: 1.25rem;
+  margin-bottom: var(--space-5);
 }
 
 .tagline-dot {
@@ -2601,10 +2658,10 @@ html[data-theme="light"] #invite-overlay p {
 /* Responsive — phone */
 @media (max-width: 480px) {
   .hero-content {
-    padding: 1.25rem;
+    padding: var(--space-5);
     border-radius: 20px;
     max-width: 100%;
-    margin: 0.5rem;
+    margin: var(--space-2);
   }
   .hero-title {
     font-size: var(--fs-10);
@@ -2669,7 +2726,7 @@ html[data-theme="light"] #invite-overlay p {
   position: relative;
   z-index: 3;
   padding: 1.5rem;
-  margin: 1.25rem 0;
+  margin: var(--space-5) 0;
   background: rgba(0, 0, 0, 0.2);
   border: 1px solid rgba(255, 255, 255, 0.08);
   border-radius: var(--radius-card);
@@ -2684,10 +2741,10 @@ html[data-theme="light"] #invite-overlay p {
 .hero-content form h3 {
   font-size: var(--fs-8);
   font-weight: 600;
-  margin-bottom: 1.25rem;
+  margin-bottom: var(--space-5);
   color: var(--text-primary);
   line-height: 1.3;
-  padding-bottom: 0.5rem;
+  padding-bottom: var(--space-2);
   display: block;
   border-bottom: 1px solid var(--border);
 }
@@ -2696,7 +2753,7 @@ html[data-theme="light"] #invite-overlay p {
   color: var(--text-secondary);
   font-weight: 500;
   font-size: var(--fs-4);
-  margin-bottom: 0.5rem;
+  margin-bottom: var(--space-2);
   display: block;
 }
 
@@ -2757,10 +2814,10 @@ html[data-theme="light"] #invite-overlay p {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 0.75rem;
-  margin-bottom: 0.5rem;
-  margin-left: 0.25rem;
-  margin-right: 0.25rem;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+  margin-left: var(--space-1);
+  margin-right: var(--space-1);
 }
 
 .field-label__name {
@@ -2829,7 +2886,7 @@ html[data-theme="light"] #invite-overlay p {
   z-index: 20;
   width: max-content;
   max-width: min(260px, calc(100vw - 4rem));
-  padding: 0.5rem 0.625rem;
+  padding: var(--space-2) 0.625rem;
   background: rgba(28, 28, 30, 0.96);
   -webkit-backdrop-filter: blur(var(--effect-blur-lg)) saturate(180%);
   backdrop-filter: blur(var(--effect-blur-lg)) saturate(180%);
@@ -2945,13 +3002,13 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .hero-content form .space-y-6 > div {
-  margin-bottom: 1rem;
+  margin-bottom: var(--space-4);
 }
 
 @media (max-width: 480px) {
   .hero-content form {
-    padding: 1rem;
-    margin: 0.75rem 0;
+    padding: var(--space-4);
+    margin: var(--space-3) 0;
   }
 }
 
@@ -2965,7 +3022,7 @@ html[data-theme="light"] #invite-overlay p {
     rgba(255, 255, 255, 0.1),
     transparent
   );
-  margin: 1.25rem 0;
+  margin: var(--space-5) 0;
 }
 
 /* Username prompt */
@@ -3135,7 +3192,7 @@ html[data-theme="light"] #invite-overlay p {
   -webkit-backdrop-filter: saturate(180%) blur(var(--effect-blur-lg));
   backdrop-filter: saturate(180%) blur(var(--effect-blur-lg));
   border: 1px solid rgba(255, 255, 255, 0.18);
-  padding: 0.5rem 0.75rem;
+  padding: var(--space-2) var(--space-3);
   border-radius: var(--radius-lg);
   display: inline-block;
   overflow: hidden;
@@ -3153,7 +3210,7 @@ html[data-theme="light"] #invite-overlay p {
 .copy-toast.copy-toast--visible {
   max-height: 40px;
   opacity: 1;
-  margin-top: 0.75rem;
+  margin-top: var(--space-3);
   transform: translateY(0);
 }
 
@@ -3352,7 +3409,7 @@ html[data-theme="light"] #invite-overlay p {
   }
   .login-card {
     padding: 2rem 1.5rem;
-    margin: 0 1rem;
+    margin: 0 var(--space-4);
     border-radius: 20px;
   }
 }
@@ -3375,8 +3432,8 @@ html[data-theme="light"] #invite-overlay p {
 .auth-dropdown-trigger {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 16px;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-4);
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: var(--radius-pill, 9999px);
@@ -3413,7 +3470,7 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .auth-dropdown-header {
-  padding: 12px 16px;
+  padding: var(--space-3) var(--space-4);
   border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
 
@@ -3427,7 +3484,7 @@ html[data-theme="light"] #invite-overlay p {
 .auth-dropdown-email {
   font-size: var(--fs-3);
   color: var(--text-secondary, rgba(255, 255, 255, 0.6));
-  margin: 4px 0 0 0;
+  margin: var(--space-1) 0 0 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -3436,7 +3493,7 @@ html[data-theme="light"] #invite-overlay p {
 .auth-dropdown-signout {
   display: block;
   width: 100%;
-  padding: 10px 16px;
+  padding: 10px var(--space-4);
   background: none;
   border: none;
   text-align: left;
@@ -3455,7 +3512,7 @@ html[data-theme="light"] #invite-overlay p {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-3);
 }
 
 .participant-info {
@@ -3483,7 +3540,7 @@ html[data-theme="light"] #invite-overlay p {
 .participant-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   flex-shrink: 0;
 }
 
@@ -3497,13 +3554,13 @@ html[data-theme="light"] #invite-overlay p {
   display: flex;
   justify-content: center;
   align-items: center;
-  margin-top: 0.5rem;
+  margin-top: var(--space-2);
 }
 
 .about-footer-link {
   background: transparent;
   border: 0;
-  padding: 0.25rem 0.5rem;
+  padding: var(--space-1) var(--space-2);
   font-size: var(--fs-4);
   letter-spacing: 0.01em;
   color: var(--text-tertiary);
@@ -3537,8 +3594,8 @@ html[data-theme="light"] #invite-overlay p {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 1rem;
-  margin-bottom: 0.5rem;
+  gap: var(--space-4);
+  margin-bottom: var(--space-2);
 }
 
 .about-modal-title {
@@ -3553,11 +3610,11 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .about-modal-section {
-  margin-top: 1.25rem;
+  margin-top: var(--space-5);
 }
 
 .about-modal-section-title {
-  margin: 0 0 0.5rem 0;
+  margin: 0 0 var(--space-2) 0;
   font-size: var(--fs-4);
   font-weight: 600;
   text-transform: uppercase;
@@ -3583,8 +3640,8 @@ html[data-theme="light"] #invite-overlay p {
 .about-modal-row {
   display: grid;
   grid-template-columns: minmax(150px, 1fr) minmax(64px, 0.8fr) minmax(64px, 0.8fr) minmax(170px, 1fr);
-  gap: 0.5rem;
-  padding: 0.5rem 0.75rem;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
   background: var(--glass-bg);
   align-items: baseline;
   font-size: var(--fs-5);
@@ -3650,7 +3707,7 @@ html[data-theme="light"] #invite-overlay p {
 }
 
 .about-modal-status {
-  padding: 0.75rem;
+  padding: var(--space-3);
   font-size: var(--fs-5);
   color: var(--text-secondary);
   background: var(--glass-bg);
@@ -3666,7 +3723,7 @@ html[data-theme="light"] #invite-overlay p {
 
 @media (max-width: 540px) {
   .about-modal-card {
-    padding: 1.25rem;
+    padding: var(--space-5);
   }
   .about-modal-row {
     grid-template-columns: 1fr;
@@ -3760,5 +3817,5 @@ html[data-theme="light"] #invite-overlay p {
    .tile-top-icons icon density there (see .split-peer-tile .guest-badge). */
 .split-peer-tile .transport-badge {
   font-size: 9px;
-  padding: 1px 4px;
+  padding: 1px var(--space-1);
 }

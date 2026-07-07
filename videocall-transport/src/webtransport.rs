@@ -9,7 +9,7 @@ use futures::channel::oneshot::channel;
 use futures::lock::Mutex as AsyncMutex;
 use std::cell::Cell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{fmt, rc::Rc};
 use thiserror::Error as ThisError;
 use videocall_types::Callback;
@@ -88,6 +88,47 @@ pub fn unistream_drop_count() -> u64 {
 fn record_unistream_drop() {
     UNISTREAM_DROP_COUNT.fetch_add(1, Ordering::Relaxed);
 }
+
+/// NETSIM-ONLY: synthetically bump the WT write-drop counter by `n` (issue
+/// #1616, follow-up to #1398). The real increment happens deep inside the
+/// `.await`-blocking media send path when an ESTABLISHED unistream write fails
+/// (a teardown-class drop), which an e2e test cannot reliably induce on a
+/// localhost loopback. This feature-gated bumper lets the netsim e2e harness
+/// drive the SAME [`UNISTREAM_DROP_COUNT`] the encoders consult via
+/// [`unistream_drop_count`], so the third axis of the mic-side single-layer
+/// audio uplink-distress detector (#1398) — WT write-drop, alongside the
+/// already-bumpable WT ready-stall and WS send-buffer-drop axes — can be
+/// exercised deterministically. It increments through the same
+/// [`record_unistream_drop`] write path the production send-error handler uses,
+/// so the counter the detector reads is the one the test drives. Zero
+/// production cost: compiled out unless the `netsim` feature is on (the
+/// dioxus-ui e2e build enables it; the production build does not). Mirrors
+/// [`force_unistream_ready_stall`] in role — but, unlike that sibling's single
+/// `fetch_add(n)`, it loops the private [`record_unistream_drop`] write path so
+/// the increment goes through the exact production seam (the counter is private
+/// to this module, so a direct add would have to duplicate it).
+///
+/// Because this is O(n) (one `record_unistream_drop` per iteration), `n` is
+/// clamped to [`MAX_NETSIM_DROP_BUMP`]: the JS bridge coerces the argument via
+/// `as u64`, and `f64::INFINITY as u64` saturates to `u64::MAX`, so an errant
+/// `__vcNetsim.bumpWtDrop(Infinity)` would otherwise spin a near-infinite loop
+/// and hang the wasm main thread. The detector only needs a delta above its
+/// per-window threshold (single digits), so the clamp is far above any real
+/// test need while bounding the worst case.
+#[cfg(feature = "netsim")]
+pub fn force_unistream_drop(n: u64) {
+    let n = n.min(MAX_NETSIM_DROP_BUMP);
+    for _ in 0..n {
+        record_unistream_drop();
+    }
+}
+
+/// Upper bound on a single [`force_unistream_drop`] bump (netsim only). The
+/// audio uplink-distress detector trips on a per-window delta of single digits,
+/// so 10_000 is orders of magnitude above any real test need while keeping the
+/// O(n) loop bounded against an `Infinity`/huge coerced argument.
+#[cfg(feature = "netsim")]
+const MAX_NETSIM_DROP_BUMP: u64 = 10_000;
 
 /// Cumulative count of "slow `writer.ready()`" events on the persistent
 /// unidirectional media streams (`send_on_persistent_stream`): each time a
@@ -187,6 +228,130 @@ const READY_STALL_THRESHOLD_MS_FLOOR: f64 = 250.0;
 const READY_STALL_THRESHOLD_MS_INIT_BITS: u64 = 4_643_000_109_586_448_384;
 
 static READY_STALL_THRESHOLD_MS: AtomicU64 = AtomicU64::new(READY_STALL_THRESHOLD_MS_INIT_BITS);
+
+/// Live count of encoders that have RAISED the uplink-saturation threshold above
+/// the floor (dual-stream / screen-share sessions) and have not yet released it
+/// (issue #1670). Used ONLY to gate the construction-time reset
+/// ([`reset_ready_stall_threshold_on_construction`]): while any live encoder
+/// holds a raise, a freshly-constructed encoder must NOT clobber the still-active
+/// raised threshold back to the floor.
+///
+/// ## Why this gate exists (the #1670 race)
+///
+/// A `CameraEncoder` is constructed once per Dioxus `Host` mount inside a
+/// `use_hook` closure (`dioxus-ui/src/components/host.rs`, the
+/// `CameraEncoder::new` call), and a `Host` can re-mount without a stable key
+/// (`attendants.rs` conditional mount). The OLD encoder's AQ control-loop
+/// `spawn_local` future is bound to the old encoder's liveness token, so it can
+/// still be ALIVE — and still holding a raised threshold from an active screen
+/// share — at the instant the NEW encoder's `new()` runs its unconditional
+/// construction-time reset. Before this gate, that fresh-construct reset
+/// clobbered the live raise back to the floor (250 ms), so the still-running
+/// dual-stream loop saw spurious saturation events and shed video needlessly.
+///
+/// ## Why it cannot wedge (RAII-tied, #1667 preserved)
+///
+/// The count is incremented on the screen-RAISE edge and decremented on the
+/// screen-STOP edge; additionally the owning encoder's `Drop` decrements it IFF
+/// the encoder is torn down while still holding a raise (the STOP edge never
+/// ran). The encoder always drops on `Host` unmount — its liveness token is the
+/// AQ loop's own exit condition — so a raise can never outlive its owner: once
+/// every raising encoder has either hit its STOP edge or dropped, the count
+/// returns to 0. The release that brings the count to 0 ALSO floors the
+/// threshold (see [`note_threshold_raise_released`]), so a dropped-while-raised
+/// encoder whose replacement already skipped its guarded construction reset
+/// still ends at the floor — closing the inverse of the #1667 leak (a
+/// dropped-while-raised encoder leaking a raised threshold) at its source rather
+/// than relying on a later fresh construct that may never come.
+static SCREEN_RAISED_THRESHOLD_OWNERS: AtomicU32 = AtomicU32::new(0);
+
+/// Register that a live encoder has RAISED the uplink-saturation threshold above
+/// the floor for a dual-stream (screen-share) session. Paired with
+/// [`note_threshold_raise_released`]. The count gates the CONSTRUCTION-time reset
+/// only: while any live encoder holds a raise, a freshly-constructed encoder must
+/// NOT clobber the still-active raised threshold back to the floor (#1670).
+pub fn note_threshold_raised() {
+    SCREEN_RAISED_THRESHOLD_OWNERS.fetch_add(1, Ordering::AcqRel);
+}
+
+/// Release a raise previously registered via [`note_threshold_raised`]. Called on
+/// the screen-share STOP edge AND (defensively) from the owning encoder's `Drop`
+/// if it still holds a raise — so a loop that DROPS while raised self-heals the
+/// count and cannot pin the threshold raised forever (the #1667 bug in reverse).
+/// Saturating at 0 so a double-release can never underflow into a huge count.
+///
+/// When this release brings the count to 0 (the LAST live owner went away), it
+/// also floors the threshold via [`reset_ready_stall_threshold`]. This is the
+/// single chokepoint that makes a drop-while-raised encoder self-heal the
+/// THRESHOLD, not merely the count (issue #1670, originally caught in pre-submit):
+/// when an old encoder is torn down before its screen-STOP edge ran, its `Drop`
+/// calls this, and the replacement encoder has ALREADY skipped its guarded
+/// construction-time reset (count was > 0 when it constructed) — so there is no
+/// later constructor to floor the threshold. Without flooring here, a single-
+/// stream publisher would stay pinned at the raised (e.g. 800 ms) threshold
+/// indefinitely, desensitizing WT uplink-saturation detection. We floor ONLY on
+/// the 1 -> 0 transition so a second concurrent raising encoder (count 2 -> 1)
+/// does not get its raise floored out from under it. (The 2 -> 1 no-floor branch
+/// protects the COUNT; the threshold's raised *value* is (re)driven only on a
+/// screen-active transition at the camera-encoder edge, and the sole floor-to-250
+/// edge there runs only when screen is globally inactive — so a sibling release
+/// never strands a still-wanted raise at the floor.)
+pub fn note_threshold_raise_released() {
+    // Saturating decrement: never wrap below 0.
+    let mut cur = SCREEN_RAISED_THRESHOLD_OWNERS.load(Ordering::Acquire);
+    loop {
+        if cur == 0 {
+            return;
+        }
+        match SCREEN_RAISED_THRESHOLD_OWNERS.compare_exchange_weak(
+            cur,
+            cur - 1,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                // Last owner released (1 -> 0): floor the threshold so a
+                // dropped-while-raised encoder cannot leave it pinned raised.
+                if cur == 1 {
+                    reset_ready_stall_threshold();
+                }
+                return;
+            }
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Live count of encoders currently holding a raised uplink-saturation threshold.
+/// Exposed for the construction-time guard and tests.
+pub fn raised_threshold_owner_count() -> u32 {
+    SCREEN_RAISED_THRESHOLD_OWNERS.load(Ordering::Acquire)
+}
+
+/// PURE predicate: may a newly-constructed encoder reset the uplink-saturation
+/// threshold to the floor? Only when NO live encoder currently holds a raise
+/// (`live_raised_owners == 0`). When a raise is live, the construction-time reset
+/// must be SKIPPED so a remount's fresh encoder cannot clobber a still-active
+/// dual-stream threshold (#1670). The floor is restored by the LAST owner's
+/// release (the screen-STOP edge or `Drop` via [`note_threshold_raise_released`]),
+/// not by this construction-time reset, so a genuinely-dropped-while-raised prior
+/// encoder yields a clean floor even when no fresh construct follows (#1667
+/// preserved).
+#[inline]
+pub fn should_reset_threshold_on_construction(live_raised_owners: u32) -> bool {
+    live_raised_owners == 0
+}
+
+/// Construction-time guarded variant of [`reset_ready_stall_threshold`]: resets to
+/// the floor ONLY when no live encoder holds a raise (see
+/// [`should_reset_threshold_on_construction`]). Use this from encoder
+/// constructors; use the unconditional [`reset_ready_stall_threshold`] on the
+/// screen-STOP edge and other force-floor sites.
+pub fn reset_ready_stall_threshold_on_construction() {
+    if should_reset_threshold_on_construction(raised_threshold_owner_count()) {
+        reset_ready_stall_threshold();
+    }
+}
 
 /// Read the current effective stall threshold (ms). This is the runtime value
 /// used by [`is_ready_stall`], which may be higher than the floor when
@@ -310,6 +475,23 @@ fn perf_now_ms() -> Option<f64> {
 /// the standard CA path. Production builds never set this global.
 const WT_CERT_HASHES_GLOBAL: &str = "__VC_WT_CERT_HASHES__";
 
+/// Returns `true` when the cert-hash override produced at least one usable
+/// hash and a `WebTransportOptions` should be built; `false` when every entry
+/// was malformed (or the array was empty) and the caller must fall through to
+/// the standard CA path (`None`).
+///
+/// Extracted from [`read_wt_cert_hash_options`] so the final "zero
+/// successfully-decoded hashes ⇒ None" gate — the one piece of that function's
+/// branch logic that is a pure decision over a `u32` count rather than a live
+/// `JsValue`/`Array` inspection — can be unit-tested on the NATIVE host
+/// target. The comparison is strictly `> 0`: zero usable hashes is a
+/// fall-through, one or more is a build. This pins the COUNT→decision mapping
+/// only; the upstream JS classification (no-window / undefined / non-array /
+/// per-entry decode) stays browser-only as noted at the call site.
+fn cert_hash_override_has_usable_entry(decoded_count: u32) -> bool {
+    decoded_count > 0
+}
+
 /// Read the per-page WebTransport cert-hash override and, if present, build
 /// a `WebTransportOptions` dictionary suitable for `new_with_options`.
 ///
@@ -359,7 +541,7 @@ fn read_wt_cert_hash_options() -> Option<WebTransportOptions> {
         hashes.push(&hash);
     }
 
-    if hashes.length() == 0 {
+    if !cert_hash_override_has_usable_entry(hashes.length()) {
         return None;
     }
 
@@ -373,13 +555,36 @@ fn read_wt_cert_hash_options() -> Option<WebTransportOptions> {
     Some(options)
 }
 
+/// Map a sequence of UTF-16 code units (as produced by `JsString::iter`) into
+/// raw bytes by taking the low byte of each unit (`(c & 0xFF) as u8`).
+///
+/// Extracted from [`base64_decode`] so the byte-producing mapping — the one
+/// part of the `atob` decode path that is pure arithmetic rather than JS-bound
+/// I/O — can be unit-tested on the NATIVE host target, sidestepping the
+/// `#[wasm_bindgen_test]` browser harness entirely (which is known to silently
+/// no-op on this dev box, a false-green). The `atob` call, `JsString` dyn_into,
+/// and `JsString::iter()` plumbing all stay at the wasm-only call site; only
+/// this mapping moved and it is the SINGLE SOURCE OF TRUTH for the truncation.
+///
+/// Why low-byte truncation and not a Rust `String`: `atob` returns a
+/// binary-safe "latin-1" JS string where every UTF-16 code unit is in
+/// `0..=0xFF` and equals the decoded byte value. Going through Rust's `String`
+/// would re-encode as UTF-8 and corrupt every byte >= 0x80. Reading the UTF-16
+/// units directly and taking the low byte preserves the high bytes exactly.
+/// This high-byte preservation is pinned by unit tests with a known-answer
+/// vector that includes units >= 0x80.
+fn truncate_utf16_units_to_bytes(units: impl Iterator<Item = u16>) -> Vec<u8> {
+    units.map(|c| (c & 0xFF) as u8).collect()
+}
+
 /// Decode a standard-alphabet base64 string into bytes via JS `atob`.
 ///
 /// We cannot pull in the `base64` crate just for this one call (bundle bloat)
 /// and `atob` returns a binary-safe "latin-1" JS string — every UTF-16 code
 /// unit is in `0..=0xFF`. Going through Rust's `String` would re-encode as
 /// UTF-8 and corrupt bytes >= 0x80, so we read the UTF-16 code units directly
-/// from the `JsString` and truncate each to a `u8`.
+/// from the `JsString` and truncate each to a `u8` via
+/// [`truncate_utf16_units_to_bytes`].
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let window = web_sys::window()?;
     let atob = Reflect::get(&window, &JsValue::from_str("atob")).ok()?;
@@ -388,8 +593,8 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
     let js_str: JsString = decoded.dyn_into().ok()?;
     // `JsString::iter` yields UTF-16 code units (`u16`). For atob output
     // every unit is guaranteed to be in 0..=0xFF, so the truncation to u8
-    // is safe; we still use `& 0xFF` defensively.
-    let bytes: Vec<u8> = js_str.iter().map(|c| (c & 0xFF) as u8).collect();
+    // is safe; the low-byte mapping lives in the unit-tested seam below.
+    let bytes = truncate_utf16_units_to_bytes(js_str.iter());
     Some(bytes)
 }
 
@@ -2096,5 +2301,354 @@ mod framing_tests {
             after,
             "public accessor must reflect all recorded drops",
         );
+    }
+
+    #[cfg(feature = "netsim")]
+    #[test]
+    fn force_unistream_drop_bumps_counter_by_n() {
+        // The netsim bumper must drive the SAME counter the detector reads, by
+        // exactly `n` for a sane `n` — this is what the #1616 e2e relies on.
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let before = unistream_drop_count();
+
+        force_unistream_drop(10);
+
+        assert_eq!(
+            unistream_drop_count() - before,
+            10,
+            "force_unistream_drop(10) must add exactly 10 to the counter the detector reads",
+        );
+    }
+
+    #[cfg(feature = "netsim")]
+    #[test]
+    fn force_unistream_drop_clamps_huge_n() {
+        // Hang-guard: the JS bridge coerces via `as u64`, and `Infinity as u64`
+        // saturates to u64::MAX. Without the clamp, force_unistream_drop would
+        // spin a near-infinite O(n) loop and hang the tab. The clamp bounds the
+        // increment to MAX_NETSIM_DROP_BUMP. Mutation guard: removing the
+        // `n.min(MAX_NETSIM_DROP_BUMP)` clamp makes this test loop ~u64::MAX
+        // times and hang (caught by the test timeout), not silently pass.
+        let _guard = DROP_COUNTER_GUARD.lock().unwrap();
+        let before = unistream_drop_count();
+
+        force_unistream_drop(u64::MAX);
+
+        assert_eq!(
+            unistream_drop_count() - before,
+            MAX_NETSIM_DROP_BUMP,
+            "a huge/Infinity-coerced n must be clamped to MAX_NETSIM_DROP_BUMP, not loop u64::MAX times",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // WebTransport cert-hash override helpers (#917).
+    //
+    // Two helpers feed the dev/E2E `serverCertificateHashes` path:
+    //   - `truncate_utf16_units_to_bytes` — the `atob`-output byte mapping,
+    //   - `cert_hash_override_has_usable_entry` — the final "≥1 usable hash"
+    //     gate inside `read_wt_cert_hash_options`.
+    //
+    // Why NATIVE `#[test]` and not `#[wasm_bindgen_test]`: both production
+    // functions originally buried their testable arithmetic inside JS-bound
+    // I/O — `truncate_utf16_units_to_bytes` was inline in `base64_decode`
+    // behind the `atob` call + `JsString::iter()`, and the count gate was the
+    // inline `if hashes.length() == 0` after a live `Array` walk. Extracting
+    // each into a pure free fn makes the truncation (a `u16`→`u8` map) and the
+    // count→decision (`u32`→`bool`) pure host-target logic that runs with no
+    // JS. This deliberately avoids the browser wasm harness, which is known to
+    // silently no-op `#[wasm_bindgen_test]` on this dev box (false-green): a
+    // no-op test on these JS-bound paths would PIN NOTHING. The `atob` call,
+    // `JsString` plumbing, and `Array`/`JsValue` inspection all remain at the
+    // wasm-only call sites and are unchanged by these seams.
+    //
+    // NOTE: the following branches of `read_wt_cert_hash_options` are NOT
+    // covered by native tests because they classify live JS values that only
+    // exist in a browser and cannot be constructed on the host target:
+    // no-`window`, `__VC_WT_CERT_HASHES__` undefined/null, value-not-an-array
+    // (`dyn_into::<Array>` failure), and the per-entry `as_string()` /
+    // `base64_decode` classification that produces the count this gate reads.
+    // Per #917 these are exercised end-to-end by the E2E freeze-regression
+    // spec, which boots the wasm with a real `__VC_WT_CERT_HASHES__` global and
+    // connects over WebTransport using the resulting `serverCertificateHashes`
+    // (the happy path). The seams below pin the two pieces of pure arithmetic
+    // those branches funnel into: the byte mapping and the usable-count gate.
+    // ─────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_utf16_units_preserves_high_bytes() {
+        // Known-answer vector spanning the full u8 range AND a unit > 0xFF.
+        // The acceptance criterion (#917): prove `& 0xFF` truncation does NOT
+        // corrupt high bytes. 0x80 / 0xFF / 0x1FF are the discriminators —
+        // mutating `& 0xFF` to `& 0x7F` clears bit 7 and turns 0x80→0x00,
+        // 0xFF→0x7F, 0x1FF→0x7F, which this assertion catches.
+        let units: [u16; 5] = [0x00, 0x7F, 0x80, 0xFF, 0x1FF];
+        let bytes = truncate_utf16_units_to_bytes(units.iter().copied());
+        assert_eq!(
+            bytes,
+            vec![0x00u8, 0x7F, 0x80, 0xFF, 0xFF],
+            "low-byte truncation must preserve bytes >= 0x80 exactly",
+        );
+    }
+
+    #[test]
+    fn truncate_utf16_units_round_trips_atob_latin1_bytes() {
+        // A FIXED real byte vector containing high bytes (here the UTF-8
+        // encoding of "é" — 0xC3 0xA9 — plus 0x00 / 0x80 / 0xFF). `atob`
+        // returns a latin-1 JS string whose every UTF-16 code unit EQUALS the
+        // decoded byte value (all in 0..=0xFF), so we model each byte as the
+        // u16 unit `atob` would yield and feed them through the PRODUCTION
+        // seam. The bytes must come back unchanged — the property a base64
+        // cert hash relies on so the SHA-256 digest is byte-identical to the
+        // server's. This calls the production fn; it does not re-implement the
+        // map inline.
+        let original: [u8; 5] = [0x00, 0x80, 0xFF, 0xC3, 0xA9];
+        let latin1_units: Vec<u16> = original.iter().map(|&b| b as u16).collect();
+        let decoded = truncate_utf16_units_to_bytes(latin1_units.into_iter());
+        assert_eq!(
+            decoded,
+            original.to_vec(),
+            "latin-1 code units must round-trip to the exact source bytes",
+        );
+    }
+
+    #[test]
+    fn cert_hash_override_zero_decoded_falls_through() {
+        // The load-bearing fall-through (#917): an empty array OR an array
+        // where EVERY entry was malformed yields zero usable hashes, so the
+        // caller must build no options and fall back to the CA path (`None`).
+        // Flipping the gate's `> 0` to `>= 0` would make zero usable hashes
+        // (re)turn `true` and build an EMPTY `serverCertificateHashes` — this
+        // assertion catches that mutation.
+        assert!(
+            !cert_hash_override_has_usable_entry(0),
+            "zero decoded hashes must fall through to None (CA path)",
+        );
+    }
+
+    #[test]
+    fn cert_hash_override_one_decoded_builds_options() {
+        // The minimal success case: a single valid hash must build options.
+        // Flipping the gate's `> 0` to `> 1` would discard a single valid
+        // cert hash (the common E2E single-cert case) — this assertion, paired
+        // with the zero case above, kills both the `>= 0` and the `> 1`
+        // mutation: `>= 0` breaks the zero case, `> 1` breaks this one.
+        assert!(
+            cert_hash_override_has_usable_entry(1),
+            "one decoded hash must build options (smallest success)",
+        );
+    }
+
+    #[test]
+    fn cert_hash_override_several_decoded_builds_options() {
+        // Multiple valid hashes (cert rotation / multi-SAN) must also build.
+        assert!(
+            cert_hash_override_has_usable_entry(5),
+            "several decoded hashes must build options",
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Construction-time threshold-reset guard (#1670).
+    //
+    // The PURE predicate `should_reset_threshold_on_construction` decides
+    // whether a freshly-constructed encoder may floor the dynamic threshold:
+    // only when NO live encoder holds a raise. The integration leg drives the
+    // real owner-count + threshold statics through the public helpers to prove
+    // the guard SKIPS the reset while a raise is live and ALLOWS it once the
+    // raise is released — the #1670 race fix. Holds `THRESHOLD_GUARD` (shared
+    // with the other threshold tests) so the dynamic-threshold static is not
+    // corrupted by parallel test execution, and restores both the threshold
+    // and the owner count to a clean state at the end so siblings are
+    // unaffected.
+    // ─────────────────────────────────────────────────────────────────────
+    #[test]
+    fn construction_reset_guarded_by_live_raise_owner() {
+        // Pure predicate: floor only when no raise is live.
+        assert!(
+            should_reset_threshold_on_construction(0),
+            "no live raise => construction may floor the threshold",
+        );
+        assert!(
+            !should_reset_threshold_on_construction(1),
+            "a live raise => construction must NOT floor the threshold",
+        );
+
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        // Start from a known state: floor the threshold and drain any leaked
+        // owners (a prior test that panicked mid-flight could have left one).
+        reset_threshold_to_floor();
+        while raised_threshold_owner_count() != 0 {
+            note_threshold_raise_released();
+        }
+
+        // A live encoder raises the threshold for a dual-stream session.
+        set_ready_stall_threshold_ms(800.0);
+        note_threshold_raised();
+        assert_eq!(
+            raised_threshold_owner_count(),
+            1,
+            "registering a raise must bump the owner count to 1",
+        );
+
+        // A fresh encoder is constructed WHILE the raise is live: its guarded
+        // construction-time reset must be SKIPPED so it cannot clobber the
+        // still-active 800 ms threshold back to the floor (the #1670 race).
+        reset_ready_stall_threshold_on_construction();
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            800.0,
+            "construction-time reset must be SKIPPED while a raise is live (#1670)",
+        );
+
+        // The raising encoder releases (STOP edge or Drop): count returns to 0.
+        note_threshold_raise_released();
+        assert_eq!(
+            raised_threshold_owner_count(),
+            0,
+            "releasing the raise must return the owner count to 0",
+        );
+
+        // Now a fresh single-stream construct floors cleanly (#1667 preserved).
+        reset_ready_stall_threshold_on_construction();
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            250.0,
+            "construction-time reset must floor once no raise is live",
+        );
+
+        // Restore clean state for sibling THRESHOLD_GUARD tests.
+        reset_threshold_to_floor();
+        while raised_threshold_owner_count() != 0 {
+            note_threshold_raise_released();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #1670 (pre-submit follow-up): releasing the LAST owner must floor
+    // the threshold, so a drop-while-raised encoder whose replacement already
+    // skipped its guarded construction reset does not leave the threshold pinned
+    // raised forever. This pins the floor-on-1->0 behavior in
+    // `note_threshold_raise_released`; mutating it to a plain decrement (drop the
+    // `if cur == 1 { reset_ready_stall_threshold() }`) turns this test red.
+    // ─────────────────────────────────────────────────────────────────────
+    #[test]
+    fn last_owner_release_floors_threshold() {
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+        while raised_threshold_owner_count() != 0 {
+            note_threshold_raise_released();
+        }
+
+        // Simulate the drop-while-raised race directly:
+        //   1. Old encoder raises (screen-share active), count 0 -> 1, 800 ms.
+        set_ready_stall_threshold_ms(800.0);
+        note_threshold_raised();
+        //   2. Replacement encoder constructs WHILE the raise is live: its
+        //      guarded reset is skipped (count > 0), so it leaves 800 ms in place
+        //      and does NOT register its own raise (single-stream camera).
+        reset_ready_stall_threshold_on_construction();
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            800.0,
+            "replacement construct must not clobber the live raise (#1670)",
+        );
+        //   3. Old encoder is dropped before its STOP edge: its `Drop` releases
+        //      the LAST owner (count 1 -> 0). There is NO later constructor to
+        //      floor the threshold, so this release itself must floor it.
+        note_threshold_raise_released();
+        assert_eq!(
+            raised_threshold_owner_count(),
+            0,
+            "last release returns the owner count to 0",
+        );
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            250.0,
+            "releasing the LAST owner must floor the threshold so a \
+             dropped-while-raised encoder cannot pin it raised (#1670)",
+        );
+
+        // A non-final release (2 -> 1) must NOT floor: a second concurrent raising
+        // encoder still wants the raise held.
+        set_ready_stall_threshold_ms(800.0);
+        note_threshold_raised();
+        note_threshold_raised();
+        assert_eq!(raised_threshold_owner_count(), 2, "two live raisers");
+        note_threshold_raise_released();
+        assert_eq!(
+            raised_threshold_owner_count(),
+            1,
+            "one raiser remains after a 2 -> 1 release",
+        );
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            800.0,
+            "a non-final release (2 -> 1) must NOT floor: the surviving raiser \
+             still holds the raise",
+        );
+
+        // Restore clean state for sibling THRESHOLD_GUARD tests.
+        reset_threshold_to_floor();
+        while raised_threshold_owner_count() != 0 {
+            note_threshold_raise_released();
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Issue #1670 (pre-submit follow-up, caught by Codex): when two camera
+    // encoders overlap during a Host remount while screen-sharing, each owns its
+    // own `screen_sharing_active` flag, so ONE encoder can hit its screen-STOP
+    // edge (releasing 2 -> 1) while the OTHER still holds a raise. The STOP edge
+    // therefore must NOT floor the threshold unconditionally — it must route the
+    // floor through the owner release, which floors ONLY on the last (1 -> 0)
+    // release. This test models that exact two-owner STOP sequence: the first
+    // STOP-release must leave the threshold RAISED (the surviving dual-stream
+    // encoder still needs it); only the second STOP-release floors. Reintroducing
+    // an unconditional `reset_ready_stall_threshold()` on the STOP edge (the
+    // original bug) is what `note_threshold_raise_released`'s 1->0 guard prevents,
+    // and this test pins the 2->1-stays-raised half specifically.
+    // ─────────────────────────────────────────────────────────────────────
+    #[test]
+    fn overlapping_encoder_stop_does_not_floor_while_a_raise_remains() {
+        let _tguard = THRESHOLD_GUARD.lock().unwrap();
+        reset_threshold_to_floor();
+        while raised_threshold_owner_count() != 0 {
+            note_threshold_raise_released();
+        }
+
+        // Two overlapping encoders are both screen-sharing: each registered its
+        // raise on its own rising edge. Count == 2, threshold raised to 800 ms.
+        set_ready_stall_threshold_ms(800.0);
+        note_threshold_raised();
+        note_threshold_raised();
+        assert_eq!(raised_threshold_owner_count(), 2, "two overlapping raisers");
+
+        // Encoder A hits its screen-STOP edge: it releases its raise (2 -> 1). The
+        // STOP edge routes the floor through this release, which must NOT floor
+        // because encoder B still holds a raise. (Before the fix, the STOP edge
+        // floored unconditionally here and clobbered B's live 800 ms threshold.)
+        note_threshold_raise_released();
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            800.0,
+            "encoder A's STOP-release (2 -> 1) must NOT floor while encoder B \
+             still holds a raise — the surviving dual-stream encoder needs 800 ms",
+        );
+
+        // Encoder B then hits its own STOP edge (1 -> 0): now the last owner is
+        // gone and the threshold floors to 250 ms.
+        note_threshold_raise_released();
+        assert_eq!(
+            ready_stall_threshold_ms(),
+            250.0,
+            "the LAST STOP-release (1 -> 0) floors the threshold",
+        );
+
+        // Restore clean state for sibling THRESHOLD_GUARD tests.
+        reset_threshold_to_floor();
+        while raised_threshold_owner_count() != 0 {
+            note_threshold_raise_released();
+        }
     }
 }

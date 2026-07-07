@@ -144,7 +144,7 @@ test.describe("Screen-share state transitions", () => {
       const screenShareBtn = page.locator(
         '.video-controls-container button[title="Screen Share"], ' +
           '.video-controls-container button[title="Share Screen"], ' +
-          ".video-controls-container .controls-secondary button:first-child",
+          ".video-controls-container .action-bar-slot-wrapper.slot-secondary button:first-child",
       );
 
       // Button should be visible and enabled initially

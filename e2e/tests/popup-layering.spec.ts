@@ -185,6 +185,46 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
     await expect(page.locator(".glass-select-menu")).not.toBeVisible({ timeout: 3_000 });
   });
 
+  test("clicking Action Bar in dock menu closes peer list", async ({ page }) => {
+    await joinMeeting(page, "actionbar_closes_peerlist");
+
+    await clickPeerListButton(page);
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    await openDockMenu(page);
+    // Dock menu opening alone must NOT close the peer list
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/);
+
+    const actionBarOption = page.locator(".glass-select-menu .glass-select-option", {
+      hasText: "Action Bar",
+    });
+    await actionBarOption.click();
+
+    await expect(page.locator("#peer-list-container")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("clicking Action Bar in dock menu closes diagnostics", async ({ page }) => {
+    await joinMeeting(page, "actionbar_closes_diag");
+
+    await clickDiagnosticsButton(page);
+    await expect(page.locator("#diagnostics-sidebar")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    await openDockMenu(page);
+
+    const actionBarOption = page.locator(".glass-select-menu .glass-select-option", {
+      hasText: "Action Bar",
+    });
+    await actionBarOption.click();
+
+    await expect(page.locator("#diagnostics-sidebar")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+  });
+
   test("clicking outside the mock-peers popover closes it", async ({ page }) => {
     await joinMeeting(page, "click_outside_mock_peers");
 

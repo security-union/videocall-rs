@@ -403,6 +403,65 @@ export async function healDownlink(): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// WS transport SEVER / RESTORE — a per-client reconnect primitive (WS only).
+//
+// Toggling the `ws-downlink` proxy's `enabled` flag severs a single client's
+// media transport and then lets it reconnect — something netsim (loss-only)
+// and a bandwidth toxic (delays, never drops) cannot do:
+//
+//   - `enabled:false` closes every connection through the proxy and refuses new
+//     ones. For a context routed via `routeDownlinkThroughProxy`, its media WS
+//     closes → the client's `on_connection_lost` fires → `schedule_reconnect`
+//     retries the still-disabled proxied URL, so the client stays offline.
+//   - `enabled:true` lets the next retry succeed → the client reconnects and its
+//     `on_connected` callback re-fires, without remounting the meeting view.
+//
+// WS-only: the context must first be pinned + routed to WS via
+// `routeDownlinkThroughProxy`. Requires the `impair` compose profile.
+// ---------------------------------------------------------------------------
+
+/**
+ * Set the `ws-downlink` proxy's `enabled` flag. Disabling severs every
+ * connection through it (a real transport drop for a routed context);
+ * re-enabling lets subsequent dials succeed. Asserts the proxy exists first so
+ * a missing `impair` profile fails loud rather than silently no-op'ing.
+ */
+async function setWsProxyEnabled(enabled: boolean): Promise<void> {
+  await assertProxyUp();
+  const res = await toxiproxyFetch(`/proxies/${WS_PROXY_NAME}`, {
+    method: "POST",
+    body: { enabled },
+  });
+  if (!res.ok) {
+    throw new Error(
+      `Failed to set '${WS_PROXY_NAME}' enabled=${enabled} (HTTP ${res.status}): ${await res.text()}`,
+    );
+  }
+}
+
+/**
+ * Sever the media transport of the context routed through the `ws-downlink`
+ * proxy (see {@link routeDownlinkThroughProxy}). The client detects the drop
+ * and enters its reconnect backoff, retrying the (still-disabled) proxied URL
+ * and staying disconnected until {@link restoreWsTransport} is called.
+ *
+ * MUST be preceded by `routeDownlinkThroughProxy(ctx)` on the target context —
+ * otherwise the client connects straight to the relay and this is a no-op on
+ * its transport.
+ */
+export async function severWsTransport(): Promise<void> {
+  await setWsProxyEnabled(false);
+}
+
+/**
+ * Re-enable the `ws-downlink` proxy so the severed client's next backoff
+ * attempt reconnects, re-firing the media client's `on_connected` callback.
+ */
+export async function restoreWsTransport(): Promise<void> {
+  await setWsProxyEnabled(true);
+}
+
+// ---------------------------------------------------------------------------
 // netsim: client-side per-TAB inbound packet loss (WS + WT). See the header
 // "WT path" section for the full mechanism and semantics.
 // ---------------------------------------------------------------------------
@@ -419,6 +478,12 @@ export const DEFAULT_NETSIM_DOWNLINK_PROFILE = "crushed_downlink";
 interface VcNetsim {
   install(profile: string, direction: "up" | "down"): boolean;
   clear(): void;
+  /** #1398: bump the WT uplink-saturation counter (slow `ready()`) by n. */
+  bumpUplinkStall?(n: number): boolean;
+  /** #1398: bump the WS send-buffer drop counter by n. */
+  bumpWsDrop?(n: number): boolean;
+  /** #1616: bump the WT write-drop (teardown) counter by n. */
+  bumpWtDrop?(n: number): boolean;
 }
 
 declare global {

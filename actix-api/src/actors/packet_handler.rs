@@ -1048,6 +1048,35 @@ mod tests {
     }
 
     #[test]
+    fn test_classify_meeting_packet_as_dropped() {
+        // #1704: a client-sent MEETING packet is always forged — MEETING events
+        // (HOST_MUTE_PARTICIPANT, MEETING_ENDED, etc.) are server-authoritative,
+        // published exclusively by meeting-api over NATS. This drop became
+        // LOAD-BEARING for a SECOND consumer in #1703 (the #1202 membership
+        // mirror): that PR widened the mirror's NATS subject gate to also observe
+        // the receiver's own per-session subject `room.{room}.{self}` — a subject a
+        // client CAN publish to. That widening is safe ONLY because this guard
+        // drops every client-authored `PacketType::MEETING` packet before it can
+        // reach NATS, so any `PacketType::MEETING` + `SYSTEM_USER_ID` packet seen on
+        // that subject is necessarily server-authored. Remove this arm and the
+        // widening silently becomes a real attack surface: a malicious participant
+        // could plant inert→Stage-B-counted `Remote` rows, un-pinning a publisher's
+        // simulcast union = bandwidth amplification. Symmetric with the CONGESTION,
+        // LAYER_HINT, and DOWNLINK_CONGESTION drops above, mirroring the #1219
+        // trust-boundary reasoning. BOTH the ws and wt paths route through the
+        // shared `SessionLogic::handle_inbound` → `classify_packet`, so one test on
+        // the shared `classify_packet` is sufficient. This test pins that drop:
+        // deleting the MEETING arm in `classify_packet` must fail here.
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+    }
+
+    #[test]
     fn test_classify_keyframe_request() {
         // Build a KEYFRAME_REQUEST aimed at "alice" so we can also verify
         // that the inner MediaPacket.user_id is propagated through to the

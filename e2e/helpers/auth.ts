@@ -43,7 +43,10 @@ interface SessionCookieOptions {
  * scopes to `.preview.videocall.fnxlabs.com`, not the broader
  * `.videocall.fnxlabs.com`.
  */
-const PARENT_COOKIE_SUFFIXES: readonly string[] = [
+// `export`ed for unit testing (see `bots-app/src/resolve-cookie-domain.test.ts`),
+// which pins the full host -> cookie-domain table. The sole production consumer
+// remains `injectSessionCookie` below.
+export const PARENT_COOKIE_SUFFIXES: readonly string[] = [
   ".preview.videocall.fnxlabs.com",
   ".videocall.fnxlabs.com",
   ".videocall.conceptcar7.com",
@@ -65,7 +68,8 @@ const PARENT_COOKIE_SUFFIXES: readonly string[] = [
  * suffix and the browser would reject the cookie). This preserves the existing
  * single-host behavior for local Playwright e2e and OSS targets.
  */
-function resolveCookieDomain(hostname: string): string {
+// `export`ed for unit testing (see `bots-app/src/resolve-cookie-domain.test.ts`).
+export function resolveCookieDomain(hostname: string): string {
   for (const suffix of PARENT_COOKIE_SUFFIXES) {
     // `endsWith(suffix)` requires at least one label in front of the suffix
     // (the leading dot guarantees `hostname !== suffix.slice(1)`), so a bare

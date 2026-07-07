@@ -527,8 +527,8 @@ pub fn GuestJoinPage(id: String) -> Element {
                 let name = input_value();
                 rsx! {
                     div { style: "position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; background: {theme_color::BG};",
-                        div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: 1rem;" }
-                        p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: 1rem;",
+                        div { class: "loading-spinner", style: "width: 40px; height: 40px; margin-bottom: var(--space-4);" }
+                        p { style: "color: {theme_color::TEXT_PRIMARY}; font-size: var(--fs-7);",
                             "Joining as guest: "
                             strong { "{name}" }
                             "..."

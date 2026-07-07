@@ -257,7 +257,8 @@ pub use connection::install_netsim_window_hook;
 pub use decode::{
     create_audio_peer_decoder, max_layers_for_kind, quality_state, AudioPeerDecoderTrait,
     DegradeReason, KindLayerBounds, PeerDecodeManager, PeerDeviceInfo, PeerReceiveDiag,
-    PrefMediaKind, QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot, VideoPeerDecoder,
+    PrefMediaKind, QualityState, ReceiveLayerBounds, ReceivedLayerSnapshot, TileHint,
+    VideoPeerDecoder,
 };
 pub use encode::{
     create_microphone_encoder, CameraEncoder, LiveQualitySnapshot, MicrophoneEncoderTrait,

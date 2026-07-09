@@ -18,6 +18,9 @@
 
 use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
+use crate::components::media_metrics_overlay::{
+    media_metrics_overlay, MediaMetricsOverlay, MediaMetricsOverlayCtx,
+};
 use crate::components::performance_settings::{
     load_performance_preference, load_receive_preference, preference_to_encoder_bounds,
     save_performance_preference, save_receive_preference, DiagnosticsReader, KindReceivePref,
@@ -1152,6 +1155,33 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
+    // Issue 1768: SELF-tile media-metrics overlay (the local SENDING metrics).
+    // The local self-view is this component's `.self-camera`, NOT a grid PeerTile
+    // (the grid filters out the local session — attendants.rs), so the sending
+    // overlay is rendered HERE, sourced from the live send snapshot
+    // (`LiveQualitySnapshot`: send resolution / target fps / audio send kbps).
+    // Built only when the diagnostics "Show media metrics on tiles" checkbox is
+    // on; `None` while the camera is off (the snapshot is camera-gated), so it
+    // shows only while publishing video. It refreshes at Host's natural
+    // re-render cadence rather than on a forced timer — send metrics are
+    // near-constant and a per-frame/1 Hz timer would tax low-power devices.
+    let self_metrics_overlay: Option<MediaMetricsOverlay> = {
+        let enabled = try_use_context::<MediaMetricsOverlayCtx>()
+            .map(|c| (c.0)())
+            .unwrap_or(false);
+        if enabled {
+            (read_quality_snapshot.0)().map(|snap| MediaMetricsOverlay {
+                is_self: true,
+                resolution: (snap.video_width > 0 && snap.video_height > 0)
+                    .then_some((snap.video_width, snap.video_height)),
+                fps: (snap.video_fps > 0).then_some(snap.video_fps as f64),
+                audio_kbps: (snap.audio_kbps > 0).then_some(snap.audio_kbps),
+            })
+        } else {
+            None
+        }
+    };
+
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
         // The camera encoder attaches srcObject via JS; if Dioxus recreates
@@ -1166,6 +1196,8 @@ pub fn Host(
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
+            // Issue 1768: SENDING-metrics overlay on the local self-view.
+            {media_metrics_overlay(self_metrics_overlay.as_ref())}
         }
         // Always-mounted screen share preview — toggled via style so the element
         // exists in the DOM before attach_screen_preview() runs.

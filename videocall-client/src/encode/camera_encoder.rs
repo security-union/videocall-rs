@@ -159,7 +159,7 @@ use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
     simulcast_layers, AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD,
-    PERIODIC_KEYFRAME_MAX_INTERVAL_MS, VIDEO_QUALITY_TIERS,
+    PERIODIC_KEYFRAME_MAX_INTERVAL_MS, SIMULCAST_LAYER_FPS_THROTTLE_SLACK, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -387,6 +387,17 @@ struct LayerEncoder {
     tier_h: u32,
     /// Cached bitrate (bps) last applied to this layer's encoder.
     local_bitrate: u32,
+    /// Minimum wall-clock gap (ms) between two encodes for this layer, derived
+    /// from the layer's simulcast rung `target_fps` (issue #1768). `0.0` on the
+    /// single-stream path (no per-layer fps cap — the stream follows the
+    /// capture/adaptive cadence). Simulcast layers use it to DROP frames that
+    /// arrive faster than the rung's fps (real-time over smoothness — never
+    /// queued); keyframes bypass the cap so every layer's GOP stays coherent.
+    min_encode_interval_ms: f64,
+    /// Wall-clock time (ms, `performance.now()` domain) of this layer's last
+    /// encode. Seeded to `NEG_INFINITY` so the first frame after (re)build always
+    /// encodes. Drives the [`min_encode_interval_ms`] frame-drop throttle.
+    last_encode_ms: f64,
     /// Kept alive so the JS output callback stays valid (see struct doc).
     _output_closure: Closure<dyn FnMut(JsValue)>,
     /// Kept alive so the JS error callback stays valid (see struct doc).
@@ -546,8 +557,11 @@ pub struct CameraEncoder {
     /// [`EncoderBitrateController::observe_encoder_queue_depth`]. The encode loop
     /// owns the `VideoEncoder`s and the control loop owns the controller, so this
     /// atomic is the borrow-safe bridge between the two tasks — neither borrows
-    /// the other's state. **Stage 1: the controller only stores this value (no
-    /// shed/tier effect), so it is observability-only.**
+    /// the other's state. **This is NOT observability-only (issue #1108, Phase
+    /// B):** the AQ control loop maps the sampled depth through the controller's
+    /// `backpressure_decision` hysteresis (the HIGH/CLEAR sustain/stabilization
+    /// timers) into a gradual video tier step-down/up — i.e. a simulcast
+    /// top-layer shed/restore under sustained encode backpressure.
     shared_encoder_queue_depth: Rc<AtomicU32>,
     /// Relay layer-union hint for this publisher's VIDEO ladder (issue #1108,
     /// Stage 3). The relay tracks the MAX simulcast layer ANY receiver currently
@@ -683,6 +697,38 @@ const SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = videocall_aq::constants::SIMULCAST_M
 /// needs a live `VideoCallClient`).
 fn clamp_layer_count(max_layers: u32) -> u32 {
     max_layers.clamp(1, SIMULCAST_MAX_SUPPORTED_LAYERS)
+}
+
+/// Per-layer framerate-cap decision for the simulcast encode throttle (issue
+/// #1768). Returns `true` if the layer should encode THIS frame, `false` to
+/// DROP it (real-time over smoothness — a dropped frame is never queued, so the
+/// layer always encodes the newest eligible frame rather than a backlog).
+///
+/// A frame is encoded when ANY of:
+///   * `want_keyframe` — a periodic GOP or PLI keyframe must reach EVERY layer
+///     so each layer's GOP stays coherent; keyframes are never dropped. Because
+///     the keyframe decision is shared across layers, all layers keyframe on the
+///     same source frame and the shared ~5s cadence is preserved.
+///   * `min_interval_ms <= 0.0` — no cap (the single-stream path passes 0.0).
+///   * at least `(1 - SIMULCAST_LAYER_FPS_THROTTLE_SLACK) * min_interval_ms` has
+///     elapsed since `last_encode_ms` — the slack lets a frame arriving slightly
+///     early still count, so a rung fed by a faster capture lands near its
+///     target fps instead of quantizing down (see the constant's doc).
+///
+/// `last_encode_ms == f64::NEG_INFINITY` (the post-(re)build seed) makes the
+/// elapsed term `+∞`, so the first frame after a build/restart always encodes.
+/// Pure (no clock / WebCodecs) so it is host-unit-testable off-wasm.
+fn should_encode_layer_frame(
+    now_ms: f64,
+    last_encode_ms: f64,
+    min_interval_ms: f64,
+    want_keyframe: bool,
+) -> bool {
+    if want_keyframe || min_interval_ms <= 0.0 {
+        return true;
+    }
+    let threshold = min_interval_ms * (1.0 - SIMULCAST_LAYER_FPS_THROTTLE_SLACK);
+    now_ms - last_encode_ms >= threshold
 }
 
 /// Convert the user SEND layer-ceiling atomic (a `u32` layer COUNT, with
@@ -899,7 +945,7 @@ fn shed_reason(prev: usize, cur: usize) -> &'static str {
 /// resolution (their bitrate is the zero shed marker and is not meaningful).
 ///
 /// The returned string is the full log message, e.g.
-/// `Simulcast layer change: active 3->2 (reason=shed-under-load) | [0] 640x360 ~390kbps ACTIVE | ...`.
+/// `Simulcast layer change: active 3->2 (reason=shed-under-load) | [0] 320x180 ~100kbps ACTIVE | ...`.
 ///
 /// Pure function (no atomics / DOM / `LayerEncoder`) so the exact emitted text
 /// is host-testable and byte-stable against the encode loop. `prev`/`cur` are
@@ -2927,42 +2973,68 @@ impl CameraEncoder {
                     //    `tier_h` are recorded so the per-frame loop can re-fit
                     //    against THIS layer's box when the source dims change.
                     //    The per-layer bitrate still adapts (tier ideal here).
-                    let (layer_w, layer_h, tier_w, tier_h, init_bitrate_bps) = if simulcast {
-                        let tiers = simulcast_layers(n_layers);
-                        let tier = &tiers[layer_idx];
-                        // Seed the first GOP at the aspect-fitted dims, not the
-                        // raw 16:9 tier dims. `width`/`height` are the native
-                        // track dims read up front (the true source aspect).
-                        let (fit_w, fit_h) = fit_within_preserving_aspect(
-                            width as u32,
-                            height as u32,
-                            tier.max_width,
-                            tier.max_height,
-                        );
-                        (
-                            fit_w,
-                            fit_h,
-                            tier.max_width,
-                            tier.max_height,
-                            tier.ideal_bitrate_kbps as f64 * 1000.0,
-                        )
-                    } else {
-                        // Single-stream: native resolution; the tier_w/tier_h
-                        // fields are unused on this path (the legacy loop fits
-                        // against the shared `local_tier_max_*`), so mirror the
-                        // layer dims to keep them well-defined.
-                        (
-                            width as u32,
-                            height as u32,
-                            width as u32,
-                            height as u32,
-                            current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0,
-                        )
-                    };
+                    // `layer_fps` is `Some(target_fps)` for a simulcast rung and
+                    // `None` on the single-stream path. It drives BOTH the encoder
+                    // framerate hint (rate-control budgets bitrate at this fps) and
+                    // the per-layer frame-drop throttle (issue #1768). Resolution
+                    // and fps are set independently: the fps comes from the rung's
+                    // `target_fps`, the dims from `fit_within_preserving_aspect`.
+                    let (layer_w, layer_h, tier_w, tier_h, init_bitrate_bps, layer_fps) =
+                        if simulcast {
+                            let tiers = simulcast_layers(n_layers);
+                            let tier = &tiers[layer_idx];
+                            // Seed the first GOP at the aspect-fitted dims, not the
+                            // raw 16:9 tier dims. `width`/`height` are the native
+                            // track dims read up front (the true source aspect).
+                            let (fit_w, fit_h) = fit_within_preserving_aspect(
+                                width as u32,
+                                height as u32,
+                                tier.max_width,
+                                tier.max_height,
+                            );
+                            (
+                                fit_w,
+                                fit_h,
+                                tier.max_width,
+                                tier.max_height,
+                                tier.ideal_bitrate_kbps as f64 * 1000.0,
+                                Some(tier.target_fps),
+                            )
+                        } else {
+                            // Single-stream: native resolution; the tier_w/tier_h
+                            // fields are unused on this path (the legacy loop fits
+                            // against the shared `local_tier_max_*`), so mirror the
+                            // layer dims to keep them well-defined. No per-layer fps
+                            // cap — the stream follows the capture/adaptive cadence.
+                            (
+                                width as u32,
+                                height as u32,
+                                width as u32,
+                                height as u32,
+                                current_bitrate.load(Ordering::Relaxed) as f64 * 1000.0,
+                                None,
+                            )
+                        };
+                    // Per-layer frame-drop interval (ms). 0.0 = no cap (single
+                    // stream); simulcast rungs cap at their rung fps (issue #1768).
+                    let min_encode_interval_ms =
+                        layer_fps.map(|fps| 1000.0 / fps as f64).unwrap_or(0.0);
                     let config =
                         VideoEncoderConfig::new(get_video_codec_string(), layer_h, layer_w);
                     config.set_bitrate(init_bitrate_bps);
                     config.set_latency_mode(LatencyMode::Realtime);
+                    // Framerate hint: tell the encoder's rate controller each rung's
+                    // target fps so it budgets bitrate-per-frame correctly (a 7 fps
+                    // rung must not be rate-budgeted as if it were 30 fps). web-sys'
+                    // `VideoEncoderConfig` has no `framerate` setter, so set it via
+                    // `Reflect` (same pattern as the screen encoder's `bitrateMode`).
+                    if let Some(fps) = layer_fps {
+                        let _ = Reflect::set(
+                            &config,
+                            &JsValue::from_str("framerate"),
+                            &JsValue::from_f64(fps as f64),
+                        );
+                    }
 
                     if let Err(e) = video_encoder.configure(&config) {
                         CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
@@ -2984,6 +3056,8 @@ impl CameraEncoder {
                         tier_w,
                         tier_h,
                         local_bitrate: init_bitrate_bps as u32,
+                        min_encode_interval_ms,
+                        last_encode_ms: f64::NEG_INFINITY,
                         _output_closure: output_closure,
                         _error_closure: error_closure,
                     })
@@ -3069,11 +3143,12 @@ impl CameraEncoder {
                 // single shared tier atomics (the AQ controller is per-publisher
                 // in PR A; per-layer AQ lands in PR B).
 
-                // The `low` simulcast rung (640×360 / ideal 400 kbps), sourced
-                // from the AQ ladder's single source of truth — `simulcast_layers(1)`
-                // resolves to exactly `[low]`. Used by the single-layer >3-peer
-                // pin (issue #1136) below as the ceiling on the single stream; no
-                // magic numbers. Only meaningful for n_layers == 1.
+                // The `low` simulcast rung (320×180 / ideal 120 kbps, issue
+                // #1768), sourced from the AQ ladder's single source of truth —
+                // `simulcast_layers(1)` resolves to exactly `[low]`. Used by the
+                // single-layer >3-peer pin (issue #1136) below as the ceiling on
+                // the single stream; no magic numbers. Only meaningful for
+                // n_layers == 1.
                 let low_rung = &simulcast_layers(1)[0];
                 let low_rung_w = low_rung.max_width;
                 let low_rung_h = low_rung.max_height;
@@ -3676,6 +3751,34 @@ impl CameraEncoder {
                                     continue;
                                 }
 
+                                // Per-layer framerate cap (issue #1768): a simulcast
+                                // rung encodes at most its `target_fps`. DROP (skip)
+                                // this frame for the layer if it arrived faster than
+                                // the rung's frame interval — real-time over
+                                // smoothness, never queued. A keyframe (periodic GOP
+                                // or PLI) is NEVER dropped, so every layer's GOP
+                                // stays coherent and the shared keyframe cadence is
+                                // preserved. Single stream is never gated here
+                                // (`simulcast == false` short-circuits, and its
+                                // `min_encode_interval_ms` is 0.0 regardless).
+                                if simulcast
+                                    && !should_encode_layer_frame(
+                                        now_ms,
+                                        layer.last_encode_ms,
+                                        layer.min_encode_interval_ms,
+                                        want_keyframe,
+                                    )
+                                {
+                                    continue;
+                                }
+                                // Passed the cap (or it's a keyframe): this layer
+                                // WILL encode this frame. Anchor the next interval to
+                                // the ACTUAL encode time (drift-free) rather than a
+                                // fixed grid. Only simulcast layers track this.
+                                if simulcast {
+                                    layer.last_encode_ms = now_ms;
+                                }
+
                                 // Dimension-change handling (rotation, camera
                                 // switch). Both paths now treat the tier as a
                                 // BOUNDING BOX and fit the source frame inside it
@@ -3760,6 +3863,24 @@ impl CameraEncoder {
                                         );
                                         layer.config.set_bitrate(layer.local_bitrate as f64);
                                         layer.config.set_latency_mode(LatencyMode::Realtime);
+                                        // Re-apply the per-layer framerate hint
+                                        // (issue #1768): a fresh config drops it, so
+                                        // without this the rung's rate controller
+                                        // would revert to a default-fps assumption
+                                        // after a dim change (rotation / camera
+                                        // switch). Recovered from the throttle
+                                        // interval (= 1000/target_fps); only
+                                        // simulcast layers reach this branch, so the
+                                        // interval is always > 0 here.
+                                        if layer.min_encode_interval_ms > 0.0 {
+                                            let _ = Reflect::set(
+                                                &layer.config,
+                                                &JsValue::from_str("framerate"),
+                                                &JsValue::from_f64(
+                                                    1000.0 / layer.min_encode_interval_ms,
+                                                ),
+                                            );
+                                        }
                                         if let Err(e) = layer.encoder.configure(&layer.config) {
                                             CAMERA_ENCODER_ERRORS_CONFIGURE_FATAL
                                                 .fetch_add(1, Ordering::Relaxed);
@@ -4008,10 +4129,10 @@ mod tests {
         encoders_to_build, format_layer_transition, frame_is_healthy, initial_active_layer_count,
         is_fatal_encoder_error_message, keyframe_tick_decision, layer_ceiling_to_count,
         loop_is_superseded, next_single_layer_pin, periodic_keyframe_due, record_camera_restart,
-        shed_reason, should_pin_single_layer_low, should_teardown_shed_layer,
-        video_at_floor_on_tick, wt_drop_step_down_decision, wt_saturation_step_down_decision,
-        KeyframeTickInput, LayerView, SimulcastLayerInfo, FORCED_KEYFRAME_COOLDOWN_MS,
-        SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
+        shed_reason, should_encode_layer_frame, should_pin_single_layer_low,
+        should_teardown_shed_layer, video_at_floor_on_tick, wt_drop_step_down_decision,
+        wt_saturation_step_down_decision, KeyframeTickInput, LayerView, SimulcastLayerInfo,
+        FORCED_KEYFRAME_COOLDOWN_MS, SHED_TEARDOWN_DWELL_MS, SIMULCAST_MAX_SUPPORTED_LAYERS,
         SINGLE_LAYER_LOW_PIN_ENGAGE_THRESHOLD, SINGLE_LAYER_LOW_PIN_RELEASE_THRESHOLD,
     };
     use crate::adaptive_quality_constants::{
@@ -4212,9 +4333,10 @@ mod tests {
         // sourced from the SAME ladder the encode loop builds layers from
         // (`simulcast_layers(3)` == [low, standard, hd]), so they can never drift
         // from a hand-hardcoded copy. The per-layer bitrates are RUNTIME values
-        // (the AQ controller's live `local_bitrate`, here below the tier ideals
-        // 400/900) — they are an input to the helper, not a ladder constant, so
-        // we pass them explicitly. The shed top layer (id 2) shows no bitrate.
+        // (the AQ controller's live `local_bitrate`, here below the issue #1768
+        // tier ideals 120/350) — they are an input to the helper, not a ladder
+        // constant, so we pass them explicitly. The shed top layer (id 2) shows
+        // no bitrate.
         let ladder = simulcast_layers(3);
         assert_eq!(
             ladder.len(),
@@ -4226,13 +4348,13 @@ mod tests {
                 id: 0,
                 w: ladder[0].max_width,
                 h: ladder[0].max_height,
-                bitrate_bps: 390_000,
+                bitrate_bps: 100_000,
             },
             LayerView {
                 id: 1,
                 w: ladder[1].max_width,
                 h: ladder[1].max_height,
-                bitrate_bps: 870_000,
+                bitrate_bps: 300_000,
             },
             LayerView {
                 id: 2,
@@ -4248,8 +4370,8 @@ mod tests {
         // silently diverging from a literal.
         let expected = format!(
             "Simulcast layer change: active 3->2 (reason=shed-under-load) | \
-             [0] {w0}x{h0} ~390kbps ACTIVE | \
-             [1] {w1}x{h1} ~870kbps ACTIVE | \
+             [0] {w0}x{h0} ~100kbps ACTIVE | \
+             [1] {w1}x{h1} ~300kbps ACTIVE | \
              [2] {w2}x{h2} SHED",
             w0 = ladder[0].max_width,
             h0 = ladder[0].max_height,
@@ -4258,13 +4380,13 @@ mod tests {
             w2 = ladder[2].max_width,
             h2 = ladder[2].max_height,
         );
-        // Spot-check the literal too: with today's ladder this is exactly the
-        // string in the issue. (If the ladder changes, the `expected` above is
-        // the authority; this literal documents the current shape.)
+        // Spot-check the literal too: with today's ladder (issue #1768) this is
+        // exactly the string the encode loop logs. (If the ladder changes, the
+        // `expected` above is the authority; this literal documents the shape.)
         assert_eq!(
             expected,
             "Simulcast layer change: active 3->2 (reason=shed-under-load) | \
-             [0] 640x360 ~390kbps ACTIVE | [1] 960x540 ~870kbps ACTIVE | [2] 1280x720 SHED"
+             [0] 320x180 ~100kbps ACTIVE | [1] 640x360 ~300kbps ACTIVE | [2] 1280x720 SHED"
         );
 
         assert_eq!(format_layer_transition(3, 2, &layers), expected);
@@ -4279,15 +4401,15 @@ mod tests {
         let layers = [
             LayerView {
                 id: 0,
-                w: 640,
-                h: 360,
-                bitrate_bps: 400_000,
+                w: 320,
+                h: 180,
+                bitrate_bps: 100_000,
             },
             LayerView {
                 id: 1,
-                w: 960,
-                h: 540,
-                bitrate_bps: 900_000,
+                w: 640,
+                h: 360,
+                bitrate_bps: 300_000,
             },
             LayerView {
                 id: 2,
@@ -4298,7 +4420,7 @@ mod tests {
         ];
         let s = format_layer_transition(3, 2, &layers);
         assert!(
-            s.contains("[1] 960x540 ~900kbps ACTIVE"),
+            s.contains("[1] 640x360 ~300kbps ACTIVE"),
             "id 1 < 2 is ACTIVE"
         );
         assert!(s.contains("[2] 1280x720 SHED"), "id 2 == active is SHED");
@@ -4315,15 +4437,15 @@ mod tests {
         let layers = [
             LayerView {
                 id: 0,
-                w: 640,
-                h: 360,
-                bitrate_bps: 400_000,
+                w: 320,
+                h: 180,
+                bitrate_bps: 120_000,
             },
             LayerView {
                 id: 1,
-                w: 960,
-                h: 540,
-                bitrate_bps: 900_000,
+                w: 640,
+                h: 360,
+                bitrate_bps: 350_000,
             },
             LayerView {
                 id: 2,
@@ -4335,9 +4457,58 @@ mod tests {
         assert_eq!(
             format_layer_transition(2, 3, &layers),
             "Simulcast layer change: active 2->3 (reason=restore) | \
-             [0] 640x360 ~400kbps ACTIVE | [1] 960x540 ~900kbps ACTIVE | \
+             [0] 320x180 ~120kbps ACTIVE | [1] 640x360 ~350kbps ACTIVE | \
              [2] 1280x720 ~1500kbps ACTIVE"
         );
+    }
+
+    // --- issue #1768: per-layer framerate-cap throttle -------------------
+
+    #[test]
+    fn should_encode_layer_frame_keyframe_and_single_stream_always_encode() {
+        // A keyframe is NEVER dropped, even mid-interval, so every layer's GOP
+        // stays coherent (drop a keyframe and receivers on that layer freeze).
+        assert!(should_encode_layer_frame(1000.0, 995.0, 1000.0 / 7.0, true));
+        // Single stream / no cap: min_interval 0.0 => always encode, even with
+        // zero elapsed. This is the byte-identical single-stream path.
+        assert!(should_encode_layer_frame(1000.0, 1000.0, 0.0, false));
+        assert!(should_encode_layer_frame(0.0, 0.0, 0.0, false));
+    }
+
+    #[test]
+    fn should_encode_layer_frame_seed_encodes_first_frame() {
+        // NEG_INFINITY seed (the post-build/-restart value) makes the elapsed
+        // term +∞, so the first frame after any (re)build always encodes.
+        assert!(should_encode_layer_frame(
+            1000.0,
+            f64::NEG_INFINITY,
+            1000.0 / 7.0,
+            false
+        ));
+    }
+
+    #[test]
+    fn should_encode_layer_frame_drops_within_interval_encodes_after() {
+        // 7 fps rung: interval 142.857ms; with the 15% slack the threshold is
+        // ~121.4ms. A non-keyframe frame BELOW the threshold is DROPPED (real-
+        // time over smoothness); at/above it the frame is ENCODED. The 130ms
+        // case ALSO pins the slack: without it the bare interval (142.857ms)
+        // would DROP 130ms too, so removing the slack fails this assertion.
+        let interval = 1000.0 / 7.0;
+        assert!(!should_encode_layer_frame(100.0, 0.0, interval, false)); // 100 < 121.4 -> drop
+        assert!(should_encode_layer_frame(130.0, 0.0, interval, false)); // 130 >= 121.4 -> encode (needs slack)
+        assert!(should_encode_layer_frame(300.0, 0.0, interval, false)); // well past -> encode
+    }
+
+    #[test]
+    fn should_encode_layer_frame_15fps_faster_cadence_than_7fps() {
+        // 15 fps rung (interval 66.7ms, threshold ~56.7ms) encodes roughly twice
+        // as often as the 7 fps rung: 60ms elapsed ENCODES at 15fps but DROPS at
+        // 7fps. Pins that each rung's fps is applied independently of the others.
+        let fps15 = 1000.0 / 15.0;
+        let fps7 = 1000.0 / 7.0;
+        assert!(should_encode_layer_frame(60.0, 0.0, fps15, false));
+        assert!(!should_encode_layer_frame(60.0, 0.0, fps7, false));
     }
 
     #[test]

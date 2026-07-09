@@ -167,14 +167,56 @@ pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 // Simulcast Layer Catalog (issue #989, Phase 1b)
 // ---------------------------------------------------------------------------
 
-/// Indices into [`VIDEO_QUALITY_TIERS`] that define the simulcast layer ladder.
+/// The camera simulcast layer ladder — **THE tuning point** for camera
+/// simulcast (issue #1768).
 ///
 /// Simulcast (issue #989) lets a publisher encode the *same* camera feed at
 /// several fixed quality layers simultaneously, tagging each encoded chunk with
-/// a cleartext layer id. This is the **single source of truth** for which
-/// resolution/bitrate each simulcast layer uses — the layers are expressed as
-/// indices into the existing `VIDEO_QUALITY_TIERS` rather than duplicating the
-/// tier values, so there is one place to tune.
+/// a cleartext layer id. Generating and provisioning those layers costs CPU
+/// (one full encode per active layer) and uplink bandwidth (the *sum* of the
+/// active layers' bitrates). This table is the **single source of truth** for
+/// the camera simulcast ladder: to make the layers lighter or heavier, edit the
+/// rung values here and nowhere else.
+///
+/// ## Why a dedicated table (not indices into `VIDEO_QUALITY_TIERS`)
+///
+/// The simulcast ladder deliberately reaches lower and lighter than the
+/// adaptive single-stream ladder ([`VIDEO_QUALITY_TIERS`]): its base rung is
+/// `320×180 @ 7 fps`, well below that ladder's constrained-but-usable bottom.
+/// Folding these rungs into `VIDEO_QUALITY_TIERS` would either break that
+/// ladder's monotonic descent or drag its adaptive floor down for every
+/// single-stream publisher — an unrelated regression. Keeping the simulcast
+/// ladder in its own table isolates simulcast tuning from adaptive tuning while
+/// still being one obvious place to edit. The rung *labels* (`low` / `standard`
+/// / `hd`) are the simulcast layer names and are intentionally independent of
+/// the like-named adaptive tiers.
+///
+/// ## Ladder (issue #1768): lighter, resolution-independent-of-fps
+///
+/// Ordered **lowest layer first** (`layer_id` == position in the slice):
+///
+/// - layer 0 = `low`      — 320×180 @ 7 fps  / ideal ~120 kbps (constrained-net rescue)
+/// - layer 1 = `standard` — 640×360 @ 15 fps / ideal ~350 kbps
+/// - layer 2 = `hd`       — 1280×720 @ 30 fps / ideal ~1500 kbps
+///
+/// Each rung's `max_width`/`max_height` and `target_fps` are set independently:
+/// resolution and framerate do not have to move together. The framerate is
+/// delivered per-layer at encode time by dropping frames that arrive faster than
+/// the rung's `target_fps` (see `camera_encoder.rs` and
+/// [`SIMULCAST_LAYER_FPS_THROTTLE_SLACK`]).
+///
+/// ## Real-time over smoothness (issue #1768)
+///
+/// The imperative is that each encoded frame is as close to *now* as possible,
+/// even at the cost of smoothness or resolution. Two mechanisms deliver this and
+/// nothing in the capture→encode path buffers a backlog:
+///   1. Every encoder is configured `LatencyMode::Realtime` (camera + screen),
+///      so the codec never trades latency for compression efficiency.
+///   2. The per-layer framerate cap DROPS the intervening frames rather than
+///      queuing them — a layer running below the source cadence always encodes
+///      the *newest* eligible frame, never a stale backlog. Encoder-queue depth
+///      is monitored (`encode_queue_size()`), and sustained depth sheds the top
+///      layer / steps quality down instead of letting latency grow.
 ///
 /// ## These are INDEPENDENT simulcast encodes — NOT nested SVC layers
 ///
@@ -197,22 +239,59 @@ pub const DEFAULT_VIDEO_TIER_INDEX: usize = 4; // "medium"
 /// (it produces a stack and sheds from the top) — it does not make the wire
 /// layers nested.
 ///
-/// The full 3-layer ladder, ordered **lowest layer first** (`layer_id` ==
-/// position in the slice), is:
-///
-/// - layer 0 = `low`      (idx 5: 640×360 / ideal 400 kbps)
-/// - layer 1 = `standard` (idx 3: 960×540 / ideal 900 kbps)
-/// - layer 2 = `hd`       (idx 2: 1280×720 / ideal 1500 kbps)
-///
 /// Ordering lowest-first matches the receiver guard (PR A) that defaults to
 /// decoding the lowest layer (`layer_id == 0`): the base layer is the cheapest
 /// to decode and the most resilient under congestion, and dropping the **top**
 /// active layer under congestion sheds the highest-cost stream first.
-const SIMULCAST_LAYER_TIER_INDICES: &[usize] = &[5, 3, 2];
+pub const SIMULCAST_VIDEO_LAYERS: &[VideoQualityTier] = &[
+    VideoQualityTier {
+        label: "low",
+        max_width: 320,
+        max_height: 180,
+        target_fps: 7,
+        ideal_bitrate_kbps: 120,
+        min_bitrate_kbps: 60, // achievable on ~100-200 kbps constrained links
+        max_bitrate_kbps: 200,
+        keyframe_interval_frames: 35, // ~5s at 7fps; wall-clock cap guarantees ≤5s
+    },
+    VideoQualityTier {
+        label: "standard",
+        max_width: 640,
+        max_height: 360,
+        target_fps: 15,
+        ideal_bitrate_kbps: 350,
+        min_bitrate_kbps: 150,
+        max_bitrate_kbps: 600,
+        keyframe_interval_frames: 75, // ~5s at 15fps; wall-clock cap guarantees ≤5s
+    },
+    VideoQualityTier {
+        label: "hd",
+        max_width: 1280,
+        max_height: 720,
+        target_fps: 30,
+        ideal_bitrate_kbps: 1500,
+        min_bitrate_kbps: 800,
+        max_bitrate_kbps: 2000,
+        keyframe_interval_frames: 150, // ~5s at 30fps; wall-clock cap guarantees ≤5s
+    },
+];
+
+/// Per-layer framerate-cap slack for the simulcast encode throttle (issue
+/// #1768), as a fraction of the rung's nominal frame interval.
+///
+/// A simulcast layer encodes the newest source frame only once at least
+/// `(1 - SLACK) × (1000 / target_fps)` ms have elapsed since its last encode;
+/// intervening frames are DROPPED (real-time over smoothness — never queued).
+/// The slack lets a frame that arrives slightly early still count, so a 7 fps
+/// rung fed by a 30 fps capture lands near 7 fps instead of quantizing down to
+/// 6 fps (it would otherwise always wait for the 5th 33.3 ms capture tick).
+/// Keyframes (periodic GOP or a PLI) bypass the cap entirely so every layer's
+/// GOP stays coherent.
+pub const SIMULCAST_LAYER_FPS_THROTTLE_SLACK: f64 = 0.15;
 
 /// Maximum number of simulcast layers in the full ladder.
 ///
-/// Equal to `SIMULCAST_LAYER_TIER_INDICES.len()`. Mirrors
+/// Equal to `SIMULCAST_VIDEO_LAYERS.len()`. Mirrors
 /// `SIMULCAST_MAX_SUPPORTED_LAYERS` in `videocall-client`'s `camera_encoder.rs`
 /// (kept in sync deliberately — the client clamps requested layers, the AQ
 /// crate owns the tier mapping).
@@ -267,8 +346,8 @@ fn spaced_ladder_positions(n: usize, len: usize) -> Vec<usize> {
 /// Resolve the simulcast layer tiers for an `n`-layer ladder.
 ///
 /// Returns a slice of [`VideoQualityTier`] references, **lowest layer first**
-/// (index in the returned slice == `layer_id`). The mapping is derived from
-/// [`SIMULCAST_LAYER_TIER_INDICES`] via [`spaced_ladder_positions`], so it is
+/// (index in the returned slice == `layer_id`). The rungs come from
+/// [`SIMULCAST_VIDEO_LAYERS`] selected via [`spaced_ladder_positions`], so it is
 /// driven entirely by the ladder length — for the current 3-rung ladder:
 ///
 /// - `n == 1` → `[low]` (single base layer — used when simulcast is off or the
@@ -276,7 +355,7 @@ fn spaced_ladder_positions(n: usize, len: usize) -> Vec<usize> {
 ///   resolution/bitrate ADAPTIVELY in the common case, so this `low` tier is not
 ///   an unconditional override. **Exception (issue #1136):** when a single-layer
 ///   publisher is in a call with **more than 3 other peers**, `camera_encoder.rs`
-///   pins the single stream to THIS `low` rung (640×360 / low ideal) as a
+///   pins the single stream to THIS `low` rung (320×180 / low ideal) as a
 ///   ceiling — one adaptive medium-tier stream is too heavy on every receiver's
 ///   decoder at that scale. With ≤3 peers the single stream stays fully
 ///   adaptive. See the single-layer low-rung pin in `camera_encoder.rs`.
@@ -296,11 +375,12 @@ pub fn simulcast_layers(n: usize) -> &'static [VideoQualityTier] {
     fn ladder(n: usize) -> Vec<VideoQualityTier> {
         // Derive the lowest-`n` well-spaced rungs generically from the ladder
         // definition (issue #1082): no per-`n` `match` arm, so raising
-        // SIMULCAST_MAX_LAYERS requires no change here.
-        spaced_ladder_positions(n, SIMULCAST_LAYER_TIER_INDICES.len())
+        // SIMULCAST_MAX_LAYERS requires no change here. The ladder is already
+        // lowest-first, so a selected position IS the layer id (issue #1768).
+        spaced_ladder_positions(n, SIMULCAST_VIDEO_LAYERS.len())
             .into_iter()
             .map(|pos| {
-                let t = &VIDEO_QUALITY_TIERS[SIMULCAST_LAYER_TIER_INDICES[pos]];
+                let t = &SIMULCAST_VIDEO_LAYERS[pos];
                 // VideoQualityTier is Copy-able plain data; clone field-by-field
                 // so the returned vec owns 'static-compatible values.
                 VideoQualityTier {
@@ -335,12 +415,12 @@ pub fn simulcast_layers(n: usize) -> &'static [VideoQualityTier] {
 /// account for that sum, not just the per-layer tier band. We define the budget
 /// as the **sum of the active layers' tier ideals** — i.e. the bitrate the
 /// ladder was authored to fit comfortably when all `active` layers run at their
-/// nominal quality. Examples for the standard ladder (`[low, standard, hd]`,
-/// ideals 400 / 900 / 1500):
+/// nominal quality. Examples for the camera ladder (`[low, standard, hd]`,
+/// ideals 120 / 350 / 1500, issue #1768):
 ///
-/// - 1 active layer  → 400 kbps
-/// - 2 active layers → 1300 kbps
-/// - 3 active layers → 2800 kbps
+/// - 1 active layer  → 120 kbps
+/// - 2 active layers → 470 kbps
+/// - 3 active layers → 1970 kbps
 ///
 /// `active` is `active_layer_count` (the top shed layers cost nothing), so as
 /// the sender's AQ sheds the top layer under congestion the budget shrinks with
@@ -650,9 +730,15 @@ pub struct AudioQualityTier {
 
 /// Audio quality tiers, ordered from highest (index 0) to lowest.
 pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
+    // Audio ladder (issue #1768): the three named levels a receiver can select
+    // are high=48 / medium=24 / low=12 kbps; `emergency` is a publisher-only
+    // rescue rung below the receiver ladder's base, escalated under the worst
+    // links. Keep this coherent with the receiver ladder `AUDIO_LAYER_KBPS`
+    // ([12, 24, 48]) and the publisher simulcast ladder
+    // `AUDIO_SIMULCAST_LAYER_KBPS` in `microphone_encoder.rs`.
     AudioQualityTier {
         label: "high",
-        bitrate_kbps: 50,
+        bitrate_kbps: 48,
         enable_dtx: true,
         enable_fec: false,
         // No FEC at the top tier: the link is healthy, so spend no overhead.
@@ -660,7 +746,7 @@ pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
     },
     AudioQualityTier {
         label: "medium",
-        bitrate_kbps: 32,
+        bitrate_kbps: 24,
         enable_dtx: true,
         enable_fec: true, // enable FEC under moderate loss
         // First degraded tier: tell Opus to expect ~10% loss (issue #619 range).
@@ -668,17 +754,19 @@ pub const AUDIO_QUALITY_TIERS: &[AudioQualityTier] = &[
     },
     AudioQualityTier {
         label: "low",
-        bitrate_kbps: 24,
+        bitrate_kbps: 12,
         enable_dtx: true,
         enable_fec: true,
         packet_loss_perc: 15,
     },
     AudioQualityTier {
         label: "emergency",
-        bitrate_kbps: 16,
+        bitrate_kbps: 8,
         enable_dtx: true,
         enable_fec: true,
-        packet_loss_perc: 20,
+        // Deepest rescue rung (below the receiver ladder's 12 kbps base): the
+        // link is failing, so hint Opus toward maximum FEC redundancy.
+        packet_loss_perc: 25,
     },
 ];
 
@@ -2344,12 +2432,39 @@ mod tests {
     // =====================================================================
 
     #[test]
-    fn test_simulcast_layer_indices_in_bounds() {
-        for &idx in SIMULCAST_LAYER_TIER_INDICES {
+    fn test_simulcast_video_layers_valid_and_monotonic() {
+        // The dedicated camera simulcast ladder (issue #1768) is ordered
+        // lowest-first: each rung must have positive dims/fps and be
+        // non-decreasing in pixels, fps, and ideal bitrate as layer_id rises.
+        assert!(
+            !SIMULCAST_VIDEO_LAYERS.is_empty(),
+            "SIMULCAST_VIDEO_LAYERS must be non-empty"
+        );
+        for t in SIMULCAST_VIDEO_LAYERS {
             assert!(
-                idx < VIDEO_QUALITY_TIERS.len(),
-                "simulcast layer tier index {idx} out of bounds (len={})",
-                VIDEO_QUALITY_TIERS.len(),
+                t.max_width > 0 && t.max_height > 0 && t.target_fps > 0,
+                "simulcast rung '{}' must have positive dims/fps",
+                t.label
+            );
+            assert!(
+                t.min_bitrate_kbps < t.max_bitrate_kbps
+                    && t.ideal_bitrate_kbps >= t.min_bitrate_kbps
+                    && t.ideal_bitrate_kbps <= t.max_bitrate_kbps,
+                "simulcast rung '{}' bitrate band invalid",
+                t.label
+            );
+        }
+        for w in SIMULCAST_VIDEO_LAYERS.windows(2) {
+            let lo_px = w[0].max_width as u64 * w[0].max_height as u64;
+            let hi_px = w[1].max_width as u64 * w[1].max_height as u64;
+            assert!(hi_px >= lo_px, "simulcast rungs must ascend in pixels");
+            assert!(
+                w[1].target_fps >= w[0].target_fps,
+                "simulcast rungs must ascend in fps"
+            );
+            assert!(
+                w[1].ideal_bitrate_kbps >= w[0].ideal_bitrate_kbps,
+                "simulcast rungs must ascend in ideal bitrate"
             );
         }
     }
@@ -2358,8 +2473,56 @@ mod tests {
     fn test_simulcast_max_layers_matches_ladder_len() {
         assert_eq!(
             SIMULCAST_MAX_LAYERS,
-            SIMULCAST_LAYER_TIER_INDICES.len(),
+            SIMULCAST_VIDEO_LAYERS.len(),
             "SIMULCAST_MAX_LAYERS must equal the ladder length"
+        );
+    }
+
+    #[test]
+    fn test_simulcast_video_layers_exact_values() {
+        // Issue #1768: pin the retuned camera simulcast ladder through the
+        // PRODUCTION resolver (`simulcast_layers`) so reverting the ladder
+        // (e.g. back to 640×360@20 / 960×540@30 / 1280×720@30 with
+        // 400/900/1500 ideals) FAILS here. Values are (w, h, fps, ideal_kbps).
+        let l = simulcast_layers(3);
+        let got: Vec<(u32, u32, u32, u32)> = l
+            .iter()
+            .map(|t| {
+                (
+                    t.max_width,
+                    t.max_height,
+                    t.target_fps,
+                    t.ideal_bitrate_kbps,
+                )
+            })
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (320, 180, 7, 120),
+                (640, 360, 15, 350),
+                (1280, 720, 30, 1500),
+            ],
+            "camera simulcast ladder must be the issue #1768 rungs"
+        );
+        // Keyframe intervals track ~5s wall-clock at each rung's NEW fps.
+        assert_eq!(l[0].keyframe_interval_frames, 35); // 5s × 7fps
+        assert_eq!(l[1].keyframe_interval_frames, 75); // 5s × 15fps
+        assert_eq!(l[2].keyframe_interval_frames, 150); // 5s × 30fps
+    }
+
+    #[test]
+    fn test_audio_tiers_exact_bitrates() {
+        // Issue #1768: pin the retuned audio ladder (high 48 / medium 24 /
+        // low 12 kbps named levels + emergency 8 kbps rescue) so reverting to
+        // 50/32/24/16 FAILS here. Read straight from the production table.
+        let got: Vec<(&str, u32)> = AUDIO_QUALITY_TIERS
+            .iter()
+            .map(|t| (t.label, t.bitrate_kbps))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("high", 48), ("medium", 24), ("low", 12), ("emergency", 8),]
         );
     }
 
@@ -2536,13 +2699,13 @@ mod tests {
 
     #[test]
     fn test_uplink_budget_is_sum_of_active_tier_ideals() {
-        // Standard ladder [low, standard, hd] = ideals 400 / 900 / 1500.
+        // Camera ladder [low, standard, hd] = ideals 120 / 350 / 1500 (#1768).
         let tiers = simulcast_layers(3);
-        assert_eq!(uplink_budget_kbps(tiers, 1), 400.0);
-        assert_eq!(uplink_budget_kbps(tiers, 2), 1300.0);
-        assert_eq!(uplink_budget_kbps(tiers, 3), 2800.0);
+        assert_eq!(uplink_budget_kbps(tiers, 1), 120.0);
+        assert_eq!(uplink_budget_kbps(tiers, 2), 470.0);
+        assert_eq!(uplink_budget_kbps(tiers, 3), 1970.0);
         // active is clamped to the ladder length (cannot over-count).
-        assert_eq!(uplink_budget_kbps(tiers, 99), 2800.0);
+        assert_eq!(uplink_budget_kbps(tiers, 99), 1970.0);
         // Zero active layers → zero budget.
         assert_eq!(uplink_budget_kbps(tiers, 0), 0.0);
     }
@@ -2552,8 +2715,8 @@ mod tests {
         // Targets that already fit must be returned unchanged (the common case
         // at low tiers and the byte-identical guarantee for N=1).
         let tiers = simulcast_layers(3);
-        let budget = uplink_budget_kbps(tiers, 3); // 2800
-        let mut targets = [300.0, 700.0, 1200.0]; // sum 2200 <= 2800
+        let budget = uplink_budget_kbps(tiers, 3); // 1970
+        let mut targets = [100.0, 300.0, 1200.0]; // sum 1600 <= 1970
         let before = targets;
         cap_layers_to_budget(&mut targets, tiers, 3, budget);
         assert_eq!(targets, before, "within-budget targets must not change");
@@ -2562,12 +2725,12 @@ mod tests {
     #[test]
     fn test_cap_scales_down_to_budget_and_respects_floors() {
         // Targets that exceed the budget must be scaled so the active sum fits,
-        // and no layer may drop below its tier floor (200 / 500 / 800).
+        // and no layer may drop below its tier floor (60 / 150 / 800) (#1768).
         let tiers = simulcast_layers(3);
         let floors: Vec<f64> = tiers.iter().map(|t| t.min_bitrate_kbps as f64).collect();
-        let budget = uplink_budget_kbps(tiers, 3); // 2800
-                                                   // All layers asking for their tier max: 600 + 1500 + 2000 = 4100 > 2800.
-        let mut targets = [600.0, 1500.0, 2000.0];
+        let budget = uplink_budget_kbps(tiers, 3); // 1970
+                                                   // All layers asking for their tier max: 200 + 600 + 2000 = 2800 > 1970.
+        let mut targets = [200.0, 600.0, 2000.0];
         cap_layers_to_budget(&mut targets, tiers, 3, budget);
 
         let sum: f64 = targets.iter().sum();
@@ -2588,10 +2751,10 @@ mod tests {
     fn test_cap_pins_to_floors_when_budget_below_floor_sum() {
         // If the budget cannot fit even the floors, pin every active layer to
         // its floor (shedding a layer to actually fit is the AQ's job, not the
-        // cap's). Floors sum = 200+500+800 = 1500; pass a budget below that.
+        // cap's). Floors sum = 60+150+800 = 1010 (#1768); pass a budget below that.
         let tiers = simulcast_layers(3);
-        let mut targets = [600.0, 1500.0, 2000.0];
-        cap_layers_to_budget(&mut targets, tiers, 3, 1000.0);
+        let mut targets = [200.0, 600.0, 2000.0];
+        cap_layers_to_budget(&mut targets, tiers, 3, 900.0);
         assert_eq!(targets[0], tiers[0].min_bitrate_kbps as f64);
         assert_eq!(targets[1], tiers[1].min_bitrate_kbps as f64);
         assert_eq!(targets[2], tiers[2].min_bitrate_kbps as f64);
@@ -2603,11 +2766,11 @@ mod tests {
         // index 0 is considered, even if its lone target exceeds the 1-layer
         // budget; indices 1..2 keep their stale values.
         let tiers = simulcast_layers(3);
-        let budget = uplink_budget_kbps(tiers, 1); // 400 (= low ideal)
+        let budget = uplink_budget_kbps(tiers, 1); // 120 (= low ideal, #1768)
         let mut targets = [600.0, 9999.0, 8888.0];
         cap_layers_to_budget(&mut targets, tiers, 1, budget);
-        // Active layer 0 capped to its floor-respecting share of 400.
-        assert!(targets[0] <= budget + 1e-6 && targets[0] >= 200.0 - 1e-6);
+        // Active layer 0 capped to its floor-respecting share of 120 (floor 60).
+        assert!(targets[0] <= budget + 1e-6 && targets[0] >= 60.0 - 1e-6);
         // Shed layers untouched.
         assert_eq!(targets[1], 9999.0);
         assert_eq!(targets[2], 8888.0);

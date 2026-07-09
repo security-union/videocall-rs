@@ -22,6 +22,7 @@ use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
+use crate::components::media_metrics_overlay::media_metrics_overlay;
 use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
 // SignalMeterMode is referenced via SignalInfo internally — no direct import
 // needed in this file (yet); attendants/peer_tile own the call-site values.
@@ -588,6 +589,11 @@ pub fn generate_for_peer(
     // `transportBadgeEnabled` flag is on AND the transport is known; `None`
     // otherwise. `transport_badge` renders nothing for `None`/`Unknown`.
     let badge_transport = signal_info.badge_transport;
+    // Issue 1768: per-tile media-metrics overlay payload (received/sending
+    // res·fps·audio), or `None` when the diagnostics checkbox is off — then
+    // `media_metrics_overlay` renders nothing. Only the two VIDEO tile arms
+    // (grid + split peer-video) inject it; screen-share panels do not.
+    let metrics_overlay = signal_info.metrics_overlay;
     // Bundled popup handlers (lifted out of per-tile state for bugs #8 + #9).
     let SignalPopupHandlers {
         show: show_signal_popup,
@@ -917,6 +923,9 @@ pub fn generate_for_peer(
                             span { class: "placeholder-text", "Video Disabled" }
                         }
                     }
+                    // Issue 1768: media-metrics overlay (bottom-anchored, passive,
+                    // pointer-events:none). Empty node when the checkbox is off.
+                    {media_metrics_overlay(metrics_overlay.as_ref())}
                     h4 {
                         id: "{split_name_id}",
                         class: "floating-name",
@@ -1319,6 +1328,9 @@ pub fn generate_for_peer(
                                 span { class: "placeholder-text", "{camera_off_label}" }
                             }
                         }
+                        // Issue 1768: media-metrics overlay (bottom-anchored, passive,
+                        // pointer-events:none). Empty node when the checkbox is off.
+                        {media_metrics_overlay(metrics_overlay.as_ref())}
                         h4 {
                             id: "{grid_name_id}",
                             class: "floating-name",

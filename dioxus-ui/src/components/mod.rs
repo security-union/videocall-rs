@@ -25,6 +25,7 @@ pub mod host;
 pub mod host_controls;
 pub mod icons;
 pub mod login;
+pub mod media_metrics_overlay;
 pub mod meeting_ended_overlay;
 pub mod meeting_format;
 pub mod meeting_info;

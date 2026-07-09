@@ -22,6 +22,9 @@ use std::rc::Rc;
 use crate::components::canvas_generator::{
     generate_for_peer, AudioLevels, SignalPopupHandlers, TileMode,
 };
+use crate::components::media_metrics_overlay::{
+    parse_resolution, MediaMetricsOverlay, MediaMetricsOverlayCtx,
+};
 use crate::components::signal_quality::{
     PeerSignalHistory, SampleData, SignalInfo, SignalMeterMode, SignalPopupPosition,
     SignalPopupState,
@@ -609,6 +612,59 @@ pub fn PeerTile(
     } else {
         None
     };
+    // Issue 1768: per-tile media-metrics overlay payload. Computed ONLY when the
+    // diagnostics "Show media metrics on tiles" checkbox is on (default off).
+    // COST: with the checkbox OFF a tile pays nothing — only the enabled flag
+    // (which rarely changes) is read, so no per-metric signal is subscribed and no
+    // snapshot scan runs. With it ON, the payload is rebuilt on EVERY render of
+    // this tile, and that is NOT strictly the ~1 Hz diagnostics cadence: this
+    // component ALSO reads `audio_level()` / `mic_audio_level()` unconditionally
+    // (see the render body below), so a SPEAKING tile re-renders at several Hz and
+    // the O(peers) `per_peer_received_snapshots()` scan below runs on each such
+    // render — i.e. O(N²) across N speaking tiles while the overlay is shown. This
+    // is an accepted cost for an opt-in diagnostics readout; the planned
+    // optimization is to compute the receive-snapshot Vec ONCE per render in
+    // `attendants` and hand every tile a `session_id -> audio_kbps` map via
+    // context for an O(1) lookup (deferred — not this change).
+    let overlay_enabled = try_use_context::<MediaMetricsOverlayCtx>()
+        .map(|c| (c.0)())
+        .unwrap_or(false);
+    let metrics_overlay: Option<MediaMetricsOverlay> = if overlay_enabled {
+        // A grid PeerTile is always a REMOTE peer: the local user's own self-view
+        // is rendered by `Host` (which filters the local session out of the grid),
+        // and the self SENDING overlay is rendered there. So this branch only ever
+        // builds the RECEIVED overlay; guard on self defensively in case a future
+        // layout ever renders the local session as a tile.
+        let is_self = my_session_id.as_deref() == Some(peer_id.as_str());
+        if is_self {
+            None
+        } else {
+            // Decoded WxH + received fps come from the live per-tile signals this
+            // component already maintains; the received audio-layer kbps comes from
+            // the SAME per-peer snapshot path the diagnostics drawer / signal popup
+            // consume. The reads are gated by `overlay_enabled` so nothing is
+            // subscribed while the checkbox is off; when on, they refresh on every
+            // render of this tile (see the O(N²)-while-on cost note above).
+            let resolution = parse_resolution(&video_resolution());
+            let fps_now = fps_received();
+            let audio_kbps = peer_id.parse::<u64>().ok().and_then(|sid| {
+                client
+                    .per_peer_received_snapshots()
+                    .into_iter()
+                    .find(|d| d.session_id == sid)
+                    .and_then(|d| d.audio.map(|a| a.kbps))
+            });
+            Some(MediaMetricsOverlay {
+                is_self: false,
+                resolution,
+                fps: (fps_now > 0.0).then_some(fps_now),
+                audio_kbps: audio_kbps.filter(|&k| k > 0),
+            })
+        }
+    } else {
+        None
+    };
+
     generate_for_peer(
         &client,
         &peer_id,
@@ -632,6 +688,7 @@ pub fn PeerTile(
             receive_diag: sig_receive_diag,
             device_info: sig_device_info,
             badge_transport,
+            metrics_overlay,
         },
         SignalPopupHandlers {
             show: show_signal_popup,

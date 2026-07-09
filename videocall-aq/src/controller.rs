@@ -2514,8 +2514,8 @@ mod tests {
         assert!(controller.is_simulcast());
         assert_eq!(controller.simulcast_layer_count(), 3);
         assert_eq!(controller.active_layer_count(), 3);
-        assert_eq!(controller.layer_resolution(0), Some((640, 360)));
-        assert_eq!(controller.layer_resolution(1), Some((960, 540)));
+        assert_eq!(controller.layer_resolution(0), Some((320, 180)));
+        assert_eq!(controller.layer_resolution(1), Some((640, 360)));
         assert_eq!(controller.layer_resolution(2), Some((1280, 720)));
         assert_eq!(controller.layer_resolution(3), None);
         assert_eq!(controller.layer_target_bitrates_kbps().len(), 3);
@@ -2871,7 +2871,7 @@ mod tests {
         let tiers = simulcast_layers(3);
         assert!(uplink_budget_kbps(tiers, 3) > uplink_budget_kbps(tiers, 2));
         assert!(uplink_budget_kbps(tiers, 2) > uplink_budget_kbps(tiers, 1));
-        assert_eq!(uplink_budget_kbps(tiers, 1), 400.0);
+        assert_eq!(uplink_budget_kbps(tiers, 1), 120.0); // low ideal (#1768)
     }
 
     // =====================================================================

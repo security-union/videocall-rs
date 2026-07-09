@@ -7286,7 +7286,7 @@ mod tests {
         // Small tile -> wants L0 while highest_available == 2.
         manager.set_peer_tile_hints(HashMap::from([(
             777u64,
-            TileHint::Capped { device_px_h: 360 },
+            TileHint::Capped { device_px_h: 180 },
         )]));
         let desired = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
         assert_eq!(
@@ -7383,7 +7383,7 @@ mod tests {
         // prior layer's last-good frame keeps painting; no higher layer to fetch).
         manager.set_peer_tile_hints(HashMap::from([(
             888u64,
-            TileHint::Capped { device_px_h: 360 },
+            TileHint::Capped { device_px_h: 180 },
         )]));
         let kf_before_down = keyframe_requests_sent_count();
         let _ = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
@@ -7419,7 +7419,7 @@ mod tests {
         // Small tile -> lid wants L0 while highest_available == 2.
         manager.set_peer_tile_hints(HashMap::from([(
             555u64,
-            TileHint::Capped { device_px_h: 360 },
+            TileHint::Capped { device_px_h: 180 },
         )]));
         let now = now_ms() as u64;
         // The tick path advertises the lid {(555,Video):0}.
@@ -7500,7 +7500,7 @@ mod tests {
         bounds.set_kind(PrefMediaKind::Video, Some(1), None); // min = L1, max = none
         manager.set_peer_tile_hints(HashMap::from([(
             999u64,
-            TileHint::Capped { device_px_h: 360 },
+            TileHint::Capped { device_px_h: 180 },
         )]));
 
         // TICK PATH: the decode guard / advertised layer must be the floor L1, not
@@ -7573,7 +7573,7 @@ mod tests {
         // held L1; WITH the L0 lid it must clamp to L0.
         manager.set_peer_tile_hints(HashMap::from([(
             666u64,
-            TileHint::Capped { device_px_h: 360 },
+            TileHint::Capped { device_px_h: 180 },
         )]));
         let seeded = manager.seed_early_congestion_for_connected_peers(now, &bounds);
         assert!(seeded, "the congested peer's sample must seed a constrain");
@@ -7628,10 +7628,10 @@ mod tests {
         // Small tile -> lid = L0. Seed congestion (chooser steps DOWN to L1), then RE-LID
         // the guards (the fix) — this is the manager-level equivalent of what the
         // early-seed timer / seed_local_congestion_and_publish now do between seed and
-        // publish.
+        // publish. (Tile 180px = new L0 native height, issue #1768, so it caps to L0.)
         manager.set_peer_tile_hints(HashMap::from([(
             666u64,
-            TileHint::Capped { device_px_h: 360 },
+            TileHint::Capped { device_px_h: 180 },
         )]));
         let seeded = manager.seed_early_congestion_for_connected_peers(now, &bounds);
         assert!(seeded, "the congested peer's sample must seed a constrain");
@@ -7808,10 +7808,10 @@ mod tests {
     /// rung PER call (here 2->1->0 across the 3 lidded calls), the over-collapse this
     /// fixes.
     ///
-    /// The lid is chosen to map to **L1** (`device_px_h = 580`: 360*1.1=396 < 580
-    /// fails L0; 540*1.1=594 >= 580 -> L1) so the idempotent result (1) DIFFERS from
-    /// the compounded result (0). With an L0 lid both paths would land at 0 and the
-    /// test would not discriminate.
+    /// The lid is chosen to map to **L1** (`device_px_h = 360`: 180*1.1=198 < 360
+    /// fails L0; 360*1.1=396 >= 360 -> L1, issue #1768) so the idempotent result (1)
+    /// DIFFERS from the compounded result (0). With an L0 lid both paths would land
+    /// at 0 and the test would not discriminate.
     ///
     /// MUTATION: make `apply_size_lid_to_decode_guards` advance the chooser (e.g.
     /// call `tick_layer_chooser`/`choose()` instead of reading `desired_preference()`),
@@ -7873,9 +7873,11 @@ mod tests {
 
         // A tile that maps to L1 (see the doc): store the hint, then apply the lid 3
         // times in the SAME window (simulating a resize drag's N un-debounced pushes).
+        // (Tile 360px = new L1 native height, issue #1768: L0 boundary 198 < 360 <=
+        // L1 boundary 396, so it caps to L1.)
         manager.set_peer_tile_hints(HashMap::from([(
             777u64,
-            TileHint::Capped { device_px_h: 580 },
+            TileHint::Capped { device_px_h: 360 },
         )]));
         for _ in 0..3 {
             let _ = manager.apply_size_lid_to_decode_guards(now, &bounds);
@@ -7939,7 +7941,7 @@ mod tests {
         // Uncapped (up-switch L0 -> L2). The up-switch must NOT emit a keyframe.
         manager.set_peer_tile_hints(HashMap::from([(
             444u64,
-            TileHint::Capped { device_px_h: 360 },
+            TileHint::Capped { device_px_h: 180 },
         )]));
         let _ = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
         manager.set_peer_tile_hints(HashMap::from([(444u64, TileHint::Uncapped)]));
@@ -7959,7 +7961,7 @@ mod tests {
         collected.borrow_mut().clear();
         manager.set_peer_tile_hints(HashMap::from([(
             444u64,
-            TileHint::Capped { device_px_h: 360 },
+            TileHint::Capped { device_px_h: 180 },
         )]));
         let _ = manager.tick_layer_choosers(now_ms() as u64, &ReceiveLayerBounds::default());
         manager.set_peer_tile_hints(HashMap::from([(444u64, TileHint::Uncapped)]));

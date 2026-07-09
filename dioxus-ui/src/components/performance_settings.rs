@@ -19,7 +19,7 @@
 //!
 //! # The two index conventions (cross-wiring these is a bug)
 //!
-//! - **SEND / AQ tiers:** index `0` is the BEST tier (1080p / 50 kbps), the
+//! - **SEND / AQ tiers:** index `0` is the BEST tier (1080p / 48 kbps), the
 //!   highest index is the WORST. The send "Max quality" selection = best allowed
 //!   = the *lower* index = backend `*_best`; "Min quality" = worst allowed = the
 //!   *higher* index = backend `*_worst`. All send logic lives at the top level of
@@ -161,7 +161,7 @@ pub fn format_simulcast_summary(s: &SimulcastSummary) -> String {
     )
 }
 
-/// Format one SEND simulcast layer line, e.g. `"Low · 640×360 · 400 kbps"`. The
+/// Format one SEND simulcast layer line, e.g. `"Low · 320×180 · 120 kbps"`. The
 /// `layer_id` is the internal 0-based id; `count` is the ladder size. The
 /// DISPLAYED label is the quality name (Low/Medium/High) via
 /// [`layer_quality_label`] — the internal id stays 0-based for e2e/protobuf. Pure.
@@ -576,7 +576,7 @@ pub fn format_mbps(kbps: u32) -> String {
 // the spec's literal phrasings; live numbers are filled from the snapshots. Pure
 // so the copy is a host-tested source of truth (a wording change breaks a test).
 
-/// VIDEO SEND summary, e.g. `"Currently sending 3 of 3 layers · 540p–720p"`. Camera off
+/// VIDEO SEND summary, e.g. `"Currently sending 3 of 3 layers · 180p–720p"`. Camera off
 /// (`snap` is `None`) → `"Camera — off"`. Single-stream → `"Sending single
 /// layer · {res}"` (the one adaptive layer's short res, when known). The res
 /// span uses the SEND snapshot's per-layer short resolutions across the EFFECTIVE
@@ -609,7 +609,7 @@ pub fn format_video_send_summary(snap: Option<&SimulcastSendSnapshot>) -> String
 }
 
 /// The short-resolution span across a SEND snapshot's layers, lowest→highest,
-/// e.g. `"540p–720p"`, or a single `"720p"` when all layers share a resolution,
+/// e.g. `"180p–720p"`, or a single `"720p"` when all layers share a resolution,
 /// or `""` when no resolutions are known yet (atomics not ticked). Pure.
 pub fn send_layer_res_span(snap: &SimulcastSendSnapshot) -> String {
     let mut shorts: Vec<u32> = snap
@@ -744,7 +744,7 @@ pub fn format_audio_receive_summary(n_peers: usize) -> String {
 /// `layers` is the persisted audio layer COUNT (`None` = Auto / full ladder);
 /// `layer_max` is the effective audio ladder depth. Derived from the SAME
 /// per-kind ladder labels the slider + rung strip use
-/// ([`send_layer_labels`] for `Audio`, lowest-first `["24k","32k","50k"]`), so the
+/// ([`send_layer_labels`] for `Audio`, lowest-first `["12k","24k","48k"]`), so the
 /// summary's top-layer label can never drift from the rungs.
 ///
 /// STATE-AWARE (mirrors [`format_send_layer_caption`]): when the mic is ACTIVE the
@@ -940,7 +940,7 @@ pub fn reason_aria_clause(r: DegradeReason) -> &'static str {
 /// `"{res} · ~{kbps} · {Q} · {i}/{n}"`; audio `"{kbps}k · {label} · {Q} · {i}/{n}"`,
 /// where `{Q}` is the quality LETTER (L/M/H via [`layer_quality_label`]) and `n`
 /// is the FULL-ladder length (so the `{i}/{n}` denominator matches the color
-/// basis). `audio_label` is the receive audio rung label (e.g. "mid (32k)")
+/// basis). `audio_label` is the receive audio rung label (e.g. "mid (24k)")
 /// supplied by the caller (the receive submodule owns that mapping). Pure /
 /// host-tested.
 ///
@@ -975,7 +975,7 @@ pub fn peer_row_metric(
 /// signal — this sentence carries label, kind, state, the res/bitrate, the layer
 /// fraction, and (when present) the reason clause. `kind_noun` is the spoken kind
 /// ("video"/"audio"/"shared content"); `res_or_bitrate` is the human detail
-/// ("540p" or "32k"). Pure / host-tested.
+/// ("360p" or "24k"). Pure / host-tested.
 pub fn peer_row_aria_label(
     label: &str,
     kind_noun: &str,
@@ -1125,8 +1125,9 @@ pub const VIDEO_TIER_LABELS: [&str; 8] = [
     "1080p", "900p", "720p", "540p", "480p", "360p", "270p", "240p",
 ];
 
-/// Audio tier labels, index 0 = best (50 kbps) … index 3 = worst (16 kbps).
-pub const AUDIO_TIER_LABELS: [&str; 4] = ["50 kbps", "32 kbps", "24 kbps", "16 kbps"];
+/// Audio tier labels, index 0 = best (48 kbps) … index 3 = worst (8 kbps).
+/// Retuned lighter in issue 1768 to match `AUDIO_QUALITY_TIERS` (48/24/12/8).
+pub const AUDIO_TIER_LABELS: [&str; 4] = ["48 kbps", "24 kbps", "12 kbps", "8 kbps"];
 
 /// Screen-share tier labels, index 0 = best (1080p) … index 2 = worst (low).
 /// Order MUST match `SCREEN_QUALITY_TIERS` (index 0 = best).
@@ -1344,8 +1345,8 @@ pub fn tick_offsets(step_count: usize) -> Vec<f32> {
 // ── SEND layer-count model (video + screen) ────────────────────────
 //
 // The SEND control for video/screen is a LAYER-COUNT slider, NOT a tier slider.
-// The track ticks are the kind's simulcast rungs, lowest-first (video: L0 360p /
-// L1 540p / L2 720p; screen: its ladder). The FLOOR thumb is pinned at L0 (the
+// The track ticks are the kind's simulcast rungs, lowest-first (video: L0 180p /
+// L1 360p / L2 720p; screen: its ladder). The FLOOR thumb is pinned at L0 (the
 // base layer is always published — the base-present invariant), and the CEILING
 // thumb is the published layer COUNT: position `p` (0-based layer index) means
 // "publish layers L0..=Lp", i.e. a count of `p + 1`.
@@ -1359,8 +1360,9 @@ pub fn tick_offsets(step_count: usize) -> Vec<f32> {
 /// The rung labels to render for a SEND layer slider, lowest layer first
 /// (index == `layer_id`), for an `layer_max`-rung ladder.
 ///
-/// VIDEO mirrors the AQ camera ladder selection over `[low 360p, standard 540p,
-/// hd 720p]`: `[low]`, `[low, hd]`, `[low, standard, hd]` for n = 1/2/3 — note
+/// VIDEO mirrors the AQ camera ladder selection over `[low 180p, standard 360p,
+/// hd 720p]` (issue 1768): `[low]`, `[low, hd]`, `[low, standard, hd]` for
+/// n = 1/2/3 — note
 /// n=2 SKIPS the middle, matching the AQ `spaced_ladder_positions` rule — so we
 /// special-case the count rather than taking a naive prefix.
 ///
@@ -1372,9 +1374,9 @@ pub fn tick_offsets(step_count: usize) -> Vec<f32> {
 /// tier labels and read consistently.
 ///
 /// AUDIO mirrors the publisher's CONTIGUOUS audio ladder (`AUDIO_LAYER_KBPS =
-/// [24, 32, 50]` kbps, lowest-first — the mic encoder publishes layers
-/// `0..n` with NO skip, unlike the spaced video/screen ladders): 1→`[24k]`,
-/// 2→`[24k, 32k]`, 3→`[24k, 32k, 50k]`.
+/// [12, 24, 48]` kbps, lowest-first — the mic encoder publishes layers
+/// `0..n` with NO skip, unlike the spaced video/screen ladders): 1→`[12k]`,
+/// 2→`[12k, 24k]`, 3→`[12k, 24k, 48k]`.
 ///
 /// Kept in lockstep with the AQ / publisher ladders here (the AQ tables are behind
 /// a wasm-only crate); a reviewer must keep them in sync. Pure / host-tested.
@@ -1391,21 +1393,22 @@ pub fn send_layer_labels(kind: PrefMediaKind, layer_max: usize) -> Vec<&'static 
             }
         }
         PrefMediaKind::Audio => {
-            // AUDIO_LAYER_KBPS = [24, 32, 50] kbps, CONTIGUOUS lowest-first (no
-            // skip): the publisher emits layers 0..n in order.
+            // AUDIO_LAYER_KBPS = [12, 24, 48] kbps (issue 1768), CONTIGUOUS
+            // lowest-first (no skip): the publisher emits layers 0..n in order.
             match n {
-                1 => vec!["24k"],
-                2 => vec!["24k", "32k"],
-                _ => vec!["24k", "32k", "50k"],
+                1 => vec!["12k"],
+                2 => vec!["12k", "24k"],
+                _ => vec!["12k", "24k", "48k"],
             }
         }
         PrefMediaKind::Video => {
-            // Camera ladder via spaced_ladder_positions over [low, standard, hd]:
+            // Camera ladder via spaced_ladder_positions over [low, standard, hd]
+            // (issue 1768: 320×180 / 640×360 / 1280×720):
             // 1→[low], 2→[low, hd] (skip standard), 3→[low, standard, hd].
             match n {
-                1 => vec!["360p"],
-                2 => vec!["360p", "720p"],
-                _ => vec!["360p", "540p", "720p"],
+                1 => vec!["180p"],
+                2 => vec!["180p", "720p"],
+                _ => vec!["180p", "360p", "720p"],
             }
         }
     }
@@ -3320,20 +3323,21 @@ pub mod receive {
     // Order is LOWEST-first: index 0 = lowest quality (left thumb), top index =
     // highest quality (right thumb).
 
-    /// Video receive layer labels, index 0 = lowest (360p) … 2 = highest (720p).
+    /// Video receive layer labels, index 0 = lowest (180p) … 2 = highest (720p).
     ///
     /// These mirror `videocall_aq::simulcast_layers(3)` = `[low, standard, hd]`,
-    /// lowest-first: low = 640×360 (360p), standard = 960×540 (540p), hd =
-    /// 1280×720 (720p). The middle "540p" is correct — `simulcast_layers(3)[1]`
-    /// is the "standard" tier at 960×540 (#1079 reviewer confirmation).
-    pub const VIDEO_LAYER_LABELS: [&str; 3] = ["360p", "540p", "720p"];
+    /// lowest-first (issue 1768): low = 320×180 (180p), standard = 640×360 (360p),
+    /// hd = 1280×720 (720p). The middle "360p" is `simulcast_layers(3)[1]`, the
+    /// "standard" tier at 640×360.
+    pub const VIDEO_LAYER_LABELS: [&str; 3] = ["180p", "360p", "720p"];
 
     /// Screen receive layer labels, index 0 = lowest … 2 = highest.
     pub const SCREEN_LAYER_LABELS: [&str; 3] = ["low", "medium", "high"];
 
-    /// Audio receive layer labels, index 0 = low (24k) … 2 = high (50k).
-    /// Three rungs to match the publisher's audio ladder (#1082).
-    pub const AUDIO_LAYER_LABELS: [&str; 3] = ["low (24k)", "mid (32k)", "high (50k)"];
+    /// Audio receive layer labels, index 0 = low (12k) … 2 = high (48k).
+    /// Three rungs to match the publisher's audio ladder (#1082; retuned lighter
+    /// in issue 1768 to 12 / 24 / 48 kbps).
+    pub const AUDIO_LAYER_LABELS: [&str; 3] = ["low (12k)", "mid (24k)", "high (48k)"];
 
     /// The labels for a media kind.
     pub fn labels_for(kind: PrefMediaKind) -> &'static [&'static str] {
@@ -3971,7 +3975,7 @@ pub mod receive {
         let q = quality_state(snap.layer_index, full_ladder_len);
         let q_mod = quality_state_modifier(q);
         let q_glyph = quality_state_glyph(q);
-        // Audio rung label for the metric ("low (24k)"/"mid (32k)"/"high (50k)").
+        // Audio rung label for the metric ("low (12k)"/"mid (24k)"/"high (48k)").
         let audio_label = index_label(PrefMediaKind::Audio, snap.layer_index);
         let metric = peer_row_metric(&snap, full_ladder_len, audio_label);
         // The human res/bitrate detail used inside the aria sentence.
@@ -4038,13 +4042,13 @@ pub mod receive {
         #[test]
         fn index_label_receive_convention_not_inverted() {
             // index 0 = LOWEST quality (left), top index = HIGHEST (right).
-            assert_eq!(index_label(PrefMediaKind::Video, 0), "360p");
+            assert_eq!(index_label(PrefMediaKind::Video, 0), "180p");
             assert_eq!(index_label(PrefMediaKind::Video, 2), "720p");
             assert_eq!(index_label(PrefMediaKind::Screen, 0), "low");
             assert_eq!(index_label(PrefMediaKind::Screen, 2), "high");
-            assert_eq!(index_label(PrefMediaKind::Audio, 0), "low (24k)");
-            assert_eq!(index_label(PrefMediaKind::Audio, 1), "mid (32k)");
-            assert_eq!(index_label(PrefMediaKind::Audio, 2), "high (50k)");
+            assert_eq!(index_label(PrefMediaKind::Audio, 0), "low (12k)");
+            assert_eq!(index_label(PrefMediaKind::Audio, 1), "mid (24k)");
+            assert_eq!(index_label(PrefMediaKind::Audio, 2), "high (48k)");
             assert_eq!(index_label(PrefMediaKind::Audio, 5), "?");
         }
 
@@ -4146,7 +4150,7 @@ pub mod receive {
                         max_pos: 2
                     }
                 ),
-                "360p – 720p"
+                "180p – 720p"
             );
             assert_eq!(
                 span_text(
@@ -4156,7 +4160,7 @@ pub mod receive {
                         max_pos: 1
                     }
                 ),
-                "540p"
+                "360p"
             );
             assert_eq!(
                 span_text(
@@ -4166,7 +4170,7 @@ pub mod receive {
                         max_pos: 2
                     }
                 ),
-                "low (24k) – high (50k)"
+                "low (12k) – high (48k)"
             );
         }
 
@@ -4526,8 +4530,8 @@ mod tests {
         // base) renders "Low"; id 2 (the top) renders "High". The internal id /
         // data-testid suffix stays 0-based; only the visible label changes (#1222).
         assert_eq!(
-            format_send_layer(0, 3, 640, 360, 400),
-            "Low · 640×360 · 400 kbps"
+            format_send_layer(0, 3, 320, 180, 120),
+            "Low · 320×180 · 120 kbps"
         );
         assert_eq!(
             format_send_layer(2, 3, 1280, 720, 1500),
@@ -4733,18 +4737,20 @@ mod tests {
             simulcast_active: true,
             effective_layers: 3,
             active_layers: 3,
+            // issue 1768 camera simulcast ladder: low 320×180/120, standard
+            // 640×360/350, hd 1280×720/1500 (sum 1970 kbps → 2.0 Mbps).
             layers: vec![
                 videocall_client::SimulcastLayerInfo {
                     layer_id: 0,
-                    bitrate_kbps: 400,
-                    width: 640,
-                    height: 360,
+                    bitrate_kbps: 120,
+                    width: 320,
+                    height: 180,
                 },
                 videocall_client::SimulcastLayerInfo {
                     layer_id: 1,
-                    bitrate_kbps: 900,
-                    width: 960,
-                    height: 540,
+                    bitrate_kbps: 350,
+                    width: 640,
+                    height: 360,
                 },
                 videocall_client::SimulcastLayerInfo {
                     layer_id: 2,
@@ -4758,7 +4764,7 @@ mod tests {
 
     #[test]
     fn send_layer_res_span_spans_lowest_to_highest() {
-        assert_eq!(send_layer_res_span(&send_snap_3layer()), "360p–720p");
+        assert_eq!(send_layer_res_span(&send_snap_3layer()), "180p–720p");
         // All one resolution → single label.
         let mut s = send_snap_3layer();
         for l in &mut s.layers {
@@ -4784,7 +4790,7 @@ mod tests {
         let s = send_snap_3layer();
         assert_eq!(
             format_video_send_summary(Some(&s)),
-            "Currently sending 3 of 3 layers · 360p–720p"
+            "Currently sending 3 of 3 layers · 180p–720p"
         );
         // Single-layer → "Sending single layer · {res}".
         let single = SimulcastSendSnapshot {
@@ -4828,28 +4834,28 @@ mod tests {
     #[test]
     fn audio_send_layer_summary_is_count_aware() {
         use PrefMediaKind::Audio;
-        // MIC ON. Audio ladder lowest-first is ["24k","32k","50k"]. Full ladder
-        // (Auto / None) → top published layer = "50k".
+        // MIC ON. Audio ladder lowest-first is ["12k","24k","48k"] (issue 1768).
+        // Full ladder (Auto / None) → top published layer = "48k".
         assert_eq!(
             format_audio_send_layer_summary(None, 3, true),
-            "Sending up to 50k"
+            "Sending up to 48k"
         );
-        // Ceiling 2 → top published layer = "32k" (the rung strip would show 2 of
+        // Ceiling 2 → top published layer = "24k" (the rung strip would show 2 of
         // 3 active); MUST differ from the full-ladder summary so a lowered ceiling
         // visibly changes the line.
         assert_eq!(
             format_audio_send_layer_summary(Some(2), 3, true),
-            "Sending up to 32k"
+            "Sending up to 24k"
         );
-        // Ceiling 1 → only the base (24k) publishes → the "only" phrasing.
+        // Ceiling 1 → only the base (12k) publishes → the "only" phrasing.
         assert_eq!(
             format_audio_send_layer_summary(Some(1), 3, true),
-            "Sending 24k only"
+            "Sending 12k only"
         );
         // Sanity: the summary's top label is exactly the top ACTIVE rung label, so
         // the summary can never drift from the rung strip.
         let labels = send_layer_labels(Audio, 3);
-        assert_eq!(labels.last().copied(), Some("50k"));
+        assert_eq!(labels.last().copied(), Some("48k"));
     }
 
     #[test]
@@ -4860,7 +4866,7 @@ mod tests {
         // ceiling so the state change is visible.
         assert_eq!(
             format_audio_send_layer_summary(None, 3, false),
-            "Will send up to 50k when the mic is on"
+            "Will send up to 48k when the mic is on"
         );
         assert_ne!(
             format_audio_send_layer_summary(None, 3, false),
@@ -4870,7 +4876,7 @@ mod tests {
         // Base-only, mic off.
         assert_eq!(
             format_audio_send_layer_summary(Some(1), 3, false),
-            "Will send 24k only when the mic is on"
+            "Will send 12k only when the mic is on"
         );
     }
 
@@ -4885,7 +4891,7 @@ mod tests {
         let s = send_snap_3layer();
         assert_eq!(
             format_content_send_summary(Some(&s)),
-            "Sending 360p–720p · 2.8 Mbps"
+            "Sending 180p–720p · 2.0 Mbps"
         );
     }
 
@@ -5314,7 +5320,7 @@ mod tests {
                 },
                 &AUDIO_TIER_LABELS
             ),
-            "16 kbps – 50 kbps"
+            "8 kbps – 48 kbps"
         );
     }
 
@@ -5448,11 +5454,11 @@ mod tests {
             video_fps: 30,
             video_ideal_kbps: 1500,
             audio_tier_index: 1,
-            audio_kbps: 32,
+            audio_kbps: 24, // issue 1768: AQ audio tier 1 (medium) = 24 kbps
             target_bitrate_kbps: 1234.0,
         };
         assert_eq!(format_video_readout(&snap), "1280x720·30fps·1500kbps");
-        assert_eq!(format_audio_readout(&snap), "32 kbps");
+        assert_eq!(format_audio_readout(&snap), "24 kbps");
     }
 
     #[test]
@@ -5464,7 +5470,7 @@ mod tests {
             video_fps: 30,
             video_ideal_kbps: 2500,
             audio_tier_index: 3, // worst of 4 → level 1 (floored, never 0)
-            audio_kbps: 16,
+            audio_kbps: 8,       // issue 1768: AQ audio tier 3 (emergency) = 8 kbps
             target_bitrate_kbps: 2000.0,
         };
         let screen = ScreenQualitySnapshot {
@@ -5479,7 +5485,7 @@ mod tests {
         assert_eq!(st.video_level, MAX_METER_LEVEL);
         assert_eq!(st.audio_level, 1);
         assert_eq!(st.video_text, "1920x1080·30fps·2500kbps");
-        assert_eq!(st.audio_text, "16 kbps");
+        assert_eq!(st.audio_text, "8 kbps");
         assert_eq!(st.screen_level, 2);
         assert_eq!(st.screen_text, "1280x720·15fps·1200kbps");
     }
@@ -5790,10 +5796,11 @@ mod tests {
     #[test]
     fn send_layer_labels_match_per_kind_ladders() {
         use PrefMediaKind::{Audio, Screen, Video};
-        // VIDEO ladder (spaced): 1→[360p], 2→[360p,720p] (skip 540p), 3→full.
-        assert_eq!(send_layer_labels(Video, 1), vec!["360p"]);
-        assert_eq!(send_layer_labels(Video, 2), vec!["360p", "720p"]);
-        assert_eq!(send_layer_labels(Video, 3), vec!["360p", "540p", "720p"]);
+        // VIDEO ladder (spaced, issue 1768): 1→[180p], 2→[180p,720p] (skip 360p),
+        // 3→full.
+        assert_eq!(send_layer_labels(Video, 1), vec!["180p"]);
+        assert_eq!(send_layer_labels(Video, 2), vec!["180p", "720p"]);
+        assert_eq!(send_layer_labels(Video, 3), vec!["180p", "360p", "720p"]);
         // SCREEN ladder differs: qualitative labels (low/medium are both 720p so
         // resolution would be ambiguous). 1→[low], 2→[low, high] (skip medium),
         // 3→[low, medium, high]. The base differs from video (proves per-kind
@@ -5801,13 +5808,13 @@ mod tests {
         assert_eq!(send_layer_labels(Screen, 1), vec!["low"]);
         assert_eq!(send_layer_labels(Screen, 2), vec!["low", "high"]);
         assert_eq!(send_layer_labels(Screen, 3), vec!["low", "medium", "high"]);
-        // AUDIO ladder is CONTIGUOUS (no skip — AUDIO_LAYER_KBPS = [24,32,50]):
-        // 1→[24k], 2→[24k,32k], 3→[24k,32k,50k]. n=2 keeps the MIDDLE rung (32k),
-        // unlike video/screen which skip it — proves the audio arm isn't a copy of
-        // the spaced ladder.
-        assert_eq!(send_layer_labels(Audio, 1), vec!["24k"]);
-        assert_eq!(send_layer_labels(Audio, 2), vec!["24k", "32k"]);
-        assert_eq!(send_layer_labels(Audio, 3), vec!["24k", "32k", "50k"]);
+        // AUDIO ladder is CONTIGUOUS (no skip — AUDIO_LAYER_KBPS = [12,24,48],
+        // issue 1768): 1→[12k], 2→[12k,24k], 3→[12k,24k,48k]. n=2 keeps the MIDDLE
+        // rung (24k), unlike video/screen which skip it — proves the audio arm
+        // isn't a copy of the spaced ladder.
+        assert_eq!(send_layer_labels(Audio, 1), vec!["12k"]);
+        assert_eq!(send_layer_labels(Audio, 2), vec!["12k", "24k"]);
+        assert_eq!(send_layer_labels(Audio, 3), vec!["12k", "24k", "48k"]);
     }
 
     #[test]
@@ -5892,13 +5899,14 @@ mod tests {
         // 1-based position 2. (peer_row_metric is the real e2e-string site; the
         // rename propagates to signal_quality.rs too — #1222.) Mutating the
         // `layer_quality_label` letter or the i/n arithmetic breaks this literal.
-        let v = snap(PrefMediaKind::Video, 1, 960, 540, 600, None);
-        assert_eq!(peer_row_metric(&v, 3, "ignored"), "540p · ~600k · M · 2/3");
-        // Audio: "{kbps}k · {label} · {Q} · {i}/{n}".
-        let a = snap(PrefMediaKind::Audio, 1, 0, 0, 32, None);
+        // issue 1768: the standard (middle) camera rung is now 640×360 @ ~350 kbps.
+        let v = snap(PrefMediaKind::Video, 1, 640, 360, 350, None);
+        assert_eq!(peer_row_metric(&v, 3, "ignored"), "360p · ~350k · M · 2/3");
+        // Audio: "{kbps}k · {label} · {Q} · {i}/{n}". Middle audio rung = 24 kbps.
+        let a = snap(PrefMediaKind::Audio, 1, 0, 0, 24, None);
         assert_eq!(
-            peer_row_metric(&a, 3, "mid (32k)"),
-            "32k · mid (32k) · M · 2/3"
+            peer_row_metric(&a, 3, "mid (24k)"),
+            "24k · mid (24k) · M · 2/3"
         );
     }
 

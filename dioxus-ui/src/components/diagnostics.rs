@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::media_metrics_overlay::{MediaMetricsOverlayCtx, MEDIA_METRICS_OVERLAY_KEY};
 use crate::components::neteq_chart::{
     neteq_history_key, push_capped, should_push, single_peer_selected, AdvancedChartType,
     ChartType, NetEqAdvancedChart, NetEqChart, NetEqHistory, NetEqSample, NetEqStatusDisplay,
@@ -29,6 +30,7 @@ use crate::components::performance_settings::{
     PerformanceSettingsPanel,
 };
 use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
+use crate::local_storage::save_bool;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
 use dioxus_core::Task;
@@ -827,6 +829,10 @@ pub fn Diagnostics(
     on_resize_end: EventHandler<()>,
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    // Issue 1768: the shared "Show media metrics on tiles" flag. The checkbox
+    // below writes it (and persists to localStorage); every PeerTile reads the
+    // same signal to show/hide its overlay.
+    let mut media_metrics_overlay_enabled = use_context::<MediaMetricsOverlayCtx>().0;
     let mut selected_peer = use_signal(|| "All Peers".to_string());
     // FIX 2: tracks whether the user has explicitly chosen a peer in the
     // selector. The one-shot auto-select effect (below) only fires while this
@@ -1387,6 +1393,34 @@ pub fn Diagnostics(
                     }
                     p { class: "transport-preference-note",
                         "Changing protocol will reload the page."
+                    }
+                }
+                // Issue 1768: per-tile media-metrics overlay toggle. A real
+                // checkbox with an explicit `label for=id` so it is properly
+                // labeled and keyboard-operable; the overlay it controls is a
+                // passive (aria-hidden) readout, so the checkbox is the sole a11y
+                // control surface for the feature.
+                section { class: "diagnostics-section", "aria-labelledby": "diag-h-display-options",
+                    h3 { id: "diag-h-display-options", "Display options" }
+                    div { class: "device-setting-group diag-overlay-toggle",
+                        input {
+                            r#type: "checkbox",
+                            id: "diag-media-metrics-overlay",
+                            "data-testid": "media-metrics-overlay-toggle",
+                            checked: media_metrics_overlay_enabled(),
+                            onchange: move |_| {
+                                let next = !media_metrics_overlay_enabled();
+                                media_metrics_overlay_enabled.set(next);
+                                save_bool(MEDIA_METRICS_OVERLAY_KEY, next);
+                            },
+                        }
+                        label { r#for: "diag-media-metrics-overlay",
+                            "Show media metrics on tiles"
+                        }
+                    }
+                    p { class: "transport-preference-note",
+                        "Overlays each peer's received resolution, fps and audio bitrate at the \
+                         bottom of their tile, and your own sending metrics on your tile."
                     }
                 }
                 // Raw stats: the four low-level pre-dumps (Reception + Sending +

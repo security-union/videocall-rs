@@ -11,10 +11,11 @@
 use wasm_bindgen_test::*;
 
 use dioxus_ui::context::{
-    apply_transport_decision, clear_display_name_from_storage, clear_transport_sticky_and_pref,
-    email_to_display_name, load_display_name_from_storage, load_transport_preference,
-    resolve_transport_config, save_display_name_to_storage, save_transport_preference,
-    save_transport_sticky, validate_display_name, TransportPreference, DISPLAY_NAME_MAX_LEN,
+    apply_notification_prefs, apply_transport_decision, clear_display_name_from_storage,
+    clear_transport_sticky_and_pref, email_to_display_name, load_display_name_from_storage,
+    load_transport_preference, resolve_transport_config, save_display_name_to_storage,
+    save_transport_preference, save_transport_sticky, validate_display_name, AppearanceSettings,
+    TransportPreference, DISPLAY_NAME_MAX_LEN,
 };
 use videocall_types::validation::normalize_spaces;
 
@@ -722,4 +723,96 @@ fn apply_decision_websocket_not_remembered_clears_stale_wt_sticky() {
     );
 
     clear_transport_sticky_and_pref();
+}
+
+// ---------------------------------------------------------------------------
+// Entry/exit notification & sound preference resolution
+//
+// These pin the pure per-direction gating that the E2E suite cannot fully
+// observe: the exit (leave) direction has no reliable toast in the Playwright
+// harness (see the skipped leave-toast tests in
+// e2e/tests/toast-notifications.spec.ts), so the exit flag's independence is
+// guaranteed here. They call the production `apply_notification_prefs` — the
+// same resolver `load_appearance_settings_from_storage` uses — so a regression
+// in the split fails these tests.
+// ---------------------------------------------------------------------------
+
+/// Resolve prefs starting from `Default` (all enabled) for the given raw stored
+/// strings, returning `(entry_msg, exit_msg, entry_sound, exit_sound)`.
+fn resolve_notification_prefs(
+    entry_notifications: Option<&str>,
+    exit_notifications: Option<&str>,
+    entry_sound: Option<&str>,
+    exit_sound: Option<&str>,
+) -> (bool, bool, bool, bool) {
+    let mut settings = AppearanceSettings::default();
+    apply_notification_prefs(
+        &mut settings,
+        entry_notifications,
+        exit_notifications,
+        entry_sound,
+        exit_sound,
+    );
+    (
+        settings.show_entry_notifications,
+        settings.show_exit_notifications,
+        settings.play_entry_sound,
+        settings.play_exit_sound,
+    )
+}
+
+#[wasm_bindgen_test]
+fn notification_prefs_default_all_enabled() {
+    // No stored keys -> every direction stays enabled.
+    assert_eq!(
+        resolve_notification_prefs(None, None, None, None),
+        (true, true, true, true)
+    );
+}
+
+#[wasm_bindgen_test]
+fn notification_prefs_exit_message_independent_of_entry() {
+    // Disabling ONLY the exit message must not touch the entry message (or
+    // either sound). A single shared flag or a cross-wired read would fail here.
+    assert_eq!(
+        resolve_notification_prefs(None, Some("false"), None, None),
+        (true, false, true, true)
+    );
+}
+
+#[wasm_bindgen_test]
+fn notification_prefs_entry_message_independent_of_exit() {
+    // Symmetric: disabling only the entry message leaves exit enabled.
+    assert_eq!(
+        resolve_notification_prefs(Some("false"), None, None, None),
+        (false, true, true, true)
+    );
+}
+
+#[wasm_bindgen_test]
+fn notification_prefs_exit_sound_independent() {
+    // Sounds are independent of messages and of each other.
+    assert_eq!(
+        resolve_notification_prefs(None, None, None, Some("false")),
+        (true, true, true, false)
+    );
+}
+
+#[wasm_bindgen_test]
+fn notification_prefs_entry_sound_independent() {
+    // Disabling the entry sound leaves the other three enabled.
+    assert_eq!(
+        resolve_notification_prefs(None, None, Some("false"), None),
+        (true, true, false, true)
+    );
+}
+
+#[wasm_bindgen_test]
+fn notification_prefs_non_false_value_enables() {
+    // Any present value other than "false" is treated as enabled, matching the
+    // `!= "false"` read used across the boolean prefs.
+    assert_eq!(
+        resolve_notification_prefs(Some("true"), Some("garbage"), None, None),
+        (true, true, true, true)
+    );
 }

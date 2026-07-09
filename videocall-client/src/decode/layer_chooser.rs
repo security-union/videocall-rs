@@ -878,11 +878,12 @@ pub fn degrade_reason(
 }
 
 /// Audio simulcast bitrates (kbps) by layer, lowest-first (issue #989, Phase 3c
-/// / 4; extended to 3 rungs in issue #1082). Mirrors the publisher's 3-layer
-/// model (low 24 / mid 32 / high 50). Kept here so the snapshot resolver has no
-/// dependency on the encoder module. This slice's length is the single source of
-/// truth for the receiver-side audio ladder size (see [`AUDIO_LAYER_CAP`]).
-const AUDIO_LAYER_KBPS: &[u32] = &[24, 32, 50];
+/// / 4; extended to 3 rungs in issue #1082; retuned lighter in issue #1768).
+/// Mirrors the publisher's 3-layer model (low 12 / mid 24 / high 48). Kept here
+/// so the snapshot resolver has no dependency on the encoder module. This
+/// slice's length is the single source of truth for the receiver-side audio
+/// ladder size (see [`AUDIO_LAYER_CAP`]).
+const AUDIO_LAYER_KBPS: &[u32] = &[12, 24, 48];
 
 /// Length of the receiver-side audio layer ladder, exposed as a `const fn` so
 /// the publisher (`microphone_encoder.rs`) can tie its own ladder to this with a
@@ -1798,9 +1799,9 @@ mod tests {
         assert_eq!(s.layer_count, 3);
         assert_eq!((s.width, s.height), (1280, 720));
         assert!(s.kbps > 0);
-        // Base layer (0) = lowest resolution.
+        // Base layer (0) = lowest resolution (issue #1768: 320x180).
         let base = received_layer_snapshot(PrefMediaKind::Video, 0, 3);
-        assert_eq!((base.width, base.height), (640, 360));
+        assert_eq!((base.width, base.height), (320, 180));
         assert!(base.kbps < s.kbps, "base bitrate < top bitrate");
     }
 
@@ -1812,14 +1813,14 @@ mod tests {
 
     #[test]
     fn snapshot_audio_has_no_resolution_and_kbps_by_layer() {
-        // Audio is now a 3-rung ladder (issue #1082): low 24 / mid 32 / high 50.
+        // Audio 3-rung ladder retuned lighter (issue #1768): low 12 / mid 24 / high 48.
         let low = received_layer_snapshot(PrefMediaKind::Audio, 0, 3);
         assert_eq!((low.width, low.height), (0, 0));
-        assert_eq!(low.kbps, 24);
+        assert_eq!(low.kbps, 12);
         let mid = received_layer_snapshot(PrefMediaKind::Audio, 1, 3);
-        assert_eq!(mid.kbps, 32);
+        assert_eq!(mid.kbps, 24);
         let high = received_layer_snapshot(PrefMediaKind::Audio, 2, 3);
-        assert_eq!(high.kbps, 50);
+        assert_eq!(high.kbps, 48);
         assert_eq!(high.layer_count, 3);
     }
 
@@ -2243,35 +2244,36 @@ mod tests {
 
     // --- #1256 Phase 1: size_cap_layer boundary table (T1) ---
     //
-    // Camera ladder (lowest-first): L0 = 640x360, L1 = 960x540, L2 = 1280x720
-    // (confirmed in videocall-aq/src/constants.rs). SIZE_CAP_MARGIN = 0.10, so the
-    // L0 boundary is 360 * 1.1 = 396px, the L1 boundary is 540 * 1.1 = 594px.
-    // Expected indices are asserted as LITERALS (not recomputed via
-    // received_layer_snapshot) so the assertion is an independent source of truth.
+    // Camera ladder (lowest-first, issue #1768): L0 = 320x180, L1 = 640x360,
+    // L2 = 1280x720 (confirmed in videocall-aq/src/constants.rs). SIZE_CAP_MARGIN
+    // = 0.10, so the L0 boundary is 180 * 1.1 = 198px, the L1 boundary is
+    // 360 * 1.1 = 396px, the L2 boundary is 720 * 1.1 = 792px. Expected indices
+    // are asserted as LITERALS (not recomputed via received_layer_snapshot) so
+    // the assertion is an independent source of truth.
     #[test]
     fn size_cap_layer_boundary_table() {
-        // Tile == L0 native height -> L0 covers it comfortably (396 >= 360).
-        assert_eq!(size_cap_layer(360, 2, 3, PrefMediaKind::Video), 0);
+        // Tile == L0 native height -> L0 covers it comfortably (198 >= 180).
+        assert_eq!(size_cap_layer(180, 2, 3, PrefMediaKind::Video), 0);
 
-        // Tile EXACTLY at the L0 margin boundary (360 * 1.1 = 396): L0 still covers
+        // Tile EXACTLY at the L0 margin boundary (180 * 1.1 = 198): L0 still covers
         // it BECAUSE of the margin. This is the tightest margin guard — dropping the
-        // `* (1.0 + SIZE_CAP_MARGIN)` factor makes the bare comparison `360 >= 396`
+        // `* (1.0 + SIZE_CAP_MARGIN)` factor makes the bare comparison `180 >= 198`
         // false, so L0 falls through to L1 (=> 1) and this assertion fails first.
         // (NOTE: the `>=` vs `>` distinction is NOT observable for integer tile
-        // heights — `360.0 * 1.1` evaluates to 396.00000000000006 in f64, strictly
-        // greater than 396.0, so both comparisons return L0 here.)
-        assert_eq!(size_cap_layer(396, 2, 3, PrefMediaKind::Video), 0);
+        // heights — `180.0 * 1.1` evaluates to 198.00000000000003 in f64, strictly
+        // greater than 198.0, so both comparisons return L0 here.)
+        assert_eq!(size_cap_layer(198, 2, 3, PrefMediaKind::Video), 0);
 
-        // 360 * 1.1 = 396 >= 378 -> the 10% margin absorbs the overshoot, L0 still
+        // 180 * 1.1 = 198 >= 189 -> the 10% margin absorbs the overshoot, L0 still
         // covers. Guards the margin: dropping `* (1.0 + SIZE_CAP_MARGIN)` (i.e.
-        // comparing bare native_h=360 >= 378) makes L0 fail -> L1 (=> 1).
-        assert_eq!(size_cap_layer(378, 2, 3, PrefMediaKind::Video), 0);
+        // comparing bare native_h=180 >= 189) makes L0 fail -> L1 (=> 1).
+        assert_eq!(size_cap_layer(189, 2, 3, PrefMediaKind::Video), 0);
 
-        // 396 < 432 -> L0 fails even WITH the margin; L1 (540*1.1=594 >= 432) covers.
-        assert_eq!(size_cap_layer(432, 2, 3, PrefMediaKind::Video), 1);
+        // 198 < 216 -> L0 fails even WITH the margin; L1 (360*1.1=396 >= 216) covers.
+        assert_eq!(size_cap_layer(216, 2, 3, PrefMediaKind::Video), 1);
 
         // Exact L1 native height -> L1 covers.
-        assert_eq!(size_cap_layer(540, 2, 3, PrefMediaKind::Video), 1);
+        assert_eq!(size_cap_layer(360, 2, 3, PrefMediaKind::Video), 1);
 
         // Exact L2 native height -> only L2 (720*1.1=792 >= 720) covers.
         assert_eq!(size_cap_layer(720, 2, 3, PrefMediaKind::Video), 2);
@@ -2284,7 +2286,7 @@ mod tests {
         // highest_available == 0: only L0 is allowed, so even a huge tile is pinned
         // to 0 (the loop range `0..=0` only ever yields 0). Guards the clamp to the
         // available top.
-        assert_eq!(size_cap_layer(360, 0, 3, PrefMediaKind::Video), 0);
+        assert_eq!(size_cap_layer(180, 0, 3, PrefMediaKind::Video), 0);
 
         // Wants L2 by size but highest_available == 1 -> clamped to 1 (the loop
         // never reaches index 2). Guards the [0, highest_available] clamp.
@@ -2304,15 +2306,16 @@ mod tests {
     #[test]
     fn size_cap_layer_always_within_available_range() {
         let highest = 2u32;
+        // Sample around the issue #1768 rung boundaries (180 / 360 / 720).
         for h in [
             0u32,
             1,
             100,
+            179,
+            180,
+            181,
             359,
             360,
-            361,
-            539,
-            540,
             719,
             720,
             5000,

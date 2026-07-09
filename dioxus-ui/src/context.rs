@@ -419,8 +419,10 @@ pub struct AppearanceSettings {
     pub glow_color: GlowColor,
     pub glow_brightness: f32,     // 0.0–1.0 scale factor
     pub inner_glow_strength: f32, // 0.0–1.0 scale factor
-    pub show_join_leave_notifications: bool,
-    pub play_join_leave_sounds: bool,
+    pub show_entry_notifications: bool,
+    pub show_exit_notifications: bool,
+    pub play_entry_sound: bool,
+    pub play_exit_sound: bool,
 }
 
 impl Default for AppearanceSettings {
@@ -430,8 +432,10 @@ impl Default for AppearanceSettings {
             glow_color: GlowColor::MintGreen,
             glow_brightness: 1.0,
             inner_glow_strength: 1.0,
-            show_join_leave_notifications: true,
-            play_join_leave_sounds: true,
+            show_entry_notifications: true,
+            show_exit_notifications: true,
+            play_entry_sound: true,
+            play_exit_sound: true,
         }
     }
 }
@@ -444,8 +448,10 @@ const APPEARANCE_GLOW_ENABLED_STORAGE_KEY: &str = "vc_appearance_glow_enabled";
 const APPEARANCE_COLOR_STORAGE_KEY: &str = "vc_appearance_glow_color";
 const APPEARANCE_BRIGHTNESS_STORAGE_KEY: &str = "vc_appearance_glow_brightness";
 const APPEARANCE_INNER_STORAGE_KEY: &str = "vc_appearance_inner_glow_strength";
-const APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY: &str = "vc_appearance_join_leave_notifications";
-const APPEARANCE_JOIN_LEAVE_SOUNDS_KEY: &str = "vc_appearance_join_leave_sounds";
+const APPEARANCE_ENTRY_NOTIFICATIONS_KEY: &str = "vc_appearance_entry_notifications";
+const APPEARANCE_EXIT_NOTIFICATIONS_KEY: &str = "vc_appearance_exit_notifications";
+const APPEARANCE_ENTRY_SOUND_KEY: &str = "vc_appearance_entry_sound";
+const APPEARANCE_EXIT_SOUND_KEY: &str = "vc_appearance_exit_sound";
 const CUSTOM_COLORS_STORAGE_KEY: &str = "vc_appearance_custom_colors";
 
 pub const MAX_CUSTOM_COLORS: usize = 10;
@@ -478,15 +484,51 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
         settings.inner_glow_strength = value.clamp(0.0, 1.0);
     }
 
-    if let Some(value) = read_local_storage(APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY) {
-        settings.show_join_leave_notifications = value != "false";
-    }
-
-    if let Some(value) = read_local_storage(APPEARANCE_JOIN_LEAVE_SOUNDS_KEY) {
-        settings.play_join_leave_sounds = value != "false";
-    }
+    apply_notification_prefs(
+        &mut settings,
+        read_local_storage(APPEARANCE_ENTRY_NOTIFICATIONS_KEY).as_deref(),
+        read_local_storage(APPEARANCE_EXIT_NOTIFICATIONS_KEY).as_deref(),
+        read_local_storage(APPEARANCE_ENTRY_SOUND_KEY).as_deref(),
+        read_local_storage(APPEARANCE_EXIT_SOUND_KEY).as_deref(),
+    );
 
     settings
+}
+
+/// Resolve the entry/exit message + sound preferences onto `settings` from the
+/// raw stored strings (as returned by [`read_local_storage`], i.e. plain text —
+/// these keys are NOT CBOR/zlib encoded). `None` means the key is absent, in
+/// which case that direction keeps its incoming (default-on) value.
+///
+/// A value equal to `"false"` disables; any other present value enables
+/// (mirrors the `!= "false"` read used elsewhere for boolean prefs). Each of
+/// the four toggles is applied independently.
+///
+/// Extracted as a pure function so the per-direction gating is unit testable
+/// without a DOM — the E2E harness cannot observe the exit (leave) direction
+/// because the "left the meeting" toast is currently suppressed there (see the
+/// skipped leave-toast tests in `toast-notifications.spec.ts`). Tested via
+/// `#[wasm_bindgen_test]` in `tests/context_unit.rs` (the lib's plain `#[test]`
+/// block is not executed by the wasm test runner).
+pub fn apply_notification_prefs(
+    settings: &mut AppearanceSettings,
+    entry_notifications: Option<&str>,
+    exit_notifications: Option<&str>,
+    entry_sound: Option<&str>,
+    exit_sound: Option<&str>,
+) {
+    if let Some(value) = entry_notifications {
+        settings.show_entry_notifications = value != "false";
+    }
+    if let Some(value) = exit_notifications {
+        settings.show_exit_notifications = value != "false";
+    }
+    if let Some(value) = entry_sound {
+        settings.play_entry_sound = value != "false";
+    }
+    if let Some(value) = exit_sound {
+        settings.play_exit_sound = value != "false";
+    }
 }
 
 /// Save local-only appearance settings to storage.
@@ -508,12 +550,20 @@ pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
         &settings.inner_glow_strength.clamp(0.0, 1.0).to_string(),
     );
     write_local_storage(
-        APPEARANCE_JOIN_LEAVE_NOTIFICATIONS_KEY,
-        &settings.show_join_leave_notifications.to_string(),
+        APPEARANCE_ENTRY_NOTIFICATIONS_KEY,
+        &settings.show_entry_notifications.to_string(),
     );
     write_local_storage(
-        APPEARANCE_JOIN_LEAVE_SOUNDS_KEY,
-        &settings.play_join_leave_sounds.to_string(),
+        APPEARANCE_EXIT_NOTIFICATIONS_KEY,
+        &settings.show_exit_notifications.to_string(),
+    );
+    write_local_storage(
+        APPEARANCE_ENTRY_SOUND_KEY,
+        &settings.play_entry_sound.to_string(),
+    );
+    write_local_storage(
+        APPEARANCE_EXIT_SOUND_KEY,
+        &settings.play_exit_sound.to_string(),
     );
 }
 

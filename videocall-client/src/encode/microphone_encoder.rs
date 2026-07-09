@@ -67,17 +67,17 @@ use web_time::SystemTime;
 /// (issue #989, Phase 3c → 3 rungs in #1082) because audio is ~1-3% of call
 /// bandwidth, so a deep ladder is not worth the per-layer Opus encode cost.
 ///
-/// - layer 0 = LOW (24 kbps) — the base the relay always forwards and a
-///   congested receiver pulls. Matches the AQ "low" tier.
-/// - layer 1 = MID (32 kbps) — an intermediate rung for moderate downlinks.
-/// - layer 2 = HIGH (50 kbps) — the upgrade layer a receiver with headroom
+/// - layer 0 = LOW (12 kbps) — the base the relay always forwards and a
+///   congested receiver pulls. Matches the AQ "low" tier (issue #1768).
+/// - layer 1 = MID (24 kbps) — an intermediate rung for moderate downlinks.
+/// - layer 2 = HIGH (48 kbps) — the upgrade layer a receiver with headroom
 ///   selects. Matches the AQ "high" tier.
 ///
 /// This slice is the **single source of truth** for the publisher-side audio
 /// ladder; its length defines the maximum supported audio layer count and is
 /// kept in lockstep with the receiver-side `AUDIO_LAYER_KBPS` table by the
-/// compile-time assert below (issue #1077).
-const AUDIO_SIMULCAST_LAYER_KBPS: &[u32] = &[24, 32, 50];
+/// compile-time assert below (issue #1077). Retuned lighter in issue #1768.
+const AUDIO_SIMULCAST_LAYER_KBPS: &[u32] = &[12, 24, 48];
 
 /// Upper bound on AUDIO simulcast layers — the ladder length (issue #1082).
 const AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS: u32 = AUDIO_SIMULCAST_LAYER_KBPS.len() as u32;
@@ -126,9 +126,9 @@ fn clamp_audio_layer_count(max_layers: u32) -> u32 {
 /// SECOND runtime gate driven by the server CONGESTION signal. Audio still has no
 /// shed from encoder backpressure or a relay `LAYER_HINT` (the client ignores
 /// AUDIO hints, and the relay stopped computing the AUDIO union under #1118 N3 /
-/// PR #1330). At the default (Auto) ceilings the full 24/32/50 kbps ladder
-/// (~106 kbps) publishes unconditionally — a deliberate, documented cost (audio
-/// is ~1-3% of call bandwidth).
+/// PR #1330). At the default (Auto) ceilings the full 12/24/48 kbps ladder
+/// (~84 kbps, issue #1768) publishes unconditionally — a deliberate, documented
+/// cost (audio is ~1-3% of call bandwidth).
 fn audio_layer_is_published(
     layer_id: u32,
     user_ceiling_atomic: u32,
@@ -501,7 +501,7 @@ fn audio_uplink_step_down_decision(
 /// counters (unistream_ready_stall_count, unistream_drop_count,
 /// websocket_drop_count) are PROCESS-GLOBAL with NO per-stream attribution.
 /// When the screen is active and driving distress, this gate may fire an audio
-/// downshift. This is BOUNDED (audio floors at 16 kbps and never stops) and
+/// downshift. This is BOUNDED (audio floors at 8 kbps and never stops) and
 /// accepted as a known limitation. The root fix is per-stream counter
 /// attribution at the transport level — out of scope for this issue.
 fn audio_detector_gate_open(
@@ -573,8 +573,8 @@ fn audio_detector_should_reseed(
 // fail-open).
 //
 // All tier bitrates are derived from `AUDIO_QUALITY_TIERS` (the SINGLE source of
-// truth) — never hardcode 50/32/24/16 here. The tier table is ordered HIGHEST
-// first (index 0 = 50 kbps top, ascending index = lower bitrate), so a "step
+// truth) — never hardcode 48/24/12/8 here. The tier table is ordered HIGHEST
+// first (index 0 = 48 kbps top, ascending index = lower bitrate), so a "step
 // down" is a step to a HIGHER index, and a recovery "climb" is a step to a
 // LOWER index.
 
@@ -601,19 +601,20 @@ fn audio_tier_index_for_bps(floor_bps: u32) -> Option<usize> {
 /// ONE tier per call — mirroring the multi-layer one-rung-per-cooldown ladder
 /// (`audio_congestion_recover`), NOT a jump straight to emergency.
 ///
-/// Ladder (from `AUDIO_QUALITY_TIERS`, ×1000): index0=50, 1=32, 2=24, 3=16 kbps.
+/// Ladder (from `AUDIO_QUALITY_TIERS`, ×1000): index0=48, 1=24, 2=12, 3=8 kbps
+/// (issue #1768).
 ///
 /// Behaviour:
 ///   * From the `u32::MAX` fail-open sentinel ("no congestion cut") the FIRST
-///     cut lands on tier index 1 (32 kbps), NOT index 0 (50 kbps). RATIONALE:
-///     the TOP tier (index 0, 50 kbps) IS the healthy / no-cut bitrate, so the
+///     cut lands on tier index 1 (24 kbps), NOT index 0 (48 kbps). RATIONALE:
+///     the TOP tier (index 0, 48 kbps) IS the healthy / no-cut bitrate, so the
 ///     first DOWN step must be a REAL reduction — landing on index 0 would be a
 ///     no-op cut. This is the bitrate analogue of the layer ceiling's first cut
 ///     going from "no cap" straight to base-only.
-///   * From a tier already on the ladder, step to the next-lower tier (32→24,
-///     24→16).
-///   * At the LOWEST/emergency tier (index 3 = 16 kbps) it CLAMPS — 16 stays at
-///     16; a single transient blip cannot gut audio below the emergency floor,
+///   * From a tier already on the ladder, step to the next-lower tier (24→12,
+///     12→8).
+///   * At the LOWEST/emergency tier (index 3 = 8 kbps) it CLAMPS — 8 stays at
+///     8; a single transient blip cannot gut audio below the emergency floor,
 ///     and repeated signals simply hold there.
 ///   * A floor that is not on the ladder (an unusual off-ladder value) is
 ///     treated as "between tiers": step to the first tier strictly below it.
@@ -652,8 +653,8 @@ fn audio_congestion_bitrate_step_down(current_floor_bps: u32) -> u32 {
 /// (issue #1398) — the bitrate analogue of [`audio_congestion_recover`].
 /// Decides the NEXT floor (bps) given the current floor, the wall-clock time,
 /// and when the last congestion cut fired. Climbs the floor UP exactly ONE tier
-/// (toward 50 kbps) per `cooldown_ms`, and returns the `u32::MAX` fail-open
-/// sentinel once it reaches (or already is at) the top tier (50 kbps).
+/// (toward 48 kbps) per `cooldown_ms`, and returns the `u32::MAX` fail-open
+/// sentinel once it reaches (or already is at) the top tier (48 kbps).
 ///
 /// Inputs mirror [`audio_congestion_recover`]:
 ///   * `current_floor_bps`: the floor right now (`u32::MAX` = fail-open / no cut;
@@ -664,7 +665,7 @@ fn audio_congestion_bitrate_step_down(current_floor_bps: u32) -> u32 {
 ///     ([`AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS`](crate::adaptive_quality_constants::AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS)).
 ///
 /// Returns `(next_floor_bps, fully_recovered)`; `fully_recovered == true` once
-/// the floor has climbed back to (or already was at) the top tier (50 kbps),
+/// the floor has climbed back to (or already was at) the top tier (48 kbps),
 /// signalling the caller to drop to the fail-open sentinel and stop ticking.
 /// ONE tier per cooldown gives the same hysteresis as the layer-ceiling ladder.
 ///
@@ -696,7 +697,7 @@ fn audio_bitrate_recover(
         // Climb ONE tier toward the top (lower index = higher bitrate).
         let next_idx = current_idx.saturating_sub(1);
         if next_idx == 0 {
-            // Reached the top tier (50 kbps) → fail-open + done.
+            // Reached the top tier (48 kbps) → fail-open + done.
             (u32::MAX, true)
         } else {
             (audio_tier_bps_for_index(next_idx), false)
@@ -723,10 +724,10 @@ fn audio_bitrate_recover(
 ///   * `distress_active_now`: TRUE when the uplink-distress DETECTOR fired a
 ///     step-down DECISION on THIS tick (issue #1398 hold-at-floor fix). It
 ///     re-anchors the cooldown to `now_ms` REGARDLESS of whether the floor VALUE
-///     changed. This is the load-bearing input at the EMERGENCY floor (16 kbps):
+///     changed. This is the load-bearing input at the EMERGENCY floor (8 kbps):
 ///     a step-down there is a clamped no-op, so `current == last_seen` and the
 ///     value-decrease path below would NOT re-anchor — leaving the cooldown to
-///     elapse and recovery to climb 16k→24k while severe distress is still
+///     elapse and recovery to climb 8k→12k while severe distress is still
 ///     ongoing, only to be re-cut a window later (a wasteful ~4 s excursion every
 ///     cooldown). With this flag, an ongoing decision HOLDS the floor: it leaves
 ///     `current` in place and resets the cut timestamp to `now_ms`, so the climb
@@ -746,7 +747,7 @@ fn audio_bitrate_tick(
 ) -> (u32, u32, Option<f64>) {
     // HOLD-AT-FLOOR (issue #1398): a step-down DECISION fired this tick. Re-anchor
     // the cooldown to `now_ms` so recovery does NOT climb — distress is still
-    // ongoing. At the emergency floor (16 kbps) the step-down was a clamped no-op
+    // ongoing. At the emergency floor (8 kbps) the step-down was a clamped no-op
     // (`current == last_seen`), so the value-decrease path below would otherwise
     // NOT re-anchor; this flag is what holds the floor there. We HOLD the current
     // value (no climb), leave `last_seen` at `current` (a hold is not a new cut
@@ -794,7 +795,7 @@ fn audio_bitrate_tick(
 ///   * `tier_bps` — the bitrate the CAMERA AQ loop writes into the shared
 ///     tier-bitrate atom. It is written ONLY by the camera encoder's AQ loop
 ///     (needs camera frames) and never reset, so when the camera is OFF it holds
-///     a STALE value (its last camera-on tier, or the 50000 top-tier default if
+///     a STALE value (its last camera-on tier, or the 48000 top-tier default if
 ///     the camera was never on this session).
 ///   * `congestion_floor_bps` — the MIC-side single-layer congestion floor
 ///     (`u32::MAX` = fail-open / no cut), driven by the mic uplink-distress
@@ -808,7 +809,7 @@ fn audio_bitrate_tick(
 ///     GATED OFF (see [`audio_detector_gate_open`]) and the mic floor must NOT
 ///     apply here.
 ///   * CAMERA OFF, floor fail-open (`u32::MAX`): return the HEALTHY TOP-TIER
-///     constant `AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000` (50000), IGNORING the
+///     constant `AUDIO_QUALITY_TIERS[0].bitrate_kbps * 1000` (48000), IGNORING the
 ///     (possibly stale) `tier_bps`. The camera AQ loop never restored `tier_bps`
 ///     after a camera-on congestion episode, so reading it would pin audio-only
 ///     at a stale low tier forever on a healthy link. With no cut, the correct
@@ -999,11 +1000,11 @@ pub struct MicrophoneEncoder {
     /// off (audio-only), and so the worklet ports are in scope.
     fec_reconfig_interval: Rc<RefCell<Option<Interval>>>,
     vad_threshold: f32,
-    /// Tier-controlled audio bitrate in bps (e.g. 50000 for 50 kbps). Shared with
+    /// Tier-controlled audio bitrate in bps (e.g. 48000 for 48 kbps). Shared with
     /// the camera encoder's quality manager, which is its ONLY writer: it lowers
     /// this on each camera-driven audio-tier change (which needs camera frames) and
-    /// never resets it. Defaults to the top tier (50000 bps). When the camera is
-    /// off this atom holds a STALE value — its last camera-on tier, or the 50000
+    /// never resets it. Defaults to the top tier (48000 bps). When the camera is
+    /// off this atom holds a STALE value — its last camera-on tier, or the 48000
     /// default if the camera was never on this session — so [`effective_audio_bitrate`]
     /// IGNORES it in the camera-off case (FIX B).
     ///
@@ -1772,7 +1773,7 @@ impl MicrophoneEncoder {
         // mechanism is gated to single-layer mode (`n_audio_layers == 1`): only
         // then does a single Opus stream with no upper layer to shed need a live
         // bitrate downshift. `fec_reconfig_tier_bitrate` is the camera AQ loop's
-        // tier-bitrate atom (defaults to 50000 bps, stays there audio-only);
+        // tier-bitrate atom (defaults to 48000 bps, stays there audio-only);
         // `fec_reconfig_bitrate_floor` is the congestion floor (u32::MAX =
         // fail-open); `fec_camera_active` is the live camera state. The FEC
         // reconfig timer feeds all three to the CAMERA-STATE-AWARE
@@ -2365,7 +2366,7 @@ impl MicrophoneEncoder {
                 // re-anchor is driven by the `bitrate_distress_this_tick` flag set
                 // on the firing path (passed into `audio_bitrate_tick` as
                 // `distress_active_now`), NOT by an observed value change — so it
-                // holds the cooldown even at the EMERGENCY floor (16 kbps), where
+                // holds the cooldown even at the EMERGENCY floor (8 kbps), where
                 // the step-down is a clamped no-op and the floor value does not
                 // change. This is the desired "ongoing distress holds the floor";
                 // off the floor a real value decrease still re-anchors via the
@@ -2458,7 +2459,7 @@ impl MicrophoneEncoder {
                             // tick. Flag it so the bitrate-recovery block below
                             // re-anchors its cooldown REGARDLESS of whether the
                             // floor VALUE changes — the load-bearing case is the
-                            // emergency floor (16 kbps), where the step is a
+                            // emergency floor (8 kbps), where the step is a
                             // clamped no-op and the value-decrease re-anchor would
                             // NOT fire, so recovery would otherwise climb under
                             // sustained distress (issue #1398 hold-at-floor fix).
@@ -2616,7 +2617,7 @@ impl MicrophoneEncoder {
                 // Bitrate component (issue #1398): ONLY in single-layer mode. The
                 // CAMERA-STATE-AWARE select of the tier-driven bitrate (camera AQ
                 // loop) and the congestion floor — camera-ON uses the tier;
-                // camera-OFF uses the floor when cut, else the healthy 50000
+                // camera-OFF uses the floor when cut, else the healthy 48000
                 // top-tier default (ignoring the stale tier). `None` in multi-layer
                 // mode → no bitrate in the reconfig.
                 let bit_rate: Option<u32> = if fec_single_layer {
@@ -2775,8 +2776,8 @@ mod layer_count_tests {
     #[test]
     fn audio_ladder_is_three_rungs_low_mid_high() {
         // The publisher ladder is the single source of truth for the cap and is
-        // ordered lowest→highest (issue #1082).
-        assert_eq!(AUDIO_SIMULCAST_LAYER_KBPS, &[24, 32, 50]);
+        // ordered lowest→highest (issue #1082; retuned lighter in #1768).
+        assert_eq!(AUDIO_SIMULCAST_LAYER_KBPS, &[12, 24, 48]);
         assert_eq!(
             AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS as usize,
             AUDIO_SIMULCAST_LAYER_KBPS.len()
@@ -3129,37 +3130,37 @@ mod layer_count_tests {
     #[test]
     fn bitrate_step_down_first_cut_lands_on_index_one_not_top() {
         // From the fail-open sentinel (no cut), the FIRST down-step must be a REAL
-        // reduction: tier index 1 (32 kbps), NOT index 0 (50 kbps, the healthy
+        // reduction: tier index 1 (24 kbps), NOT index 0 (48 kbps, the healthy
         // no-cut bitrate). A step that returned index 0 would be a no-op cut.
         // Revert it catches: making `audio_congestion_bitrate_step_down` return
         // `audio_tier_bps_for_index(0)` (top) from the sentinel → this fails
-        // (32000 != 50000).
+        // (24000 != 48000).
         assert_eq!(audio_congestion_bitrate_step_down(u32::MAX), tier_bps(1));
-        assert_eq!(tier_bps(0), 50_000, "table sanity: top tier is 50 kbps");
-        assert_eq!(tier_bps(1), 32_000, "table sanity: second tier is 32 kbps");
+        assert_eq!(tier_bps(0), 48_000, "table sanity: top tier is 48 kbps");
+        assert_eq!(tier_bps(1), 24_000, "table sanity: second tier is 24 kbps");
     }
 
     #[test]
     fn bitrate_step_down_walks_the_ladder_one_tier_at_a_time() {
-        // 50(top)→cut→32→24→16, one tier per call (NOT a jump to emergency).
-        // Revert it catches: returning `current` unchanged → 32 stays 32, this
+        // 48(top)→cut→24→12→8, one tier per call (NOT a jump to emergency).
+        // Revert it catches: returning `current` unchanged → 24 stays 24, this
         // fails; jumping straight to the bottom from the sentinel → first cut
-        // would be 16000, the index_one test fails.
-        assert_eq!(audio_congestion_bitrate_step_down(tier_bps(0)), tier_bps(1)); // 50→32
-        assert_eq!(audio_congestion_bitrate_step_down(tier_bps(1)), tier_bps(2)); // 32→24
-        assert_eq!(audio_congestion_bitrate_step_down(tier_bps(2)), tier_bps(3)); // 24→16
-        assert_eq!(tier_bps(2), 24_000);
-        assert_eq!(tier_bps(3), 16_000);
+        // would be 8000, the index_one test fails.
+        assert_eq!(audio_congestion_bitrate_step_down(tier_bps(0)), tier_bps(1)); // 48→24
+        assert_eq!(audio_congestion_bitrate_step_down(tier_bps(1)), tier_bps(2)); // 24→12
+        assert_eq!(audio_congestion_bitrate_step_down(tier_bps(2)), tier_bps(3)); // 12→8
+        assert_eq!(tier_bps(2), 12_000);
+        assert_eq!(tier_bps(3), 8_000);
     }
 
     #[test]
     fn bitrate_step_down_clamps_at_emergency_floor() {
-        // At the lowest tier (16 kbps) a further cut HOLDS at 16 — a single
+        // At the lowest tier (8 kbps) a further cut HOLDS at 8 — a single
         // transient blip cannot gut audio below emergency, and repeated signals
         // simply hold. Revert it catches: an unclamped `idx + 1` index → panic /
         // out-of-bounds, or returning 0 → this fails.
         let bottom = tier_bps(AUDIO_QUALITY_TIERS.len() - 1);
-        assert_eq!(bottom, 16_000);
+        assert_eq!(bottom, 8_000);
         assert_eq!(audio_congestion_bitrate_step_down(bottom), bottom);
     }
 
@@ -3169,15 +3170,15 @@ mod layer_count_tests {
         // CAMERA-OFF, FLOOR FAIL-OPEN (no cut): the tier atom may hold a STALE low
         // value — the camera AQ loop lowers it on camera-on congestion and never
         // restores it — so it MUST be IGNORED here. With no cut, the correct
-        // audio-only bitrate is the healthy TOP tier (50000). camera_video_exhausted
-        // is irrelevant when camera is off.
+        // audio-only bitrate is the healthy TOP tier (48000, #1768).
+        // camera_video_exhausted is irrelevant when camera is off.
         assert_eq!(
-            effective_audio_bitrate(16_000, u32::MAX, false, false),
-            50_000
+            effective_audio_bitrate(8_000, u32::MAX, false, false),
+            48_000
         );
         assert_eq!(
-            effective_audio_bitrate(50_000, u32::MAX, false, false),
-            50_000
+            effective_audio_bitrate(48_000, u32::MAX, false, false),
+            48_000
         );
     }
 
@@ -3187,13 +3188,13 @@ mod layer_count_tests {
         // STALE camera-on value; it MUST be IGNORED — the mic floor is the live
         // authority audio-only. Returns the FLOOR regardless of the tier.
         assert_eq!(
-            effective_audio_bitrate(50_000, 32_000, false, false),
-            32_000
+            effective_audio_bitrate(48_000, 24_000, false, false),
+            24_000
         );
         // THE FIX-B decisive case: a STALE tier BELOW the floor.
         assert_eq!(
-            effective_audio_bitrate(24_000, 32_000, false, false),
-            32_000
+            effective_audio_bitrate(12_000, 24_000, false, false),
+            24_000
         );
     }
 
@@ -3201,11 +3202,11 @@ mod layer_count_tests {
     fn effective_audio_bitrate_camera_on_not_exhausted_uses_tier_ignores_floor() {
         // CAMERA-ON, video NOT exhausted: the camera AQ loop is the live authority
         // and the mic detector is gated OFF, so the floor MUST NOT apply.
-        assert_eq!(effective_audio_bitrate(50_000, 32_000, true, false), 50_000);
+        assert_eq!(effective_audio_bitrate(48_000, 24_000, true, false), 48_000);
         // Tier already below the floor: still the tier (the AQ loop owns it).
         assert_eq!(
-            effective_audio_bitrate(24_000, u32::MAX, true, false),
-            24_000
+            effective_audio_bitrate(12_000, u32::MAX, true, false),
+            12_000
         );
     }
 
@@ -3214,59 +3215,59 @@ mod layer_count_tests {
         // Issue #1611 backstop: camera ON + video EXHAUSTED → min(tier, floor).
         // This is the "camera can't shed video, audio is the only axis" path.
         // Floor tighter than tier: floor governs.
-        assert_eq!(effective_audio_bitrate(50_000, 32_000, true, true), 32_000);
+        assert_eq!(effective_audio_bitrate(48_000, 24_000, true, true), 24_000);
         // Tier tighter than floor: tier governs.
-        assert_eq!(effective_audio_bitrate(24_000, 32_000, true, true), 24_000);
+        assert_eq!(effective_audio_bitrate(12_000, 24_000, true, true), 12_000);
         // No cut (floor = u32::MAX): min(tier, MAX) = tier (no change from healthy).
         assert_eq!(
-            effective_audio_bitrate(50_000, u32::MAX, true, true),
-            50_000
+            effective_audio_bitrate(48_000, u32::MAX, true, true),
+            48_000
         );
     }
 
     #[test]
     fn bitrate_recover_holds_during_cooldown() {
-        // Right after a cut to 32 kbps, recovery HOLDS until a full cooldown has
+        // Right after a cut to 24 kbps, recovery HOLDS until a full cooldown has
         // elapsed — no early climb. Revert it catches: climbing before the
         // cooldown (dropping the `>=` guard) → this fails.
         let cut_at = 1000.0;
         let (next, done) = audio_bitrate_recover(
-            tier_bps(1), // 32 kbps (post first-cut)
+            tier_bps(1), // 24 kbps (post first-cut, #1768)
             cut_at + AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS - 1.0,
             Some(cut_at),
             AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS,
         );
-        assert_eq!(next, tier_bps(1), "must hold at 32 kbps during cooldown");
+        assert_eq!(next, tier_bps(1), "must hold at 24 kbps during cooldown");
         assert!(!done, "not fully recovered while still cut");
     }
 
     #[test]
     fn bitrate_recover_climbs_one_tier_per_cooldown() {
-        // After one cooldown, 24 kbps climbs to 32 kbps (one tier UP, toward the
-        // top), NOT straight to 50. Revert it catches: a two-tier climb
-        // (`saturating_sub(2)`) → this fails (would land on 50000/sentinel);
+        // After one cooldown, 12 kbps climbs to 24 kbps (one tier UP, toward the
+        // top), NOT straight to 48. Revert it catches: a two-tier climb
+        // (`saturating_sub(2)`) → this fails (would land on 48000/sentinel);
         // climbing the wrong direction (toward lower bitrate) → this fails.
         let cut_at = 1000.0;
         let (next, done) = audio_bitrate_recover(
-            tier_bps(2), // 24 kbps
+            tier_bps(2), // 12 kbps (#1768)
             cut_at + AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS,
             Some(cut_at),
             AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS,
         );
-        assert_eq!(next, tier_bps(1), "climb exactly one tier (24→32)");
+        assert_eq!(next, tier_bps(1), "climb exactly one tier (12→24)");
         assert!(!done, "still below the top tier");
     }
 
     #[test]
     fn bitrate_recover_final_tier_returns_fail_open() {
-        // Climbing the LAST tier back to the top (32→50) collapses to the
+        // Climbing the LAST tier back to the top (24→48) collapses to the
         // fail-open sentinel and signals fully-recovered. Revert it catches:
-        // returning `tier_bps(0)` (50000) instead of the sentinel → this fails
-        // (50000 != u32::MAX), which would leave a permanent 50 kbps "cut" that
+        // returning `tier_bps(0)` (48000) instead of the sentinel → this fails
+        // (48000 != u32::MAX), which would leave a permanent 48 kbps "cut" that
         // never clears.
         let cut_at = 1000.0;
         let (next, done) = audio_bitrate_recover(
-            tier_bps(1), // 32 kbps (one below top)
+            tier_bps(1), // 24 kbps (one below top, #1768)
             cut_at + AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS,
             Some(cut_at),
             AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS,
@@ -3294,7 +3295,7 @@ mod layer_count_tests {
     fn bitrate_tick_spaces_tiers_one_cooldown_apart() {
         // The FULL per-tick hysteresis (analogue of
         // `audio_congestion_tick_spaces_rungs_one_cooldown_apart`): after a cut to
-        // 32 kbps, recovery climbs back EXACTLY one tier per cooldown — NOT all
+        // 24 kbps, recovery climbs back EXACTLY one tier per cooldown — NOT all
         // tiers on consecutive ticks once the first cooldown elapses. This is the
         // regression guard for the per-tier cooldown re-anchor in
         // `audio_bitrate_tick`.
@@ -3302,25 +3303,25 @@ mod layer_count_tests {
         let tick = 1000.0; // recovery cadence
         let t0 = 1_000.0;
 
-        // First tick after the client cut the floor to 32 kbps (a decrease vs the
+        // First tick after the client cut the floor to 24 kbps (a decrease vs the
         // fail-open sentinel): detected, cooldown anchored.
         // (`distress_active_now == false` throughout: this test models distress
         // having STOPPED — the floor was cut out-of-band by the client and now the
         // recovery climbs back. The new hold-at-floor flag is exercised separately.)
         let (c, ls, cut) = audio_bitrate_tick(tier_bps(1), u32::MAX, t0, None, cd, false);
-        assert_eq!(c, tier_bps(1), "held at 32 kbps right after the cut");
+        assert_eq!(c, tier_bps(1), "held at 24 kbps right after the cut");
         assert_eq!(cut, Some(t0), "cooldown anchored at the cut time");
 
-        // Suppose congestion deepens: a SECOND cut to 24 kbps (another decrease).
+        // Suppose congestion deepens: a SECOND cut to 12 kbps (another decrease).
         let (c, ls, cut) = audio_bitrate_tick(tier_bps(2), ls, t0 + tick, cut, cd, false);
-        assert_eq!(c, tier_bps(2), "held at 24 kbps after the second cut");
+        assert_eq!(c, tier_bps(2), "held at 12 kbps after the second cut");
         assert_eq!(cut, Some(t0 + tick), "cooldown re-anchored at the new cut");
 
-        // Just before the cooldown elapses: still 24 kbps.
+        // Just before the cooldown elapses: still 12 kbps.
         let (c, ls, cut) = audio_bitrate_tick(c, ls, t0 + tick + cd - tick, cut, cd, false);
-        assert_eq!(c, tier_bps(2), "holds 24 kbps until a full cooldown");
+        assert_eq!(c, tier_bps(2), "holds 12 kbps until a full cooldown");
 
-        // Cooldown elapsed: climb exactly one tier (24→32), NOT straight to top.
+        // Cooldown elapsed: climb exactly one tier (12→24), NOT straight to top.
         let climb_at = t0 + tick + cd;
         let (c, ls, cut) = audio_bitrate_tick(c, ls, climb_at, cut, cd, false);
         assert_eq!(c, tier_bps(1), "climbs exactly one tier after one cooldown");
@@ -3330,7 +3331,7 @@ mod layer_count_tests {
             "per-tier cooldown re-anchored at climb"
         );
 
-        // THE anti-regression assertion: the immediate next tick must HOLD at 32.
+        // THE anti-regression assertion: the immediate next tick must HOLD at 24.
         // Without the per-tier re-anchor, `cut` would still be the old cut time
         // and this tick would jump straight to the top.
         let (c, ls, cut) = audio_bitrate_tick(c, ls, climb_at + tick, cut, cd, false);
@@ -3346,14 +3347,14 @@ mod layer_count_tests {
     fn bitrate_tick_clear_to_max_is_read_as_fully_recovered_no_new_cut() {
         // FIX C RECOVERY-SAFETY: the camera-ON edge stores `u32::MAX` into the
         // floor atom out-of-band (clearing the mic cut to fail-open). This RAISES
-        // the floor from a prior cut (e.g. 32 kbps) to `u32::MAX`. The recovery
+        // the floor from a prior cut (e.g. 24 kbps) to `u32::MAX`. The recovery
         // state machine must read that raise correctly on the next tick:
         //   * `current == u32::MAX` → `audio_bitrate_recover` returns
         //     `(u32::MAX, true)` (fully recovered), so the tick clears `next_cut`
         //     to `None` (no lingering cooldown).
         //   * the raise (32000 → u32::MAX) is NOT a decrease, so `current <
         //     last_seen` is false → no SPURIOUS new-cut is detected.
-        // `last_seen` is the prior, LOWER floor (32 kbps) the loop last left; a
+        // `last_seen` is the prior, LOWER floor (24 kbps) the loop last left; a
         // pre-existing cooldown timestamp is present.
         let cd = AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS;
         let now = 10_000.0;
@@ -3389,24 +3390,24 @@ mod layer_count_tests {
 
     #[test]
     fn bitrate_tick_holds_floor_under_sustained_distress() {
-        // ISSUE #1398 HOLD-AT-FLOOR: at the EMERGENCY floor (16 kbps), an ongoing
+        // ISSUE #1398 HOLD-AT-FLOOR: at the EMERGENCY floor (8 kbps), an ongoing
         // step-down DECISION is a clamped no-op (the value cannot drop further), so
         // the value-decrease re-anchor (`current < last_seen`) never fires. The new
         // `distress_active_now` flag is what re-anchors the cooldown there, so the
         // 2-min recovery climb only begins after distress STOPS for a full cooldown.
         // Without the fix the cooldown would elapse under sustained distress and
-        // recovery would climb 16k→24k, only to be re-cut a window later — a
-        // wasteful ~4 s excursion every cooldown. Audio must HOLD at 16k.
+        // recovery would climb 8k→12k, only to be re-cut a window later — a
+        // wasteful ~4 s excursion every cooldown. Audio must HOLD at 8k.
         let cd = AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS;
         let tick = 1000.0; // recovery cadence
-        let floor16 = tier_bps(AUDIO_QUALITY_TIERS.len() - 1); // 16 kbps, bottom rung
+        let floor_min = tier_bps(AUDIO_QUALITY_TIERS.len() - 1); // 8 kbps, bottom rung
 
-        // The detector has cut the floor to 16k and distress is ONGOING. The loop
-        // last left the atom at 16k (a hold is not a new cut), and a cooldown is
+        // The detector has cut the floor to 8k and distress is ONGOING. The loop
+        // last left the atom at 8k (a hold is not a new cut), and a cooldown is
         // anchored from an earlier cut.
         let cut_ts = 1_000.0;
-        let mut last_seen = floor16;
-        let mut floor = floor16;
+        let mut last_seen = floor_min;
+        let mut floor = floor_min;
         let mut cut = Some(cut_ts);
 
         // Tick repeatedly PAST the cooldown with distress STILL firing each tick.
@@ -3415,15 +3416,15 @@ mod layer_count_tests {
         for _ in 0..((cd / tick) as i64 + 5) {
             let (f, ls, c) = audio_bitrate_tick(floor, last_seen, now, cut, cd, true);
             assert_eq!(
-                f, floor16,
-                "must HOLD at the 16 kbps emergency floor while distress is ongoing"
+                f, floor_min,
+                "must HOLD at the 8 kbps emergency floor while distress is ongoing"
             );
             assert_eq!(
                 c,
                 Some(now),
                 "an ongoing distress decision re-anchors the cooldown to NOW each tick"
             );
-            assert_eq!(ls, floor16, "a hold leaves last_seen at the held floor");
+            assert_eq!(ls, floor_min, "a hold leaves last_seen at the held floor");
             floor = f;
             last_seen = ls;
             cut = c;
@@ -3438,30 +3439,30 @@ mod layer_count_tests {
 
         // Now distress STOPS: `distress_active_now == false`. The cooldown was last
         // anchored at the final distress tick; once a FULL cooldown passes with no
-        // further decision, recovery climbs one tier (16k→24k).
+        // further decision, recovery climbs one tier (8k→12k).
         let stop_anchor = cut.expect("cooldown anchored at the last distress tick");
-        // Just before a full cooldown after distress stopped: still 16k.
+        // Just before a full cooldown after distress stopped: still 8k.
         let (f, ls, c) =
             audio_bitrate_tick(floor, last_seen, stop_anchor + cd - tick, cut, cd, false);
         assert_eq!(
-            f, floor16,
-            "holds 16k until a full cooldown AFTER distress stops"
+            f, floor_min,
+            "holds 8k until a full cooldown AFTER distress stops"
         );
         floor = f;
         last_seen = ls;
         cut = c;
-        // Full cooldown after distress stopped: climb one tier (16k→24k).
+        // Full cooldown after distress stopped: climb one tier (8k→12k).
         let (f, _ls, _c) = audio_bitrate_tick(floor, last_seen, stop_anchor + cd, cut, cd, false);
         assert_eq!(
             f,
             tier_bps(AUDIO_QUALITY_TIERS.len() - 2),
-            "climbs ONE tier (16k→24k) only after distress stops for a full cooldown"
+            "climbs ONE tier (8k→12k) only after distress stops for a full cooldown"
         );
         // Revert it catches: forcing the call site to pass `false` (or removing the
         // `distress_active_now && current != u32::MAX` re-anchor branch in
         // `audio_bitrate_tick`, or dropping the `Some(now_ms)` re-anchor in it) makes
         // the cooldown elapse DURING sustained distress, so the in-loop assertion
-        // `f == floor16` fails on the tick where recovery climbs 16k→24k.
+        // `f == floor_min` fails on the tick where recovery climbs 8k→12k.
     }
 
     #[test]
@@ -3471,17 +3472,17 @@ mod layer_count_tests {
         // floor climbs normally one tier per cooldown all the way back to the
         // fail-open sentinel — the floor is never wedged at a low tier forever.
         let cd = AUDIO_CONGESTION_RECOVERY_COOLDOWN_MS;
-        let floor16 = tier_bps(AUDIO_QUALITY_TIERS.len() - 1); // 16 kbps
+        let floor_min = tier_bps(AUDIO_QUALITY_TIERS.len() - 1); // 8 kbps
 
-        // Start cut at the 16k floor with a cooldown anchored; distress has stopped.
+        // Start cut at the 8k floor with a cooldown anchored; distress has stopped.
         let cut_anchor = 1_000.0;
-        let mut floor = floor16;
-        let mut last_seen = floor16;
+        let mut floor = floor_min;
+        let mut last_seen = floor_min;
         let mut cut = Some(cut_anchor);
         let mut now = cut_anchor;
 
         // Drive forward in cooldown-sized hops with NO distress. The floor must
-        // climb 16k→24k→32k→50k(=MAX) and finally clear the cut to None.
+        // climb 8k→12k→24k→48k(=MAX) and finally clear the cut to None.
         let mut climbs = 0;
         for _ in 0..10 {
             now += cd;
@@ -3502,7 +3503,7 @@ mod layer_count_tests {
             "with distress stopped the floor climbs all the way back to fail-open — no wedge"
         );
         assert_eq!(cut, None, "full recovery clears the cut memory");
-        // 16k→24k→32k→MAX = three climbs from the bottom rung.
+        // 8k→12k→24k→MAX = three climbs from the bottom rung.
         assert_eq!(
             climbs, 3,
             "climbed exactly one tier per cooldown back to the top"
@@ -3561,29 +3562,29 @@ mod layer_count_tests {
         // Single-layer key: a change in ONLY the bitrate (fec/loss steady) must
         // emit so the live bitrate downshift is applied. Revert it catches:
         // dropping the bitrate component from the key (comparing only fec/loss) →
-        // this fails (would suppress a pure bitrate change). init_bitrate=50000.
-        let init = Some(50_000);
+        // this fails (would suppress a pure bitrate change). init_bitrate=48000.
+        let init = Some(48_000);
         // Healthy at init (top tier, full bitrate): suppress.
         assert_eq!(
-            audio_reconfig_change((false, 0, Some(50_000)), None, init),
+            audio_reconfig_change((false, 0, Some(48_000)), None, init),
             None
         );
-        // Floor cut drops the effective bitrate to 32 kbps (fec/loss unchanged):
+        // Floor cut drops the effective bitrate to 24 kbps (fec/loss unchanged):
         // must emit.
         assert_eq!(
             audio_reconfig_change(
-                (false, 0, Some(32_000)),
-                Some((false, 0, Some(50_000))),
+                (false, 0, Some(24_000)),
+                Some((false, 0, Some(48_000))),
                 init
             ),
-            Some((false, 0, Some(32_000))),
+            Some((false, 0, Some(24_000))),
             "a pure bitrate downshift must re-apply in single-layer mode"
         );
         // Same key again: suppress (debounce).
         assert_eq!(
             audio_reconfig_change(
-                (false, 0, Some(32_000)),
-                Some((false, 0, Some(32_000))),
+                (false, 0, Some(24_000)),
+                Some((false, 0, Some(24_000))),
                 init
             ),
             None
@@ -4108,7 +4109,7 @@ mod tests {
 
     #[wasm_bindgen_test]
     fn pack_typical_opus_frame_size() {
-        // Typical Opus frame at 50kbps, 20ms = ~125 bytes
+        // Typical Opus frame at 48kbps, 20ms = ~120 bytes
         let primary: Vec<u8> = (0..120).collect();
         let redundant = PreviousAudioFrame {
             data: (0..100).collect(),

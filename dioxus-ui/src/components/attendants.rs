@@ -17,8 +17,8 @@
  */
 
 use crate::components::action_bar_layout::{
-    load_action_bar_layout, remove_action_bar_layout, save_action_bar_layout, slot_index,
-    ActionBarSlot, DEFAULT_SLOTS,
+    apply_keyboard_reorder, load_action_bar_layout, remove_action_bar_layout,
+    save_action_bar_layout, slot_index, ActionBarSlot, DEFAULT_SLOTS,
 };
 use crate::components::decode_budget::{
     decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
@@ -38,6 +38,7 @@ use crate::components::{
     diagnostics::Diagnostics,
     host::Host,
     host_controls::HostControls,
+    media_metrics_overlay::{MediaMetricsOverlayCtx, MEDIA_METRICS_OVERLAY_KEY},
     meeting_ended_overlay::MeetingEndedOverlay,
     meeting_options_controls::MeetingOptionsControls,
     peer_list::{PeerList, PeerListEntry},
@@ -71,7 +72,7 @@ use crate::context::{
     LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap,
     SignalPopupStateMap, TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
 };
-use crate::local_storage::{load_f64, save_f64};
+use crate::local_storage::{load_bool, load_f64, save_f64};
 use crate::types::DeviceInfo;
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
@@ -597,6 +598,129 @@ fn read_nav_axis_gap_px(nav: &web_sys::Element, is_vertical: bool) -> f64 {
         .unwrap_or(19.2)
 }
 
+// ─── Shared `.glass-select-menu` keyboard-navigation helpers ────────────────
+// WCAG 2.1.1 keyboard equivalents for the dock-position dropdown that houses
+// Bottom/Left/Right, autohide, Customize, and Reset to Default. Before these
+// helpers the menu options were `<div role="option">` with only `onclick` —
+// a keyboard user could not enter customize mode or reset the bar at all.
+// The helpers are reusable across any wrapper that hosts a
+// `.glass-select-menu` with `.glass-select-option` children (and optional
+// `.glass-select-separator` interlopers, which are naturally skipped by the
+// `.glass-select-option` class selector).
+
+/// Focus the element with the given `id`. Silently no-op if the id is not
+/// present in the document or the element is not focusable — this lets
+/// callers restore focus to their trigger without knowing whether the
+/// trigger was swapped out by the action they just fired (e.g. entering
+/// customize mode replaces the dock trigger with the Done button).
+fn focus_element_by_id(id: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+    {
+        if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
+            let _ = html.focus();
+        }
+    }
+}
+
+/// Focus the first (`last=false`) or last (`last=true`) `.glass-select-option`
+/// inside the `.glass-select-menu` that lives under `wrapper_selector`
+/// (e.g. `.dock-position-wrapper`). Used by trigger's ArrowDown/ArrowUp and
+/// by the menu's Home/End handlers.
+fn focus_glass_option_at(wrapper_selector: &str, last: bool) {
+    let selector = format!("{wrapper_selector} .glass-select-menu .glass-select-option");
+    if let Some(nodes) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector_all(&selector).ok())
+    {
+        let n = nodes.length();
+        if n == 0 {
+            return;
+        }
+        let idx = if last { n - 1 } else { 0 };
+        if let Some(node) = nodes.item(idx) {
+            if let Ok(html) = node.dyn_into::<web_sys::HtmlElement>() {
+                let _ = html.focus();
+            }
+        }
+    }
+}
+
+/// Move focus to the next (`delta = +1`) or previous (`delta = -1`)
+/// `.glass-select-option` relative to the currently-focused element.
+/// Separators are skipped by walking sibling-by-sibling and matching on the
+/// option class. Focus wraps at the ends (APG listbox convention). No-op if
+/// nothing in the document has focus or the active element isn't inside a
+/// menu.
+fn focus_glass_option_relative(delta: i32) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Some(active) = doc.active_element() else {
+        return;
+    };
+    let step_forward = delta >= 0;
+    let mut cursor = if step_forward {
+        active.next_element_sibling()
+    } else {
+        active.previous_element_sibling()
+    };
+    while let Some(el) = cursor {
+        let next = if step_forward {
+            el.next_element_sibling()
+        } else {
+            el.previous_element_sibling()
+        };
+        if el.class_list().contains("glass-select-option") {
+            if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
+                let _ = html.focus();
+            }
+            return;
+        }
+        cursor = next;
+    }
+    // Reached the end without finding another option → wrap to first/last.
+    if let Some(parent) = active.parent_element() {
+        if let Ok(nodes) = parent.query_selector_all(".glass-select-option") {
+            let n = nodes.length();
+            if n == 0 {
+                return;
+            }
+            let idx = if step_forward { 0 } else { n - 1 };
+            if let Some(node) = nodes.item(idx) {
+                if let Ok(html) = node.dyn_into::<web_sys::HtmlElement>() {
+                    let _ = html.focus();
+                }
+            }
+        }
+    }
+}
+
+/// Focus the first element matching `selector`. Used to move focus onto a
+/// button that is only rendered by a state transition the caller just made
+/// (e.g. focusing the `.action-bar-done-trigger` after `customize_mode.set(true)`
+/// swaps out the dock-menu trigger for the Done button on next render).
+fn focus_by_selector(selector: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.query_selector(selector).ok().flatten())
+    {
+        if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
+            let _ = html.focus();
+        }
+    }
+}
+
+/// Returns true if the keyboard event carries an "activate this option" key:
+/// Enter or Space. On a `<div role="option">` the browser does NOT synthesise
+/// a click for either key (unlike a `<button>`), so callers must handle the
+/// activation themselves.
+fn is_option_activate_key(evt: &Event<KeyboardData>) -> bool {
+    let key = evt.key();
+    key == Key::Enter || matches!(&key, Key::Character(s) if s == " ")
+}
+
 #[component]
 pub fn AttendantsComponent(
     #[props(default)] id: String,
@@ -685,6 +809,12 @@ pub fn AttendantsComponent(
     let mut dock_menu_open = use_signal(|| false);
     let mut autohide_enabled = use_signal(load_dock_autohide);
     let mut customize_mode = use_signal(|| false);
+    // Text pushed into the customize-mode aria-live region on keyboard reorder
+    // (WCAG 2.1.1). Empty when there is nothing new to announce; a fresh string
+    // — even the SAME logical position revisited — must be produced so screen
+    // readers re-announce it. Reset to empty when customize mode exits so the
+    // region is silent between edit sessions.
+    let mut action_bar_announce: Signal<String> = use_signal(String::new);
     // Action-bar layout is persisted as a (visible_slots, hidden_slots) pair so
     // that user-removed slots stay removed across reloads. `load_action_bar_layout`
     // returns the migrated pair; both signals must be kept in lock-step on every
@@ -725,6 +855,10 @@ pub fn AttendantsComponent(
                 drag_pointer_id_reset.set(0);
                 drag_grab_dx_reset.set(0.0);
                 drag_grab_dy_reset.set(0.0);
+                // Silence the keyboard-reorder live region between edit
+                // sessions so a stale message doesn't get re-announced when
+                // customize mode is re-entered.
+                action_bar_announce.set(String::new());
             }
         });
     }
@@ -1022,6 +1156,12 @@ pub fn AttendantsComponent(
     // drawer can mount the `PerformanceSettingsPanel` (sliders/Auto/meters) — the
     // panel moved out of the Settings modal into the drawer (#1131 unify).
     let perf_controls_sink: Signal<Option<PerfControlsHandle>> = use_signal(|| None);
+    // Issue 1768: "Show media metrics on tiles" preference. Seeded from
+    // localStorage (default off), toggled by the diagnostics-drawer checkbox, and
+    // read by every PeerTile via `MediaMetricsOverlayCtx`. A single shared signal
+    // so toggling the checkbox shows/hides every tile's overlay reactively.
+    let media_metrics_overlay_enabled: Signal<bool> =
+        use_signal(|| load_bool(MEDIA_METRICS_OVERLAY_KEY, false));
 
     // Deep-link interception (#1131 unify): a requested `"performance"` section no
     // longer has a Settings tab — the Performance controls live in the Diagnostics
@@ -1746,8 +1886,8 @@ pub fn AttendantsComponent(
                         }
 
                         let settings = appearance_settings.peek();
-                        let show_toast = settings.show_join_leave_notifications;
-                        let play_sound = settings.play_join_leave_sounds;
+                        let show_toast = settings.show_exit_notifications;
+                        let play_sound = settings.play_exit_sound;
                         drop(settings);
 
                         if show_toast {
@@ -1806,8 +1946,8 @@ pub fn AttendantsComponent(
                         );
 
                         let settings = appearance_settings.peek();
-                        let show_toast = settings.show_join_leave_notifications;
-                        let play_sound = settings.play_join_leave_sounds;
+                        let show_toast = settings.show_entry_notifications;
+                        let play_sound = settings.play_entry_sound;
                         drop(settings);
 
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
@@ -2538,6 +2678,12 @@ pub fn AttendantsComponent(
     // Per-tile crop state — signal created early (near peer_status_map) so
     // on_peer_removed can clean up; context provided here for child access.
     use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
+
+    // Issue 1768: media-metrics overlay toggle. `MediaMetricsOverlayCtx` is the
+    // enabled flag every PeerTile (remote overlays) and `Host` (the self overlay)
+    // consult. `Host` sources the local SEND metrics from its own live snapshot
+    // reader, so no separate send-snapshot context is needed here.
+    use_context_provider(|| MediaMetricsOverlayCtx(media_metrics_overlay_enabled));
 
     // Action bar dock position and autohide — exposed via context so that
     // the AppearanceSettingsPanel can read/write them.
@@ -6184,19 +6330,49 @@ pub fn AttendantsComponent(
                                 }
                             },
                             div { class: "controls",
+                                // Visual-only backdrop stays conditional on
+                                // customize_mode — it dims the app while editing.
                                 if customize_mode() {
                                     div { class: "customize-backdrop" }
-                                    // Visually-hidden aria-live region: rendering it only when
-                                    // customize_mode is active causes screen readers to announce
-                                    // its content politely as the mode is entered (and stop
-                                    // announcing it when it disappears on exit). Pairs with the
-                                    // per-button aria-labels on the remove buttons.
-                                    div {
-                                        class: "visually-hidden",
-                                        role: "status",
-                                        "aria-live": "polite",
-                                        "Customizing action bar. Drag buttons to reorder, press the remove button to hide a slot, then press Done to finish."
+                                }
+                                // Enter-customize announcement.  Region is ALWAYS
+                                // mounted; only its text content toggles.  Some
+                                // older AT (JAWS, some NVDA versions) do not fire
+                                // a polite announcement when a live region enters
+                                // the DOM already containing text — they only
+                                // announce on subsequent text mutations.  Keeping
+                                // the region mounted with empty text on load and
+                                // filling it on customize-enter (empty → text) is
+                                // the mutation shape those readers reliably pick
+                                // up.  Cleared back to empty on exit so the
+                                // instructions are not re-announced next time.
+                                div {
+                                    class: "visually-hidden",
+                                    role: "status",
+                                    "aria-live": "polite",
+                                    {
+                                        if customize_mode() {
+                                            "Customizing action bar. Tab to a button and press arrow keys to move its slot within the bar, or drag with the pointer. Press the minus button to hide a slot, then press Done to finish."
+                                        } else {
+                                            ""
+                                        }
                                     }
+                                }
+                                // Second live region dedicated to keyboard-reorder
+                                // feedback.  `aria-atomic=true` forces the whole
+                                // text to be re-announced each time it changes,
+                                // even for a single-word delta.  Also always
+                                // mounted — `action_bar_announce` is a Signal that
+                                // starts empty, is written on each keyboard
+                                // reorder, and is reset back to empty in the
+                                // customize_mode-exit `use_effect` (search for
+                                // "Silence the keyboard-reorder live region").
+                                div {
+                                    class: "visually-hidden",
+                                    role: "status",
+                                    "aria-live": "polite",
+                                    "aria-atomic": "true",
+                                    "{action_bar_announce}"
                                 }
                                 nav {
                                     class: {
@@ -6206,6 +6382,106 @@ pub fn AttendantsComponent(
                                         let cust = if customize_mode() { " customize-mode" } else { "" };
                                         let drag_cls = if customize_mode() && dragging_slot().is_some() && drag_started() { " drag-active" } else { "" };
                                         format!("video-controls-container {pos}{hidden}{expanded}{cust}{drag_cls}")
+                                    },
+                                    // Keyboard reorder (WCAG 2.1.1): with focus on any
+                                    // customize-mode slot button, Arrow keys / Home / End move
+                                    // the slot within the bar. The handler is on the nav so a
+                                    // single closure serves every slot; the target's data-slot
+                                    // attribute (present on each wrapper) identifies which slot
+                                    // to move. `Event.target` survives after dispatch even in
+                                    // Dioxus synthetic events (unlike `currentTarget`), so
+                                    // `target().closest(..)` is the reliable lookup path.
+                                    //
+                                    // Filters (each is a real bug the live tester hit):
+                                    // - Modifier held → skip. Cmd/Ctrl/Alt+Arrow generate Home/
+                                    //   End on macOS/Chromebook; without this guard, hitting
+                                    //   Cmd+ArrowLeft to jump home also jumped the slot to
+                                    //   position 1, and Cmd+ArrowRight jumped to position N —
+                                    //   the "jumps to 9 first, then walks to 5" report.
+                                    // - `KeyboardEvent.repeat` → skip. OS-level auto-repeat
+                                    //   fires ~30 events/s while a key is held; a slot would
+                                    //   race from 3 to 9 in a blink. Single press = single step.
+                                    // - Target inside the remove button → skip. Arrow keys
+                                    //   there mean "I'm about to click Remove", not "reorder".
+                                    onkeydown: move |evt: Event<KeyboardData>| {
+                                        if !customize_mode() { return; }
+                                        // Escape exits customize mode entirely (the standard
+                                        // modal-ish idiom). Handled BEFORE the modifier check
+                                        // so a user pressing plain Escape isn't gated by an
+                                        // accidentally-held modifier, and BEFORE the arrow
+                                        // match so it's an unambiguous exit path. Save +
+                                        // restore focus to the dock-menu trigger, exactly
+                                        // like the Done button's onclick above.
+                                        if evt.key() == Key::Escape {
+                                            evt.stop_propagation();
+                                            evt.prevent_default();
+                                            customize_mode.set(false);
+                                            save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
+                                            Timeout::new(0, || {
+                                                focus_element_by_id("dock-menu-trigger");
+                                            })
+                                            .forget();
+                                            return;
+                                        }
+                                        // Any modifier held → treat as a browser shortcut
+                                        // (Cmd/Ctrl+Arrow = Home/End on macOS, Alt+Arrow =
+                                        // history nav, Shift+Arrow = text selection).
+                                        let m = evt.modifiers();
+                                        if m.contains(Modifiers::CONTROL)
+                                            || m.contains(Modifiers::META)
+                                            || m.contains(Modifiers::ALT)
+                                            || m.contains(Modifiers::SHIFT)
+                                        {
+                                            return;
+                                        }
+                                        // Enum match (matches the codebase convention and
+                                        // avoids Key::to_string() edge cases across browsers).
+                                        let (delta, absolute): (Option<i32>, Option<i32>) = match evt.key() {
+                                            Key::ArrowLeft | Key::ArrowUp => (Some(-1), None),
+                                            Key::ArrowRight | Key::ArrowDown => (Some(1), None),
+                                            Key::Home => (None, Some(0)),
+                                            Key::End => (None, Some(i32::MAX)),
+                                            _ => return,
+                                        };
+                                        let ke: web_sys::KeyboardEvent = evt.as_web_event().unchecked_into();
+                                        // OS-level auto-repeat → skip. A held key must not
+                                        // fast-forward a slot through the whole bar.
+                                        if ke.repeat() { return; }
+                                        let Some(target) = ke.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) else { return; };
+                                        // If focus is on the − remove button inside a slot,
+                                        // arrow keys must not reorder that slot; the user is on
+                                        // that button to click Remove.
+                                        if let Ok(Some(_)) = target.closest(".action-bar-remove-btn") {
+                                            return;
+                                        }
+                                        let Ok(Some(wrapper)) = target.closest(".action-bar-slot-wrapper[data-slot]") else { return; };
+                                        let slug = wrapper.get_attribute("data-slot").unwrap_or_default();
+                                        let Some(slot) = ActionBarSlot::from_slug(&slug) else { return; };
+                                        // Always suppress the browser's default (page scroll on
+                                        // arrows, Home/End jump) so a focused slot in customize
+                                        // mode never scrolls the meeting view. Even a no-op key
+                                        // (already at the edge) should not scroll.
+                                        evt.prevent_default();
+                                        let mut next = action_bar_slots.read().clone();
+                                        let Some(result) = apply_keyboard_reorder(&mut next, slot, delta, absolute) else { return; };
+                                        let len = next.len();
+                                        if result.new_idx == result.old_idx {
+                                            action_bar_announce.set(format!(
+                                                "{} is already at position {} of {}.",
+                                                slot.display_name(),
+                                                result.old_idx + 1,
+                                                len,
+                                            ));
+                                            return;
+                                        }
+                                        action_bar_slots.set(next);
+                                        save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
+                                        action_bar_announce.set(format!(
+                                            "{} moved to position {} of {}.",
+                                            slot.display_name(),
+                                            result.new_idx + 1,
+                                            len,
+                                        ));
                                     },
                                     onpointermove: {
                                         let drag_slot_size = drag_slot_size.clone();
@@ -6355,6 +6631,16 @@ pub fn AttendantsComponent(
                                             let drag_nav_top_mic = drag_nav_top.clone();
                                             rsx! {
                                                 div {
+                                                    // Keyboard reorder a11y (WCAG 2.1.1): the wrapper is
+                                                    // NOT focusable itself. The inner button is already a
+                                                    // real `<button>` and takes focus normally. In
+                                                    // customize mode, ArrowLeft/Right/Up/Down/Home/End
+                                                    // pressed on that focused button bubble to the nav's
+                                                    // onkeydown, which resolves the slot via this
+                                                    // `data-slot` attribute. Adding tabindex here would
+                                                    // create a second tab stop per slot (see live-tester
+                                                    // report: "focus only moves after Tab twice").
+                                                    "data-slot": ActionBarSlot::Mic.slug(),
                                                     class: if dragging_slot() == Some(ActionBarSlot::Mic) && drag_started() { "action-bar-slot-wrapper slot-primary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-primary" },
                                                     style: "{mic_style}",
                                                     onpointerdown: move |evt: PointerEvent| {
@@ -6434,6 +6720,7 @@ pub fn AttendantsComponent(
                                             let drag_nav_top_cam = drag_nav_top.clone();
                                             rsx! {
                                                 div {
+                                                    "data-slot": ActionBarSlot::Camera.slug(),
                                                     class: if dragging_slot() == Some(ActionBarSlot::Camera) && drag_started() { "action-bar-slot-wrapper slot-primary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-primary" },
                                                     style: "{cam_style}",
                                                     onpointerdown: move |evt: PointerEvent| {
@@ -6523,6 +6810,7 @@ pub fn AttendantsComponent(
                                                 let drag_nav_top_ss = drag_nav_top.clone();
                                                 rsx! {
                                                     div {
+                                                        "data-slot": ActionBarSlot::ScreenShare.slug(),
                                                         class: if dragging_slot() == Some(ActionBarSlot::ScreenShare) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
                                                         style: "{ss_style}",
                                                         onpointerdown: move |evt: PointerEvent| {
@@ -6560,7 +6848,19 @@ pub fn AttendantsComponent(
                                                         },
                                                         ScreenShareButton {
                                                             active: is_active,
-                                                            disabled: is_disabled || customize_mode(),
+                                                            // Do NOT set `disabled` from customize_mode.
+                                                            // The HTML `disabled` attribute strips the
+                                                            // button from the tab order, which is what
+                                                            // caused Tab to skip ScreenShare in customize
+                                                            // mode (live report: "Tab doesn't work for
+                                                            // screen share, only for its remove"). Every
+                                                            // other slot stays focusable in customize
+                                                            // mode and relies on CSS `pointer-events:none`
+                                                            // (via `.customize-mode .action-bar-slot-wrapper
+                                                            // > .video-control-button`) plus the
+                                                            // `if customize_mode() { return; }` guard in
+                                                            // the onclick below for click-inertness.
+                                                            disabled: is_disabled,
                                                             onclick: {
                                                                 let stream_cell = pre_acquired_screen_stream.clone();
                                                                 move |_| {
@@ -6698,6 +6998,7 @@ pub fn AttendantsComponent(
                                                 let drag_nav_top_pl = drag_nav_top.clone();
                                                 rsx! {
                                                     div {
+                                                        "data-slot": ActionBarSlot::PeerList.slug(),
                                                         class: if dragging_slot() == Some(ActionBarSlot::PeerList) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
                                                         style: "{pl_style}",
                                                         onpointerdown: move |evt: PointerEvent| {
@@ -6787,6 +7088,7 @@ pub fn AttendantsComponent(
                                                 let drag_nav_top_dm = drag_nav_top.clone();
                                                 rsx! {
                                                     div {
+                                                        "data-slot": ActionBarSlot::DensityMode.slug(),
                                                         class: if dragging_slot() == Some(ActionBarSlot::DensityMode) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
                                                         style: "{dm_style}",
                                                         onpointerdown: move |evt: PointerEvent| {
@@ -6863,195 +7165,6 @@ pub fn AttendantsComponent(
                                                 }
                                             }
                                         }
-                                        // (а) Dock position dropdown — not customizable (houses Customize/Reset)
-                                        div { class: "dock-position-wrapper",
-                                            style: "order: 90",
-                                            if customize_mode() {
-                                                button {
-                                                    class: "video-control-button action-bar-done-trigger",
-                                                    title: "Done customizing",
-                                                    "aria-label": "Done customizing",
-                                                    r#type: "button",
-                                                    onclick: move |e| {
-                                                        e.stop_propagation();
-                                                        customize_mode.set(false);
-                                                        save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                    },
-                                                    svg {
-                                                        xmlns: "http://www.w3.org/2000/svg",
-                                                        width: "20",
-                                                        height: "20",
-                                                        view_box: "0 0 24 24",
-                                                        fill: "none",
-                                                        stroke: "currentColor",
-                                                        stroke_width: "2.5",
-                                                        stroke_linecap: "round",
-                                                        stroke_linejoin: "round",
-                                                        polyline { points: "4 12 10 18 20 6" }
-                                                    }
-                                                }
-                                            } else {
-                                            div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
-                                                button {
-                                                    class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
-                                                    title: "Action bar position",
-                                                    r#type: "button",
-                                                    "aria-haspopup": "listbox",
-                                                    "aria-expanded": if dock_menu_open() { "true" } else { "false" },
-                                                    onclick: move |e| {
-                                                        e.stop_propagation();
-                                                        let opening = !dock_menu_open();
-                                                        dock_menu_open.set(opening);
-                                                        if opening {
-                                                            density_open.set(false);
-                                                            mock_peers_open.set(false);
-                                                        }
-                                                    },
-                                                    svg {
-                                                        xmlns: "http://www.w3.org/2000/svg",
-                                                        width: "20",
-                                                        height: "20",
-                                                        view_box: "0 0 24 24",
-                                                        fill: "none",
-                                                        stroke: "currentColor",
-                                                        stroke_width: "2",
-                                                        stroke_linecap: "round",
-                                                        stroke_linejoin: "round",
-                                                        rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
-                                                        circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                        circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                        circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
-                                                    }
-                                                    span { class: "tooltip",
-                                                        span { class: "tooltip-title", "Action bar position" }
-                                                        span { class: "tooltip-desc", "Move the action bar to the bottom, left, or right edge of the call." }
-                                                    }
-                                                }
-                                                if dock_menu_open() {
-                                                    div {
-                                                        class: "glass-select-menu",
-                                                        role: "listbox",
-                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
-                                                        div {
-                                                            class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
-                                                            role: "option",
-                                                            onclick: move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                dock_position.set(DockPosition::Bottom);
-                                                                save_dock_position(DockPosition::Bottom);
-                                                                dock_menu_open.set(false);
-                                                            },
-                                                            "Bottom"
-                                                        }
-                                                        div {
-                                                            class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
-                                                            role: "option",
-                                                            onclick: move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                dock_position.set(DockPosition::Left);
-                                                                save_dock_position(DockPosition::Left);
-                                                                dock_menu_open.set(false);
-                                                            },
-                                                            "Left"
-                                                        }
-                                                        div {
-                                                            class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
-                                                            role: "option",
-                                                            onclick: move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                dock_position.set(DockPosition::Right);
-                                                                save_dock_position(DockPosition::Right);
-                                                                dock_menu_open.set(false);
-                                                            },
-                                                            "Right"
-                                                        }
-                                                        div { class: "glass-select-separator" }
-                                                        div {
-                                                            class: "glass-select-option",
-                                                            role: "option",
-                                                            onclick: move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                let new_val = !autohide_enabled();
-                                                                autohide_enabled.set(new_val);
-                                                                save_dock_autohide(new_val);
-                                                                dock_menu_open.set(false);
-                                                            },
-                                                            if autohide_enabled() {
-                                                                "Turn Hiding Off"
-                                                            } else {
-                                                                "Turn Hiding On"
-                                                            }
-                                                        }
-                                                        div { class: "glass-select-separator" }
-                                                        div {
-                                                            class: "glass-select-option",
-                                                            role: "option",
-                                                            onclick: move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                customize_mode.set(true);
-                                                                dock_menu_open.set(false);
-                                                            },
-                                                            "Customize"
-                                                        }
-                                                        div {
-                                                            class: "glass-select-option",
-                                                            role: "option",
-                                                            onclick: move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                action_bar_slots.set(DEFAULT_SLOTS.to_vec());
-                                                                action_bar_hidden.set(Vec::new());
-                                                                remove_action_bar_layout();
-                                                                dock_menu_open.set(false);
-                                                            },
-                                                            "Reset to Default"
-                                                        }
-                                                        div { class: "glass-select-separator" }
-                                                        div {
-                                                            class: "glass-select-option",
-                                                            role: "option",
-                                                            onclick: move |e: MouseEvent| {
-                                                                e.stop_propagation();
-                                                                let was_closed = !device_settings_open();
-                                                                device_settings_open.set(true);
-                                                                if was_closed {
-                                                                    device_settings_generation
-                                                                        .set(device_settings_generation() + 1);
-                                                                }
-                                                                peer_list_open.set(false);
-                                                                diagnostics_open.set(false);
-                                                                density_open.set(false);
-                                                                mock_peers_open.set(false);
-                                                                meeting_options_open.set(false);
-                                                                device_settings_initial_section
-                                                                    .set(Some("preferences".to_string()));
-                                                                dock_menu_open.set(false);
-                                                            },
-                                                            "Action Bar\u{2026}"
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            }
-                                        }
-                                        if mock_peers_enabled() {
-                                            div {
-                                                class: "action-bar-mock-peers-wrapper",
-                                                style: "order: 91",
-                                                MockPeersButton {
-                                                    open: mock_peers_open(),
-                                                    onclick: move |e: MouseEvent| {
-                                                        if customize_mode() { return; }
-                                                        e.stop_propagation();
-                                                        let opening = !mock_peers_open();
-                                                        mock_peers_open.set(opening);
-                                                        if opening {
-                                                            density_open.set(false);
-                                                            dock_menu_open.set(false);
-                                                        }
-                                                    },
-                                                }
-                                            }
-                                        }
                                         if action_bar_slots.read().contains(&ActionBarSlot::Diagnostics) {
                                             {
                                                 let diag_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Diagnostics).unwrap_or(5);
@@ -7066,6 +7179,7 @@ pub fn AttendantsComponent(
                                                 let drag_nav_top_diag = drag_nav_top.clone();
                                                 rsx! {
                                                     div {
+                                                        "data-slot": ActionBarSlot::Diagnostics.slug(),
                                                         class: if dragging_slot() == Some(ActionBarSlot::Diagnostics) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
                                                         style: "{diag_style}",
                                                         onpointerdown: move |evt: PointerEvent| {
@@ -7157,6 +7271,7 @@ pub fn AttendantsComponent(
                                                 let drag_nav_top_ds = drag_nav_top.clone();
                                                 rsx! {
                                                     div {
+                                                        "data-slot": ActionBarSlot::DeviceSettings.slug(),
                                                         class: if dragging_slot() == Some(ActionBarSlot::DeviceSettings) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
                                                         style: "{ds_style}",
                                                         onpointerdown: move |evt: PointerEvent| {
@@ -7252,6 +7367,7 @@ pub fn AttendantsComponent(
                                                 let drag_nav_top_mo = drag_nav_top.clone();
                                                 rsx! {
                                                     div {
+                                                        "data-slot": ActionBarSlot::MeetingOptions.slug(),
                                                         class: if dragging_slot() == Some(ActionBarSlot::MeetingOptions) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
                                                         style: "{mo_style}",
                                                         onpointerdown: move |evt: PointerEvent| {
@@ -7318,6 +7434,383 @@ pub fn AttendantsComponent(
                                                             }
                                                         }
                                                     }
+                                                }
+                                            }
+                                        }
+                                        // (а) Dock position dropdown — not customizable (houses Customize/Reset)
+                                        div { class: "dock-position-wrapper",
+                                            style: "order: 90",
+                                            if customize_mode() {
+                                                button {
+                                                    class: "video-control-button action-bar-done-trigger",
+                                                    title: "Done customizing",
+                                                    "aria-label": "Done customizing",
+                                                    r#type: "button",
+                                                    onclick: move |e| {
+                                                        e.stop_propagation();
+                                                        customize_mode.set(false);
+                                                        save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
+                                                        // Done unmounts on the next render (this branch
+                                                        // is `if customize_mode()`), so focus would drop
+                                                        // to <body> without a restore. Mirror the entry
+                                                        // path (Customize option focuses Done via
+                                                        // deferred Timeout after `customize_mode.set(true)`):
+                                                        // send focus back to the dock-menu trigger which
+                                                        // renders in the same slot after re-render.
+                                                        Timeout::new(0, || {
+                                                            focus_element_by_id("dock-menu-trigger");
+                                                        })
+                                                        .forget();
+                                                    },
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "20",
+                                                        height: "20",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2.5",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        polyline { points: "4 12 10 18 20 6" }
+                                                    }
+                                                }
+                                            } else {
+                                            div { class: if dock_menu_open() { "glass-select open" } else { "glass-select" },
+                                                button {
+                                                    // Stable id so keyboard-close paths (Escape from
+                                                    // an option, Enter/Space activation) can return
+                                                    // focus here via `focus_element_by_id`. Same id
+                                                    // is intentionally NOT reused on the Done button
+                                                    // (customize-mode branch above); Customize's
+                                                    // activation focuses `.action-bar-done-trigger`
+                                                    // directly instead.
+                                                    id: "dock-menu-trigger",
+                                                    class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
+                                                    title: "Action bar position",
+                                                    r#type: "button",
+                                                    "aria-haspopup": "listbox",
+                                                    "aria-expanded": if dock_menu_open() { "true" } else { "false" },
+                                                    onclick: move |e| {
+                                                        e.stop_propagation();
+                                                        let opening = !dock_menu_open();
+                                                        dock_menu_open.set(opening);
+                                                        if opening {
+                                                            density_open.set(false);
+                                                            mock_peers_open.set(false);
+                                                        }
+                                                    },
+                                                    // WCAG 2.1.1 keyboard entry to the dock menu.
+                                                    // Native `<button>` already fires onclick on
+                                                    // Enter/Space, so we only need Escape (close if
+                                                    // open) and ArrowDown/ArrowUp (open + focus
+                                                    // first/last option). Opening requires deferring
+                                                    // focus to the next tick because the menu isn't
+                                                    // in the DOM until Dioxus re-renders.
+                                                    onkeydown: move |evt: Event<KeyboardData>| {
+                                                        let key = evt.key();
+                                                        if key == Key::Escape && dock_menu_open() {
+                                                            evt.stop_propagation();
+                                                            evt.prevent_default();
+                                                            dock_menu_open.set(false);
+                                                        } else if key == Key::ArrowDown {
+                                                            evt.stop_propagation();
+                                                            evt.prevent_default();
+                                                            if dock_menu_open() {
+                                                                focus_glass_option_at(".dock-position-wrapper", false);
+                                                            } else {
+                                                                dock_menu_open.set(true);
+                                                                density_open.set(false);
+                                                                mock_peers_open.set(false);
+                                                                Timeout::new(0, || {
+                                                                    focus_glass_option_at(".dock-position-wrapper", false);
+                                                                })
+                                                                .forget();
+                                                            }
+                                                        } else if key == Key::ArrowUp {
+                                                            evt.stop_propagation();
+                                                            evt.prevent_default();
+                                                            if dock_menu_open() {
+                                                                focus_glass_option_at(".dock-position-wrapper", true);
+                                                            } else {
+                                                                dock_menu_open.set(true);
+                                                                density_open.set(false);
+                                                                mock_peers_open.set(false);
+                                                                Timeout::new(0, || {
+                                                                    focus_glass_option_at(".dock-position-wrapper", true);
+                                                                })
+                                                                .forget();
+                                                            }
+                                                        }
+                                                    },
+                                                    svg {
+                                                        xmlns: "http://www.w3.org/2000/svg",
+                                                        width: "20",
+                                                        height: "20",
+                                                        view_box: "0 0 24 24",
+                                                        fill: "none",
+                                                        stroke: "currentColor",
+                                                        stroke_width: "2",
+                                                        stroke_linecap: "round",
+                                                        stroke_linejoin: "round",
+                                                        rect { x: "2", y: "8", width: "20", height: "8", rx: "4" }
+                                                        circle { cx: "8", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "12", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                        circle { cx: "16", cy: "12", r: "1.5", fill: "currentColor", stroke: "none" }
+                                                    }
+                                                    span { class: "tooltip",
+                                                        span { class: "tooltip-title", "Action bar position" }
+                                                        span { class: "tooltip-desc", "Move the action bar to the bottom, left, or right edge of the call." }
+                                                    }
+                                                }
+                                                if dock_menu_open() {
+                                                    div {
+                                                        class: "glass-select-menu",
+                                                        role: "listbox",
+                                                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                        // Menu-level keyboard navigation (WCAG 2.1.1).
+                                                        // Each option only owns Enter/Space (activation)
+                                                        // — Escape, Arrow keys, Home, and End are
+                                                        // handled once here so we don't duplicate the
+                                                        // navigation logic across every option. The
+                                                        // arrow helpers skip `.glass-select-separator`
+                                                        // children by matching on `.glass-select-option`.
+                                                        onkeydown: move |evt: Event<KeyboardData>| {
+                                                            let key = evt.key();
+                                                            if key == Key::Escape {
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
+                                                            } else if key == Key::ArrowDown {
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                focus_glass_option_relative(1);
+                                                            } else if key == Key::ArrowUp {
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                focus_glass_option_relative(-1);
+                                                            } else if key == Key::Home {
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                focus_glass_option_at(".dock-position-wrapper", false);
+                                                            } else if key == Key::End {
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                focus_glass_option_at(".dock-position-wrapper", true);
+                                                            }
+                                                        },
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Bottom { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            tabindex: "0",
+                                                            "aria-selected": if dock_position() == DockPosition::Bottom { "true" } else { "false" },
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Bottom);
+                                                                save_dock_position(DockPosition::Bottom);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            onkeydown: move |evt: Event<KeyboardData>| {
+                                                                if !is_option_activate_key(&evt) { return; }
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                dock_position.set(DockPosition::Bottom);
+                                                                save_dock_position(DockPosition::Bottom);
+                                                                dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
+                                                            },
+                                                            "Bottom"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Left { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            tabindex: "0",
+                                                            "aria-selected": if dock_position() == DockPosition::Left { "true" } else { "false" },
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Left);
+                                                                save_dock_position(DockPosition::Left);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            onkeydown: move |evt: Event<KeyboardData>| {
+                                                                if !is_option_activate_key(&evt) { return; }
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                dock_position.set(DockPosition::Left);
+                                                                save_dock_position(DockPosition::Left);
+                                                                dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
+                                                            },
+                                                            "Left"
+                                                        }
+                                                        div {
+                                                            class: if dock_position() == DockPosition::Right { "glass-select-option selected" } else { "glass-select-option" },
+                                                            role: "option",
+                                                            tabindex: "0",
+                                                            "aria-selected": if dock_position() == DockPosition::Right { "true" } else { "false" },
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                dock_position.set(DockPosition::Right);
+                                                                save_dock_position(DockPosition::Right);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            onkeydown: move |evt: Event<KeyboardData>| {
+                                                                if !is_option_activate_key(&evt) { return; }
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                dock_position.set(DockPosition::Right);
+                                                                save_dock_position(DockPosition::Right);
+                                                                dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
+                                                            },
+                                                            "Right"
+                                                        }
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            tabindex: "0",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let new_val = !autohide_enabled();
+                                                                autohide_enabled.set(new_val);
+                                                                save_dock_autohide(new_val);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            onkeydown: move |evt: Event<KeyboardData>| {
+                                                                if !is_option_activate_key(&evt) { return; }
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                let new_val = !autohide_enabled();
+                                                                autohide_enabled.set(new_val);
+                                                                save_dock_autohide(new_val);
+                                                                dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
+                                                            },
+                                                            if autohide_enabled() {
+                                                                "Turn Hiding Off"
+                                                            } else {
+                                                                "Turn Hiding On"
+                                                            }
+                                                        }
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            tabindex: "0",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                customize_mode.set(true);
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            onkeydown: move |evt: Event<KeyboardData>| {
+                                                                if !is_option_activate_key(&evt) { return; }
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                customize_mode.set(true);
+                                                                dock_menu_open.set(false);
+                                                                // The dock-menu trigger button is swapped
+                                                                // out for the Done button on the next
+                                                                // render. Focus that Done button so the
+                                                                // keyboard user has an obvious way back
+                                                                // out of customize mode.
+                                                                Timeout::new(0, || {
+                                                                    focus_by_selector(".action-bar-done-trigger");
+                                                                })
+                                                                .forget();
+                                                            },
+                                                            "Customize"
+                                                        }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            tabindex: "0",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                action_bar_slots.set(DEFAULT_SLOTS.to_vec());
+                                                                action_bar_hidden.set(Vec::new());
+                                                                remove_action_bar_layout();
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            onkeydown: move |evt: Event<KeyboardData>| {
+                                                                if !is_option_activate_key(&evt) { return; }
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                action_bar_slots.set(DEFAULT_SLOTS.to_vec());
+                                                                action_bar_hidden.set(Vec::new());
+                                                                remove_action_bar_layout();
+                                                                dock_menu_open.set(false);
+                                                                focus_element_by_id("dock-menu-trigger");
+                                                            },
+                                                            "Reset to Default"
+                                                        }
+                                                        div { class: "glass-select-separator" }
+                                                        div {
+                                                            class: "glass-select-option",
+                                                            role: "option",
+                                                            tabindex: "0",
+                                                            onclick: move |e: MouseEvent| {
+                                                                e.stop_propagation();
+                                                                let was_closed = !device_settings_open();
+                                                                device_settings_open.set(true);
+                                                                if was_closed {
+                                                                    device_settings_generation
+                                                                        .set(device_settings_generation() + 1);
+                                                                    peer_list_open.set(false);
+                                                                    diagnostics_open.set(false);
+                                                                    density_open.set(false);
+                                                                    mock_peers_open.set(false);
+                                                                    meeting_options_open.set(false);
+                                                                }
+                                                                device_settings_initial_section
+                                                                    .set(Some("preferences".to_string()));
+                                                                dock_menu_open.set(false);
+                                                            },
+                                                            onkeydown: move |evt: Event<KeyboardData>| {
+                                                                if !is_option_activate_key(&evt) { return; }
+                                                                evt.stop_propagation();
+                                                                evt.prevent_default();
+                                                                let was_closed = !device_settings_open();
+                                                                device_settings_open.set(true);
+                                                                if was_closed {
+                                                                    device_settings_generation
+                                                                        .set(device_settings_generation() + 1);
+                                                                    peer_list_open.set(false);
+                                                                    diagnostics_open.set(false);
+                                                                    density_open.set(false);
+                                                                    mock_peers_open.set(false);
+                                                                    meeting_options_open.set(false);
+                                                                }
+                                                                device_settings_initial_section
+                                                                    .set(Some("preferences".to_string()));
+                                                                dock_menu_open.set(false);
+                                                                // Settings modal manages its own focus on
+                                                                // open, so no explicit focus restore.
+                                                            },
+                                                            "Action Bar\u{2026}"
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            }
+                                        }
+                                        if mock_peers_enabled() {
+                                            div {
+                                                class: "action-bar-mock-peers-wrapper",
+                                                style: "order: 91",
+                                                MockPeersButton {
+                                                    open: mock_peers_open(),
+                                                    onclick: move |e: MouseEvent| {
+                                                        if customize_mode() { return; }
+                                                        e.stop_propagation();
+                                                        let opening = !mock_peers_open();
+                                                        mock_peers_open.set(opening);
+                                                        if opening {
+                                                            density_open.set(false);
+                                                            dock_menu_open.set(false);
+                                                        }
+                                                    },
                                                 }
                                             }
                                         }

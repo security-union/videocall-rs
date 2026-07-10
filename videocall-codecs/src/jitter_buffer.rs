@@ -285,12 +285,20 @@ const DELAY_SMOOTHING_FACTOR: f64 = 0.99;
 /// Release-side WebCodecs backpressure high-water mark (issue #1024).
 ///
 /// Frames released by the jitter buffer are handed to the WebCodecs `VideoDecoder`, whose own
-/// internal queue is *unpaced* — given a burst it decodes and paints as fast as it can rather than
-/// at display rate. That is the "second buffer stage" #1020 describes: the jitter-buffer freshness
-/// deadline bounds the first stage, but without this gate a recovery burst still piles into the
-/// decoder and is painted back-to-back. So before releasing a frame we consult the live decoder
-/// queue depth (`Decodable::decode_queue_depth()`) and stop releasing while it is at/above this
-/// mark, letting the decoder drain to display rate. Frames simply stay buffered for the next tick.
+/// internal queue is *unpaced* — given a burst it decodes as fast as it can. That is the "second
+/// buffer stage" #1020 describes: the jitter-buffer freshness deadline bounds the first stage, but
+/// without this gate a recovery burst still piles into the decoder unboundedly. So before releasing
+/// a frame we consult the live decoder queue depth (`Decodable::decode_queue_depth()`) and stop
+/// releasing while it is at/above this mark. Held frames simply stay buffered for the next tick.
+///
+/// What this gate actually bounds is the **in-flight decode-queue DEPTH** — how many released frames
+/// sit undecoded in the WebCodecs queue at once — which caps decoder-side memory and the
+/// second-stage backlog to a few frames. It does NOT pace *paints* to display rate: decoded frames
+/// still surface to the main thread as fast as the decoder drains them (before issue #1783 each was
+/// then painted on receipt — the fast-forward "catch-up flash" on a burst). Presenting at display
+/// rate, and collapsing a burst to the newest frame instead of replaying it, is the job of the
+/// main-thread presentation coalescing (`playout::LatestFrameMailbox`, issue #1783), NOT of this
+/// depth cap.
 ///
 /// Chosen as 3: large enough to keep the decoder continuously fed (no underrun/stutter at ~30fps,
 /// where a healthy queue sits at 0-1) yet small enough that the second-stage backlog can never
@@ -885,12 +893,14 @@ impl<T> JitterBuffer<T> {
             // Release-side backpressure (issue #1024). The freshness deadline above has already had
             // its chance to evict a stale backlog this tick; only AFTER that do we throttle the
             // release of fresh frames. If the WebCodecs decoder's own (unpaced) queue is at/above
-            // the high-water mark, stop releasing this tick so it drains at display rate instead of
-            // being shoveled full and painting back-to-back. The held frames stay buffered and are
-            // re-evaluated on the next ~10ms tick; if the backup persists until the head ages past
-            // MAX_PLAYOUT_AGE_MS the freshness deadline (which runs first) skips to live, so this
-            // can never accumulate unbounded lag. Decoders with no observable queue (native/mock)
-            // report depth 0 and are never throttled.
+            // the high-water mark, stop releasing this tick so the in-flight decode-queue depth
+            // (decoder-side memory / second-stage backlog) stays bounded instead of being shoveled
+            // full. This caps DEPTH, not paint cadence: burst frames that do get decoded are
+            // collapsed to the newest at presentation by `playout::LatestFrameMailbox` (#1783), not
+            // here. The held frames stay buffered and are re-evaluated on the next ~10ms tick; if
+            // the backup persists until the head ages past MAX_PLAYOUT_AGE_MS the freshness deadline
+            // (which runs first) skips to live, so this can never accumulate unbounded lag. Decoders
+            // with no observable queue (native/mock) report depth 0 and are never throttled.
             if self.decoder.decode_queue_depth() >= DECODE_QUEUE_HIGH_WATER_MARK {
                 // The gate would normally `break` and hold this tick.
                 if next_decodable_key.is_none() {

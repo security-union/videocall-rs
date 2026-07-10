@@ -17,14 +17,25 @@ import { waitForServices } from "../helpers/wait-for-services";
  * The text is always the three-segment `"{res} · {fps}fps · {audio}k"` shape (an
  * absent metric renders an em-dash), so every overlay contains `"fps"`.
  *
+ * Issue #1784: the REMOTE peer's fps is the PAINTED rate (frames drawn to the
+ * canvas), sourced from the decoder's per-peer `video_painted` diagnostics event —
+ * not the arrival-rate `fps_received` bucket, which still feeds the diagnostics
+ * drawer / signal popup unchanged. The visible three-segment format is unchanged;
+ * the painted-vs-arrival source is guarded at the unit level (`overlay_painted_fps_
+ * sample`, `PaintRateMeter` in videocall-client), while this spec asserts the
+ * painted route reaches the overlay as a real number.
+ *
  * Selectors below are anchored to the RSX authored in this change:
  *   - checkbox / label:  dioxus-ui/src/components/diagnostics.rs (Display options)
  *   - overlay element:   dioxus-ui/src/components/media_metrics_overlay.rs
  *     injected into `.canvas-container` by canvas_generator.rs (grid + split arms).
  *
  * A real second camera-on browser is required so the peer tile actually decodes
- * video (mock peers are video-OFF placeholders that never decode). Cameras
- * default OFF, so `vc_prejoin_camera_on` is seeded to `"true"` for both users.
+ * video (mock peers are video-OFF placeholders that never decode). Cameras AND
+ * mics both default OFF, so `vc_prejoin_camera_on` and `vc_prejoin_mic_on` are
+ * seeded to `"true"` for both users — camera-on drives the RECEIVED-video
+ * metrics, mic-on drives the RECEIVED-audio kbps (issue #1769), which the overlay
+ * asserts is a real number ("· {n}k"), not the em-dash placeholder ("· —k").
  * Untagged (no @bvt): runs in the dioxus full suite, not per-PR CI.
  */
 
@@ -166,9 +177,16 @@ async function setupTwoUserMeeting(uiURL: string, meetingId: string) {
     uiURL,
   );
 
-  // Seed camera-on BEFORE page creation so the initial prejoin read is true.
+  // Seed camera-on AND mic-on BEFORE page creation so the initial prejoin read
+  // is true for both. Camera-on gives the RECEIVED-video overlay metrics; mic-on
+  // gives the RECEIVED-audio kbps (issue #1769). BOTH default OFF
+  // (`load_preferred_camera_on` / `load_preferred_mic_on` → false), so without
+  // the mic seed the peer publishes no audio and the overlay's audio field would
+  // legitimately read the em-dash "—k".
   await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+  await hostCtx.addInitScript(`localStorage.setItem("vc_prejoin_mic_on", "true");`);
   await guestCtx.addInitScript(`localStorage.setItem("vc_prejoin_camera_on", "true");`);
+  await guestCtx.addInitScript(`localStorage.setItem("vc_prejoin_mic_on", "true");`);
 
   const hostPage = await hostCtx.newPage();
   const guestPage = await guestCtx.newPage();
@@ -257,6 +275,32 @@ test.describe("Per-tile media-metrics overlay (issue 1768)", () => {
       await expect(peerOverlay.first()).toBeVisible({ timeout: 20_000 });
       await expect(peerOverlay.first()).toContainText("fps");
       await expect(peerOverlay.first()).toContainText("↓");
+
+      // Issue #1784: the received fps is now the PAINTED rate (frames actually drawn
+      // to the canvas), delivered per-peer on the decoder's `video_painted`
+      // diagnostics event and consumed via `overlay_painted_fps_sample`. This polls
+      // that the middle segment is a REAL integer ("· {n}fps ·"), not the em-dash
+      // ("· —fps ·") — proving the painted-fps route actually reaches the overlay
+      // (a broken route would leave the readout at the em-dash). With the peer's
+      // camera seeded on, frames paint, so a positive painted-fps must appear.
+      await expect
+        .poll(async () => (await peerOverlay.first().textContent()) ?? "", {
+          timeout: 30_000,
+        })
+        .toMatch(/·\s*\d+fps\s*·/);
+
+      // Issue #1769: the RECEIVED-audio field is the trailing "· {n}k" segment and
+      // must be a REAL number, not the em-dash placeholder "—k". With the guest's
+      // mic seeded on (above), the host observes audio flowing from the peer and
+      // the overlay sources the kbps from the per-tile `audio_bitrate` signal
+      // (driven off the peer_status audio-on flag) instead of scanning the receive
+      // snapshots. Poll because audio may take a moment to start flowing after the
+      // tile appears; the em-dash form "· —k" never matches the numeric pattern.
+      await expect
+        .poll(async () => (await peerOverlay.first().textContent()) ?? "", {
+          timeout: 30_000,
+        })
+        .toMatch(/·\s*\d+k\s*$/);
 
       // RELOAD PERSISTENCE — guards the `load_bool` read-back the spec would
       // otherwise leave unverified. After a reload the "true" preference must be

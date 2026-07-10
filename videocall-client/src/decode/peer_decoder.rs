@@ -39,7 +39,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 use videocall_codecs::decoder::WasmDecoder;
 use videocall_codecs::frame::{FrameBuffer, FrameCodec, FrameType, VideoFrame as CodecVideoFrame};
-use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent};
+use videocall_codecs::playout::LatestFrameMailbox;
+use videocall_diagnostics::{global_sender, metric, now_ms, DiagEvent, Metric, MetricValue};
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::media_packet::VideoCodec;
 use wasm_bindgen::prelude::Closure;
@@ -81,6 +82,200 @@ struct CanvasRenderer {
 /// prioritize the stalest stream when its global cap is reached.
 type KeyframeRequestRoute = Rc<RefCell<Option<Box<dyn Fn(f64)>>>>;
 
+/// Shared handle to the `requestAnimationFrame` paint closure (issue #1783). `Rc` so the
+/// `on_video_frame` offer closure can schedule it while `VideoPeerDecoder` keeps it alive;
+/// `RefCell<Option<..>>` because the closure is filled in after the cell is created in
+/// [`VideoPeerDecoder::new`] (it captures a clone of the cell for scheduling).
+type RafPaintClosure = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
+
+/// Shared handle to the painted-fps sample-timer closure (issue #1784). Same shape as
+/// [`RafPaintClosure`] — an `Rc<RefCell<Option<..>>>` kept on `VideoPeerDecoder` so the browser
+/// `setInterval` callback stays alive for the decoder's lifetime; a dedicated alias keeps the
+/// struct field and the local both under clippy's `type_complexity` threshold.
+type SampleTimerClosure = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
+
+/// Issue #1784: diagnostics subsystem + metric for per-peer PAINTED fps — the rate
+/// of frames actually drawn to the canvas at the rAF paint site, as opposed to the
+/// arrival-rate `video` / `fps_received` bucket (`diagnostics_manager.rs`) that
+/// counts packets the instant they are dispatched into the decode pipeline, before
+/// the jitter buffer drops/holds/skips and before #1783 coalesces a burst of late
+/// frames to a single draw. The media-metrics overlay's "↓ fps" reads THIS.
+///
+/// A dedicated subsystem (not a new metric on the existing `video` event) because
+/// the two are produced at different sites: `fps_received` is emitted by the
+/// `DiagnosticManager` heartbeat, while `fps_painted` is emitted here, from the
+/// per-peer `VideoPeerDecoder` that owns the paint. `health_reporter` and the
+/// diagnostics drawer ignore unknown subsystems, so this is additive.
+pub const SUBSYSTEM_VIDEO_PAINTED: &str = "video_painted";
+pub const METRIC_FPS_PAINTED: &str = "fps_painted";
+
+/// Sample/emit cadence for the painted-fps meter (issue #1784): one 1 s rollup +
+/// broadcast per video decoder. Mirrors `FpsTracker`'s ~1 s bucket and
+/// `render_fps`'s 1 Hz interval.
+#[cfg(target_arch = "wasm32")]
+const PAINTED_FPS_SAMPLE_INTERVAL_MS: i32 = 1000;
+
+/// Pure, host-testable 1-second painted-fps meter (issue #1784).
+///
+/// Counts frames ACTUALLY PAINTED to the canvas — `record_paint` is called at the
+/// rAF paint site in [`VideoPeerDecoder`], right where `render_to_canvas_cached`
+/// reports it drew — and `sample` rolls the count into an fps value on the ~1 Hz
+/// tick that emits the [`SUBSYSTEM_VIDEO_PAINTED`] event. This is deliberately
+/// distinct from the arrival-rate `FpsTracker` (`fps_received`): a burst of late
+/// frames that #1783 coalesces to a single draw counts as ONE paint here, so the
+/// value never exceeds the source frame rate.
+///
+/// A window with zero paints (a stopped or hidden tile — no `record_paint` calls)
+/// samples to exactly `0.0`, so the overlay's snap-down reverts the readout to the
+/// em-dash. Timestamps are passed in (`js_sys::Date::now()` in production, synthetic
+/// values in tests) so the bucketing math carries no web-sys dependency and is unit
+/// tested on the host.
+///
+/// EMISSION GATING (issue #1784, perf): the sampler does NOT broadcast a zero every
+/// second forever after a peer stops painting. [`sample_and_gate`] emits while
+/// painting, then only the first [`ZERO_EMIT_GRACE`] zero samples after a
+/// paint→no-paint edge (so the overlay still snaps to the em-dash), then goes SILENT
+/// until the next `record_paint` re-arms it. The re-arm trigger is a paint EVENT (not
+/// a consecutive-success counter that could reset under contention), so quiescence is
+/// event-driven and cannot wedge a healthy stream into silence — a single paint fully
+/// re-arms the trailing-zero budget.
+struct PaintRateMeter {
+    /// Frames painted since the last `sample()`.
+    frames_since_sample: u32,
+    /// Wall-clock ms at the last `sample()` — the current window's start. Read only
+    /// by `sample`, which the production caller invokes only under wasm (the browser
+    /// timer); host tests exercise it too, but the plain host (non-test) build of
+    /// the crate — how `videocall-ui` compiles this dep for its host test binary —
+    /// never reads it, hence the same wasm-scoped allow as `raf_id` above.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    last_sample_ms: f64,
+    /// Trailing-zero emission budget (issue #1784 emission gating). `record_paint`
+    /// re-arms it to [`ZERO_EMIT_GRACE`]; `sample_and_gate` spends one unit per
+    /// zero-fps tick it emits, then falls silent at 0. SEEDED to [`ZERO_EMIT_GRACE`]
+    /// (not 0) at construction — see [`PaintRateMeter::new`] for the decoder-
+    /// replacement rationale. Written live by `record_paint` but read only in the
+    /// wasm-only/test `sample_and_gate`, hence the wasm-scoped allow (same rationale
+    /// as `last_sample_ms`).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    zero_emit_budget: u8,
+}
+
+/// Number of zero-fps samples the painted-fps sampler still broadcasts after a peer
+/// stops painting, before going silent (issue #1784). Two (not one) so the overlay's
+/// snap-down-to-em-dash survives a single dropped bus message; the overlay only needs
+/// one zero to revert, so this is a deliberate safety margin, not a correctness floor.
+const ZERO_EMIT_GRACE: u8 = 2;
+
+impl PaintRateMeter {
+    /// A fresh meter is SEEDED with a full [`ZERO_EMIT_GRACE`] trailing-zero budget so
+    /// its first few ticks (before any paint) emit snap-down zeros rather than nothing.
+    /// This clears a STALE overlay value across decoder replacement (issue #1784
+    /// lifecycle edge): on reset / re-election `peer.video` is swapped for a new
+    /// `VideoPeerDecoder`, dropping the old (possibly still-armed) meter before its
+    /// trailing zeros fire; the overlay's `fps_painted` signal is keyed by peer_id and
+    /// SURVIVES that swap, so a `> 0` value would otherwise persist — visibly, since the
+    /// overlay renders over the "Video Disabled" placeholder too — until the peer's
+    /// video happens to resume (permanent if it never does). Seeding makes the new
+    /// meter broadcast up to 2 zeros that snap the readout to the em-dash. Bounded cost:
+    /// at most `ZERO_EMIT_GRACE` events per decoder construction.
+    fn new(now_ms: f64) -> Self {
+        Self {
+            frames_since_sample: 0,
+            last_sample_ms: now_ms,
+            zero_emit_budget: ZERO_EMIT_GRACE,
+        }
+    }
+
+    /// Record one frame painted to the canvas. Called at the paint site. Also RE-ARMS
+    /// the trailing-zero emission budget: any paint is the event that resumes emission,
+    /// so a healthy (even intermittently painting) stream can never be wedged silent.
+    fn record_paint(&mut self) {
+        self.frames_since_sample = self.frames_since_sample.saturating_add(1);
+        self.zero_emit_budget = ZERO_EMIT_GRACE;
+    }
+
+    /// Roll the elapsed window into a painted-fps value and reset the window.
+    ///
+    /// Returns `0.0` when the window had zero paints (stopped/hidden tile) or a
+    /// non-positive elapsed span; otherwise `frames * 1000 / elapsed_ms`, the
+    /// painted rate normalized to per-second.
+    ///
+    /// Called by [`sample_and_gate`](Self::sample_and_gate) (and host unit tests); the
+    /// plain host build has no live caller, so it carries the same wasm-scoped allow as
+    /// the rAF fields above.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn sample(&mut self, now_ms: f64) -> f64 {
+        let elapsed = now_ms - self.last_sample_ms;
+        let count = self.frames_since_sample;
+        self.frames_since_sample = 0;
+        self.last_sample_ms = now_ms;
+        if count == 0 || elapsed <= 0.0 {
+            return 0.0;
+        }
+        (count as f64 * 1000.0) / elapsed
+    }
+
+    /// Sample the window AND apply emission gating (issue #1784). Returns:
+    ///   * `Some(fps)` with `fps > 0` — the window painted; always emitted so the
+    ///     overlay tracks a live rate (this path also leaves the budget armed via
+    ///     `record_paint`).
+    ///   * `Some(0.0)` — the first [`ZERO_EMIT_GRACE`] samples after painting stops,
+    ///     so the overlay snaps DOWN to the em-dash; the budget is spent one per tick.
+    ///   * `None` — the budget is exhausted: stay SILENT (no bus broadcast) until the
+    ///     next `record_paint` re-arms. Because the re-arm is a paint event, a never-
+    ///     painting or long-stopped decoder emits nothing per second, and a resuming
+    ///     stream re-emits immediately — quiescence is event-driven, not a counter that
+    ///     could pin a healthy stream.
+    ///
+    /// wasm-only caller (the sample timer) plus host tests, hence the wasm-scoped allow.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    fn sample_and_gate(&mut self, now_ms: f64) -> Option<f64> {
+        let fps = self.sample(now_ms);
+        if fps > 0.0 {
+            return Some(fps);
+        }
+        if self.zero_emit_budget > 0 {
+            self.zero_emit_budget -= 1;
+            return Some(0.0);
+        }
+        None
+    }
+}
+
+/// Build the per-peer painted-fps diagnostics event (issue #1784). Mirrors the
+/// `video_resolution` event this same decoder already emits: `to_peer` is the
+/// SENDING peer's session id (the id the UI's `PeerTile` matches its own `peer_id`
+/// against), `from_peer` is the local session, and `media_type` distinguishes the
+/// camera decoder (`VIDEO`) from the screen decoder (`SCREEN`). Extracted so the
+/// event shape is host-testable without a real decoder or browser clock.
+///
+/// Takes the peer ids BY VALUE and moves them into the metrics (`From<String>` is a
+/// move, no re-allocation), so the caller's one clone of the shared stream-context is
+/// the only allocation. `media_type` is `&'static`, so it uses the zero-alloc
+/// [`MetricValue::text_static`] borrow (the #1421 pattern) rather than allocating a
+/// `String` on every 1 Hz emission and again on every per-subscriber delivery clone.
+pub fn build_painted_fps_event(
+    from_peer: String,
+    to_peer: String,
+    media_type: &'static str,
+    fps: f64,
+) -> DiagEvent {
+    DiagEvent {
+        subsystem: SUBSYSTEM_VIDEO_PAINTED,
+        stream_id: None,
+        ts_ms: now_ms(),
+        metrics: vec![
+            metric!(METRIC_FPS_PAINTED, fps),
+            metric!("from_peer", from_peer),
+            metric!("to_peer", to_peer),
+            Metric {
+                name: "media_type",
+                value: MetricValue::text_static(media_type),
+            },
+        ],
+    }
+}
+
 ///
 /// VideoPeerDecoder
 ///
@@ -114,7 +309,12 @@ pub struct VideoPeerDecoder {
     /// borrow it from the `CanvasRenderer` because that storage may be
     /// `None` when the canvas hasn't been wired yet, but
     /// `set_stream_context` *does* run before any decoded frames. Set there.
-    stream_context: RefCell<Option<(String, String)>>,
+    ///
+    /// Shared (`Rc`) so the painted-fps sample timer (issue #1784, captured in
+    /// [`Self::new`]) can read the `(from_peer, to_peer)` pair to tag its
+    /// `video_painted` broadcast. `RefCell` because the pair is written after
+    /// construction by `set_stream_context`; every access is on the render thread.
+    stream_context: Rc<RefCell<Option<(String, String)>>>,
     /// HCL issue 893: pending acknowledgement that the underlying
     /// `WasmDecoder` has produced its first decoded frame and rendered it
     /// to the canvas. The decoder pipeline is asynchronous — `decode()`
@@ -157,6 +357,46 @@ pub struct VideoPeerDecoder {
     /// peer/stream — it is bound to one (peer, media_type), so the worker message carries no
     /// identity.
     keyframe_request_route: KeyframeRequestRoute,
+    /// Issue #1783 realtime-first playout: latest-wins presentation mailbox. The `on_video_frame`
+    /// callback (which drains every decoded frame from the worker→main queue) `offer`s each frame
+    /// here instead of painting it synchronously; a `requestAnimationFrame`-scheduled paint then
+    /// `take`s the newest and draws it. A burst of late frames thus collapses to a single draw (an
+    /// instant jump to live) rather than a fast-forward replay. Steady state (≤1 frame pending per
+    /// frame interval) is unchanged: the one held frame is presented untouched.
+    ///
+    /// Shared (`Rc`) with the paint closure and the offer closure captured in [`Self::new`]; kept
+    /// on `self` so `clear_canvas` and `Drop` can close any still-held frame (freeing GPU memory the
+    /// browser would not reclaim on its own). `web_sys::VideoFrame` is not `Send`/`Sync`, but every
+    /// access is on the single render thread.
+    latest_frame: Rc<RefCell<LatestFrameMailbox<web_sys::VideoFrame>>>,
+    /// Issue #1783: whether a `requestAnimationFrame` paint is currently pending. Prevents
+    /// scheduling more than one rAF at a time — the single scheduled paint always presents whatever
+    /// is newest when it fires, so a burst of offers coalesces to one draw.
+    ///
+    /// Read only in the wasm-gated `Drop` (its writers are the closures in `new`, which hold their
+    /// own `Rc` clones), so on the host build it is held-but-not-read; the `allow(dead_code)` is
+    /// scoped to non-wasm and does not mask a real unused field on the target that ships.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    raf_scheduled: Rc<Cell<bool>>,
+    /// Issue #1783: handle of the pending rAF paint, so `Drop` can `cancel_animation_frame` it
+    /// before the paint closure is freed (mirrors `render_fps::RenderFpsObserver`). `0` when none is
+    /// pending. Read only in the wasm-gated `Drop`; see `raf_scheduled` for the non-wasm allow.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    raf_id: Rc<Cell<i32>>,
+    /// Issue #1783: keeps the rAF paint closure alive for the decoder's lifetime. The offer closure
+    /// (stored inside the `WasmDecoder`) holds a clone of this `Rc` to schedule the paint; storing
+    /// it here too makes the lifetime explicit and independent of the decoder's internals.
+    _raf_paint_closure: RafPaintClosure,
+    /// Issue #1784: `setInterval` handle of the 1 Hz painted-fps sampler so `Drop` can clear it
+    /// (mirrors `render_fps::RenderFpsObserver`). `0` when none is installed. Set + read only in
+    /// wasm-gated code (the sampler is a browser timer); on the host build it is held-but-not-read.
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    painted_fps_interval_id: Rc<Cell<i32>>,
+    /// Issue #1784: keeps the painted-fps sampler closure alive for the decoder's lifetime, exactly
+    /// as `_raf_paint_closure` does for the paint closure. Populated only in the wasm branch of
+    /// [`Self::new`]; `None` on the host build (and in `noop()`).
+    #[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+    _painted_fps_interval_closure: SampleTimerClosure,
 }
 
 // Trait to handle VideoFrame callbacks in WASM
@@ -272,26 +512,111 @@ impl VideoPeerDecoder {
         // back on by the next `decode()`.
         let paint_enabled = Rc::new(Cell::new(true));
 
-        let canvas_ref = canvas_renderer.clone();
-        let first_render_flag = first_render_pending_ack.clone();
-        let paint_flag = paint_enabled.clone();
+        // Issue #1783 realtime-first playout: the latest-wins presentation mailbox and its
+        // rAF-scheduled paint. The offer closure below hands every decoded frame here and schedules
+        // a single paint; the paint presents only the newest, closing the rest. See the field docs.
+        let latest_frame: Rc<RefCell<LatestFrameMailbox<web_sys::VideoFrame>>> =
+            Rc::new(RefCell::new(LatestFrameMailbox::new()));
+        let raf_scheduled = Rc::new(Cell::new(false));
+        let raf_id = Rc::new(Cell::new(0i32));
+
+        // Issue #1784 painted-fps: the 1 s-bucket paint counter, shared with the rAF paint closure
+        // (which `record_paint`s on each successful draw) and the sample timer below. Seed the
+        // window start with the current wall clock so the first `sample()` normalizes correctly.
+        let paint_meter = Rc::new(RefCell::new(PaintRateMeter::new(js_sys::Date::now())));
+
         // Track within the closure (cheap `Cell` would suffice but we already
         // need an `Rc<RefCell<bool>>` on `self` so we mirror the cell into the
         // closure). `mark_first_render` only flips once per
         // `VideoPeerDecoder` — every later render is a no-op (see the
         // `mark_first_render_*` tests for the pinned semantics).
         let first_render_fired = Rc::new(RefCell::new(false));
+
+        // The rAF paint: present the single newest held frame, at most one draw per animation
+        // frame. Held in an `Rc<RefCell<Option<Closure>>>` so the offer closure can schedule it and
+        // so it stays alive for the decoder's lifetime.
+        let raf_paint_closure: RafPaintClosure = Rc::new(RefCell::new(None));
+        {
+            let mailbox = latest_frame.clone();
+            let canvas_ref = canvas_renderer.clone();
+            let paint_flag = paint_enabled.clone();
+            let first_render_flag = first_render_pending_ack.clone();
+            let first_render_fired = first_render_fired.clone();
+            let raf_scheduled_for_paint = raf_scheduled.clone();
+            let paint_meter_for_paint = paint_meter.clone();
+            *raf_paint_closure.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+                // This rAF has fired; allow the next offer to schedule the following paint.
+                raf_scheduled_for_paint.set(false);
+                // Present the newest frame; older frames of the burst were already closed at offer
+                // time. `take` releases the mailbox borrow before we render (render never touches
+                // the mailbox, but keep the borrow window minimal).
+                let frame = mailbox.borrow_mut().take();
+                if let Some(video_frame) = frame {
+                    // Issue #1183 late-frame race, re-checked at *paint* time: if the tile was
+                    // hidden (its `clear_canvas()` ran) between the offer and this rAF, drop the
+                    // frame WITHOUT painting — still close it to release GPU memory — so it cannot
+                    // repaint the wiped tile. Checking here (not only at offer) closes the window
+                    // fully, since the actual draw now happens later than the offer.
+                    if !paint_flag.get() {
+                        video_frame.close();
+                        return;
+                    }
+                    mark_first_render(&first_render_fired, &first_render_flag);
+                    // Issue #1784: count this frame in the painted-fps meter ONLY when the draw
+                    // actually landed on a wired canvas. `render_to_canvas_cached` returns `false`
+                    // when no canvas is set yet or the `drawImage` errored — those are not paints,
+                    // so they must not inflate the rate.
+                    if Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type) {
+                        paint_meter_for_paint.borrow_mut().record_paint();
+                    }
+                }
+            })
+                as Box<dyn FnMut()>));
+        }
+
+        // The worker→main drain callback (issue #1783): offer each decoded frame to the latest-wins
+        // mailbox and ensure exactly one rAF paint is pending. This runs synchronously per
+        // `postMessage` the `WasmDecoder` drains; the per-frame `frames_painted` ACK is incremented
+        // one step upstream (in `decoder/wasm.rs`, before this callback), so a frame coalesced away
+        // here is still counted as consumed and `paint_lag_ms` stays correct.
+        let paint_flag = paint_enabled.clone();
+        let mailbox_for_offer = latest_frame.clone();
+        let raf_scheduled_for_offer = raf_scheduled.clone();
+        let raf_id_for_offer = raf_id.clone();
+        let raf_paint_for_offer = raf_paint_closure.clone();
+        // Cache the `Window` handle once (the global window is stable for the page lifetime) and
+        // capture it in the offer closure, rather than re-fetching `web_sys::window()` on every
+        // scheduled frame — mirrors `render_fps::RenderFpsObserver::start`. `None` (no window) makes
+        // rAF scheduling a no-op, exactly as before.
+        let window_for_offer = web_sys::window();
         let on_video_frame = move |video_frame: web_sys::VideoFrame| {
             // Issue #1183 late-frame race: if painting was disabled on the
-            // decode-stop edge, drop this frame WITHOUT painting (still close
-            // it to release the GPU/codec resource) so a frame that finished
-            // decoding after `clear_canvas()` cannot repaint the wiped tile.
+            // decode-stop edge, drop this frame WITHOUT holding or painting
+            // (still close it to release the GPU/codec resource) so a frame that
+            // finished decoding after `clear_canvas()` cannot repaint the wiped
+            // tile — and so nothing accumulates in the mailbox for a hidden tile.
             if !paint_flag.get() {
                 video_frame.close();
                 return;
             }
-            mark_first_render(&first_render_fired, &first_render_flag);
-            Self::render_to_canvas_cached(&canvas_ref, video_frame, media_type);
+            // Latest-wins: hold only the newest decoded frame. A displaced (older, still-unpainted)
+            // frame is closed here — issue #1783 presents only the newest, and closing the skipped
+            // `VideoFrame` is mandatory to free its GPU memory.
+            if let Some(stale) = mailbox_for_offer.borrow_mut().offer(video_frame) {
+                stale.close();
+            }
+            // Ensure a single rAF paint is pending. It will present whatever is newest when it
+            // fires, so a burst arriving across several message tasks coalesces to one draw.
+            if !raf_scheduled_for_offer.get() {
+                if let Some(win) = window_for_offer.as_ref() {
+                    if let Some(cb) = raf_paint_for_offer.borrow().as_ref() {
+                        if let Ok(id) = win.request_animation_frame(cb.as_ref().unchecked_ref()) {
+                            raf_id_for_offer.set(id);
+                            raf_scheduled_for_offer.set(true);
+                        }
+                    }
+                }
+            }
         };
 
         // Issue #1025: shared slot for the proactive keyframe-request route. The closure
@@ -320,16 +645,73 @@ impl VideoPeerDecoder {
         let decoder = Box::new(WasmVideoFrameDecoder {
             decoder: wasm_decoder,
         });
+
+        // Issue #1784: shared peer-id context, read by the painted-fps timer to tag its broadcast.
+        // Populated after construction by `set_stream_context` (which the manager calls before any
+        // frame is decoded); while `None`, the timer skips emission for that tick.
+        let stream_context: Rc<RefCell<Option<(String, String)>>> = Rc::new(RefCell::new(None));
+
+        // Issue #1784: the 1 Hz painted-fps sampler — installed ONLY on the camera decoder
+        // (`MEDIA_TYPE_CAMERA`). The overlay does not show a peer's screen-share painted-fps
+        // (`overlay_painted_fps_sample` discards `SCREEN`), so a sampler on the screen decoder would
+        // broadcast a useless zero every second that every one of the N tiles parses and drops.
+        // Each tick rolls the paint counter through the emission gate (`sample_and_gate`); on an emit
+        // decision it broadcasts a `video_painted` event tagged with this stream's peer ids. A
+        // stopped/hidden tile paints nothing, so the gate emits the trailing zeros (overlay → em-dash)
+        // then goes silent until a paint re-arms it. Browser-timer, hence wasm-only; on the host build
+        // `PaintRateMeter` is exercised directly by unit tests. Mirrors
+        // `render_fps::RenderFpsObserver`'s interval + teardown.
+        let painted_fps_interval_id = Rc::new(Cell::new(0i32));
+        let painted_fps_interval_closure: SampleTimerClosure = Rc::new(RefCell::new(None));
+        #[cfg(target_arch = "wasm32")]
+        if media_type == MEDIA_TYPE_CAMERA {
+            let meter_for_timer = paint_meter.clone();
+            let ctx_for_timer = stream_context.clone();
+            let closure = Closure::<dyn FnMut()>::new(move || {
+                // Emission gate: `None` means stay silent this tick (no broadcast).
+                let Some(fps) = meter_for_timer
+                    .borrow_mut()
+                    .sample_and_gate(js_sys::Date::now())
+                else {
+                    return;
+                };
+                // Release the stream-context borrow BEFORE broadcasting (do not hold a RefCell borrow
+                // across `try_broadcast`). This single clone is the only allocation the emission
+                // costs — `build_painted_fps_event` moves the owned strings straight into the metrics.
+                let ctx = ctx_for_timer.borrow().clone();
+                if let Some((from_peer, to_peer)) = ctx {
+                    let _ = global_sender().try_broadcast(build_painted_fps_event(
+                        from_peer, to_peer, media_type, fps,
+                    ));
+                }
+            });
+            if let Some(win) = web_sys::window() {
+                if let Ok(id) = win.set_interval_with_callback_and_timeout_and_arguments_0(
+                    closure.as_ref().unchecked_ref(),
+                    PAINTED_FPS_SAMPLE_INTERVAL_MS,
+                ) {
+                    painted_fps_interval_id.set(id);
+                }
+            }
+            *painted_fps_interval_closure.borrow_mut() = Some(closure);
+        }
+
         Ok(Self {
             decoder,
             canvas_renderer,
             media_type,
             last_source_dims: RefCell::new((0, 0)),
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
-            stream_context: RefCell::new(None),
+            stream_context,
             first_render_pending_ack,
             paint_enabled,
             keyframe_request_route,
+            latest_frame,
+            raf_scheduled,
+            raf_id,
+            _raf_paint_closure: raf_paint_closure,
+            painted_fps_interval_id,
+            _painted_fps_interval_closure: painted_fps_interval_closure,
         })
     }
 
@@ -465,14 +847,19 @@ impl VideoPeerDecoder {
     /// does not carry rotation metadata — capture-side rotation is already baked
     /// into the pixels). Applies to both the camera and screen-share decoders
     /// (same `VideoPeerDecoder` path).
+    ///
+    /// Returns `true` when a frame was actually drawn to a wired canvas (the honest
+    /// "painted" signal the #1784 painted-fps meter counts), and `false` when no
+    /// canvas is wired yet or the `drawImage` call errored — neither of which put a
+    /// frame on screen. The `video_frame` is always closed regardless.
     fn render_to_canvas_cached(
         canvas_renderer: &Rc<RefCell<Option<CanvasRenderer>>>,
         video_frame: web_sys::VideoFrame,
         media_type: &'static str,
-    ) {
+    ) -> bool {
         let mut renderer_guard = canvas_renderer.borrow_mut();
 
-        if let Some(renderer) = renderer_guard.as_mut() {
+        let painted = if let Some(renderer) = renderer_guard.as_mut() {
             // Always size the canvas buffer to the frame's *display* dimensions
             // (post-crop / post-rotation / sample-aspect-corrected). This is the
             // aspect the tile should present.
@@ -513,20 +900,26 @@ impl VideoPeerDecoder {
             // display-sized buffer. The 6-arg form (dx, dy, dw, dh) is what makes
             // this aspect-correct for frames where the intrinsic (visible) source
             // size differs from the display size — see the doc comment above.
-            if let Err(e) = renderer.context.draw_image_with_video_frame_and_dw_and_dh(
+            match renderer.context.draw_image_with_video_frame_and_dw_and_dh(
                 &video_frame,
                 0.0,
                 0.0,
                 width as f64,
                 height as f64,
             ) {
-                log::error!("Error drawing video frame: {e:?}");
+                Ok(()) => true,
+                Err(e) => {
+                    log::error!("Error drawing video frame: {e:?}");
+                    false
+                }
             }
         } else {
             log::debug!("Canvas not yet set, skipping frame render");
-        }
+            false
+        };
 
         video_frame.close();
+        painted
     }
 
     /// Clear the canvas backing bitmap to transparent (issue #1183).
@@ -557,6 +950,15 @@ impl VideoPeerDecoder {
         // dropped instead of repainting the tile we are about to wipe. The next
         // `decode()` (only reached while visible) re-enables painting.
         self.paint_enabled.set(false);
+        // Issue #1783 compose with #1183: drop any frame still held for presentation. The tile is
+        // leaving the active set, so a held frame must never be painted — not even by a rAF that
+        // fires after a subsequent `decode()` re-enables `paint_enabled`. The rAF re-check of
+        // `paint_enabled` already guards the still-hidden case, but taking the frame here also
+        // covers the re-enable-before-rAF race and releases GPU memory immediately. On the host
+        // test path the mailbox is always empty, so `take()` is `None` and `close()` is never hit.
+        if let Some(frame) = self.latest_frame.borrow_mut().take() {
+            frame.close();
+        }
         if let Some(renderer) = self.canvas_renderer.borrow().as_ref() {
             let width = renderer.canvas.width();
             let height = renderer.canvas.height();
@@ -635,10 +1037,16 @@ impl VideoPeerDecoder {
             media_type: MEDIA_TYPE_CAMERA,
             last_source_dims: RefCell::new((0, 0)),
             last_encoder_state: RefCell::new((0, String::new(), String::new())),
-            stream_context: RefCell::new(None),
+            stream_context: Rc::new(RefCell::new(None)),
             first_render_pending_ack: Rc::new(RefCell::new(false)),
             paint_enabled: Rc::new(Cell::new(true)),
             keyframe_request_route: Rc::new(RefCell::new(None)),
+            latest_frame: Rc::new(RefCell::new(LatestFrameMailbox::new())),
+            raf_scheduled: Rc::new(Cell::new(false)),
+            raf_id: Rc::new(Cell::new(0)),
+            _raf_paint_closure: Rc::new(RefCell::new(None)),
+            painted_fps_interval_id: Rc::new(Cell::new(0)),
+            _painted_fps_interval_closure: Rc::new(RefCell::new(None)),
         }
     }
 
@@ -830,6 +1238,37 @@ impl PeerDecode for VideoPeerDecoder {
             _rendered: true,
             first_frame,
         })
+    }
+}
+
+impl Drop for VideoPeerDecoder {
+    fn drop(&mut self) {
+        // Issue #1783: tear down the presentation holder cleanly.
+        //   1. Cancel any pending `requestAnimationFrame` paint BEFORE its closure is freed (the
+        //      closure is a struct field dropped *after* this body runs), so the browser cannot
+        //      invoke a freed callback.
+        //   2. Close any frame still held in the mailbox — a `web_sys::VideoFrame` is not reclaimed
+        //      promptly by GC, so an un-closed held frame leaks GPU memory.
+        // Guarded to wasm: on the host test target these web-sys calls are unavailable (they would
+        // abort), and there the mailbox is always empty and no rAF is ever scheduled anyway.
+        #[cfg(target_arch = "wasm32")]
+        {
+            if self.raf_scheduled.get() {
+                if let Some(win) = web_sys::window() {
+                    let _ = win.cancel_animation_frame(self.raf_id.get());
+                }
+            }
+            if let Some(frame) = self.latest_frame.borrow_mut().take() {
+                frame.close();
+            }
+            // Issue #1784: clear the painted-fps sample interval BEFORE its closure field is freed,
+            // so the browser cannot invoke a freed callback (mirrors the rAF teardown above).
+            if self.painted_fps_interval_id.get() != 0 {
+                if let Some(win) = web_sys::window() {
+                    win.clear_interval_with_handle(self.painted_fps_interval_id.get());
+                }
+            }
+        }
     }
 }
 
@@ -1328,6 +1767,226 @@ mod tests {
             "reaching decode() means the tile is visible again (the \
              manager's !visible guard returns SKIPPED before us), so the \
              next frame is wanted — painting must be re-enabled"
+        );
+    }
+
+    // --- Issue #1784: painted-fps meter ----------------------------------
+    //
+    // These pin the SOURCE of the media-metrics overlay's "↓ fps": frames
+    // ACTUALLY PAINTED, not packets ARRIVED. The meter is the host-testable
+    // core `record_paint`/`sample` that the rAF paint site and the 1 Hz sample
+    // timer drive in production.
+
+    /// The canonical fails-on-unfixed guard (issue #1784 acceptance): a window in
+    /// which packets ARRIVE but nothing is PAINTED (no `record_paint`) must sample
+    /// to exactly 0.0 — the overlay's snap-down then reverts the readout to the
+    /// em-dash. A window with real paints reports the painted rate. If the metric
+    /// were sourced at arrival (the un-fixed behaviour), the no-paint window would
+    /// read a positive fps and the first assertion would fail.
+    #[test]
+    fn paint_rate_meter_zero_without_paints_then_rate_with_paints() {
+        let mut m = PaintRateMeter::new(0.0);
+        // Arrival-only window: no paints recorded → 0 fps.
+        assert_eq!(
+            m.sample(1000.0),
+            0.0,
+            "a window with zero paints must sample to 0 fps (overlay → em-dash)"
+        );
+        // 30 frames painted over the next ~1 s window → 30 fps.
+        for _ in 0..30 {
+            m.record_paint();
+        }
+        let fps = m.sample(2000.0);
+        assert!(
+            (fps - 30.0).abs() < 1e-9,
+            "30 paints over 1000ms must sample to 30 fps, got {fps}"
+        );
+    }
+
+    /// A partial window normalizes to a per-second rate (so the 1 Hz timer is
+    /// robust to slightly-off tick spacing): 15 paints over 500 ms → 30 fps.
+    #[test]
+    fn paint_rate_meter_normalizes_to_per_second() {
+        let mut m = PaintRateMeter::new(0.0);
+        for _ in 0..15 {
+            m.record_paint();
+        }
+        let fps = m.sample(500.0);
+        assert!(
+            (fps - 30.0).abs() < 1e-9,
+            "15 paints over 500ms must normalize to 30 fps, got {fps}"
+        );
+    }
+
+    /// `sample` resets the window, so a subsequent empty window reads 0 — this is
+    /// what makes a video that STOPS drop to the em-dash within one tick rather
+    /// than latching the last painted rate.
+    #[test]
+    fn paint_rate_meter_resets_window_each_sample() {
+        let mut m = PaintRateMeter::new(0.0);
+        for _ in 0..10 {
+            m.record_paint();
+        }
+        let _ = m.sample(1000.0);
+        assert_eq!(
+            m.sample(2000.0),
+            0.0,
+            "count must reset after sample → the next paint-free window is 0 fps"
+        );
+    }
+
+    /// A non-positive elapsed span (two samples at the same instant — a defensive
+    /// case a jittery timer could produce) returns 0 rather than dividing by zero.
+    #[test]
+    fn paint_rate_meter_guards_nonpositive_elapsed() {
+        let mut m = PaintRateMeter::new(1000.0);
+        m.record_paint();
+        assert_eq!(
+            m.sample(1000.0),
+            0.0,
+            "zero elapsed must return 0, not NaN/inf"
+        );
+    }
+
+    /// Emission gating (issue #1784, perf): the sampler emits while painting, then
+    /// only [`ZERO_EMIT_GRACE`] (2) trailing zeros after painting stops, then goes
+    /// SILENT until a paint re-arms it. Mutation-sensitive:
+    ///   * remove the trailing zeros (zero path → always `None`) → the `Some(0.0)`
+    ///     asserts fail (breaks the overlay's snap-down-to-em-dash);
+    ///   * remove the re-arm in `record_paint` → the budget is never armed, so NO
+    ///     trailing zero ever emits and the first `Some(0.0)` assert fails (the
+    ///     snap-down would never be delivered). The resume round below additionally
+    ///     pins that a paint re-arms the budget for a SECOND stop.
+    #[test]
+    fn paint_rate_meter_emits_two_trailing_zeros_then_silent_until_repaint() {
+        let mut m = PaintRateMeter::new(0.0);
+
+        // Active painting: a window with paints emits the live rate.
+        for _ in 0..30 {
+            m.record_paint();
+        }
+        assert_eq!(
+            m.sample_and_gate(1000.0),
+            Some(30.0),
+            "a painted window must emit the rate"
+        );
+
+        // Painting stops. The first two zero windows STILL emit 0 so the overlay
+        // snaps down to the em-dash even if one bus message is dropped.
+        assert_eq!(
+            m.sample_and_gate(2000.0),
+            Some(0.0),
+            "1st post-stop zero must emit (snap-down)"
+        );
+        assert_eq!(
+            m.sample_and_gate(3000.0),
+            Some(0.0),
+            "2nd post-stop zero must emit (grace)"
+        );
+
+        // Budget spent → SILENT: no more per-second zero broadcasts.
+        assert_eq!(
+            m.sample_and_gate(4000.0),
+            None,
+            "after the grace zeros the sampler must go silent"
+        );
+        assert_eq!(
+            m.sample_and_gate(5000.0),
+            None,
+            "and stay silent while there are no paints"
+        );
+
+        // A paint RE-ARMS (event-driven resume): the next painted window emits its
+        // rate, and the trailing-zero budget is reset for the next stop.
+        for _ in 0..24 {
+            m.record_paint();
+        }
+        assert_eq!(
+            m.sample_and_gate(6000.0),
+            Some(24.0),
+            "a paint must resume emission with the live rate"
+        );
+        assert_eq!(
+            m.sample_and_gate(7000.0),
+            Some(0.0),
+            "re-armed: trailing zeros must fire again after the second stop"
+        );
+        assert_eq!(
+            m.sample_and_gate(8000.0),
+            Some(0.0),
+            "2nd re-armed trailing zero"
+        );
+        assert_eq!(
+            m.sample_and_gate(9000.0),
+            None,
+            "silent again once the re-armed budget is spent"
+        );
+    }
+
+    /// A FRESH meter is seeded with a full trailing-zero budget (issue #1784 lifecycle
+    /// edge): its first `ZERO_EMIT_GRACE` ticks emit snap-down zeros — clearing any
+    /// stale `fps_painted` value that survived a decoder replacement (reset/re-election)
+    /// on the same peer_id — then it goes silent until the first paint. Fails if the
+    /// constructor seed is reverted to `0` (the two `Some(0.0)` become `None`, so a
+    /// stale overlay value would never be cleared when a replaced decoder never
+    /// repaints).
+    #[test]
+    fn paint_rate_meter_fresh_meter_emits_snap_down_zeros_then_silent() {
+        let mut m = PaintRateMeter::new(0.0);
+        assert_eq!(
+            m.sample_and_gate(1000.0),
+            Some(0.0),
+            "a fresh meter must emit a snap-down zero to clear a stale overlay value"
+        );
+        assert_eq!(
+            m.sample_and_gate(2000.0),
+            Some(0.0),
+            "and a second (grace margin against a dropped bus message)"
+        );
+        assert_eq!(
+            m.sample_and_gate(3000.0),
+            None,
+            "then go silent — no useless per-second zeros while never painting"
+        );
+    }
+
+    /// The painted-fps event carries the painted rate + peer routing + media_type
+    /// under the dedicated subsystem, so the overlay can source "↓ fps" from it and
+    /// distinguish it from the arrival-rate `video`/`fps_received` event.
+    #[test]
+    fn build_painted_fps_event_shape() {
+        let evt = build_painted_fps_event(
+            "me-session".to_string(),
+            "peer-session".to_string(),
+            MEDIA_TYPE_CAMERA,
+            28.0,
+        );
+        assert_eq!(evt.subsystem, SUBSYSTEM_VIDEO_PAINTED);
+        assert!(evt.stream_id.is_none());
+        let get = |name: &str| {
+            evt.metrics
+                .iter()
+                .find(|m| m.name == name)
+                .map(|m| &m.value)
+        };
+        match get(METRIC_FPS_PAINTED) {
+            Some(MetricValue::F64(v)) => assert!((v - 28.0).abs() < 1e-9),
+            other => panic!("expected fps_painted F64, got {other:?}"),
+        }
+        // `to_peer` is the SENDING peer id the UI's PeerTile matches against — it
+        // must round-trip so the overlay routes the sample to the right tile.
+        assert!(
+            matches!(get("to_peer"), Some(MetricValue::Text(t)) if t.as_ref() == "peer-session"),
+            "to_peer must carry the sending peer id"
+        );
+        // media_type must be the camera literal AND the zero-alloc borrowed form
+        // (#1421): reverting to `.to_string()` yields `Cow::Owned` and fails this.
+        assert!(
+            matches!(
+                get("media_type"),
+                Some(MetricValue::Text(std::borrow::Cow::Borrowed("VIDEO")))
+            ),
+            "media_type must be a zero-alloc borrowed 'VIDEO' (text_static, not to_string)"
         );
     }
 }

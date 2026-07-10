@@ -892,6 +892,21 @@ pub const fn audio_layer_kbps_len() -> usize {
     AUDIO_LAYER_KBPS.len()
 }
 
+/// Nominal kbps of the BASE received-audio layer (layer 0, the rung the relay
+/// always forwards). Exposed as the single source of truth for UI readouts that
+/// want the received-audio bitrate WITHOUT walking the per-peer snapshot path
+/// (issue #1769): audio simulcast is a shallow, off-by-default ladder
+/// (`clamp_audio_layer_count`: `0`/`1` → single layer), so on the default
+/// deployment the ONLY audio layer published is layer 0 and this value is the
+/// exact received nominal — identical to what `received_layer_snapshot(Audio, …)`
+/// resolves for the per-peer Reception row in the diagnostics drawer. When the
+/// (non-default) audio-simulcast feature is on and a receiver pulls a higher
+/// rung, this base value under-reports the selected layer; a consumer needing the
+/// selected-layer bitrate must still use the snapshot path.
+pub const fn base_audio_layer_kbps() -> u32 {
+    AUDIO_LAYER_KBPS[0]
+}
+
 /// Receiver-side per-kind layer ceilings (issue #1082). Video and Screen are
 /// tied at compile time to the AQ ladder sizes (`videocall_aq`'s
 /// `SIMULCAST_MAX_LAYERS` / `SCREEN_SIMULCAST_MAX_LAYERS`); Audio is tied to

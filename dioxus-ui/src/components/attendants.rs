@@ -490,6 +490,35 @@ fn should_reconcile_host_on_connect(first_connect: &Cell<bool>, is_guest: bool) 
     !was_first && !is_guest
 }
 
+/// Decide what a completed `/participants` roster read should do to the host
+/// set: return `Some(hosts)` to apply, or `None` to discard the read.
+///
+/// This is the security-critical seq-recheck guard. When the host-event counter
+/// advanced during the in-flight fetch (`current_seq != seq_at_start`), a live
+/// HOST_GRANTED/HOST_REVOKED landed mid-fetch and is fresher than this roster
+/// read, so we return `None` and the caller leaves `host_set_signal` untouched —
+/// preventing a stale roster from clobbering a just-applied live revoke (which
+/// would re-introduce a false host badge). `host_event_seq` is bumped with a
+/// wrapping add, so any change (including the `u64::MAX → 0` wrap) counts as "a
+/// host event landed." When the seq is unchanged the roster read is
+/// authoritative, and `Some` carries exactly the participants flagged `is_host`.
+fn resolve_host_set_from_roster(
+    parts: Vec<videocall_meeting_types::responses::ParticipantStatusResponse>,
+    seq_at_start: u64,
+    current_seq: u64,
+) -> Option<HashSet<String>> {
+    if current_seq != seq_at_start {
+        return None;
+    }
+    Some(
+        parts
+            .into_iter()
+            .filter(|p| p.is_host)
+            .map(|p| p.user_id)
+            .collect(),
+    )
+}
+
 /// Replace `host_set_signal` with the current hosts from the `/participants`
 /// roster — the source of truth at (re)connect time, since a HOST_GRANTED/
 /// HOST_REVOKED event can be swallowed during a reconnect. Skips the
@@ -505,15 +534,11 @@ fn reseed_host_set_from_roster(
         match crate::constants::meeting_api_client() {
             Ok(client) => match client.list_participants(&meeting_id).await {
                 Ok(parts) => {
-                    if *host_event_seq.peek() != seq_at_start {
-                        return;
+                    if let Some(hosts) =
+                        resolve_host_set_from_roster(parts, seq_at_start, *host_event_seq.peek())
+                    {
+                        host_set_signal.set(hosts);
                     }
-                    let hosts: HashSet<String> = parts
-                        .into_iter()
-                        .filter(|p| p.is_host)
-                        .map(|p| p.user_id)
-                        .collect();
-                    host_set_signal.set(hosts);
                 }
                 Err(e) => log::debug!("host-set roster seed failed: {e}"),
             },
@@ -8651,6 +8676,7 @@ fn parse_speaking_peer(evt: &videocall_diagnostics::DiagEvent) -> Option<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use videocall_meeting_types::responses::ParticipantStatusResponse;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
@@ -8721,6 +8747,78 @@ mod tests {
         assert!(
             !should_reconcile_host_on_connect(&first_connect, true),
             "guest reconnect must not reconcile"
+        );
+    }
+
+    // ── roster-seed seq-recheck clobber guard ──
+
+    /// Build a minimal admitted `ParticipantStatusResponse` for the guard tests.
+    /// Only `user_id`/`is_host` matter to `resolve_host_set_from_roster`; the rest are
+    /// filler so we exercise the real production struct, not a stand-in.
+    fn roster_part(user_id: &str, is_host: bool) -> ParticipantStatusResponse {
+        ParticipantStatusResponse {
+            user_id: user_id.to_string(),
+            display_name: None,
+            status: "admitted".to_string(),
+            is_host,
+            is_guest: false,
+            joined_at: 0,
+            admitted_at: None,
+            room_token: None,
+            observer_token: None,
+            waiting_room_enabled: true,
+            admitted_can_admit: false,
+            end_on_host_leave: true,
+            host_display_name: None,
+            host_user_id: None,
+            allow_guests: false,
+        }
+    }
+
+    /// The security-critical clobber guard: after the in-flight `/participants`
+    /// fetch, `reseed_host_set_from_roster` only applies the roster read when the
+    /// host-event counter is unchanged. This drives the exact production
+    /// `resolve_host_set_from_roster` path the async block calls.
+    ///
+    /// `None` ⇔ the caller's `if let Some(hosts) = …` body never runs, so
+    /// `host_set_signal.set` is never called and the signal is left UNTOUCHED —
+    /// the stale roster cannot re-introduce a just-revoked host badge.
+    ///
+    /// Removing the guard's `if current_seq != seq_at_start { return None; }`
+    /// early-return makes the stale case return `Some({alice})` instead of
+    /// `None`, failing the first assertion.
+    #[wasm_bindgen_test]
+    fn stale_roster_discarded_when_host_event_landed_mid_fetch() {
+        // Roster still lists `alice` as host — a HOST_REVOKED for alice was in
+        // flight when this read was taken.
+        let parts = vec![roster_part("alice", true), roster_part("bob", false)];
+
+        // A live host event bumped the counter during the fetch (7 → 8): the
+        // roster read is stale and MUST be discarded. `None` means the caller
+        // leaves `host_set_signal` untouched, so alice's revoked badge stays gone.
+        assert_eq!(
+            resolve_host_set_from_roster(parts.clone(), 7, 8),
+            None,
+            "a host event during the fetch must discard the stale roster read"
+        );
+
+        // Wrapping bump case: seq_at_start = u64::MAX, current = 0 is still a
+        // change and must also discard.
+        assert_eq!(
+            resolve_host_set_from_roster(parts.clone(), u64::MAX, 0),
+            None,
+            "a wrapped seq bump must still discard the stale roster read"
+        );
+
+        // No event landed (seq unchanged): the roster read is authoritative and
+        // IS applied — proving the discard above is a real guard, not a dead
+        // path — carrying exactly the `is_host` participants.
+        let applied = resolve_host_set_from_roster(parts, 7, 7)
+            .expect("unchanged seq must apply the roster host set");
+        let expected: HashSet<String> = [String::from("alice")].into_iter().collect();
+        assert_eq!(
+            applied, expected,
+            "only participants flagged is_host are applied"
         );
     }
 

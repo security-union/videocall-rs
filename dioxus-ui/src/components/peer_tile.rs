@@ -23,7 +23,8 @@ use crate::components::canvas_generator::{
     generate_for_peer, AudioLevels, SignalPopupHandlers, TileMode,
 };
 use crate::components::media_metrics_overlay::{
-    parse_resolution, MediaMetricsOverlay, MediaMetricsOverlayCtx,
+    next_overlay_fps, overlay_audio_kbps, overlay_painted_fps_sample, parse_resolution,
+    MediaMetricsOverlay, MediaMetricsOverlayCtx,
 };
 use crate::components::signal_quality::{
     PeerSignalHistory, SampleData, SignalInfo, SignalMeterMode, SignalPopupPosition,
@@ -38,6 +39,7 @@ use futures::future::AbortHandle;
 use futures::future::Abortable;
 use gloo_timers::callback::Timeout;
 use videocall_client::audio_constants::{MIC_HOLD_DURATION_MS, UI_AUDIO_LEVEL_DELTA};
+use videocall_client::decode::peer_decoder::SUBSYSTEM_VIDEO_PAINTED;
 use videocall_diagnostics::{subscribe, DiagEvent, MetricValue};
 use wasm_bindgen::JsCast;
 
@@ -106,8 +108,26 @@ pub fn PeerTile(
 
     // Signal quality tracking: raw metrics from diagnostics events
     let mut fps_received = use_signal(|| 0.0_f64);
+    // Issue #1784: PAINTED fps consumed ONLY by the media-metrics overlay's "↓ fps".
+    // Sourced from the per-peer `video_painted` diagnostics event the decoder emits
+    // at the paint site (frames ACTUALLY drawn to the canvas), NOT from the
+    // arrival-rate `fps_received` bucket above. Fed in the `video_painted` arm of
+    // `handle_diagnostics_event` through the same host-tested `next_overlay_fps`
+    // step (issue #1772) that snaps DOWN to 0 the instant painting stops (stopped
+    // video → em-dash) and EMA-smooths the residual ±1 fps bucket-boundary jitter.
+    // The RAW `fps_received` above is untouched and remains the value the drawer
+    // chart / signal popup / health reporter read (a useful network-burstiness
+    // signal, deliberately distinct from what the viewer actually sees).
+    let mut fps_painted = use_signal(|| 0.0_f64);
     let mut expand_rate = use_signal(|| 0.0_f64);
     let mut video_bitrate = use_signal(|| 0.0_f64);
+    // Issue #1769: received-audio nominal kbps for THIS peer, fed from the
+    // `peer_status` heartbeat's `audio_enabled` flag (the same authoritative
+    // audio-on/off signal that drives the mic icon) using the base received-audio
+    // layer nominal. The media-metrics overlay reads this signal directly instead
+    // of scanning `per_peer_received_snapshots()` on every render — see the
+    // overlay payload below. Also feeds the drawer chart's `SampleData`
+    // (previously always 0, since this signal was never populated).
     let mut audio_bitrate = use_signal(|| 0.0_f64);
     let mut audio_buffer_ms = use_signal(|| 0.0_f64);
     let mut screen_fps = use_signal(|| 0.0_f64);
@@ -246,7 +266,13 @@ pub fn PeerTile(
         }
 
         // Initialize from client snapshot
-        audio_enabled.set(effect_client.is_audio_enabled_for_peer(&peer_id_owned));
+        let initial_audio_on = effect_client.is_audio_enabled_for_peer(&peer_id_owned);
+        audio_enabled.set(initial_audio_on);
+        // Issue #1769: seed the received-audio kbps from the initial audio-on
+        // state so the overlay shows a number immediately (before the first
+        // `peer_status` heartbeat) rather than an em-dash. Routes through the same
+        // host-tested `overlay_audio_kbps` mapping as the heartbeat write below.
+        audio_bitrate.set(overlay_audio_kbps(initial_audio_on));
         video_enabled.set(effect_client.is_video_enabled_for_peer(&peer_id_owned));
         screen_enabled.set(effect_client.is_screen_share_enabled_for_peer(&peer_id_owned));
         let initial_level = effect_client.audio_level_for_peer(&peer_id_owned);
@@ -278,6 +304,7 @@ pub fn PeerTile(
                     &mut mic_audio_level,
                     &mic_hold,
                     &mut fps_received,
+                    &mut fps_painted,
                     &mut expand_rate,
                     &mut video_bitrate,
                     &mut audio_bitrate,
@@ -615,17 +642,15 @@ pub fn PeerTile(
     // Issue 1768: per-tile media-metrics overlay payload. Computed ONLY when the
     // diagnostics "Show media metrics on tiles" checkbox is on (default off).
     // COST: with the checkbox OFF a tile pays nothing — only the enabled flag
-    // (which rarely changes) is read, so no per-metric signal is subscribed and no
-    // snapshot scan runs. With it ON, the payload is rebuilt on EVERY render of
-    // this tile, and that is NOT strictly the ~1 Hz diagnostics cadence: this
-    // component ALSO reads `audio_level()` / `mic_audio_level()` unconditionally
-    // (see the render body below), so a SPEAKING tile re-renders at several Hz and
-    // the O(peers) `per_peer_received_snapshots()` scan below runs on each such
-    // render — i.e. O(N²) across N speaking tiles while the overlay is shown. This
-    // is an accepted cost for an opt-in diagnostics readout; the planned
-    // optimization is to compute the receive-snapshot Vec ONCE per render in
-    // `attendants` and hand every tile a `session_id -> audio_kbps` map via
-    // context for an O(1) lookup (deferred — not this change).
+    // (which rarely changes) is read, so none of the per-metric signals are
+    // subscribed. With it ON, the payload is rebuilt on EVERY render of this tile
+    // (the component reads `audio_level()` / `mic_audio_level()` unconditionally,
+    // so a SPEAKING tile re-renders at several Hz), but each rebuild is now just
+    // O(1) reads of per-tile signals this component already maintains at the ~1 Hz
+    // diagnostics cadence — decoded resolution, the smoothed received fps (#1772),
+    // and the received-audio kbps signal (#1769). There is NO per-render
+    // `per_peer_received_snapshots()` scan any more, so the payload build is O(1)
+    // per tile instead of the previous O(N²)-across-N-speaking-tiles snapshot walk.
     let overlay_enabled = try_use_context::<MediaMetricsOverlayCtx>()
         .map(|c| (c.0)())
         .unwrap_or(false);
@@ -639,26 +664,29 @@ pub fn PeerTile(
         if is_self {
             None
         } else {
-            // Decoded WxH + received fps come from the live per-tile signals this
-            // component already maintains; the received audio-layer kbps comes from
-            // the SAME per-peer snapshot path the diagnostics drawer / signal popup
-            // consume. The reads are gated by `overlay_enabled` so nothing is
-            // subscribed while the checkbox is off; when on, they refresh on every
-            // render of this tile (see the O(N²)-while-on cost note above).
+            // Every field is a live per-tile signal read (O(1)), gated by
+            // `overlay_enabled` so nothing is subscribed while the checkbox is off:
+            //   * resolution — decoded WxH from `video_resolution`;
+            //   * fps — the #1784 PAINTED rate (`fps_painted`): frames actually
+            //     drawn to the canvas, NOT the arrival-rate `fps_received` bucket,
+            //     so the readout matches what the viewer sees (capped at the source
+            //     rate once #1783 coalesces late-frame bursts to one draw);
+            //   * audio kbps — the #1769 `audio_bitrate` signal, driven off the
+            //     `peer_status` heartbeat's audio-on flag (the same signal as the
+            //     mic icon). This replaces the former per-render
+            //     `per_peer_received_snapshots()` scan; the snapshot path still
+            //     backs the diagnostics drawer / signal popup, it is just no longer
+            //     walked here.
             let resolution = parse_resolution(&video_resolution());
-            let fps_now = fps_received();
-            let audio_kbps = peer_id.parse::<u64>().ok().and_then(|sid| {
-                client
-                    .per_peer_received_snapshots()
-                    .into_iter()
-                    .find(|d| d.session_id == sid)
-                    .and_then(|d| d.audio.map(|a| a.kbps))
-            });
+            let fps_now = fps_painted();
+            let audio_kbps = audio_bitrate();
             Some(MediaMetricsOverlay {
                 is_self: false,
                 resolution,
                 fps: (fps_now > 0.0).then_some(fps_now),
-                audio_kbps: audio_kbps.filter(|&k| k > 0),
+                // Em-dash fallback for a genuinely-absent value (audio off →
+                // signal is 0); a healthy audio-on peer shows the real nominal.
+                audio_kbps: (audio_kbps > 0.0).then_some(audio_kbps.round() as u32),
             })
         }
     } else {
@@ -732,9 +760,10 @@ fn handle_diagnostics_event(
     mic_audio_level: &mut Signal<f32>,
     mic_hold_timeout: &Rc<RefCell<Option<Timeout>>>,
     fps_received: &mut Signal<f64>,
+    fps_painted: &mut Signal<f64>,
     expand_rate: &mut Signal<f64>,
     video_bitrate: &mut Signal<f64>,
-    _audio_bitrate: &mut Signal<f64>,
+    audio_bitrate: &mut Signal<f64>,
     audio_buffer_ms: &mut Signal<f64>,
     screen_fps: &mut Signal<f64>,
     screen_bitrate: &mut Signal<f64>,
@@ -781,6 +810,17 @@ fn handle_diagnostics_event(
             if let Some(a) = audio {
                 if a != *audio_enabled.peek() {
                     audio_enabled.set(a);
+                }
+                // Issue #1769: drive the received-audio kbps off the SAME
+                // authoritative audio-on flag that sets the mic icon, so the
+                // overlay's audio field agrees with the mic state. Routes through
+                // the host-tested `overlay_audio_kbps` mapping (base received-audio
+                // nominal when on; 0 → em-dash when off). `peer_status` fires ~1 Hz
+                // per peer, so gate the `.set()` on an actual change to avoid
+                // waking overlay subscribers every tick.
+                let ab = overlay_audio_kbps(a);
+                if (*audio_bitrate.peek() - ab).abs() > f64::EPSILON {
+                    audio_bitrate.set(ab);
                 }
             }
             if let Some(v) = video {
@@ -871,11 +911,28 @@ fn handle_diagnostics_event(
                 }
             } else {
                 if let Some(f) = fps {
+                    // ARRIVAL rate: still feeds the drawer chart, signal popup, and
+                    // health reporter. Issue #1784 moved the OVERLAY's "↓ fps" off
+                    // this bucket and onto the painted rate (the `video_painted` arm
+                    // below), so this no longer touches the overlay signal.
                     fps_received.set(f);
                 }
                 if let Some(b) = bitrate {
                     video_bitrate.set(b);
                 }
+            }
+        }
+        sub if sub == SUBSYSTEM_VIDEO_PAINTED => {
+            // Issue #1784: PAINTED fps — the media-metrics overlay's "↓ fps" source.
+            // The decoder emits this per-peer at the paint site (frames actually
+            // drawn), so it reflects what the viewer sees, not packet arrival. The
+            // pure `overlay_painted_fps_sample` parser returns the camera sample for
+            // THIS peer (filtering wrong-peer and SCREEN events); feeding it through
+            // `next_overlay_fps` preserves the mandatory snap-down-to-0 (a stopped
+            // video paints nothing → sample 0 → em-dash) plus residual jitter EMA.
+            if let Some(sample) = overlay_painted_fps_sample(&evt.metrics, peer_id) {
+                let prev = *fps_painted.peek();
+                fps_painted.set(next_overlay_fps(prev, sample));
             }
         }
         "neteq" => {

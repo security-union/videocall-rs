@@ -82,6 +82,14 @@ pub fn Host(
     on_device_settings_toggle: EventHandler<()>,
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
+    /// Classified permission failures from the live encoders' real `getUserMedia`
+    /// rejection (e.g. `DeviceInUse`). Distinct from `on_*_error` (generic
+    /// strings) so the parent can show a specific reason and drive auto-retry.
+    #[props(default)]
+    on_microphone_permission_error: EventHandler<videocall_client::MediaPermissionsErrorState>,
+    #[props(default)] on_camera_permission_error: EventHandler<
+        videocall_client::MediaPermissionsErrorState,
+    >,
     #[props(default)] device_settings_initial_section: Option<String>,
     #[props(default)] device_settings_generation: u32,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
@@ -116,6 +124,12 @@ pub fn Host(
         use_hook(|| Rc::new(RefCell::new(None)));
     let mic_error_handler: Rc<RefCell<Option<EventHandler<String>>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
+    let camera_permission_error_handler: Rc<
+        RefCell<Option<EventHandler<videocall_client::MediaPermissionsErrorState>>>,
+    > = use_hook(|| Rc::new(RefCell::new(None)));
+    let mic_permission_error_handler: Rc<
+        RefCell<Option<EventHandler<videocall_client::MediaPermissionsErrorState>>>,
+    > = use_hook(|| Rc::new(RefCell::new(None)));
     let screen_state_handler: Rc<RefCell<Option<EventHandler<ScreenShareEvent>>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
 
@@ -187,6 +201,14 @@ pub fn Host(
             camera_error_cb,
             effective_max_layers,
         );
+        let cam_perm_error_cell = camera_permission_error_handler.clone();
+        let camera_permission_error_cb =
+            VcCallback::from(move |err: videocall_client::MediaPermissionsErrorState| {
+                if let Some(handler) = cam_perm_error_cell.borrow().as_ref() {
+                    handler.call(err);
+                }
+            });
+        camera.set_permission_error_callback(camera_permission_error_cb);
 
         let mic_settings_cell = mic_settings_handler.clone();
         let mic_settings_cb = VcCallback::from(move |settings: String| {
@@ -221,6 +243,14 @@ pub fn Host(
             // pre-simulcast mic path).
             audio_effective_max_layers,
         );
+        let mic_perm_error_cell = mic_permission_error_handler.clone();
+        let mic_permission_error_cb =
+            VcCallback::from(move |err: videocall_client::MediaPermissionsErrorState| {
+                if let Some(handler) = mic_perm_error_cell.borrow().as_ref() {
+                    handler.call(err);
+                }
+            });
+        microphone.set_permission_error_callback(mic_permission_error_cb);
 
         let screen_settings_cell = screen_settings_handler.clone();
         let screen_settings_cb = VcCallback::from(move |settings: String| {
@@ -436,6 +466,8 @@ pub fn Host(
     *screen_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
     *camera_error_handler.borrow_mut() = Some(on_camera_error);
     *mic_error_handler.borrow_mut() = Some(on_microphone_error);
+    *camera_permission_error_handler.borrow_mut() = Some(on_camera_permission_error);
+    *mic_permission_error_handler.borrow_mut() = Some(on_microphone_permission_error);
     *screen_state_handler.borrow_mut() = Some(on_screen_share_state);
 
     // Initialize devices once

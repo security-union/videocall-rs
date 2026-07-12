@@ -32,7 +32,9 @@ use crate::constants::AUDIO_CHANNELS;
 use crate::constants::AUDIO_SAMPLE_RATE;
 use crate::crypto::aes::Aes128State;
 use crate::encode::encoder_state::EncoderState;
+use crate::media_devices::classify_get_user_media_error;
 use crate::wrappers::EncodedAudioChunkTypeWrapper;
+use crate::MediaPermissionsErrorState;
 use crate::VideoCallClient;
 use gloo::timers::callback::Interval;
 use gloo_utils::window;
@@ -980,6 +982,14 @@ pub struct MicrophoneEncoder {
     /// `[1, AUDIO_SIMULCAST_MAX_SUPPORTED_LAYERS]`.
     max_layers: u32,
     on_error: Option<Callback<String>>,
+    /// Classified callback fired ONLY at the real `getUserMedia` rejection site,
+    /// carrying a [`MediaPermissionsErrorState`] (e.g. `DeviceInUse`) so the UI
+    /// can show a specific reason and drive auto-retry. At that one site it fires
+    /// INSTEAD OF `on_error` (the UI raises a dedicated modal for the classified
+    /// error, so emitting both would stack two modals). `on_error` still carries
+    /// the generic string for every OTHER error site in `start`.
+    /// `None` until wired via [`Self::set_permission_error_callback`].
+    on_permission_error: Option<Callback<MediaPermissionsErrorState>>,
     is_speaking: Rc<AtomicBool>,
     vad_interval: Rc<RefCell<Option<Interval>>>,
     /// CONGESTION-recovery timer (issue #621). Created in [`Self::start`] and torn
@@ -1264,6 +1274,7 @@ impl MicrophoneEncoder {
             codecs: vec![AudioWorkletCodec::default()],
             max_layers,
             on_error: Some(on_error),
+            on_permission_error: None,
             is_speaking: Rc::new(AtomicBool::new(false)),
             vad_interval: Rc::new(RefCell::new(None)),
             congestion_recovery_interval: Rc::new(RefCell::new(None)),
@@ -1467,6 +1478,17 @@ impl MicrophoneEncoder {
         self.on_error = Some(on_error);
     }
 
+    /// Wire the classified permission-error callback. Fired only at the real
+    /// `getUserMedia` rejection site (see [`Self::start`]) with the specific
+    /// [`MediaPermissionsErrorState`], INSTEAD OF the generic `on_error` at that
+    /// site (so the UI shows exactly one modal, not two).
+    pub fn set_permission_error_callback(
+        &mut self,
+        on_permission_error: Callback<MediaPermissionsErrorState>,
+    ) {
+        self.on_permission_error = Some(on_permission_error);
+    }
+
     // delegates to self.state
     pub fn set_enabled(&mut self, value: bool) -> bool {
         let is_changed = self.state.set_enabled(value);
@@ -1567,6 +1589,7 @@ impl MicrophoneEncoder {
             .store(u32::MAX, Ordering::Relaxed);
         let aes = client.aes();
         let on_error = self.on_error.clone();
+        let on_permission_error = self.on_permission_error.clone();
         let EncoderState {
             enabled, switching, ..
         } = self.state.clone();
@@ -1871,8 +1894,16 @@ impl MicrophoneEncoder {
             let device = match JsFuture::from(devices_query).await {
                 Ok(ok) => ok.unchecked_into::<MediaStream>(),
                 Err(e) => {
-                    if let Some(cb) = &on_error {
-                        cb.emit(format!("Failed to get microphone stream: {e:?}"));
+                    // Classify the rejection (e.g. NotReadableError → DeviceInUse)
+                    // so the UI can show a specific reason and auto-retry. We emit
+                    // ONLY the classified permission callback here — NOT the
+                    // generic string `on_error` — because the UI raises a
+                    // dedicated modal for the classified error, and firing both
+                    // would stack two modals for the same failure. The raw error
+                    // is still logged for diagnostics.
+                    log::error!("Failed to get microphone stream: {e:?}");
+                    if let Some(cb) = &on_permission_error {
+                        cb.emit(classify_get_user_media_error(&e));
                     }
                     return;
                 }

@@ -296,6 +296,13 @@ test.describe("Peer screen-share diagnostics", () => {
       await expect(tooltip).toContainText(/Screen /);
       await expect(tooltip).toContainText(/fps/i);
       await expect(tooltip).toContainText(/kbps/i);
+      // Issue #1787: the camera-video line labels its rate `fps arriving` to
+      // disambiguate the arrival-rate series from the per-tile overlay's
+      // painted-fps. The peer-tile popup opens in `SignalMeterMode::Full`, so
+      // the Video line always renders here; the `arriving` qualifier is unique
+      // to that line (the Screen line reads `fps` / `fps (static)`), making this
+      // a discriminating pin — reverting the label to bare `fps` fails it.
+      await expect(tooltip).toContainText("fps arriving");
 
       // ----- Source vs Received resolution (#891 amendment, May 2026). -----
       //

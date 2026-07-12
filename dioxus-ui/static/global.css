@@ -3632,11 +3632,14 @@ html[data-theme="light"] #invite-overlay p {
   overflow: hidden;
 }
 
-/* issue 1480: 4-col server build-info table (Service/Version/Commit/Built).
-   With nowrap on every cell, the Service column carries the 18-char
-   `webtransport-relay` and the Built column the 20-char `YYYY-MM-DD HH:MM:SSZ`
-   timestamp, so both get explicit min-track floors so they never clip; Version
-   and Commit are the flexible columns. */
+/* issue 1480 / issue 1789: 4-col server build-info table
+   (Service/Version/Commit/Built). The Service column carries the 18-char
+   `webtransport-relay`. The Built column no longer holds the old fixed-width mono
+   `YYYY-MM-DD HH:MM:SSZ`: as of issue 1789 it is a proportional, locale-formatted
+   value in the viewer's local timezone, carrying a short zone label (e.g.
+   "Jun 19, 2026, 6:48:11 AM PDT"). Both columns keep an explicit min-track floor
+   so they reserve enough width, and Built's `1fr` share lets it expand for the
+   longer localized/zone strings; Version and Commit are the flexible columns. */
 .about-modal-row {
   display: grid;
   grid-template-columns: minmax(150px, 1fr) minmax(64px, 0.8fr) minmax(64px, 0.8fr) minmax(170px, 1fr);
@@ -3649,8 +3652,11 @@ html[data-theme="light"] #invite-overlay p {
   min-width: 0;
 }
 
-/* issue 1480: client 2-col table (label | value). The value track gets a
-   min floor sized for the full 20-char Built timestamp so it never clips. */
+/* issue 1480 / issue 1789: client 2-col table (label | value). The value track
+   keeps a min floor and a `1fr` share; it now sizes for the proportional
+   local-time Built value (e.g. "Jun 19, 2026, 6:48:11 AM PDT", issue 1789)
+   instead of the old 20-char mono `YYYY-MM-DD HH:MM:SSZ`, so the localized
+   zone-labeled string never clips. */
 .about-modal-section:first-of-type .about-modal-row {
   grid-template-columns: minmax(110px, 0.45fr) minmax(170px, 1fr);
 }

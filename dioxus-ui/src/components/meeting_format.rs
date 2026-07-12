@@ -3,11 +3,17 @@
  * Licensed under MIT OR Apache-2.0
  */
 
-//! Shared formatters for meeting list rows.
+//! Shared date/time/duration formatters.
 //!
-//! Used by [`crate::components::meetings_list`] (the merged home-feed list).
-//! Both functions are pure and operate on millisecond integers — no Dioxus
-//! signals, no DOM, no async.
+//! Used by [`crate::components::meetings_list`] (the merged home-feed list) and,
+//! for the timezone-aware timestamp formatters, by [`crate::constants`]'s
+//! build-timestamp helpers (issue #1789). All functions operate on plain values
+//! (millisecond integers / strings) with no Dioxus signals and no async. The
+//! duration/label helpers are pure; the `format_datetime*` /
+//! `format_local_date_iso` formatters delegate to the browser's `js_sys::Date` /
+//! `Intl.DateTimeFormat` for local-timezone resolution, so they only do
+//! meaningful work under a browser/Node runtime (host builds compile them but
+//! exercise them via `wasm_bindgen_test`).
 
 /// Format a duration in milliseconds as a compact human-readable string.
 ///
@@ -103,40 +109,82 @@ pub fn format_datetime(timestamp_ms: i64) -> String {
 /// `Intl` result), this degrades gracefully to [`format_datetime`] — which
 /// still gives date + time, just without the zone — rather than panicking.
 pub fn format_datetime_zoned(timestamp_ms: i64) -> String {
+    intl_zoned(timestamp_ms, false).unwrap_or_else(|_| format_datetime(timestamp_ms))
+}
+
+/// Issue #1789: same as [`format_datetime_zoned`] but also renders **seconds**.
+/// Used for build timestamps, which the About modal and diagnostics build-info
+/// table show down to the second (matching the pre-#1789 `HH:MM:SSZ` precision)
+/// now that they are converted from UTC into the viewer's local zone. Kept a
+/// separate entry point so the meeting-list callers of [`format_datetime_zoned`]
+/// keep their existing minute-precision shape.
+///
+/// Degrades to [`format_datetime`] (date + minute, zone-less) on any JS-interop
+/// failure — the seconds are lost in that last-resort path, but the common case
+/// (a real browser) always carries them.
+pub fn format_datetime_zoned_seconds(timestamp_ms: i64) -> String {
+    intl_zoned(timestamp_ms, true).unwrap_or_else(|_| format_datetime(timestamp_ms))
+}
+
+/// Shared `Intl.DateTimeFormat` core for the zoned variants. Builds the options
+/// object (optionally including `second`) and formats `timestamp_ms` in the
+/// viewer's locale + local timezone, carrying the short `timeZoneName` label.
+///
+/// Each `Reflect::set` returns a `Result`; on any interop failure the whole
+/// function returns the `JsValue` error so the caller can pick its own zone-less
+/// fallback.
+fn intl_zoned(timestamp_ms: i64, include_seconds: bool) -> Result<String, wasm_bindgen::JsValue> {
     use wasm_bindgen::{JsCast, JsValue};
 
-    // Build the Intl.DateTimeFormat options object. Each `Reflect::set` returns
-    // a Result; on any failure we bail to the zone-less fallback below.
-    fn build(timestamp_ms: i64) -> Result<String, JsValue> {
-        let options = js_sys::Object::new();
-        let set = |key: &str, value: &JsValue| -> Result<(), JsValue> {
-            js_sys::Reflect::set(&options, &JsValue::from_str(key), value).map(|_| ())
-        };
-        set("year", &JsValue::from_str("numeric"))?;
-        set("month", &JsValue::from_str("short"))?;
-        set("day", &JsValue::from_str("numeric"))?;
-        set("hour", &JsValue::from_str("numeric"))?;
-        set("minute", &JsValue::from_str("2-digit"))?;
-        // The timezone label (e.g. "PDT", "GMT+1") — the whole point of the
-        // "zoned" variant. Defaults to the user's local zone.
-        set("timeZoneName", &JsValue::from_str("short"))?;
-
-        // Undefined locales => the runtime uses the user's locale. Matches the
-        // js-sys `DateTimeFormat::default()` pattern.
-        let locales: js_sys::Array = JsValue::UNDEFINED.unchecked_into();
-        let formatter = js_sys::Intl::DateTimeFormat::new(&locales, &options);
-
-        let date = js_sys::Date::new(&JsValue::from_f64(timestamp_ms as f64));
-        // `format` is a getter that returns the bound formatting Function; call
-        // it with the Date to produce the localized string.
-        let format_fn = formatter.format();
-        let formatted = format_fn.call1(&JsValue::UNDEFINED, date.as_ref())?;
-        formatted
-            .as_string()
-            .ok_or_else(|| JsValue::from_str("Intl.DateTimeFormat returned a non-string"))
+    let options = js_sys::Object::new();
+    let set = |key: &str, value: &str| -> Result<(), JsValue> {
+        js_sys::Reflect::set(&options, &JsValue::from_str(key), &JsValue::from_str(value))
+            .map(|_| ())
+    };
+    set("year", "numeric")?;
+    set("month", "short")?;
+    set("day", "numeric")?;
+    set("hour", "numeric")?;
+    set("minute", "2-digit")?;
+    if include_seconds {
+        set("second", "2-digit")?;
     }
+    // The timezone label (e.g. "PDT", "GMT+1") — the whole point of the "zoned"
+    // variant. Defaults to the user's local zone.
+    set("timeZoneName", "short")?;
 
-    build(timestamp_ms).unwrap_or_else(|_| format_datetime(timestamp_ms))
+    // Undefined locales => the runtime uses the user's locale. Matches the
+    // js-sys `DateTimeFormat::default()` pattern.
+    let locales: js_sys::Array = JsValue::UNDEFINED.unchecked_into();
+    let formatter = js_sys::Intl::DateTimeFormat::new(&locales, &options);
+
+    let date = js_sys::Date::new(&JsValue::from_f64(timestamp_ms as f64));
+    // `format` is a getter that returns the bound formatting Function; call it
+    // with the Date to produce the localized string.
+    let format_fn = formatter.format();
+    let formatted = format_fn.call1(&JsValue::UNDEFINED, date.as_ref())?;
+    formatted
+        .as_string()
+        .ok_or_else(|| JsValue::from_str("Intl.DateTimeFormat returned a non-string"))
+}
+
+/// Issue #1789: render `timestamp_ms` as a bare `YYYY-MM-DD` calendar date in the
+/// viewer's **local** timezone (not UTC). Used by the home-page footer's
+/// date-only "built …" suffix so a near-midnight-UTC build shows the date that
+/// matches the viewer's own calendar rather than being off by a day.
+///
+/// `js_sys::Date`'s `get_full_year` / `get_month` / `get_date` getters return
+/// local-zone components, and the browser applies the correct offset for that
+/// instant (DST-aware), which is exactly the conversion we want. Zero-pads month
+/// and day so the output stays sortable and matches the ISO date shape.
+pub fn format_local_date_iso(timestamp_ms: i64) -> String {
+    use wasm_bindgen::JsValue;
+    let date = js_sys::Date::new(&JsValue::from_f64(timestamp_ms as f64));
+    let year = date.get_full_year();
+    // `get_month` is 0-based (Jan == 0); shift to 1-based for the ISO date.
+    let month = date.get_month() + 1;
+    let day = date.get_date();
+    format!("{year:04}-{month:02}-{day:02}")
 }
 
 #[cfg(test)]
@@ -331,6 +379,57 @@ mod tests {
             zoned.contains(&zoneless),
             "zoned output '{zoned}' should contain the zone-less rendering '{zoneless}' \
              plus a trailing zone token"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // format_datetime_zoned_seconds tests (issue #1789)
+    //
+    // The seconds variant adds `second: "2-digit"` on top of the minute-precision
+    // `format_datetime_zoned`. We can't pin the exact zone/locale on the runner,
+    // so we assert the seconds output is strictly LONGER than the minute-only
+    // output for the same instant: if `second` were dropped from the options the
+    // two would be identical and this fails. Runs under wasm-pack (Intl only
+    // exists in a browser/Node runtime); the macro emits a host-target stub.
+    // -------------------------------------------------------------------------
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn format_datetime_zoned_seconds_adds_seconds_over_minute() {
+        let ts = 1_714_323_600_000; // 2024-04-28T17:00:00Z
+        let with_seconds = format_datetime_zoned_seconds(ts);
+        let minute_only = format_datetime_zoned(ts);
+        assert!(
+            with_seconds.len() > minute_only.len(),
+            "seconds output '{with_seconds}' should be longer than minute-only \
+             '{minute_only}' (the extra `:SS` component)"
+        );
+        assert!(
+            with_seconds.contains("2024"),
+            "expected the 4-digit year in seconds output '{with_seconds}'"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // format_local_date_iso tests (issue #1789)
+    //
+    // Local-zone `YYYY-MM-DD`. The runner's timezone is unknown, so we can't pin
+    // the exact calendar day (an instant can land on either side of local
+    // midnight), but we CAN pin the shape and the year. The local-vs-UTC
+    // correctness (the near-midnight day flip) is host-tested at the
+    // `build_date_local_with` seam in constants.rs with an injected converter.
+    // -------------------------------------------------------------------------
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn format_local_date_iso_has_iso_shape() {
+        let ts = 1_714_305_600_000; // 2024-04-28T12:00:00Z (mid-day, away from 00:00Z)
+        let out = format_local_date_iso(ts);
+        let bytes = out.as_bytes();
+        assert_eq!(out.len(), 10, "expected YYYY-MM-DD (10 chars), got '{out}'");
+        assert_eq!(bytes[4], b'-', "expected '-' at index 4 in '{out}'");
+        assert_eq!(bytes[7], b'-', "expected '-' at index 7 in '{out}'");
+        assert!(
+            out.starts_with("2024-"),
+            "every timezone offset (-12..+14) keeps this instant in 2024: '{out}'"
         );
     }
 }

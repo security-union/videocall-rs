@@ -31,7 +31,19 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
     rsx! {
         button {
             class,
-            disabled: !available,
+            // Stable hook for E2E (the in-meeting mic toggle). Mirrors the
+            // camera button's `camera-toggle-button` testid so the
+            // device-permission specs (media-device-permission.spec.ts) can drive
+            // the mic ON/OFF and assert the not-disabled retry behavior via a
+            // stable selector instead of a fragile tooltip/class match.
+            "data-testid": "mic-toggle-button",
+            // NOTE: intentionally NOT `disabled: !available`. When a device is
+            // unavailable (in use, denied, unplugged) the button must stay
+            // clickable so the user can retry acquisition — the `onclick` is the
+            // only manual retry path. The `!available` state is conveyed via the
+            // warning icon/tooltip/`.device-warning` badge below, not by
+            // disabling the control (which previously wedged the user into a
+            // leave-and-rejoin).
             onclick: move |evt| onclick.call(evt),
             if enabled {
                 svg {
@@ -113,7 +125,9 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
             // send-diagnostics "Camera — off" regression guard (#1101) instead of
             // a fragile tooltip/class selector.
             "data-testid": "camera-toggle-button",
-            disabled: !available,
+            // NOTE: intentionally NOT `disabled: !available` — see MicButton for
+            // the rationale. Keeping the button clickable while unavailable is
+            // what lets the user retry a blocked camera without leaving the call.
             onclick: move |evt| onclick.call(evt),
             if enabled {
                 svg {
@@ -228,7 +242,15 @@ pub fn ScreenShareButton(
 // =============================================================================
 
 #[component]
-pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
+pub fn PeerListButton(
+    open: bool,
+    // Optional DOM id for the rendered `<button>`. The action-bar call site
+    // passes "peer-list-trigger" so the #1790 Escape handler can restore focus
+    // here; the customize-mode drag-preview call site passes nothing (empty),
+    // which omits the attribute so the id is never duplicated in the DOM.
+    #[props(default)] id: String,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
     let class = if open {
         "video-control-button active"
     } else {
@@ -236,7 +258,10 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
     };
 
     rsx! {
-        button { class, onclick: move |evt| onclick.call(evt),
+        button {
+            id: if id.is_empty() { None } else { Some(id.clone()) },
+            class,
+            onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",
@@ -283,7 +308,14 @@ pub fn PeerListButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element 
 // =============================================================================
 
 #[component]
-pub fn DiagnosticsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element {
+pub fn DiagnosticsButton(
+    open: bool,
+    // Optional DOM id for the rendered `<button>` (see `PeerListButton`). The
+    // action-bar call site passes "diagnostics-trigger" for #1790 focus restore;
+    // the drag-preview call site passes nothing so the id is never duplicated.
+    #[props(default)] id: String,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
     let class = if open {
         "video-control-button active"
     } else {
@@ -291,7 +323,10 @@ pub fn DiagnosticsButton(open: bool, onclick: EventHandler<MouseEvent>) -> Eleme
     };
 
     rsx! {
-        button { class, onclick: move |evt| onclick.call(evt),
+        button {
+            id: if id.is_empty() { None } else { Some(id.clone()) },
+            class,
+            onclick: move |evt| onclick.call(evt),
             if open {
                 svg {
                     xmlns: "http://www.w3.org/2000/svg",

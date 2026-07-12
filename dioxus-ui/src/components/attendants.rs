@@ -157,10 +157,132 @@ pub enum ScreenShareToastState {
 /// `ScreenEncoder::start_with_stream()`.
 pub type PreAcquiredScreenStream = Rc<RefCell<Option<web_sys::MediaStream>>>;
 
+#[derive(Debug, PartialEq, Eq)]
 pub enum MediaErrorState {
     NoDevice,
     PermissionDenied,
+    /// Device exists and the site is permitted, but another application is
+    /// holding it (`getUserMedia` → `NotReadableError`). Recoverable: the app
+    /// auto-retries this case in the background (see `should_auto_retry`), so the
+    /// message below explicitly promises reconnection. Keep the copy in sync with
+    /// that behavior.
+    DeviceInUse,
     Other,
+}
+
+/// Whether the background auto-retry loop should keep polling a blocked device.
+///
+/// Only `DeviceInUse` is auto-retried: the OS/browser will let `getUserMedia`
+/// succeed once the other app releases the device, with no user action. We do
+/// NOT auto-retry `PermissionDenied` (a site-level deny is not silently
+/// re-granted — retrying via JS is a no-op until the user changes browser
+/// settings) nor `NoDevice`/`Other`.
+///
+/// This is deliberately NOT gated on any "user wants the device on" intent. A
+/// background probe can ONLY ever CLEAR a stale `DeviceInUse` error (it never
+/// sets `pending_*_enable`, so it can never auto-start capture — see the retry
+/// tick closure), so keeping the badge accurate is always safe regardless of
+/// whether the user has ever touched that device's button. Gating on intent
+/// only left the "blocked" badge stuck forever for a device the user never
+/// toggled on at pre-join and never clicked in-meeting, which the retry loop is
+/// specifically meant to recover.
+fn should_auto_retry(error: Option<&MediaErrorState>) -> bool {
+    matches!(error, Some(MediaErrorState::DeviceInUse))
+}
+
+/// Outcome of ONE background auto-retry interval tick.
+#[derive(Debug, PartialEq, Eq)]
+struct RetryTickDecision {
+    /// Whether THIS tick should issue a `getUserMedia` probe.
+    probe: bool,
+    /// The elapsed-ticks counter to store for the next tick.
+    since: u32,
+    /// The required gap (in ticks) to store for the next tick.
+    gap: u32,
+}
+
+/// Pure backoff decision for the background auto-retry loop, extracted from the
+/// `Interval` closure so the LONG-RUN schedule is unit-testable without a
+/// browser or the Dioxus runtime (the closure itself is untestable off-target).
+///
+/// The interval fires on a fixed cadence (every `RETRY_BASE_INTERVAL_MS`). Only
+/// ticks whose elapsed count has caught up to the current `gap` issue an actual
+/// probe; the rest just advance the counter. On a probe, the counter resets and
+/// the gap doubles, capped at `max_gap`. Starting from `(since=0, gap=1)` this
+/// yields probes at ticks 1, 3, 7, 15, then every 15 ticks forever (gaps of
+/// 1, 2, 4, 8, 15, 15, … ticks → 4s, 8s, 16s, 32s, 60s, 60s … at a 4s base).
+///
+/// Crucially, once `gap` reaches `max_gap` the schedule is a stable, unbounded
+/// stream of probes exactly `max_gap` ticks apart — it can never enter a state
+/// that stops issuing probes (see `retry_backoff_never_wedges`). This is the
+/// long-run property that a hand-trace of only the first few ticks cannot prove.
+fn retry_tick_decision(since: u32, gap: u32, max_gap: u32) -> RetryTickDecision {
+    let next_since = since + 1;
+    if next_since < gap {
+        // Off-schedule tick: bump the counter, no probe.
+        RetryTickDecision {
+            probe: false,
+            since: next_since,
+            gap,
+        }
+    } else {
+        // Probe tick: reset the counter and grow the gap (capped) for next time.
+        RetryTickDecision {
+            probe: true,
+            since: 0,
+            gap: (gap * 2).min(max_gap),
+        }
+    }
+}
+
+/// Whether the blocking "Device access problem" modal should auto-close.
+///
+/// The modal renders whenever `show_device_warning` is true, INDEPENDENT of the
+/// current error signals (see `render_device_warning_modal`). A background
+/// auto-retry can clear `mic_error`/`video_error` while the user has left the
+/// modal open, which would strand them on an empty dialog with no error rows.
+/// So once a probe result leaves BOTH sides error-free, close the modal if it is
+/// still showing. `warning_shown` gates the write so we never call `.set(false)`
+/// on an already-closed modal, and the both-sides-clear check means a probe that
+/// recovers one side while the other is still (or newly) failing keeps the modal
+/// up to display the remaining error.
+fn should_auto_close_device_warning(
+    mic_error_is_none: bool,
+    video_error_is_none: bool,
+    warning_shown: bool,
+) -> bool {
+    warning_shown && mic_error_is_none && video_error_is_none
+}
+
+/// Map the client-layer permission error into the UI-layer error state that
+/// drives the modal copy. Kept 1:1 with the `on_result` classification so a
+/// failure surfaced through the live encoder callback renders the exact same
+/// message as one surfaced through the pre-flight permission probe.
+fn map_permission_error(err: &MediaPermissionsErrorState) -> MediaErrorState {
+    match err {
+        MediaPermissionsErrorState::NoDevice => MediaErrorState::NoDevice,
+        MediaPermissionsErrorState::PermissionDenied => MediaErrorState::PermissionDenied,
+        MediaPermissionsErrorState::DeviceInUse => MediaErrorState::DeviceInUse,
+        MediaPermissionsErrorState::Other(_) => MediaErrorState::Other,
+    }
+}
+
+/// Target UI error state for ONE side after a permission probe.
+///
+/// `Denied(err)` maps to the corresponding [`MediaErrorState`]; any granted (or
+/// otherwise non-denied) outcome maps to `None`. Callers invoke this only for a
+/// side that was actually probed and pair it with a set-if-changed guard, so a
+/// repeated probe that finds the same blocked state performs ZERO signal writes
+/// (Dioxus `Signal::set` marks dirty unconditionally — no value dedupe), which
+/// avoids a full-component re-render and a retry-effect re-run on every failed
+/// background auto-retry tick. `Unknown` ("not probed this call") also maps to
+/// `None`, but the call site never writes for an un-probed side, so that mapping
+/// is never used to clobber a live error on the other side.
+fn permission_probe_error_target(state: &PermissionState) -> Option<MediaErrorState> {
+    match state {
+        PermissionState::Denied(err) => Some(map_permission_error(err)),
+        _ => None,
+    }
 }
 
 const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
@@ -173,12 +295,46 @@ fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
         MediaErrorState::Other => rsx! {
             p { " {device} has an unexpected problem." }
         },
+        MediaErrorState::DeviceInUse => rsx! {
+            p { " {device} is being used by another application. Close whatever else is using it and it will reconnect automatically." }
+        },
         MediaErrorState::PermissionDenied => rsx! {
             p { " {device} is blocked in your browser." }
             p { style: "{SUBTLE_HELP_TEXT_STYLE}",
                 "Please click the lock icon in your browser's address bar and allow access if you want to use it."
             }
         },
+    }
+}
+
+/// The blocking "Device access problem" modal, reused for BOTH the pre-join
+/// failure path and the in-meeting failure path. The only difference between the
+/// two call sites is what dismissing does (`on_dismiss`): pre-join connects +
+/// joins, in-meeting just closes the modal. Kept as a plain free function (like
+/// [`render_single_device_error`]) so both call sites share one source of truth.
+fn render_device_warning_modal(
+    mic_error: Option<&MediaErrorState>,
+    video_error: Option<&MediaErrorState>,
+    on_dismiss: EventHandler<()>,
+) -> Element {
+    rsx! {
+        div { class: "modal-overlay", "data-testid": "device-warning-modal",
+            div { class: "modal-window",
+                h3 { "Device access problem" }
+                if let Some(err) = mic_error {
+                    {render_single_device_error("Microphone", err)}
+                }
+                if let Some(err) = video_error {
+                    {render_single_device_error("Camera", err)}
+                }
+                button {
+                    class: "btn-apple btn-primary",
+                    style: "margin-top: 1.5rem;",
+                    onclick: move |_| on_dismiss.call(()),
+                    "Ok"
+                }
+            }
+        }
     }
 }
 
@@ -646,6 +802,62 @@ fn focus_element_by_id(id: &str) {
         if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
             let _ = html.focus();
         }
+    }
+}
+
+/// True when a click originated inside the action bar (`.video-controls-container`).
+/// The in-meeting `#main-container` background-click handler uses this to leave the
+/// side panels (peer list, diagnostics) open when the click landed on an action-bar
+/// control — the panel toggles themselves, mic, camera, etc. — rather than on the
+/// video grid. Any failure to resolve the click target defaults to `false`
+/// ("not in the action bar"), the safe default that lets a genuine background click
+/// still light-dismiss the panels. Uses the file's established
+/// `target().closest(".video-controls-container")` idiom.
+fn click_within_action_bar(evt: &MouseEvent) -> bool {
+    evt.as_web_event()
+        .target()
+        .and_then(|t| t.dyn_into::<web_sys::Element>().ok())
+        .and_then(|el| el.closest(".video-controls-container").ok().flatten())
+        .is_some()
+}
+
+/// Which side panel an Escape keypress should close. Precedence is diagnostics
+/// FIRST, then the peer list: diagnostics is the visually topmost drawer (mobile
+/// z-index 9301 vs the peer list's 9300), so Escape peels the top layer first —
+/// the same popover-before-panel layering the dock/density handlers follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscCloseTarget {
+    Diagnostics,
+    PeerList,
+}
+
+impl EscCloseTarget {
+    /// The id of the action-bar toggle button that owns this panel. Escape-close
+    /// restores focus here (WAI-ARIA APG disclosure pattern) so keyboard focus
+    /// never falls back to `<body>`. These strings are the fn's contract with the
+    /// rendered `id:` attributes on `PeerListButton` / `DiagnosticsButton`; the
+    /// rendered-id side of that contract is guarded by the e2e `activeElement`
+    /// assertions in `popup-layering.spec.ts`.
+    fn trigger_id(self) -> &'static str {
+        match self {
+            EscCloseTarget::Diagnostics => "diagnostics-trigger",
+            EscCloseTarget::PeerList => "peer-list-trigger",
+        }
+    }
+}
+
+/// Decide which side panel Escape should close, given each panel's open state.
+/// Returns `None` when neither panel is open — Escape is then a no-op here and the
+/// popover handlers (density / mock-peers / dock menu) keep today's behavior.
+/// Diagnostics takes precedence over the peer list when both are open (topmost
+/// drawer closes first).
+fn esc_panel_close_target(diagnostics_open: bool, peer_list_open: bool) -> Option<EscCloseTarget> {
+    if diagnostics_open {
+        Some(EscCloseTarget::Diagnostics)
+    } else if peer_list_open {
+        Some(EscCloseTarget::PeerList)
+    } else {
+        None
     }
 }
 
@@ -1235,8 +1447,8 @@ pub fn AttendantsComponent(
     let peer_list_bump_pending: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     let mut screen_share_version = use_signal(|| 0u32);
     let media_access_granted = use_signal(|| false);
-    let mic_error = use_signal(|| None::<MediaErrorState>);
-    let video_error = use_signal(|| None::<MediaErrorState>);
+    let mut mic_error = use_signal(|| None::<MediaErrorState>);
+    let mut video_error = use_signal(|| None::<MediaErrorState>);
     let mut show_device_warning = use_signal(|| false);
     let reload_devices_counter = use_signal(|| 0u32);
     let mut device_was_denied = use_signal(|| false);
@@ -1252,6 +1464,26 @@ pub fn AttendantsComponent(
     let mut ss_resizing: Signal<bool> = use_signal(|| false);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
+    // Read-and-cleared once per background auto-retry tick. When a background
+    // tick's `on_result` reports another failure, we suppress re-popping the
+    // blocking modal (it's already been shown for the initial failure); only a
+    // user-initiated request or the first failure surfaces it.
+    //
+    // INVARIANT: this flag is only read-and-cleared inside the
+    // `session_loaded() || connecting()` branch of `on_result`. The background
+    // retry loop fires for ANY `DeviceInUse` error (see `should_auto_retry`),
+    // both pre-join and post-join, so a retry tick's `on_result` can land
+    // pre-join. The flag-clearing stays safe there: a background retry result
+    // pre-join lands in the `else if !join_requested()` (pre-join preview)
+    // branch, which neither reads/clears this flag NOR pops the modal — so a
+    // flag left `true` by a pre-join retry tick is inert (nothing pre-join
+    // consumes it) and no modal-suppression is needed there (that branch never
+    // pops the modal in the first place). When the user dismisses the failure
+    // modal into the meeting, control moves to the `session_loaded() ||
+    // connecting()` branch, which clears the flag and OR-s it with the
+    // single-device-probe inference, so in-meeting modal suppression remains
+    // correct regardless of the flag's stale pre-join value.
+    let is_background_retry: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     // True only when the user explicitly clicked Join/Start (vs. granting
     // permission just to preview devices). Gates the auto-connect in the
     // MediaDeviceAccess callback so a preview-permission grant does NOT join
@@ -2258,6 +2490,10 @@ pub fn AttendantsComponent(
         let mut mda = MediaDeviceAccess::new();
         let client_cell = RefCell::new(client.clone());
         let preview_engine_for_mda = preview_engine.clone();
+        // Read-and-cleared once per `on_result` (in the in-meeting branch) to
+        // decide whether THIS result came from a background auto-retry tick (in
+        // which case we must NOT re-pop the blocking modal).
+        let is_background_retry = is_background_retry.clone();
         mda.on_result = VcCallback::from(move |permit: MediaPermission| {
             let mut connection_error = connection_error;
             let mut media_access_granted = media_access_granted;
@@ -2273,10 +2509,61 @@ pub fn AttendantsComponent(
             let mut device_was_denied = device_was_denied;
             let mut join_requested = join_requested;
 
-            connection_error.set(None);
-            mic_error.set(None);
-            video_error.set(None);
-            media_access_granted.set(true);
+            // A single-device background retry tick leaves the OTHER side as
+            // `PermissionState::Unknown` (a "not probed this call" sentinel).
+            // Only clear/reset state for the side(s) actually probed, so a mic-
+            // only tick can never stomp a healthy live camera's error/enabled
+            // state (or vice versa). `connection_error`/`media_access_granted`
+            // are meaningful ONLY for a genuine full request (pre-join grant or
+            // a manual button click that probes BOTH sides) — resetting them on
+            // a single-device health-check tick every ~4s could mask a real,
+            // concurrent connection-error banner, so they are gated on both
+            // sides being probed.
+            let audio_probed = !matches!(permit.audio, PermissionState::Unknown);
+            let video_probed = !matches!(permit.video, PermissionState::Unknown);
+
+            // Set-if-changed to avoid a background-retry re-render storm.
+            // `mic_error`/`video_error` are read in this ~9000-line component's
+            // render scope (the device-warning modal, button badges, …) AND the
+            // retry `use_effect` subscribes to them, so an unconditional
+            // clear-then-reclassify would re-render the whole component on EVERY
+            // failed probe — even one that reports the exact same blocked state as
+            // the previous tick (`Signal::set` marks dirty unconditionally; it does
+            // NOT dedupe by value — that is `use_memo`, not `Signal`). Compute the
+            // target for each PROBED side and write only on a genuine change, so a
+            // steady-state blocked device performs zero ERROR-signal writes per
+            // retry tick — avoiding a full-component re-render and a needless re-run
+            // of the retry effect. (The retry `Interval` itself is now built
+            // once-per-episode behind an `is_none()` guard, so even a re-run of that
+            // effect no longer rebuilds the timer; this dedupe is a re-render
+            // optimization, no longer load-bearing for retry-cadence correctness.)
+            // (The
+            // in-meeting branch below may still write other signals such as
+            // `pending_*_enable` on a failed tick; those don't drive the retry
+            // effect, so they're out of scope for this dedupe.)
+            // Gated on `*_probed` so an un-probed (`Unknown`) side — the sentinel a
+            // single-device retry leaves behind — is never clobbered. `.peek()`
+            // reads without subscribing (correct here: this is an event-handler
+            // closure, not render, matching `.peek()` use elsewhere in this file).
+            if audio_probed {
+                let target = permission_probe_error_target(&permit.audio);
+                if mic_error.peek().as_ref() != target.as_ref() {
+                    mic_error.set(target);
+                }
+            }
+            if video_probed {
+                let target = permission_probe_error_target(&permit.video);
+                if video_error.peek().as_ref() != target.as_ref() {
+                    video_error.set(target);
+                }
+            }
+            // Only a genuine full request (both sides probed) touches these; a
+            // single-device background retry tick never reaches here, so no
+            // set-if-changed dedupe is needed (they don't churn on retry ticks).
+            if audio_probed && video_probed {
+                connection_error.set(None);
+                media_access_granted.set(true);
+            }
 
             // Fulfil any pending mic/camera enables that triggered the permission request.
             if matches!(permit.audio, PermissionState::Granted) && pending_mic_enable() {
@@ -2288,40 +2575,78 @@ pub fn AttendantsComponent(
                 pending_video_enable.set(false);
             }
 
-            match &permit.audio {
-                PermissionState::Denied(MediaPermissionsErrorState::NoDevice) => {
-                    mic_error.set(Some(MediaErrorState::NoDevice));
-                }
-                PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied) => {
-                    mic_error.set(Some(MediaErrorState::PermissionDenied));
-                }
-                PermissionState::Denied(MediaPermissionsErrorState::Other(_)) => {
-                    mic_error.set(Some(MediaErrorState::Other));
-                }
-                _ => {}
-            }
-
-            match &permit.video {
-                PermissionState::Denied(MediaPermissionsErrorState::NoDevice) => {
-                    video_error.set(Some(MediaErrorState::NoDevice));
-                }
-                PermissionState::Denied(MediaPermissionsErrorState::PermissionDenied) => {
-                    video_error.set(Some(MediaErrorState::PermissionDenied));
-                }
-                PermissionState::Denied(MediaPermissionsErrorState::Other(_)) => {
-                    video_error.set(Some(MediaErrorState::Other));
-                }
-                _ => {}
+            // If a probe (typically a background auto-retry tick) has left BOTH
+            // sides error-free while the blocking modal is still open — the user
+            // never dismissed it because the retry loop is designed to recover
+            // without user action — auto-close it. Otherwise the user is stranded
+            // on an empty "Device access problem" dialog with no error rows, just
+            // an "Ok" button. This runs AFTER the per-side set-if-changed writes
+            // above so the reads see the final error state for THIS result; the
+            // both-None gate means a probe that recovers one side while the other
+            // is still (or newly) failing keeps the modal up to show the remainder.
+            // Placed before the branch below so it applies uniformly to the
+            // in-meeting, pre-join-preview, and join flows that all share this
+            // handler.
+            if should_auto_close_device_warning(
+                mic_error.read().is_none(),
+                video_error.read().is_none(),
+                show_device_warning(),
+            ) {
+                show_device_warning.set(false);
             }
 
             if session_loaded() || connecting() {
-                if mic_error.read().is_some() {
+                // In-meeting result (initial retry click, focus re-check, or a
+                // background auto-retry tick). Read-and-clear the background flag
+                // EXACTLY once here, on both success and failure, so it can never
+                // stay stuck: a success clears it (so the next genuine failure
+                // pops the modal) and a background failure clears it (so it stays
+                // silent this tick).
+                //
+                // A single-device probe (exactly one side left `Unknown`) is the
+                // AUTHORITATIVE background signal: only the auto-retry tick issues
+                // `request_audio_only`/`request_video_only`, so a lone `Unknown`
+                // side means "background". We OR it with the flag because a
+                // both-device retry tick fires TWO single-device probes → TWO
+                // `on_result`s, and the read-and-clear flag would only cover the
+                // first; the inference covers the second so it can never re-pop
+                // the modal. A manual full request probes BOTH sides (no
+                // `Unknown`), so it is never misclassified as background.
+                let single_device_probe = audio_probed != video_probed;
+                let was_background_retry =
+                    is_background_retry.replace(false) || single_device_probe;
+                // Diagnostic (step 4): record the CLASSIFIED outcome of every
+                // in-meeting probe — especially the background auto-retry ticks —
+                // so a recurrence of the "badge never clears after the app releases
+                // the device" report leaves concrete console evidence of WHAT the
+                // browser actually returned on each attempt (granted vs which error
+                // variant), rather than forcing another static-only investigation.
+                if was_background_retry {
+                    log::info!(
+                        "[media-retry] probe result (background): audio={:?} video={:?}",
+                        permit.audio,
+                        permit.video,
+                    );
+                }
+                let mic_failed = mic_error.read().is_some();
+                let video_failed = video_error.read().is_some();
+                // Only mutate a side's enabled/pending state if THIS result
+                // actually probed it — an audio-only tick must never touch the
+                // camera's enabled state (and vice versa), even if the other
+                // side happens to carry a stale error signal.
+                if audio_probed && mic_failed {
                     mic_enabled.set(false);
                     pending_mic_enable.set(false);
                 }
-                if video_error.read().is_some() {
+                if video_probed && video_failed {
                     video_enabled.set(false);
                     pending_video_enable.set(false);
+                }
+                // Surface the blocking modal for a user-initiated failure (or the
+                // first failure), but NOT for a background auto-retry tick that
+                // failed again — the modal is already up from the initial failure.
+                if (mic_failed || video_failed) && !was_background_retry {
+                    show_device_warning.set(true);
                 }
             } else if !join_requested() {
                 // Permission was requested just to PREVIEW devices (issue #959).
@@ -2330,6 +2655,24 @@ pub fn AttendantsComponent(
                 // must click Join/Start to actually enter the meeting.
                 log::info!("Media permission granted for pre-join preview (not joining yet)");
             } else if mic_error.read().is_some() || video_error.read().is_some() {
+                // Initial JOIN attempt failed because a device was blocked
+                // (e.g. `DeviceInUse`/`NotReadableError`). The background
+                // auto-retry loop arms itself off the `*_error` signal alone
+                // (see `should_auto_retry`), so there is nothing to seed here:
+                // any `DeviceInUse` error — including one detected at the very
+                // first JOIN-time probe, for a device the user never toggled on
+                // pre-join and never clicks in-meeting — is retried until the
+                // blocking app releases it and the badge clears on its own.
+                //
+                // (This supersedes an earlier, narrower fix that seeded a
+                // `*_want_on` intent signal from the raw pre-join toggle here so
+                // the loop could arm for a blocked device. That only closed the
+                // gap when the user had toggled the device ON pre-join; a device
+                // blocked with the toggle OFF still sat "blocked" forever. Since
+                // a background probe can only ever CLEAR the error — never
+                // auto-start capture — gating retry on intent protected nothing,
+                // so the intent signal was removed and retry is now
+                // unconditional.)
                 show_device_warning.set(true);
                 meeting_joined.set(false);
                 join_requested.set(false);
@@ -2388,6 +2731,217 @@ pub fn AttendantsComponent(
         });
         Rc::new(RefCell::new(mda))
     });
+
+    // ── Background auto-retry loop for a device blocked by `DeviceInUse` ──
+    //
+    // While a device is blocked by another application
+    // (`MediaErrorState::DeviceInUse`), re-probe `getUserMedia` in the background
+    // so the device reconnects on its own the moment the other app releases it —
+    // no click required. Local `getUserMedia` calls fail/succeed near-instantly
+    // (no network round-trip). Retry is NOT gated on any "user wants it on"
+    // intent: a background probe can only ever CLEAR the error (it never sets
+    // `pending_*_enable`, so it can never auto-start capture), so keeping the
+    // badge accurate is always safe — see `should_auto_retry`.
+    //
+    // BACKOFF (approach: fixed-interval timer + on-schedule probing). A single
+    // fixed 4s `gloo` `Interval` fires every 4s, but the actual `getUserMedia`
+    // PROBE only runs on ticks that match an exponentially-growing schedule:
+    // 4s → 8s → 16s → 32s → 60s (held), so a device that is never released does
+    // not poll forever at 4s (battery/CPU tax on low-power devices over a long
+    // meeting). Off-schedule ticks are a near-free empty closure invocation
+    // (a couple of signal reads + a counter bump), NOT a `getUserMedia` call.
+    // The `Interval` is built EXACTLY ONCE per retry episode. This effect re-runs
+    // on any change to a signal it subscribes to (`*_error`), and
+    // some re-runs happen mid-episode while `want_retry` stays true — e.g. the
+    // live encoder's restart loop fires `on_*_permission_error` several times over
+    // ~5s. The `if cell.borrow().is_none()` guard below therefore gates BOTH the
+    // backoff-counter reset AND the `Interval::new(...)` call (and the arm returns
+    // early otherwise): a mid-episode re-run leaves the RUNNING timer and its
+    // backoff untouched. This is deliberate — rebuilding the `Interval` restarts
+    // its fixed countdown from zero, so rebuilding on every churned re-run could
+    // push the first probe out indefinitely under sustained error-signal writes,
+    // leaving the device "stuck failing" long after the blocking app released it.
+    // (The `on_result` probe writes are additionally set-if-changed via
+    // `permission_probe_error_target`, and the in-meeting `on_*_permission_error`
+    // handlers are likewise set-if-changed, so a repeated-same-state failure does
+    // not even re-run this effect — but correctness no longer DEPENDS on that,
+    // because the once-per-episode guard makes the cadence deterministic
+    // regardless of how often the effect re-runs.) The single live `Interval` is
+    // dropped (cancelling its `setInterval`) only when `want_retry` goes false
+    // (else-branch) or on unmount (`use_drop`), so at most one timer is ever live.
+    // Backoff lives in the separate `Rc<Cell<u32>>` counters below, not inside the
+    // `Interval`. `retry_gap_ticks` is the required number of 4s
+    // ticks between probes; it resets to 1 (→ 4s) on a FRESH retry episode
+    // (interval slot empty) and doubles up to `RETRY_MAX_GAP_TICKS` (15 ≈ 60s)
+    // after each probe that still finds the device blocked. Success clears the
+    // error signal → `want_retry` goes false → the interval is dropped → the
+    // next fresh failure starts a new episode back at 4s. A user re-toggling
+    // the device off then on again likewise ends the episode (want_off) and the
+    // next on-with-failure starts fresh at 4s.
+    //
+    // MOBILE SAFETY: each probe touches ONLY the side(s) that still need
+    // retrying via `request_audio_only`/`request_video_only`, never the combined
+    // `request()` — re-probing a healthy, live camera every few seconds while
+    // only the mic is blocked risks glitching the live stream on constrained
+    // devices (iOS Safari / some Android WebViews).
+    //
+    // The interval lives in a `use_hook` cell and is created/dropped inside a
+    // `use_effect` gated on the retry condition; `use_drop` cancels it on
+    // unmount. We deliberately do NOT `.forget()` it — dropping the `Interval`
+    // must provably cancel the underlying `setInterval`.
+    {
+        // 4s base cadence; ceiling of 15 ticks (× 4s = 60s) between probes.
+        const RETRY_BASE_INTERVAL_MS: u32 = 4000;
+        const RETRY_MAX_GAP_TICKS: u32 = 15;
+
+        type IntervalCell = Rc<RefCell<Option<gloo_timers::callback::Interval>>>;
+        let cell: IntervalCell = use_hook(|| Rc::new(RefCell::new(None)));
+        // 4s ticks elapsed since the last probe fired, and the current required
+        // gap (in ticks) between probes. Persist across effect re-runs so the
+        // backoff is NOT reset when a background failure rewrites an error signal
+        // mid-episode (which re-runs this effect); reset only on a fresh episode.
+        let retry_since_probe: Rc<Cell<u32>> = use_hook(|| Rc::new(Cell::new(0)));
+        let retry_gap_ticks: Rc<Cell<u32>> = use_hook(|| Rc::new(Cell::new(1)));
+        let cell_effect = cell.clone();
+        let mda_effect = mda.clone();
+        let is_background_retry_effect = is_background_retry.clone();
+        let since_probe_effect = retry_since_probe.clone();
+        let gap_ticks_effect = retry_gap_ticks.clone();
+        use_effect(move || {
+            // Subscribe to the gating signals so this effect re-runs (starting or
+            // stopping the interval) whenever error state changes.
+            let want_retry = should_auto_retry(mic_error.read().as_ref())
+                || should_auto_retry(video_error.read().as_ref());
+            if want_retry {
+                // Fresh episode ONLY (no interval currently armed): reset the
+                // backoff so the first probe lands at ~4s, and BUILD the interval.
+                //
+                // If an interval is ALREADY armed we must do NOTHING here — neither
+                // reset the backoff nor rebuild the timer. This effect re-runs on
+                // any change to a signal it subscribes to (`*_error`).
+                // Some of those re-runs happen mid-episode while
+                // `want_retry` stays true — e.g. the live encoder's restart loop
+                // fires `on_*_permission_error` up to 5 times over ~5s, each doing a
+                // (now set-if-changed, but historically unconditional) error write.
+                // Rebuilding the `Interval` on every such re-run would restart its
+                // fixed countdown from zero each time, so the FIRST probe could be
+                // pushed out indefinitely under sustained churn — the device would
+                // appear "stuck failing" long after the blocking app released it.
+                // Guarding creation behind `is_none()` makes the cadence
+                // deterministic: once armed, the timer ticks undisturbed until the
+                // error clears (want_retry → false, else-branch drops it) or the
+                // component unmounts. The tick closure re-reads all signals fresh
+                // each fire, so it stays correct without being rebuilt.
+                if cell_effect.borrow().is_none() {
+                    since_probe_effect.set(0);
+                    gap_ticks_effect.set(1);
+                    log::info!(
+                        "[media-retry] arming auto-retry loop (mic_err={:?} video_err={:?})",
+                        mic_error.peek().as_ref(),
+                        video_error.peek().as_ref(),
+                    );
+                } else {
+                    // Already armed; leave the running timer and its backoff intact.
+                    return;
+                }
+                let mda_tick = mda_effect.clone();
+                let is_background_retry_tick = is_background_retry_effect.clone();
+                let since_probe_tick = since_probe_effect.clone();
+                let gap_ticks_tick = gap_ticks_effect.clone();
+                let interval = gloo_timers::callback::Interval::new(
+                    RETRY_BASE_INTERVAL_MS,
+                    move || {
+                        // Recompute the retry condition FRESH each tick — signals
+                        // may have changed since the interval was created (e.g. one
+                        // device recovered so its error cleared).
+                        let mic_retry = should_auto_retry(mic_error.read().as_ref());
+                        let video_retry = should_auto_retry(video_error.read().as_ref());
+                        if !(mic_retry || video_retry) {
+                            return;
+                        }
+                        // Backoff gate: the pure `retry_tick_decision` decides
+                        // whether enough base-cadence ticks have elapsed for the
+                        // current gap. Off-schedule ticks just advance the counter
+                        // and return without issuing `getUserMedia`; probe ticks
+                        // reset the counter and grow the (capped) gap. Keeping the
+                        // math in a pure fn lets the long-run schedule be unit-tested.
+                        let gap_before = gap_ticks_tick.get();
+                        let decision = retry_tick_decision(
+                            since_probe_tick.get(),
+                            gap_before,
+                            RETRY_MAX_GAP_TICKS,
+                        );
+                        since_probe_tick.set(decision.since);
+                        gap_ticks_tick.set(decision.gap);
+                        if !decision.probe {
+                            // Deliberately NOT logged: a skip-tick is a near-free
+                            // no-op and logging every one would spam the console
+                            // over a long meeting (step 4 keeps volume reasonable).
+                            return;
+                        }
+                        // Probe attempt — log it (and the backoff state) so a
+                        // recurrence of the "badge never clears" report leaves real
+                        // console evidence: whether the loop is ticking at all,
+                        // which side(s) it probes, and the gap it is now at.
+                        log::info!(
+                            "[media-retry] probe tick: mic_retry={mic_retry} video_retry={video_retry} \
+                             gap_ticks_before={gap_before} next_gap_ticks={}",
+                            decision.gap,
+                        );
+                        // Mark the upcoming `on_result`(s) as background-originated
+                        // so a repeated failure does NOT re-pop the blocking modal.
+                        // (A both-device retry fires two single-device probes → two
+                        // `on_result`s; `on_result` additionally infers "background"
+                        // from a lone `Unknown` side, covering the second one.)
+                        is_background_retry_tick.set(true);
+                        // Deliberately DO NOT set `pending_mic_enable`/
+                        // `pending_video_enable` here. A background recovery probe
+                        // must only CLEAR the blocked-state error (removing the
+                        // warning badge and auto-closing the modal); it must NOT
+                        // signal an intent to enable the device. Setting the
+                        // pending flags would make `on_result`'s fulfilment logic
+                        // flip `mic_enabled`/`video_enabled` to `true` and start
+                        // capture the instant the other app releases the device —
+                        // turning the camera/mic on with no immediate user action,
+                        // which is both surprising and a privacy concern. Starting
+                        // capture must require a fresh, explicit user click; the
+                        // manual-click path (button `onclick`) still sets the
+                        // pending flags so a "click on while blocked → later probe
+                        // succeeds → device turns on" flow keeps working.
+                        // Probe ONLY the still-blocked side(s). Each single-device
+                        // probe leaves the OTHER side `Unknown` in its `on_result`,
+                        // so it cannot stomp a healthy live device's state. When
+                        // BOTH are blocked, both devices are already down (no live
+                        // stream to glitch), so two independent single-device
+                        // probes are safe. Success flows through `on_result`, which
+                        // clears the error signal (dropping this interval on the
+                        // next effect run) and auto-closes the modal — but does NOT
+                        // fulfil any pending-enable, because this path never sets
+                        // one, so the device stays OFF until the user clicks.
+                        if mic_retry {
+                            mda_tick.borrow().request_audio_only();
+                        }
+                        if video_retry {
+                            mda_tick.borrow().request_video_only();
+                        }
+                    },
+                );
+                *cell_effect.borrow_mut() = Some(interval);
+            } else {
+                // No device needs retrying → cancel the timer. The next fresh
+                // failure will re-arm it with the backoff reset to 4s. Log only the
+                // real armed→disarmed transition (recovery / user opted-off), not
+                // every steady re-run that was already disarmed.
+                if cell_effect.borrow().is_some() {
+                    log::info!("[media-retry] disarming auto-retry loop (recovered or opted off)");
+                }
+                *cell_effect.borrow_mut() = None;
+            }
+        });
+        use_drop(move || {
+            *cell.borrow_mut() = None;
+        });
+    }
 
     // ── Pre-join device enumeration + preview wiring (issue #959) ───────
     //
@@ -5380,33 +5934,22 @@ pub fn AttendantsComponent(
                     }
                 }
                 if show_device_warning() {
-                    div { class: "modal-overlay",
-                        div { class: "modal-window",
-                            h3 { "Device access problem" }
-                            if let Some(err) = mic_error.read().as_ref() {
-                                {render_single_device_error("Microphone", err)}
+                    {
+                        let mut client = client.clone();
+                        // Pre-join dismiss: proceed to connect + join, matching the
+                        // original inline handler exactly (issue #959).
+                        let on_dismiss = EventHandler::new(move |()| {
+                            show_device_warning.set(false);
+                            if let Err(e) = client.connect() {
+                                error!("Connection failed: {e:?}");
                             }
-                            if let Some(err) = video_error.read().as_ref() {
-                                {render_single_device_error("Camera", err)}
-                            }
-                            {
-                                let mut client = client.clone();
-                                rsx! {
-                                    button {
-                                        class: "btn-apple btn-primary",
-                                        style: "margin-top: 1.5rem;",
-                                        onclick: move |_| {
-                                            show_device_warning.set(false);
-                                            if let Err(e) = client.connect() {
-                                                error!("Connection failed: {e:?}");
-                                            }
-                                            meeting_joined.set(true);
-                                        },
-                                        "Ok"
-                                    }
-                                }
-                            }
-                        }
+                            meeting_joined.set(true);
+                        });
+                        render_device_warning_modal(
+                            mic_error.read().as_ref(),
+                            video_error.read().as_ref(),
+                            on_dismiss,
+                        )
                     }
                 }
             }
@@ -5653,10 +6196,55 @@ pub fn AttendantsComponent(
             // Provide VideoCallClient context
             style:"display:flex;gap:var(--space-2)",
             div { id: "main-container", class: "meeting-page",
-                onclick: move |_| {
+                onclick: move |evt: MouseEvent| {
                     dock_menu_open.set(false);
                     density_open.set(false);
                     mock_peers_open.set(false);
+                    // Background (video-grid) clicks also light-dismiss the open
+                    // side panels — the peer list and diagnostics drawer (issue
+                    // #1790). Clicks on the action bar (`.video-controls-container`)
+                    // are excluded so the panel toggles, mic and camera keep the
+                    // panels open; clicks INSIDE a panel are stopped on the panel
+                    // container itself, so they never reach this handler. Closing
+                    // by flipping the signal runs the SAME teardown as the toggle:
+                    // the diagnostics drawer is only mounted while `diagnostics_open`
+                    // is true, so setting it false unmounts it and runs its cleanup;
+                    // the peer list has no extra close-time work.
+                    if !click_within_action_bar(&evt) {
+                        peer_list_open.set(false);
+                        diagnostics_open.set(false);
+                    }
+                },
+                onkeydown: move |evt: Event<KeyboardData>| {
+                    // Escape light-dismisses an open side panel and restores focus
+                    // to that panel's action-bar toggle (WAI-ARIA APG disclosure
+                    // pattern) so focus never drops to `<body>` (issue #1790).
+                    //
+                    // If PR #1777 (popover Esc) lands, its popover cases (density,
+                    // mock-peers) belong in this branch ABOVE the panel handling:
+                    // popovers are more transient than panels, so Escape should peel
+                    // them first. The dock menu keeps its own Esc handler.
+                    //
+                    // The chat drawer is DELIBERATELY excluded from this
+                    // light-dismiss: its message composer means a stray background
+                    // Escape must not risk discarding an in-progress draft. That is
+                    // out of issue-1790 scope.
+                    if evt.key() == Key::Escape {
+                        if let Some(target) =
+                            esc_panel_close_target(diagnostics_open(), peer_list_open())
+                        {
+                            evt.prevent_default();
+                            match target {
+                                EscCloseTarget::Diagnostics => diagnostics_open.set(false),
+                                EscCloseTarget::PeerList => peer_list_open.set(false),
+                            }
+                            // The trigger button always persists in the action bar,
+                            // so focus restore is synchronous (no deferral needed —
+                            // unlike the dock trigger, which is swapped for Done in
+                            // customize mode).
+                            focus_element_by_id(target.trigger_id());
+                        }
+                    }
                 },
                 BrowserCompatibility {}
 
@@ -6710,6 +7298,11 @@ pub fn AttendantsComponent(
                                                         onclick: move |_| {
                                                             if customize_mode() { return; }
                                                             if !mic_enabled() {
+                                                                // Turn the mic ON. If acquisition is blocked
+                                                                // (DeviceInUse), `pending_mic_enable` lets a
+                                                                // later successful probe fulfil the enable;
+                                                                // the background retry loop arms itself off
+                                                                // the error signal alone (see should_auto_retry).
                                                                 if mda_mic.borrow().is_granted(MediaAccessKind::AudioCheck) {
                                                                     mic_enabled.set(true);
                                                                 } else {
@@ -6787,6 +7380,11 @@ pub fn AttendantsComponent(
                                                         onclick: move |_| {
                                                             if customize_mode() { return; }
                                                             if !video_enabled() {
+                                                                // Turn the camera ON. If acquisition is blocked
+                                                                // (DeviceInUse), `pending_video_enable` lets a
+                                                                // later successful probe fulfil the enable;
+                                                                // the background retry loop arms itself off
+                                                                // the error signal alone (see should_auto_retry).
                                                                 if mda_cam.borrow().is_granted(MediaAccessKind::VideoCheck) {
                                                                     video_enabled.set(true);
                                                                     if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
@@ -7060,9 +7658,16 @@ pub fn AttendantsComponent(
                                                             }
                                                         },
                                                         PeerListButton {
+                                                            id: "peer-list-trigger",
                                                             open: peer_list_open(),
-                                                            onclick: move |_| {
+                                                            onclick: move |e: MouseEvent| {
                                                                 if customize_mode() { return; }
+                                                                // Mirror the density toggle: stop the click
+                                                                // reaching `#main-container`'s handler (the
+                                                                // toggle is inside the action bar, so it would
+                                                                // be ignored there anyway, but stopping here
+                                                                // keeps the popover-close identical to density).
+                                                                e.stop_propagation();
                                                                 let opening = !peer_list_open();
                                                                 peer_list_open.set(opening);
                                                                 if opening {
@@ -7241,9 +7846,14 @@ pub fn AttendantsComponent(
                                                             }
                                                         },
                                                         DiagnosticsButton {
+                                                            id: "diagnostics-trigger",
                                                             open: diagnostics_open(),
-                                                            onclick: move |_| {
+                                                            onclick: move |e: MouseEvent| {
                                                                 if customize_mode() { return; }
+                                                                // Mirror the density toggle (see PeerListButton
+                                                                // above): stop the click reaching
+                                                                // `#main-container`'s background handler.
+                                                                e.stop_propagation();
                                                                 let opening = !diagnostics_open();
                                                                 diagnostics_open.set(opening);
                                                                 if opening {
@@ -7963,6 +8573,23 @@ pub fn AttendantsComponent(
                                     }
                                 }
                             }
+                            // In-meeting device-access problem modal. Reuses the
+                            // SAME modal as the pre-join path, but dismissing just
+                            // closes it — the user is already in the call, so there
+                            // is no connect/join to perform. The background
+                            // auto-retry loop keeps trying a `DeviceInUse` device.
+                            if show_device_warning() {
+                                {
+                                    let on_dismiss = EventHandler::new(move |()| {
+                                        show_device_warning.set(false);
+                                    });
+                                    render_device_warning_modal(
+                                        mic_error.read().as_ref(),
+                                        video_error.read().as_ref(),
+                                        on_dismiss,
+                                    )
+                                }
+                            }
                             // Host component (encoders)
                             if media_access_granted() {
                                 Host {
@@ -7986,6 +8613,35 @@ pub fn AttendantsComponent(
                                         log::error!("Camera error: {err}");
                                         video_enabled.set(false);
                                         user_error.set(Some(format!("Camera error: {err}")));
+                                    },
+                                    on_microphone_permission_error: move |err: MediaPermissionsErrorState| {
+                                        log::warn!("Microphone permission error in-meeting: {err:?}");
+                                        // Set-if-changed, mirroring `on_result`'s
+                                        // `permission_probe_error_target` path: the live
+                                        // encoder's restart loop fires this callback up to
+                                        // MAX_RESTARTS times over ~5s, all with the SAME
+                                        // classified error. `Signal::set` marks dirty
+                                        // unconditionally, so an unconditional write here
+                                        // would re-run the retry `use_effect` (which
+                                        // subscribes to `mic_error`) several times in a
+                                        // burst. Write only on a genuine change so those
+                                        // repeat fires are no-ops.
+                                        let target = map_permission_error(&err);
+                                        if mic_error.peek().as_ref() != Some(&target) {
+                                            mic_error.set(Some(target));
+                                        }
+                                        mic_enabled.set(false);
+                                        show_device_warning.set(true);
+                                    },
+                                    on_camera_permission_error: move |err: MediaPermissionsErrorState| {
+                                        log::warn!("Camera permission error in-meeting: {err:?}");
+                                        // Set-if-changed — see the microphone handler above.
+                                        let target = map_permission_error(&err);
+                                        if video_error.peek().as_ref() != Some(&target) {
+                                            video_error.set(Some(target));
+                                        }
+                                        video_enabled.set(false);
+                                        show_device_warning.set(true);
                                     },
                                     on_screen_share_state: move |event: ScreenShareEvent| {
                                         log::info!("Screen share state changed: {event:?}");
@@ -8066,6 +8722,12 @@ pub fn AttendantsComponent(
                     class: if peer_list_open() { "visible" } else { "" },
                     // Overlay drawer: floats over the tiles at its (resizable) width.
                     style: format!("width: {}px", left_width()),
+                    // Clicks INSIDE the peer list must not bubble to
+                    // `#main-container` — otherwise the background light-dismiss
+                    // (issue #1790) would treat an in-panel click as an outside
+                    // click and close the panel. (Same guard as the diagnostics
+                    // drawer root and the density/mock-peers popovers.)
+                    onclick: move |e: MouseEvent| e.stop_propagation(),
                     if peer_list_open() {
                         PeerList {
                             peers: peers_for_display.clone(),
@@ -8681,6 +9343,64 @@ mod tests {
 
     wasm_bindgen_test_configure!(run_in_browser);
 
+    // ── #1790 Escape panel-close precedence ──
+    // Plain host `#[test]`s (not browser tests): `esc_panel_close_target` and
+    // `trigger_id` are pure (bool/enum in, enum/&str out, no DOM), so they run
+    // under native libtest — the gate CI actually executes for this crate
+    // (`cargo test -p videocall-ui --lib`; the crate's `#[wasm_bindgen_test]`
+    // fns are host-stubbed there and never launch a browser). Same rationale as
+    // the `deep_link_*` / `auto_retry_*` classifier tests above.
+
+    /// Both panels open → Escape closes DIAGNOSTICS first, because it is the
+    /// topmost drawer (mobile z-index 9301 vs the peer list's 9300). A precedence
+    /// flip (peer list first) fails HERE — this is the test that guards the order.
+    #[test]
+    fn esc_both_open_closes_diagnostics_first() {
+        assert_eq!(
+            esc_panel_close_target(true, true),
+            Some(EscCloseTarget::Diagnostics)
+        );
+    }
+
+    /// Only the peer list is open → Escape closes the peer list.
+    #[test]
+    fn esc_only_peer_list_closes_peer_list() {
+        assert_eq!(
+            esc_panel_close_target(false, true),
+            Some(EscCloseTarget::PeerList)
+        );
+    }
+
+    /// Only diagnostics is open → Escape closes diagnostics.
+    #[test]
+    fn esc_only_diagnostics_closes_diagnostics() {
+        assert_eq!(
+            esc_panel_close_target(true, false),
+            Some(EscCloseTarget::Diagnostics)
+        );
+    }
+
+    /// Neither panel open → `None`, so Escape is a no-op in the panel handler and
+    /// the popover handlers (density / mock-peers / dock menu) keep today's
+    /// behavior.
+    #[test]
+    fn esc_none_open_returns_none() {
+        assert_eq!(esc_panel_close_target(false, false), None);
+    }
+
+    /// Lockstep pin on the trigger-button ids this handler restores focus to.
+    /// These strings are the fn's OUTPUT contract; the rendered-id side of the
+    /// contract (that a DOM element actually carries each id) is guarded by the
+    /// e2e `activeElement` assertions in `popup-layering.spec.ts`, not here.
+    #[test]
+    fn esc_close_target_trigger_ids() {
+        assert_eq!(
+            EscCloseTarget::Diagnostics.trigger_id(),
+            "diagnostics-trigger"
+        );
+        assert_eq!(EscCloseTarget::PeerList.trigger_id(), "peer-list-trigger");
+    }
+
     // ── Settings deep-link routing (#1131 unify) ──
     // Plain host `#[test]`s (not browser tests): the classifier is pure.
 
@@ -8711,6 +9431,166 @@ mod tests {
         assert_eq!(
             classify_settings_deep_link(Some("bogus")),
             SettingsDeepLink::Modal
+        );
+    }
+
+    // ── background auto-retry gating (device-in-use) ──
+
+    /// Only a device blocked by `DeviceInUse` should be auto-retried, and this
+    /// is unconditional — it does NOT depend on any user "wants it on" intent,
+    /// because a background probe can only ever CLEAR the error, never auto-start
+    /// capture. Flipping the error variant must change the result.
+    #[test]
+    fn auto_retry_only_for_device_in_use() {
+        // DeviceInUse → retry, regardless of whether the user ever toggled the
+        // device on. This is the exact case that was stuck "blocked forever"
+        // when retry was gated on intent.
+        assert!(should_auto_retry(Some(&MediaErrorState::DeviceInUse)));
+        // A DIFFERENT error (permission denied) → do NOT retry: browsers don't
+        // silently re-grant a site-level deny.
+        assert!(!should_auto_retry(Some(&MediaErrorState::PermissionDenied)));
+        // No error at all → nothing to retry.
+        assert!(!should_auto_retry(None));
+    }
+
+    /// Belt-and-suspenders: the other non-retryable error variants (NoDevice,
+    /// Other) must also NOT auto-retry.
+    #[test]
+    fn auto_retry_excludes_other_error_variants() {
+        assert!(!should_auto_retry(Some(&MediaErrorState::NoDevice)));
+        assert!(!should_auto_retry(Some(&MediaErrorState::Other)));
+    }
+
+    // ── background auto-retry backoff schedule (long-run) ──
+
+    /// Drive `retry_tick_decision` — the exact production backoff logic the retry
+    /// `Interval` closure calls each tick — for many ticks, starting from a fresh
+    /// episode `(since=0, gap=1)` with the real `RETRY_MAX_GAP_TICKS` cap (15).
+    /// Returns the 1-based tick indices on which a probe fired.
+    fn simulate_retry_probe_ticks(total_ticks: u32, max_gap: u32) -> Vec<u32> {
+        let mut since = 0u32;
+        let mut gap = 1u32;
+        let mut probe_ticks = Vec::new();
+        for tick in 1..=total_ticks {
+            let d = retry_tick_decision(since, gap, max_gap);
+            since = d.since;
+            gap = d.gap;
+            if d.probe {
+                probe_ticks.push(tick);
+            }
+        }
+        probe_ticks
+    }
+
+    /// The documented schedule: probes at ticks 1, 3, 7, 15, then every 15 ticks.
+    /// At a 4s base cadence these are 4s, 12s, 28s, 60s, 120s, 180s, … i.e. gaps
+    /// of 4s, 8s, 16s, 32s, 60s, 60s, … — the "4s→8s→16s→32s→60s(held)" ladder.
+    /// A regression that broke the doubling or the cap (e.g. `>=` vs `<`, or a bad
+    /// `min`) would shift these tick indices and fail.
+    #[test]
+    fn retry_backoff_schedule_matches_documented_ladder() {
+        // 45 ticks = 3 minutes at a 4s base — well past the plateau boundary.
+        let probes = simulate_retry_probe_ticks(45, 15);
+        assert_eq!(
+            probes,
+            vec![1, 3, 7, 15, 30, 45],
+            "probe ticks must follow 1,3,7,15 then every 15"
+        );
+    }
+
+    /// LONG-RUN, wedge-freedom property — the specific class of bug the manual
+    /// "5 minutes and the badge never cleared" report points at: an off-by-one in
+    /// the backoff math that, deep into the plateau, leaves `since`/`gap` in a
+    /// state that never issues another probe. Simulate 150 ticks (10 minutes at a
+    /// 4s base) and assert the loop keeps probing forever at a STABLE 15-tick
+    /// cadence once the gap caps — never stalls, never drifts.
+    #[test]
+    fn retry_backoff_never_wedges_past_the_plateau() {
+        let max_gap = 15u32;
+        let probes = simulate_retry_probe_ticks(150, max_gap);
+
+        // It must probe many times over 10 simulated minutes (not stop early).
+        assert!(
+            probes.len() >= 10,
+            "expected sustained probing over 150 ticks, got {} probes: {probes:?}",
+            probes.len()
+        );
+
+        // Once the gap has capped (from tick 15 onward the gap is `max_gap`), every
+        // subsequent probe is EXACTLY `max_gap` ticks after the previous one — a
+        // steady, unbounded stream. This is the anti-wedge invariant.
+        let plateau: Vec<u32> = probes.iter().copied().filter(|&t| t >= 15).collect();
+        for pair in plateau.windows(2) {
+            assert_eq!(
+                pair[1] - pair[0],
+                max_gap,
+                "plateau probes must be exactly {max_gap} ticks apart; got {plateau:?}"
+            );
+        }
+
+        // The gap must also never exceed the cap at any point in the run.
+        let mut since = 0u32;
+        let mut gap = 1u32;
+        for _ in 0..150 {
+            let d = retry_tick_decision(since, gap, max_gap);
+            assert!(d.gap <= max_gap, "gap {} exceeded cap {max_gap}", d.gap);
+            since = d.since;
+            gap = d.gap;
+        }
+    }
+
+    // ── device-warning modal auto-close on background recovery ──
+
+    /// The modal auto-closes ONLY when it is currently shown AND both sides are
+    /// error-free. Flipping any of the three terms must change the result — this
+    /// pins the exact condition used in `on_result` so a stale modal cannot be
+    /// left over an empty dialog after a background retry succeeds, and so a
+    /// still-failing side keeps the modal up.
+    #[test]
+    fn auto_close_device_warning_only_when_shown_and_both_clear() {
+        // Shown + both sides recovered → close (the bug this guards against).
+        assert!(should_auto_close_device_warning(true, true, true));
+        // Shown but mic still failing → keep open to display the mic error.
+        assert!(!should_auto_close_device_warning(false, true, true));
+        // Shown but video still failing → keep open to display the video error.
+        assert!(!should_auto_close_device_warning(true, false, true));
+        // Shown but BOTH still failing → keep open.
+        assert!(!should_auto_close_device_warning(false, false, true));
+        // Not shown → nothing to close (avoid a redundant `.set(false)`), even
+        // when both sides are clear.
+        assert!(!should_auto_close_device_warning(true, true, false));
+    }
+
+    // ── probe → target error-state mapping (set-if-changed dedupe) ──
+
+    /// The probe→target mapping used by the set-if-changed writes in `on_result`.
+    /// A granted/unknown probe targets `None` (no error); each `Denied` variant
+    /// targets its matching `MediaErrorState`. This is the value compared against
+    /// the current signal so a repeated identical failure writes nothing — pin it
+    /// so a regression that mis-maps a variant (and would therefore either miss a
+    /// real change or churn a no-op write) is caught. `Other` carries a `JsValue`
+    /// (wasm-only), so it is exercised in-browser, not here.
+    #[test]
+    fn probe_error_target_maps_each_state() {
+        assert!(permission_probe_error_target(&PermissionState::Granted).is_none());
+        assert!(permission_probe_error_target(&PermissionState::Unknown).is_none());
+        assert_eq!(
+            permission_probe_error_target(&PermissionState::Denied(
+                MediaPermissionsErrorState::NoDevice
+            )),
+            Some(MediaErrorState::NoDevice)
+        );
+        assert_eq!(
+            permission_probe_error_target(&PermissionState::Denied(
+                MediaPermissionsErrorState::PermissionDenied
+            )),
+            Some(MediaErrorState::PermissionDenied)
+        );
+        assert_eq!(
+            permission_probe_error_target(&PermissionState::Denied(
+                MediaPermissionsErrorState::DeviceInUse
+            )),
+            Some(MediaErrorState::DeviceInUse)
         );
     }
 

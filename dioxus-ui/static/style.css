@@ -1572,15 +1572,18 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   font-size: 0.85em;
 }
 
-/* issue 1480: build-info grid column count tracks whether github info
-   (Commit + Branch) is shown. --git = Component/Commit/Branch/Built (4 col);
+/* issue 1480 / issue 1789: build-info grid column count tracks whether github
+   info (Commit + Branch) is shown. --git = Component/Commit/Branch/Built (4 col);
    --nogit = Component/Built (2 col). Cells use display:contents rows so the
    grid column count must equal the spans rendered per row.
    Fit/shrink rationale: Component is the only flexible column and shrinks via
-   minmax(0, 1fr) so it ellipsizes, while the three content columns (7-char
-   commit, branch, and the full ~19-20 char `YYYY-MM-DD HH:MM:SSZ` Built value)
-   stay `auto` and size to their content, so they remain fully visible within
-   the ~300px drawer — the longer seconds-precision Built still does not clip.
+   minmax(0, 1fr) so it ellipsizes, while the content columns (7-char commit,
+   branch, and the Built value) stay `auto` and size to their content, so they
+   remain fully visible within the 720px desktop diagnostics sidebar. As of
+   issue 1789 the Built value is a proportional, locale-formatted timestamp in
+   the viewer's local timezone with a short zone label (e.g.
+   "Jun 19, 2026, 6:48:11 AM PDT") rather than the old fixed-width mono
+   `YYYY-MM-DD HH:MM:SSZ`; the `auto` track sizes to it so it still does not clip.
    The column gap was reduced from 10px to 6px to claw back horizontal space. */
 .build-info-table--git {
   grid-template-columns: minmax(0, 1fr) auto auto auto;

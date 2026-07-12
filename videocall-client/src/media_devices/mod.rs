@@ -19,6 +19,10 @@
 mod media_device_access;
 mod media_device_list;
 
+// Crate-internal: the encoders classify their own `getUserMedia` rejections
+// through the SAME logic as the pre-flight permission probe, so device-in-use /
+// no-device / permission-denied are labeled identically wherever they surface.
+pub(crate) use media_device_access::classify_get_user_media_error;
 pub use media_device_access::MediaAccessKind;
 pub use media_device_access::MediaDeviceAccess;
 pub use media_device_access::MediaPermission;

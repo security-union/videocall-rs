@@ -733,7 +733,13 @@ pub fn generate_for_peer(
                             id: "{ss_signal_btn_id}",
                             class: "signal-indicator",
                             "aria-label": "Show screen-share signal quality",
-                            onclick: move |_| on_toggle_signal_popup.call(()),
+                            // stop_propagation: this is a tile-overlay control, not a
+                            // background/grid click, so it must not light-dismiss an
+                            // open side panel (issue #1790).
+                            onclick: move |e: MouseEvent| {
+                                e.stop_propagation();
+                                on_toggle_signal_popup.call(());
+                            },
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
                         // Issue #1483: transport badge adjacent to the signal
@@ -741,7 +747,10 @@ pub fn generate_for_peer(
                         // transport is known (gated upstream → `badge_transport`).
                         {transport_badge(badge_transport)}
                         button {
-                            onclick: move |_| {
+                            onclick: move |e: MouseEvent| {
+                                // stop_propagation: tile-overlay control, not a grid
+                                // click — must not light-dismiss a side panel (#1790).
+                                e.stop_propagation();
                                 toggle_pinned_div(&ss_div_pin);
                                 on_toggle_pin.call(peer_user_id_for_pin_ss.clone());
                             },
@@ -752,7 +761,12 @@ pub fn generate_for_peer(
                             let ss_crop_class = ss_canvas_crop.clone();
                             rsx! {
                                 button {
-                                    onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
+                                    onclick: move |e: MouseEvent| {
+                                        // stop_propagation: tile-overlay control, not a
+                                        // grid click — must not light-dismiss a panel (#1790).
+                                        e.stop_propagation();
+                                        toggle_canvas_crop(&ss_canvas_crop, cropped_tiles);
+                                    },
                                     class: if is_canvas_letterboxed(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                     CropIcon {}
                                 }
@@ -952,7 +966,12 @@ pub fn generate_for_peer(
                             id: "{split_signal_btn_id}",
                             class: "signal-indicator",
                             "aria-label": "Show signal quality",
-                            onclick: move |_| on_toggle_signal_popup.call(()),
+                            // stop_propagation: tile-overlay control, not a grid
+                            // click — must not light-dismiss a side panel (#1790).
+                            onclick: move |e: MouseEvent| {
+                                e.stop_propagation();
+                                on_toggle_signal_popup.call(());
+                            },
                             SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                         }
                         // Issue #1483: transport badge adjacent to the signal
@@ -964,7 +983,12 @@ pub fn generate_for_peer(
                                 let pv_crop_class = pv_canvas_crop.clone();
                                 rsx! {
                                     button {
-                                        onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
+                                        onclick: move |e: MouseEvent| {
+                                            // stop_propagation: tile-overlay control, not a
+                                            // grid click — must not light-dismiss a panel (#1790).
+                                            e.stop_propagation();
+                                            toggle_canvas_crop(&pv_canvas_crop, cropped_tiles);
+                                        },
                                         class: if is_canvas_letterboxed(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                         CropIcon {}
                                     }
@@ -1021,7 +1045,10 @@ pub fn generate_for_peer(
                         }
                         // Pin (visible on hover / when speaking)
                         button {
-                            onclick: move |_| {
+                            onclick: move |e: MouseEvent| {
+                                // stop_propagation: tile-overlay control, not a grid
+                                // click — must not light-dismiss a side panel (#1790).
+                                e.stop_propagation();
                                 toggle_pinned_div(&div_id_pin);
                                 on_toggle_pin.call(peer_user_id_for_pin_vo.clone());
                             },
@@ -1128,14 +1155,22 @@ pub fn generate_for_peer(
                         let ss_crop_class = ss_canvas_crop.clone();
                         rsx! {
                             button {
-                                onclick: move |_| toggle_canvas_crop(&ss_canvas_crop, cropped_tiles),
+                                onclick: move |e: MouseEvent| {
+                                    // stop_propagation: tile-overlay control, not a grid
+                                    // click — must not light-dismiss a side panel (#1790).
+                                    e.stop_propagation();
+                                    toggle_canvas_crop(&ss_canvas_crop, cropped_tiles);
+                                },
                                 class: if is_canvas_letterboxed(&ss_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                 CropIcon {}
                             }
                         }
                     }
                     button {
-                        onclick: move |_| {
+                        onclick: move |e: MouseEvent| {
+                            // stop_propagation: tile-overlay control, not a grid
+                            // click — must not light-dismiss a side panel (#1790).
+                            e.stop_propagation();
                             toggle_pinned_div(&ss_div_pin);
                             on_toggle_pin.call(peer_user_id_for_pin_ss.clone());
                         },
@@ -1357,7 +1392,12 @@ pub fn generate_for_peer(
                                 id: "{grid_signal_btn_id}",
                                 class: "signal-indicator",
                                 "aria-label": "Show signal quality",
-                                onclick: move |_| on_toggle_signal_popup.call(()),
+                                // stop_propagation: tile-overlay control, not a grid
+                                // click — must not light-dismiss a side panel (#1790).
+                                onclick: move |e: MouseEvent| {
+                                    e.stop_propagation();
+                                    on_toggle_signal_popup.call(());
+                                },
                                 SignalBarsIcon { level: signal_level.bars(), lost: signal_level.is_lost() }
                             }
                             // Issue #1483: transport badge adjacent to the signal
@@ -1371,7 +1411,12 @@ pub fn generate_for_peer(
                                     let pv_crop_class = pv_canvas_crop.clone();
                                     rsx! {
                                         button {
-                                            onclick: move |_| toggle_canvas_crop(&pv_canvas_crop, cropped_tiles),
+                                            onclick: move |e: MouseEvent| {
+                                                // stop_propagation: tile-overlay control, not a
+                                                // grid click — must not light-dismiss a panel (#1790).
+                                                e.stop_propagation();
+                                                toggle_canvas_crop(&pv_canvas_crop, cropped_tiles);
+                                            },
                                             class: if is_canvas_letterboxed(&pv_crop_class, &cropped_tiles) { "crop-icon" } else { "crop-icon active" },
                                             CropIcon {}
                                         }
@@ -1428,7 +1473,10 @@ pub fn generate_for_peer(
                             }
                             // Pin (visible on hover / when speaking)
                             button {
-                                onclick: move |_| {
+                                onclick: move |e: MouseEvent| {
+                                    // stop_propagation: tile-overlay control, not a grid
+                                    // click — must not light-dismiss a side panel (#1790).
+                                    e.stop_propagation();
                                     toggle_pinned_div(&pv_div_pin);
                                     on_toggle_pin.call(peer_user_id_for_pin.clone());
                                 },

@@ -1577,14 +1577,14 @@ fn show_body_tooltip(
     let video_line = if show_video {
         if sample.video_resolution.is_empty() {
             format!(
-                "<span style='color:{}'>Video: {:.1} fps | {:.0} kbps</span>",
+                "<span style='color:{}'>Video: {:.1} fps arriving | {:.0} kbps</span>",
                 theme_color::SIGNAL_VIDEO,
                 sample.video_fps,
                 sample.video_bitrate_kbps
             )
         } else if video_tier.is_empty() {
             format!(
-                "<span style='color:{}'>Video: {} | {:.1} fps | {:.0} kbps</span>",
+                "<span style='color:{}'>Video: {} | {:.1} fps arriving | {:.0} kbps</span>",
                 theme_color::SIGNAL_VIDEO,
                 sample.video_resolution,
                 sample.video_fps,
@@ -1592,7 +1592,7 @@ fn show_body_tooltip(
             )
         } else {
             format!(
-                "<span style='color:{}'>Video: {} ({}) | {:.1} fps | {:.0} kbps</span>",
+                "<span style='color:{}'>Video: {} ({}) | {:.1} fps arriving | {:.0} kbps</span>",
                 theme_color::SIGNAL_VIDEO,
                 sample.video_resolution,
                 video_tier,

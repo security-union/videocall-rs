@@ -126,6 +126,8 @@ pub fn camera_encoder_layers_torn_down() -> u64 {
     CAMERA_ENCODER_LAYERS_TORN_DOWN_AFTER_DWELL.load(Ordering::Relaxed)
 }
 use crate::connection::MediaStreamKey;
+use crate::media_devices::classify_get_user_media_error;
+use crate::MediaPermissionsErrorState;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::Callback;
 use wasm_bindgen::prelude::Closure;
@@ -421,6 +423,14 @@ pub struct CameraEncoder {
     current_fps: Arc<AtomicU32>,
     on_encoder_settings_update: Callback<String>,
     on_error: Option<Callback<String>>,
+    /// Classified callback fired ONLY at the real `getUserMedia` rejection site,
+    /// carrying a [`MediaPermissionsErrorState`] (e.g. `DeviceInUse`) so the UI
+    /// can show a specific reason and drive auto-retry. At that one site it fires
+    /// INSTEAD OF `on_error` (the UI raises a dedicated modal for the classified
+    /// error, so emitting both would stack two modals). `on_error` still carries
+    /// the generic string for every OTHER error site in `start`.
+    /// `None` until wired via [`Self::set_permission_error_callback`].
+    on_permission_error: Option<Callback<MediaPermissionsErrorState>>,
     /// Tier-controlled max width. The encoding loop checks this and reconfigures
     /// the encoder when it changes. 0 means "use camera native resolution".
     tier_max_width: Rc<AtomicU32>,
@@ -1240,6 +1250,7 @@ impl CameraEncoder {
             current_fps: Arc::new(AtomicU32::new(0)),
             on_encoder_settings_update,
             on_error: Some(on_error),
+            on_permission_error: None,
             tier_max_width: Rc::new(AtomicU32::new(default_tier.max_width)),
             tier_max_height: Rc::new(AtomicU32::new(default_tier.max_height)),
             tier_keyframe_interval: Rc::new(AtomicU32::new(default_tier.keyframe_interval_frames)),
@@ -2239,6 +2250,17 @@ impl CameraEncoder {
         self.force_keyframe = flag;
     }
 
+    /// Wire the classified permission-error callback. Fired only at the real
+    /// `getUserMedia` rejection site (see [`Self::start`]) with the specific
+    /// [`MediaPermissionsErrorState`], INSTEAD OF the generic `on_error` at that
+    /// site (so the UI shows exactly one modal, not two).
+    pub fn set_permission_error_callback(
+        &mut self,
+        on_permission_error: Callback<MediaPermissionsErrorState>,
+    ) {
+        self.on_permission_error = Some(on_permission_error);
+    }
+
     /// Replace the internal congestion step-down flag with an externally-owned one.
     ///
     /// Call this after construction to share the flag with `VideoCallClient`,
@@ -2474,6 +2496,7 @@ impl CameraEncoder {
             self.state.set_enabled(true);
         }
         let on_error = self.on_error.clone();
+        let on_permission_error = self.on_permission_error.clone();
 
         log::info!(
             "CameraEncoder::start(): using video device_id = {}",
@@ -2684,10 +2707,17 @@ impl CameraEncoder {
                 let device = match JsFuture::from(devices_query).await {
                     Ok(s) => s.unchecked_into::<MediaStream>(),
                     Err(e) => {
-                        let msg = format!("Failed to get camera stream: {e:?}");
-                        error!("{msg}");
-                        if let Some(cb) = &on_error {
-                            cb.emit(msg);
+                        // Classify the rejection (e.g. NotReadableError →
+                        // DeviceInUse) so the UI can show a specific reason and
+                        // auto-retry. We emit ONLY the classified permission
+                        // callback here — NOT the generic string `on_error` —
+                        // because the UI raises a dedicated modal for the
+                        // classified error, and firing both would stack two
+                        // modals for the same failure. The raw error is still
+                        // logged for diagnostics.
+                        error!("Failed to get camera stream: {e:?}");
+                        if let Some(cb) = &on_permission_error {
+                            cb.emit(classify_get_user_media_error(&e));
                         }
                         record_camera_restart(RestartReason::Other);
                         restart_count += 1;

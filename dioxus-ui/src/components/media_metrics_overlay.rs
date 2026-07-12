@@ -44,6 +44,18 @@
 //! network arrival rate. The RAW `fps_received` arrival signal stays untouched for
 //! every other consumer (drawer chart, signal popup, health reporter), where the
 //! network-burstiness view is the useful one.
+//!
+//! Receiver-inclusive (issue #1787): because painted-fps is measured at THIS
+//! client's paint site, it reflects LOCAL render health as well as the sender's
+//! rate. A CPU-bound or throttled receiver (e.g. a backgrounded tab, or a slow
+//! device that can't keep up) paints fewer frames and so reads a REDUCED overlay
+//! fps even when the sender is perfectly healthy. This is intended — the overlay
+//! exists to surface local jank — but is stated here to preempt "the overlay says
+//! 18fps but the sender is fine" confusion: that number is the viewer's own paint
+//! rate, not necessarily a sender fault. The drawer/popup ARRIVAL fps (labelled
+//! `FPS(arriving):` / `fps arriving`) is the one to compare against the sender's
+//! output; a gap between arrival and painted with healthy arrival points at the
+//! local receiver.
 
 use dioxus::prelude::*;
 use videocall_client::decode::peer_decoder::METRIC_FPS_PAINTED;

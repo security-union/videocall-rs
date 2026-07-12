@@ -182,10 +182,13 @@ fn render_reception(map: &BTreeMap<(String, String), ReceptionEntry>) -> Option<
         // would re-render the drawer body for an invisible ms tick).
         // issue 1656: `FPS(painted)` (TRUE painted-frame fps, `{:.1}`) and
         // `Stale` (content staleness — ms the painted content is behind
-        // real-time, #1641, whole ms) are NEW lines added to the fixed template
-        // — the existing `FPS:` line stays as fps_received.
+        // real-time, #1641, whole ms) are NEW lines added to the fixed template.
+        // issue 1787: the received-rate line is labelled `FPS(arriving):` (still
+        // sourced from `fps_received`, the network arrival rate) to self-identify
+        // as arrival and parallel the painted line — the two legitimately diverge
+        // during bursts (arriving can spike above painted).
         text.push_str(&format!(
-            "Peer: {peer} ({kind})\nFPS: {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nStale: {} ms\nTimestamp: {}s\n\n",
+            "Peer: {peer} ({kind})\nFPS(arriving): {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nStale: {} ms\nTimestamp: {}s\n\n",
             fmt1(e.fps_painted),
             fmt1(e.bitrate_kbps),
             fmt1(e.loss_per_sec),
@@ -1331,6 +1334,11 @@ pub fn Diagnostics(
             // off — the call UI behind it remains interactive). (#1131 §5 a11y)
             role: "region",
             "aria-label": "Performance & Diagnostics",
+            // Clicks INSIDE the drawer must not bubble to `#main-container` — its
+            // background light-dismiss (issue #1790) would otherwise treat an
+            // in-drawer click as an outside click and close the panel. (Same guard
+            // as `#peer-list-container` and the density/mock-peers popovers.)
+            onclick: move |e: MouseEvent| e.stop_propagation(),
             div { class: "sidebar-header",
                 h2 { "Performance & Diagnostics" }
                 // Spacer keeps the × rightmost (the cross-nav button was removed
@@ -1524,7 +1532,7 @@ pub fn Diagnostics(
                                             span { class: "build-info-cell monospace", "{crate::constants::short_sha(env!(\"GIT_SHA\"))}" }
                                             span { class: "build-info-cell", "{env!(\"GIT_BRANCH\")}" }
                                         }
-                                        span { class: "build-info-cell", "{crate::constants::build_datetime(env!(\"BUILD_TIMESTAMP\")).unwrap_or_else(|| env!(\"BUILD_TIMESTAMP\").to_string())}" }
+                                        span { class: "build-info-cell", "{crate::constants::build_datetime_local(env!(\"BUILD_TIMESTAMP\")).unwrap_or_else(|| env!(\"BUILD_TIMESTAMP\").to_string())}" }
                                     }
                                     for comp in backend_versions() {
                                         {
@@ -1533,7 +1541,7 @@ pub fn Diagnostics(
                                             let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
                                             let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
                                             let raw_ts = comp["build_timestamp"].as_str().unwrap_or("");
-                                            let built = crate::constants::build_datetime(raw_ts).unwrap_or_else(|| if raw_ts.is_empty() { "-".to_string() } else { raw_ts.to_string() });
+                                            let built = crate::constants::build_datetime_local(raw_ts).unwrap_or_else(|| if raw_ts.is_empty() { "-".to_string() } else { raw_ts.to_string() });
                                             let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
                                             rsx! {
                                                 div { class: "build-info-row",
@@ -2677,7 +2685,10 @@ mod tests {
         };
         assert!(update_reception(&mut map, &evt), "keyed event must fold");
         let text = render_reception(&map).expect("non-empty map → Some");
-        assert!(text.contains("FPS: 30.00"), "FPS value present: {text}");
+        assert!(
+            text.contains("FPS(arriving): 30.00"),
+            "FPS value present: {text}"
+        );
         assert!(text.contains("850"), "bitrate present: {text}");
         assert!(text.contains("VIDEO"), "media type present: {text}");
         // The peer label is the REMOTE source (to_peer), not the local self-id.
@@ -2704,7 +2715,7 @@ mod tests {
     /// and the loss event (loss/keyframe) ALTERNATE for the same (peer, kind).
     /// Folding the loss event must RETAIN the previously-seen fps/bitrate —
     /// every label stays, no line vanishes. Reverting to per-event rendering
-    /// fails the `FPS: 30.00` assertion after the loss event.
+    /// fails the `FPS(arriving): 30.00` assertion after the loss event.
     #[test]
     fn reception_merges_alternating_event_shapes_without_dropping_lines() {
         let mut map = BTreeMap::new();
@@ -2734,7 +2745,7 @@ mod tests {
         assert!(update_reception(&mut map, &loss));
         let text = render_reception(&map).expect("non-empty map");
         assert!(
-            text.contains("FPS: 30.00"),
+            text.contains("FPS(arriving): 30.00"),
             "fps retained across the loss event: {text}"
         );
         assert!(text.contains("Loss: 2.5/s"), "loss folded in: {text}");
@@ -2933,7 +2944,10 @@ mod tests {
             1,
             "one merged block: {text}"
         );
-        assert!(text.contains("FPS: 30.00"), "fps_received retained: {text}");
+        assert!(
+            text.contains("FPS(arriving): 30.00"),
+            "fps_received retained: {text}"
+        );
         assert!(
             text.contains("FPS(painted): 28.0"),
             "painted folded: {text}"

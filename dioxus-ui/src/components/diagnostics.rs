@@ -16,6 +16,7 @@
  * conditions.
  */
 
+use crate::components::media_metrics_overlay::{MediaMetricsOverlayCtx, MEDIA_METRICS_OVERLAY_KEY};
 use crate::components::neteq_chart::{
     neteq_history_key, push_capped, should_push, single_peer_selected, AdvancedChartType,
     ChartType, NetEqAdvancedChart, NetEqChart, NetEqHistory, NetEqSample, NetEqStatusDisplay,
@@ -29,6 +30,7 @@ use crate::components::performance_settings::{
     PerformanceSettingsPanel,
 };
 use crate::context::{confirm_transport_change, TransportPreference, TransportPreferenceCtx};
+use crate::local_storage::save_bool;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
 use dioxus_core::Task;
@@ -180,10 +182,13 @@ fn render_reception(map: &BTreeMap<(String, String), ReceptionEntry>) -> Option<
         // would re-render the drawer body for an invisible ms tick).
         // issue 1656: `FPS(painted)` (TRUE painted-frame fps, `{:.1}`) and
         // `Stale` (content staleness — ms the painted content is behind
-        // real-time, #1641, whole ms) are NEW lines added to the fixed template
-        // — the existing `FPS:` line stays as fps_received.
+        // real-time, #1641, whole ms) are NEW lines added to the fixed template.
+        // issue 1787: the received-rate line is labelled `FPS(arriving):` (still
+        // sourced from `fps_received`, the network arrival rate) to self-identify
+        // as arrival and parallel the painted line — the two legitimately diverge
+        // during bursts (arriving can spike above painted).
         text.push_str(&format!(
-            "Peer: {peer} ({kind})\nFPS: {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nStale: {} ms\nTimestamp: {}s\n\n",
+            "Peer: {peer} ({kind})\nFPS(arriving): {fps}\nFPS(painted): {}\nBitrate: {} kbps\nLoss: {}/s\nKeyframe requests: {}/s\nStale: {} ms\nTimestamp: {}s\n\n",
             fmt1(e.fps_painted),
             fmt1(e.bitrate_kbps),
             fmt1(e.loss_per_sec),
@@ -827,6 +832,10 @@ pub fn Diagnostics(
     on_resize_end: EventHandler<()>,
 ) -> Element {
     let transport_pref_ctx = use_context::<TransportPreferenceCtx>();
+    // Issue 1768: the shared "Show media metrics on tiles" flag. The checkbox
+    // below writes it (and persists to localStorage); every PeerTile reads the
+    // same signal to show/hide its overlay.
+    let mut media_metrics_overlay_enabled = use_context::<MediaMetricsOverlayCtx>().0;
     let mut selected_peer = use_signal(|| "All Peers".to_string());
     // FIX 2: tracks whether the user has explicitly chosen a peer in the
     // selector. The one-shot auto-select effect (below) only fires while this
@@ -1325,6 +1334,11 @@ pub fn Diagnostics(
             // off — the call UI behind it remains interactive). (#1131 §5 a11y)
             role: "region",
             "aria-label": "Performance & Diagnostics",
+            // Clicks INSIDE the drawer must not bubble to `#main-container` — its
+            // background light-dismiss (issue #1790) would otherwise treat an
+            // in-drawer click as an outside click and close the panel. (Same guard
+            // as `#peer-list-container` and the density/mock-peers popovers.)
+            onclick: move |e: MouseEvent| e.stop_propagation(),
             div { class: "sidebar-header",
                 h2 { "Performance & Diagnostics" }
                 // Spacer keeps the × rightmost (the cross-nav button was removed
@@ -1387,6 +1401,34 @@ pub fn Diagnostics(
                     }
                     p { class: "transport-preference-note",
                         "Changing protocol will reload the page."
+                    }
+                }
+                // Issue 1768: per-tile media-metrics overlay toggle. A real
+                // checkbox with an explicit `label for=id` so it is properly
+                // labeled and keyboard-operable; the overlay it controls is a
+                // passive (aria-hidden) readout, so the checkbox is the sole a11y
+                // control surface for the feature.
+                section { class: "diagnostics-section", "aria-labelledby": "diag-h-display-options",
+                    h3 { id: "diag-h-display-options", "Display options" }
+                    div { class: "device-setting-group diag-overlay-toggle",
+                        input {
+                            r#type: "checkbox",
+                            id: "diag-media-metrics-overlay",
+                            "data-testid": "media-metrics-overlay-toggle",
+                            checked: media_metrics_overlay_enabled(),
+                            onchange: move |_| {
+                                let next = !media_metrics_overlay_enabled();
+                                media_metrics_overlay_enabled.set(next);
+                                save_bool(MEDIA_METRICS_OVERLAY_KEY, next);
+                            },
+                        }
+                        label { r#for: "diag-media-metrics-overlay",
+                            "Show media metrics on tiles"
+                        }
+                    }
+                    p { class: "transport-preference-note",
+                        "Overlays each peer's received resolution, fps and audio bitrate at the \
+                         bottom of their tile, and your own sending metrics on your tile."
                     }
                 }
                 // Raw stats: the four low-level pre-dumps (Reception + Sending +
@@ -1490,7 +1532,7 @@ pub fn Diagnostics(
                                             span { class: "build-info-cell monospace", "{crate::constants::short_sha(env!(\"GIT_SHA\"))}" }
                                             span { class: "build-info-cell", "{env!(\"GIT_BRANCH\")}" }
                                         }
-                                        span { class: "build-info-cell", "{crate::constants::build_datetime(env!(\"BUILD_TIMESTAMP\")).unwrap_or_else(|| env!(\"BUILD_TIMESTAMP\").to_string())}" }
+                                        span { class: "build-info-cell", "{crate::constants::build_datetime_local(env!(\"BUILD_TIMESTAMP\")).unwrap_or_else(|| env!(\"BUILD_TIMESTAMP\").to_string())}" }
                                     }
                                     for comp in backend_versions() {
                                         {
@@ -1499,7 +1541,7 @@ pub fn Diagnostics(
                                             let sha = comp["git_sha"].as_str().unwrap_or("?").to_string();
                                             let br = comp["git_branch"].as_str().unwrap_or("?").to_string();
                                             let raw_ts = comp["build_timestamp"].as_str().unwrap_or("");
-                                            let built = crate::constants::build_datetime(raw_ts).unwrap_or_else(|| if raw_ts.is_empty() { "-".to_string() } else { raw_ts.to_string() });
+                                            let built = crate::constants::build_datetime_local(raw_ts).unwrap_or_else(|| if raw_ts.is_empty() { "-".to_string() } else { raw_ts.to_string() });
                                             let label = if ver.is_empty() { svc } else { format!("{svc} ({ver})") };
                                             rsx! {
                                                 div { class: "build-info-row",
@@ -2643,7 +2685,10 @@ mod tests {
         };
         assert!(update_reception(&mut map, &evt), "keyed event must fold");
         let text = render_reception(&map).expect("non-empty map → Some");
-        assert!(text.contains("FPS: 30.00"), "FPS value present: {text}");
+        assert!(
+            text.contains("FPS(arriving): 30.00"),
+            "FPS value present: {text}"
+        );
         assert!(text.contains("850"), "bitrate present: {text}");
         assert!(text.contains("VIDEO"), "media type present: {text}");
         // The peer label is the REMOTE source (to_peer), not the local self-id.
@@ -2670,7 +2715,7 @@ mod tests {
     /// and the loss event (loss/keyframe) ALTERNATE for the same (peer, kind).
     /// Folding the loss event must RETAIN the previously-seen fps/bitrate —
     /// every label stays, no line vanishes. Reverting to per-event rendering
-    /// fails the `FPS: 30.00` assertion after the loss event.
+    /// fails the `FPS(arriving): 30.00` assertion after the loss event.
     #[test]
     fn reception_merges_alternating_event_shapes_without_dropping_lines() {
         let mut map = BTreeMap::new();
@@ -2700,7 +2745,7 @@ mod tests {
         assert!(update_reception(&mut map, &loss));
         let text = render_reception(&map).expect("non-empty map");
         assert!(
-            text.contains("FPS: 30.00"),
+            text.contains("FPS(arriving): 30.00"),
             "fps retained across the loss event: {text}"
         );
         assert!(text.contains("Loss: 2.5/s"), "loss folded in: {text}");
@@ -2899,7 +2944,10 @@ mod tests {
             1,
             "one merged block: {text}"
         );
-        assert!(text.contains("FPS: 30.00"), "fps_received retained: {text}");
+        assert!(
+            text.contains("FPS(arriving): 30.00"),
+            "fps_received retained: {text}"
+        );
         assert!(
             text.contains("FPS(painted): 28.0"),
             "painted folded: {text}"

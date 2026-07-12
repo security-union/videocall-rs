@@ -41,6 +41,30 @@ pub struct PeerListEntry {
     pub user_id: String,
 }
 
+/// What Escape should do while focus is in the peer-list search box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SearchEscapeAction {
+    /// Non-empty query: Escape clears the query and is swallowed (stop +
+    /// prevent-default) so the panel stays OPEN — the standard search-field
+    /// Escape idiom: first Escape clears, only a second Escape dismisses.
+    ClearOnly,
+    /// Empty query: Escape is left to bubble so the panel's own background
+    /// light-dismiss (issue #1790, handled on `#main-container`) closes the
+    /// peer list.
+    Bubble,
+}
+
+/// Decide what Escape does in the search box from whether the query is empty.
+/// Extracted as a pure fn so the clear-before-close precedence is unit-tested
+/// without a DOM.
+fn search_escape_action(query_empty: bool) -> SearchEscapeAction {
+    if query_empty {
+        SearchEscapeAction::Bubble
+    } else {
+        SearchEscapeAction::ClearOnly
+    }
+}
+
 #[component]
 pub fn PeerList(
     peers: Vec<PeerListEntry>,
@@ -210,6 +234,22 @@ pub fn PeerList(
                         value: "{search_query}",
                         oninput: move |e: Event<FormData>| {
                             search_query.set(e.value());
+                        },
+                        onkeydown: move |e: Event<KeyboardData>| {
+                            // Escape in the search box: with a non-empty query,
+                            // clear it and swallow the key so the panel stays open
+                            // (first Escape clears). With an empty query, let Escape
+                            // bubble so the panel's #1790 light-dismiss closes it.
+                            if e.key() == Key::Escape {
+                                match search_escape_action(search_query().is_empty()) {
+                                    SearchEscapeAction::ClearOnly => {
+                                        e.stop_propagation();
+                                        e.prevent_default();
+                                        search_query.set(String::new());
+                                    }
+                                    SearchEscapeAction::Bubble => {}
+                                }
+                            }
                         },
                         class: "search-input",
                     }
@@ -633,6 +673,17 @@ fn handle_peer_list_diagnostics(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Escape in the search box clears a non-empty query first (staying open),
+    /// and only bubbles to close the panel once the query is empty. A regression
+    /// that dropped the clear step (Escape always bubbles) would flip the
+    /// non-empty case to `Bubble` and fail here — this pins the #1790
+    /// clear-before-close precedence.
+    #[test]
+    fn search_escape_clears_before_closing() {
+        assert_eq!(search_escape_action(false), SearchEscapeAction::ClearOnly);
+        assert_eq!(search_escape_action(true), SearchEscapeAction::Bubble);
+    }
 
     /// Build a display-name lookup closure backed by a `HashMap<sid, name>`,
     /// mirroring the shape of `VideoCallClientCtx::get_peer_display_name`.

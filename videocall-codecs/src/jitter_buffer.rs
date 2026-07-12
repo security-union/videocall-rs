@@ -285,12 +285,20 @@ const DELAY_SMOOTHING_FACTOR: f64 = 0.99;
 /// Release-side WebCodecs backpressure high-water mark (issue #1024).
 ///
 /// Frames released by the jitter buffer are handed to the WebCodecs `VideoDecoder`, whose own
-/// internal queue is *unpaced* — given a burst it decodes and paints as fast as it can rather than
-/// at display rate. That is the "second buffer stage" #1020 describes: the jitter-buffer freshness
-/// deadline bounds the first stage, but without this gate a recovery burst still piles into the
-/// decoder and is painted back-to-back. So before releasing a frame we consult the live decoder
-/// queue depth (`Decodable::decode_queue_depth()`) and stop releasing while it is at/above this
-/// mark, letting the decoder drain to display rate. Frames simply stay buffered for the next tick.
+/// internal queue is *unpaced* — given a burst it decodes as fast as it can. That is the "second
+/// buffer stage" #1020 describes: the jitter-buffer freshness deadline bounds the first stage, but
+/// without this gate a recovery burst still piles into the decoder unboundedly. So before releasing
+/// a frame we consult the live decoder queue depth (`Decodable::decode_queue_depth()`) and stop
+/// releasing while it is at/above this mark. Held frames simply stay buffered for the next tick.
+///
+/// What this gate actually bounds is the **in-flight decode-queue DEPTH** — how many released frames
+/// sit undecoded in the WebCodecs queue at once — which caps decoder-side memory and the
+/// second-stage backlog to a few frames. It does NOT pace *paints* to display rate: decoded frames
+/// still surface to the main thread as fast as the decoder drains them (before issue #1783 each was
+/// then painted on receipt — the fast-forward "catch-up flash" on a burst). Presenting at display
+/// rate, and collapsing a burst to the newest frame instead of replaying it, is the job of the
+/// main-thread presentation coalescing (`playout::LatestFrameMailbox`, issue #1783), NOT of this
+/// depth cap.
 ///
 /// Chosen as 3: large enough to keep the decoder continuously fed (no underrun/stutter at ~30fps,
 /// where a healthy queue sits at 0-1) yet small enough that the second-stage backlog can never
@@ -391,13 +399,50 @@ const MAX_SOURCE_FRAME_INTERVAL_MS: f64 = 1000.0;
 // buffered keyframe to skip to, the governor does nothing and leaves that case entirely to the
 // 1800ms deadline (which owns keyframe-less eviction + the throttled proactive request). This
 // preserves the #1287/#1297/#814 keyframe-storm-avoidance invariant.
+//
+// v2 (issue #1791): the engage threshold is tightened from 1300ms into the sub-second class
+// (`GOVERNOR_ENGAGE_MS` = 800ms, see below) so a standing backlog resyncs to live ~500ms sooner
+// than v1 did instead of draining as a 2x fast-forward. The no-new-PLI invariant above is
+// UNCHANGED and load-bearing: v2 still jumps ONLY when a keyframe is already buffered and still
+// fires NO PLI at engage — forcing a keyframe on every engage would recreate the #1479 meeting-wide
+// keyframe storm, worst on high-RTT mobile. The 1800ms freshness deadline and its throttled
+// proactive request remain the untouched backstop for the keyframe-less case.
+//
+// Residual (documented per #1787): with a 5s camera GOP a keyframe is frequently NOT buffered at
+// engage time, so a sub-800ms drain — and any 800–1300ms backlog that happens to have no buffered
+// keyframe — still fast-forwards briefly. The per-tile painted-fps overlay can then TRUTHFULLY read
+// above the source rate for <=1–2s. This change makes those excursions rarer and shorter (bounded
+// by the tighter engage plus keyframe availability), not impossible.
 
-/// Buffered playout-latency total (ms) at/above which the governor begins counting toward a
-/// resync skip. Chosen within the designed 1200–1500ms engage band and comfortably below the
-/// 1800ms freshness deadline so the governor resyncs the *fresh-head* backlog case the deadline
-/// structurally cannot see, while still leaving the deadline as the backstop. The loss repro
-/// pins steady-state lag near ~1700ms, so 1300ms engages well before the deadline would.
-const GOVERNOR_ENGAGE_MS: f64 = 1300.0;
+/// Buffered playout-latency total (ms) at/above which the governor begins counting toward a resync
+/// skip. Tightened from v1's 1300ms to 800ms (issue #1791) so sub-second standing backlogs jump to
+/// live instead of replaying as a 2x fast-forward drain.
+///
+/// Why 800ms specifically — it must sit clearly ABOVE the legitimate-jitter envelope and clearly
+/// BELOW the freshness deadline (the compile-time ordering invariant below pins the corners):
+/// - Floor: the adaptive playout delay is clamped at `MAX_PLAYOUT_DELAY_MS` (500ms), so on a
+///   maximally jittery 200ms+ RTT mobile link the legitimate steady-state total (stage-1 span at the
+///   500ms clamp plus a shallow stage-2 decode queue) peaks around ~550–600ms. 800ms leaves
+///   ~200–300ms of headroom above that so the governor does NOT resync legitimate jitter — engaging
+///   near 500–600ms would. The decode queue only pins at its high-water mark (inflating stage-2)
+///   DURING a real backlog drain — exactly the condition the governor should catch — not in the
+///   legitimate steady state, so the legitimate ceiling really is ~600ms, not higher. NOTE the
+///   ~550–600ms / ~200–300ms-headroom figures are FRAME-RATE-DEPENDENT: stage-2 is
+///   `decode_queue_depth × source_frame_interval_ms` (the interval clamped at
+///   `MAX_SOURCE_FRAME_INTERVAL_MS` = 1000ms), so for a low-fps stream (e.g. 5fps screen share →
+///   ~200ms/frame) even a shallow 1–2-frame queue adds ~200–400ms and erodes the stated margin.
+///   This is benign, not a false-positive risk: a queue that stays deep long enough to matter IS
+///   the sustained drain the governor targets, and the 40-tick net-sustain window (below) filters
+///   per-frame stage-2 spikes. Read the headroom as a camera-cadence figure that shrinks (never
+///   inverts, given the 500ms stage-1 clamp) as source fps drops.
+/// - Ceiling: 800ms is 1000ms below the 1800ms freshness deadline, so the deadline stays the clear
+///   backstop for a genuinely stale head; the governor owns only the fresh-head backlog band the
+///   deadline structurally cannot see.
+/// - Coverage: 800ms catches the 800–1300ms standing backlogs v1's 1300ms threshold missed — the
+///   common WS/TCP congestion case that previously drained as a fast-forward. Sub-800ms drains are
+///   deliberately left to play through (see the residual note above); resyncing them would trip on
+///   legitimate jitter.
+const GOVERNOR_ENGAGE_MS: f64 = 800.0;
 /// Buffered playout-latency total (ms) below which the engaged EPISODE is considered recovered
 /// and `governor_engaged` clears. Set just below `MAX_PLAYOUT_DELAY_MS` (500) so the episode is
 /// marked recovered once the stream is back inside the normal adaptive-delay envelope. This is an
@@ -405,10 +450,21 @@ const GOVERNOR_ENGAGE_MS: f64 = 1300.0;
 /// plus `GOVERNOR_COOLDOWN_MS` (see `run_resync_governor`). A latch-gate here would deadlock
 /// because post-skip latency can settle above this value (see the `governor_engaged` field doc).
 const GOVERNOR_DISENGAGE_MS: f64 = 450.0;
-/// Consecutive ticks the latency total must stay at/above `GOVERNOR_ENGAGE_MS` before the
-/// governor skips. At the ~10ms worker tick this is ~400ms of sustained high latency, long
-/// enough that transient jitter/reordering spikes cannot trip a skip but short enough to react
-/// well within the engage band.
+/// Windowed sustain target for the governor's leaky-bucket counter (`governor_sustain_ticks`): the
+/// governor skips once the counter reaches this many net ticks of high latency. The counter
+/// INCREMENTS on each ~10ms tick whose latency total is at/above `GOVERNOR_ENGAGE_MS` (saturating at
+/// this cap) and DECREMENTS (floored at 0) on each tick below it — a decaying window, NOT a
+/// strictly-consecutive counter (per the repo hysteresis rule, issue #1791). A brief jitter clump
+/// therefore builds a little count and then decays away instead of arming a skip, while a genuine
+/// standing backlog with occasional sub-threshold dips still accumulates to the cap. At the ~10ms
+/// worker tick, 40 ticks is ~400ms of net-sustained high latency.
+///
+/// Kept at 40 (NOT shortened) despite the tighter 800ms engage: lowering the engage threshold
+/// narrows the gap between engage and the legitimate-jitter envelope, so the sustain window becomes
+/// MORE important as the transient-jitter false-positive guard, not less. Shortening it would let a
+/// ~400ms mobile-jitter burst trip a resync. The decaying window (vs the old strictly-consecutive
+/// reset) is the robustness improvement here: it tolerates brief dips within a real backlog without
+/// resetting to zero, so a mostly-standing backlog is not repeatedly disarmed by jitter.
 const GOVERNOR_SUSTAIN_TICKS: u32 = 40;
 /// Minimum wall-clock interval (ms) between governor skips. ~one keyframe RTT: after a skip the
 /// buffer must be allowed to refill and the latency to recompute before another skip is even
@@ -416,7 +472,7 @@ const GOVERNOR_SUSTAIN_TICKS: u32 = 40;
 const GOVERNOR_COOLDOWN_MS: f64 = 2500.0;
 
 /// Compile-time guard on the load-bearing governor/deadline threshold ordering:
-/// `GOVERNOR_DISENGAGE_MS (450) < MAX_PLAYOUT_DELAY_MS (500) < GOVERNOR_ENGAGE_MS (1300) <
+/// `GOVERNOR_DISENGAGE_MS (450) < MAX_PLAYOUT_DELAY_MS (500) < GOVERNOR_ENGAGE_MS (800) <
 /// MAX_PLAYOUT_AGE_MS (1800)`. This ordering is what makes the governor coexist with the
 /// freshness deadline rather than fight it: disengage sits inside the normal adaptive-delay
 /// envelope (so an engaged episode is marked recovered there), engage sits above that envelope but below the
@@ -619,11 +675,14 @@ pub struct JitterBuffer<T> {
     /// closed. The next emitted diagnostic includes this pending dropped count.
     pending_freshness_skip: Option<FreshnessSkip>,
 
-    /// Resync-governor (issue #1252): count of consecutive ~10ms ticks on which the buffered
-    /// playout-latency total was at/above `GOVERNOR_ENGAGE_MS`. Resets to 0 whenever the total
-    /// drops below the engage threshold and after a successful governor skip. The governor only
-    /// skips once this reaches `GOVERNOR_SUSTAIN_TICKS`, so a transient jitter spike cannot trip
-    /// a resync. Runtime state — reset on `flush()`.
+    /// Resync-governor (issues #1252, #1791): leaky-bucket window count of ~10ms ticks whose buffered
+    /// playout-latency total was at/above `GOVERNOR_ENGAGE_MS`. INCREMENTS (saturating at
+    /// `GOVERNOR_SUSTAIN_TICKS`) on each qualifying tick and DECREMENTS (floored at 0) on each tick
+    /// below the engage threshold — a decaying window rather than a strictly-consecutive counter, so
+    /// a transient jitter clump decays away instead of arming a skip while a genuine standing backlog
+    /// with brief dips still accumulates. Also reset to 0 after a successful governor skip. The
+    /// governor only skips once this reaches `GOVERNOR_SUSTAIN_TICKS`. Runtime state — reset on
+    /// `flush()`.
     governor_sustain_ticks: u32,
 
     /// Resync-governor (issue #1252): engaged-EPISODE flag, `true` from the tick a governor skip
@@ -885,12 +944,14 @@ impl<T> JitterBuffer<T> {
             // Release-side backpressure (issue #1024). The freshness deadline above has already had
             // its chance to evict a stale backlog this tick; only AFTER that do we throttle the
             // release of fresh frames. If the WebCodecs decoder's own (unpaced) queue is at/above
-            // the high-water mark, stop releasing this tick so it drains at display rate instead of
-            // being shoveled full and painting back-to-back. The held frames stay buffered and are
-            // re-evaluated on the next ~10ms tick; if the backup persists until the head ages past
-            // MAX_PLAYOUT_AGE_MS the freshness deadline (which runs first) skips to live, so this
-            // can never accumulate unbounded lag. Decoders with no observable queue (native/mock)
-            // report depth 0 and are never throttled.
+            // the high-water mark, stop releasing this tick so the in-flight decode-queue depth
+            // (decoder-side memory / second-stage backlog) stays bounded instead of being shoveled
+            // full. This caps DEPTH, not paint cadence: burst frames that do get decoded are
+            // collapsed to the newest at presentation by `playout::LatestFrameMailbox` (#1783), not
+            // here. The held frames stay buffered and are re-evaluated on the next ~10ms tick; if
+            // the backup persists until the head ages past MAX_PLAYOUT_AGE_MS the freshness deadline
+            // (which runs first) skips to live, so this can never accumulate unbounded lag. Decoders
+            // with no observable queue (native/mock) report depth 0 and are never throttled.
             if self.decoder.decode_queue_depth() >= DECODE_QUEUE_HIGH_WATER_MARK {
                 // The gate would normally `break` and hold this tick.
                 if next_decodable_key.is_none() {
@@ -1412,19 +1473,23 @@ impl<T> JitterBuffer<T> {
         }
     }
 
-    /// v1 resync-to-live governor (issue #1252). Evaluated once per 10ms tick. When the buffered
-    /// playout-latency total stays `>= GOVERNOR_ENGAGE_MS` for `GOVERNOR_SUSTAIN_TICKS` consecutive
-    /// ticks AND we are past `GOVERNOR_COOLDOWN_MS` since the last governor skip, skip to the newest
-    /// buffered keyframe (reusing the same helper the freshness deadline uses, so they cannot
-    /// diverge). If there is NO buffered keyframe, the governor does NOTHING — no eviction, NO PLI,
-    /// no keyframe request. That case is left entirely to the existing 1800ms freshness deadline.
-    /// This is the #1287/#1297/#814 storm-avoidance invariant: v1 introduces ZERO new
-    /// keyframe-request sources. Thrash-prevention/hysteresis comes from TWO guards that DO gate
-    /// the skip: (1) `governor_sustain_ticks` resets to 0 after every skip, so the latency must
-    /// re-accumulate `>= GOVERNOR_ENGAGE_MS` for `GOVERNOR_SUSTAIN_TICKS` again; (2)
-    /// `GOVERNOR_COOLDOWN_MS` since the last skip. The `governor_engaged` flag / `GOVERNOR_DISENGAGE_MS`
-    /// only track the engaged episode for observability + lifecycle — they are NOT read by the skip
-    /// decision (see the `governor_engaged` field doc for why a latch-gate would deadlock).
+    /// v2 resync-to-live governor (issues #1252, #1791). Evaluated once per 10ms tick. When the
+    /// buffered playout-latency total holds `>= GOVERNOR_ENGAGE_MS` (800ms) for a net
+    /// `GOVERNOR_SUSTAIN_TICKS` on the leaky-bucket sustain window (increment above engage, decrement
+    /// below — NOT strictly-consecutive; see `GOVERNOR_SUSTAIN_TICKS`) AND we are past
+    /// `GOVERNOR_COOLDOWN_MS` since the last governor skip, skip to the newest buffered keyframe
+    /// (reusing the same helper the freshness deadline uses, so they cannot diverge). If there is NO
+    /// buffered keyframe, the governor does NOTHING — no eviction, NO PLI, no keyframe request. That
+    /// case is left entirely to the existing 1800ms freshness deadline. This no-PLI-at-engage rule is
+    /// deliberate and load-bearing: it is the #1287/#1297/#814/#1479 storm-avoidance invariant —
+    /// firing a keyframe request on every engage would recreate the #1479 meeting-wide keyframe
+    /// storm, worst on high-RTT mobile. v2 introduces ZERO new keyframe-request sources.
+    /// Thrash-prevention/hysteresis comes from TWO guards that DO gate the skip: (1)
+    /// `governor_sustain_ticks` resets to 0 after every skip, so the latency must re-accumulate to
+    /// `GOVERNOR_SUSTAIN_TICKS` on the window again; (2) `GOVERNOR_COOLDOWN_MS` since the last skip.
+    /// The `governor_engaged` flag / `GOVERNOR_DISENGAGE_MS` only track the engaged episode for
+    /// observability + lifecycle — they are NOT read by the skip decision (see the `governor_engaged`
+    /// field doc for why a latch-gate would deadlock).
     fn run_resync_governor(&mut self, current_time_ms: u128) {
         let total = self.playout_latency_parts_ms(current_time_ms).0;
 
@@ -1433,11 +1498,20 @@ impl<T> JitterBuffer<T> {
             self.governor_engaged = false;
         }
 
-        // Sustain counter.
+        // Leaky-bucket sustain window (issue #1791): increment (capped at GOVERNOR_SUSTAIN_TICKS)
+        // while the total is at/above engage, decay by one (floored at 0) while it is below. A
+        // decaying window rather than a strictly-consecutive counter (repo hysteresis rule): a
+        // transient jitter clump builds a little count and then decays away without arming a skip,
+        // while a genuine standing backlog with brief sub-threshold dips still accumulates to the
+        // cap. The cap keeps the window bounded so a long backlog cannot bank unbounded credit that
+        // would keep the skip armed long after the backlog clears.
         if total >= GOVERNOR_ENGAGE_MS {
-            self.governor_sustain_ticks = self.governor_sustain_ticks.saturating_add(1);
+            self.governor_sustain_ticks = self
+                .governor_sustain_ticks
+                .saturating_add(1)
+                .min(GOVERNOR_SUSTAIN_TICKS);
         } else {
-            self.governor_sustain_ticks = 0;
+            self.governor_sustain_ticks = self.governor_sustain_ticks.saturating_sub(1);
         }
 
         if self.governor_sustain_ticks < GOVERNOR_SUSTAIN_TICKS {
@@ -1451,7 +1525,8 @@ impl<T> JitterBuffer<T> {
             }
         }
 
-        // Engage: skip to the newest buffered keyframe ONLY. No keyframe -> do nothing (no PLI).
+        // Engage: skip to the newest buffered keyframe ONLY. No keyframe -> do nothing, and in
+        // particular NO PLI/keyframe request at engage (#1479 meeting-wide keyframe-storm guard).
         // On a no-keyframe engage condition we intentionally do NOT reset the sustain counter or
         // set `last_skip`, so the governor keeps trying each tick until either a keyframe appears
         // or the 1800ms deadline fires — the deadline owns the keyframe-less case.
@@ -3693,17 +3768,18 @@ mod tests {
         );
     }
 
-    /// Build the canonical governor backlog directly: mid-stream (last decoded = 1) behind a gap
-    /// (seq 2 is missing), a few stale deltas, and a NEWEST keyframe positioned so the buffered
-    /// arrival span equals 1300ms (>= `GOVERNOR_ENGAGE_MS`) while the head age stays below the
-    /// 1800ms freshness deadline across the poll window. The playout target is pinned absurdly high
-    /// so the normal release gate never drains the backlog mid-test — only the governor (or, if we
-    /// crossed it, the deadline) can change the buffer. `head_arrival` anchors the head; the newest
-    /// keyframe arrives 1300ms later. Returns the keyframe sequence number.
-    fn build_governor_backlog(
+    /// Build a governor backlog with an EXPLICIT buffered arrival span (ms) between the head-of-line
+    /// delta and the newest keyframe, so a test can place the standing backlog anywhere in the
+    /// governor's engage band. Mid-stream (last decoded = 1) behind a gap (seq 2 missing), two
+    /// leading deltas at +100/+200 (kept below any span this is used with), and the NEWEST keyframe
+    /// at `head_arrival + span_ms`. The playout target is pinned absurdly high so the release gate
+    /// never drains the backlog mid-test — only the governor (or, if crossed, the deadline) can
+    /// change the buffer. Returns the keyframe sequence number.
+    fn build_governor_backlog_with_span(
         jb: &mut JitterBuffer<crate::decoder::DecodedFrame>,
         head_arrival: u128,
         first_seq: u64,
+        span_ms: u128,
     ) -> u64 {
         jb.buffered_frames.clear();
         jb.last_decoded_sequence_number = Some(1);
@@ -3713,9 +3789,21 @@ mod tests {
         buffer_frame_at(jb, first_seq, FrameType::DeltaFrame, head_arrival);
         buffer_frame_at(jb, first_seq + 1, FrameType::DeltaFrame, head_arrival + 100);
         buffer_frame_at(jb, first_seq + 2, FrameType::DeltaFrame, head_arrival + 200);
-        // Newest keyframe at head_arrival + 1300 → buffered arrival span == 1300ms.
-        buffer_frame_at(jb, key_seq, FrameType::KeyFrame, head_arrival + 1300);
+        buffer_frame_at(jb, key_seq, FrameType::KeyFrame, head_arrival + span_ms);
         key_seq
+    }
+
+    /// Build the canonical governor backlog directly: mid-stream (last decoded = 1) behind a gap
+    /// (seq 2 is missing), a few stale deltas, and a NEWEST keyframe positioned so the buffered
+    /// arrival span equals 1300ms (comfortably above `GOVERNOR_ENGAGE_MS`) while the head age stays
+    /// below the 1800ms freshness deadline across the poll window. `head_arrival` anchors the head;
+    /// the newest keyframe arrives 1300ms later. Returns the keyframe sequence number.
+    fn build_governor_backlog(
+        jb: &mut JitterBuffer<crate::decoder::DecodedFrame>,
+        head_arrival: u128,
+        first_seq: u64,
+    ) -> u64 {
+        build_governor_backlog_with_span(jb, head_arrival, first_seq, 1300)
     }
 
     /// (a) The governor must engage after the latency total has stayed at/above
@@ -4064,6 +4152,260 @@ mod tests {
         assert!(
             jb.governor_last_skip_ms.is_none(),
             "flush must clear the last-skip anchor"
+        );
+    }
+
+    /// (g) #1791: a standing backlog in the (new-engage, old-1300) band WITH a buffered keyframe must
+    /// engage the tightened governor and skip to the newest buffered keyframe. The buffered span is
+    /// 1000ms — at/above the new 800ms `GOVERNOR_ENGAGE_MS` but BELOW the old 1300ms constant, so this
+    /// test FAILS on the un-tightened code: at engage=1300 the total (1000) never reaches the engage
+    /// threshold, the sustain window never fills, and no skip fires. Reverting `GOVERNOR_ENGAGE_MS` to
+    /// 1300 breaks this test — the fails-on-unfixed proof.
+    #[test]
+    fn governor_engages_on_sub_1300_backlog_with_buffered_keyframe() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+        let head_arrival = 100u128;
+        // Span 1000ms: >= GOVERNOR_ENGAGE_MS (800) but < the old 1300ms constant.
+        let key_seq = build_governor_backlog_with_span(&mut jb, head_arrival, 5, 1000);
+
+        assert_eq!(jb.governor_skip_count(), 0, "no skips before the window");
+
+        // Poll the head-age band [1050, 1440): buffered span holds at 1000ms (>= engage) and head age
+        // stays below the 1800ms freshness deadline, so ONLY the governor can act.
+        let mut now = head_arrival + 1050; // 1150; keyframe arrived at 1100 <= now
+        for _ in 0..GOVERNOR_SUSTAIN_TICKS {
+            // Constant-INDEPENDENT setup invariant: the harness produces a ~1000ms backlog regardless
+            // of GOVERNOR_ENGAGE_MS, so reverting the constant to 1300 leaves this passing and makes
+            // the behavioral skip-count assert below (not this line) the thing that fails.
+            let total = jb.playout_latency_parts_ms(now).0;
+            assert!(
+                (900.0..1100.0).contains(&total),
+                "setup invariant: the harness must produce a ~1000ms sub-1300 backlog (now={now}, total={total})"
+            );
+            jb.find_and_move_continuous_frames(now);
+            now += 10;
+        }
+
+        // Fails-on-unfixed proof: at engage=1300 the ~1000ms total never reaches the engage
+        // threshold, the leaky bucket never fills, and no skip fires -> this assert would read 0.
+        assert_eq!(
+            jb.governor_skip_count(),
+            1,
+            "governor must skip once for a sub-1300 backlog with a buffered keyframe (fails at engage=1300)"
+        );
+        assert!(
+            !jb.buffered_frames.contains_key(&5)
+                && !jb.buffered_frames.contains_key(&6)
+                && !jb.buffered_frames.contains_key(&7),
+            "stale deltas before the newest keyframe must be dropped"
+        );
+        assert!(
+            jb.buffered_frames.contains_key(&key_seq),
+            "the newest keyframe must be preserved as the resync target"
+        );
+        assert_eq!(
+            jb.get_dropped_frames_count(),
+            3,
+            "exactly the three deltas before the keyframe were dropped"
+        );
+        assert_eq!(
+            jb.buffered_span_ms(now),
+            0.0,
+            "playout latency span must collapse after the resync skip"
+        );
+    }
+
+    /// (h) #1791 no-PLI invariant in the tightened band: a keyframe-LESS standing backlog in the
+    /// (new-engage, 1300) band must NOT skip and must NOT fire a keyframe request (PLI) at engage.
+    /// Lowering the engage threshold must not open a new keyframe-request source — the keyframe-less
+    /// case still belongs entirely to the 1800ms freshness deadline (kept below its threshold here so
+    /// it cannot fire and be mistaken for governor action).
+    ///
+    /// Mutation coverage: adding a PLI at governor engage fails the request-count assert; evicting the
+    /// keyframe-less backlog fails the deltas-retained assert.
+    #[test]
+    fn governor_fires_no_pli_on_sub_1300_keyframeless_backlog() {
+        let requests = Arc::new(AtomicU32::new(0));
+        let decoded = Arc::new(Mutex::new(Vec::new()));
+        let req = requests.clone();
+        let mut jb = JitterBuffer::with_keyframe_request(
+            Box::new(MockDecoder::new_with_vec(decoded.clone())),
+            Box::new(move |_head_age_ms| {
+                req.fetch_add(1, Ordering::SeqCst);
+            }),
+        );
+
+        // Mid-stream behind a gap, ONLY deltas buffered (no keyframe). Span 1000ms: qualifies for the
+        // tightened governor (>= 800) but below the old 1300 constant, while head age stays below the
+        // 1800ms deadline so the deadline does not fire either.
+        jb.last_decoded_sequence_number = Some(1);
+        jb.target_playout_delay_ms = 100_000.0;
+        buffer_frame_at(&mut jb, 5, FrameType::DeltaFrame, 100);
+        buffer_frame_at(&mut jb, 6, FrameType::DeltaFrame, 200);
+        buffer_frame_at(&mut jb, 7, FrameType::DeltaFrame, 1100); // span 1000, no keyframe
+
+        let mut now = 1150u128;
+        for _ in 0..(GOVERNOR_SUSTAIN_TICKS + 4) {
+            let total = jb.playout_latency_parts_ms(now).0;
+            assert!(
+                (GOVERNOR_ENGAGE_MS..1300.0).contains(&total),
+                "setup invariant: total must qualify in the sub-1300 band (now={now}, total={total})"
+            );
+            assert!(
+                ((now - 100) as f64) < MAX_PLAYOUT_AGE_MS,
+                "setup invariant: head age must stay below the freshness deadline (now={now})"
+            );
+            jb.find_and_move_continuous_frames(now);
+            now += 10;
+        }
+
+        assert_eq!(
+            jb.governor_skip_count(),
+            0,
+            "governor must take no action with no buffered keyframe, even in the tightened band"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            0,
+            "governor must NEVER fire a keyframe request at engage (the #1479 storm guard)"
+        );
+        assert!(
+            jb.buffered_frames.contains_key(&5)
+                && jb.buffered_frames.contains_key(&6)
+                && jb.buffered_frames.contains_key(&7),
+            "governor must not evict the keyframe-less backlog (that case belongs to the deadline)"
+        );
+        assert_eq!(
+            jb.get_dropped_frames_count(),
+            0,
+            "nothing may be dropped: neither the governor nor the (sub-threshold) deadline acted"
+        );
+    }
+
+    /// (i) #1791 leaky-bucket sustain window: a transient clump of high-latency ticks SHORTER than the
+    /// sustain window must NOT engage, and once the latency falls back below engage the window must
+    /// DECAY (not stay latched, not merely reset). Guards the mobile-jitter false positive and pins
+    /// the decaying-window mechanism.
+    ///
+    /// Mutation coverage: skipping without the sustain gate fails the phase-A skip-count assert; a
+    /// strictly-consecutive reset-to-0 (the old behavior) leaves the counter at 0 after phase B and
+    /// fails the final assert; a latched counter that never decays leaves it at the full clump size
+    /// and also fails that assert.
+    #[test]
+    fn governor_transient_clump_decays_and_does_not_engage() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+
+        // Phase A: a 15-tick clump above engage (span 1000ms). 15 < GOVERNOR_SUSTAIN_TICKS (40), so
+        // the governor must NOT skip; the leaky bucket climbs to exactly 15.
+        let clump_ticks = 15u32;
+        build_governor_backlog_with_span(&mut jb, 100, 5, 1000);
+        let mut now = 1150u128;
+        for _ in 0..clump_ticks {
+            assert!(
+                jb.playout_latency_parts_ms(now).0 >= GOVERNOR_ENGAGE_MS,
+                "phase-A setup: total must be at/above engage (now={now})"
+            );
+            jb.find_and_move_continuous_frames(now);
+            now += 10;
+        }
+        assert_eq!(
+            jb.governor_skip_count(),
+            0,
+            "a sub-window clump must not engage"
+        );
+        assert_eq!(
+            jb.governor_sustain_ticks, clump_ticks,
+            "the leaky bucket must climb one per above-engage tick"
+        );
+
+        // Phase B: the backlog drains back below engage (fresh span-300ms backlog, total 300 < 800).
+        // The window must DECAY one per below-engage tick.
+        let decay_ticks = 5u32;
+        build_governor_backlog_with_span(&mut jb, 2000, 50, 300);
+        let mut now2 = 2350u128;
+        for _ in 0..decay_ticks {
+            assert!(
+                jb.playout_latency_parts_ms(now2).0 < GOVERNOR_ENGAGE_MS,
+                "phase-B setup: total must be below engage (now2={now2})"
+            );
+            jb.find_and_move_continuous_frames(now2);
+            now2 += 10;
+        }
+        assert_eq!(
+            jb.governor_skip_count(),
+            0,
+            "a decaying clump must never engage"
+        );
+        assert_eq!(
+            jb.governor_sustain_ticks,
+            clump_ticks - decay_ticks,
+            "the window must decay one per below-engage tick (15 up, 5 down => 10), not reset to 0 and not latch at 15"
+        );
+    }
+
+    /// (j) #1791 no-wedge lifecycle: engage → skip → healthy playback disengages → the governor can
+    /// engage AGAIN for a fresh backlog (it is not permanently locked out). Walks the full cycle at
+    /// the tightened 800ms threshold.
+    ///
+    /// Mutation coverage: removing the `total < GOVERNOR_DISENGAGE_MS` disengage clause leaves the
+    /// latch stuck true and fails the disengage assert; any change that wedges the governor after a
+    /// skip (counter/cooldown never re-arming) prevents the second skip and fails the `== 2` assert.
+    #[test]
+    fn governor_disengages_after_skip_and_can_reengage_no_wedge() {
+        let (mut jb, _decoded) = create_test_jitter_buffer();
+
+        // Phase 1: engage skip #1 on a sub-1300 backlog (span 1000ms) with a buffered keyframe.
+        build_governor_backlog_with_span(&mut jb, 100, 5, 1000);
+        let mut now = 1150u128;
+        for _ in 0..GOVERNOR_SUSTAIN_TICKS {
+            jb.find_and_move_continuous_frames(now);
+            now += 10;
+        }
+        assert_eq!(jb.governor_skip_count(), 1, "phase 1 must engage skip #1");
+        assert!(jb.governor_engaged, "latch set after engaging");
+        let first_skip_at = jb.governor_last_skip_ms.expect("skip #1 records its time");
+
+        // Phase 2: healthy playback — a small fresh backlog (span 300ms, total 300 < DISENGAGE 450).
+        // The latch must clear and, crucially, the governor must NOT keep skipping while healthy.
+        build_governor_backlog_with_span(&mut jb, 2000, 50, 300);
+        let mut now2 = 2350u128;
+        for _ in 0..20 {
+            assert!(
+                jb.playout_latency_parts_ms(now2).0 < GOVERNOR_DISENGAGE_MS,
+                "phase-2 setup: total must be below the disengage threshold (now2={now2})"
+            );
+            jb.find_and_move_continuous_frames(now2);
+            now2 += 10;
+        }
+        assert!(
+            !jb.governor_engaged,
+            "healthy playback must disengage the latch (total < GOVERNOR_DISENGAGE_MS)"
+        );
+        assert_eq!(
+            jb.governor_skip_count(),
+            1,
+            "the governor must not thrash-skip while playback is healthy"
+        );
+
+        // Phase 3: a fresh sub-1300 backlog forms PAST the cooldown — the governor must engage again
+        // (skip #2), proving it did not wedge.
+        build_governor_backlog_with_span(&mut jb, 5000, 80, 1000);
+        let mut now3 = 6050u128; // head age 1050 < 1800; now3 - first_skip_at >= cooldown
+        assert!(
+            ((now3 - first_skip_at) as f64) >= GOVERNOR_COOLDOWN_MS,
+            "phase-3 polls must start past the cooldown (now3={now3}, first_skip_at={first_skip_at})"
+        );
+        for _ in 0..GOVERNOR_SUSTAIN_TICKS {
+            jb.find_and_move_continuous_frames(now3);
+            now3 += 10;
+            if jb.governor_skip_count() == 2 {
+                break;
+            }
+        }
+        assert_eq!(
+            jb.governor_skip_count(),
+            2,
+            "a fresh qualifying backlog past the cooldown must re-engage (no wedge)"
         );
     }
 

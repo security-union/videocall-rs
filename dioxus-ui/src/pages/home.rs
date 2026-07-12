@@ -176,7 +176,10 @@ pub fn Home() -> Element {
 
     // Issue #1480: build date shows on ALL builds (not github info). Omit the
     // "· built …" suffix entirely when the timestamp is the build.rs sentinel.
-    let about_built_suffix = crate::constants::build_date(env!("BUILD_TIMESTAMP"))
+    // Issue #1789: the date is the build instant's LOCAL calendar date (viewer's
+    // timezone), so a near-midnight-UTC build shows the day matching the reader's
+    // own calendar. Date-only, so no zone hint is needed.
+    let about_built_suffix = crate::constants::build_date_local(env!("BUILD_TIMESTAMP"))
         .map(|d| format!(" · built {d}"))
         .unwrap_or_default();
 

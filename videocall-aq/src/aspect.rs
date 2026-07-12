@@ -350,14 +350,14 @@ mod tests {
 
     // ── simulcast_layer_target_dims (issue #1196) ───────────────────────────
 
-    /// The camera simulcast ladder (n == 3) is `[low 640x360, standard
-    /// 960x540, hd 1280x720]`. A 4:3 source LARGER than every rung must
-    /// downscale uniformly into each box and KEEP 4:3 — never the raw 16:9
-    /// tier dims. This is the per-rung ladder the issue calls out.
+    /// The camera simulcast ladder (n == 3) is `[low 320x180, standard
+    /// 640x360, hd 1280x720]` (issue #1768). A 4:3 source LARGER than every
+    /// rung must downscale uniformly into each box and KEEP 4:3 — never the raw
+    /// 16:9 tier dims. This is the per-rung ladder the issue calls out.
     ///
     /// Mutation guard (adversarial-review check #2): if the encode path
     /// reverted to the buggy behavior of configuring each layer at the raw
-    /// `(tier_w, tier_h)`, layer 0 would be 640x360 (16:9), layer 1 960x540,
+    /// `(tier_w, tier_h)`, layer 0 would be 320x180 (16:9), layer 1 640x360,
     /// layer 2 1280x720 — all 16:9, all DIFFERENT from the values asserted
     /// here, so this test would fail. That is exactly the regression we lock.
     #[test]
@@ -366,8 +366,8 @@ mod tests {
         let src = (1280u32, 960u32);
         // (tier box, expected fitted dims) — all 4:3, never the 16:9 tier dims.
         let cases = [
-            ((640u32, 360u32), (480u32, 360u32)),
-            ((960, 540), (720, 540)),
+            ((320u32, 180u32), (240u32, 180u32)),
+            ((640, 360), (480, 360)),
             ((1280, 720), (960, 720)),
         ];
         for ((tier_w, tier_h), (exp_w, exp_h)) in cases {
@@ -401,13 +401,14 @@ mod tests {
     /// regression is caught.
     #[test]
     fn camera_small_four_three_source_does_not_upscale() {
-        let src = (640u32, 480u32); // 4:3, smaller than standard/hd rungs
-                                    // low 640x360 binds on height -> 480x360.
-        let low = simulcast_layer_target_dims(src.0, src.1, 640, 360, 640, 360);
-        assert_eq!((low.target_w, low.target_h), (480, 360));
-        // standard 960x540 and hd 1280x720 do NOT bind -> source unchanged.
-        let std_ = simulcast_layer_target_dims(src.0, src.1, 960, 540, 960, 540);
-        assert_eq!((std_.target_w, std_.target_h), (640, 480));
+        let src = (640u32, 480u32); // 4:3, smaller than standard/hd rungs (#1768)
+                                    // low 320x180 binds on both axes -> 240x180.
+        let low = simulcast_layer_target_dims(src.0, src.1, 320, 180, 320, 180);
+        assert_eq!((low.target_w, low.target_h), (240, 180));
+        // standard 640x360 binds on height -> 480x360.
+        let std_ = simulcast_layer_target_dims(src.0, src.1, 640, 360, 640, 360);
+        assert_eq!((std_.target_w, std_.target_h), (480, 360));
+        // hd 1280x720 does NOT bind -> source unchanged.
         let hd = simulcast_layer_target_dims(src.0, src.1, 1280, 720, 1280, 720);
         assert_eq!((hd.target_w, hd.target_h), (640, 480));
     }

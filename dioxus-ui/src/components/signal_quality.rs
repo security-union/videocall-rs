@@ -728,6 +728,13 @@ pub struct SignalInfo {
     /// nothing for `None`, so the "flag OFF → nothing / Unknown → nothing"
     /// contract lives in one place.
     pub badge_transport: Option<crate::components::canvas_generator::TransportBadge>,
+    /// Issue 1768: pre-resolved per-tile media-metrics overlay payload, or
+    /// `None` when the "Show media metrics on tiles" checkbox is off (the common
+    /// default) so the render path adds nothing to the DOM. Built once per
+    /// diagnostics tick in `peer_tile`; rendered by
+    /// [`crate::components::media_metrics_overlay::media_metrics_overlay`] inside
+    /// the tile's `.canvas-container`.
+    pub metrics_overlay: Option<crate::components::media_metrics_overlay::MediaMetricsOverlay>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1570,14 +1577,14 @@ fn show_body_tooltip(
     let video_line = if show_video {
         if sample.video_resolution.is_empty() {
             format!(
-                "<span style='color:{}'>Video: {:.1} fps | {:.0} kbps</span>",
+                "<span style='color:{}'>Video: {:.1} fps arriving | {:.0} kbps</span>",
                 theme_color::SIGNAL_VIDEO,
                 sample.video_fps,
                 sample.video_bitrate_kbps
             )
         } else if video_tier.is_empty() {
             format!(
-                "<span style='color:{}'>Video: {} | {:.1} fps | {:.0} kbps</span>",
+                "<span style='color:{}'>Video: {} | {:.1} fps arriving | {:.0} kbps</span>",
                 theme_color::SIGNAL_VIDEO,
                 sample.video_resolution,
                 sample.video_fps,
@@ -1585,7 +1592,7 @@ fn show_body_tooltip(
             )
         } else {
             format!(
-                "<span style='color:{}'>Video: {} ({}) | {:.1} fps | {:.0} kbps</span>",
+                "<span style='color:{}'>Video: {} ({}) | {:.1} fps arriving | {:.0} kbps</span>",
                 theme_color::SIGNAL_VIDEO,
                 sample.video_resolution,
                 video_tier,
@@ -2016,7 +2023,7 @@ fn layer_kind_noun(kind: PrefMediaKind) -> &'static str {
 /// One row in the popup's "Layers" section, rendered IDENTICALLY to the
 /// Performance dialog's per-peer `PeerRow`: the quality dot
 /// (`perf-q-dot--{state}` + non-color glyph), the metric text from
-/// [`peer_row_metric`] ("540p · ~600k · M · 2/3", 1-based), and — only when the
+/// [`peer_row_metric`] ("360p · ~350k · M · 2/3", 1-based), and — only when the
 /// reception is below the full-ladder top — a tinted reason chip
 /// (`perf-reason-chip--{reason}`). The whole row carries the same
 /// full-sentence `aria-label` ([`peer_row_aria_label`]) so color is never the
@@ -2037,7 +2044,7 @@ fn SignalLayerRow(
     let q = quality_state(snap.layer_index, full_ladder_len);
     let q_mod = quality_state_modifier(q);
     let q_glyph = quality_state_glyph(q);
-    // Audio rung label for the metric ("low (24k)" / "mid (32k)" / "high (50k)")
+    // Audio rung label for the metric ("low (12k)" / "mid (24k)" / "high (48k)")
     // — the receive submodule owns this mapping, same as the perf dialog.
     let audio_label = crate::components::performance_settings::receive::index_label(
         PrefMediaKind::Audio,

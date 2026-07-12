@@ -18,6 +18,9 @@
 
 use crate::components::attendants::PreAcquiredScreenStream;
 use crate::components::device_settings_modal::DeviceSettingsModal;
+use crate::components::media_metrics_overlay::{
+    media_metrics_overlay, MediaMetricsOverlay, MediaMetricsOverlayCtx,
+};
 use crate::components::performance_settings::{
     load_performance_preference, load_receive_preference, preference_to_encoder_bounds,
     save_performance_preference, save_receive_preference, DiagnosticsReader, KindReceivePref,
@@ -79,6 +82,14 @@ pub fn Host(
     on_device_settings_toggle: EventHandler<()>,
     #[props(default)] on_microphone_error: EventHandler<String>,
     #[props(default)] on_camera_error: EventHandler<String>,
+    /// Classified permission failures from the live encoders' real `getUserMedia`
+    /// rejection (e.g. `DeviceInUse`). Distinct from `on_*_error` (generic
+    /// strings) so the parent can show a specific reason and drive auto-retry.
+    #[props(default)]
+    on_microphone_permission_error: EventHandler<videocall_client::MediaPermissionsErrorState>,
+    #[props(default)] on_camera_permission_error: EventHandler<
+        videocall_client::MediaPermissionsErrorState,
+    >,
     #[props(default)] device_settings_initial_section: Option<String>,
     #[props(default)] device_settings_generation: u32,
     on_screen_share_state: EventHandler<ScreenShareEvent>,
@@ -113,6 +124,12 @@ pub fn Host(
         use_hook(|| Rc::new(RefCell::new(None)));
     let mic_error_handler: Rc<RefCell<Option<EventHandler<String>>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
+    let camera_permission_error_handler: Rc<
+        RefCell<Option<EventHandler<videocall_client::MediaPermissionsErrorState>>>,
+    > = use_hook(|| Rc::new(RefCell::new(None)));
+    let mic_permission_error_handler: Rc<
+        RefCell<Option<EventHandler<videocall_client::MediaPermissionsErrorState>>>,
+    > = use_hook(|| Rc::new(RefCell::new(None)));
     let screen_state_handler: Rc<RefCell<Option<EventHandler<ScreenShareEvent>>>> =
         use_hook(|| Rc::new(RefCell::new(None)));
 
@@ -184,6 +201,14 @@ pub fn Host(
             camera_error_cb,
             effective_max_layers,
         );
+        let cam_perm_error_cell = camera_permission_error_handler.clone();
+        let camera_permission_error_cb =
+            VcCallback::from(move |err: videocall_client::MediaPermissionsErrorState| {
+                if let Some(handler) = cam_perm_error_cell.borrow().as_ref() {
+                    handler.call(err);
+                }
+            });
+        camera.set_permission_error_callback(camera_permission_error_cb);
 
         let mic_settings_cell = mic_settings_handler.clone();
         let mic_settings_cb = VcCallback::from(move |settings: String| {
@@ -218,6 +243,14 @@ pub fn Host(
             // pre-simulcast mic path).
             audio_effective_max_layers,
         );
+        let mic_perm_error_cell = mic_permission_error_handler.clone();
+        let mic_permission_error_cb =
+            VcCallback::from(move |err: videocall_client::MediaPermissionsErrorState| {
+                if let Some(handler) = mic_perm_error_cell.borrow().as_ref() {
+                    handler.call(err);
+                }
+            });
+        microphone.set_permission_error_callback(mic_permission_error_cb);
 
         let screen_settings_cell = screen_settings_handler.clone();
         let screen_settings_cb = VcCallback::from(move |settings: String| {
@@ -433,6 +466,8 @@ pub fn Host(
     *screen_settings_handler.borrow_mut() = Some(on_encoder_settings_update);
     *camera_error_handler.borrow_mut() = Some(on_camera_error);
     *mic_error_handler.borrow_mut() = Some(on_microphone_error);
+    *camera_permission_error_handler.borrow_mut() = Some(on_camera_permission_error);
+    *mic_permission_error_handler.borrow_mut() = Some(on_microphone_permission_error);
     *screen_state_handler.borrow_mut() = Some(on_screen_share_state);
 
     // Initialize devices once
@@ -1152,6 +1187,33 @@ pub fn Host(
     let selected_speaker_id = s.media_devices.audio_outputs.selected();
     drop(s);
 
+    // Issue 1768: SELF-tile media-metrics overlay (the local SENDING metrics).
+    // The local self-view is this component's `.self-camera`, NOT a grid PeerTile
+    // (the grid filters out the local session — attendants.rs), so the sending
+    // overlay is rendered HERE, sourced from the live send snapshot
+    // (`LiveQualitySnapshot`: send resolution / target fps / audio send kbps).
+    // Built only when the diagnostics "Show media metrics on tiles" checkbox is
+    // on; `None` while the camera is off (the snapshot is camera-gated), so it
+    // shows only while publishing video. It refreshes at Host's natural
+    // re-render cadence rather than on a forced timer — send metrics are
+    // near-constant and a per-frame/1 Hz timer would tax low-power devices.
+    let self_metrics_overlay: Option<MediaMetricsOverlay> = {
+        let enabled = try_use_context::<MediaMetricsOverlayCtx>()
+            .map(|c| (c.0)())
+            .unwrap_or(false);
+        if enabled {
+            (read_quality_snapshot.0)().map(|snap| MediaMetricsOverlay {
+                is_self: true,
+                resolution: (snap.video_width > 0 && snap.video_height > 0)
+                    .then_some((snap.video_width, snap.video_height)),
+                fps: (snap.video_fps > 0).then_some(snap.video_fps as f64),
+                audio_kbps: (snap.audio_kbps > 0).then_some(snap.audio_kbps),
+            })
+        } else {
+            None
+        }
+    };
+
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
         // The camera encoder attaches srcObject via JS; if Dioxus recreates
@@ -1166,6 +1228,8 @@ pub fn Host(
                 "position:absolute; width:1px; height:1px; opacity:0; overflow:hidden; pointer-events:none;"
             },
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
+            // Issue 1768: SENDING-metrics overlay on the local self-view.
+            {media_metrics_overlay(self_metrics_overlay.as_ref())}
         }
         // Always-mounted screen share preview — toggled via style so the element
         // exists in the DOM before attach_screen_preview() runs.

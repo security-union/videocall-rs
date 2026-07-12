@@ -109,12 +109,12 @@ pub fn AboutModal(mut open: Signal<bool>) -> Element {
     let client_sha = crate::constants::short_sha(env!("GIT_SHA"));
     let client_branch = env!("GIT_BRANCH");
     let client_ts = env!("BUILD_TIMESTAMP");
-    // Issue #1480: render the full `YYYY-MM-DD HH:MM:SSZ` Built value (matches the
-    // diagnostics build-info table — date + full time incl. seconds and trailing
-    // zone); fall back to the raw ts only if `build_datetime` returns None
-    // (sentinel/empty).
+    // Issue #1789: render the Built value as date + full time (to the second) +
+    // short zone label, converted from UTC into the viewer's local timezone
+    // (matches the diagnostics build-info table). Falls back to the raw ts only if
+    // `build_datetime_local` returns None (sentinel/empty).
     let client_built =
-        crate::constants::build_datetime(client_ts).unwrap_or_else(|| client_ts.to_string());
+        crate::constants::build_datetime_local(client_ts).unwrap_or_else(|| client_ts.to_string());
 
     let server_section = match state() {
         FetchState::Loading => rsx! {
@@ -165,8 +165,12 @@ pub fn AboutModal(mut open: Signal<bool>) -> Element {
                                     "{crate::constants::short_sha(&comp.git_sha)}"
                                 }
                             }
-                            span { class: "about-modal-value about-modal-value--mono",
-                                "{crate::constants::build_datetime(&comp.build_timestamp).unwrap_or_else(|| dash_if_empty(&comp.build_timestamp).to_string())}"
+                            // Issue 1789: the Built value is now a proportional
+                            // locale string (e.g. "Jun 19, 2026, 6:48:11 AM PDT"),
+                            // so it drops the --mono class (Version/Commit keep it);
+                            // matches the diagnostics build-info rendering.
+                            span { class: "about-modal-value",
+                                "{crate::constants::build_datetime_local(&comp.build_timestamp).unwrap_or_else(|| dash_if_empty(&comp.build_timestamp).to_string())}"
                             }
                         }
                     }
@@ -260,7 +264,9 @@ pub fn AboutModal(mut open: Signal<bool>) -> Element {
                         }
                         div { class: "about-modal-row",
                             span { class: "about-modal-label", "Built" }
-                            span { class: "about-modal-value about-modal-value--mono",
+                            // Issue 1789: proportional locale Built value → drop
+                            // --mono (matches the server rows + diagnostics).
+                            span { class: "about-modal-value",
                                 "{client_built}"
                             }
                         }

@@ -155,34 +155,42 @@ pub fn PreferencesSettingsPanel() -> Element {
                 hr { class: "appearance-section-divider" }
 
                 // ── Section 3: Notifications ─────────────────────────────────
+                //
+                // Four independent toggles: entry/exit messages and entry/exit
+                // sounds. Each row's helper <p> carries an id wired to the input
+                // via `aria-describedby`, so a screen reader announces the name
+                // AND the clarifying description. The visible `for=` label is the
+                // sole accessible name — the switch wrapper deliberately has no
+                // `aria-label` to avoid doubling the announced name.
                 section { class: "appearance-section",
                     div { class: "appearance-section-header",
                         h3 { class: "appearance-section-title", "Notifications" }
                     }
 
-                    // Entry/exit notifications toggle
+                    // Entry message toggle
                     div { class: "appearance-section-header dock-autohide-row",
                         div { class: "appearance-section-heading-stack",
                             label {
                                 class: "appearance-section-title appearance-section-title--sm",
-                                r#for: "join-leave-notifications-toggle",
-                                "Entry/exit notifications"
+                                r#for: "entry-notifications-toggle",
+                                "Entry message"
                             }
-                            p { class: "appearance-section-helper",
-                                "Show a message when participants join or leave."
+                            p {
+                                id: "entry-notifications-desc",
+                                class: "appearance-section-helper",
+                                "Show a message when a participant joins."
                             }
                         }
-                        label {
-                            class: "glow-switch",
-                            "aria-label": "Toggle entry and exit notifications",
+                        label { class: "glow-switch",
                             input {
-                                id: "join-leave-notifications-toggle",
+                                id: "entry-notifications-toggle",
                                 r#type: "checkbox",
-                                checked: appearance.show_join_leave_notifications,
+                                "aria-describedby": "entry-notifications-desc",
+                                checked: appearance.show_entry_notifications,
                                 onchange: move |evt: Event<FormData>| {
                                     let enabled = evt.checked();
                                     appearance_ctx.0.set(AppearanceSettings {
-                                        show_join_leave_notifications: enabled,
+                                        show_entry_notifications: enabled,
                                         ..appearance_ctx.0()
                                     });
                                 },
@@ -191,29 +199,94 @@ pub fn PreferencesSettingsPanel() -> Element {
                         }
                     }
 
-                    // Entry/exit sounds toggle
+                    // Exit message toggle
                     div { class: "appearance-section-header dock-autohide-row",
                         div { class: "appearance-section-heading-stack",
                             label {
                                 class: "appearance-section-title appearance-section-title--sm",
-                                r#for: "join-leave-sounds-toggle",
-                                "Entry/exit sounds"
+                                r#for: "exit-notifications-toggle",
+                                "Exit message"
                             }
-                            p { class: "appearance-section-helper",
-                                "Play a sound when participants join or leave."
+                            p {
+                                id: "exit-notifications-desc",
+                                class: "appearance-section-helper",
+                                "Show a message when a participant leaves."
                             }
                         }
-                        label {
-                            class: "glow-switch",
-                            "aria-label": "Toggle entry and exit sounds",
+                        label { class: "glow-switch",
                             input {
-                                id: "join-leave-sounds-toggle",
+                                id: "exit-notifications-toggle",
                                 r#type: "checkbox",
-                                checked: appearance.play_join_leave_sounds,
+                                "aria-describedby": "exit-notifications-desc",
+                                checked: appearance.show_exit_notifications,
                                 onchange: move |evt: Event<FormData>| {
                                     let enabled = evt.checked();
                                     appearance_ctx.0.set(AppearanceSettings {
-                                        play_join_leave_sounds: enabled,
+                                        show_exit_notifications: enabled,
+                                        ..appearance_ctx.0()
+                                    });
+                                },
+                            }
+                            span { class: "glow-switch-track" }
+                        }
+                    }
+
+                    // Entry sound toggle
+                    div { class: "appearance-section-header dock-autohide-row",
+                        div { class: "appearance-section-heading-stack",
+                            label {
+                                class: "appearance-section-title appearance-section-title--sm",
+                                r#for: "entry-sound-toggle",
+                                "Entry sound"
+                            }
+                            p {
+                                id: "entry-sound-desc",
+                                class: "appearance-section-helper",
+                                "Play a sound when a participant joins."
+                            }
+                        }
+                        label { class: "glow-switch",
+                            input {
+                                id: "entry-sound-toggle",
+                                r#type: "checkbox",
+                                "aria-describedby": "entry-sound-desc",
+                                checked: appearance.play_entry_sound,
+                                onchange: move |evt: Event<FormData>| {
+                                    let enabled = evt.checked();
+                                    appearance_ctx.0.set(AppearanceSettings {
+                                        play_entry_sound: enabled,
+                                        ..appearance_ctx.0()
+                                    });
+                                },
+                            }
+                            span { class: "glow-switch-track" }
+                        }
+                    }
+
+                    // Exit sound toggle
+                    div { class: "appearance-section-header dock-autohide-row",
+                        div { class: "appearance-section-heading-stack",
+                            label {
+                                class: "appearance-section-title appearance-section-title--sm",
+                                r#for: "exit-sound-toggle",
+                                "Exit sound"
+                            }
+                            p {
+                                id: "exit-sound-desc",
+                                class: "appearance-section-helper",
+                                "Play a sound when a participant leaves."
+                            }
+                        }
+                        label { class: "glow-switch",
+                            input {
+                                id: "exit-sound-toggle",
+                                r#type: "checkbox",
+                                "aria-describedby": "exit-sound-desc",
+                                checked: appearance.play_exit_sound,
+                                onchange: move |evt: Event<FormData>| {
+                                    let enabled = evt.checked();
+                                    appearance_ctx.0.set(AppearanceSettings {
+                                        play_exit_sound: enabled,
                                         ..appearance_ctx.0()
                                     });
                                 },

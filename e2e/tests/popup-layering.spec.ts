@@ -93,6 +93,23 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
     await diagBtn.first().click();
   }
 
+  // Click the video grid on the half OPPOSITE an open side panel, in the upper
+  // third so the point is well clear of the bottom action bar. The peer list
+  // docks LEFT and the diagnostics drawer docks RIGHT (both float OVER the grid),
+  // so clicking the far side lands on an unambiguous background/grid point — not
+  // on the panel and not on the action bar. At the 1280px desktop viewport this
+  // is a reliable "outside" click for the #main-container light-dismiss (#1790).
+  async function clickGridClearOf(page: Page, panelSide: "left" | "right"): Promise<void> {
+    const grid = page.locator("#grid-container");
+    await expect(grid).toBeVisible();
+    const box = await grid.boundingBox();
+    if (!box) throw new Error("#grid-container has no bounding box");
+    const xFrac = panelSide === "left" ? 0.75 : 0.25;
+    const x = box.x + box.width * xFrac;
+    const y = box.y + box.height * 0.15;
+    await page.mouse.click(x, y);
+  }
+
   test("opening dock menu closes density popover", async ({ page }) => {
     await joinMeeting(page, "dock_closes_density");
 
@@ -244,5 +261,202 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
 
     await page.locator("#grid-container").click({ position: { x: 10, y: 10 } });
     await expect(page.locator(".mock-peers-popover")).not.toBeVisible({ timeout: 3_000 });
+  });
+
+  // ── #1790 side-panel light-dismiss (click-outside + Esc) ──
+  //
+  // Most of these FAIL on the pre-#1790 base: before this change the
+  // `#main-container` background handler closed only the density/dock/mock
+  // popovers — never the peer list or diagnostics drawer — so a grid click left
+  // the panel open and Escape did nothing. Each test states its base behavior.
+  //
+  // The two "keep open" tests (inside-panel click, action-bar click) PASS on
+  // base AND on the correct fix: their job is to catch an OVER-broad #1790 that
+  // closes the panel on the wrong click (a missing container stop_propagation,
+  // or a missing action-bar guard). They are stated as such in-file.
+  //
+  // The diagnostics "closed" assertions rely on the `#diagnostics-sidebar`
+  // placeholder that persists once the drawer has been opened at least once, so
+  // `not.toHaveClass(/visible/)` anchors to a real element — every test opens the
+  // drawer before closing it.
+
+  test("clicking the grid closes the peer list (#1790)", async ({ page }) => {
+    await joinMeeting(page, "grid_closes_peerlist");
+
+    await clickPeerListButton(page);
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    // Peer list docks LEFT → click the RIGHT half of the grid.
+    await clickGridClearOf(page, "left");
+
+    // FAILS on base: no background close existed for the peer list.
+    await expect(page.locator("#peer-list-container")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+  });
+
+  test("clicking the grid closes the diagnostics drawer (#1790)", async ({ page }) => {
+    await joinMeeting(page, "grid_closes_diag");
+
+    await clickDiagnosticsButton(page);
+    await expect(page.locator("#diagnostics-sidebar")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    // Diagnostics docks RIGHT → click the LEFT half of the grid.
+    await clickGridClearOf(page, "right");
+
+    // FAILS on base: no background close existed for the diagnostics drawer.
+    await expect(page.locator("#diagnostics-sidebar")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+  });
+
+  test("clicking inside the peer list keeps it open (#1790 stop-propagation)", async ({ page }) => {
+    await joinMeeting(page, "inside_keeps_peerlist");
+
+    await clickPeerListButton(page);
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    // Click a neutral spot INSIDE the panel (its search box). This PASSES on
+    // base (base never closed the panel on any click) AND on the correct fix
+    // (the container stop_propagation keeps the in-panel click from reaching the
+    // background handler). It FAILS on a fixed-but-broken build that dropped the
+    // `#peer-list-container` stop_propagation — pinning that guard.
+    await page.locator("#peer-list-container .search-input").click();
+
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/);
+  });
+
+  test("clicking a mic control in the action bar keeps the peer list open (#1790)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "actionbar_keeps_peerlist");
+
+    await clickPeerListButton(page);
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    // A click on an action-bar control is NOT an outside/grid click, so it must
+    // leave the panel open. The mic toggle does NOT stop propagation, so this
+    // relies on the click_within_action_bar guard in the background handler.
+    // PASSES on base AND on the correct fix; FAILS on a #1790 that ignored the
+    // action bar and closed the panel on every non-panel click.
+    await page.locator(".video-controls-container").hover();
+    await page.locator('[data-testid="mic-toggle-button"]').click();
+
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/);
+  });
+
+  test("Escape closes the peer list and restores focus to its trigger (#1790)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "esc_closes_peerlist");
+
+    await clickPeerListButton(page);
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    // Move focus INTO the panel first (empty search box) so a genuine restore is
+    // observable: focus must travel from inside the panel back OUT to the
+    // trigger. Empty query → Escape bubbles to the background handler.
+    await page.locator("#peer-list-container .search-input").click();
+    await page.keyboard.press("Escape");
+
+    // FAILS on base: Escape did nothing for the peer list.
+    await expect(page.locator("#peer-list-container")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+    // Focus restored to the action-bar toggle, NOT left on <body> or the
+    // now-removed search box.
+    await expect
+      .poll(() => page.evaluate(() => document.activeElement?.id ?? ""))
+      .toBe("peer-list-trigger");
+  });
+
+  test("Escape closes the diagnostics drawer and restores focus to its trigger (#1790)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "esc_closes_diag");
+
+    await clickDiagnosticsButton(page);
+    await expect(page.locator("#diagnostics-sidebar")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    // Focus a focusable element INSIDE the drawer (its close button) WITHOUT
+    // activating it, so the Escape that follows originates from inside the panel
+    // and a genuine focus restore is observable.
+    await page.locator("#diagnostics-sidebar .close-button").focus();
+    await page.keyboard.press("Escape");
+
+    // FAILS on base: Escape did nothing for the diagnostics drawer.
+    await expect(page.locator("#diagnostics-sidebar")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+    await expect
+      .poll(() => page.evaluate(() => document.activeElement?.id ?? ""))
+      .toBe("diagnostics-trigger");
+  });
+
+  test("both panels open: Escape peels diagnostics then the peer list, restoring focus each time (#1790)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "esc_both_open_walk");
+
+    // Open diagnostics first, then the peer list; both drawers coexist (left +
+    // right) — neither open path closes the other.
+    await clickDiagnosticsButton(page);
+    await expect(page.locator("#diagnostics-sidebar")).toHaveClass(/visible/, { timeout: 5_000 });
+    await clickPeerListButton(page);
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    // First Escape → diagnostics (the topmost drawer) closes; focus lands on the
+    // diagnostics trigger. FAILS on base (Escape closed neither).
+    await page.locator("#peer-list-trigger").focus();
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#diagnostics-sidebar")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/);
+    await expect
+      .poll(() => page.evaluate(() => document.activeElement?.id ?? ""))
+      .toBe("diagnostics-trigger");
+
+    // Second Escape → the peer list closes; focus lands on the peer-list trigger.
+    // Focus moving to two DIFFERENT triggers in sequence is the strongest proof
+    // that focus restore is real and per-panel, not incidental.
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#peer-list-container")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+    await expect
+      .poll(() => page.evaluate(() => document.activeElement?.id ?? ""))
+      .toBe("peer-list-trigger");
+  });
+
+  test("Escape in the peer-list search clears the query first, then closes (#1790)", async ({
+    page,
+  }) => {
+    await joinMeeting(page, "esc_search_clear_then_close");
+
+    await clickPeerListButton(page);
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    const searchInput = page.locator("#peer-list-container .search-input");
+    await searchInput.click();
+    await searchInput.pressSequentially("abc");
+    await expect(searchInput).toHaveValue("abc");
+
+    // First Escape with a non-empty query CLEARS the field and is swallowed —
+    // the panel stays open. FAILS on the unfixed input handler: without it the
+    // first Escape would bubble and close the panel with the query still set.
+    await page.keyboard.press("Escape");
+    await expect(searchInput).toHaveValue("");
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/);
+
+    // Second Escape (query now empty) bubbles and closes the panel, restoring
+    // focus to the trigger.
+    await page.keyboard.press("Escape");
+    await expect(page.locator("#peer-list-container")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+    await expect
+      .poll(() => page.evaluate(() => document.activeElement?.id ?? ""))
+      .toBe("peer-list-trigger");
   });
 });

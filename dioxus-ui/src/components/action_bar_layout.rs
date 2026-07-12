@@ -48,6 +48,38 @@ impl ActionBarSlot {
     pub fn is_removable(self) -> bool {
         !NON_REMOVABLE_SLOTS.contains(&self)
     }
+
+    /// Stable, DOM-safe identifier used for the `data-slot` attribute on each
+    /// action-bar wrapper. Matches the serde tag (v2 storage schema) so a
+    /// single string round-trips through storage and keyboard-reorder lookups.
+    pub fn slug(self) -> &'static str {
+        match self {
+            ActionBarSlot::Mic => "mic",
+            ActionBarSlot::Camera => "camera",
+            ActionBarSlot::ScreenShare => "screen",
+            ActionBarSlot::PeerList => "participants",
+            ActionBarSlot::DensityMode => "density",
+            ActionBarSlot::Diagnostics => "diagnostics",
+            ActionBarSlot::DeviceSettings => "settings",
+            ActionBarSlot::MeetingOptions => "meeting_options",
+        }
+    }
+
+    /// Inverse of [`Self::slug`]. Used by the keyboard-reorder handler to map
+    /// the `data-slot` attribute back to the enum variant.
+    pub fn from_slug(s: &str) -> Option<Self> {
+        Some(match s {
+            "mic" => ActionBarSlot::Mic,
+            "camera" => ActionBarSlot::Camera,
+            "screen" => ActionBarSlot::ScreenShare,
+            "participants" => ActionBarSlot::PeerList,
+            "density" => ActionBarSlot::DensityMode,
+            "diagnostics" => ActionBarSlot::Diagnostics,
+            "settings" => ActionBarSlot::DeviceSettings,
+            "meeting_options" => ActionBarSlot::MeetingOptions,
+            _ => return None,
+        })
+    }
 }
 
 pub const DEFAULT_SLOTS: &[ActionBarSlot] = &[
@@ -258,6 +290,53 @@ pub fn slot_index(slots: &[ActionBarSlot], slot: ActionBarSlot) -> Option<usize>
     slots.iter().position(|s| *s == slot)
 }
 
+/// Result of a keyboard-reorder attempt on the action-bar. `old_idx` is the
+/// slot's position before the keystroke; `new_idx` is its position after.
+/// When they are equal the caller MUST NOT persist and should still announce
+/// a "no-op" to the aria-live region (the slot is already at that edge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyboardReorderResult {
+    pub old_idx: usize,
+    pub new_idx: usize,
+}
+
+/// Apply a keyboard reorder (Arrow / Home / End) to `slots` in-place.
+///
+/// `delta` is a relative step (`-1` for Left/Up, `+1` for Right/Down) when
+/// arrow keys are pressed. `absolute` overrides `delta` (`Some(0)` = Home,
+/// `Some(i32::MAX)` = End). Values are clamped to the current list bounds so
+/// the caller does not need to bound-check.
+///
+/// Returns `None` if `slot` is not present in `slots` OR if `slots` is empty.
+/// Otherwise returns `Some(KeyboardReorderResult { old_idx, new_idx })`; the
+/// slot is moved in the vector when `new_idx != old_idx`.
+///
+/// The keyboard-reorder handler in `attendants.rs` calls this function
+/// directly, so a mutation to the clamp or index math is observable in the
+/// unit tests below (see [`tests::keyboard_reorder_*`]).
+pub fn apply_keyboard_reorder(
+    slots: &mut Vec<ActionBarSlot>,
+    slot: ActionBarSlot,
+    delta: Option<i32>,
+    absolute: Option<i32>,
+) -> Option<KeyboardReorderResult> {
+    if slots.is_empty() {
+        return None;
+    }
+    let old_idx = slots.iter().position(|s| *s == slot)?;
+    let max_idx = (slots.len() - 1) as i32;
+    let new_idx = if let Some(d) = delta {
+        (old_idx as i32 + d).clamp(0, max_idx) as usize
+    } else {
+        absolute.unwrap_or(0).clamp(0, max_idx) as usize
+    };
+    if new_idx != old_idx {
+        slots.remove(old_idx);
+        slots.insert(new_idx, slot);
+    }
+    Some(KeyboardReorderResult { old_idx, new_idx })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,7 +426,7 @@ mod tests {
         assert_eq!(loaded_slots[1], ActionBarSlot::Mic);
         assert_eq!(loaded_slots[2], ActionBarSlot::DeviceSettings);
         // All other defaults appended.
-        assert!(loaded_slots.contains(&ActionBarSlot::ScreenShare));
+        assert!(loaded_slots.contains(&ActionBarSlot::PeerList));
         assert!(loaded_hidden.is_empty());
     }
 
@@ -445,6 +524,100 @@ mod tests {
         assert_eq!(
             stored.slots,
             vec![ActionBarSlot::PeerList, ActionBarSlot::ScreenShare]
+        );
+    }
+
+    /// Round-trip proof: `from_slug(slug(x)) == Some(x)` for every enum variant.
+    /// Mutation check: swap any pair of arms in either `slug` or `from_slug`
+    /// and this test fails. Also asserts the slugs are the same DOM-safe
+    /// tokens used by the v2 storage schema (see the `#[serde]` renames), so
+    /// changing one side without the other is caught.
+    #[test]
+    fn slug_roundtrip_for_every_variant() {
+        for slot in DEFAULT_SLOTS.iter().copied() {
+            let s = slot.slug();
+            assert_eq!(
+                ActionBarSlot::from_slug(s),
+                Some(slot),
+                "slug round-trip failed for {slot:?} (slug={s:?})",
+            );
+            // No whitespace, matches CSS attribute-selector safety.
+            assert!(!s.contains(' '), "slug {s:?} must be whitespace-free");
+            assert!(!s.is_empty(), "slug for {slot:?} must be non-empty");
+        }
+        // Unknown slug → None.
+        assert_eq!(ActionBarSlot::from_slug("bogus"), None);
+        assert_eq!(ActionBarSlot::from_slug(""), None);
+    }
+
+    /// Arrow-key delta moves the slot by exactly one position and clamps at
+    /// the edges. Mutation check: replace `clamp(0, max_idx)` with a
+    /// wrapping/unchecked expression and this test fails.
+    #[test]
+    fn keyboard_reorder_arrow_delta_moves_and_clamps() {
+        // Right arrow from the middle.
+        let mut slots: Vec<ActionBarSlot> = DEFAULT_SLOTS.to_vec();
+        let result = apply_keyboard_reorder(&mut slots, ActionBarSlot::ScreenShare, Some(1), None)
+            .expect("ScreenShare is present");
+        assert_eq!(result.old_idx, 2);
+        assert_eq!(result.new_idx, 3);
+        assert_eq!(slots[3], ActionBarSlot::ScreenShare);
+
+        // Left arrow at index 0 clamps (no move).
+        let mut slots: Vec<ActionBarSlot> = DEFAULT_SLOTS.to_vec();
+        let result = apply_keyboard_reorder(&mut slots, ActionBarSlot::Mic, Some(-1), None)
+            .expect("Mic is present");
+        assert_eq!(result.old_idx, 0);
+        assert_eq!(result.new_idx, 0);
+        assert_eq!(slots, DEFAULT_SLOTS.to_vec());
+
+        // Right arrow at the last index clamps.
+        let mut slots: Vec<ActionBarSlot> = DEFAULT_SLOTS.to_vec();
+        let last = *DEFAULT_SLOTS.last().unwrap();
+        let last_idx = DEFAULT_SLOTS.len() - 1;
+        let result = apply_keyboard_reorder(&mut slots, last, Some(1), None).expect("present");
+        assert_eq!(result.old_idx, last_idx);
+        assert_eq!(result.new_idx, last_idx);
+    }
+
+    /// Home jumps to 0, End jumps to len-1 (clamped from `i32::MAX`).
+    /// Mutation check: swap the branches or drop the `absolute` clamp and
+    /// this test fails.
+    #[test]
+    fn keyboard_reorder_home_end_absolute_jumps() {
+        let mut slots: Vec<ActionBarSlot> = DEFAULT_SLOTS.to_vec();
+        let last = *DEFAULT_SLOTS.last().unwrap();
+        let len = DEFAULT_SLOTS.len();
+
+        // Home: move last slot to index 0.
+        let result = apply_keyboard_reorder(&mut slots, last, None, Some(0)).expect("present");
+        assert_eq!(result.new_idx, 0);
+        assert_eq!(slots[0], last);
+
+        // End: move the (now index-0) slot back to the last index. `i32::MAX`
+        // must clamp to `len-1` without overflow.
+        let result =
+            apply_keyboard_reorder(&mut slots, last, None, Some(i32::MAX)).expect("present");
+        assert_eq!(result.new_idx, len - 1);
+        assert_eq!(slots[len - 1], last);
+    }
+
+    /// Absent slot returns None; empty list returns None. Both are guards
+    /// the keyboard handler relies on for early-return.
+    #[test]
+    fn keyboard_reorder_returns_none_for_absent_or_empty() {
+        let mut slots: Vec<ActionBarSlot> = vec![ActionBarSlot::Mic, ActionBarSlot::Camera];
+        assert_eq!(
+            apply_keyboard_reorder(&mut slots, ActionBarSlot::PeerList, Some(1), None),
+            None,
+        );
+        // Original list is untouched.
+        assert_eq!(slots, vec![ActionBarSlot::Mic, ActionBarSlot::Camera]);
+
+        let mut empty: Vec<ActionBarSlot> = Vec::new();
+        assert_eq!(
+            apply_keyboard_reorder(&mut empty, ActionBarSlot::Mic, Some(1), None),
+            None,
         );
     }
 }

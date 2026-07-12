@@ -107,6 +107,40 @@ async fn mic_button_disabled_shows_unmute_tooltip() {
     cleanup(&mount);
 }
 
+// Regression guard (device-in-use deadlock fix): when a device is unavailable
+// (in use by another app, denied, or unplugged) the button MUST stay clickable
+// so the user can retry acquisition. Previously `disabled: !available` wired the
+// unavailable state straight to the HTML `disabled` attribute, killing the only
+// manual-retry path (`onclick`) and forcing a leave-and-rejoin. This asserts the
+// button is NOT disabled while `available: false`.
+#[wasm_bindgen_test]
+async fn mic_button_stays_clickable_when_unavailable() {
+    let mount = create_mount_point();
+    fn wrapper() -> Element {
+        rsx! { MicButton { enabled: false, available: false, onclick: move |_| {} } }
+    }
+    render_into(&mount, wrapper);
+    yield_now().await;
+
+    let button = mount
+        .query_selector("button")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<web_sys::HtmlButtonElement>()
+        .unwrap();
+    assert!(
+        !button.disabled(),
+        "unavailable MicButton must remain clickable so the user can retry"
+    );
+    // The unavailable state must still be conveyed visually.
+    assert!(
+        button.class_list().contains("error"),
+        "unavailable MicButton should carry the 'error' CSS class"
+    );
+
+    cleanup(&mount);
+}
+
 // ---------------------------------------------------------------------------
 // CameraButton tests
 // ---------------------------------------------------------------------------
@@ -160,6 +194,35 @@ async fn camera_button_disabled_shows_start_video_tooltip() {
         desc.text_content().unwrap().contains("camera"),
         "start-video description should mention the camera, got: {:?}",
         desc.text_content()
+    );
+
+    cleanup(&mount);
+}
+
+// Regression guard (device-in-use deadlock fix): symmetric to the MicButton
+// case above — an unavailable camera must stay clickable so the user can retry.
+#[wasm_bindgen_test]
+async fn camera_button_stays_clickable_when_unavailable() {
+    let mount = create_mount_point();
+    fn wrapper() -> Element {
+        rsx! { CameraButton { enabled: false, available: false, onclick: move |_| {} } }
+    }
+    render_into(&mount, wrapper);
+    yield_now().await;
+
+    let button = mount
+        .query_selector("button")
+        .unwrap()
+        .unwrap()
+        .dyn_into::<web_sys::HtmlButtonElement>()
+        .unwrap();
+    assert!(
+        !button.disabled(),
+        "unavailable CameraButton must remain clickable so the user can retry"
+    );
+    assert!(
+        button.class_list().contains("error"),
+        "unavailable CameraButton should carry the 'error' CSS class"
     );
 
     cleanup(&mount);

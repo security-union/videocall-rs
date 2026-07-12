@@ -506,6 +506,191 @@ pub(crate) fn build_datetime(ts: &str) -> Option<String> {
     Some(trimmed.replacen('T', " ", 1))
 }
 
+/// Days from the Unix epoch (1970-01-01) to the civil date `y-m-d` in the
+/// proleptic Gregorian calendar. Howard Hinnant's `days_from_civil` — exact for
+/// every date, no lookup tables, no `chrono` dependency. `m` is 1-based
+/// (1 = January). Issue #1789: the pure step that turns a parsed UTC build
+/// timestamp into an absolute instant.
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe - 719_468
+}
+
+/// Parse fractional-second digits into whole milliseconds, truncating toward
+/// zero: `"5"` -> 500, `"12"` -> 120, `"123"` -> 123, `"123456"` -> 123. Returns
+/// `None` for empty or non-digit input so the whole timestamp degrades. Issue #1789.
+fn parse_fraction_millis(frac: &str) -> Option<i64> {
+    if frac.is_empty() || !frac.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let mut millis = 0i64;
+    for i in 0..3 {
+        let digit = frac
+            .as_bytes()
+            .get(i)
+            .map(|b| i64::from(b - b'0'))
+            .unwrap_or(0);
+        millis = millis * 10 + digit;
+    }
+    Some(millis)
+}
+
+/// Split an RFC3339 time component (`hh:mm:ss[.fff]<zone>`) into its clock part
+/// and the zone's offset **east of UTC in seconds**. Accepts `Z`/`z` (0),
+/// `±hh:mm`, and `±hhmm`. Returns `None` when no zone designator is present —
+/// a zone-less local time is ambiguous, so we don't guess (it degrades to the
+/// verbatim #1480 fallback). Issue #1789.
+fn split_zone(time: &str) -> Option<(&str, i64)> {
+    if let Some(clock) = time.strip_suffix('Z').or_else(|| time.strip_suffix('z')) {
+        return Some((clock, 0));
+    }
+    // The only `+`/`-` in a time component starts the numeric offset (the clock
+    // and fraction have none), so the last one is the zone sign.
+    let sign_pos = time.rfind(['+', '-'])?;
+    let (clock, off) = time.split_at(sign_pos);
+    let sign = if off.starts_with('-') { -1 } else { 1 };
+    let digits = &off[1..];
+    let (oh, om) = match digits.split_once(':') {
+        Some((h, m)) => (h, m),
+        // `±hhmm` with no colon. Require the 4-char tail to be plain ASCII before
+        // byte-slicing it in half: a multi-byte char (e.g. `+€a`, 4 bytes) would
+        // otherwise split mid-scalar and panic. Non-digit ASCII still slices
+        // safely and is rejected by the `.parse()` below, keeping the whole
+        // helper scalar-safe like `build_datetime`.
+        None if digits.len() == 4 && digits.is_ascii() => (&digits[0..2], &digits[2..4]),
+        None => return None,
+    };
+    let oh: i64 = oh.parse().ok()?;
+    let om: i64 = om.parse().ok()?;
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    Some((clock, sign * (oh * 3_600 + om * 60)))
+}
+
+/// Issue #1789: parse a build timestamp (`YYYY-MM-DDThh:mm:ss[.fff]<zone>`, as
+/// emitted by `build.rs`: `YYYY-MM-DDThh:mm:ssZ`) into Unix-epoch milliseconds.
+///
+/// Pure and host-testable — no `js_sys`/`web-sys` — so the parse is exercised by
+/// ordinary `cargo test` and its correctness is pinned against known instants.
+/// The DST-aware *local* rendering happens later, in the Intl/`js_sys::Date`
+/// step; parsing only needs the absolute instant, which is timezone-independent.
+///
+/// Returns `None` (→ callers degrade to the verbatim #1480 fallback) for
+/// anything that isn't a full, zone-designated date+time: a bare date (no `'T'`),
+/// a zone-less time, out-of-range fields, or otherwise malformed input.
+fn parse_build_instant_millis(ts: &str) -> Option<i64> {
+    let s = ts.trim();
+    // A bare date (no `'T'`) has no instant to anchor to → degrade.
+    let (date, time) = s.split_once('T')?;
+
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: i64 = date_parts.next()?.parse().ok()?;
+    let day: i64 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+
+    let (clock, offset_secs) = split_zone(time)?;
+    let (hms, frac_ms) = match clock.split_once('.') {
+        Some((hms, frac)) => (hms, parse_fraction_millis(frac)?),
+        None => (clock, 0),
+    };
+    let mut hms_parts = hms.split(':');
+    let hour: i64 = hms_parts.next()?.parse().ok()?;
+    let minute: i64 = hms_parts.next()?.parse().ok()?;
+    let second: i64 = hms_parts.next()?.parse().ok()?;
+    if hms_parts.next().is_some() {
+        return None;
+    }
+    // Allow a leap second (60); reject anything clearly out of range.
+    if hour > 23 || minute > 59 || second > 60 {
+        return None;
+    }
+
+    let days = days_from_civil(year, month, day);
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_secs;
+    Some(secs * 1_000 + frac_ms)
+}
+
+/// Pure core of [`build_datetime_local`] (issue #1789). Applies the #1480
+/// degradation gate, parses the timestamp to an absolute instant, and delegates
+/// the instant→string rendering to `format_instant` — the browser's local-zone
+/// Intl formatter in production, a deterministic stub in host tests. This is the
+/// testable seam: a known instant fed through an injected converter must render
+/// the shifted local form, never the raw `…Z`. Inputs that aren't an anchorable
+/// instant (bare date, malformed, sentinel) degrade exactly as [`build_datetime`].
+fn build_datetime_local_with<F>(ts: &str, format_instant: F) -> Option<String>
+where
+    F: FnOnce(i64) -> String,
+{
+    let trimmed = ts.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        return None;
+    }
+    match parse_build_instant_millis(trimmed) {
+        Some(ms) => Some(format_instant(ms)),
+        None => build_datetime(trimmed),
+    }
+}
+
+/// Pure core of [`build_date_local`] (issue #1789). As [`build_datetime_local_with`]
+/// but `local_date` yields a bare local `YYYY-MM-DD`, and the non-instant fallback
+/// is [`build_date`] (date-only compaction). The seam lets a host test pin the
+/// near-midnight day flip (a late-UTC instant rendering the *next* local day)
+/// without a browser.
+fn build_date_local_with<F>(ts: &str, local_date: F) -> Option<String>
+where
+    F: FnOnce(i64) -> String,
+{
+    let trimmed = ts.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        return None;
+    }
+    match parse_build_instant_millis(trimmed) {
+        Some(ms) => Some(local_date(ms)),
+        None => build_date(trimmed),
+    }
+}
+
+/// Issue #1789: render a build timestamp as date + full time (to the second) +
+/// short timezone label, converted from its UTC instant into the **viewer's
+/// local timezone** (e.g. `Jun 19, 2026, 6:48:11 AM PDT`). Replaces the raw-UTC
+/// [`build_datetime`] at the About-modal and diagnostics build-info surfaces so
+/// the shown time matches the reader's own clock, DST-correctly (the browser
+/// applies the offset at the build instant).
+///
+/// Degradation (issue #1480 contract, preserved): the `"unknown"` sentinel and
+/// empty/whitespace return `None`; a bare date or any string that can't be
+/// anchored to an instant falls back to [`build_datetime`]'s verbatim rendering.
+/// Server `build_timestamp` values arrive as arbitrary strings from the version
+/// endpoint — unparseable ones keep that verbatim/dash fallback.
+pub(crate) fn build_datetime_local(ts: &str) -> Option<String> {
+    build_datetime_local_with(ts, |ms| {
+        crate::components::meeting_format::format_datetime_zoned_seconds(ms)
+    })
+}
+
+/// Issue #1789: render a build timestamp as a bare `YYYY-MM-DD` calendar date in
+/// the **viewer's local timezone**. Replaces the raw-UTC [`build_date`] at the
+/// home-page footer so a near-midnight-UTC build shows the day that matches the
+/// viewer's own calendar rather than being off by one. Same #1480 degradation
+/// contract as [`build_date`]; the footer form carries no zone hint by design
+/// (it is date-only).
+pub(crate) fn build_date_local(ts: &str) -> Option<String> {
+    build_date_local_with(ts, |ms| {
+        crate::components::meeting_format::format_local_date_iso(ms)
+    })
+}
+
 /// Issue #1480: truncate a git SHA to its first 7 characters (canonical short
 /// form). Returns `"unknown"` when empty and the input unchanged when already
 /// shorter than 7 chars (or non-ASCII — `chars().take` is scalar-safe). Moved
@@ -879,7 +1064,11 @@ mod log_level_tests {
 
 #[cfg(test)]
 mod build_info_tests {
-    use super::{build_date, build_datetime, git_info_visible, short_sha};
+    use super::{
+        build_date, build_date_local_with, build_datetime, build_datetime_local_with,
+        days_from_civil, git_info_visible, parse_build_instant_millis, parse_fraction_millis,
+        short_sha, split_zone,
+    };
 
     /// Issue #1480: pins the FAIL-CLOSED default. Empty / falsey -> github info
     /// hidden; only an explicit truthy ("true"/"1") shows it. The accessor
@@ -964,5 +1153,260 @@ mod build_info_tests {
     fn short_sha_handles_unicode_safely() {
         let emoji = "abc\u{1F600}\u{1F601}";
         assert_eq!(short_sha(emoji), emoji);
+    }
+
+    // -------------------------------------------------------------------------
+    // Issue #1789: build-timestamp -> local-time conversion.
+    //
+    // The parse is pure (no js_sys/web-sys), so these run as ordinary host-target
+    // unit tests. The instant references below are external (computed with
+    // Python's datetime, NOT recomputed via the production `days_from_civil`
+    // formula) so a mutation in the parse math is actually caught.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn days_from_civil_anchors_at_epoch() {
+        // 1970-01-01 is day 0 by definition; a mutation to the constant offset
+        // (719_468) or the era math shifts this off zero.
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        // 1969-12-31 is the day before the epoch.
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        // 1970-01-02 is one day after.
+        assert_eq!(days_from_civil(1970, 1, 2), 1);
+    }
+
+    #[test]
+    fn parse_build_instant_millis_pins_known_instants() {
+        // Unix epoch.
+        assert_eq!(parse_build_instant_millis("1970-01-01T00:00:00Z"), Some(0));
+        // The exact instant meeting_format's zoned tests use.
+        assert_eq!(
+            parse_build_instant_millis("2024-04-28T17:00:00Z"),
+            Some(1_714_323_600_000)
+        );
+        // build.rs's canonical `YYYY-MM-DDThh:mm:ssZ` shape.
+        assert_eq!(
+            parse_build_instant_millis("2026-06-19T13:48:11Z"),
+            Some(1_781_876_891_000)
+        );
+    }
+
+    #[test]
+    fn parse_build_instant_millis_applies_offsets() {
+        // All three name the SAME absolute instant as 2024-04-28T17:00:00Z, so
+        // the offset must be subtracted correctly (east positive).
+        const KNOWN: i64 = 1_714_323_600_000;
+        assert_eq!(
+            parse_build_instant_millis("2024-04-28T18:00:00+01:00"),
+            Some(KNOWN)
+        );
+        assert_eq!(
+            parse_build_instant_millis("2024-04-28T12:00:00-05:00"),
+            Some(KNOWN)
+        );
+        // Colon-less offset form `+hhmm`.
+        assert_eq!(
+            parse_build_instant_millis("2024-04-28T18:00:00+0100"),
+            Some(KNOWN)
+        );
+    }
+
+    #[test]
+    fn parse_build_instant_millis_handles_fractional_seconds() {
+        // Fractional seconds add whole milliseconds (truncating), on top of the
+        // 2024-04-28T17:00:00Z reference.
+        assert_eq!(
+            parse_build_instant_millis("2024-04-28T17:00:00.5Z"),
+            Some(1_714_323_600_500)
+        );
+        assert_eq!(
+            parse_build_instant_millis("2024-04-28T17:00:00.123456Z"),
+            Some(1_714_323_600_123)
+        );
+    }
+
+    #[test]
+    fn parse_build_instant_millis_rejects_non_instants() {
+        // Bare date (no `'T'`), sentinel, empty, zone-less time, and out-of-range
+        // fields all return None so callers degrade to the verbatim fallback.
+        assert_eq!(parse_build_instant_millis("2026-06-19"), None);
+        assert_eq!(parse_build_instant_millis("unknown"), None);
+        assert_eq!(parse_build_instant_millis(""), None);
+        assert_eq!(parse_build_instant_millis("2026-06-19T13:48:11"), None); // no zone
+        assert_eq!(parse_build_instant_millis("2026-13-19T00:00:00Z"), None); // month 13
+        assert_eq!(parse_build_instant_millis("2026-06-19T24:00:00Z"), None); // hour 24
+        assert_eq!(parse_build_instant_millis("garbage"), None);
+    }
+
+    /// Issue 1789 regression: a colon-less `±hhmm` offset whose 4-byte tail is
+    /// NOT plain ASCII must degrade to None, not panic. `+€a` is 4 bytes but `€`
+    /// is a 3-byte scalar, so the old `&digits[0..2]` byte-slice split it
+    /// mid-character and panicked (a wasm panic poisons the whole app, and these
+    /// strings reach the parser from server `build_timestamp` values). On the
+    /// unfixed code this test PANICS — i.e. fails — so it is mutation-sensitive.
+    /// Plain-ASCII garbage in the same shape slices safely and is rejected by the
+    /// numeric parse.
+    #[test]
+    fn parse_build_instant_millis_bad_offset_degrades_without_panic() {
+        assert_eq!(parse_build_instant_millis("2026-06-19T12:34:56+€a"), None);
+        assert_eq!(parse_build_instant_millis("2026-06-19T12:34:56+ab12"), None);
+    }
+
+    #[test]
+    fn split_zone_parses_designators() {
+        assert_eq!(split_zone("13:48:11Z"), Some(("13:48:11", 0)));
+        assert_eq!(split_zone("13:48:11+01:00"), Some(("13:48:11", 3_600)));
+        assert_eq!(split_zone("13:48:11-05:00"), Some(("13:48:11", -18_000)));
+        assert_eq!(split_zone("13:48:11+0530"), Some(("13:48:11", 19_800)));
+        // No designator → ambiguous → None.
+        assert_eq!(split_zone("13:48:11"), None);
+    }
+
+    #[test]
+    fn parse_fraction_millis_truncates() {
+        assert_eq!(parse_fraction_millis("5"), Some(500));
+        assert_eq!(parse_fraction_millis("12"), Some(120));
+        assert_eq!(parse_fraction_millis("123"), Some(123));
+        assert_eq!(parse_fraction_millis("123456"), Some(123));
+        assert_eq!(parse_fraction_millis(""), None);
+        assert_eq!(parse_fraction_millis("12a"), None);
+    }
+
+    /// Issue #1789 REQUIRED regression: a parseable instant fed through the
+    /// site-level seam must be rendered by the injected local-zone converter and
+    /// must NOT keep the raw `…Z` UTC form. Reverting the seam to call
+    /// `build_datetime` verbatim makes both assertions below fail (the output
+    /// would be `"2024-04-28 17:00:00Z"`, which is not the converter's string and
+    /// still carries the `Z`).
+    #[test]
+    fn build_datetime_local_routes_instant_through_converter_not_utc() {
+        // 2024-04-28T17:00:00Z.
+        const KNOWN_MS: i64 = 1_714_323_600_000;
+        let out = build_datetime_local_with("2024-04-28T17:00:00Z", |ms| {
+            assert_eq!(ms, KNOWN_MS, "the parsed instant handed to the converter");
+            // Mimic a viewer at UTC+2, rendered WITHOUT a trailing `Z`, the way
+            // the real Intl local formatter would.
+            let shifted = ms + 2 * 3_600 * 1_000;
+            format!("local:{shifted}")
+        })
+        .expect("a parseable instant must render Some");
+        assert_eq!(out, format!("local:{}", KNOWN_MS + 2 * 3_600 * 1_000));
+        assert!(
+            !out.contains('Z'),
+            "the converted local rendering must not keep the raw UTC 'Z': '{out}'"
+        );
+    }
+
+    /// Issue #1789: the #1480 degradation contract is preserved verbatim through
+    /// the new seam. The stub converter would be WRONG to invoke for a
+    /// non-instant; if the seam ever routed these through it the output would
+    /// differ from `build_datetime` and this fails.
+    #[test]
+    fn build_datetime_local_degrades_like_build_datetime() {
+        let converted = |_ms: i64| "CONVERTED".to_string();
+        assert_eq!(build_datetime_local_with("unknown", converted), None);
+        assert_eq!(build_datetime_local_with("", converted), None);
+        assert_eq!(build_datetime_local_with("   ", converted), None);
+        assert_eq!(
+            build_datetime_local_with("2026-06-19", converted),
+            Some("2026-06-19".to_string()),
+            "bare date has no instant → verbatim (unchanged from build_datetime)"
+        );
+        assert_eq!(
+            build_datetime_local_with("2026-06-19T13:48:11", converted),
+            Some("2026-06-19 13:48:11".to_string()),
+            "zone-less time is ambiguous → verbatim (first T -> space)"
+        );
+        assert_eq!(
+            build_datetime_local_with("not-a-timestamp", converted),
+            Some("not-a-timestamp".to_string()),
+            "malformed → verbatim (kept as-is, never converted)"
+        );
+    }
+
+    /// Issue #1789: the home footer's date must be the build instant's LOCAL
+    /// calendar date, not the raw UTC date. For 2026-06-19T23:30:00Z a viewer
+    /// east of UTC is already on the 20th; the seam surfaces the injected
+    /// local-date converter's `"2026-06-20"`, whereas the raw-UTC `build_date`
+    /// would compact to `"2026-06-19"`. Reverting the seam to `build_date` makes
+    /// the first assertion fail.
+    #[test]
+    fn build_date_local_uses_local_calendar_date_not_utc() {
+        let expected_ms = parse_build_instant_millis("2026-06-19T23:30:00Z").unwrap();
+        let out = build_date_local_with("2026-06-19T23:30:00Z", |ms| {
+            assert_eq!(
+                ms, expected_ms,
+                "the parsed instant handed to the converter"
+            );
+            "2026-06-20".to_string()
+        })
+        .expect("a parseable instant must render Some");
+        assert_eq!(
+            out, "2026-06-20",
+            "the LOCAL calendar date, one day past UTC"
+        );
+        // Sanity: the old raw-UTC path really would have shown the previous day.
+        assert_eq!(
+            build_date("2026-06-19T23:30:00Z"),
+            Some("2026-06-19".to_string())
+        );
+    }
+
+    /// Issue #1789: date-only seam preserves the #1480 degradation contract
+    /// (sentinel/empty → None; bare date → unchanged) exactly like `build_date`.
+    #[test]
+    fn build_date_local_degrades_like_build_date() {
+        let local_date = |_ms: i64| "CONVERTED".to_string();
+        assert_eq!(build_date_local_with("unknown", local_date), None);
+        assert_eq!(build_date_local_with("", local_date), None);
+        assert_eq!(build_date_local_with("   ", local_date), None);
+        assert_eq!(
+            build_date_local_with("2026-06-19", local_date),
+            Some("2026-06-19".to_string()),
+            "bare date has no instant → unchanged (build_date passthrough)"
+        );
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Issue #1789: real-path (wasm) coverage for the local-time build-stamp entries.
+//
+// `build_datetime_local` / `build_date_local` route through js_sys::Date + Intl
+// (browser-only), so the meaningful assertions run under wasm-pack; the
+// `wasm_bindgen_test` macro emits a host-target stub that compiles but does not
+// execute the browser path. Mirrors the split in `meeting_format.rs`.
+// -----------------------------------------------------------------------------
+#[cfg(test)]
+mod build_info_local_wasm_tests {
+    use super::{build_date_local, build_datetime, build_datetime_local};
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn build_datetime_local_converts_off_verbatim_utc() {
+        // 2024-04-28T17:00:00Z. The local-zone rendering must differ from the
+        // raw-UTC verbatim form (`2024-04-28 17:00:00Z`): different shape (month
+        // name + zone label) in every runner timezone. If the site were reverted
+        // to `build_datetime` the two would be equal and this fails.
+        let ts = "2024-04-28T17:00:00Z";
+        let local = build_datetime_local(ts).expect("parseable → Some");
+        let verbatim = build_datetime(ts).expect("parseable → Some");
+        assert_ne!(
+            local, verbatim,
+            "local rendering '{local}' must differ from raw-UTC verbatim '{verbatim}'"
+        );
+        assert!(
+            local.contains("2024"),
+            "expected the year in the local rendering '{local}'"
+        );
+    }
+
+    #[wasm_bindgen_test::wasm_bindgen_test]
+    fn build_date_local_has_iso_date_shape() {
+        // 2024-04-28T12:00:00Z — mid-day so it stays in 2024 across every offset.
+        let out = build_date_local("2024-04-28T12:00:00Z").expect("parseable → Some");
+        assert_eq!(out.len(), 10, "expected YYYY-MM-DD (10 chars), got '{out}'");
+        assert!(
+            out.starts_with("2024-"),
+            "every timezone offset keeps this instant in 2024: '{out}'"
+        );
     }
 }

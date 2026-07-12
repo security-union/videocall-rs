@@ -56,6 +56,15 @@ pub trait MicrophoneEncoderTrait {
     fn select(&mut self, device_id: String) -> bool;
     fn set_enabled(&mut self, enabled: bool) -> bool;
     fn set_error_callback(&mut self, on_error: Callback<String>);
+    /// Wire the classified permission-error callback. Fired only at the real
+    /// `getUserMedia` rejection site with a specific
+    /// [`crate::MediaPermissionsErrorState`] (e.g. `DeviceInUse`), INSTEAD OF
+    /// the generic string `on_error`. See
+    /// [`MicrophoneEncoder::set_permission_error_callback`].
+    fn set_permission_error_callback(
+        &mut self,
+        on_permission_error: Callback<crate::MediaPermissionsErrorState>,
+    );
     /// Set the user's SEND audio layer-ceiling (the perf-panel "layers published"
     /// control). `ceiling` is a layer COUNT (`None` = Auto / full ladder). Applied
     /// LIVE with no mic-encoder restart — see
@@ -120,6 +129,13 @@ impl MicrophoneEncoderTrait for MicrophoneEncoder {
 
     fn set_error_callback(&mut self, on_error: Callback<String>) {
         self.set_error_callback(on_error)
+    }
+
+    fn set_permission_error_callback(
+        &mut self,
+        on_permission_error: Callback<crate::MediaPermissionsErrorState>,
+    ) {
+        self.set_permission_error_callback(on_permission_error)
     }
 
     fn set_user_layer_ceiling(&self, ceiling: Option<u32>) {

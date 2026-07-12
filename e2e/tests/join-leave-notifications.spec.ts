@@ -3,27 +3,32 @@ import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
- * E2E tests for the "Entry/exit notifications" preference toggle in the
- * Appearance settings (Preferences section).
+ * E2E tests for the entry/exit message and sound preference toggles in the
+ * Appearance settings (Notifications section).
  *
- * The preference is persisted in localStorage under the key
- * `vc_appearance_join_leave_notifications` and defaults to `true` (enabled).
+ * These are four independent toggles:
+ *   - Entry message  -> `vc_appearance_entry_notifications`
+ *   - Exit message   -> `vc_appearance_exit_notifications`
+ *   - Entry sound    -> `vc_appearance_entry_sound`
+ *   - Exit sound     -> `vc_appearance_exit_sound`
+ * Each defaults to `true` (enabled).
  *
- * When enabled: peer-joined and peer-left toasts appear (rendered inside the
- * `.peer-toasts` container with class `.peer-toast`) and the corresponding
- * join/leave sounds play.
- *
- * When disabled: both the toast UI and the sound are suppressed entirely
- * inside `on_peer_joined` / `on_peer_left` (see attendants.rs).
+ * The entry (join) toggles gate `on_peer_joined`; the exit (leave) toggles gate
+ * `on_peer_left` (see attendants.rs). The toast UI renders inside the
+ * `.peer-toasts` container with class `.peer-toast`.
  */
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
-const STORAGE_KEY = "vc_appearance_join_leave_notifications";
-const SOUNDS_STORAGE_KEY = "vc_appearance_join_leave_sounds";
+const ENTRY_NOTIFICATIONS_KEY = "vc_appearance_entry_notifications";
+const EXIT_NOTIFICATIONS_KEY = "vc_appearance_exit_notifications";
+const ENTRY_SOUND_KEY = "vc_appearance_entry_sound";
+const EXIT_SOUND_KEY = "vc_appearance_exit_sound";
 
-// dioxus_sdk_storage serializes values as CBOR + zlib + hex. This is the
-// encoded form of the Rust string literal "false".
-const ENCODED_FALSE = "78da4b4d4bcc294e050008750271";
+// These appearance keys are stored as PLAIN TEXT (see read_local_storage /
+// write_local_storage in context.rs) — the app writes `bool.to_string()` and
+// reads `value != "false"`. So the disabled value on the wire is literally
+// "false", not a CBOR/zlib blob.
+const STORED_FALSE = "false";
 
 const BROWSER_ARGS = [
   "--ignore-certificate-errors",
@@ -191,9 +196,8 @@ test.describe("Entry/exit notifications preference", () => {
       expect(hostResult).toBe("in-meeting");
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
-      // Note: dioxus_sdk_storage serializes values as zlib-compressed serde
-      // blobs, so raw localStorage.getItem() does NOT return plain "true"/"false".
-      // The behavioral assertion below (toast appears) is the real verification.
+      // With no stored preference the default (enabled) applies. The behavioral
+      // assertion below (toast appears) is the real verification.
 
       // Start polling for the toast BEFORE the guest joins so we don't miss
       // it if PARTICIPANT_JOINED fires quickly.
@@ -247,11 +251,12 @@ test.describe("Entry/exit notifications preference", () => {
 
       // Inject the disabled preference BEFORE any navigation so it is
       // present on first page load, before the appearance settings context
-      // reads from localStorage during initialization.
-      // dioxus_sdk_storage uses CBOR+zlib+hex encoding.
-      await hostCtx.addInitScript((encoded: string) => {
-        localStorage.setItem("vc_appearance_join_leave_notifications", encoded);
-      }, ENCODED_FALSE);
+      // reads from localStorage during initialization. These appearance keys
+      // are plain text (see context.rs read/write_local_storage), so the
+      // disabled value on the wire is literally "false".
+      await hostCtx.addInitScript((value: string) => {
+        localStorage.setItem("vc_appearance_entry_notifications", value);
+      }, STORED_FALSE);
 
       const hostPage = await hostCtx.newPage();
       const guestPage = await guestCtx.newPage();
@@ -264,8 +269,11 @@ test.describe("Entry/exit notifications preference", () => {
 
       // Confirm the preference was actually persisted in this origin's
       // localStorage (init script ran).
-      const stored = await hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY);
-      expect(stored).toBe(ENCODED_FALSE);
+      const stored = await hostPage.evaluate(
+        (key) => localStorage.getItem(key),
+        ENTRY_NOTIFICATIONS_KEY,
+      );
+      expect(stored).toBe(STORED_FALSE);
 
       // Guest joins the meeting
       await navigateToMeeting(guestPage, meetingId, "JlnOffGuest");
@@ -341,10 +349,9 @@ test.describe("Entry/exit notifications preference", () => {
         timeout: 5_000,
       });
 
-      // Locate the "Entry/exit notifications" toggle in the Preferences
-      // section. The input has a stable id and the visible label points
-      // to it via `for=`.
-      const toggleInput = hostPage.locator("#join-leave-notifications-toggle");
+      // Locate the "Entry message" toggle in the Notifications section. The
+      // input has a stable id and the visible label points to it via `for=`.
+      const toggleInput = hostPage.locator("#entry-notifications-toggle");
       await expect(toggleInput).toBeVisible();
       await expect(toggleInput).toBeChecked();
 
@@ -352,29 +359,32 @@ test.describe("Entry/exit notifications preference", () => {
       await expect(
         hostPage
           .locator("#settings-panel-appearance .appearance-section-title")
-          .filter({ hasText: "Preferences" }),
+          .filter({ hasText: "Notifications" }),
       ).toBeVisible();
       await expect(
         hostPage
-          .locator('#settings-panel-appearance label[for="join-leave-notifications-toggle"]')
-          .filter({ hasText: "Entry/exit notifications" }),
+          .locator('#settings-panel-appearance label[for="entry-notifications-toggle"]')
+          .filter({ hasText: "Entry message" }),
       ).toBeVisible();
 
-      // Uncheck the toggle. The input is hidden behind a custom switch UI,
-      // so use the label's click target (the surrounding `.glow-switch`
-      // label) which forwards activation to the input.
-      const toggleSwitch = hostPage.locator(
-        '#settings-panel-appearance label[aria-label="Toggle entry and exit notifications"]',
+      // Uncheck the toggle. The checkbox is visually hidden behind a custom
+      // switch UI, so click its visible `for=` label, which natively forwards
+      // activation to the associated input.
+      const toggleLabel = hostPage.locator(
+        '#settings-panel-appearance label[for="entry-notifications-toggle"]',
       );
-      await toggleSwitch.click();
+      await toggleLabel.click();
       await expect(toggleInput).not.toBeChecked({ timeout: 5_000 });
 
-      // Verify the preference was persisted to localStorage.
+      // Verify the preference was persisted to localStorage as plain "false".
       await expect
-        .poll(() => hostPage.evaluate((key) => localStorage.getItem(key), STORAGE_KEY), {
-          timeout: 5_000,
-        })
-        .toBe(ENCODED_FALSE);
+        .poll(
+          () => hostPage.evaluate((key) => localStorage.getItem(key), ENTRY_NOTIFICATIONS_KEY),
+          {
+            timeout: 5_000,
+          },
+        )
+        .toBe(STORED_FALSE);
 
       // Close the settings modal.
       await hostPage.locator('button[aria-label="Close settings"]').click();
@@ -445,18 +455,24 @@ test.describe("Entry/exit notifications preference", () => {
         timeout: 5_000,
       });
 
-      // The sounds toggle input should be present (visually hidden behind
+      // Both sound toggle inputs should be present (visually hidden behind
       // the custom switch UI, so use a presence check rather than
       // `toBeVisible`).
-      const soundsToggleInput = hostPage.locator("#join-leave-sounds-toggle");
-      await expect(soundsToggleInput).toHaveCount(1);
+      await expect(hostPage.locator("#entry-sound-toggle")).toHaveCount(1);
+      await expect(hostPage.locator("#exit-sound-toggle")).toHaveCount(1);
 
-      // The accessible label must exist and be visible -- it's the
-      // user-facing click target for the toggle.
-      const soundsToggleLabel = hostPage.locator(
-        '#settings-panel-appearance label[aria-label="Toggle entry and exit sounds"]',
-      );
-      await expect(soundsToggleLabel).toBeVisible();
+      // The visible `for=` labels must exist and be visible -- they name the
+      // toggles and are the user-facing click targets.
+      await expect(
+        hostPage
+          .locator('#settings-panel-appearance label[for="entry-sound-toggle"]')
+          .filter({ hasText: "Entry sound" }),
+      ).toBeVisible();
+      await expect(
+        hostPage
+          .locator('#settings-panel-appearance label[for="exit-sound-toggle"]')
+          .filter({ hasText: "Exit sound" }),
+      ).toBeVisible();
     } finally {
       await browser1.close();
     }
@@ -484,14 +500,14 @@ test.describe("Entry/exit notifications preference", () => {
         uiURL,
       );
 
-      // Pre-seed the sounds preference to "false" BEFORE any navigation so
-      // it is present on first page load. The notifications (toasts)
-      // preference is left at its default (true), so toasts should still
-      // appear -- verifying the two toggles are independent.
-      // dioxus_sdk_storage uses CBOR+zlib+hex encoding.
-      await hostCtx.addInitScript((encoded: string) => {
-        localStorage.setItem("vc_appearance_join_leave_sounds", encoded);
-      }, ENCODED_FALSE);
+      // Pre-seed the entry sound preference to "false" BEFORE any navigation so
+      // it is present on first page load. The entry message preference is left
+      // at its default (true), so the join toast should still appear --
+      // verifying the message and sound toggles are independent. These keys are
+      // plain text (see context.rs), so the disabled value is literally "false".
+      await hostCtx.addInitScript((value: string) => {
+        localStorage.setItem("vc_appearance_entry_sound", value);
+      }, STORED_FALSE);
 
       const hostPage = await hostCtx.newPage();
       const guestPage = await guestCtx.newPage();
@@ -502,10 +518,9 @@ test.describe("Entry/exit notifications preference", () => {
       expect(hostResult).toBe("in-meeting");
       await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
 
-      // Note: dioxus_sdk_storage serializes values as zlib-compressed serde
-      // blobs, so raw localStorage.getItem() does NOT return plain strings.
-      // The behavioral assertions below (toast appears despite sounds off)
-      // are the real verification that the two toggles are independent.
+      // The behavioral assertions below (toast appears despite the entry sound
+      // being off) are the real verification that message and sound are
+      // independent. Sound playback itself has no DOM signal to assert on.
 
       // Start polling for the toast BEFORE the guest joins so we don't miss
       // it if PARTICIPANT_JOINED fires quickly.
@@ -577,14 +592,14 @@ test.describe("Entry/exit notifications preference", () => {
         timeout: 5_000,
       });
 
-      // The sounds toggle should default to checked (enabled).
-      const soundsToggleInput = hostPage.locator("#join-leave-sounds-toggle");
+      // The entry sound toggle should default to checked (enabled).
+      const soundsToggleInput = hostPage.locator("#entry-sound-toggle");
       await expect(soundsToggleInput).toBeChecked();
 
-      // Click the label to uncheck the toggle (input is visually hidden
-      // behind the custom switch UI).
+      // Click the visible `for=` label to uncheck the toggle (the checkbox is
+      // visually hidden behind the custom switch UI).
       const soundsToggleLabel = hostPage.locator(
-        '#settings-panel-appearance label[aria-label="Toggle entry and exit sounds"]',
+        '#settings-panel-appearance label[for="entry-sound-toggle"]',
       );
       await soundsToggleLabel.click();
       await expect(soundsToggleInput).not.toBeChecked({ timeout: 5_000 });
@@ -595,14 +610,169 @@ test.describe("Entry/exit notifications preference", () => {
         timeout: 5_000,
       });
 
-      // Verify the preference was persisted to localStorage.
+      // Verify the preference was persisted to localStorage as plain "false".
       await expect
-        .poll(() => hostPage.evaluate((key) => localStorage.getItem(key), SOUNDS_STORAGE_KEY), {
+        .poll(() => hostPage.evaluate((key) => localStorage.getItem(key), ENTRY_SOUND_KEY), {
           timeout: 5_000,
         })
-        .toBe(ENCODED_FALSE);
+        .toBe(STORED_FALSE);
     } finally {
       await browser1.close();
+    }
+  });
+
+  test("exit sound toggle persists to localStorage", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_jls_exit_persist_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "exit-sound-host@videocall.rs",
+        "ExitSoundHost",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+
+      // Host starts the meeting alone.
+      await navigateToMeeting(hostPage, meetingId, "ExitSoundHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Hover the action bar to reveal controls (autohide may be active).
+      await hostPage.locator(".video-controls-container").hover();
+
+      // Open the device settings modal and go to the Appearance tab.
+      await hostPage.locator('[data-testid="open-settings"]').click();
+      await expect(hostPage.locator(".device-settings-modal")).toBeVisible({
+        timeout: 10_000,
+      });
+      await hostPage.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
+      await expect(hostPage.locator("#settings-panel-appearance")).toBeVisible({
+        timeout: 5_000,
+      });
+
+      // The exit sound toggle should default to checked (enabled).
+      const exitSoundInput = hostPage.locator("#exit-sound-toggle");
+      await expect(exitSoundInput).toBeChecked();
+
+      // Click the visible `for=` label to uncheck it (the checkbox is visually
+      // hidden behind the custom switch UI).
+      await hostPage.locator('#settings-panel-appearance label[for="exit-sound-toggle"]').click();
+      await expect(exitSoundInput).not.toBeChecked({ timeout: 5_000 });
+
+      // Close the settings modal.
+      await hostPage.locator('button[aria-label="Close settings"]').click();
+      await expect(hostPage.locator(".device-settings-modal")).not.toBeVisible({
+        timeout: 5_000,
+      });
+
+      // Verify the exit-sound preference was persisted (plain "false"), and
+      // that toggling it did NOT touch the entry-sound key.
+      await expect
+        .poll(() => hostPage.evaluate((key) => localStorage.getItem(key), EXIT_SOUND_KEY), {
+          timeout: 5_000,
+        })
+        .toBe(STORED_FALSE);
+      const entrySoundStored = await hostPage.evaluate(
+        (key) => localStorage.getItem(key),
+        ENTRY_SOUND_KEY,
+      );
+      expect(entrySoundStored).not.toBe(STORED_FALSE);
+    } finally {
+      await browser1.close();
+    }
+  });
+
+  test("disabling the exit message leaves the entry message firing", async ({ baseURL }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_jln_exit_off_entry_on_${Date.now()}`;
+
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+    const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+
+    // This is independence guarantee, exercised in the direction the e2e
+    // harness can reliably observe: the join toast.
+    //
+    // We disable ONLY the exit message and leave the entry message at its
+    // default (enabled). The host must STILL see a join toast when a guest
+    // arrives. If `on_peer_joined` were cross-wired to the exit flag (or the
+    // two directions shared a single flag, the pre-split behavior), disabling
+    // exit would suppress the join toast and this test would fail -- so it is
+    // mutation-sensitive to a regression of the split. Its complement, the
+    // "join notification suppressed when disabled" test above, seeds the entry
+    // key and asserts the join toast is gone; together they pin both directions.
+    //
+    // The mirror behavioral direction (exit message fires while entry is off)
+    // cannot be asserted in e2e: the "left the meeting" toast is currently
+    // suppressed in the harness by a videocall-client callback-ordering bug --
+    // see the two skipped leave-toast tests in toast-notifications.spec.ts. The
+    // exit gating + legacy migration are instead pinned by the pure-function
+    // unit tests in context.rs (notification_prefs_*).
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-exitoff@videocall.rs",
+        "ExitOffHost",
+        uiURL,
+      );
+      const guestCtx = await createAuthenticatedContext(
+        browser2,
+        "guest-exitoff@videocall.rs",
+        "ExitOffGuest",
+        uiURL,
+      );
+
+      // Disable ONLY the exit message before load (plain-text "false").
+      await hostCtx.addInitScript((value: string) => {
+        localStorage.setItem("vc_appearance_exit_notifications", value);
+      }, STORED_FALSE);
+
+      const hostPage = await hostCtx.newPage();
+      const guestPage = await guestCtx.newPage();
+
+      // Host starts the meeting.
+      await navigateToMeeting(hostPage, meetingId, "ExitOffHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Confirm the seed actually landed as the disabled value the app reads
+      // (guards against a re-encoding regression making the seed a no-op).
+      const exitStored = await hostPage.evaluate(
+        (key) => localStorage.getItem(key),
+        EXIT_NOTIFICATIONS_KEY,
+      );
+      expect(exitStored).toBe(STORED_FALSE);
+
+      // Start polling for the join toast BEFORE the guest joins so we don't
+      // miss it if PARTICIPANT_JOINED fires quickly.
+      const hostJoinedToast = hostPage.locator(".peer-toast", {
+        hasText: "joined the meeting",
+      });
+      const toastPromise = expect(hostJoinedToast.first()).toBeVisible({ timeout: 30_000 });
+
+      // Guest joins and is admitted.
+      await navigateToMeeting(guestPage, meetingId, "ExitOffGuest");
+      const guestResult = await joinMeetingFromPage(guestPage);
+      await admitGuestIfNeeded(hostPage, guestPage, guestResult);
+
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+      await expect(guestPage.locator("#grid-container")).toBeVisible({ timeout: 10_000 });
+
+      // The join toast MUST still appear despite the exit message being off.
+      await toastPromise;
+      const firstToast = hostJoinedToast.first();
+      await expect(firstToast.locator(".toast-action")).toContainText("joined the meeting");
+    } finally {
+      await browser1.close();
+      await browser2.close();
     }
   });
 });

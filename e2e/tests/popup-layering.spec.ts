@@ -459,4 +459,62 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
       .poll(() => page.evaluate(() => document.activeElement?.id ?? ""))
       .toBe("peer-list-trigger");
   });
+
+  test("pressing Escape closes density popover", async ({ page }) => {
+    await joinMeeting(page, "escape_closes_density");
+
+    await openDensityPopover(page);
+    await expect(page.locator(".density-popover")).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".density-popover")).not.toBeVisible({ timeout: 3_000 });
+  });
+
+  // Standing coverage for the dock menu's pre-existing Escape handler
+  // (attendants.rs:7627-7632). Not added by #1777 but pinned here for
+  // regression safety alongside the new density/mock-peers tests.
+  test("pressing Escape closes dock menu", async ({ page }) => {
+    await joinMeeting(page, "escape_closes_dock");
+
+    await openDockMenu(page);
+    await expect(page.locator(".glass-select-menu")).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".glass-select-menu")).not.toBeVisible({ timeout: 3_000 });
+  });
+
+  test("pressing Escape closes mock-peers popover", async ({ page }) => {
+    await joinMeeting(page, "escape_closes_mock_peers");
+
+    await page.locator(".video-controls-container").hover();
+    const mockBtn = page
+      .locator(".video-controls-container button")
+      .filter({ has: page.locator('.tooltip:has-text("Mock Peers")') });
+
+    // Skip if mock peers button doesn't exist (env-gated to debug builds)
+    if ((await mockBtn.count()) === 0) {
+      test.skip();
+      return;
+    }
+
+    await mockBtn.first().click();
+    await expect(page.locator(".mock-peers-popover")).toBeVisible({ timeout: 5_000 });
+
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".mock-peers-popover")).not.toBeVisible({ timeout: 3_000 });
+  });
+
+  test("Escape-closing density popover restores focus to trigger", async ({ page }) => {
+    await joinMeeting(page, "escape_restores_density_focus");
+
+    await openDensityPopover(page);
+    await expect(page.locator(".density-popover")).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(page.locator(".density-popover")).not.toBeVisible({ timeout: 3_000 });
+
+    // Focus must land on the density trigger, not on <body>
+    const trigger = page.locator("#density-mode-trigger");
+    await expect(trigger).toBeFocused({ timeout: 3_000 });
+  });
 });

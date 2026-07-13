@@ -112,13 +112,10 @@ test.describe("Action bar customize mode", () => {
       return;
     }
 
-    // Record initial CSS order values
-    const initialOrders = await slots.evaluateAll((els) =>
-      els.map((el) => {
-        const style = el.getAttribute("style") || "";
-        const match = style.match(/order:\s*(\d+)/);
-        return match ? parseInt(match[1], 10) : 0;
-      }),
+    // Record initial slot sequence by slug (DOM order == visual order in the
+    // keyed render model).
+    const initialSequence = await slots.evaluateAll((els) =>
+      els.map((el) => (el as HTMLElement).getAttribute("data-slot") || ""),
     );
 
     // Get bounding box of first and second slot to perform a drag
@@ -186,15 +183,49 @@ test.describe("Action bar customize mode", () => {
     ];
     expect(layout.slots).not.toEqual(DEFAULT_LAYOUT);
 
-    // And the live CSS `order` values must differ from before the drag too.
-    const postOrders = await slots.evaluateAll((els) =>
-      els.map((el) => {
-        const style = el.getAttribute("style") || "";
-        const match = style.match(/order:\s*(\d+)/);
-        return match ? parseInt(match[1], 10) : 0;
-      }),
+    // The visible slot sequence must have changed too.
+    const postSequence = await slots.evaluateAll((els) =>
+      els.map((el) => (el as HTMLElement).getAttribute("data-slot") || ""),
     );
-    expect(JSON.stringify(postOrders)).not.toEqual(JSON.stringify(initialOrders));
+    expect(JSON.stringify(postSequence)).not.toEqual(JSON.stringify(initialSequence));
+
+    // Acceptance guard for #1761: after drag reorder, DOM traversal order
+    // must match visual order for the draggable slot set.
+    const dragOrderParity = await slots.evaluateAll((els) => {
+      const entries = els.map((el, domIdx) => {
+        const node = el as HTMLElement;
+        const rect = node.getBoundingClientRect();
+        return {
+          slot: node.getAttribute("data-slot") || "",
+          domIdx,
+          x: rect.left + rect.width / 2,
+          y: rect.top + rect.height / 2,
+        };
+      });
+      const dom = entries.map((e) => e.slot);
+      if (entries.length <= 1) {
+        return { dom, visual: dom };
+      }
+      const nav = (els[0] as HTMLElement).closest(
+        ".video-controls-container",
+      ) as HTMLElement | null;
+      const flexDirection = nav ? window.getComputedStyle(nav).flexDirection : "row";
+      const isRow = flexDirection.startsWith("row");
+      const isReverse = flexDirection.endsWith("reverse");
+      const visual = [...entries]
+        .sort((a, b) => {
+          if (isRow) {
+            return isReverse ? b.x - a.x : a.x - b.x;
+          }
+          return isReverse ? b.y - a.y : a.y - b.y;
+        })
+        .map((e) => e.slot);
+      return { dom, visual };
+    });
+    expect(
+      dragOrderParity.dom,
+      `after drag reorder, DOM order must match visual order (DOM=${dragOrderParity.dom.join(" -> ")}, visual=${dragOrderParity.visual.join(" -> ")})`,
+    ).toEqual(dragOrderParity.visual);
   });
 
   test("removed slot stays removed after page reload", async ({ page }) => {
@@ -220,11 +251,11 @@ test.describe("Action bar customize mode", () => {
       return;
     }
 
-    // Record the `order` CSS value of the slot we will remove so we can prove
-    // the SAME slot stays gone post-reload, not just "some slot is missing".
-    const firstSlotOrder = await secondarySlots.first().evaluate((el) => {
-      return window.getComputedStyle(el as HTMLElement).order;
-    });
+    // Record the slug of the slot we remove so we can prove the SAME slot
+    // stays gone post-reload, not just "some slot is missing".
+    const firstSlotSlug = await secondarySlots
+      .first()
+      .evaluate((el) => (el as HTMLElement).getAttribute("data-slot") || "");
 
     const removeBtn = page
       .locator(
@@ -272,13 +303,13 @@ test.describe("Action bar customize mode", () => {
       `removed slot resurrected on reload (initial=${initialCount}, afterRemove=${countBeforeReload}, afterReload=${countAfterReload})`,
     ).toBe(countBeforeReload);
 
-    const ordersAfterReload = await page
+    const slotsAfterReload = await page
       .locator(".video-controls-container .action-bar-slot-wrapper.slot-secondary")
-      .evaluateAll((els) => els.map((el) => window.getComputedStyle(el as HTMLElement).order));
+      .evaluateAll((els) => els.map((el) => (el as HTMLElement).getAttribute("data-slot") || ""));
     expect(
-      ordersAfterReload,
-      `the removed slot (order=${firstSlotOrder}) reappeared after reload`,
-    ).not.toContain(firstSlotOrder);
+      slotsAfterReload,
+      `the removed slot (slot=${firstSlotSlug}) reappeared after reload`,
+    ).not.toContain(firstSlotSlug);
   });
 
   test("Mic and Camera have no remove button (non-removable)", async ({ page }) => {
@@ -293,27 +324,23 @@ test.describe("Action bar customize mode", () => {
 
     await enterCustomizeMode(page);
 
-    // Even with customize mode active, the Mic (order=0) and Camera (order=1)
-    // slots must NOT contain a `.action-bar-remove-btn` child. Screen share (order=2)
-    // is also slot-primary but IS removable, so we don't blanket-assert on
-    // .slot-primary; we identify Mic/Camera by their CSS `order`.
+    // Even with customize mode active, Mic and Camera slots must NOT contain
+    // a `.action-bar-remove-btn` child.
     const slotsWithRemove = await page
       .locator(".video-controls-container .action-bar-slot-wrapper")
       .evaluateAll((els) =>
         els
           .map((el) => ({
-            order: window.getComputedStyle(el as HTMLElement).order,
+            slot: (el as HTMLElement).getAttribute("data-slot") || "",
             hasRemove: !!(el as HTMLElement).querySelector(".action-bar-remove-btn"),
           }))
-          .filter((s) => s.order === "0" || s.order === "1"),
+          .filter((s) => s.slot === "mic" || s.slot === "camera"),
       );
-    // Mic at order=0 and Camera at order=1 must both be present and must
+    // Mic and Camera must both be present and must
     // both have NO remove button.
     expect(slotsWithRemove.length, "Mic and Camera must both be in the bar").toBe(2);
     for (const s of slotsWithRemove) {
-      expect(s.hasRemove, `slot at order=${s.order} (Mic/Camera) must have no remove button`).toBe(
-        false,
-      );
+      expect(s.hasRemove, `slot=${s.slot} (Mic/Camera) must have no remove button`).toBe(false);
     }
   });
 
@@ -336,16 +363,15 @@ test.describe("Action bar customize mode", () => {
     await page.locator(".video-controls-container").hover();
     await page.waitForTimeout(300);
 
-    // Snapshot every visible direct child of the controls container, keyed
-    // by its CSS `order:` value (stable across the customize toggle because
-    // the underlying layout is the default in both snapshots — DOM source
-    // order is NOT stable because flex `order` decides visual position).
-    type BoxSnapshot = { order: number; x: number; y: number };
+    // Snapshot every visible direct child of the controls container keyed by
+    // stable identifiers (`data-slot` for slots, semantic tags for fixed
+    // wrappers) so comparisons are robust without CSS `order`.
+    type BoxSnapshot = { tag: string; x: number; y: number };
     const snapshot = async (): Promise<BoxSnapshot[]> =>
       page.evaluate(() => {
         const container = document.querySelector(".video-controls-container");
         if (!container) return [];
-        const out: { order: number; x: number; y: number }[] = [];
+        const out: { tag: string; x: number; y: number }[] = [];
         for (const child of Array.from(container.children)) {
           const el = child as HTMLElement;
           // Skip non-rendered (display:none) children.
@@ -353,10 +379,16 @@ test.describe("Action bar customize mode", () => {
           if (computed.display === "none" || computed.visibility === "hidden") continue;
           const rect = el.getBoundingClientRect();
           if (rect.width === 0 && rect.height === 0) continue;
-          const orderStr = computed.order || "0";
-          const order = parseInt(orderStr, 10);
-          if (Number.isNaN(order)) continue;
-          out.push({ order, x: rect.x, y: rect.y });
+          const dataSlot = el.getAttribute("data-slot");
+          const cls = el.className || "";
+          let tag = dataSlot ?? "";
+          if (!tag) {
+            if (cls.includes("dock-position-wrapper")) tag = "__done_or_dock";
+            else if (cls.includes("hangup-wrapper")) tag = "__hangup";
+            else if (cls.includes("action-bar-mock-peers-wrapper")) tag = "__mockpeers";
+            else tag = `__unknown(${cls})`;
+          }
+          out.push({ tag, x: rect.x, y: rect.y });
         }
         return out;
       });
@@ -377,17 +409,17 @@ test.describe("Action bar customize mode", () => {
     // `controls-secondary` wrapper / `display:contents` regression.
     const TOLERANCE_PX = 1.5;
     for (const b of before) {
-      const a = after.find((x) => x.order === b.order);
-      expect(a, `slot with order=${b.order} disappeared after entering customize`).toBeTruthy();
+      const a = after.find((x) => x.tag === b.tag);
+      expect(a, `slot ${b.tag} disappeared after entering customize`).toBeTruthy();
       const dx = Math.abs((a as BoxSnapshot).x - b.x);
       const dy = Math.abs((a as BoxSnapshot).y - b.y);
       expect(
         dx,
-        `slot with order=${b.order} moved horizontally by ${dx}px when entering customize mode`,
+        `slot ${b.tag} moved horizontally by ${dx}px when entering customize mode`,
       ).toBeLessThanOrEqual(TOLERANCE_PX);
       expect(
         dy,
-        `slot with order=${b.order} moved vertically by ${dy}px when entering customize mode`,
+        `slot ${b.tag} moved vertically by ${dy}px when entering customize mode`,
       ).toBeLessThanOrEqual(TOLERANCE_PX);
     }
   });
@@ -508,6 +540,13 @@ test.describe("Action bar customize mode", () => {
       afterScreenIdx,
       `Screen share did not move right by exactly one on a single ArrowRight (before=${beforeScreenIdx}, after=${afterScreenIdx})`,
     ).toBe(beforeScreenIdx + 1);
+
+    // Focus must stay on the moved slot so Tab continues from that control
+    // instead of restarting navigation from the beginning of the bar.
+    const movedScreenButton = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="screen"] > button')
+      .first();
+    await expect(movedScreenButton).toBeFocused({ timeout: 2_000 });
 
     // The keyboard move must persist without needing to press Done — every
     // arrow keystroke saves. Verifies the handler calls save_action_bar_layout.
@@ -713,28 +752,13 @@ test.describe("Action bar customize mode", () => {
     }
   });
 
-  test("Tab order in the default layout follows the visual left-to-right bar order", async ({
+  test("Tab order follows the visual left-to-right bar order after keyboard reorder", async ({
     page,
   }) => {
-    // Scope note: this test CLEARS `vc_action_bar_layout` and reloads, so
-    // it validates only the DEFAULT layout. After a user drags or
-    // keyboard-reorders a slot, DOM order for the customizable slots
-    // still follows fixed source order (see the deferred follow-up:
-    // "a11y: Tab order stops matching visual bar after a user reorders
-    // action-bar slots"), so the property asserted below is intentionally
-    // false in that state and is NOT what this test claims to guard.
-    //
-    // Live-tester report: "after density mode I jump to the Done button,
-    // but between density and done there are 3 buttons". Root cause: the
-    // dock-position-wrapper (which becomes the Done button in customize
-    // mode) and the mock-peers-wrapper were declared in source order
-    // BETWEEN DensityMode and Diagnostics, so DOM order was
-    //     Mic, Camera, SS, PL, DM, Done, MockPeers, Diag, DS, MO, Hang
-    // even though CSS `order: 90/91/99` placed Done/MockPeers/HangUp visually
-    // at the end. Since Tab follows DOM order (not CSS `order:`), Tab from
-    // DensityMode jumped straight to Done. The fix moves the Done and
-    // MockPeers wrappers to AFTER MeetingOptions in source order so DOM
-    // order matches the default visual order.
+    // Regression guard for customized layouts: after a real keyboard reorder,
+    // the DOM (Tab) sequence must still match the visual left-to-right order.
+    // This fails on the old source-order-only rendering where only CSS order
+    // changed after reorder.
     await joinMeeting(page, "kbd_tab_order_matches_visual");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
     await page.reload();
@@ -744,6 +768,33 @@ test.describe("Action bar customize mode", () => {
     // Hover to expand so all slots render.
     await page.locator(".video-controls-container").hover();
     await page.waitForTimeout(300);
+
+    const readSlotOrder = async () =>
+      page
+        .locator(".video-controls-container .action-bar-slot-wrapper[data-slot]")
+        .evaluateAll((els) =>
+          els
+            .map((el) => ({
+              slot: el.getAttribute("data-slot") as string,
+              order: parseInt(window.getComputedStyle(el as HTMLElement).order || "0", 10),
+            }))
+            .sort((a, b) => a.order - b.order)
+            .map((s) => s.slot),
+        );
+
+    const before = await readSlotOrder();
+    const screenBtn = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="screen"] > button')
+      .first();
+    await expect(screenBtn).toBeVisible({ timeout: 5_000 });
+    await screenBtn.focus();
+    await expect(screenBtn).toBeFocused();
+    await page.keyboard.press("ArrowRight");
+    await page.waitForTimeout(150);
+
+    const after = await readSlotOrder();
+    expect(after.indexOf("screen")).toBe(before.indexOf("screen") + 1);
+    expect(after).not.toEqual(before);
 
     // Gather (DOM index, visual order, tag) for every focusable button
     // inside the controls container. Then assert that iterating DOM order
@@ -906,7 +957,7 @@ test.describe("Action bar customize mode", () => {
     // if the "Customize" option is not activatable by keyboard. This test
     // exercises the full path: focus trigger → Space to open → arrow to
     // Customize → Enter to activate → assert customize-mode is on and
-    // focus lands on the Done button (so the user can escape back out).
+    // focus lands on the first slot button (Mic/Sound by default).
     await joinMeeting(page, "kbd_enter_customize");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
     await page.reload();
@@ -939,15 +990,66 @@ test.describe("Action bar customize mode", () => {
     // The dock menu is closed.
     await expect(page.locator(".glass-select-menu")).not.toBeVisible({ timeout: 3_000 });
 
-    // Focus was moved to the Done button (which replaced the dock trigger
-    // in customize mode) — the keyboard user has an obvious way out.
-    const done = page.locator("button.action-bar-done-trigger");
+    // Focus should land on the first user-facing slot button (Mic/Sound)
+    // so keyboard navigation proceeds left-to-right from the start of the
+    // action bar, not from Done.
+    const micButton = page.locator(
+      '.video-controls-container .action-bar-slot-wrapper[data-slot="mic"] > button.video-control-button',
+    );
     await expect(
-      done,
-      "Focus must land on the Done button after entering customize mode",
+      micButton,
+      "Focus must land on the Mic/Sound slot after entering customize mode",
     ).toBeFocused({
       timeout: 3_000,
     });
+  });
+
+  test("re-entering customize mode still focuses Mic/Sound (not Done)", async ({ page }) => {
+    await joinMeeting(page, "kbd_customize_reenter_focus");
+    await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
+    await page.reload();
+    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+    const enterCustomizeViaKeyboard = async () => {
+      await page.locator(".video-controls-container").hover();
+      await page.waitForTimeout(250);
+      const trigger = page.locator("#dock-menu-trigger");
+      await trigger.focus();
+      await page.keyboard.press("Space");
+      await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 3_000 });
+      const customize = page.locator(".dock-position-wrapper .glass-select-option", {
+        hasText: "Customize",
+      });
+      await customize.focus();
+      await page.keyboard.press("Enter");
+      await expect(page.locator(".video-controls-container.customize-mode")).toBeVisible({
+        timeout: 5_000,
+      });
+    };
+
+    const micButton = page.locator(
+      '.video-controls-container .action-bar-slot-wrapper[data-slot="mic"] > button.video-control-button',
+    );
+
+    await enterCustomizeViaKeyboard();
+    await expect(micButton).toBeFocused({ timeout: 3_000 });
+
+    // Exit customize mode through Done and verify focus is restored to trigger.
+    const doneBtn = page.locator("button.action-bar-done-trigger");
+    await expect(doneBtn).toBeVisible({ timeout: 3_000 });
+    await doneBtn.focus();
+    await page.keyboard.press("Enter");
+    await expect(page.locator(".video-controls-container.customize-mode")).not.toBeVisible({
+      timeout: 5_000,
+    });
+    await expect(page.locator("#dock-menu-trigger")).toBeFocused({ timeout: 3_000 });
+
+    // Second entry must behave exactly like the first.
+    await enterCustomizeViaKeyboard();
+    await expect(
+      micButton,
+      "Focus must still land on Mic/Sound after re-entering customize mode",
+    ).toBeFocused({ timeout: 3_000 });
   });
 
   test("keyboard user can reset the action bar via the dock menu (Space on Reset to Default)", async ({

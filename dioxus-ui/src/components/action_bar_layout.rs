@@ -286,10 +286,6 @@ pub fn remove_action_bar_layout() {
     }
 }
 
-pub fn slot_index(slots: &[ActionBarSlot], slot: ActionBarSlot) -> Option<usize> {
-    slots.iter().position(|s| *s == slot)
-}
-
 /// Result of a keyboard-reorder attempt on the action-bar. `old_idx` is the
 /// slot's position before the keystroke; `new_idx` is its position after.
 /// When they are equal the caller MUST NOT persist and should still announce

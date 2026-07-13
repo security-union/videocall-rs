@@ -18,7 +18,7 @@
 
 use crate::components::action_bar_layout::{
     apply_keyboard_reorder, load_action_bar_layout, remove_action_bar_layout,
-    save_action_bar_layout, slot_index, ActionBarSlot, DEFAULT_SLOTS,
+    save_action_bar_layout, ActionBarSlot, DEFAULT_SLOTS,
 };
 use crate::components::decode_budget::{
     decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
@@ -934,10 +934,7 @@ fn focus_glass_option_relative(delta: i32) {
     }
 }
 
-/// Focus the first element matching `selector`. Used to move focus onto a
-/// button that is only rendered by a state transition the caller just made
-/// (e.g. focusing the `.action-bar-done-trigger` after `customize_mode.set(true)`
-/// swaps out the dock-menu trigger for the Done button on next render).
+/// Focus the first element matching `selector`.
 fn focus_by_selector(selector: &str) {
     if let Some(el) = web_sys::window()
         .and_then(|w| w.document())
@@ -947,6 +944,100 @@ fn focus_by_selector(selector: &str) {
             let _ = html.focus();
         }
     }
+}
+
+/// Focus the first actionable slot button in the action bar. Prefer Mic
+/// (`data-slot="mic"`) so keyboard navigation starts at the default first
+/// user-facing control; fall back to the first enabled (or first present)
+/// slot button if Mic is unavailable.
+fn focus_first_action_bar_button() {
+    let selectors = [
+        ".video-controls-container .action-bar-slot-wrapper[data-slot=\"mic\"] > button.video-control-button:not([disabled])",
+        ".video-controls-container .action-bar-slot-wrapper[data-slot] > button.video-control-button:not([disabled])",
+        ".video-controls-container .action-bar-slot-wrapper[data-slot=\"mic\"] > button.video-control-button",
+        ".video-controls-container .action-bar-slot-wrapper[data-slot] > button.video-control-button",
+    ];
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    for selector in selectors {
+        if let Ok(Some(el)) = doc.query_selector(selector) {
+            if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
+                let _ = html.focus();
+                return;
+            }
+        }
+    }
+}
+
+fn is_action_bar_slot_visible(
+    slot: ActionBarSlot,
+    customize_mode: bool,
+    ios_device: bool,
+    has_screen_share: bool,
+    is_owner: bool,
+) -> bool {
+    match slot {
+        ActionBarSlot::ScreenShare => customize_mode || !ios_device,
+        ActionBarSlot::DensityMode => customize_mode || !has_screen_share,
+        ActionBarSlot::MeetingOptions => is_owner,
+        _ => true,
+    }
+}
+
+fn visible_action_bar_slots(
+    slots: &[ActionBarSlot],
+    customize_mode: bool,
+    ios_device: bool,
+    has_screen_share: bool,
+    is_owner: bool,
+) -> Vec<ActionBarSlot> {
+    slots
+        .iter()
+        .copied()
+        .filter(|slot| {
+            is_action_bar_slot_visible(
+                *slot,
+                customize_mode,
+                ios_device,
+                has_screen_share,
+                is_owner,
+            )
+        })
+        .collect()
+}
+
+fn merge_visible_action_bar_slots(
+    full_slots: &[ActionBarSlot],
+    reordered_visible_slots: &[ActionBarSlot],
+    customize_mode: bool,
+    ios_device: bool,
+    has_screen_share: bool,
+    is_owner: bool,
+) -> Vec<ActionBarSlot> {
+    let mut visible_idx = 0usize;
+    full_slots
+        .iter()
+        .copied()
+        .map(|slot| {
+            if is_action_bar_slot_visible(
+                slot,
+                customize_mode,
+                ios_device,
+                has_screen_share,
+                is_owner,
+            ) {
+                let mapped_slot = reordered_visible_slots
+                    .get(visible_idx)
+                    .copied()
+                    .unwrap_or(slot);
+                visible_idx += 1;
+                mapped_slot
+            } else {
+                slot
+            }
+        })
+        .collect()
 }
 
 /// Returns true if the keyboard event carries an "activate this option" key:
@@ -1099,6 +1190,24 @@ pub fn AttendantsComponent(
             }
         });
     }
+
+    // Always seed keyboard focus on customize-mode entry at the first
+    // actionable slot button (Mic/Sound by default). This runs on every
+    // false->true transition so re-entering customize mode is consistent,
+    // independent of which menu activation path was used.
+    use_effect(move || {
+        if customize_mode() {
+            Timeout::new(0, || {
+                focus_first_action_bar_button();
+            })
+            .forget();
+        }
+    });
+
+    // DOM reorder shim removed: slots are now rendered in
+    // `action_bar_slots` order directly, so DOM order IS visual order
+    // and keyboard Tab order follows naturally without post-render
+    // DOM manipulation.
     let encoder_settings = use_signal(|| None::<String>);
     // Last peer count logged by the meeting-view render log below — lets that
     // log fire only on changes (edge-trigger) instead of every re-render.
@@ -6216,21 +6325,32 @@ pub fn AttendantsComponent(
                     }
                 },
                 onkeydown: move |evt: Event<KeyboardData>| {
-                    // Escape light-dismisses an open side panel and restores focus
-                    // to that panel's action-bar toggle (WAI-ARIA APG disclosure
-                    // pattern) so focus never drops to `<body>` (issue #1790).
-                    //
-                    // If PR #1777 (popover Esc) lands, its popover cases (density,
-                    // mock-peers) belong in this branch ABOVE the panel handling:
-                    // popovers are more transient than panels, so Escape should peel
-                    // them first. The dock menu keeps its own Esc handler.
+                    // Escape light-dismisses the topmost transient surface and
+                    // restores focus to its action-bar toggle (WAI-ARIA APG
+                    // disclosure pattern) so focus never drops to `<body>`. Popovers
+                    // (density, mock-peers) are more transient than the side panels,
+                    // so Escape peels them FIRST (#1777); only when no popover is
+                    // open does it close the topmost side panel — diagnostics, then
+                    // the peer list (issue #1790). The `else if` chain guarantees
+                    // each Escape closes EXACTLY one surface. The dock menu keeps its
+                    // own Esc handler (with stop_propagation).
                     //
                     // The chat drawer is DELIBERATELY excluded from this
                     // light-dismiss: its message composer means a stray background
                     // Escape must not risk discarding an in-progress draft. That is
                     // out of issue-1790 scope.
                     if evt.key() == Key::Escape {
-                        if let Some(target) =
+                        if density_open() {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            density_open.set(false);
+                            focus_element_by_id("density-mode-trigger");
+                        } else if mock_peers_open() {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            mock_peers_open.set(false);
+                            focus_element_by_id("mock-peers-trigger");
+                        } else if let Some(target) =
                             esc_panel_close_target(diagnostics_open(), peer_list_open())
                         {
                             evt.prevent_default();
@@ -7075,9 +7195,17 @@ pub fn AttendantsComponent(
                                         // mode never scrolls the meeting view. Even a no-op key
                                         // (already at the edge) should not scroll.
                                         evt.prevent_default();
-                                        let mut next = action_bar_slots.read().clone();
-                                        let Some(result) = apply_keyboard_reorder(&mut next, slot, delta, absolute) else { return; };
-                                        let len = next.len();
+                                        let ios_device = is_ios();
+                                        let current_full = action_bar_slots.read().clone();
+                                        let mut visible_slots = visible_action_bar_slots(
+                                            &current_full,
+                                            customize_mode(),
+                                            ios_device,
+                                            has_screen_share,
+                                            is_owner,
+                                        );
+                                        let Some(result) = apply_keyboard_reorder(&mut visible_slots, slot, delta, absolute) else { return; };
+                                        let len = visible_slots.len();
                                         if result.new_idx == result.old_idx {
                                             action_bar_announce.set(format!(
                                                 "{} is already at position {} of {}.",
@@ -7087,6 +7215,14 @@ pub fn AttendantsComponent(
                                             ));
                                             return;
                                         }
+                                        let next = merge_visible_action_bar_slots(
+                                            &current_full,
+                                            &visible_slots,
+                                            customize_mode(),
+                                            ios_device,
+                                            has_screen_share,
+                                            is_owner,
+                                        );
                                         action_bar_slots.set(next);
                                         save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
                                         action_bar_announce.set(format!(
@@ -7095,6 +7231,17 @@ pub fn AttendantsComponent(
                                             result.new_idx + 1,
                                             len,
                                         ));
+                                        // Preserve keyboard continuity after reorder: keep
+                                        // focus on the moved slot's primary button so Tab
+                                        // continues from the user's current position.
+                                        let moved_selector = format!(
+                                            ".video-controls-container .action-bar-slot-wrapper[data-slot=\"{}\"] > button.video-control-button",
+                                            slot.slug()
+                                        );
+                                        Timeout::new(0, move || {
+                                            focus_by_selector(&moved_selector);
+                                        })
+                                        .forget();
                                     },
                                     onpointermove: {
                                         let drag_slot_size = drag_slot_size.clone();
@@ -7120,22 +7267,46 @@ pub fn AttendantsComponent(
                                             if slot_size <= 0.0 { return; }
                                             let is_vertical = dock_position() != DockPosition::Bottom;
                                             let dragged = dragging_slot().unwrap();
-                                            // Compute insertion index from ORIGINAL position + cursor delta
+                                            let ios_device = is_ios();
+                                            // Compute insertion index from ORIGINAL visible position +
+                                            // cursor delta so drag math follows the rendered bar order.
                                             let orig_slots = drag_orig_layout();
-                                            let orig_idx = orig_slots.iter().position(|s| *s == dragged).unwrap_or(0);
-                                            let num_slots = action_bar_slots.read().len();
+                                            let orig_visible = visible_action_bar_slots(
+                                                &orig_slots,
+                                                customize_mode(),
+                                                ios_device,
+                                                has_screen_share,
+                                                is_owner,
+                                            );
+                                            let orig_idx = orig_visible.iter().position(|s| *s == dragged).unwrap_or(0);
+                                            let num_slots = orig_visible.len();
+                                            if num_slots == 0 { return; }
                                             let cursor = if is_vertical { cy } else { cx };
                                             let origin = if is_vertical { drag_start_y.get() } else { drag_start_x.get() };
                                             let delta = cursor - origin;
                                             let shift_count = (delta / slot_size).round() as i32;
                                             let new_idx = (orig_idx as i32 + shift_count).clamp(0, num_slots as i32 - 1) as usize;
                                             if drag_insertion_idx() != Some(new_idx) {
-                                                // Live-slots model: actually move the slot in the array
-                                                let mut next = action_bar_slots.read().clone();
-                                                if let Some(cur) = next.iter().position(|s| *s == dragged) {
-                                                    next.remove(cur);
-                                                    next.insert(new_idx.min(next.len()), dragged);
-                                                    action_bar_slots.set(next);
+                                                let current_full = action_bar_slots.read().clone();
+                                                let mut next_visible = visible_action_bar_slots(
+                                                    &current_full,
+                                                    customize_mode(),
+                                                    ios_device,
+                                                    has_screen_share,
+                                                    is_owner,
+                                                );
+                                                if let Some(cur) = next_visible.iter().position(|s| *s == dragged) {
+                                                    next_visible.remove(cur);
+                                                    next_visible.insert(new_idx.min(next_visible.len()), dragged);
+                                                    let next_full = merge_visible_action_bar_slots(
+                                                        &current_full,
+                                                        &next_visible,
+                                                        customize_mode(),
+                                                        ios_device,
+                                                        has_screen_share,
+                                                        is_owner,
+                                                    );
+                                                    action_bar_slots.set(next_full);
                                                 }
                                                 drag_insertion_idx.set(Some(new_idx));
                                             }
@@ -7228,374 +7399,361 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     },
-                                    // Primary: Mic button
-                                    if action_bar_slots.read().contains(&ActionBarSlot::Mic) {
+                                    // Customizable slots: render only the visible subset so every
+                                    // emitted sibling is keyed (no keyed+keyless fragment mix).
+                                    for slot in visible_action_bar_slots(
+                                        &action_bar_slots.read(),
+                                        customize_mode(),
+                                        is_ios(),
+                                        has_screen_share,
+                                        is_owner,
+                                    ) {
                                         {
-                                            let mic_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Mic).unwrap_or(0);
-                                            let mic_style = format!("order: {mic_idx};");
-                                            let mda_mic = mda.clone();
-                                            let drag_slot_size_mic = drag_slot_size.clone();
-                                            let drag_pointer_id_mic = drag_pointer_id.clone();
-                                            let drag_grab_dx_mic = drag_grab_dx.clone();
-                                            let drag_grab_dy_mic = drag_grab_dy.clone();
-                                            let drag_start_x_mic = drag_start_x.clone();
-                                            let drag_start_y_mic = drag_start_y.clone();
-                                            let drag_nav_left_mic = drag_nav_left.clone();
-                                            let drag_nav_top_mic = drag_nav_top.clone();
-                                            rsx! {
-                                                div {
-                                                    // Keyboard reorder a11y (WCAG 2.1.1): the wrapper is
-                                                    // NOT focusable itself. The inner button is already a
-                                                    // real `<button>` and takes focus normally. In
-                                                    // customize mode, ArrowLeft/Right/Up/Down/Home/End
-                                                    // pressed on that focused button bubble to the nav's
-                                                    // onkeydown, which resolves the slot via this
-                                                    // `data-slot` attribute. Adding tabindex here would
-                                                    // create a second tab stop per slot (see live-tester
-                                                    // report: "focus only moves after Tab twice").
-                                                    "data-slot": ActionBarSlot::Mic.slug(),
-                                                    class: if dragging_slot() == Some(ActionBarSlot::Mic) && drag_started() { "action-bar-slot-wrapper slot-primary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-primary" },
-                                                    style: "{mic_style}",
-                                                    onpointerdown: move |evt: PointerEvent| {
-                                                        if !customize_mode() { return; }
-                                                        let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                        let cx = pe.client_x() as f64;
-                                                        let cy = pe.client_y() as f64;
-                                                        drag_start_x_mic.set(cx);
-                                                        drag_start_y_mic.set(cy);
-                                                        drag_started.set(false);
-                                                        drag_pointer_id_mic.set(pe.pointer_id());
-                                                        drag_orig_layout.set(action_bar_slots.read().clone());
-                                                        let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Mic).unwrap_or(0);
-                                                        dragging_slot.set(Some(ActionBarSlot::Mic));
-                                                        drag_pointer_x.set(cx);
-                                                        drag_pointer_y.set(cy);
-                                                        drag_insertion_idx.set(Some(src_idx));
-                                                        // `Event.target` survives after dispatch (currentTarget does not in
-                                                        // Dioxus synthetic handlers). Walk up to the slot wrapper for our rect.
-                                                        if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                            if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                let rect = el.get_bounding_client_rect();
-                                                                drag_grab_dx_mic.set(cx - rect.left());
-                                                                drag_grab_dy_mic.set(cy - rect.top());
-                                                                let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                // Capture on the NAV so its move/up/cancel handlers receive events.
-                                                                if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                    let nrect = nav.get_bounding_client_rect();
-                                                                    drag_nav_left_mic.set(nrect.left());
-                                                                    drag_nav_top_mic.set(nrect.top());
-                                                                    let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                    drag_slot_size_mic.set(size + gap);
-                                                                    let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                }
-                                                            }
-                                                        }
-                                                    },
-                                                    MicButton {
-                                                        enabled: mic_enabled(),
-                                                        available: mic_error.read().is_none(),
-                                                        onclick: move |_| {
-                                                            if customize_mode() { return; }
-                                                            if !mic_enabled() {
-                                                                // Turn the mic ON. If acquisition is blocked
-                                                                // (DeviceInUse), `pending_mic_enable` lets a
-                                                                // later successful probe fulfil the enable;
-                                                                // the background retry loop arms itself off
-                                                                // the error signal alone (see should_auto_retry).
-                                                                if mda_mic.borrow().is_granted(MediaAccessKind::AudioCheck) {
-                                                                    mic_enabled.set(true);
-                                                                } else {
-                                                                    pending_mic_enable.set(true);
-                                                                    mda_mic.borrow().request();
-                                                                }
-                                                            } else {
-                                                                mic_enabled.set(false);
-                                                            }
-                                                        },
-                                                    }
-                                                    // Mic is non-removable (see NON_REMOVABLE_SLOTS): it can be
-                                                    // dragged to reorder, but the remove button is intentionally
-                                                    // not rendered so the user cannot strand themselves
-                                                    // without a mute control mid-call.
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Primary: Camera button
-                                    if action_bar_slots.read().contains(&ActionBarSlot::Camera) {
-                                        {
-                                            let cam_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Camera).unwrap_or(1);
-                                            let cam_style = format!("order: {cam_idx};");
-                                            let mda_cam = mda.clone();
-                                            let drag_slot_size_cam = drag_slot_size.clone();
-                                            let drag_pointer_id_cam = drag_pointer_id.clone();
-                                            let drag_grab_dx_cam = drag_grab_dx.clone();
-                                            let drag_grab_dy_cam = drag_grab_dy.clone();
-                                            let drag_start_x_cam = drag_start_x.clone();
-                                            let drag_start_y_cam = drag_start_y.clone();
-                                            let drag_nav_left_cam = drag_nav_left.clone();
-                                            let drag_nav_top_cam = drag_nav_top.clone();
-                                            rsx! {
-                                                div {
-                                                    "data-slot": ActionBarSlot::Camera.slug(),
-                                                    class: if dragging_slot() == Some(ActionBarSlot::Camera) && drag_started() { "action-bar-slot-wrapper slot-primary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-primary" },
-                                                    style: "{cam_style}",
-                                                    onpointerdown: move |evt: PointerEvent| {
-                                                        if !customize_mode() { return; }
-                                                        let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                        let cx = pe.client_x() as f64;
-                                                        let cy = pe.client_y() as f64;
-                                                        drag_start_x_cam.set(cx);
-                                                        drag_start_y_cam.set(cy);
-                                                        drag_started.set(false);
-                                                        drag_pointer_id_cam.set(pe.pointer_id());
-                                                        drag_orig_layout.set(action_bar_slots.read().clone());
-                                                        let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Camera).unwrap_or(0);
-                                                        dragging_slot.set(Some(ActionBarSlot::Camera));
-                                                        drag_pointer_x.set(cx);
-                                                        drag_pointer_y.set(cy);
-                                                        drag_insertion_idx.set(Some(src_idx));
-                                                        if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                            if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                let rect = el.get_bounding_client_rect();
-                                                                drag_grab_dx_cam.set(cx - rect.left());
-                                                                drag_grab_dy_cam.set(cy - rect.top());
-                                                                let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                    let nrect = nav.get_bounding_client_rect();
-                                                                    drag_nav_left_cam.set(nrect.left());
-                                                                    drag_nav_top_cam.set(nrect.top());
-                                                                    let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                    drag_slot_size_cam.set(size + gap);
-                                                                    let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                }
-                                                            }
-                                                        }
-                                                    },
-                                                    CameraButton {
-                                                        enabled: video_enabled(),
-                                                        available: video_error.read().is_none(),
-                                                        onclick: move |_| {
-                                                            if customize_mode() { return; }
-                                                            if !video_enabled() {
-                                                                // Turn the camera ON. If acquisition is blocked
-                                                                // (DeviceInUse), `pending_video_enable` lets a
-                                                                // later successful probe fulfil the enable;
-                                                                // the background retry loop arms itself off
-                                                                // the error signal alone (see should_auto_retry).
-                                                                if mda_cam.borrow().is_granted(MediaAccessKind::VideoCheck) {
-                                                                    video_enabled.set(true);
-                                                                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                                                                        if let Some(elem) = doc.get_element_by_id("webcam") {
-                                                                            if let Ok(v) = elem.dyn_into::<web_sys::HtmlVideoElement>() {
-                                                                                let _ = v.play();
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    pending_video_enable.set(true);
-                                                                    mda_cam.borrow().request();
-                                                                }
-                                                            } else {
-                                                                video_enabled.set(false);
-                                                            }
-                                                        },
-                                                    }
-                                                    // Camera is non-removable (see NON_REMOVABLE_SLOTS): it can
-                                                    // be dragged to reorder, but the remove button is
-                                                    // intentionally not rendered so the user cannot strand
-                                                    // themselves without a camera-mute control mid-call.
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Secondary buttons: hidden by default, revealed on hover via
-                                    // .slot-secondary. All slots are DIRECT flex children of the nav so
-                                    // flex `order:` resolves in a single context — required for reorder.
-                                    if (customize_mode() || !is_ios()) && action_bar_slots.read().contains(&ActionBarSlot::ScreenShare) {
-                                            {
-                                                let ss_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::ScreenShare).unwrap_or(2);
-                                                let ss_style = format!("order: {ss_idx};");
-                                                let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                                let is_disabled = matches!(
-                                                    screen_share_state(),
-                                                    ScreenShareState::Requesting | ScreenShareState::StreamReady
-                                                );
-                                                let drag_slot_size_ss = drag_slot_size.clone();
-                                                let drag_pointer_id_ss = drag_pointer_id.clone();
-                                                let drag_grab_dx_ss = drag_grab_dx.clone();
-                                                let drag_grab_dy_ss = drag_grab_dy.clone();
-                                                let drag_start_x_ss = drag_start_x.clone();
-                                                let drag_start_y_ss = drag_start_y.clone();
-                                                let drag_nav_left_ss = drag_nav_left.clone();
-                                                let drag_nav_top_ss = drag_nav_top.clone();
+                                        let slug = slot.slug();
+                                                let tier = match slot {
+                                                    ActionBarSlot::Mic | ActionBarSlot::Camera => "slot-primary",
+                                                    _ => "slot-secondary",
+                                                };
+                                                let is_dragging = dragging_slot() == Some(slot) && drag_started();
+                                                let wrapper_class = if is_dragging {
+                                                    format!("action-bar-slot-wrapper {tier} is-drag-placeholder")
+                                                } else {
+                                                    format!("action-bar-slot-wrapper {tier}")
+                                                };
+                                                let drag_slot_size_c = drag_slot_size.clone();
+                                                let drag_pointer_id_c = drag_pointer_id.clone();
+                                                let drag_grab_dx_c = drag_grab_dx.clone();
+                                                let drag_grab_dy_c = drag_grab_dy.clone();
+                                                let drag_start_x_c = drag_start_x.clone();
+                                                let drag_start_y_c = drag_start_y.clone();
+                                                let drag_nav_left_c = drag_nav_left.clone();
+                                                let drag_nav_top_c = drag_nav_top.clone();
                                                 rsx! {
                                                     div {
-                                                        "data-slot": ActionBarSlot::ScreenShare.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::ScreenShare) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{ss_style}",
+                                                        key: "{slug}",
+                                                        "data-slot": slug,
+                                                        class: "{wrapper_class}",
                                                         onpointerdown: move |evt: PointerEvent| {
                                                             if !customize_mode() { return; }
                                                             let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
                                                             let cx = pe.client_x() as f64;
                                                             let cy = pe.client_y() as f64;
-                                                            drag_start_x_ss.set(cx);
-                                                            drag_start_y_ss.set(cy);
+                                                            drag_start_x_c.set(cx);
+                                                            drag_start_y_c.set(cy);
                                                             drag_started.set(false);
-                                                            drag_pointer_id_ss.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::ScreenShare).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::ScreenShare));
+                                                            drag_pointer_id_c.set(pe.pointer_id());
+                                                            let current_full = action_bar_slots.read().clone();
+                                                            drag_orig_layout.set(current_full.clone());
+                                                            let src_visible = visible_action_bar_slots(
+                                                                &current_full,
+                                                                customize_mode(),
+                                                                is_ios(),
+                                                                has_screen_share,
+                                                                is_owner,
+                                                            );
+                                                            let src_idx = src_visible.iter().position(|s| *s == slot).unwrap_or(0);
+                                                            dragging_slot.set(Some(slot));
                                                             drag_pointer_x.set(cx);
                                                             drag_pointer_y.set(cy);
                                                             drag_insertion_idx.set(Some(src_idx));
                                                             if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
                                                                 if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
                                                                     let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_ss.set(cx - rect.left());
-                                                                    drag_grab_dy_ss.set(cy - rect.top());
+                                                                    drag_grab_dx_c.set(cx - rect.left());
+                                                                    drag_grab_dy_c.set(cy - rect.top());
                                                                     let is_vertical = dock_position() != DockPosition::Bottom;
                                                                     let size = if is_vertical { rect.height() } else { rect.width() };
                                                                     if let Ok(Some(nav)) = el.closest(".video-controls-container") {
                                                                         let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_ss.set(nrect.left());
-                                                                        drag_nav_top_ss.set(nrect.top());
+                                                                        drag_nav_left_c.set(nrect.left());
+                                                                        drag_nav_top_c.set(nrect.top());
                                                                         let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_ss.set(size + gap);
+                                                                        drag_slot_size_c.set(size + gap);
                                                                         let _ = nav.set_pointer_capture(pe.pointer_id());
                                                                     }
                                                                 }
                                                             }
                                                         },
-                                                        ScreenShareButton {
-                                                            active: is_active,
-                                                            // Do NOT set `disabled` from customize_mode.
-                                                            // The HTML `disabled` attribute strips the
-                                                            // button from the tab order, which is what
-                                                            // caused Tab to skip ScreenShare in customize
-                                                            // mode (live report: "Tab doesn't work for
-                                                            // screen share, only for its remove"). Every
-                                                            // other slot stays focusable in customize
-                                                            // mode and relies on CSS `pointer-events:none`
-                                                            // (via `.customize-mode .action-bar-slot-wrapper
-                                                            // > .video-control-button`) plus the
-                                                            // `if customize_mode() { return; }` guard in
-                                                            // the onclick below for click-inertness.
-                                                            disabled: is_disabled,
-                                                            onclick: {
-                                                                let stream_cell = pre_acquired_screen_stream.clone();
-                                                                move |_| {
-                                                                    if customize_mode() { return; }
-                                                                    if matches!(screen_share_state(), ScreenShareState::Idle) {
-                                                                        let navigator = gloo_utils::window().navigator();
-                                                                        let media_devices = match navigator.media_devices() {
-                                                                            Ok(md) => md,
-                                                                            Err(e) => {
-                                                                                log::error!("Failed to get media devices: {e:?}");
-                                                                                return;
-                                                                            }
-                                                                        };
-
-                                                                        let width_constraint = js_sys::Object::new();
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &width_constraint,
-                                                                            &JsValue::from_str("ideal"),
-                                                                            &JsValue::from_f64(1920.0),
-                                                                        );
-                                                                        let height_constraint = js_sys::Object::new();
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &height_constraint,
-                                                                            &JsValue::from_str("ideal"),
-                                                                            &JsValue::from_f64(1080.0),
-                                                                        );
-                                                                        let framerate_constraint = js_sys::Object::new();
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &framerate_constraint,
-                                                                            &JsValue::from_str("ideal"),
-                                                                            &JsValue::from_f64(10.0),
-                                                                        );
-                                                                        let video_constraints = js_sys::Object::new();
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &video_constraints,
-                                                                            &JsValue::from_str("width"),
-                                                                            &width_constraint.into(),
-                                                                        );
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &video_constraints,
-                                                                            &JsValue::from_str("height"),
-                                                                            &height_constraint.into(),
-                                                                        );
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &video_constraints,
-                                                                            &JsValue::from_str("frameRate"),
-                                                                            &framerate_constraint.into(),
-                                                                        );
-
-                                                                        let constraints = web_sys::DisplayMediaStreamConstraints::new();
-                                                                        constraints.set_video(&video_constraints.into());
-                                                                        constraints.set_audio(&JsValue::FALSE);
-
-                                                                        let promise = match media_devices
-                                                                            .get_display_media_with_constraints(&constraints)
-                                                                        {
-                                                                            Ok(p) => p,
-                                                                            Err(e) => {
-                                                                                log::error!("getDisplayMedia failed synchronously: {e:?}");
-                                                                                return;
-                                                                            }
-                                                                        };
-                                                                        screen_share_state.set(ScreenShareState::Requesting);
-                                                                        let cell = stream_cell.clone();
-                                                                        wasm_bindgen_futures::spawn_local(async move {
-                                                                            match JsFuture::from(promise).await {
-                                                                                Ok(stream) => {
-                                                                                    let media_stream: web_sys::MediaStream = stream
-                                                                                        .unchecked_into();
-                                                                                    cell.borrow_mut().replace(media_stream);
-                                                                                    screen_share_state.set(ScreenShareState::StreamReady);
+                                                        // Slot-specific inner content
+                                                        match slot {
+                                                            ActionBarSlot::Mic => {
+                                                                let mda_mic = mda.clone();
+                                                                rsx! {
+                                                                    MicButton {
+                                                                        enabled: mic_enabled(),
+                                                                        available: mic_error.read().is_none(),
+                                                                        onclick: move |_| {
+                                                                            if customize_mode() { return; }
+                                                                            if !mic_enabled() {
+                                                                                // Turn the mic ON. If acquisition is blocked
+                                                                                // (DeviceInUse), `pending_mic_enable` lets a
+                                                                                // later successful probe fulfil the enable;
+                                                                                // the background retry loop arms itself off
+                                                                                // the error signal alone (see should_auto_retry).
+                                                                                if mda_mic.borrow().is_granted(MediaAccessKind::AudioCheck) {
+                                                                                    mic_enabled.set(true);
+                                                                                } else {
+                                                                                    pending_mic_enable.set(true);
+                                                                                    mda_mic.borrow().request();
                                                                                 }
-                                                                                Err(e) => {
-                                                                                    let is_cancel = js_sys::Reflect::get(
-                                                                                            &e,
-                                                                                            &JsValue::from_str("name"),
-                                                                                        )
-                                                                                        .ok()
-                                                                                        .and_then(|v| v.as_string())
-                                                                                        .map(|n| n == "NotAllowedError")
-                                                                                        .unwrap_or(false);
-                                                                                    if is_cancel {
-                                                                                        log::info!("User cancelled screen sharing");
-                                                                                    } else {
-                                                                                        log::error!("getDisplayMedia rejected: {e:?}");
+                                                                            } else {
+                                                                                mic_enabled.set(false);
+                                                                            }
+                                                                        },
+                                                                    }
+                                                                }
+                                                            }
+                                                            ActionBarSlot::Camera => {
+                                                                let mda_cam = mda.clone();
+                                                                rsx! {
+                                                                    CameraButton {
+                                                                        enabled: video_enabled(),
+                                                                        available: video_error.read().is_none(),
+                                                                        onclick: move |_| {
+                                                                            if customize_mode() { return; }
+                                                                            if !video_enabled() {
+                                                                                // Turn the camera ON. If acquisition is blocked
+                                                                                // (DeviceInUse), `pending_video_enable` lets a
+                                                                                // later successful probe fulfil the enable;
+                                                                                // the background retry loop arms itself off
+                                                                                // the error signal alone (see should_auto_retry).
+                                                                                if mda_cam.borrow().is_granted(MediaAccessKind::VideoCheck) {
+                                                                                    video_enabled.set(true);
+                                                                                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                                                                                        if let Some(elem) = doc.get_element_by_id("webcam") {
+                                                                                            if let Ok(v) = elem.dyn_into::<web_sys::HtmlVideoElement>() {
+                                                                                                let _ = v.play();
+                                                                                            }
+                                                                                        }
                                                                                     }
-                                                                                    screen_share_state.set(ScreenShareState::Idle);
+                                                                                } else {
+                                                                                    pending_video_enable.set(true);
+                                                                                    mda_cam.borrow().request();
                                                                                 }
+                                                                            } else {
+                                                                                video_enabled.set(false);
                                                                             }
-                                                                        });
-                                                                    } else {
-                                                                        screen_share_state.set(ScreenShareState::Idle);
+                                                                        },
                                                                     }
+                                                                }
+                                                            }
+                                                            ActionBarSlot::ScreenShare => {
+                                                                let is_active = matches!(screen_share_state(), ScreenShareState::Active);
+                                                                let is_disabled = matches!(
+                                                                    screen_share_state(),
+                                                                    ScreenShareState::Requesting | ScreenShareState::StreamReady
+                                                                );
+                                                                let stream_cell = pre_acquired_screen_stream.clone();
+                                                                rsx! {
+                                                                    ScreenShareButton {
+                                                                        active: is_active,
+                                                                        disabled: is_disabled,
+                                                                        onclick: move |_| {
+                                                                            if customize_mode() { return; }
+                                                                            if matches!(screen_share_state(), ScreenShareState::Idle) {
+                                                                                let navigator = gloo_utils::window().navigator();
+                                                                                let media_devices = match navigator.media_devices() {
+                                                                                    Ok(md) => md,
+                                                                                    Err(e) => {
+                                                                                        log::error!("Failed to get media devices: {e:?}");
+                                                                                        return;
+                                                                                    }
+                                                                                };
+
+                                                                                let width_constraint = js_sys::Object::new();
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &width_constraint,
+                                                                                    &JsValue::from_str("ideal"),
+                                                                                    &JsValue::from_f64(1920.0),
+                                                                                );
+                                                                                let height_constraint = js_sys::Object::new();
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &height_constraint,
+                                                                                    &JsValue::from_str("ideal"),
+                                                                                    &JsValue::from_f64(1080.0),
+                                                                                );
+                                                                                let framerate_constraint = js_sys::Object::new();
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &framerate_constraint,
+                                                                                    &JsValue::from_str("ideal"),
+                                                                                    &JsValue::from_f64(10.0),
+                                                                                );
+                                                                                let video_constraints = js_sys::Object::new();
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &video_constraints,
+                                                                                    &JsValue::from_str("width"),
+                                                                                    &width_constraint.into(),
+                                                                                );
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &video_constraints,
+                                                                                    &JsValue::from_str("height"),
+                                                                                    &height_constraint.into(),
+                                                                                );
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &video_constraints,
+                                                                                    &JsValue::from_str("frameRate"),
+                                                                                    &framerate_constraint.into(),
+                                                                                );
+
+                                                                                let constraints = web_sys::DisplayMediaStreamConstraints::new();
+                                                                                constraints.set_video(&video_constraints.into());
+                                                                                constraints.set_audio(&JsValue::FALSE);
+
+                                                                                let promise = match media_devices
+                                                                                    .get_display_media_with_constraints(&constraints)
+                                                                                {
+                                                                                    Ok(p) => p,
+                                                                                    Err(e) => {
+                                                                                        log::error!("getDisplayMedia failed synchronously: {e:?}");
+                                                                                        return;
+                                                                                    }
+                                                                                };
+                                                                                screen_share_state.set(ScreenShareState::Requesting);
+                                                                                let cell = stream_cell.clone();
+                                                                                wasm_bindgen_futures::spawn_local(async move {
+                                                                                    match JsFuture::from(promise).await {
+                                                                                        Ok(stream) => {
+                                                                                            let media_stream: web_sys::MediaStream = stream
+                                                                                                .unchecked_into();
+                                                                                            cell.borrow_mut().replace(media_stream);
+                                                                                            screen_share_state.set(ScreenShareState::StreamReady);
+                                                                                        }
+                                                                                        Err(e) => {
+                                                                                            let is_cancel = js_sys::Reflect::get(
+                                                                                                    &e,
+                                                                                                    &JsValue::from_str("name"),
+                                                                                                )
+                                                                                                .ok()
+                                                                                                .and_then(|v| v.as_string())
+                                                                                                .map(|n| n == "NotAllowedError")
+                                                                                                .unwrap_or(false);
+                                                                                            if is_cancel {
+                                                                                                log::info!("User cancelled screen sharing");
+                                                                                            } else {
+                                                                                                log::error!("getDisplayMedia rejected: {e:?}");
+                                                                                            }
+                                                                                            screen_share_state.set(ScreenShareState::Idle);
+                                                                                        }
+                                                                                    }
+                                                                                });
+                                                                            } else {
+                                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                                            }
+                                                                        },
+                                                                    }
+                                                                }
+                                                            }
+                                                            ActionBarSlot::PeerList => rsx! {
+                                                                PeerListButton {
+                                                                    id: "peer-list-trigger",
+                                                                    open: peer_list_open(),
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        // Mirror the density toggle: stop the click
+                                                                        // reaching `#main-container`'s handler (the
+                                                                        // toggle is inside the action bar, so it would
+                                                                        // be ignored there anyway, but stopping here
+                                                                        // keeps the popover-close identical to density).
+                                                                        e.stop_propagation();
+                                                                        let opening = !peer_list_open();
+                                                                        peer_list_open.set(opening);
+                                                                        if opening {
+                                                                            density_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::DensityMode => rsx! {
+                                                                DensityModeButton {
+                                                                    label: density_mode().label().to_string(),
+                                                                    open: density_open(),
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        e.stop_propagation();
+                                                                        let opening = !density_open();
+                                                                        density_open.set(opening);
+                                                                        if opening {
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::Diagnostics => rsx! {
+                                                                DiagnosticsButton {
+                                                                    id: "diagnostics-trigger",
+                                                                    open: diagnostics_open(),
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        // Mirror the density toggle (see PeerListButton
+                                                                        // above): stop the click reaching
+                                                                        // `#main-container`'s background handler.
+                                                                        e.stop_propagation();
+                                                                        let opening = !diagnostics_open();
+                                                                        diagnostics_open.set(opening);
+                                                                        if opening {
+                                                                            device_settings_open.set(false);
+                                                                            density_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                            meeting_options_open.set(false);
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::DeviceSettings => rsx! {
+                                                                DeviceSettingsButton {
+                                                                    open: device_settings_open(),
+                                                                    onclick: move |_| {
+                                                                        if customize_mode() { return; }
+                                                                        device_settings_initial_section.set(None);
+                                                                        let was_closed = !device_settings_open();
+                                                                        device_settings_open.set(!device_settings_open());
+                                                                        if was_closed {
+                                                                            device_settings_generation
+                                                                                .set(device_settings_generation() + 1);
+                                                                            peer_list_open.set(false);
+                                                                            diagnostics_open.set(false);
+                                                                            density_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                            meeting_options_open.set(false);
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::MeetingOptions => rsx! {
+                                                                MeetingOptionsButton {
+                                                                    open: meeting_options_open(),
+                                                                    onclick: move |_| {
+                                                                        if customize_mode() { return; }
+                                                                        meeting_options_open.set(!meeting_options_open());
+                                                                    },
                                                                 }
                                                             },
                                                         }
-                                                        if customize_mode() {
+                                                        // Remove button: shown in customize mode for
+                                                        // removable slots only. Mic/Camera are pinned
+                                                        // (NON_REMOVABLE_SLOTS) to prevent mid-call loss
+                                                        // of mute/camera-mute controls.
+                                                        if customize_mode() && slot.is_removable() {
                                                             button {
                                                                 class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::ScreenShare.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::ScreenShare.display_name()),
+                                                                "aria-label": format!("Remove {}", slot.display_name()),
+                                                                title: format!("Remove {}", slot.display_name()),
                                                                 onpointerdown: move |evt: PointerEvent| {
                                                                     evt.stop_propagation();
                                                                 },
                                                                 onclick: move |e| {
                                                                     e.stop_propagation();
                                                                     let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::ScreenShare);
+                                                                    slots.retain(|s| *s != slot);
                                                                     action_bar_slots.set(slots);
                                                                     let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::ScreenShare) {
-                                                                        hidden.push(ActionBarSlot::ScreenShare);
+                                                                    if !hidden.contains(&slot) {
+                                                                        hidden.push(slot);
                                                                     }
                                                                     action_bar_hidden.set(hidden);
                                                                     save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
@@ -7606,472 +7764,7 @@ pub fn AttendantsComponent(
                                                     }
                                                 }
                                             }
-                                        }
-                                        if action_bar_slots.read().contains(&ActionBarSlot::PeerList) {
-                                            {
-                                                let pl_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::PeerList).unwrap_or(3);
-                                                let pl_style = format!("order: {pl_idx};");
-                                                let drag_slot_size_pl = drag_slot_size.clone();
-                                                let drag_pointer_id_pl = drag_pointer_id.clone();
-                                                let drag_grab_dx_pl = drag_grab_dx.clone();
-                                                let drag_grab_dy_pl = drag_grab_dy.clone();
-                                                let drag_start_x_pl = drag_start_x.clone();
-                                                let drag_start_y_pl = drag_start_y.clone();
-                                                let drag_nav_left_pl = drag_nav_left.clone();
-                                                let drag_nav_top_pl = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::PeerList.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::PeerList) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{pl_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_pl.set(cx);
-                                                            drag_start_y_pl.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_pl.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::PeerList).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::PeerList));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_pl.set(cx - rect.left());
-                                                                    drag_grab_dy_pl.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_pl.set(nrect.left());
-                                                                        drag_nav_top_pl.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_pl.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        PeerListButton {
-                                                            id: "peer-list-trigger",
-                                                            open: peer_list_open(),
-                                                            onclick: move |e: MouseEvent| {
-                                                                if customize_mode() { return; }
-                                                                // Mirror the density toggle: stop the click
-                                                                // reaching `#main-container`'s handler (the
-                                                                // toggle is inside the action bar, so it would
-                                                                // be ignored there anyway, but stopping here
-                                                                // keeps the popover-close identical to density).
-                                                                e.stop_propagation();
-                                                                let opening = !peer_list_open();
-                                                                peer_list_open.set(opening);
-                                                                if opening {
-                                                                    density_open.set(false);
-                                                                    dock_menu_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                }
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::PeerList.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::PeerList.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::PeerList);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::PeerList) {
-                                                                        hidden.push(ActionBarSlot::PeerList);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if (customize_mode() || !has_screen_share) && action_bar_slots.read().contains(&ActionBarSlot::DensityMode) {
-                                            {
-                                                let dm_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::DensityMode).unwrap_or(4);
-                                                let dm_style = format!("order: {dm_idx};");
-                                                let drag_slot_size_dm = drag_slot_size.clone();
-                                                let drag_pointer_id_dm = drag_pointer_id.clone();
-                                                let drag_grab_dx_dm = drag_grab_dx.clone();
-                                                let drag_grab_dy_dm = drag_grab_dy.clone();
-                                                let drag_start_x_dm = drag_start_x.clone();
-                                                let drag_start_y_dm = drag_start_y.clone();
-                                                let drag_nav_left_dm = drag_nav_left.clone();
-                                                let drag_nav_top_dm = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::DensityMode.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::DensityMode) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{dm_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_dm.set(cx);
-                                                            drag_start_y_dm.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_dm.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::DensityMode).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::DensityMode));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_dm.set(cx - rect.left());
-                                                                    drag_grab_dy_dm.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_dm.set(nrect.left());
-                                                                        drag_nav_top_dm.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_dm.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        DensityModeButton {
-                                                            label: density_mode().label().to_string(),
-                                                            open: density_open(),
-                                                            onclick: move |e: MouseEvent| {
-                                                                if customize_mode() { return; }
-                                                                e.stop_propagation();
-                                                                let opening = !density_open();
-                                                                density_open.set(opening);
-                                                                if opening {
-                                                                    dock_menu_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                }
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::DensityMode.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::DensityMode.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::DensityMode);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::DensityMode) {
-                                                                        hidden.push(ActionBarSlot::DensityMode);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if action_bar_slots.read().contains(&ActionBarSlot::Diagnostics) {
-                                            {
-                                                let diag_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Diagnostics).unwrap_or(5);
-                                                let diag_style = format!("order: {diag_idx};");
-                                                let drag_slot_size_diag = drag_slot_size.clone();
-                                                let drag_pointer_id_diag = drag_pointer_id.clone();
-                                                let drag_grab_dx_diag = drag_grab_dx.clone();
-                                                let drag_grab_dy_diag = drag_grab_dy.clone();
-                                                let drag_start_x_diag = drag_start_x.clone();
-                                                let drag_start_y_diag = drag_start_y.clone();
-                                                let drag_nav_left_diag = drag_nav_left.clone();
-                                                let drag_nav_top_diag = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::Diagnostics.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::Diagnostics) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{diag_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_diag.set(cx);
-                                                            drag_start_y_diag.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_diag.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Diagnostics).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::Diagnostics));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_diag.set(cx - rect.left());
-                                                                    drag_grab_dy_diag.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_diag.set(nrect.left());
-                                                                        drag_nav_top_diag.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_diag.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        DiagnosticsButton {
-                                                            id: "diagnostics-trigger",
-                                                            open: diagnostics_open(),
-                                                            onclick: move |e: MouseEvent| {
-                                                                if customize_mode() { return; }
-                                                                // Mirror the density toggle (see PeerListButton
-                                                                // above): stop the click reaching
-                                                                // `#main-container`'s background handler.
-                                                                e.stop_propagation();
-                                                                let opening = !diagnostics_open();
-                                                                diagnostics_open.set(opening);
-                                                                if opening {
-                                                                    device_settings_open.set(false);
-                                                                    density_open.set(false);
-                                                                    dock_menu_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                    meeting_options_open.set(false);
-                                                                }
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::Diagnostics.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::Diagnostics.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::Diagnostics);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::Diagnostics) {
-                                                                        hidden.push(ActionBarSlot::Diagnostics);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if action_bar_slots.read().contains(&ActionBarSlot::DeviceSettings) {
-                                            {
-                                                let ds_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::DeviceSettings).unwrap_or(6);
-                                                let ds_style = format!("order: {ds_idx};");
-                                                let drag_slot_size_ds = drag_slot_size.clone();
-                                                let drag_pointer_id_ds = drag_pointer_id.clone();
-                                                let drag_grab_dx_ds = drag_grab_dx.clone();
-                                                let drag_grab_dy_ds = drag_grab_dy.clone();
-                                                let drag_start_x_ds = drag_start_x.clone();
-                                                let drag_start_y_ds = drag_start_y.clone();
-                                                let drag_nav_left_ds = drag_nav_left.clone();
-                                                let drag_nav_top_ds = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::DeviceSettings.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::DeviceSettings) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{ds_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_ds.set(cx);
-                                                            drag_start_y_ds.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_ds.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::DeviceSettings).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::DeviceSettings));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_ds.set(cx - rect.left());
-                                                                    drag_grab_dy_ds.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_ds.set(nrect.left());
-                                                                        drag_nav_top_ds.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_ds.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        DeviceSettingsButton {
-                                                            open: device_settings_open(),
-                                                            onclick: move |_| {
-                                                                if customize_mode() { return; }
-                                                                device_settings_initial_section.set(None);
-                                                                let was_closed = !device_settings_open();
-                                                                device_settings_open.set(!device_settings_open());
-                                                                if was_closed {
-                                                                    device_settings_generation
-                                                                        .set(device_settings_generation() + 1);
-                                                                    peer_list_open.set(false);
-                                                                    diagnostics_open.set(false);
-                                                                    density_open.set(false);
-                                                                    dock_menu_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                    meeting_options_open.set(false);
-                                                                }
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::DeviceSettings.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::DeviceSettings.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::DeviceSettings);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::DeviceSettings) {
-                                                                        hidden.push(ActionBarSlot::DeviceSettings);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if is_owner && action_bar_slots.read().contains(&ActionBarSlot::MeetingOptions) {
-                                            {
-                                                let mo_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::MeetingOptions).unwrap_or(8);
-                                                let mo_style = format!("order: {mo_idx};");
-                                                let drag_slot_size_mo = drag_slot_size.clone();
-                                                let drag_pointer_id_mo = drag_pointer_id.clone();
-                                                let drag_grab_dx_mo = drag_grab_dx.clone();
-                                                let drag_grab_dy_mo = drag_grab_dy.clone();
-                                                let drag_start_x_mo = drag_start_x.clone();
-                                                let drag_start_y_mo = drag_start_y.clone();
-                                                let drag_nav_left_mo = drag_nav_left.clone();
-                                                let drag_nav_top_mo = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::MeetingOptions.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::MeetingOptions) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{mo_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_mo.set(cx);
-                                                            drag_start_y_mo.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_mo.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::MeetingOptions).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::MeetingOptions));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_mo.set(cx - rect.left());
-                                                                    drag_grab_dy_mo.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_mo.set(nrect.left());
-                                                                        drag_nav_top_mo.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_mo.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        MeetingOptionsButton {
-                                                            open: meeting_options_open(),
-                                                            onclick: move |_| {
-                                                                if customize_mode() { return; }
-                                                                meeting_options_open.set(!meeting_options_open());
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::MeetingOptions.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::MeetingOptions.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::MeetingOptions);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::MeetingOptions) {
-                                                                        hidden.push(ActionBarSlot::MeetingOptions);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    }
                                         // (а) Dock position dropdown — not customizable (houses Customize/Reset)
                                         div { class: "dock-position-wrapper",
                                             style: "order: 90",
@@ -8118,8 +7811,9 @@ pub fn AttendantsComponent(
                                                     // focus here via `focus_element_by_id`. Same id
                                                     // is intentionally NOT reused on the Done button
                                                     // (customize-mode branch above); Customize's
-                                                    // activation focuses `.action-bar-done-trigger`
-                                                    // directly instead.
+                                                    // activation now shifts focus to the first
+                                                    // action-bar slot button (Mic/Sound by default)
+                                                    // via the customize-mode entry effect.
                                                     id: "dock-menu-trigger",
                                                     class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
                                                     title: "Action bar position",
@@ -8345,15 +8039,6 @@ pub fn AttendantsComponent(
                                                                 evt.prevent_default();
                                                                 customize_mode.set(true);
                                                                 dock_menu_open.set(false);
-                                                                // The dock-menu trigger button is swapped
-                                                                // out for the Done button on the next
-                                                                // render. Focus that Done button so the
-                                                                // keyboard user has an obvious way back
-                                                                // out of customize mode.
-                                                                Timeout::new(0, || {
-                                                                    focus_by_selector(".action-bar-done-trigger");
-                                                                })
-                                                                .forget();
                                                             },
                                                             "Customize"
                                                         }
@@ -8549,6 +8234,10 @@ pub fn AttendantsComponent(
                                                 rsx! {}
                                             }
                                         }
+                                                                        // Keep ScreenShare focusable in customize mode.
+                                                                        // Including `customize_mode` in `disabled` would
+                                                                        // remove it from tab order and reintroduce a11y
+                                                                        // tab-skip regressions.
                                     }
                                 }
                             }
@@ -9162,6 +8851,14 @@ pub fn AttendantsComponent(
                 if mock_peers_enabled() && mock_peers_open() {
                     div { class: "mock-peers-popover",
                         onclick: move |e: MouseEvent| e.stop_propagation(),
+                        onkeydown: move |evt: Event<KeyboardData>| {
+                            if evt.key() == Key::Escape {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                mock_peers_open.set(false);
+                                focus_element_by_id("mock-peers-trigger");
+                            }
+                        },
                         div { class: "mock-peers-popover-header",
                             span { "Mock Peers" }
                             button {

@@ -488,7 +488,7 @@ pub fn MockPeersButton(open: bool, onclick: EventHandler<MouseEvent>) -> Element
     };
 
     rsx! {
-        button { class, onclick: move |evt| onclick.call(evt),
+        button { id: "mock-peers-trigger", class, onclick: move |evt| onclick.call(evt),
             svg {
                 xmlns: "http://www.w3.org/2000/svg",
                 view_box: "0 0 24 24",
@@ -524,6 +524,7 @@ pub fn DensityModeButton(label: String, open: bool, onclick: EventHandler<MouseE
 
     rsx! {
         button {
+            id: "density-mode-trigger",
             class,
             title: "Layout density: {label}",
             onclick: move |evt| onclick.call(evt),

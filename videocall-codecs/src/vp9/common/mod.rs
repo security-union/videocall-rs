@@ -27,9 +27,14 @@
 pub mod bit_buffer;
 pub mod block;
 pub mod bool_coder;
+pub mod frame_buffer;
 pub mod generated;
+pub mod idct;
+pub mod intra_pred;
 pub mod quant;
 pub mod trees;
 
 #[cfg(test)]
 mod generated_tests;
+#[cfg(test)]
+mod idct_fixtures;

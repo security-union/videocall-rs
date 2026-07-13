@@ -24,3 +24,6 @@
 #![allow(dead_code)] // consumed in later milestones
 
 pub mod bitstream;
+pub mod block_encode;
+pub mod fdct;
+pub mod quantize;

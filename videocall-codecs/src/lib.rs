@@ -19,12 +19,18 @@
 //! A high-fidelity, cross-platform video decoder jitter buffer implementation in Rust.
 
 pub mod decoder;
-#[cfg(not(target_arch = "wasm32"))]
 pub mod encoder;
 pub mod frame;
 pub mod jitter_buffer;
 pub mod jitter_estimator;
 pub mod messages;
+pub mod vp9;
+
+/// Deterministic synthetic sources, PSNR metrics, an IVF writer, and (behind
+/// `libvpx`) a synchronous libvpx decode oracle. Used by the VP9 encoder's
+/// TDD harness. Enabled with the `test-utils` feature.
+#[cfg(feature = "test-utils")]
+pub mod testing;
 
 // Diagnostics helper to publish video metrics via the shared event bus.
 #[cfg(feature = "wasm")]

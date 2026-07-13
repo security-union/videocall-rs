@@ -12,7 +12,7 @@ authors = [
 keywords = ["video", "codec", "webrtc", "vpx", "wasm"]
 categories = ["multimedia::video", "wasm", "web-programming"]
 description = "Cross-platform video codec library with VP8/VP9 support for native and WebAssembly environments"
-include = ["src/**/*", "assets/**/*"]
+include = ["src/**/*", "assets/**/*", "tests/**/*", "benches/**/*"]
 
 [lib]
 name = "videocall_codecs"
@@ -36,7 +36,9 @@ required-features = ["native"]
 
 [features]
 default = []
-native = []
+libvpx = ["dep:env-libvpx-sys"]
+native = ["libvpx"]
+test-utils = []
 wasm = [
     "wasm-bindgen",
     "web-sys",
@@ -81,13 +83,24 @@ web-sys = { version = "0.3", optional = true, features = [
 ] }
 videocall-diagnostics = { path = "../videocall-diagnostics", optional = true, version = "0.1.4" }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-env-libvpx-sys = { workspace = true }
-
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
 [dev-dependencies]
 approx = "0.5.1"
 wasm-bindgen-test = "0.3.42"
+criterion = { workspace = true }
+
+[[test]]
+name = "oracle_vp9"
+required-features = ["libvpx", "test-utils"]
+
+[[test]]
+name = "perf_gate"
+required-features = ["test-utils"]
+
+[[bench]]
+name = "vp9_encode"
+harness = false
+required-features = ["libvpx", "test-utils"]
 

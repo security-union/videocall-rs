@@ -18,7 +18,7 @@
 
 use videocall_codecs::{
     decoder::{Decodable, Decoder, VideoCodec},
-    frame::{FrameType, VideoFrame},
+    frame::{FrameCodec, FrameType, VideoFrame},
     jitter_buffer::JitterBuffer,
 };
 
@@ -51,6 +51,7 @@ fn main() {
             batch.push(VideoFrame {
                 sequence_number,
                 frame_type: FrameType::KeyFrame,
+                codec: FrameCodec::Unspecified,
                 data: vec![0; 1000],
                 timestamp: 0.0,
             });
@@ -60,6 +61,7 @@ fn main() {
                 batch.push(VideoFrame {
                     sequence_number,
                     frame_type: FrameType::DeltaFrame,
+                    codec: FrameCodec::Unspecified,
                     data: vec![0; 200],
                     timestamp: 0.0,
                 });

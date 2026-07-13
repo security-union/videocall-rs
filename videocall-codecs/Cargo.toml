@@ -91,6 +91,10 @@ approx = "0.5.1"
 wasm-bindgen-test = "0.3.42"
 criterion = { workspace = true }
 
+[[example]]
+name = "dump_vp9_ivf"
+required-features = ["test-utils"]
+
 [[test]]
 name = "oracle_vp9"
 required-features = ["libvpx", "test-utils"]

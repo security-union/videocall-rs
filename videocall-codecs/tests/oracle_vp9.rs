@@ -103,7 +103,6 @@ fn dump_ivf(frames: &[EncodedFrame], width: u16, height: u16, fps: u32) -> PathB
 // --- Milestones ---
 
 #[test]
-#[ignore = "M1 pending: keyframe encode + oracle decode + PSNR"]
 fn m1_keyframe_decodes_with_dims_and_psnr() {
     let (w, h, fps) = (640u32, 480u32, 30u32);
     let src = gradient(w, h, 0);
@@ -138,6 +137,81 @@ fn m1_keyframe_decodes_with_dims_and_psnr() {
             PSNR_Y_KEYFRAME_MIN,
             path.display()
         );
+    }
+}
+
+/// Informational: report the encoded size and PSNR of the M1 gradient keyframe
+/// at the current fixed quantizer. Not a pass/fail gate.
+#[test]
+#[ignore = "informational: prints size + PSNR"]
+fn m1_report_size_and_psnr() {
+    let (w, h) = (640u32, 480u32);
+    let src = gradient(w, h, 0);
+    let mut enc = Vp9Encoder::new(config(w, h, 30, 500)).expect("encoder init");
+    let ef = enc.encode(0, &src).expect("encode").expect("keyframe");
+    let decoded = decode_all(std::slice::from_ref(&ef));
+    let psnr = psnr_i420(&src, &decoded[0].i420, w, h);
+    eprintln!(
+        "M1 gradient {w}x{h}: {} bytes, PSNR-Y {:.2} dB, PSNR-U {:.2} dB, PSNR-V {:.2} dB",
+        ef.data.len(),
+        psnr.y,
+        psnr.u,
+        psnr.v
+    );
+}
+
+/// Bit-exact reconstruction: the encoder's own reconstruction buffer must match,
+/// sample-for-sample, what the libvpx oracle decodes from the same bitstream.
+/// Any drift (prediction, transform rounding, dequant, context bookkeeping)
+/// shows up here at the first bad frame. Odd sizes exercise mi padding and the
+/// partial bottom superblock row.
+#[test]
+fn m1b_recon_matches_oracle_decode() {
+    for &(w, h) in &[(176u32, 144u32), (640, 480), (636, 476)] {
+        for (label, src) in [
+            ("gradient", gradient(w, h, 0)),
+            ("moving_box", moving_box(w, h, 3)),
+        ] {
+            let mut enc = Vp9Encoder::new(config(w, h, 30, 500)).expect("encoder init");
+            let ef = enc
+                .encode(0, &src)
+                .expect("encode error")
+                .expect("keyframe should be emitted");
+            let recon = enc
+                .last_reconstruction_i420()
+                .expect("reconstruction available");
+
+            let mut dec = OracleDecoder::new().expect("oracle init failed");
+            let decoded = dec.decode(&ef.data).expect("oracle decode failed");
+            assert_eq!(decoded.len(), 1, "{label} {w}x{h}: expected one frame");
+            let d = &decoded[0];
+            assert_eq!((d.width, d.height), (w, h), "{label} {w}x{h}: dims");
+            assert_eq!(
+                d.i420.len(),
+                recon.len(),
+                "{label} {w}x{h}: buffer length mismatch"
+            );
+
+            if d.i420 != recon {
+                let first = d
+                    .i420
+                    .iter()
+                    .zip(recon.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap();
+                let diffs = d
+                    .i420
+                    .iter()
+                    .zip(recon.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                panic!(
+                    "{label} {w}x{h}: recon drift — {diffs} samples differ, first at byte {first} \
+                     (oracle {} vs recon {})",
+                    d.i420[first], recon[first]
+                );
+            }
+        }
     }
 }
 

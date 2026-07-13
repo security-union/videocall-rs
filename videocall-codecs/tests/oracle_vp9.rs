@@ -180,7 +180,11 @@ fn m1_report_size_and_psnr() {
 /// partial bottom superblock row.
 #[test]
 fn m1b_recon_matches_oracle_decode() {
-    for &(w, h) in &[(176u32, 144u32), (640, 480), (636, 476)] {
+    // 328x248 gives odd mi_cols (41) and mi_rows (31): its right-column and
+    // bottom-row 16x16 blocks straddle the frame edge, forcing the split-to-8x8
+    // partition path (`write_partition`'s has_rows/has_cols handling and the
+    // corner's zero-bit forced split), which the even-mi sizes never exercise.
+    for &(w, h) in &[(176u32, 144u32), (640, 480), (636, 476), (328, 248)] {
         for (label, src) in [
             ("gradient", gradient(w, h, 0)),
             ("moving_box", moving_box(w, h, 3)),
@@ -236,7 +240,10 @@ fn m1b_recon_matches_oracle_decode() {
 /// exercise mi padding and the partial bottom superblock row.
 #[test]
 fn m2b_inter_recon_matches_oracle_decode() {
-    for &(w, h) in &[(176u32, 144u32), (640, 480), (636, 476)] {
+    // 328x248 → odd mi_cols (41) / mi_rows (31): the edge 16x16 blocks straddle
+    // the frame and force the split-to-8x8 partition path on inter frames too,
+    // where a drift would compound frame-to-frame through the reference.
+    for &(w, h) in &[(176u32, 144u32), (640, 480), (636, 476), (328, 248)] {
         let frames: Vec<Vec<u8>> = (0..30).map(|t| moving_box(w, h, t)).collect();
         let mut enc = Vp9Encoder::new(config(w, h, 30, 500)).expect("encoder init");
         let mut dec = OracleDecoder::new().expect("oracle init failed");

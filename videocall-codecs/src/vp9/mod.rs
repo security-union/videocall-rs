@@ -43,6 +43,11 @@
 use crate::encoder::{Encodable, EncodedFrame, EncoderConfig};
 use anyhow::Result;
 
+pub(crate) mod common;
+#[cfg(any(test, feature = "test-utils"))]
+pub(crate) mod debug;
+pub(crate) mod enc;
+
 /// The pure-Rust VP9 encoder.
 ///
 /// Construct via [`Encodable::new`]. Encoding is not yet implemented; see the

@@ -25,8 +25,10 @@
 
 pub mod bitstream;
 pub mod block_encode;
+pub mod encodemv;
 pub mod encoder;
 pub mod fdct;
+pub mod mcomp;
 pub mod pack;
 pub mod quantize;
 pub mod tokenize;

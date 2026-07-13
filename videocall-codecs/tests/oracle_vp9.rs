@@ -215,8 +215,62 @@ fn m1b_recon_matches_oracle_decode() {
     }
 }
 
+/// Bit-exact inter drift: the encoder's own reconstruction of every frame in a
+/// moving sequence must match the libvpx oracle sample-for-sample. Inter frames
+/// feed their reconstruction forward as the next reference, so any single-frame
+/// drift (motion compensation offset, mvref/mode-context disagreement, coef ref
+/// type, MV coding) compounds — this catches it at the first bad frame. Odd sizes
+/// exercise mi padding and the partial bottom superblock row.
 #[test]
-#[ignore = "M2 pending: inter sequence, one keyframe, PSNR band"]
+fn m2b_inter_recon_matches_oracle_decode() {
+    for &(w, h) in &[(176u32, 144u32), (640, 480), (636, 476)] {
+        let frames: Vec<Vec<u8>> = (0..30).map(|t| moving_box(w, h, t)).collect();
+        let mut enc = Vp9Encoder::new(config(w, h, 30, 500)).expect("encoder init");
+        let mut dec = OracleDecoder::new().expect("oracle init failed");
+
+        for (t, frame) in frames.iter().enumerate() {
+            let ef = enc
+                .encode(t as i64, frame)
+                .expect("encode error")
+                .expect("frame should be emitted");
+            let recon = enc
+                .last_reconstruction_i420()
+                .expect("reconstruction available");
+            let decoded = dec.decode(&ef.data).expect("oracle decode failed");
+            assert_eq!(decoded.len(), 1, "frame {t} {w}x{h}: expected one frame");
+            let d = &decoded[0];
+            assert_eq!((d.width, d.height), (w, h), "frame {t} {w}x{h}: dims");
+            assert_eq!(
+                d.i420.len(),
+                recon.len(),
+                "frame {t} {w}x{h}: buffer length mismatch"
+            );
+            if d.i420 != recon {
+                let first = d
+                    .i420
+                    .iter()
+                    .zip(recon.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap();
+                let diffs = d
+                    .i420
+                    .iter()
+                    .zip(recon.iter())
+                    .filter(|(a, b)| a != b)
+                    .count();
+                panic!(
+                    "frame {t} ({}) {w}x{h}: recon drift — {diffs} samples differ, first at \
+                     byte {first} (oracle {} vs recon {})",
+                    if ef.is_keyframe { "key" } else { "inter" },
+                    d.i420[first],
+                    recon[first]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn m2_sequence_90_frames_kf150_one_key_rest_inter() {
     let (w, h, fps) = (640u32, 480u32, 30u32);
     let frames: Vec<Vec<u8>> = (0..90).map(|t| moving_box(w, h, t)).collect();
@@ -317,5 +371,33 @@ fn m4_update_bitrate_kbps_takes_effect() {
     assert!(
         bytes_hi as f64 >= 2.0 * bytes_lo as f64,
         "high-bitrate bytes {bytes_hi} should be >= 2x low-bitrate bytes {bytes_lo}"
+    );
+}
+
+#[test]
+#[ignore = "informational: prints M2 stream size, PSNR, timing"]
+fn m2_report_metrics() {
+    let (w, h, fps) = (640u32, 480u32, 30u32);
+    let frames: Vec<Vec<u8>> = (0..90).map(|t| moving_box(w, h, t)).collect();
+    let mut enc = Vp9Encoder::new(config(w, h, fps, 500)).expect("encoder init");
+    let t0 = std::time::Instant::now();
+    let encoded = encode_sequence(&mut enc, &frames);
+    let elapsed = t0.elapsed();
+
+    let total: usize = encoded.iter().map(|f| f.data.len()).sum();
+    let key_bytes = encoded[0].data.len();
+    let decoded = decode_all(&encoded);
+    let ys: Vec<f64> = decoded
+        .iter()
+        .zip(frames.iter())
+        .map(|(d, src)| psnr_i420(src, &d.i420, w, h).y)
+        .collect();
+    let avg = ys.iter().sum::<f64>() / ys.len() as f64;
+    let min = ys.iter().copied().fold(f64::INFINITY, f64::min);
+    eprintln!(
+        "M2 90 frames {w}x{h}: total {total} bytes (keyframe {key_bytes}), \
+         avg PSNR-Y {avg:.2} dB, min {min:.2} dB, encode {:.1} ms total = {:.2} ms/frame (debug build)",
+        elapsed.as_secs_f64() * 1e3,
+        elapsed.as_secs_f64() * 1e3 / 90.0
     );
 }

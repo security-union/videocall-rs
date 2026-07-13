@@ -16,35 +16,77 @@
  * conditions.
  */
 
-//! Keyframe encode orchestration.
+//! Frame encode orchestration (keyframe and inter).
 //!
-//! [`encode_keyframe`] runs the two-phase pipeline of `vp9/encoder`: a superblock
-//! walk that predicts, transforms, quantizes and *tokenizes* every block (the
-//! reconstruction it leaves behind is bit-identical to the decoder's), followed
-//! by a re-walk that packs the frame header, partition tree, modes and tokens
-//! into the bitstream. Both walks descend superblocks in the identical recursive
-//! order, so the entropy and partition contexts they maintain agree with the
-//! decoder's.
+//! Both [`encode_keyframe`] and [`encode_inter_frame`] run the two-phase pipeline
+//! of `vp9/encoder`: a superblock walk that predicts, transforms, quantizes and
+//! *tokenizes* every block (the reconstruction it leaves behind is bit-identical
+//! to the decoder's), followed by a re-walk that packs the frame header,
+//! partition tree, modes and tokens into the bitstream. Both walks descend
+//! superblocks in the identical recursive order, so the entropy, partition and
+//! mode-info contexts they maintain agree with the decoder's.
 //!
-//! M1 scope: Profile 0, error-resilient, single tile, fixed full split to 8x8,
-//! `tx_mode = ALLOW_8X8` (luma 8x8 / chroma 4x4 transforms), DC_PRED everywhere.
+//! Scope: Profile 0, error-resilient, single tile, fixed full split to 8x8,
+//! `tx_mode = ALLOW_8X8` (luma 8x8 / chroma 4x4 transforms). Keyframes use
+//! DC_PRED; inter frames use ZEROMV / NEARESTMV / NEWMV against a single LAST
+//! reference with integer-pel motion compensation.
 
-use crate::vp9::common::block::{BlockSize, Partition, TxMode, TxSize, SUBSIZE_LOOKUP};
+use crate::vp9::common::block::{
+    BlockSize, Partition, PredictionMode, TxMode, TxSize, SUBSIZE_LOOKUP,
+};
 use crate::vp9::common::bool_coder::BoolWriter;
 use crate::vp9::common::frame_buffer::FrameBuffer;
+use crate::vp9::common::generated::{DEFAULT_PARTITION_PROBS, KF_PARTITION_PROBS};
+use crate::vp9::common::inter_pred::{predict_inter_block, Plane as McPlane};
+use crate::vp9::common::mvref::{
+    find_mv_refs, Mv, MvRefGeom, MvRefInfo, INTRA_FRAME, LAST_FRAME, NONE_FRAME,
+};
 use crate::vp9::enc::bitstream::{pack_frame_header, UncompressedHeader};
-use crate::vp9::enc::block_encode::{encode_intra_block, BlockCtx};
+use crate::vp9::enc::block_encode::{encode_intra_block, residual_transform_reconstruct, BlockCtx};
+use crate::vp9::enc::encodemv::encode_mv;
+use crate::vp9::enc::mcomp::{search_block, RefPlane, SrcBlock};
 use crate::vp9::enc::pack::{
-    b_width_log2, pack_mb_tokens, write_kf_dc_modes, write_partition, write_skip, PartitionContext,
+    b_width_log2, pack_mb_tokens, write_inter_mode, write_intra_inter, write_kf_dc_modes,
+    write_partition, write_single_ref_last, write_skip, InterNeighbor, PartitionContext,
 };
 use crate::vp9::enc::quantize::QuantParams;
-use crate::vp9::enc::tokenize::{combine_entropy_contexts, tokenize_block, PlaneType, Token};
+use crate::vp9::enc::tokenize::{
+    combine_entropy_contexts, tokenize_block, PlaneType, Token, REF_TYPE_INTER, REF_TYPE_INTRA,
+};
 
-/// The coefficient tokens and skip flag of one coded 8x8 mode-info block.
-#[derive(Clone, Default)]
-struct CodedBlock {
+/// `INTER_OFFSET(mode)` = `mode - NEARESTMV`.
+#[inline]
+fn inter_offset(mode: PredictionMode) -> usize {
+    (mode as u8 - PredictionMode::NearestMv as u8) as usize
+}
+
+/// One coded 8x8 mode-info block: coefficient tokens, skip flag, and the
+/// mode/reference/motion needed by neighbor context derivations and the pack
+/// walk. Keyframe blocks are intra DC_PRED; inter blocks carry a real mode/MV.
+#[derive(Clone)]
+struct Mi {
     skip: bool,
     tokens: Vec<Token>,
+    is_inter: bool,
+    mode: PredictionMode,
+    ref_frame: [i8; 2],
+    mv: Mv,
+    /// `mode_context` derived at encode time and reused by the pack walk.
+    mode_context: u8,
+}
+
+impl Default for Mi {
+    fn default() -> Self {
+        Mi {
+            skip: false,
+            tokens: Vec::new(),
+            is_inter: false,
+            mode: PredictionMode::DcPred,
+            ref_frame: [INTRA_FRAME, NONE_FRAME],
+            mv: Mv::ZERO,
+            mode_context: 0,
+        }
+    }
 }
 
 /// Per-plane entropy contexts (`above_context`/`left_context`) maintained across
@@ -119,24 +161,27 @@ fn subsize_of(bsize: BlockSize, partition: Partition) -> BlockSize {
 }
 
 /// Frame geometry, the coded-block grid, and quantizer, shared across the two
-/// walks. `src`/`recon` are passed separately so their borrows never alias.
+/// walks. `src`/`recon`/`reference` are passed separately so their borrows never
+/// alias.
 struct Frame {
     mi_rows: u32,
     mi_cols: u32,
     qp: QuantParams,
-    grid: Vec<CodedBlock>,
+    grid: Vec<Mi>,
 }
 
 impl Frame {
     #[inline]
-    fn block_mut(&mut self, mi_row: u32, mi_col: u32) -> &mut CodedBlock {
+    fn block_mut(&mut self, mi_row: u32, mi_col: u32) -> &mut Mi {
         &mut self.grid[(mi_row * self.mi_cols + mi_col) as usize]
     }
 
     #[inline]
-    fn block(&self, mi_row: u32, mi_col: u32) -> &CodedBlock {
+    fn block(&self, mi_row: u32, mi_col: u32) -> &Mi {
         &self.grid[(mi_row * self.mi_cols + mi_col) as usize]
     }
+
+    // --- Keyframe (intra) walks --------------------------------------------
 
     /// Recursive tokenize walk (mirrors `write_modes_sb`'s descent order).
     fn encode_sb(
@@ -163,7 +208,7 @@ impl Frame {
         self.encode_sb(src, recon, ec, mi_row + bs, mi_col + bs, sub);
     }
 
-    /// Encode + tokenize one 8x8 mode-info block (luma 8x8, chroma 4x4 U/V),
+    /// Encode + tokenize one intra 8x8 mode-info block (luma 8x8, chroma 4x4),
     /// updating entropy contexts and recording the coded block.
     fn encode_leaf(
         &mut self,
@@ -184,8 +229,15 @@ impl Frame {
             ec.left_y[ly] != 0 || ec.left_y[ly + 1] != 0,
         );
         let (eob_y, qc_y) =
-            encode_plane_block(src, recon, &self.qp, Plane::Y, mi_row, mi_col, up, left);
-        let tokens_y = tokenize_block(&qc_y, eob_y, TxSize::Tx8X8, PlaneType::Y, pt_y);
+            encode_intra_plane_block(src, recon, &self.qp, Plane::Y, mi_row, mi_col, up, left);
+        let tokens_y = tokenize_block(
+            &qc_y,
+            eob_y,
+            TxSize::Tx8X8,
+            PlaneType::Y,
+            REF_TYPE_INTRA,
+            pt_y,
+        );
         let he_y = (eob_y > 0) as u8;
         ec.above_y[ay] = he_y;
         ec.above_y[ay + 1] = he_y;
@@ -197,8 +249,15 @@ impl Frame {
         let lu = (mi_row & 7) as usize;
         let pt_u = combine_entropy_contexts(ec.above_u[au] != 0, ec.left_u[lu] != 0);
         let (eob_u, qc_u) =
-            encode_plane_block(src, recon, &self.qp, Plane::U, mi_row, mi_col, up, left);
-        let tokens_u = tokenize_block(&qc_u, eob_u, TxSize::Tx4X4, PlaneType::Uv, pt_u);
+            encode_intra_plane_block(src, recon, &self.qp, Plane::U, mi_row, mi_col, up, left);
+        let tokens_u = tokenize_block(
+            &qc_u,
+            eob_u,
+            TxSize::Tx4X4,
+            PlaneType::Uv,
+            REF_TYPE_INTRA,
+            pt_u,
+        );
         let he_u = (eob_u > 0) as u8;
         ec.above_u[au] = he_u;
         ec.left_u[lu] = he_u;
@@ -206,23 +265,206 @@ impl Frame {
         // --- Chroma V 4x4 ---
         let pt_v = combine_entropy_contexts(ec.above_v[au] != 0, ec.left_v[lu] != 0);
         let (eob_v, qc_v) =
-            encode_plane_block(src, recon, &self.qp, Plane::V, mi_row, mi_col, up, left);
-        let tokens_v = tokenize_block(&qc_v, eob_v, TxSize::Tx4X4, PlaneType::Uv, pt_v);
+            encode_intra_plane_block(src, recon, &self.qp, Plane::V, mi_row, mi_col, up, left);
+        let tokens_v = tokenize_block(
+            &qc_v,
+            eob_v,
+            TxSize::Tx4X4,
+            PlaneType::Uv,
+            REF_TYPE_INTRA,
+            pt_v,
+        );
         let he_v = (eob_v > 0) as u8;
         ec.above_v[au] = he_v;
         ec.left_v[lu] = he_v;
 
         let skip = eob_y == 0 && eob_u == 0 && eob_v == 0;
-        let tokens = if skip {
-            Vec::new()
-        } else {
-            let mut t = tokens_y;
-            t.extend(tokens_u);
-            t.extend(tokens_v);
-            t
+        let tokens = concat_tokens(skip, tokens_y, tokens_u, tokens_v);
+        *self.block_mut(mi_row, mi_col) = Mi {
+            skip,
+            tokens,
+            ..Mi::default()
         };
-        *self.block_mut(mi_row, mi_col) = CodedBlock { skip, tokens };
     }
+
+    // --- Inter walks --------------------------------------------------------
+
+    /// Recursive inter tokenize walk (same descent order as the keyframe walk).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_inter_sb(
+        &mut self,
+        src: &FrameBuffer,
+        reference: &FrameBuffer,
+        recon: &mut FrameBuffer,
+        ec: &mut EntropyContext,
+        mi_row: u32,
+        mi_col: u32,
+        bsize: BlockSize,
+    ) {
+        if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
+            return;
+        }
+        if bsize == BlockSize::B8X8 {
+            self.encode_inter_leaf(src, reference, recon, ec, mi_row, mi_col);
+            return;
+        }
+        let bs = (1u32 << b_width_log2(bsize)) / 4;
+        let sub = split_child(bsize);
+        self.encode_inter_sb(src, reference, recon, ec, mi_row, mi_col, sub);
+        self.encode_inter_sb(src, reference, recon, ec, mi_row, mi_col + bs, sub);
+        self.encode_inter_sb(src, reference, recon, ec, mi_row + bs, mi_col, sub);
+        self.encode_inter_sb(src, reference, recon, ec, mi_row + bs, mi_col + bs, sub);
+    }
+
+    /// Motion-estimate, predict, transform and tokenize one inter 8x8 block.
+    fn encode_inter_leaf(
+        &mut self,
+        src: &FrameBuffer,
+        reference: &FrameBuffer,
+        recon: &mut FrameBuffer,
+        ec: &mut EntropyContext,
+        mi_row: u32,
+        mi_col: u32,
+    ) {
+        let (mi_rows, mi_cols) = (self.mi_rows as i32, self.mi_cols as i32);
+
+        // 1. Spatial MV reference + inter-mode context from coded neighbors.
+        let (mode_context, refs) = {
+            let grid = &self.grid;
+            let cols = self.mi_cols;
+            let geom = MvRefGeom {
+                mi_rows,
+                mi_cols,
+                ref_frame: LAST_FRAME,
+                ref_sign_bias: [0; 4],
+                allow_hp: false,
+            };
+            find_mv_refs(
+                |r, c| {
+                    if r < 0 || c < 0 || r >= mi_rows || c >= mi_cols {
+                        None
+                    } else {
+                        let mi = &grid[(r as u32 * cols + c as u32) as usize];
+                        Some(MvRefInfo {
+                            mode: mi.mode as u8,
+                            ref_frame: mi.ref_frame,
+                            mv: [mi.mv, Mv::ZERO],
+                        })
+                    }
+                },
+                mi_row as i32,
+                mi_col as i32,
+                BlockSize::B8X8,
+                &geom,
+            )
+        };
+        let nearest = refs[0];
+
+        // 2. Motion search on luma; classify the winner into a coded mode.
+        let best = {
+            let (rdata, rorg, rstride, _, _) = reference.y();
+            let (sdata, sorg, sstride, _, _) = src.y();
+            let refp = RefPlane {
+                data: rdata,
+                origin: rorg,
+                stride: rstride,
+            };
+            let srcb = SrcBlock {
+                data: sdata,
+                off: sorg + (mi_row * 8) as usize * sstride + (mi_col * 8) as usize,
+                stride: sstride,
+            };
+            search_block(&refp, &srcb, mi_row as i32, mi_col as i32, nearest)
+        };
+        let mv = best.mv;
+        let mode = if mv == Mv::ZERO {
+            PredictionMode::ZeroMv
+        } else if mv == nearest {
+            PredictionMode::NearestMv
+        } else {
+            PredictionMode::NewMv
+        };
+
+        // 3. Motion-compensate the prediction into `recon` for all planes.
+        for plane in [McPlane::Y, McPlane::U, McPlane::V] {
+            predict_inter_block(
+                reference,
+                recon,
+                plane,
+                mi_row as i32,
+                mi_col as i32,
+                mv,
+                mi_rows,
+                mi_cols,
+            );
+        }
+
+        // 4. Residual, transform, tokenize per plane (prediction already placed).
+        let ay = (mi_col * 2) as usize;
+        let ly = ((mi_row & 7) * 2) as usize;
+        let pt_y = combine_entropy_contexts(
+            ec.above_y[ay] != 0 || ec.above_y[ay + 1] != 0,
+            ec.left_y[ly] != 0 || ec.left_y[ly + 1] != 0,
+        );
+        let (eob_y, qc_y) = inter_plane_residual(src, recon, &self.qp, Plane::Y, mi_row, mi_col);
+        let tokens_y = tokenize_block(
+            &qc_y,
+            eob_y,
+            TxSize::Tx8X8,
+            PlaneType::Y,
+            REF_TYPE_INTER,
+            pt_y,
+        );
+        let he_y = (eob_y > 0) as u8;
+        ec.above_y[ay] = he_y;
+        ec.above_y[ay + 1] = he_y;
+        ec.left_y[ly] = he_y;
+        ec.left_y[ly + 1] = he_y;
+
+        let au = mi_col as usize;
+        let lu = (mi_row & 7) as usize;
+        let pt_u = combine_entropy_contexts(ec.above_u[au] != 0, ec.left_u[lu] != 0);
+        let (eob_u, qc_u) = inter_plane_residual(src, recon, &self.qp, Plane::U, mi_row, mi_col);
+        let tokens_u = tokenize_block(
+            &qc_u,
+            eob_u,
+            TxSize::Tx4X4,
+            PlaneType::Uv,
+            REF_TYPE_INTER,
+            pt_u,
+        );
+        let he_u = (eob_u > 0) as u8;
+        ec.above_u[au] = he_u;
+        ec.left_u[lu] = he_u;
+
+        let pt_v = combine_entropy_contexts(ec.above_v[au] != 0, ec.left_v[lu] != 0);
+        let (eob_v, qc_v) = inter_plane_residual(src, recon, &self.qp, Plane::V, mi_row, mi_col);
+        let tokens_v = tokenize_block(
+            &qc_v,
+            eob_v,
+            TxSize::Tx4X4,
+            PlaneType::Uv,
+            REF_TYPE_INTER,
+            pt_v,
+        );
+        let he_v = (eob_v > 0) as u8;
+        ec.above_v[au] = he_v;
+        ec.left_v[lu] = he_v;
+
+        let skip = eob_y == 0 && eob_u == 0 && eob_v == 0;
+        let tokens = concat_tokens(skip, tokens_y, tokens_u, tokens_v);
+        *self.block_mut(mi_row, mi_col) = Mi {
+            skip,
+            tokens,
+            is_inter: true,
+            mode,
+            ref_frame: [LAST_FRAME, NONE_FRAME],
+            mv,
+            mode_context,
+        };
+    }
+
+    // --- Pack walks ---------------------------------------------------------
 
     /// Recursive pack walk: partition tree + modes + tokens (`write_modes_sb`).
     fn pack_sb(
@@ -232,6 +474,7 @@ impl Frame {
         mi_row: u32,
         mi_col: u32,
         bsize: BlockSize,
+        is_keyframe: bool,
     ) {
         if mi_row >= self.mi_rows || mi_col >= self.mi_cols {
             return;
@@ -241,6 +484,13 @@ impl Frame {
             Partition::None
         } else {
             Partition::Split
+        };
+        // Keyframes use the fixed KF partition probabilities; inter frames use the
+        // (default, no-update) frame-context partition probabilities.
+        let partition_probs = if is_keyframe {
+            &KF_PARTITION_PROBS
+        } else {
+            &DEFAULT_PARTITION_PROBS
         };
         write_partition(
             w,
@@ -252,17 +502,22 @@ impl Frame {
             bsize,
             self.mi_rows,
             self.mi_cols,
+            partition_probs,
         );
         let subsize = subsize_of(bsize, partition);
 
         if bsize == BlockSize::B8X8 {
-            self.pack_leaf(w, mi_row, mi_col);
+            if is_keyframe {
+                self.pack_leaf_kf(w, mi_row, mi_col);
+            } else {
+                self.pack_leaf_inter(w, mi_row, mi_col);
+            }
         } else {
             let sub = split_child(bsize);
-            self.pack_sb(w, pc, mi_row, mi_col, sub);
-            self.pack_sb(w, pc, mi_row, mi_col + bs, sub);
-            self.pack_sb(w, pc, mi_row + bs, mi_col, sub);
-            self.pack_sb(w, pc, mi_row + bs, mi_col + bs, sub);
+            self.pack_sb(w, pc, mi_row, mi_col, sub, is_keyframe);
+            self.pack_sb(w, pc, mi_row, mi_col + bs, sub, is_keyframe);
+            self.pack_sb(w, pc, mi_row + bs, mi_col, sub, is_keyframe);
+            self.pack_sb(w, pc, mi_row + bs, mi_col + bs, sub, is_keyframe);
         }
 
         // update_partition_context (only at leaves for the full-split structure).
@@ -271,8 +526,8 @@ impl Frame {
         }
     }
 
-    /// Pack one leaf's skip flag, modes and coefficient tokens (`write_modes_b`).
-    fn pack_leaf(&self, w: &mut BoolWriter, mi_row: u32, mi_col: u32) {
+    /// Pack one keyframe leaf: skip flag, DC modes, coefficient tokens.
+    fn pack_leaf_kf(&self, w: &mut BoolWriter, mi_row: u32, mi_col: u32) {
         let block = self.block(mi_row, mi_col);
         let above_skip = mi_row > 0 && self.block(mi_row - 1, mi_col).skip;
         let left_skip = mi_col > 0 && self.block(mi_row, mi_col - 1).skip;
@@ -280,12 +535,106 @@ impl Frame {
         write_kf_dc_modes(w);
         pack_mb_tokens(w, &block.tokens);
     }
+
+    /// Pack one inter leaf (`pack_inter_mode_mvs`): skip, is_inter, single-ref,
+    /// inter mode, the MV for NEWMV, then coefficient tokens.
+    fn pack_leaf_inter(&self, w: &mut BoolWriter, mi_row: u32, mi_col: u32) {
+        let block = self.block(mi_row, mi_col);
+        let above = self.inter_neighbor(mi_row.checked_sub(1), Some(mi_col));
+        let left = self.inter_neighbor(Some(mi_row), mi_col.checked_sub(1));
+
+        // skip.
+        let above_skip = above.is_some() && self.block(mi_row - 1, mi_col).skip;
+        let left_skip = left.is_some() && self.block(mi_row, mi_col - 1).skip;
+        write_skip(w, above_skip, left_skip, block.skip);
+
+        // is_inter (always 1 for this encoder's inter frames).
+        write_intra_inter(w, above, left, block.is_inter);
+
+        // tx_size: ALLOW_8X8 is not TX_MODE_SELECT → no bits.
+
+        // reference frame (single ref, LAST).
+        write_single_ref_last(w, above, left);
+
+        // inter mode.
+        write_inter_mode(w, block.mode_context as usize, inter_offset(block.mode));
+
+        // interp filter: fixed EIGHTTAP (not SWITCHABLE) → no bits.
+
+        // NEWMV codes the MV difference against the nearest reference MV.
+        if block.mode == PredictionMode::NewMv {
+            let (_ctx, refs) = self.mv_refs_at(mi_row, mi_col);
+            encode_mv(w, block.mv, refs[0], false);
+        }
+
+        pack_mb_tokens(w, &block.tokens);
+    }
+
+    /// Neighbor descriptor for the inter prediction contexts, or `None` at a
+    /// frame edge (mirrors `above_mi` / `left_mi == NULL`).
+    fn inter_neighbor(&self, mi_row: Option<u32>, mi_col: Option<u32>) -> Option<InterNeighbor> {
+        let (r, c) = (mi_row?, mi_col?);
+        if r >= self.mi_rows || c >= self.mi_cols {
+            return None;
+        }
+        let mi = self.block(r, c);
+        Some(InterNeighbor {
+            is_inter: mi.is_inter,
+            ref0: mi.ref_frame[0],
+            ref1: mi.ref_frame[1],
+        })
+    }
+
+    /// Recompute `find_mv_refs` at `(mi_row, mi_col)` from the finished grid (the
+    /// pack walk needs the nearest MV to code a NEWMV difference).
+    fn mv_refs_at(&self, mi_row: u32, mi_col: u32) -> (u8, [Mv; 2]) {
+        let (mi_rows, mi_cols) = (self.mi_rows as i32, self.mi_cols as i32);
+        let cols = self.mi_cols;
+        let grid = &self.grid;
+        let geom = MvRefGeom {
+            mi_rows,
+            mi_cols,
+            ref_frame: LAST_FRAME,
+            ref_sign_bias: [0; 4],
+            allow_hp: false,
+        };
+        find_mv_refs(
+            |r, c| {
+                if r < 0 || c < 0 || r >= mi_rows || c >= mi_cols {
+                    None
+                } else {
+                    let mi = &grid[(r as u32 * cols + c as u32) as usize];
+                    Some(MvRefInfo {
+                        mode: mi.mode as u8,
+                        ref_frame: mi.ref_frame,
+                        mv: [mi.mv, Mv::ZERO],
+                    })
+                }
+            },
+            mi_row as i32,
+            mi_col as i32,
+            BlockSize::B8X8,
+            &geom,
+        )
+    }
+}
+
+/// Concatenate the per-plane token lists (Y, U, V) unless the block is skipped.
+fn concat_tokens(skip: bool, y: Vec<Token>, u: Vec<Token>, v: Vec<Token>) -> Vec<Token> {
+    if skip {
+        Vec::new()
+    } else {
+        let mut t = y;
+        t.extend(u);
+        t.extend(v);
+        t
+    }
 }
 
 /// Run [`encode_intra_block`] for one plane's transform block, returning its
 /// end-of-block count and quantized coefficients.
 #[allow(clippy::too_many_arguments)]
-fn encode_plane_block(
+fn encode_intra_plane_block(
     src: &FrameBuffer,
     recon: &mut FrameBuffer,
     qp: &QuantParams,
@@ -325,11 +674,43 @@ fn encode_plane_block(
     (res.eob as usize, res.qcoeff)
 }
 
+/// Transform + reconstruct one plane's transform block whose motion-compensated
+/// prediction already sits in `recon`.
+fn inter_plane_residual(
+    src: &FrameBuffer,
+    recon: &mut FrameBuffer,
+    qp: &QuantParams,
+    plane: Plane,
+    mi_row: u32,
+    mi_col: u32,
+) -> (usize, Vec<i16>) {
+    let (tx_size, px) = match plane {
+        Plane::Y => (TxSize::Tx8X8, 8u32),
+        Plane::U | Plane::V => (TxSize::Tx4X4, 4u32),
+    };
+    let (src_data, src_org, src_stride, _, _) = match plane {
+        Plane::Y => src.y(),
+        Plane::U => src.u(),
+        Plane::V => src.v(),
+    };
+    let src_off = src_org + (mi_row * px) as usize * src_stride + (mi_col * px) as usize;
+    let (rdata, rorg, rstride) = match plane {
+        Plane::Y => recon.y_mut(),
+        Plane::U => recon.u_mut(),
+        Plane::V => recon.v_mut(),
+    };
+    let off = rorg + (mi_row * px) as usize * rstride + (mi_col * px) as usize;
+    let res = residual_transform_reconstruct(
+        rdata, rstride, src_data, src_off, src_stride, tx_size, off, qp,
+    );
+    (res.eob as usize, res.qcoeff)
+}
+
 /// Encode a single keyframe of `src` at `base_qindex`.
 ///
 /// Returns the complete VP9 frame bitstream and the reconstruction buffer (which
-/// equals what a conformant decoder produces, and becomes the reference for
-/// later inter frames). `src` must already hold the imported, mi-padded frame.
+/// equals what a conformant decoder produces, and becomes the reference for later
+/// inter frames). `src` must already hold the imported, mi-padded frame.
 pub fn encode_keyframe(src: &FrameBuffer, base_qindex: u8) -> (Vec<u8>, FrameBuffer) {
     let width = src.crop_width;
     let height = src.crop_height;
@@ -339,7 +720,7 @@ pub fn encode_keyframe(src: &FrameBuffer, base_qindex: u8) -> (Vec<u8>, FrameBuf
 
     let mut recon = FrameBuffer::new(width, height);
     let qp = QuantParams::new(base_qindex as i32, 0, 0);
-    let grid = vec![CodedBlock::default(); (mi_rows * mi_cols) as usize];
+    let grid = vec![Mi::default(); (mi_rows * mi_cols) as usize];
 
     let mut frame = Frame {
         mi_rows,
@@ -363,23 +744,92 @@ pub fn encode_keyframe(src: &FrameBuffer, base_qindex: u8) -> (Vec<u8>, FrameBuf
 
     // --- Phase 2: pack the frame. ---
     let header = UncompressedHeader::keyframe(width, height, base_qindex);
-    let (mut out, _) = pack_frame_header(&header, TxMode::Allow8X8);
+    let out = pack(&frame, &header, true);
+    (out, recon)
+}
+
+/// Encode a single inter frame of `src` against `reference` (the previous
+/// reconstruction, borders already extended) at `base_qindex`.
+///
+/// Returns the VP9 frame bitstream and this frame's reconstruction (the next
+/// reference). Uses a single LAST reference, integer-pel motion compensation, and
+/// ZEROMV / NEARESTMV / NEWMV modes.
+pub fn encode_inter_frame(
+    src: &FrameBuffer,
+    reference: &FrameBuffer,
+    base_qindex: u8,
+) -> (Vec<u8>, FrameBuffer) {
+    let width = src.crop_width;
+    let height = src.crop_height;
+    let mi_rows = src.mi_rows();
+    let mi_cols = src.mi_cols();
+    let mi_cols_aligned = ((mi_cols + 7) & !7) as usize;
+
+    let mut recon = FrameBuffer::new(width, height);
+    let qp = QuantParams::new(base_qindex as i32, 0, 0);
+    let grid = vec![Mi::default(); (mi_rows * mi_cols) as usize];
+
+    let mut frame = Frame {
+        mi_rows,
+        mi_cols,
+        qp,
+        grid,
+    };
+
+    // --- Phase 1: motion estimation + tokenize walk (builds reconstruction). ---
+    let mut ec = EntropyContext::new(mi_cols_aligned);
+    let mut mi_row = 0;
+    while mi_row < mi_rows {
+        ec.reset_left();
+        let mut mi_col = 0;
+        while mi_col < mi_cols {
+            frame.encode_inter_sb(
+                src,
+                reference,
+                &mut recon,
+                &mut ec,
+                mi_row,
+                mi_col,
+                BlockSize::B64X64,
+            );
+            mi_col += 8;
+        }
+        mi_row += 8;
+    }
+
+    // --- Phase 2: pack the frame. ---
+    let header = UncompressedHeader::inter(width, height, base_qindex);
+    let out = pack(&frame, &header, false);
+    (out, recon)
+}
+
+/// Pack a fully-encoded [`Frame`]: header, compressed header, and the single-tile
+/// mode/token stream.
+fn pack(frame: &Frame, header: &UncompressedHeader, is_keyframe: bool) -> Vec<u8> {
+    let mi_cols_aligned = ((frame.mi_cols + 7) & !7) as usize;
+    let (mut out, _) = pack_frame_header(header, TxMode::Allow8X8);
 
     let mut tile = BoolWriter::new();
     let mut pc = PartitionContext::new(mi_cols_aligned);
     let mut mi_row = 0;
-    while mi_row < mi_rows {
+    while mi_row < frame.mi_rows {
         pc.reset_left();
         let mut mi_col = 0;
-        while mi_col < mi_cols {
-            frame.pack_sb(&mut tile, &mut pc, mi_row, mi_col, BlockSize::B64X64);
+        while mi_col < frame.mi_cols {
+            frame.pack_sb(
+                &mut tile,
+                &mut pc,
+                mi_row,
+                mi_col,
+                BlockSize::B64X64,
+                is_keyframe,
+            );
             mi_col += 8;
         }
         mi_row += 8;
     }
     out.extend_from_slice(&tile.finalize());
-
-    (out, recon)
+    out
 }
 
 #[cfg(test)]
@@ -424,6 +874,50 @@ mod tests {
     fn odd_size_encodes_without_panic() {
         // 636x476 exercises mi padding (→640x480) and the partial bottom SB row.
         let (bytes, recon) = encode_keyframe(&make_src(636, 476), 150);
+        assert!(!bytes.is_empty());
+        assert_eq!((recon.crop_width, recon.crop_height), (636, 476));
+    }
+
+    #[test]
+    fn inter_frame_is_deterministic_and_shows_inter_marker() {
+        let key = encode_keyframe(&make_src(128, 96), 128);
+        let mut reference = key.1;
+        reference.extend_borders();
+        let src = make_src(128, 96);
+        let a = encode_inter_frame(&src, &reference, 128).0;
+        let b = encode_inter_frame(&src, &reference, 128).0;
+        assert_eq!(a, b, "inter encode must be deterministic");
+        // frame_type bit (inter = 1) sits after marker(2)+profile(2)+show_existing(1).
+        assert_eq!(a[0] >> 6, 0b10, "frame marker");
+    }
+
+    #[test]
+    fn inter_of_identical_frame_is_small() {
+        // Encoding a frame identical to its reference should predict everything
+        // with ZEROMV + skip, yielding a tiny frame relative to the keyframe.
+        let key = encode_keyframe(&make_src(128, 96), 128);
+        let mut reference = key.1;
+        reference.extend_borders();
+        // The source for the inter frame equals the *reconstruction* so ZEROMV is
+        // near-perfect (residual near zero).
+        let src_i420 = reference.export_i420();
+        let mut src = FrameBuffer::new(128, 96);
+        src.import_i420(&src_i420, 128, 96).unwrap();
+        let inter = encode_inter_frame(&src, &reference, 128);
+        assert!(
+            inter.0.len() < key.0.len(),
+            "inter frame ({}) should be smaller than keyframe ({})",
+            inter.0.len(),
+            key.0.len()
+        );
+    }
+
+    #[test]
+    fn inter_odd_size_encodes_without_panic() {
+        let key = encode_keyframe(&make_src(636, 476), 150);
+        let mut reference = key.1;
+        reference.extend_borders();
+        let (bytes, recon) = encode_inter_frame(&make_src(636, 476), &reference, 150);
         assert!(!bytes.is_empty());
         assert_eq!((recon.crop_width, recon.crop_height), (636, 476));
     }

@@ -132,13 +132,20 @@ fn tables(tx_size: TxSize) -> (&'static [i16], &'static [i16], &'static [u8], us
     }
 }
 
-/// `coef_probs[tx_size][plane_type][INTRA][band][ctx]` (the three unconstrained
-/// nodes). `INTRA` (ref type 0) is the only reference type on a keyframe.
-fn coef_probs(tx_size: TxSize, plane: PlaneType, band: usize, ctx: usize) -> [u8; 3] {
+/// `coef_probs[tx_size][plane_type][ref_type][band][ctx]` (the three
+/// unconstrained nodes). `ref_type` is 0 for intra blocks (all of a keyframe) and
+/// 1 for inter blocks; the decoder selects the same slice from `is_inter_block`.
+fn coef_probs(
+    tx_size: TxSize,
+    plane: PlaneType,
+    ref_type: usize,
+    band: usize,
+    ctx: usize,
+) -> [u8; 3] {
     let p = plane as usize;
     match tx_size {
-        TxSize::Tx4X4 => DEFAULT_COEF_PROBS_4X4[p][0][band][ctx],
-        TxSize::Tx8X8 => DEFAULT_COEF_PROBS_8X8[p][0][band][ctx],
+        TxSize::Tx4X4 => DEFAULT_COEF_PROBS_4X4[p][ref_type][band][ctx],
+        TxSize::Tx8X8 => DEFAULT_COEF_PROBS_8X8[p][ref_type][band][ctx],
         _ => unreachable!("tokenizer only supports 4x4 and 8x8 transforms"),
     }
 }
@@ -156,6 +163,7 @@ pub fn tokenize_block(
     eob: usize,
     tx_size: TxSize,
     plane: PlaneType,
+    ref_type: usize,
     pt_init: usize,
 ) -> Vec<Token> {
     let (scan, neighbors, band, tx_eob) = tables(tx_size);
@@ -170,7 +178,7 @@ pub fn tokenize_block(
         while v == 0 {
             tokens.push(Token {
                 token: ZERO_TOKEN,
-                probs: coef_probs(tx_size, plane, band[c] as usize, pt),
+                probs: coef_probs(tx_size, plane, ref_type, band[c] as usize, pt),
                 extra: 0,
             });
             token_cache[scan[c] as usize] = 0;
@@ -181,7 +189,7 @@ pub fn tokenize_block(
         let (token, extra) = get_token_extra(v);
         tokens.push(Token {
             token,
-            probs: coef_probs(tx_size, plane, band[c] as usize, pt),
+            probs: coef_probs(tx_size, plane, ref_type, band[c] as usize, pt),
             extra,
         });
         token_cache[scan[c] as usize] = energy_class(token);
@@ -192,13 +200,18 @@ pub fn tokenize_block(
     if c < tx_eob {
         tokens.push(Token {
             token: EOB_TOKEN,
-            probs: coef_probs(tx_size, plane, band[c] as usize, pt),
+            probs: coef_probs(tx_size, plane, ref_type, band[c] as usize, pt),
             extra: 0,
         });
     }
 
     tokens
 }
+
+/// Reference type index into `coef_probs`: intra blocks (all of a keyframe).
+pub const REF_TYPE_INTRA: usize = 0;
+/// Reference type index into `coef_probs`: inter blocks.
+pub const REF_TYPE_INTER: usize = 1;
 
 /// `combine_entropy_contexts(a, b)` = `(a != 0) + (b != 0)`.
 #[inline]
@@ -281,7 +294,7 @@ mod tests {
     #[test]
     fn all_zero_block_emits_single_eob() {
         let q = [0i16; 64];
-        let toks = tokenize_block(&q, 0, TxSize::Tx8X8, PlaneType::Y, 0);
+        let toks = tokenize_block(&q, 0, TxSize::Tx8X8, PlaneType::Y, REF_TYPE_INTRA, 0);
         assert_eq!(toks.len(), 1);
         assert_eq!(toks[0].token, EOB_TOKEN);
     }
@@ -290,7 +303,7 @@ mod tests {
     fn dc_only_block_emits_one_then_eob() {
         let mut q = [0i16; 16];
         q[0] = 1; // DC = +1 ⇒ ONE_TOKEN, positive sign.
-        let toks = tokenize_block(&q, 1, TxSize::Tx4X4, PlaneType::Y, 0);
+        let toks = tokenize_block(&q, 1, TxSize::Tx4X4, PlaneType::Y, REF_TYPE_INTRA, 0);
         assert_eq!(toks.len(), 2);
         assert_eq!(toks[0].token, ONE_TOKEN);
         assert_eq!(toks[0].extra & 1, 0);
@@ -305,7 +318,7 @@ mod tests {
         for (i, c) in q.iter_mut().enumerate() {
             *c = if i % 2 == 0 { 1 } else { -1 };
         }
-        let toks = tokenize_block(&q, 16, TxSize::Tx4X4, PlaneType::Y, 0);
+        let toks = tokenize_block(&q, 16, TxSize::Tx4X4, PlaneType::Y, REF_TYPE_INTRA, 0);
         assert!(toks.iter().all(|t| t.token != EOB_TOKEN));
         assert_eq!(toks.len(), 16);
     }

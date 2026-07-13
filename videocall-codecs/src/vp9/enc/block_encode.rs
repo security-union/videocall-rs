@@ -73,9 +73,6 @@ pub fn encode_intra_block(
     ctx: &BlockCtx,
     qp: &QuantParams,
 ) -> BlockResult {
-    let bs = 4usize << (ctx.tx_size as usize);
-    let n = bs * bs;
-
     // 1. DC prediction into the reconstruction block.
     build_intra_dc(
         recon,
@@ -90,19 +87,54 @@ pub fn encode_intra_block(
         ctx.frame_h,
     );
 
-    // 2. Residual = source - prediction (prediction currently in `recon`).
+    // 2..5. Residual against the prediction now sitting in `recon`.
+    residual_transform_reconstruct(
+        recon,
+        recon_stride,
+        src,
+        src_off,
+        src_stride,
+        ctx.tx_size,
+        ctx.off,
+        qp,
+    )
+}
+
+/// Transform, quantize and reconstruct one block whose **prediction already sits
+/// in `recon` at `off`** (from DC intra prediction or motion compensation).
+///
+/// Forms `residual = src - prediction`, forward-transforms, quantizes /
+/// dequantizes, and adds the inverse transform back into `recon` in place. On
+/// return the `recon` block holds `prediction + reconstructed residual`; a block
+/// that quantizes to all zeros (`eob == 0`) leaves the prediction untouched. This
+/// is the shared kernel of the intra and inter encode paths.
+#[allow(clippy::too_many_arguments)]
+pub fn residual_transform_reconstruct(
+    recon: &mut [u8],
+    recon_stride: usize,
+    src: &[u8],
+    src_off: usize,
+    src_stride: usize,
+    tx_size: TxSize,
+    off: usize,
+    qp: &QuantParams,
+) -> BlockResult {
+    let bs = 4usize << (tx_size as usize);
+    let n = bs * bs;
+
+    // Residual = source - prediction (prediction currently in `recon`).
     let mut residual = [0i16; 64];
     for r in 0..bs {
         for c in 0..bs {
             let s = src[src_off + r * src_stride + c] as i16;
-            let p = recon[ctx.off + r * recon_stride + c] as i16;
+            let p = recon[off + r * recon_stride + c] as i16;
             residual[r * bs + c] = s - p;
         }
     }
 
-    // 3. Forward transform.
+    // Forward transform.
     let mut coeff = [0i16; 64];
-    match ctx.tx_size {
+    match tx_size {
         TxSize::Tx4X4 => {
             let mut c4 = [0i16; 16];
             fdct4x4(&residual[..n], bs, &mut c4);
@@ -113,33 +145,32 @@ pub fn encode_intra_block(
             fdct8x8(&residual[..n], bs, &mut c8);
             coeff.copy_from_slice(&c8);
         }
-        _ => unreachable!("encode_intra_block only supports 4x4 and 8x8 transforms"),
+        _ => unreachable!("only 4x4 and 8x8 transforms are supported"),
     }
 
-    // 4. Quantize / dequantize.
+    // Quantize / dequantize.
     let mut qcoeff = [0i16; 64];
     let mut dqcoeff = [0i16; 64];
     let eob = quantize_fp(
         &coeff[..n],
-        ctx.tx_size,
+        tx_size,
         qp,
         &mut qcoeff[..n],
         &mut dqcoeff[..n],
     );
     let skip = eob == 0;
 
-    // 5. Inverse transform back into the reconstruction (recon still holds the
-    //    prediction, so this yields prediction + residual). Skipped blocks keep
-    //    the prediction untouched.
+    // Inverse transform back into the reconstruction (recon still holds the
+    // prediction, so this yields prediction + residual).
     if !skip {
-        match ctx.tx_size {
+        match tx_size {
             TxSize::Tx4X4 => {
                 let dq: [i16; 16] = dqcoeff[..16].try_into().unwrap();
-                idct4x4_add(&dq, &mut recon[ctx.off..], recon_stride);
+                idct4x4_add(&dq, &mut recon[off..], recon_stride);
             }
             TxSize::Tx8X8 => {
                 let dq: [i16; 64] = dqcoeff;
-                idct8x8_add(&dq, &mut recon[ctx.off..], recon_stride);
+                idct8x8_add(&dq, &mut recon[off..], recon_stride);
             }
             _ => unreachable!(),
         }

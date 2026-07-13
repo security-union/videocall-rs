@@ -42,7 +42,7 @@
 
 use crate::encoder::{Encodable, EncodedFrame, EncoderConfig};
 use crate::vp9::common::frame_buffer::FrameBuffer;
-use crate::vp9::enc::encoder::encode_keyframe;
+use crate::vp9::enc::encoder::{encode_inter_frame, encode_keyframe};
 use anyhow::Result;
 
 pub(crate) mod common;
@@ -56,15 +56,17 @@ const M1_BASE_QINDEX: u8 = 150;
 
 /// The pure-Rust VP9 encoder.
 ///
-/// Construct via [`Encodable::new`]. Every frame is currently encoded as an
-/// intra keyframe at a fixed quantizer (inter prediction and rate control land
-/// in later milestones).
+/// Construct via [`Encodable::new`]. The first frame (and every
+/// `keyframe_interval`-th frame) is an intra keyframe at a fixed quantizer; the
+/// rest are single-reference inter frames with integer-pel motion compensation.
+/// Rate control lands in a later milestone.
 pub struct Vp9Encoder {
     config: EncoderConfig,
     frame_count: u64,
-    /// Reconstruction of the most recently encoded frame (the future inter-frame
-    /// reference; also exposed for the bit-exact oracle drift test).
-    last_recon: Option<FrameBuffer>,
+    /// Reconstruction of the most recently encoded frame with borders extended:
+    /// the LAST reference for the next inter frame. Also exposed (via the
+    /// cropped export) for the bit-exact oracle drift test.
+    reference: Option<FrameBuffer>,
 }
 
 impl Vp9Encoder {
@@ -74,7 +76,14 @@ impl Vp9Encoder {
     /// This is exactly what a conformant decoder must reproduce, so tests can
     /// assert bit-exactness against the libvpx oracle.
     pub fn last_reconstruction_i420(&self) -> Option<Vec<u8>> {
-        self.last_recon.as_ref().map(|fb| fb.export_i420())
+        self.reference.as_ref().map(|fb| fb.export_i420())
+    }
+
+    /// Whether the next call to [`Encodable::encode`] will emit a keyframe (the
+    /// first frame, then every `keyframe_interval`-th frame).
+    fn is_keyframe(&self) -> bool {
+        let interval = self.config.keyframe_interval.max(1) as u64;
+        self.reference.is_none() || self.frame_count.is_multiple_of(interval)
     }
 }
 
@@ -83,7 +92,7 @@ impl Encodable for Vp9Encoder {
         Ok(Self {
             config,
             frame_count: 0,
-            last_recon: None,
+            reference: None,
         })
     }
 
@@ -98,13 +107,21 @@ impl Encodable for Vp9Encoder {
         src.import_i420(i420, w, h)
             .map_err(|e| anyhow::anyhow!("i420 import failed: {e}"))?;
 
-        let (data, recon) = encode_keyframe(&src, M1_BASE_QINDEX);
+        let is_keyframe = self.is_keyframe();
+        let (data, mut recon) = match (is_keyframe, self.reference.as_ref()) {
+            (false, Some(reference)) => encode_inter_frame(&src, reference, M1_BASE_QINDEX),
+            _ => encode_keyframe(&src, M1_BASE_QINDEX),
+        };
+
+        // The reconstruction becomes the LAST reference; extend its borders so
+        // motion compensation of the next frame can read past the frame edge.
+        recon.extend_borders();
+        self.reference = Some(recon);
         self.frame_count += 1;
-        self.last_recon = Some(recon);
 
         Ok(Some(EncodedFrame {
             data,
-            is_keyframe: true,
+            is_keyframe,
             pts,
         }))
     }

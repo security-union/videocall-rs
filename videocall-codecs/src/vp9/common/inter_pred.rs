@@ -71,22 +71,29 @@ fn clamp(v: i32, lo: i32, hi: i32) -> i32 {
 /// `build_inter_predictors` uses for a square block after clamping.
 ///
 /// `mi_row`/`mi_col` are the block's mode-info coordinates, `px` the plane block
-/// dimension in pixels (8 luma, 4 chroma for 4:2:0). Returns the clamped Q4 MV's
-/// integer part and sub-pel remainder; the caller asserts the remainder is zero.
+/// dimension in pixels (8 luma / 4 chroma for an 8x8 leaf; 16 / 8 for a 16x16
+/// leaf), and `bw_mi`/`bh_mi` the block size in mode-info units (1 for an 8x8
+/// leaf, 2 for a 16x16 leaf) used for the frame-edge clamp (`set_mi_row_col`).
+/// Returns the clamped Q4 MV's integer part and sub-pel remainder; the caller
+/// asserts the remainder is zero.
+#[allow(clippy::too_many_arguments)]
 fn integer_mv_offset(
     mv: Mv,
     mi_row: i32,
     mi_col: i32,
     px: i32,
     ss: i32,
+    bw_mi: i32,
+    bh_mi: i32,
     mi_rows: i32,
     mi_cols: i32,
 ) -> (i32, i32, i32, i32) {
-    // Edges in 1/8-pel luma units (set_mi_row_col with MI_SIZE = 8).
+    // Edges in 1/8-pel luma units (set_mi_row_col with MI_SIZE = 8), block size
+    // dependent: mb_to_bottom/right use the block's mi height/width.
     let mb_to_top = -((mi_row * 8) * 8);
-    let mb_to_bottom = (mi_rows - 1 - mi_row) * 8 * 8;
+    let mb_to_bottom = (mi_rows - bh_mi - mi_row) * 8 * 8;
     let mb_to_left = -((mi_col * 8) * 8);
-    let mb_to_right = (mi_cols - 1 - mi_col) * 8 * 8;
+    let mb_to_right = (mi_cols - bw_mi - mi_col) * 8 * 8;
 
     // clamp_mv_to_umv_border_sb: scale to Q4 for this plane, then clamp. Blocks
     // are square here, so bw == bh == px.
@@ -116,8 +123,10 @@ fn integer_mv_offset(
     (off_row, off_col, subpel_row, subpel_col)
 }
 
-/// Motion-compensate one 8x8 luma / 4x4 chroma block by copying from `reference`
-/// into `dst` at the block's mode-info position.
+/// Motion-compensate one block by copying from `reference` into `dst` at the
+/// block's mode-info position. `bsize_mi` is the (square) block size in mode-info
+/// units: 1 for an 8x8 leaf (8x8 luma / 4x4 chroma), 2 for a 16x16 leaf (16x16
+/// luma / 8x8 chroma).
 ///
 /// `reference` must have its borders extended. `mv` must be a multiple of 16 in
 /// 1/8-pel units (enforced by the motion search); this function debug-asserts the
@@ -130,13 +139,20 @@ pub fn predict_inter_block(
     mi_row: i32,
     mi_col: i32,
     mv: Mv,
+    bsize_mi: i32,
     mi_rows: i32,
     mi_cols: i32,
 ) {
     let ss = plane.subsampling();
-    let px = if ss == 0 { 8 } else { 4 }; // block dim in plane pixels
-    let (off_row, off_col, sub_row, sub_col) =
-        integer_mv_offset(mv, mi_row, mi_col, px, ss, mi_rows, mi_cols);
+    // Block dimension in plane pixels (luma bsize_mi*8, chroma bsize_mi*4) and the
+    // pixel size of one mode-info unit in this plane (luma 8, chroma 4). The block
+    // dimension sizes the copy and the sub-pel clamp; the mi size maps the block's
+    // grid position to a pixel offset (they coincide only for an 8x8 leaf).
+    let px = (bsize_mi * 8) >> ss;
+    let mi_px = 8 >> ss;
+    let (off_row, off_col, sub_row, sub_col) = integer_mv_offset(
+        mv, mi_row, mi_col, px, ss, bsize_mi, bsize_mi, mi_rows, mi_cols,
+    );
     debug_assert_eq!(
         (sub_row, sub_col),
         (0, 0),
@@ -148,8 +164,8 @@ pub fn predict_inter_block(
         Plane::U => reference.u(),
         Plane::V => reference.v(),
     };
-    let base_row = mi_row * px + off_row;
-    let base_col = mi_col * px + off_col;
+    let base_row = mi_row * mi_px + off_row;
+    let base_col = mi_col * mi_px + off_col;
     let src0 = (rorg as i32 + base_row * rstride as i32 + base_col) as usize;
 
     let (ddata, dorg, dstride) = match plane {
@@ -157,7 +173,7 @@ pub fn predict_inter_block(
         Plane::U => dst.u_mut(),
         Plane::V => dst.v_mut(),
     };
-    let dst0 = dorg + (mi_row * px) as usize * dstride + (mi_col * px) as usize;
+    let dst0 = dorg + (mi_row * mi_px) as usize * dstride + (mi_col * mi_px) as usize;
 
     for r in 0..px as usize {
         let s = src0 + r * rstride;
@@ -197,7 +213,7 @@ mod tests {
     fn zero_mv_copies_colocated_block() {
         let reference = make_ref(64, 64);
         let mut dst = FrameBuffer::new(64, 64);
-        predict_inter_block(&reference, &mut dst, Plane::Y, 2, 3, Mv::ZERO, 8, 8);
+        predict_inter_block(&reference, &mut dst, Plane::Y, 2, 3, Mv::ZERO, 1, 8, 8);
         // Block at mi (2,3) → pixels (16, 24).
         for r in 0..8 {
             for c in 0..8 {
@@ -214,7 +230,17 @@ mod tests {
         // MV = (16, 32) in 1/8-pel → +2 px down, +4 px right (multiples of 16).
         let reference = make_ref(64, 64);
         let mut dst = FrameBuffer::new(64, 64);
-        predict_inter_block(&reference, &mut dst, Plane::Y, 2, 2, Mv::new(16, 32), 8, 8);
+        predict_inter_block(
+            &reference,
+            &mut dst,
+            Plane::Y,
+            2,
+            2,
+            Mv::new(16, 32),
+            1,
+            8,
+            8,
+        );
         for r in 0..8 {
             for c in 0..8 {
                 // dst(16+r,16+c) = ref(16+r+2, 16+c+4).
@@ -238,6 +264,7 @@ mod tests {
             4,
             4,
             Mv::new(-16, -16),
+            1,
             8,
             8,
         );
@@ -264,6 +291,7 @@ mod tests {
             0,
             0,
             Mv::new(-16, -16),
+            1,
             8,
             8,
         );
@@ -278,7 +306,17 @@ mod tests {
         // assert (no subpel) and buffer equality.
         let reference = make_ref(64, 64);
         let mut dst = FrameBuffer::new(64, 64);
-        predict_inter_block(&reference, &mut dst, Plane::U, 1, 1, Mv::new(32, 32), 8, 8);
+        predict_inter_block(
+            &reference,
+            &mut dst,
+            Plane::U,
+            1,
+            1,
+            Mv::new(32, 32),
+            1,
+            8,
+            8,
+        );
         let (ddata, dorg, dstride) = {
             let (a, b, c) = dst.u_mut();
             (a.to_vec(), b, c)
@@ -307,6 +345,7 @@ mod tests {
             0,
             mi_cols - 1,
             Mv::new(0, 16),
+            1,
             60,
             mi_cols,
         );

@@ -24,9 +24,11 @@
 //! mi blocks, so the encoder must operate on the same mi-aligned region, with
 //! the source's cropped edge replicated to fill it.
 //!
-//! [`FrameBuffer::extend_borders`] replicates the outermost active samples into
-//! the margins, matching libvpx `extend_plane` (`vpx_scale/generic/yv12extend.c`)
-//! so reference frames are ready for motion compensation in later milestones.
+//! [`FrameBuffer::extend_borders`] replicates the outermost **cropped** samples
+//! into the margins (and over the mi-padding between the crop and active edges),
+//! matching libvpx `extend_plane` (`vpx_scale/generic/yv12extend.c`, called with
+//! the crop dimensions) so reference frames match the decoder's for motion
+//! compensation.
 
 /// Border width in samples on every side of every plane.
 pub const BORDER: usize = 64;
@@ -45,10 +47,25 @@ struct Plane {
     /// Active (mi-aligned) dimensions.
     width: usize,
     height: usize,
+    /// True (cropped) dimensions. The mi-padding columns/rows between the crop
+    /// and the active edge are reconstructed while coding but overwritten by
+    /// border extension, which replicates the *crop* edge.
+    crop_width: usize,
+    crop_height: usize,
+    /// Allocated (superblock-aligned) dimensions, excluding the border.
+    alloc_width: usize,
+    alloc_height: usize,
 }
 
 impl Plane {
-    fn new(active_w: usize, active_h: usize, alloc_w: usize, alloc_h: usize) -> Self {
+    fn new(
+        active_w: usize,
+        active_h: usize,
+        crop_w: usize,
+        crop_h: usize,
+        alloc_w: usize,
+        alloc_h: usize,
+    ) -> Self {
         let stride = alloc_w + 2 * BORDER;
         let rows = alloc_h + 2 * BORDER;
         Self {
@@ -57,30 +74,53 @@ impl Plane {
             origin: BORDER * stride + BORDER,
             width: active_w,
             height: active_h,
+            crop_width: crop_w,
+            crop_height: crop_h,
+            alloc_width: alloc_w,
+            alloc_height: alloc_h,
         }
     }
 
+    /// Extend the plane's borders by replicating the **cropped** edge, matching
+    /// libvpx `vpx_extend_frame_borders` / `extend_plane` (called with
+    /// `y_crop_width`/`y_crop_height`). Everything outside the crop rectangle —
+    /// the mi-padding columns/rows *and* the surrounding border — is filled from
+    /// the nearest crop-edge sample. Getting this wrong desyncs inter motion
+    /// compensation from the decoder for any block whose MV reads past the crop
+    /// edge (invisible for crop == active, i.e. mi-aligned resolutions).
     #[inline]
     fn extend_borders(&mut self) {
-        let (w, h, stride, origin) = (self.width, self.height, self.stride, self.origin);
-        // Left/right columns.
-        for r in 0..h {
+        let (cw, ch, stride, origin) =
+            (self.crop_width, self.crop_height, self.stride, self.origin);
+        // Column range to fill on each row, relative to the row's active col 0:
+        // from -BORDER on the left to (alloc_width + BORDER) on the right.
+        let right_end = self.alloc_width + BORDER; // exclusive
+        for r in 0..ch {
             let row = origin + r * stride;
             let left = self.data[row];
-            let right = self.data[row + w - 1];
+            let right = self.data[row + cw - 1];
             for c in 1..=BORDER {
                 self.data[row - c] = left;
-                self.data[row + w - 1 + c] = right;
+            }
+            for c in cw..right_end {
+                self.data[row + c] = right;
             }
         }
-        // Top/bottom rows (including the just-filled left/right margins).
-        let line = w + 2 * BORDER;
-        let top = origin - BORDER;
-        let bottom = origin + (h - 1) * stride - BORDER;
+        // Top/bottom: copy the (now horizontally-extended) first/last crop row
+        // across the full padded width. Top fills [-BORDER, 0); bottom fills
+        // [crop_height, alloc_height + BORDER), overwriting the mi-padding rows.
+        let line_start = origin - BORDER;
+        let line_len = BORDER + right_end;
         for k in 1..=BORDER {
-            self.data.copy_within(top..top + line, top - k * stride);
             self.data
-                .copy_within(bottom..bottom + line, bottom + k * stride);
+                .copy_within(line_start..line_start + line_len, line_start - k * stride);
+        }
+        let bottom_src = origin + (ch - 1) * stride - BORDER;
+        let bottom_end = self.alloc_height + BORDER; // exclusive, in active-relative rows
+        for r in ch..bottom_end {
+            let dst = origin + r * stride - BORDER;
+            self.data
+                .copy_within(bottom_src..bottom_src + line_len, dst);
         }
     }
 }
@@ -116,9 +156,30 @@ impl FrameBuffer {
         Self {
             crop_width,
             crop_height,
-            y: Plane::new(y_active_w, y_active_h, y_alloc_w, y_alloc_h),
-            u: Plane::new(uv_active_w, uv_active_h, uv_alloc_w, uv_alloc_h),
-            v: Plane::new(uv_active_w, uv_active_h, uv_alloc_w, uv_alloc_h),
+            y: Plane::new(
+                y_active_w,
+                y_active_h,
+                crop_width as usize,
+                crop_height as usize,
+                y_alloc_w,
+                y_alloc_h,
+            ),
+            u: Plane::new(
+                uv_active_w,
+                uv_active_h,
+                uv_crop_w as usize,
+                uv_crop_h as usize,
+                uv_alloc_w,
+                uv_alloc_h,
+            ),
+            v: Plane::new(
+                uv_active_w,
+                uv_active_h,
+                uv_crop_w as usize,
+                uv_crop_h as usize,
+                uv_alloc_w,
+                uv_alloc_h,
+            ),
         }
     }
 

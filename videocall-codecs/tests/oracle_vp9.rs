@@ -49,6 +49,19 @@ const BITRATE_TOLERANCE: f64 = 0.5;
 
 /// Standard test config: 150-frame keyframe interval, q 40..60, cpu_used 7.
 fn config(width: u32, height: u32, framerate: u32, bitrate_kbps: u32) -> EncoderConfig {
+    config_cpu(width, height, framerate, bitrate_kbps, 7)
+}
+
+/// Like [`config`] but with an explicit `cpu_used` preset. Preset 7-8 keep every
+/// fitting 16x16 as a leaf; presets 5-6 split high-SAD 16x16 blocks to 8x8, which
+/// exercises the `PARTITION_SPLIT` path of the new partitioner.
+fn config_cpu(
+    width: u32,
+    height: u32,
+    framerate: u32,
+    bitrate_kbps: u32,
+    cpu_used: u8,
+) -> EncoderConfig {
     EncoderConfig {
         width,
         height,
@@ -57,7 +70,7 @@ fn config(width: u32, height: u32, framerate: u32, bitrate_kbps: u32) -> Encoder
         keyframe_interval: 150,
         min_quantizer: 40,
         max_quantizer: 60,
-        cpu_used: 7,
+        cpu_used,
     }
 }
 
@@ -331,6 +344,54 @@ fn m2b_recon_matches_oracle_under_varying_qindex() {
     }
 }
 
+/// Bit-exact reconstruction through the `PARTITION_SPLIT` path of the 16x16
+/// partitioner. At `cpu_used = 5` the split valve is active, and the [`busy`]
+/// source's broadband texture pushes most 16x16 blocks' motion-compensated SAD
+/// above the threshold, so they split into four 8x8 leaves. This drives partition
+/// writing (SPLIT at 16 then NONE at each 8x8), the 8x8 mode/token path and the
+/// partition-context bookkeeping under the new decision code, and must still match
+/// the libvpx oracle sample-for-sample — including the odd size whose crop edge
+/// exercises intra edge replication on the keyframe. Complements the preset-7
+/// drift tests above, which cover the 16x16-leaf path.
+#[test]
+fn m2b_split_partitions_recon_matches_oracle() {
+    for &(w, h) in &[(640u32, 480u32), (636, 476)] {
+        let mut enc = Vp9Encoder::new(config_cpu(w, h, 30, 500, 5)).expect("encoder init");
+        let mut dec = OracleDecoder::new().expect("oracle init failed");
+
+        for t in 0..12usize {
+            let frame = busy(w, h, t as u32);
+            let ef = enc
+                .encode(t as i64, &frame)
+                .expect("encode error")
+                .expect("frame should be emitted");
+            let recon = enc
+                .last_reconstruction_i420()
+                .expect("reconstruction available");
+            let decoded = dec.decode(&ef.data).expect("oracle decode failed");
+            assert_eq!(decoded.len(), 1, "frame {t} {w}x{h}: expected one frame");
+            let d = &decoded[0];
+            assert_eq!((d.width, d.height), (w, h), "frame {t} {w}x{h}: dims");
+            assert_eq!(d.i420.len(), recon.len(), "frame {t} {w}x{h}: length");
+            if d.i420 != recon {
+                let first = d
+                    .i420
+                    .iter()
+                    .zip(recon.iter())
+                    .position(|(a, b)| a != b)
+                    .unwrap();
+                panic!(
+                    "frame {t} ({}) {w}x{h}: split-path recon drift at byte {first} \
+                     (oracle {} vs recon {})",
+                    if ef.is_keyframe { "key" } else { "inter" },
+                    d.i420[first],
+                    recon[first]
+                );
+            }
+        }
+    }
+}
+
 #[test]
 fn m2_sequence_90_frames_kf150_one_key_rest_inter() {
     let (w, h, fps) = (640u32, 480u32, 30u32);
@@ -371,22 +432,21 @@ fn m2_sequence_90_frames_kf150_one_key_rest_inter() {
     );
 }
 
-/// M3 uses 320x240 (not 640x480 like M1/M2) deliberately. The stage-6 encoder
-/// signals a fixed full-split-to-8x8 partition with default (error-resilient)
-/// probabilities, so every 8x8 block pays a small, quantizer-independent
-/// mode/partition/skip cost. That per-block floor is ~0.9 bytes, i.e. ~1050 kbps
-/// for a *fully static* 640x480 inter frame — above the 250..=750 band — so a
-/// 500 kbps target is physically unreachable at 640x480 regardless of source or
-/// quantizer. It scales with block count, so at 320x240 the floor is ~270 kbps,
-/// well below the target, and the rate controller genuinely governs the bitrate.
-/// (16x16/64x64 partitions and skip-run coding, which would lower the floor, are
-/// future work.) The M3 source is [`busy`], whose mid-amplitude broadband
-/// texture is quantizer-gradable — unlike `moving_box`, whose sharp edges cost a
-/// fixed number of bits at any quantizer and leave nothing for the controller to
-/// steer.
+/// M3 runs at 640x480, the app's target resolution. With `BLOCK_16X16` leaves
+/// (the default partition since stage 6.5) each coded block owns a 2x2 mode-info
+/// region, so the quantizer-independent partition/mode/skip floor is a quarter of
+/// the old fixed-8x8 structure's — about 270 kbps for a fully static 640x480 inter
+/// frame, well below the 500 kbps target. That leaves the rate controller room to
+/// govern the coded size via the quantizer, so the measured bitrate lands inside
+/// the 250..=750 band. (Before 16x16 partitions the floor was ~1050 kbps at this
+/// resolution and 500 kbps was physically unreachable, which is why earlier stages
+/// ran this test at 320x240.) The source is [`busy`], whose mid-amplitude
+/// broadband texture is quantizer-gradable — unlike `moving_box`, whose sharp
+/// edges cost a fixed number of bits at any quantizer and leave nothing for the
+/// controller to steer.
 #[test]
 fn m3_bitrate_within_tolerance_over_150_frames() {
-    let (w, h, fps, kbps) = (320u32, 240u32, 30u32, 500u32);
+    let (w, h, fps, kbps) = (640u32, 480u32, 30u32, 500u32);
     let n = 150usize;
     let frames: Vec<Vec<u8>> = (0..n as u32).map(|t| busy(w, h, t)).collect();
 
@@ -409,13 +469,13 @@ fn m3_bitrate_within_tolerance_over_150_frames() {
     );
 }
 
-/// Uses 320x240 with the quantizer-gradable [`busy`] source for the same reason
-/// as [`m3_bitrate_within_tolerance_over_150_frames`]: only there does the rate
-/// controller actually govern the bitrate, so quadrupling the target visibly
-/// moves the coded size.
+/// Runs at 640x480 with the quantizer-gradable [`busy`] source: with the 16x16
+/// signalling floor low enough for the rate controller to govern the bitrate at
+/// this resolution (see [`m3_bitrate_within_tolerance_over_150_frames`]),
+/// quadrupling the target visibly moves the coded size.
 #[test]
 fn m4_update_bitrate_kbps_takes_effect() {
-    let (w, h, fps) = (320u32, 240u32, 30u32);
+    let (w, h, fps) = (640u32, 480u32, 30u32);
     let mut enc = Vp9Encoder::new(config(w, h, fps, 300)).expect("encoder init");
 
     // Low-bitrate phase: 60 frames @300 kbps, summing bytes but excluding the
@@ -451,6 +511,54 @@ fn m4_update_bitrate_kbps_takes_effect() {
     assert!(
         bytes_hi as f64 >= 2.0 * bytes_lo as f64,
         "high-bitrate bytes {bytes_hi} should be >= 2x low-bitrate bytes {bytes_lo}"
+    );
+}
+
+/// Informational: the `BLOCK_16X16` signalling floor at 640x480. Encodes a fully
+/// static sequence pinned to the maximum quantizer (`q = 63`), so the coded size
+/// is almost entirely quantizer-independent partition/mode/skip overhead. Reports
+/// the resulting kbps (the floor) and the m3 `busy` sequence's measured kbps and
+/// quantizer span. Not a pass/fail gate.
+#[test]
+#[ignore = "informational: prints 16x16 signalling floor + m3 stats"]
+fn stage65_report_floor_and_m3() {
+    let (w, h, fps) = (640u32, 480u32, 30u32);
+
+    // --- Signalling floor: static source, quantizer pinned to the max. ---
+    let mut cfg = config(w, h, fps, 50); // low target → controller pushes q up
+    cfg.min_quantizer = 63;
+    cfg.max_quantizer = 63;
+    let n = 150usize;
+    let still = busy(w, h, 0); // one frame, repeated (perfectly static)
+    let mut enc = Vp9Encoder::new(cfg).expect("encoder init");
+    let mut floor_bytes = 0usize;
+    for t in 0..n {
+        if let Some(ef) = enc.encode(t as i64, &still).expect("encode") {
+            if !(t == 0 && ef.is_keyframe) {
+                floor_bytes += ef.data.len();
+            }
+        }
+    }
+    let inter_frames = (n - 1) as f64;
+    let floor_kbps = (floor_bytes as f64 * 8.0 / 1000.0) / (inter_frames / fps as f64);
+
+    // --- m3 sequence stats: busy at the 500 kbps target. ---
+    let frames: Vec<Vec<u8>> = (0..n as u32).map(|t| busy(w, h, t)).collect();
+    let mut enc = Vp9Encoder::new(config(w, h, fps, 500)).expect("encoder init");
+    let mut qs: Vec<u8> = Vec::new();
+    let mut total = 0usize;
+    for (t, f) in frames.iter().enumerate() {
+        if let Some(ef) = enc.encode(t as i64, f).expect("encode") {
+            total += ef.data.len();
+            qs.push(enc.last_base_qindex());
+        }
+    }
+    let m3_kbps = (total as f64 * 8.0 / 1000.0) / (n as f64 / fps as f64);
+    let (qmin, qmax) = (*qs.iter().min().unwrap(), *qs.iter().max().unwrap());
+
+    eprintln!(
+        "Stage 6.5 @ {w}x{h}: 16x16 static floor {floor_kbps:.0} kbps (q63); \
+         m3 busy @500kbps target measured {m3_kbps:.0} kbps, qindex span {qmin}..={qmax}"
     );
 }
 

@@ -46,17 +46,27 @@ pub struct SrcBlock<'a> {
     pub stride: usize,
 }
 
-/// Sum of absolute differences between the 8x8 `src` block and the reference at
-/// integer pixel offset `(dy, dx)` from the block's mode-info position.
-fn sad8x8(reference: &RefPlane, src: &SrcBlock, mi_row: i32, mi_col: i32, dy: i32, dx: i32) -> u32 {
+/// Sum of absolute differences between a `bw`x`bh` `src` block and the reference
+/// at integer pixel offset `(dy, dx)` from the block's mode-info position.
+#[allow(clippy::too_many_arguments)]
+fn sad_block(
+    reference: &RefPlane,
+    src: &SrcBlock,
+    mi_row: i32,
+    mi_col: i32,
+    dy: i32,
+    dx: i32,
+    bw: usize,
+    bh: usize,
+) -> u32 {
     let base_row = mi_row * 8 + dy;
     let base_col = mi_col * 8 + dx;
     let mut src_p = src.off;
     let mut ref_p =
         (reference.origin as i32 + base_row * reference.stride as i32 + base_col) as usize;
     let mut sad = 0u32;
-    for _ in 0..8 {
-        for c in 0..8 {
+    for _ in 0..bh {
+        for c in 0..bw {
             let s = src.data[src_p + c] as i32;
             let r = reference.data[ref_p + c] as i32;
             sad += (s - r).unsigned_abs();
@@ -95,7 +105,8 @@ pub struct SearchResult {
     pub sad: u32,
 }
 
-/// Search for the best even whole-pixel MV for one 8x8 luma block.
+/// Search for the best even whole-pixel MV for one luma block of `bw`x`bh`
+/// pixels (8x8 for an 8x8 leaf, 16x16 for a 16x16 leaf).
 ///
 /// `pred_mv` is the predicted (nearest) MV, rounded to the nearest even pixel and
 /// used both as the search origin and the cost center. The search always
@@ -103,6 +114,11 @@ pub struct SearchResult {
 /// `sf` supplies the `cpu_used`-derived search range and the ZEROMV-first
 /// early-exit threshold. Returns the winning MV (a multiple of 16 in 1/8-pel)
 /// and its SAD.
+///
+/// The ZEROMV early-exit threshold `sf.zeromv_early_exit_sad` is calibrated for
+/// an 8x8 block; it is scaled by the block's area (in 8x8 units) so a 16x16 block
+/// takes the shortcut under the same per-pixel error.
+#[allow(clippy::too_many_arguments)]
 pub fn search_block(
     reference: &RefPlane,
     src: &SrcBlock,
@@ -110,12 +126,19 @@ pub fn search_block(
     mi_col: i32,
     pred_mv: Mv,
     sf: &SpeedFeatures,
+    bw: usize,
+    bh: usize,
 ) -> SearchResult {
+    let sad_at = |dy: i32, dx: i32| sad_block(reference, src, mi_row, mi_col, dy, dx, bw, bh);
+    // Scale the (8x8-calibrated) early-exit threshold by block area in 8x8 units.
+    let area_in_8x8 = ((bw * bh) / 64) as u32;
+    let early_exit_sad = sf.zeromv_early_exit_sad.saturating_mul(area_in_8x8.max(1));
+
     // ZEROMV-first early exit: if the no-motion match is already good enough,
     // take it and skip the search entirely (the dominant case for static
     // regions). `zeromv_early_exit_sad == 0` disables this.
-    let zero_sad = sad8x8(reference, src, mi_row, mi_col, 0, 0);
-    if sf.zeromv_early_exit_sad > 0 && zero_sad <= sf.zeromv_early_exit_sad {
+    let zero_sad = sad_at(0, 0);
+    if sf.zeromv_early_exit_sad > 0 && zero_sad <= early_exit_sad {
         return SearchResult {
             mv: Mv::ZERO,
             sad: zero_sad,
@@ -134,7 +157,7 @@ pub fn search_block(
     let start = (round_even(pred_mv.row), round_even(pred_mv.col));
 
     let cost_at = |dy: i32, dx: i32| -> (u32, u32) {
-        let sad = sad8x8(reference, src, mi_row, mi_col, dy, dx);
+        let sad = sad_at(dy, dx);
         (sad + mv_cost(px_to_mv(dy, dx), pred_mv), sad)
     };
 
@@ -214,7 +237,8 @@ mod tests {
     const FULL_SEARCH: SpeedFeatures = SpeedFeatures {
         search_range_px: 16,
         zeromv_early_exit_sad: 0,
-        max_partition_16x16: false,
+        max_partition_16x16: true,
+        split_16x16_sad: u32::MAX,
     };
 
     /// A reference frame with a white box at pixel (bx, by).
@@ -259,7 +283,7 @@ mod tests {
             off: sorg + 40 * sstride + 40,
             stride: sstride,
         };
-        let res = search_block(&refp, &src, 5, 5, Mv::ZERO, &FULL_SEARCH);
+        let res = search_block(&refp, &src, 5, 5, Mv::ZERO, &FULL_SEARCH, 8, 8);
         assert_eq!(res.mv, Mv::new(-16, -16), "expected -2px,-2px motion");
         assert_eq!(res.sad, 0, "exact match should have zero SAD");
     }
@@ -281,7 +305,7 @@ mod tests {
             off: sorg + 80 * sstride + 80,
             stride: sstride,
         };
-        let res = search_block(&refp, &src, 10, 10, Mv::ZERO, &FULL_SEARCH);
+        let res = search_block(&refp, &src, 10, 10, Mv::ZERO, &FULL_SEARCH, 8, 8);
         assert_eq!(res.mv, Mv::ZERO);
         assert_eq!(res.sad, 0);
     }
@@ -302,7 +326,7 @@ mod tests {
             off: sorg + 36 * sstride + 44,
             stride: sstride,
         };
-        let res = search_block(&refp, &src, 4, 5, Mv::ZERO, &FULL_SEARCH);
+        let res = search_block(&refp, &src, 4, 5, Mv::ZERO, &FULL_SEARCH, 8, 8);
         assert_eq!(res.mv.row % 16, 0);
         assert_eq!(res.mv.col % 16, 0);
     }
@@ -329,9 +353,10 @@ mod tests {
         let sf = SpeedFeatures {
             search_range_px: 16,
             zeromv_early_exit_sad: u32::MAX, // always trigger
-            max_partition_16x16: false,
+            max_partition_16x16: true,
+            split_16x16_sad: u32::MAX,
         };
-        let res = search_block(&refp, &src, 5, 5, Mv::ZERO, &sf);
+        let res = search_block(&refp, &src, 5, 5, Mv::ZERO, &sf, 8, 8);
         assert_eq!(res.mv, Mv::ZERO, "early exit must return ZEROMV");
     }
 }

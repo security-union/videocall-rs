@@ -74,6 +74,10 @@ struct Mi {
     mv: Mv,
     /// `mode_context` derived at encode time and reused by the pack walk.
     mode_context: u8,
+    /// True on all four mode-info units of a `BLOCK_16X16` leaf (a 16x16 block
+    /// coded as one unit). The pack walk reads it on the top-left unit to decide
+    /// `PARTITION_NONE` (16x16 leaf) vs `PARTITION_SPLIT` (four 8x8 leaves).
+    is_leaf16: bool,
 }
 
 impl Default for Mi {
@@ -86,8 +90,23 @@ impl Default for Mi {
             ref_frame: [INTRA_FRAME, NONE_FRAME],
             mv: Mv::ZERO,
             mode_context: 0,
+            is_leaf16: false,
         }
     }
+}
+
+/// The result of a `BLOCK_16X16` MV-reference derivation + motion search, shared
+/// between the partition decision and the leaf encode.
+#[derive(Clone, Copy)]
+struct Search16 {
+    /// Inter-mode probability context from the two nearest coded neighbors.
+    mode_context: u8,
+    /// Nearest reference MV (`best_ref_mvs[0]`), the NEWMV coding center.
+    nearest: Mv,
+    /// The winning MV (a multiple of 16 in 1/8-pel).
+    mv: Mv,
+    /// The winning MV's luma SAD (prediction error), for the split decision.
+    sad: u32,
 }
 
 /// Per-plane entropy contexts (`above_context`/`left_context`) maintained across
@@ -184,6 +203,32 @@ impl Frame {
         &self.grid[(mi_row * self.mi_cols + mi_col) as usize]
     }
 
+    /// Whether a `BLOCK_16X16` at `(mi_row, mi_col)` fits entirely within the mi
+    /// grid — the condition for coding it as a `PARTITION_NONE` leaf. When it
+    /// straddles the frame's right/bottom edge, VP9 forces a split, so the walk
+    /// falls through to four 8x8 leaves instead (matching `write_partition`'s
+    /// `has_rows`/`has_cols` handling and the decoder's `decode_partition`).
+    #[inline]
+    fn fits16(&self, mi_row: u32, mi_col: u32) -> bool {
+        mi_row + 2 <= self.mi_rows && mi_col + 2 <= self.mi_cols
+    }
+
+    /// Store one 16x16 leaf's mode info into all four mode-info units of its 2x2
+    /// region (neighbor context lookups read mi units, so the decoder's single
+    /// coded block must appear replicated). Coefficient `tokens` live only on the
+    /// top-left unit, which is the one the pack walk reads.
+    fn store_leaf16(&mut self, mi_row: u32, mi_col: u32, tl: Mi) {
+        // The other three units carry the same metadata but no tokens.
+        let meta = Mi {
+            tokens: Vec::new(),
+            ..tl.clone()
+        };
+        *self.block_mut(mi_row, mi_col + 1) = meta.clone();
+        *self.block_mut(mi_row + 1, mi_col) = meta.clone();
+        *self.block_mut(mi_row + 1, mi_col + 1) = meta;
+        *self.block_mut(mi_row, mi_col) = tl;
+    }
+
     // --- Keyframe (intra) walks --------------------------------------------
 
     /// Recursive tokenize walk (mirrors `write_modes_sb`'s descent order).
@@ -203,12 +248,134 @@ impl Frame {
             self.encode_leaf(src, recon, ec, mi_row, mi_col);
             return;
         }
+        // A keyframe 16x16 leaf's luma reconstruction is bit-identical to the
+        // 8x8-split path (same four 8x8 DC transforms in the same raster order),
+        // so splitting an intra 16x16 only spends more bits: always keep it when
+        // it fits the frame.
+        if bsize == BlockSize::B16X16 && self.sf.max_partition_16x16 && self.fits16(mi_row, mi_col)
+        {
+            self.encode_leaf16_kf(src, recon, ec, mi_row, mi_col);
+            return;
+        }
         let bs = (1u32 << b_width_log2(bsize)) / 4;
         let sub = split_child(bsize);
         self.encode_sb(src, recon, ec, mi_row, mi_col, sub);
         self.encode_sb(src, recon, ec, mi_row, mi_col + bs, sub);
         self.encode_sb(src, recon, ec, mi_row + bs, mi_col, sub);
         self.encode_sb(src, recon, ec, mi_row + bs, mi_col + bs, sub);
+    }
+
+    /// Encode + tokenize one intra `BLOCK_16X16` leaf: four 8x8 luma transforms
+    /// (each DC-predicted from its own reconstructed neighbors, in raster order)
+    /// and one 8x8 transform per chroma plane. Updates the per-plane entropy
+    /// contexts exactly as `foreach_transformed_block` + `vp9_set_contexts` do,
+    /// and records the replicated mode info.
+    fn encode_leaf16_kf(
+        &mut self,
+        src: &FrameBuffer,
+        recon: &mut FrameBuffer,
+        ec: &mut EntropyContext,
+        mi_row: u32,
+        mi_col: u32,
+    ) {
+        let up_blk = mi_row > 0;
+        let left_blk = mi_col > 0;
+
+        // --- Luma: four 8x8 transforms in raster order (TL, TR, BL, BR). ---
+        let base_ay = (mi_col * 2) as usize;
+        let base_ly = ((mi_row & 7) * 2) as usize;
+        let mut tokens_y = Vec::new();
+        let mut any_eob = false;
+        for sr in 0..2u32 {
+            for sc in 0..2u32 {
+                let ay = base_ay + (sc * 2) as usize;
+                let ly = base_ly + (sr * 2) as usize;
+                let pt = combine_entropy_contexts(
+                    ec.above_y[ay] != 0 || ec.above_y[ay + 1] != 0,
+                    ec.left_y[ly] != 0 || ec.left_y[ly + 1] != 0,
+                );
+                let (eob, qc) = intra_dc_tx(
+                    src,
+                    recon,
+                    &self.qp,
+                    TxSize::Tx8X8,
+                    Plane::Y,
+                    (mi_row * 8 + sr * 8) as usize,
+                    (mi_col * 8 + sc * 8) as usize,
+                    sr > 0 || up_blk,
+                    sc > 0 || left_blk,
+                );
+                tokens_y.extend(tokenize_block(
+                    &qc,
+                    eob,
+                    TxSize::Tx8X8,
+                    PlaneType::Y,
+                    REF_TYPE_INTRA,
+                    pt,
+                ));
+                let he = (eob > 0) as u8;
+                any_eob |= eob > 0;
+                ec.above_y[ay] = he;
+                ec.above_y[ay + 1] = he;
+                ec.left_y[ly] = he;
+                ec.left_y[ly + 1] = he;
+            }
+        }
+
+        // --- Chroma: one 8x8 transform per plane (4:2:0 → 8x8 chroma block). ---
+        let au = mi_col as usize;
+        let lu = (mi_row & 7) as usize;
+        let cy = (mi_row * 4) as usize;
+        let cx = (mi_col * 4) as usize;
+        let mut tokens_u = Vec::new();
+        let mut tokens_v = Vec::new();
+        for (plane, above, left, out) in [
+            (Plane::U, &mut ec.above_u, &mut ec.left_u, &mut tokens_u),
+            (Plane::V, &mut ec.above_v, &mut ec.left_v, &mut tokens_v),
+        ] {
+            let pt = combine_entropy_contexts(
+                above[au] != 0 || above[au + 1] != 0,
+                left[lu] != 0 || left[lu + 1] != 0,
+            );
+            let (eob, qc) = intra_dc_tx(
+                src,
+                recon,
+                &self.qp,
+                TxSize::Tx8X8,
+                plane,
+                cy,
+                cx,
+                up_blk,
+                left_blk,
+            );
+            out.extend(tokenize_block(
+                &qc,
+                eob,
+                TxSize::Tx8X8,
+                PlaneType::Uv,
+                REF_TYPE_INTRA,
+                pt,
+            ));
+            let he = (eob > 0) as u8;
+            any_eob |= eob > 0;
+            above[au] = he;
+            above[au + 1] = he;
+            left[lu] = he;
+            left[lu + 1] = he;
+        }
+
+        let skip = !any_eob;
+        let tokens = concat_tokens(skip, tokens_y, tokens_u, tokens_v);
+        self.store_leaf16(
+            mi_row,
+            mi_col,
+            Mi {
+                skip,
+                tokens,
+                is_leaf16: true,
+                ..Mi::default()
+            },
+        );
     }
 
     /// Encode + tokenize one intra 8x8 mode-info block (luma 8x8, chroma 4x4),
@@ -311,12 +478,228 @@ impl Frame {
             self.encode_inter_leaf(src, reference, recon, ec, mi_row, mi_col);
             return;
         }
+        // A 16x16 that fits the frame is coded as one leaf unless its best
+        // motion-compensated luma SAD is above the split valve, in which case it
+        // falls through to four 8x8 leaves (the validated per-8x8 path) for the
+        // extra prediction/quality that a finer motion field buys.
+        if bsize == BlockSize::B16X16 && self.sf.max_partition_16x16 && self.fits16(mi_row, mi_col)
+        {
+            let d = self.search_16x16(reference, src, mi_row, mi_col);
+            if d.sad <= self.sf.split_16x16_sad {
+                self.encode_leaf16_inter(src, reference, recon, ec, mi_row, mi_col, d);
+                return;
+            }
+        }
         let bs = (1u32 << b_width_log2(bsize)) / 4;
         let sub = split_child(bsize);
         self.encode_inter_sb(src, reference, recon, ec, mi_row, mi_col, sub);
         self.encode_inter_sb(src, reference, recon, ec, mi_row, mi_col + bs, sub);
         self.encode_inter_sb(src, reference, recon, ec, mi_row + bs, mi_col, sub);
         self.encode_inter_sb(src, reference, recon, ec, mi_row + bs, mi_col + bs, sub);
+    }
+
+    /// Run the spatial MV-reference derivation and integer-pel motion search for
+    /// a `BLOCK_16X16` at `(mi_row, mi_col)`, returning the mode context, nearest
+    /// reference MV and the winning MV/SAD. Shared by the partition decision and
+    /// the leaf encode so the search runs once.
+    fn search_16x16(
+        &self,
+        reference: &FrameBuffer,
+        src: &FrameBuffer,
+        mi_row: u32,
+        mi_col: u32,
+    ) -> Search16 {
+        let (mi_rows, mi_cols) = (self.mi_rows as i32, self.mi_cols as i32);
+        let (mode_context, refs) = {
+            let grid = &self.grid;
+            let cols = self.mi_cols;
+            let geom = MvRefGeom {
+                mi_rows,
+                mi_cols,
+                ref_frame: LAST_FRAME,
+                ref_sign_bias: [0; 4],
+                allow_hp: false,
+            };
+            find_mv_refs(
+                |r, c| {
+                    if r < 0 || c < 0 || r >= mi_rows || c >= mi_cols {
+                        None
+                    } else {
+                        let mi = &grid[(r as u32 * cols + c as u32) as usize];
+                        Some(MvRefInfo {
+                            mode: mi.mode as u8,
+                            ref_frame: mi.ref_frame,
+                            mv: [mi.mv, Mv::ZERO],
+                        })
+                    }
+                },
+                mi_row as i32,
+                mi_col as i32,
+                BlockSize::B16X16,
+                &geom,
+            )
+        };
+        let nearest = refs[0];
+        let best = {
+            let (rdata, rorg, rstride, _, _) = reference.y();
+            let (sdata, sorg, sstride, _, _) = src.y();
+            let refp = RefPlane {
+                data: rdata,
+                origin: rorg,
+                stride: rstride,
+            };
+            let srcb = SrcBlock {
+                data: sdata,
+                off: sorg + (mi_row * 8) as usize * sstride + (mi_col * 8) as usize,
+                stride: sstride,
+            };
+            search_block(
+                &refp,
+                &srcb,
+                mi_row as i32,
+                mi_col as i32,
+                nearest,
+                &self.sf,
+                16,
+                16,
+            )
+        };
+        Search16 {
+            mode_context,
+            nearest,
+            mv: best.mv,
+            sad: best.sad,
+        }
+    }
+
+    /// Motion-compensate, residual, transform and tokenize one inter
+    /// `BLOCK_16X16` leaf using the precomputed [`Search16`]: one MV drives a
+    /// 16x16 luma / 8x8 chroma block copy, then four 8x8 luma transforms and one
+    /// 8x8 transform per chroma plane, with the same entropy-context bookkeeping
+    /// as the intra leaf.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_leaf16_inter(
+        &mut self,
+        src: &FrameBuffer,
+        reference: &FrameBuffer,
+        recon: &mut FrameBuffer,
+        ec: &mut EntropyContext,
+        mi_row: u32,
+        mi_col: u32,
+        d: Search16,
+    ) {
+        let (mi_rows, mi_cols) = (self.mi_rows as i32, self.mi_cols as i32);
+        let mv = d.mv;
+        let mode = if mv == Mv::ZERO {
+            PredictionMode::ZeroMv
+        } else if mv == d.nearest {
+            PredictionMode::NearestMv
+        } else {
+            PredictionMode::NewMv
+        };
+
+        // Motion-compensate the whole 16x16 leaf (bsize_mi = 2) per plane.
+        for plane in [McPlane::Y, McPlane::U, McPlane::V] {
+            predict_inter_block(
+                reference,
+                recon,
+                plane,
+                mi_row as i32,
+                mi_col as i32,
+                mv,
+                2,
+                mi_rows,
+                mi_cols,
+            );
+        }
+
+        // --- Luma: four 8x8 residual transforms in raster order. ---
+        let base_ay = (mi_col * 2) as usize;
+        let base_ly = ((mi_row & 7) * 2) as usize;
+        let mut tokens_y = Vec::new();
+        let mut any_eob = false;
+        for sr in 0..2u32 {
+            for sc in 0..2u32 {
+                let ay = base_ay + (sc * 2) as usize;
+                let ly = base_ly + (sr * 2) as usize;
+                let pt = combine_entropy_contexts(
+                    ec.above_y[ay] != 0 || ec.above_y[ay + 1] != 0,
+                    ec.left_y[ly] != 0 || ec.left_y[ly + 1] != 0,
+                );
+                let (eob, qc) = inter_residual_tx(
+                    src,
+                    recon,
+                    &self.qp,
+                    TxSize::Tx8X8,
+                    Plane::Y,
+                    (mi_row * 8 + sr * 8) as usize,
+                    (mi_col * 8 + sc * 8) as usize,
+                );
+                tokens_y.extend(tokenize_block(
+                    &qc,
+                    eob,
+                    TxSize::Tx8X8,
+                    PlaneType::Y,
+                    REF_TYPE_INTER,
+                    pt,
+                ));
+                let he = (eob > 0) as u8;
+                any_eob |= eob > 0;
+                ec.above_y[ay] = he;
+                ec.above_y[ay + 1] = he;
+                ec.left_y[ly] = he;
+                ec.left_y[ly + 1] = he;
+            }
+        }
+
+        // --- Chroma: one 8x8 residual transform per plane. ---
+        let au = mi_col as usize;
+        let lu = (mi_row & 7) as usize;
+        let cy = (mi_row * 4) as usize;
+        let cx = (mi_col * 4) as usize;
+        let mut tokens_u = Vec::new();
+        let mut tokens_v = Vec::new();
+        for (plane, above, left, out) in [
+            (Plane::U, &mut ec.above_u, &mut ec.left_u, &mut tokens_u),
+            (Plane::V, &mut ec.above_v, &mut ec.left_v, &mut tokens_v),
+        ] {
+            let pt = combine_entropy_contexts(
+                above[au] != 0 || above[au + 1] != 0,
+                left[lu] != 0 || left[lu + 1] != 0,
+            );
+            let (eob, qc) = inter_residual_tx(src, recon, &self.qp, TxSize::Tx8X8, plane, cy, cx);
+            out.extend(tokenize_block(
+                &qc,
+                eob,
+                TxSize::Tx8X8,
+                PlaneType::Uv,
+                REF_TYPE_INTER,
+                pt,
+            ));
+            let he = (eob > 0) as u8;
+            any_eob |= eob > 0;
+            above[au] = he;
+            above[au + 1] = he;
+            left[lu] = he;
+            left[lu + 1] = he;
+        }
+
+        let skip = !any_eob;
+        let tokens = concat_tokens(skip, tokens_y, tokens_u, tokens_v);
+        self.store_leaf16(
+            mi_row,
+            mi_col,
+            Mi {
+                skip,
+                tokens,
+                is_inter: true,
+                mode,
+                ref_frame: [LAST_FRAME, NONE_FRAME],
+                mv,
+                mode_context: d.mode_context,
+                is_leaf16: true,
+            },
+        );
     }
 
     /// Motion-estimate, predict, transform and tokenize one inter 8x8 block.
@@ -384,6 +767,8 @@ impl Frame {
                 mi_col as i32,
                 nearest,
                 &self.sf,
+                8,
+                8,
             )
         };
         let mv = best.mv;
@@ -404,6 +789,7 @@ impl Frame {
                 mi_row as i32,
                 mi_col as i32,
                 mv,
+                1,
                 mi_rows,
                 mi_cols,
             );
@@ -471,6 +857,7 @@ impl Frame {
             ref_frame: [LAST_FRAME, NONE_FRAME],
             mv,
             mode_context,
+            is_leaf16: false,
         };
     }
 
@@ -490,7 +877,15 @@ impl Frame {
             return;
         }
         let bs = (1u32 << b_width_log2(bsize)) / 4;
-        let partition = if bsize == BlockSize::B8X8 {
+        // A 16x16 that fits and was coded as a leaf writes PARTITION_NONE; an 8x8
+        // block always does. Everything else (64/32, or a 16x16 that was split or
+        // straddles the frame edge) writes PARTITION_SPLIT and recurses. The
+        // decision is read back from the top-left mi's `is_leaf16`, set by the
+        // encode walk, so both walks descend identically.
+        let is_leaf16 = bsize == BlockSize::B16X16
+            && self.fits16(mi_row, mi_col)
+            && self.block(mi_row, mi_col).is_leaf16;
+        let partition = if bsize == BlockSize::B8X8 || is_leaf16 {
             Partition::None
         } else {
             Partition::Split
@@ -516,11 +911,13 @@ impl Frame {
         );
         let subsize = subsize_of(bsize, partition);
 
-        if bsize == BlockSize::B8X8 {
+        if partition == Partition::None {
+            // A leaf (8x8 or 16x16). Keyframe leaves share one pack path; inter
+            // leaves differ only in the mv-ref block size.
             if is_keyframe {
                 self.pack_leaf_kf(w, mi_row, mi_col);
             } else {
-                self.pack_leaf_inter(w, mi_row, mi_col);
+                self.pack_leaf_inter(w, mi_row, mi_col, bsize);
             }
         } else {
             let sub = split_child(bsize);
@@ -530,8 +927,9 @@ impl Frame {
             self.pack_sb(w, pc, mi_row + bs, mi_col + bs, sub, is_keyframe);
         }
 
-        // update_partition_context (only at leaves for the full-split structure).
-        if bsize == BlockSize::B8X8 || partition != Partition::Split {
+        // update_partition_context runs at every non-split node (leaves and the
+        // 16x16 leaf); split parents leave it to their recursed children.
+        if partition != Partition::Split {
             pc.update(mi_row, mi_col, subsize, bsize);
         }
     }
@@ -547,8 +945,10 @@ impl Frame {
     }
 
     /// Pack one inter leaf (`pack_inter_mode_mvs`): skip, is_inter, single-ref,
-    /// inter mode, the MV for NEWMV, then coefficient tokens.
-    fn pack_leaf_inter(&self, w: &mut BoolWriter, mi_row: u32, mi_col: u32) {
+    /// inter mode, the MV for NEWMV, then coefficient tokens. `bsize` is the coded
+    /// block size (`BLOCK_8X8` or `BLOCK_16X16`), which selects the
+    /// `mv_ref_blocks` neighborhood for the NEWMV reference.
+    fn pack_leaf_inter(&self, w: &mut BoolWriter, mi_row: u32, mi_col: u32, bsize: BlockSize) {
         let block = self.block(mi_row, mi_col);
         let above = self.inter_neighbor(mi_row.checked_sub(1), Some(mi_col));
         let left = self.inter_neighbor(Some(mi_row), mi_col.checked_sub(1));
@@ -573,7 +973,7 @@ impl Frame {
 
         // NEWMV codes the MV difference against the nearest reference MV.
         if block.mode == PredictionMode::NewMv {
-            let (_ctx, refs) = self.mv_refs_at(mi_row, mi_col);
+            let (_ctx, refs) = self.mv_refs_at(mi_row, mi_col, bsize);
             encode_mv(w, block.mv, refs[0], false);
         }
 
@@ -595,9 +995,11 @@ impl Frame {
         })
     }
 
-    /// Recompute `find_mv_refs` at `(mi_row, mi_col)` from the finished grid (the
-    /// pack walk needs the nearest MV to code a NEWMV difference).
-    fn mv_refs_at(&self, mi_row: u32, mi_col: u32) -> (u8, [Mv; 2]) {
+    /// Recompute `find_mv_refs` at `(mi_row, mi_col)` for block size `bsize` from
+    /// the finished grid (the pack walk needs the nearest MV to code a NEWMV
+    /// difference). All `mv_ref_blocks` offsets are causal in z-order, so the
+    /// finished grid holds the same neighbor values the encode walk saw.
+    fn mv_refs_at(&self, mi_row: u32, mi_col: u32, bsize: BlockSize) -> (u8, [Mv; 2]) {
         let (mi_rows, mi_cols) = (self.mi_rows as i32, self.mi_cols as i32);
         let cols = self.mi_cols;
         let grid = &self.grid;
@@ -623,7 +1025,7 @@ impl Frame {
             },
             mi_row as i32,
             mi_col as i32,
-            BlockSize::B8X8,
+            bsize,
             &geom,
         )
     }
@@ -710,6 +1112,81 @@ fn inter_plane_residual(
         Plane::V => recon.v_mut(),
     };
     let off = rorg + (mi_row * px) as usize * rstride + (mi_col * px) as usize;
+    let res = residual_transform_reconstruct(
+        rdata, rstride, src_data, src_off, src_stride, tx_size, off, qp,
+    );
+    (res.eob as usize, res.qcoeff)
+}
+
+/// DC-predict, residual, transform and reconstruct one intra transform block of
+/// `tx_size` in `plane`, whose top-left sits at plane pixel `(y_px, x_px)`.
+/// `up`/`left` are the neighbor-availability flags for this transform block (true
+/// when a reconstructed neighbor exists, i.e. a sub-block edge inside the coded
+/// block or a frame-interior block edge). Returns the end-of-block count and the
+/// quantized coefficients for tokenization.
+#[allow(clippy::too_many_arguments)]
+fn intra_dc_tx(
+    src: &FrameBuffer,
+    recon: &mut FrameBuffer,
+    qp: &QuantParams,
+    tx_size: TxSize,
+    plane: Plane,
+    y_px: usize,
+    x_px: usize,
+    up: bool,
+    left: bool,
+) -> (usize, Vec<i16>) {
+    let (src_data, src_org, src_stride, fw, fh) = match plane {
+        Plane::Y => src.y(),
+        Plane::U => src.u(),
+        Plane::V => src.v(),
+    };
+    let src_off = src_org + y_px * src_stride + x_px;
+    let (rdata, rorg, rstride) = match plane {
+        Plane::Y => recon.y_mut(),
+        Plane::U => recon.u_mut(),
+        Plane::V => recon.v_mut(),
+    };
+    let off = rorg + y_px * rstride + x_px;
+    let ctx = BlockCtx {
+        tx_size,
+        off,
+        up_available: up,
+        left_available: left,
+        x0: x_px as i32,
+        y0: y_px as i32,
+        frame_w: fw as i32,
+        frame_h: fh as i32,
+    };
+    let res = encode_intra_block(rdata, rstride, src_data, src_off, src_stride, &ctx, qp);
+    (res.eob as usize, res.qcoeff)
+}
+
+/// Residual, transform and reconstruct one inter transform block of `tx_size` in
+/// `plane` at plane pixel `(y_px, x_px)`, whose motion-compensated prediction is
+/// already in `recon`. Returns the end-of-block count and quantized coefficients.
+#[allow(clippy::too_many_arguments)]
+fn inter_residual_tx(
+    src: &FrameBuffer,
+    recon: &mut FrameBuffer,
+    qp: &QuantParams,
+    tx_size: TxSize,
+    plane: Plane,
+    y_px: usize,
+    x_px: usize,
+) -> (usize, Vec<i16>) {
+    let (src_data, src_org, src_stride, _, _) = match plane {
+        Plane::Y => src.y(),
+        Plane::U => src.u(),
+        Plane::V => src.v(),
+    };
+    let src_off = src_org + y_px * src_stride + x_px;
+    let (rdata, rorg, rstride) = match plane {
+        Plane::Y => recon.y_mut(),
+        Plane::U => recon.u_mut(),
+        Plane::V => recon.v_mut(),
+    };
+    let off = rorg + y_px * rstride + x_px;
     let res = residual_transform_reconstruct(
         rdata, rstride, src_data, src_off, src_stride, tx_size, off, qp,
     );

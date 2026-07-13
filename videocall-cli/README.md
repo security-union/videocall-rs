@@ -34,7 +34,7 @@ Then restart your shell (or run `source "$HOME/.cargo/env"`) so `cargo` is on yo
 Make sure you have the required libraries installed:
 
 ```sh
-sudo apt install build-essential pkg-config libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake libssl-dev
+sudo apt install build-essential pkg-config libclang-dev libasound2-dev libv4l-dev cmake libssl-dev
 ```
 
 #### macOS (experimental ⚠️)
@@ -47,8 +47,13 @@ xcode-select --install
 On macOS the native build pulls audio/video from CoreAudio and AVFoundation, so the Linux-only ALSA (`libasound2`) and V4L (`libv4l`) packages aren't needed. Install the rest with [Homebrew](https://brew.sh):
 
 ```sh
-brew install pkg-config llvm libvpx cmake openssl
+brew install pkg-config llvm cmake openssl
 ```
+
+> **VP9 encoding is pure Rust by default** — no C libvpx is required or linked.
+> If you need the legacy C libvpx backend (for A/B comparison or rollback), build
+> with `--features libvpx`, which additionally requires `libvpx-dev` (Linux) /
+> `libvpx` (macOS). The public behavior is the same either way.
 
 ---
 

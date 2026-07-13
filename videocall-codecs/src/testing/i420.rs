@@ -122,6 +122,53 @@ pub fn noise(width: u32, height: u32, t: u32, seed: u64) -> Vec<u8> {
     buf
 }
 
+/// A rate-control test source: a smooth static gradient with moderate per-frame
+/// texture that survives quantization in a graded way.
+///
+/// Unlike [`moving_box`] — whose sharp, high-contrast edges cost a fixed number
+/// of bits at *any* quantizer, leaving the bitrate quantizer-insensitive — the
+/// texture here is mid-amplitude and broadband, so raising the quantizer zeroes
+/// progressively more of it and the coded size responds smoothly to `qindex`.
+/// That quantizer-sensitivity is what lets the rate controller actually steer the
+/// bitrate, so this is the source the M3/M4 rate-control milestones use.
+///
+/// The texture is a deterministic function of `(row, col, t)` (own xorshift64,
+/// no `rand`), and it changes every frame, so motion compensation cannot predict
+/// it away — every frame carries genuine, quantizer-gradable residual.
+pub fn busy(width: u32, height: u32, t: u32) -> Vec<u8> {
+    // Amplitude chosen so that, within the app's default q window (qindex
+    // 160..240) at CIF-class resolutions, the coded bitrate spans well below to
+    // well above typical targets — giving the rate controller room to converge.
+    const TEXTURE_AMPLITUDE: i32 = 18;
+
+    let mut buf = vec![0u8; buffer_size_i420(width, height)];
+    let (w, h) = (width as usize, height as usize);
+    let (y, u, v) = planes_mut(&mut buf, width, height);
+
+    for row in 0..h {
+        for col in 0..w {
+            // Gentle low-frequency gradient background (compressible; predicted
+            // near-perfectly by ZEROMV once coded).
+            let bg = 64 + ((row as i32 + col as i32) / 8).min(127);
+            // Mid-amplitude per-frame texture (the quantizer-sensitive residual).
+            let mut state = (row as u64).wrapping_mul(2_654_435_761)
+                ^ (col as u64).wrapping_mul(40_503)
+                ^ (t as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            if state == 0 {
+                state = 0x1234_5678_9ABC_DEF0;
+            }
+            let noise = ((xorshift64(&mut state) >> 33) as i32 & 0xff) - 128;
+            let val = bg + noise * TEXTURE_AMPLITUDE / 128;
+            y[row * w + col] = val.clamp(0, 255) as u8;
+        }
+    }
+    // Neutral chroma keeps the source's cost in luma where the texture lives.
+    for c in u.iter_mut().chain(v.iter_mut()) {
+        *c = 128;
+    }
+    buf
+}
+
 /// Advance an xorshift64 state and return the new value. State must be non-zero.
 fn xorshift64(state: &mut u64) -> u64 {
     let mut x = *state;
@@ -162,5 +209,23 @@ mod tests {
     #[test]
     fn moving_box_moves() {
         assert_ne!(moving_box(128, 128, 0), moving_box(128, 128, 10));
+    }
+
+    #[test]
+    fn busy_is_deterministic_and_changes_each_frame() {
+        assert_eq!(busy(320, 240, 4), busy(320, 240, 4));
+        // The per-frame texture must differ frame-to-frame so inter frames carry
+        // real residual (otherwise the rate controller has nothing to steer).
+        assert_ne!(busy(320, 240, 4), busy(320, 240, 5));
+    }
+
+    #[test]
+    fn busy_correct_length_and_neutral_chroma() {
+        for &(w, h) in &[(320u32, 240u32), (636, 476)] {
+            let b = busy(w, h, 3);
+            assert_eq!(b.len(), buffer_size_i420(w, h));
+            // Chroma planes are neutral gray.
+            assert!(b[(w * h) as usize..].iter().all(|&c| c == 128));
+        }
     }
 }

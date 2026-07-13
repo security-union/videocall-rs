@@ -50,6 +50,7 @@ use crate::vp9::enc::pack::{
     write_partition, write_single_ref_last, write_skip, InterNeighbor, PartitionContext,
 };
 use crate::vp9::enc::quantize::QuantParams;
+use crate::vp9::enc::speed::SpeedFeatures;
 use crate::vp9::enc::tokenize::{
     combine_entropy_contexts, tokenize_block, PlaneType, Token, REF_TYPE_INTER, REF_TYPE_INTRA,
 };
@@ -168,6 +169,8 @@ struct Frame {
     mi_cols: u32,
     qp: QuantParams,
     grid: Vec<Mi>,
+    /// `cpu_used`-derived motion-search knobs (inter frames only).
+    sf: SpeedFeatures,
 }
 
 impl Frame {
@@ -374,7 +377,14 @@ impl Frame {
                 off: sorg + (mi_row * 8) as usize * sstride + (mi_col * 8) as usize,
                 stride: sstride,
             };
-            search_block(&refp, &srcb, mi_row as i32, mi_col as i32, nearest)
+            search_block(
+                &refp,
+                &srcb,
+                mi_row as i32,
+                mi_col as i32,
+                nearest,
+                &self.sf,
+            )
         };
         let mv = best.mv;
         let mode = if mv == Mv::ZERO {
@@ -727,6 +737,8 @@ pub fn encode_keyframe(src: &FrameBuffer, base_qindex: u8) -> (Vec<u8>, FrameBuf
         mi_cols,
         qp,
         grid,
+        // Keyframes do no motion search; the value is unused.
+        sf: SpeedFeatures::default(),
     };
 
     // --- Phase 1: tokenize walk (also builds the reconstruction). ---
@@ -753,11 +765,13 @@ pub fn encode_keyframe(src: &FrameBuffer, base_qindex: u8) -> (Vec<u8>, FrameBuf
 ///
 /// Returns the VP9 frame bitstream and this frame's reconstruction (the next
 /// reference). Uses a single LAST reference, integer-pel motion compensation, and
-/// ZEROMV / NEARESTMV / NEWMV modes.
+/// ZEROMV / NEARESTMV / NEWMV modes. `sf` supplies the `cpu_used`-derived motion
+/// search range and ZEROMV early-exit threshold.
 pub fn encode_inter_frame(
     src: &FrameBuffer,
     reference: &FrameBuffer,
     base_qindex: u8,
+    sf: &SpeedFeatures,
 ) -> (Vec<u8>, FrameBuffer) {
     let width = src.crop_width;
     let height = src.crop_height;
@@ -774,6 +788,7 @@ pub fn encode_inter_frame(
         mi_cols,
         qp,
         grid,
+        sf: *sf,
     };
 
     // --- Phase 1: motion estimation + tokenize walk (builds reconstruction). ---
@@ -884,8 +899,8 @@ mod tests {
         let mut reference = key.1;
         reference.extend_borders();
         let src = make_src(128, 96);
-        let a = encode_inter_frame(&src, &reference, 128).0;
-        let b = encode_inter_frame(&src, &reference, 128).0;
+        let a = encode_inter_frame(&src, &reference, 128, &SpeedFeatures::default()).0;
+        let b = encode_inter_frame(&src, &reference, 128, &SpeedFeatures::default()).0;
         assert_eq!(a, b, "inter encode must be deterministic");
         // frame_type bit (inter = 1) sits after marker(2)+profile(2)+show_existing(1).
         assert_eq!(a[0] >> 6, 0b10, "frame marker");
@@ -903,7 +918,7 @@ mod tests {
         let src_i420 = reference.export_i420();
         let mut src = FrameBuffer::new(128, 96);
         src.import_i420(&src_i420, 128, 96).unwrap();
-        let inter = encode_inter_frame(&src, &reference, 128);
+        let inter = encode_inter_frame(&src, &reference, 128, &SpeedFeatures::default());
         assert!(
             inter.0.len() < key.0.len(),
             "inter frame ({}) should be smaller than keyframe ({})",
@@ -917,7 +932,12 @@ mod tests {
         let key = encode_keyframe(&make_src(636, 476), 150);
         let mut reference = key.1;
         reference.extend_borders();
-        let (bytes, recon) = encode_inter_frame(&make_src(636, 476), &reference, 150);
+        let (bytes, recon) = encode_inter_frame(
+            &make_src(636, 476),
+            &reference,
+            150,
+            &SpeedFeatures::default(),
+        );
         assert!(!bytes.is_empty());
         assert_eq!((recon.crop_width, recon.crop_height), (636, 476));
     }

@@ -27,9 +27,8 @@
 //! encoder-only, none of this needs to be bit-exact.
 
 use crate::vp9::common::mvref::Mv;
+use crate::vp9::enc::speed::SpeedFeatures;
 
-/// Search range in pixels around the start point (even positions only).
-const SEARCH_RANGE_PX: i32 = 16;
 /// Lambda for the crude `SAD + lambda * mv_bits` cost. Small so SAD dominates.
 const LAMBDA: u32 = 4;
 
@@ -101,17 +100,32 @@ pub struct SearchResult {
 /// `pred_mv` is the predicted (nearest) MV, rounded to the nearest even pixel and
 /// used both as the search origin and the cost center. The search always
 /// evaluates ZEROMV and the predictor, then refines with a halving step pattern.
-/// Returns the winning MV (a multiple of 16 in 1/8-pel) and its SAD.
+/// `sf` supplies the `cpu_used`-derived search range and the ZEROMV-first
+/// early-exit threshold. Returns the winning MV (a multiple of 16 in 1/8-pel)
+/// and its SAD.
 pub fn search_block(
     reference: &RefPlane,
     src: &SrcBlock,
     mi_row: i32,
     mi_col: i32,
     pred_mv: Mv,
+    sf: &SpeedFeatures,
 ) -> SearchResult {
+    // ZEROMV-first early exit: if the no-motion match is already good enough,
+    // take it and skip the search entirely (the dominant case for static
+    // regions). `zeromv_early_exit_sad == 0` disables this.
+    let zero_sad = sad8x8(reference, src, mi_row, mi_col, 0, 0);
+    if sf.zeromv_early_exit_sad > 0 && zero_sad <= sf.zeromv_early_exit_sad {
+        return SearchResult {
+            mv: Mv::ZERO,
+            sad: zero_sad,
+        };
+    }
+
     // Clamp the search so reads stay inside the reference border (64 px) and the
-    // 8x8 block fits: |offset| <= SEARCH_RANGE_PX is well within.
-    let clamp_px = |v: i32| v.clamp(-SEARCH_RANGE_PX, SEARCH_RANGE_PX);
+    // 8x8 block fits: |offset| <= search range is well within.
+    let range = sf.search_range_px;
+    let clamp_px = |v: i32| v.clamp(-range, range);
     // Round the predictor to an even pixel offset (its px value = mv/8).
     let round_even = |mv8: i16| {
         let px = (mv8 as i32) / 8;
@@ -131,7 +145,9 @@ pub fn search_block(
     let mut best_cost;
     let mut best_sad;
     {
-        let (c0, s0) = cost_at(0, 0);
+        // Reuse the ZEROMV SAD already computed for the early-exit check.
+        let s0 = zero_sad;
+        let c0 = s0 + mv_cost(px_to_mv(0, 0), pred_mv);
         best_dy = 0;
         best_dx = 0;
         best_cost = c0;
@@ -193,6 +209,14 @@ mod tests {
     use super::*;
     use crate::vp9::common::frame_buffer::FrameBuffer;
 
+    /// Full-search knobs (no early exit) so these tests exercise the refinement
+    /// path deterministically regardless of the preset table.
+    const FULL_SEARCH: SpeedFeatures = SpeedFeatures {
+        search_range_px: 16,
+        zeromv_early_exit_sad: 0,
+        max_partition_16x16: false,
+    };
+
     /// A reference frame with a white box at pixel (bx, by).
     fn boxed_ref(w: u32, h: u32, bx: usize, by: usize, size: usize) -> FrameBuffer {
         let (yw, yh) = (w as usize, h as usize);
@@ -235,7 +259,7 @@ mod tests {
             off: sorg + 40 * sstride + 40,
             stride: sstride,
         };
-        let res = search_block(&refp, &src, 5, 5, Mv::ZERO);
+        let res = search_block(&refp, &src, 5, 5, Mv::ZERO, &FULL_SEARCH);
         assert_eq!(res.mv, Mv::new(-16, -16), "expected -2px,-2px motion");
         assert_eq!(res.sad, 0, "exact match should have zero SAD");
     }
@@ -257,7 +281,7 @@ mod tests {
             off: sorg + 80 * sstride + 80,
             stride: sstride,
         };
-        let res = search_block(&refp, &src, 10, 10, Mv::ZERO);
+        let res = search_block(&refp, &src, 10, 10, Mv::ZERO, &FULL_SEARCH);
         assert_eq!(res.mv, Mv::ZERO);
         assert_eq!(res.sad, 0);
     }
@@ -278,8 +302,36 @@ mod tests {
             off: sorg + 36 * sstride + 44,
             stride: sstride,
         };
-        let res = search_block(&refp, &src, 4, 5, Mv::ZERO);
+        let res = search_block(&refp, &src, 4, 5, Mv::ZERO, &FULL_SEARCH);
         assert_eq!(res.mv.row % 16, 0);
         assert_eq!(res.mv.col % 16, 0);
+    }
+
+    #[test]
+    fn early_exit_returns_zeromv_on_good_match() {
+        // The box has moved, so a full search would find non-zero motion for the
+        // corner block — but a preset with a generous early-exit threshold should
+        // accept ZEROMV before searching once the no-motion SAD is under it.
+        let reference = boxed_ref(128, 128, 40, 40, 16);
+        let current = boxed_ref(128, 128, 42, 42, 16);
+        let (rdata, rorg, rstride, _, _) = reference.y();
+        let (sdata, sorg, sstride, _, _) = current.y();
+        let refp = RefPlane {
+            data: rdata,
+            origin: rorg,
+            stride: rstride,
+        };
+        let src = SrcBlock {
+            data: sdata,
+            off: sorg + 40 * sstride + 40,
+            stride: sstride,
+        };
+        let sf = SpeedFeatures {
+            search_range_px: 16,
+            zeromv_early_exit_sad: u32::MAX, // always trigger
+            max_partition_16x16: false,
+        };
+        let res = search_block(&refp, &src, 5, 5, Mv::ZERO, &sf);
+        assert_eq!(res.mv, Mv::ZERO, "early exit must return ZEROMV");
     }
 }

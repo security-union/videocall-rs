@@ -53,7 +53,6 @@ pub struct VideoEncoderBuilder {
     pub fps: u32,
     pub resolution: (u32, u32),
     pub cpu_used: u32,
-    #[allow(dead_code)]
     pub profile: u32,
 }
 
@@ -84,6 +83,16 @@ impl VideoEncoderBuilder {
         }
         if height % 2 != 0 || height == 0 {
             return Err(anyhow!("Height must be divisible by 2"));
+        }
+        // The encoder backends only implement VP9 profile 0 (8-bit 4:2:0).
+        // `EncoderConfig` has no profile field, so a non-zero `profile` here
+        // would be silently dropped and produce profile-0 output. Reject it
+        // loudly instead of misleading the caller.
+        if self.profile != 0 {
+            return Err(anyhow!(
+                "Unsupported VP9 profile {}: only profile 0 (8-bit 4:2:0) is supported",
+                self.profile
+            ));
         }
 
         let config = EncoderConfig {
@@ -157,5 +166,42 @@ impl<'a> Iterator for Frames<'a> {
     type Item = Frame<'a>;
     fn next(&mut self) -> Option<Self::Item> {
         self.frame.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VideoEncoderBuilder;
+
+    #[test]
+    fn build_rejects_unsupported_profile() {
+        // Only VP9 profile 0 (8-bit 4:2:0) is supported. A non-zero profile
+        // must fail loudly rather than silently produce profile-0 output.
+        for profile in [1u32, 2, 3] {
+            let mut builder = VideoEncoderBuilder::new(30, 7).set_resolution(640, 480);
+            builder.profile = profile;
+            match builder.build() {
+                // Edition 2018: `panic!`/`assert!` with a single string literal
+                // is not a format string, so pass args positionally.
+                Ok(_) => panic!("build with profile {} should have failed", profile),
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("Unsupported VP9 profile") && msg.contains("profile 0"),
+                        "profile {} error should name the profile and profile 0: {}",
+                        profile,
+                        msg
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn build_accepts_profile_zero() {
+        // The default profile (0) must still build successfully.
+        let mut builder = VideoEncoderBuilder::new(30, 7).set_resolution(640, 480);
+        builder.profile = 0;
+        assert!(builder.build().is_ok(), "profile 0 must build successfully");
     }
 }

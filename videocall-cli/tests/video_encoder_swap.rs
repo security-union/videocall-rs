@@ -164,3 +164,31 @@ fn build_rejects_odd_dimensions() {
     assert!(build_err(640, 481).contains("Height must be divisible by 2"));
     assert!(build_err(0, 480).contains("Width must be divisible by 2"));
 }
+
+#[test]
+fn build_rejects_unsupported_profile() {
+    // Only VP9 profile 0 (8-bit 4:2:0) is supported. A non-zero profile must
+    // fail loudly rather than silently produce profile-0 output.
+    for profile in [1u32, 2, 3] {
+        let mut builder = VideoEncoderBuilder::new(FPS, CPU_USED).set_resolution(WIDTH, HEIGHT);
+        builder.profile = profile;
+        match builder.build() {
+            Ok(_) => panic!("build with profile {profile} should have failed"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Unsupported VP9 profile") && msg.contains("profile 0"),
+                    "profile {profile} error should name the profile and profile 0: {msg}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn build_accepts_profile_zero() {
+    // The default profile (0) must still build successfully.
+    let mut builder = VideoEncoderBuilder::new(FPS, CPU_USED).set_resolution(WIDTH, HEIGHT);
+    builder.profile = 0;
+    assert!(builder.build().is_ok(), "profile 0 must build successfully");
+}

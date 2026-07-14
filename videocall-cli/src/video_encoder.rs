@@ -82,6 +82,16 @@ impl VideoEncoderBuilder {
         if height % 2 != 0 || height == 0 {
             return Err(anyhow!("Height must be divisible by 2"));
         }
+        // The encoder backends only implement VP9 profile 0 (8-bit 4:2:0).
+        // `EncoderConfig` has no profile field, so a non-zero `profile` here
+        // would be silently dropped and produce profile-0 output. Reject it
+        // loudly instead of misleading the caller.
+        if self.profile != 0 {
+            return Err(anyhow!(
+                "Unsupported VP9 profile {}: only profile 0 (8-bit 4:2:0) is supported",
+                self.profile
+            ));
+        }
 
         let config = EncoderConfig {
             width,

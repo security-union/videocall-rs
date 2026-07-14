@@ -191,6 +191,16 @@ pub fn sb64_cols_from_mi(mi_cols: u32) -> u32 {
     mi_aligned_to_sb(mi_cols) >> 3
 }
 
+/// `get_tile_offset`: the SB64-aligned mi column at which tile `idx` starts for
+/// a `log2`-tile-column split of `mi_cols`. Shared by the encoder (which packs
+/// each tile) and the decoder (which must split the tile payloads at the exact
+/// same columns), so a single definition keeps the two provably consistent.
+pub fn tile_offset(idx: u32, mi_cols: u32, log2: u32) -> u32 {
+    let sb_cols = sb64_cols_from_mi(mi_cols);
+    let offset = ((idx * sb_cols) >> log2) << 3; // << MI_BLOCK_SIZE_LOG2
+    offset.min(mi_cols)
+}
+
 /// `(min, max)` log2 tile-column counts for a frame `mi_cols`, matching
 /// `vp9_get_tile_n_bits`.
 pub fn tile_cols_log2_range(mi_cols: u32) -> (u32, u32) {

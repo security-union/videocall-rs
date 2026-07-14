@@ -51,6 +51,7 @@ use anyhow::Result;
 pub(crate) mod common;
 #[cfg(any(test, feature = "test-utils"))]
 pub(crate) mod debug;
+pub mod dec;
 pub(crate) mod enc;
 
 /// Multiple of the per-frame keyframe target above which a keyframe is re-encoded

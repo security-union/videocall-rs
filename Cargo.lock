@@ -1023,7 +1023,6 @@ dependencies = [
  "anyhow",
  "chrono",
  "dotenv",
- "env-libvpx-sys",
  "futures",
  "hound",
  "image 0.25.9",
@@ -1035,6 +1034,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+ "videocall-codecs",
  "videocall-types",
  "web-transport-quinn 0.8.1",
 ]

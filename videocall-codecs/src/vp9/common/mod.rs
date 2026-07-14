@@ -33,6 +33,7 @@ pub mod idct;
 pub mod inter_pred;
 pub mod intra_pred;
 pub mod mvref;
+pub mod partition;
 pub mod quant;
 pub mod trees;
 

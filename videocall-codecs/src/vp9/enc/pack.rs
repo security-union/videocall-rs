@@ -23,19 +23,20 @@
 //! `update_partition_context`). The recursive superblock walk that drives these
 //! lives in [`super::encoder`].
 
-use crate::vp9::common::block::{
-    BlockSize, Partition, B_WIDTH_LOG2, MI_WIDTH_LOG2, NUM_8X8_BLOCKS_WIDE,
-};
+use crate::vp9::common::block::{BlockSize, B_WIDTH_LOG2};
 use crate::vp9::common::bool_coder::BoolWriter;
 use crate::vp9::common::generated::{
     DEFAULT_INTER_MODE_PROBS, DEFAULT_INTRA_INTER_PROBS, DEFAULT_SINGLE_REF_PROBS,
     DEFAULT_SKIP_PROBS, KF_UV_MODE_PROBS, KF_Y_MODE_PROBS, PARETO8_FULL,
 };
 use crate::vp9::common::mvref::LAST_FRAME;
-use crate::vp9::common::trees::{
-    write_token, write_tree, INTER_MODE_TREE, INTRA_MODE_TREE, PARTITION_TREE,
-};
+use crate::vp9::common::trees::{write_token, write_tree, INTER_MODE_TREE, INTRA_MODE_TREE};
 use crate::vp9::enc::tokenize::{Token, CATEGORY1_TOKEN, EOB_TOKEN, ONE_TOKEN, ZERO_TOKEN};
+
+// The partition-context state and its token reader/writer are decoder-mandated,
+// so they live in `common`; re-exported here for the encoder walk that used to
+// find them in this module.
+pub use crate::vp9::common::partition::{write_partition, PartitionContext};
 
 /// `vp9_coef_encodings[token]` = `(value, len)` for the constrained subtree walk
 /// (`vp9/encoder/vp9_tokenize.c`). Only tokens `TWO..=CATEGORY6` are used here.
@@ -53,11 +54,6 @@ const COEF_ENCODINGS: [(u32, u32); 12] = [
     (127, 7),
     (0, 1),
 ];
-
-/// `PARTITION_PLOFFSET`: probability models per block size in the partition ctx.
-const PARTITION_PLOFFSET: usize = 4;
-/// `MI_MASK`: superblock-local mi index mask (8 mi per SB64).
-const MI_MASK: u32 = 7;
 
 /// Extra-bit probabilities for CATEGORY1..CATEGORY6 (`vp9_catN_prob`, 8-bit).
 fn extra_bit_probs(token: u8) -> &'static [u8] {
@@ -275,90 +271,6 @@ pub fn write_inter_mode(w: &mut BoolWriter, mode_context: usize, inter_offset: u
         &DEFAULT_INTER_MODE_PROBS[mode_context],
         inter_offset,
     );
-}
-
-/// Partition above/left context arrays (`above_seg_context` / `left_seg_context`),
-/// mirroring the encoder's per-frame/per-SB-row lifecycle.
-pub struct PartitionContext {
-    /// One byte per mi column across the (sb-aligned) frame width.
-    pub above: Vec<u8>,
-    /// One byte per mi row within a superblock (8 entries).
-    pub left: [u8; 8],
-}
-
-impl PartitionContext {
-    pub fn new(mi_cols_aligned: usize) -> Self {
-        Self {
-            above: vec![0u8; mi_cols_aligned],
-            left: [0u8; 8],
-        }
-    }
-
-    /// Reset the left context at the start of a superblock row.
-    pub fn reset_left(&mut self) {
-        self.left = [0u8; 8];
-    }
-
-    /// `partition_plane_context`: derive the partition probability context.
-    fn plane_context(&self, mi_row: u32, mi_col: u32, bsize: BlockSize) -> usize {
-        let bsl = MI_WIDTH_LOG2[bsize as usize] as usize;
-        let above = ((self.above[mi_col as usize] >> bsl) & 1) as usize;
-        let left = ((self.left[(mi_row & MI_MASK) as usize] >> bsl) & 1) as usize;
-        (left * 2 + above) + bsl * PARTITION_PLOFFSET
-    }
-
-    /// `update_partition_context`: stamp the context after coding a block.
-    pub fn update(&mut self, mi_row: u32, mi_col: u32, subsize: BlockSize, bsize: BlockSize) {
-        // `partition_context_lookup[subsize]` — the {above, left} masks. For the
-        // block sizes this encoder emits, above == left (square blocks).
-        const ABOVE: [u8; 13] = [15, 15, 14, 14, 14, 12, 12, 12, 8, 8, 8, 0, 0];
-        const LEFT: [u8; 13] = [15, 14, 15, 14, 12, 14, 12, 8, 12, 8, 0, 8, 0];
-        let bs = NUM_8X8_BLOCKS_WIDE[bsize as usize] as usize;
-        let a = ABOVE[subsize as usize];
-        let l = LEFT[subsize as usize];
-        for k in 0..bs {
-            self.above[mi_col as usize + k] = a;
-        }
-        let base = (mi_row & MI_MASK) as usize;
-        for k in 0..bs {
-            self.left[base + k] = l;
-        }
-    }
-}
-
-/// `write_partition`: emit the partition decision with frame-edge handling.
-///
-/// `hbs` is the half-block size in mi units. At the frame's right/bottom edge one
-/// of the partition token's bits is forced (or the whole token dropped), matching
-/// `has_rows`/`has_cols` in libvpx.
-#[allow(clippy::too_many_arguments)]
-pub fn write_partition(
-    w: &mut BoolWriter,
-    ctx: &PartitionContext,
-    hbs: u32,
-    mi_row: u32,
-    mi_col: u32,
-    partition: Partition,
-    bsize: BlockSize,
-    mi_rows: u32,
-    mi_cols: u32,
-    partition_probs: &[[u8; 3]; 16],
-) {
-    let cidx = ctx.plane_context(mi_row, mi_col, bsize);
-    let probs = &partition_probs[cidx];
-    let has_rows = (mi_row + hbs) < mi_rows;
-    let has_cols = (mi_col + hbs) < mi_cols;
-
-    if has_rows && has_cols {
-        write_token(w, &PARTITION_TREE, probs, partition as usize);
-    } else if !has_rows && has_cols {
-        // SPLIT or HORZ: one bit distinguishes them.
-        w.write((partition == Partition::Split) as u8, probs[1]);
-    } else if has_rows && !has_cols {
-        // SPLIT or VERT.
-        w.write((partition == Partition::Split) as u8, probs[2]);
-    }
-    // else: neither — partition is forced SPLIT, nothing coded.
 }
 
 /// `b_width_log2_lookup[bsize]` — exposed for the walk's `bs = (1<<bsl)/4`.

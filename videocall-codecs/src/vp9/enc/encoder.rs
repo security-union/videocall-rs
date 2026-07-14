@@ -37,7 +37,7 @@
 //! reference with integer-pel motion compensation.
 
 use crate::vp9::common::block::{
-    sb64_cols_from_mi, tile_cols_log2_range, BlockSize, Partition, PredictionMode, TxMode, TxSize,
+    tile_cols_log2_range, tile_offset, BlockSize, Partition, PredictionMode, TxMode, TxSize,
     SUBSIZE_LOOKUP,
 };
 use crate::vp9::common::bool_coder::BoolWriter;
@@ -1244,13 +1244,6 @@ struct TileGeom {
 fn tile_cols_log2_for(mi_cols: u32) -> u32 {
     let (_min, max) = tile_cols_log2_range(mi_cols);
     max.min(MAX_TILE_COLS_LOG2)
-}
-
-/// `get_tile_offset`: the SB64-aligned mi column at which tile `idx` starts.
-fn tile_offset(idx: u32, mi_cols: u32, log2: u32) -> u32 {
-    let sb_cols = sb64_cols_from_mi(mi_cols);
-    let offset = ((idx * sb_cols) >> log2) << 3; // << MI_BLOCK_SIZE_LOG2
-    offset.min(mi_cols)
 }
 
 /// The `1 << log2` tile columns spanning `mi_cols`.

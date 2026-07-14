@@ -114,3 +114,8 @@ name = "vp9_encode"
 harness = false
 required-features = ["libvpx", "test-utils"]
 
+[[bench]]
+name = "vp9_decode"
+harness = false
+required-features = ["libvpx", "test-utils"]
+

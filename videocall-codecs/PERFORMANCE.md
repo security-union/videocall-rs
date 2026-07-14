@@ -37,6 +37,23 @@ between the "tile-parallel" and "SIMD" columns.
 
 _Reproduce:_ `cargo bench -p videocall-codecs --features "libvpx test-utils" --bench vp9_encode`
 
+## Decode (M0 — keyframe, pure-Rust vs libvpx)
+
+Median decode time per frame, same conditions (keyframes from this crate's
+encoder, decoded by our pure-Rust `dec::decode_keyframe` vs libvpx):
+
+| Resolution | libvpx decode | pure-Rust decode | vs libvpx |
+|---|---|---|---|
+| 640×480  | 0.157 ms | 0.200 ms | 1.27× |
+| 1280×720 | 0.453 ms | 0.571 ms | 1.26× |
+
+The decoder is ~165× faster than real-time @640×480 and all-scalar. Note the gap
+to libvpx (~1.27×) is **much smaller than the encoder's** (~2×): decode has no
+motion search and gains less from SIMD. Decode is currently profile-0 keyframe
+only (M0); SIMD in the detokenize/idct hot paths is a later optimization.
+
+_Reproduce:_ `cargo bench -p videocall-codecs --features "libvpx test-utils" --bench vp9_decode`
+
 ---
 
 # TODO / next steps

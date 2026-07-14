@@ -26,6 +26,14 @@ pub mod jitter_estimator;
 pub mod messages;
 pub mod vp9;
 
+// UniFFI Swift/Kotlin bindings for the pure-Rust VP9 codec. Native-only (the
+// `uniffi` CLI machinery does not build for wasm32), gated behind the `uniffi`
+// feature so nothing else is affected.
+#[cfg(all(feature = "uniffi", not(target_arch = "wasm32")))]
+uniffi::setup_scaffolding!();
+#[cfg(all(feature = "uniffi", not(target_arch = "wasm32")))]
+mod ffi;
+
 /// Deterministic synthetic sources, PSNR metrics, an IVF writer, and (behind
 /// `libvpx`) a synchronous libvpx decode oracle. Used by the VP9 encoder's
 /// TDD harness. Enabled with the `test-utils` feature.

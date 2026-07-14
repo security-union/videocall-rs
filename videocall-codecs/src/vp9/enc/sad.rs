@@ -75,7 +75,7 @@ fn sad_scalar(
 /// reference plane is border-extended so motion-search reads always are).
 #[inline]
 #[allow(clippy::too_many_arguments)]
-pub fn sad(
+pub(crate) fn sad(
     src: &[u8],
     src_off: usize,
     src_stride: usize,
@@ -181,7 +181,7 @@ mod aarch64 {
     /// `off + (h - 1) * stride + w <= slice.len()`.
     #[target_feature(enable = "neon")]
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn sad_neon(
+    pub(super) unsafe fn sad_neon(
         src: &[u8],
         src_off: usize,
         src_stride: usize,
@@ -241,7 +241,7 @@ mod x86 {
 
     /// Whether AVX2 is available, detected once and cached.
     #[inline]
-    pub fn avx2_available() -> bool {
+    pub(super) fn avx2_available() -> bool {
         match AVX2.load(Ordering::Relaxed) {
             1 => true,
             2 => false,
@@ -278,7 +278,7 @@ mod x86 {
     /// Every sampled byte must be in bounds (see [`super::sad`]).
     #[target_feature(enable = "sse2")]
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn sad_sse2(
+    pub(super) unsafe fn sad_sse2(
         src: &[u8],
         src_off: usize,
         src_stride: usize,
@@ -329,7 +329,7 @@ mod x86 {
     /// available (guaranteed by the [`avx2_available`] guard at the call site).
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
-    pub unsafe fn sad_avx2(
+    pub(super) unsafe fn sad_avx2(
         src: &[u8],
         src_off: usize,
         src_stride: usize,

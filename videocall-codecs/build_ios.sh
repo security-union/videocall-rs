@@ -6,11 +6,16 @@
 # `native`/`libvpx` features) so the resulting static library has zero C deps.
 #
 # Slices produced (see README-ios.md for the full rationale):
-#   * ios-arm64            aarch64-apple-ios          device       (stable, Tier 2)
-#   * ios-arm64-simulator  aarch64-apple-ios-sim      simulator    (stable, Tier 2)
-#   * macos-arm64          aarch64-apple-darwin       macOS        (stable, Tier 2)
-#   * watchos              arm64_32 + arm64           device (fat) (NIGHTLY, Tier 3)
-#   * watchos-simulator    aarch64-apple-watchos-sim  simulator    (NIGHTLY, Tier 3)
+#   * ios-arm64               aarch64-apple-ios          device       (stable, Tier 2)
+#   * ios-arm64-simulator     aarch64-apple-ios-sim      simulator    (stable, Tier 2)
+#   * ios-arm64-maccatalyst   aarch64-apple-ios-macabi   Catalyst     (stable, Tier 2)
+#   * macos-arm64             aarch64-apple-darwin       macOS        (stable, Tier 2)
+#   * watchos                 arm64_32 + arm64           device (fat) (NIGHTLY, Tier 3)
+#   * watchos-simulator       aarch64-apple-watchos-sim  simulator    (NIGHTLY, Tier 3)
+#
+# Mac Catalyst (`-macabi`) is a distinct slice from native macOS: a Catalyst app
+# (SUPPORTS_MACCATALYST=YES) links the iOS-on-Mac ABI, which native macos-arm64
+# does NOT provide. Both slices coexist in the xcframework.
 #
 # Deployment targets: iOS 15 / macOS 12 / watchOS 10.
 #
@@ -57,6 +62,14 @@ echo "Building for macOS (arm64)..."
 RUSTFLAGS="-C link-arg=-mmacosx-version-min=12.0" \
   cargo build -p videocall-codecs --no-default-features --features "$FEATURES" \
   --release --target aarch64-apple-darwin
+
+# Mac Catalyst: the `-macabi` variant needs the deployment target expressed via a
+# full `-target arm64-apple-ios<min>-macabi` triple (there is no `-macabi`
+# min-version flag), otherwise clang defaults the object's Catalyst minos.
+echo "Building for Mac Catalyst (arm64, ios-macabi)..."
+RUSTFLAGS="-C link-arg=-target -C link-arg=arm64-apple-ios15.0-macabi" \
+  cargo build -p videocall-codecs --no-default-features --features "$FEATURES" \
+  --release --target aarch64-apple-ios-macabi
 
 # --- watchOS: NIGHTLY + build-std, Tier 3 ------------------------------------
 #
@@ -125,6 +138,7 @@ cat "$OUT_SWIFT"/*FFI.modulemap > "$OUT_SWIFT/include/module.modulemap"
 SIGN_LIBS=(
   "target/aarch64-apple-ios/release/$LIB_NAME"
   "target/aarch64-apple-ios-sim/release/$LIB_NAME"
+  "target/aarch64-apple-ios-macabi/release/$LIB_NAME"
   "target/aarch64-apple-darwin/release/$LIB_NAME"
 )
 if [ "$BUILD_WATCHOS" = "1" ]; then
@@ -142,6 +156,7 @@ rm -rf target/VideocallCodecs.xcframework
 XCARGS=(
   -library "target/aarch64-apple-ios/release/$LIB_NAME" -headers "$OUT_SWIFT/include"
   -library "target/aarch64-apple-ios-sim/release/$LIB_NAME" -headers "$OUT_SWIFT/include"
+  -library "target/aarch64-apple-ios-macabi/release/$LIB_NAME" -headers "$OUT_SWIFT/include"
   -library "target/aarch64-apple-darwin/release/$LIB_NAME" -headers "$OUT_SWIFT/include"
 )
 if [ "$BUILD_WATCHOS" = "1" ]; then
@@ -157,9 +172,9 @@ echo "=== Build completed successfully ==="
 echo "XCFramework:    $ROOT_DIR/target/VideocallCodecs.xcframework"
 echo "Swift bindings: $ROOT_DIR/$OUT_SWIFT/videocall_codecs.swift"
 if [ "$BUILD_WATCHOS" = "1" ]; then
-  echo "Slices:         ios-arm64, ios-arm64-simulator, macos-arm64, watchos (arm64_32+arm64), watchos-simulator"
+  echo "Slices:         ios-arm64, ios-arm64-simulator, ios-arm64-maccatalyst, macos-arm64, watchos (arm64_32+arm64), watchos-simulator"
 else
-  echo "Slices:         ios-arm64, ios-arm64-simulator, macos-arm64  (watchOS skipped)"
+  echo "Slices:         ios-arm64, ios-arm64-simulator, ios-arm64-maccatalyst, macos-arm64  (watchOS skipped)"
 fi
 echo ""
 echo "To use in Swift:"

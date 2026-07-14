@@ -47,6 +47,8 @@ pub struct ParsedUncompressed {
     pub loop_filter_level: u8,
     pub base_qindex: u8,
     pub segmentation_enabled: bool,
+    /// `log2` of the number of tile columns decoded from `tile_info`.
+    pub log2_tile_cols: u32,
     /// Value of the 16-bit compressed-header-size field.
     pub compressed_header_size: u16,
     /// Byte offset at which the compressed header begins.
@@ -157,7 +159,7 @@ pub fn parse_uncompressed_header(
     assert!(!segmentation_enabled, "unexpected segmentation");
 
     // Tile info.
-    parse_tile_info(&mut rb, width);
+    let log2_tile_cols = parse_tile_info(&mut rb, width);
 
     // 16-bit compressed header size.
     let compressed_header_size = rb.read_literal(16) as u16;
@@ -180,28 +182,32 @@ pub fn parse_uncompressed_header(
         loop_filter_level,
         base_qindex,
         segmentation_enabled,
+        log2_tile_cols,
         compressed_header_size,
         uncompressed_header_bytes,
     }
 }
 
-/// Consume `write_tile_info`'s bits (single tile column/row for our subset).
-fn parse_tile_info(rb: &mut BitBufferReader, width: u32) {
+/// Read `write_tile_info`'s bits and return the decoded `log2_tile_cols` (the
+/// inverse of `bitstream.rs::write_tile_info`). Columns are coded as increment
+/// one-bits from `min_log2_tile_cols` upward, stopping at a `0` terminator or on
+/// reaching `max_log2_tile_cols`; tile rows are `0` for this encoder's subset.
+fn parse_tile_info(rb: &mut BitBufferReader, width: u32) -> u32 {
     use crate::vp9::common::block::{mi_cols, tile_cols_log2_range};
     let (min_log2, max_log2) = tile_cols_log2_range(mi_cols(width));
-    // columns: (log2_tile_cols - min_log2) ones (0 here) then a 0 if below max.
-    let ones = 0u32.saturating_sub(min_log2);
-    for _ in 0..ones {
-        let b = rb.read_bit();
-        assert_eq!(b, 1);
+    // columns: keep reading increment bits until a 0 or until we hit max_log2.
+    let mut log2_tile_cols = min_log2;
+    while log2_tile_cols < max_log2 {
+        if rb.read_bit() != 0 {
+            log2_tile_cols += 1;
+        } else {
+            break;
+        }
     }
-    if 0 < max_log2 {
-        let b = rb.read_bit();
-        assert_eq!(b, 0, "expected tile col terminator");
-    }
-    // rows.
-    let b = rb.read_bit();
-    assert_eq!(b, 0, "expected 0 tile rows");
+    // rows: log2_tile_rows == 0 (a single 0 bit; no increment for our subset).
+    let has_rows = rb.read_bit();
+    assert_eq!(has_rows, 0, "expected 0 tile rows");
+    log2_tile_cols
 }
 
 /// Fields recovered from the compressed header.

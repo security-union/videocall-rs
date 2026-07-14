@@ -26,13 +26,19 @@
 //! superblocks in the identical recursive order, so the entropy, partition and
 //! mode-info contexts they maintain agree with the decoder's.
 //!
-//! Scope: Profile 0, error-resilient, single tile, fixed full split to 8x8,
+//! The frame is split into `1..=4` VP9 tile columns (a pure function of width);
+//! each tile is encoded and packed independently — in parallel via rayon on
+//! native targets, sequentially on wasm — then their payloads are concatenated
+//! with per-tile size prefixes and their reconstructions stitched into one frame.
+//!
+//! Scope: Profile 0, error-resilient, fixed full split to 8x8,
 //! `tx_mode = ALLOW_8X8` (luma 8x8 / chroma 4x4 transforms). Keyframes use
 //! DC_PRED; inter frames use ZEROMV / NEARESTMV / NEWMV against a single LAST
 //! reference with integer-pel motion compensation.
 
 use crate::vp9::common::block::{
-    BlockSize, Partition, PredictionMode, TxMode, TxSize, SUBSIZE_LOOKUP,
+    sb64_cols_from_mi, tile_cols_log2_range, BlockSize, Partition, PredictionMode, TxMode, TxSize,
+    SUBSIZE_LOOKUP,
 };
 use crate::vp9::common::bool_coder::BoolWriter;
 use crate::vp9::common::frame_buffer::FrameBuffer;
@@ -190,6 +196,15 @@ struct Frame {
     grid: Vec<Mi>,
     /// `cpu_used`-derived motion-search knobs (inter frames only).
     sf: SpeedFeatures,
+    /// Left mi-column bound of the tile being coded (inclusive). Blocks at this
+    /// column have no left neighbor: intra prediction, the entropy/partition
+    /// contexts and the MV-reference scan all treat the tile's left edge as a
+    /// frame edge (`set_mi_row_col`: `left_mi = mi_col > tile->mi_col_start`).
+    /// `0` for a single-tile frame, restoring the original behavior exactly.
+    tile_col_start: u32,
+    /// Right mi-column bound of the tile (exclusive) — one past the last coded
+    /// column. Caps the MV-reference scan; equals `mi_cols` for a single tile.
+    tile_col_end: u32,
 }
 
 impl Frame {
@@ -279,7 +294,7 @@ impl Frame {
         mi_col: u32,
     ) {
         let up_blk = mi_row > 0;
-        let left_blk = mi_col > 0;
+        let left_blk = mi_col > self.tile_col_start;
 
         // --- Luma: four 8x8 transforms in raster order (TL, TR, BL, BR). ---
         let base_ay = (mi_col * 2) as usize;
@@ -389,7 +404,7 @@ impl Frame {
         mi_col: u32,
     ) {
         let up = mi_row > 0;
-        let left = mi_col > 0;
+        let left = mi_col > self.tile_col_start;
 
         // --- Luma 8x8 ---
         let ay = (mi_col * 2) as usize;
@@ -513,6 +528,9 @@ impl Frame {
         let (mode_context, refs) = {
             let grid = &self.grid;
             let cols = self.mi_cols;
+            // MV-reference candidates are clamped to the tile's column span
+            // (`is_inside`); rows span the whole frame (tile_rows == 1).
+            let (tcs, tce) = (self.tile_col_start as i32, self.tile_col_end as i32);
             let geom = MvRefGeom {
                 mi_rows,
                 mi_cols,
@@ -522,7 +540,7 @@ impl Frame {
             };
             find_mv_refs(
                 |r, c| {
-                    if r < 0 || c < 0 || r >= mi_rows || c >= mi_cols {
+                    if r < 0 || c < tcs || r >= mi_rows || c >= tce {
                         None
                     } else {
                         let mi = &grid[(r as u32 * cols + c as u32) as usize];
@@ -718,6 +736,9 @@ impl Frame {
         let (mode_context, refs) = {
             let grid = &self.grid;
             let cols = self.mi_cols;
+            // MV-reference candidates are clamped to the tile's column span
+            // (`is_inside`); rows span the whole frame (tile_rows == 1).
+            let (tcs, tce) = (self.tile_col_start as i32, self.tile_col_end as i32);
             let geom = MvRefGeom {
                 mi_rows,
                 mi_cols,
@@ -727,7 +748,7 @@ impl Frame {
             };
             find_mv_refs(
                 |r, c| {
-                    if r < 0 || c < 0 || r >= mi_rows || c >= mi_cols {
+                    if r < 0 || c < tcs || r >= mi_rows || c >= tce {
                         None
                     } else {
                         let mi = &grid[(r as u32 * cols + c as u32) as usize];
@@ -938,7 +959,7 @@ impl Frame {
     fn pack_leaf_kf(&self, w: &mut BoolWriter, mi_row: u32, mi_col: u32) {
         let block = self.block(mi_row, mi_col);
         let above_skip = mi_row > 0 && self.block(mi_row - 1, mi_col).skip;
-        let left_skip = mi_col > 0 && self.block(mi_row, mi_col - 1).skip;
+        let left_skip = mi_col > self.tile_col_start && self.block(mi_row, mi_col - 1).skip;
         write_skip(w, above_skip, left_skip, block.skip);
         write_kf_dc_modes(w);
         pack_mb_tokens(w, &block.tokens);
@@ -951,7 +972,12 @@ impl Frame {
     fn pack_leaf_inter(&self, w: &mut BoolWriter, mi_row: u32, mi_col: u32, bsize: BlockSize) {
         let block = self.block(mi_row, mi_col);
         let above = self.inter_neighbor(mi_row.checked_sub(1), Some(mi_col));
-        let left = self.inter_neighbor(Some(mi_row), mi_col.checked_sub(1));
+        // The tile's left edge is a frame edge: no left neighbor there.
+        let left = if mi_col > self.tile_col_start {
+            self.inter_neighbor(Some(mi_row), Some(mi_col - 1))
+        } else {
+            None
+        };
 
         // skip.
         let above_skip = above.is_some() && self.block(mi_row - 1, mi_col).skip;
@@ -1002,6 +1028,8 @@ impl Frame {
     fn mv_refs_at(&self, mi_row: u32, mi_col: u32, bsize: BlockSize) -> (u8, [Mv; 2]) {
         let (mi_rows, mi_cols) = (self.mi_rows as i32, self.mi_cols as i32);
         let cols = self.mi_cols;
+        // MV-reference candidates are clamped to the tile's column span.
+        let (tcs, tce) = (self.tile_col_start as i32, self.tile_col_end as i32);
         let grid = &self.grid;
         let geom = MvRefGeom {
             mi_rows,
@@ -1012,7 +1040,7 @@ impl Frame {
         };
         find_mv_refs(
             |r, c| {
-                if r < 0 || c < 0 || r >= mi_rows || c >= mi_cols {
+                if r < 0 || c < tcs || r >= mi_rows || c >= tce {
                     None
                 } else {
                     let mi = &grid[(r as u32 * cols + c as u32) as usize];
@@ -1193,48 +1221,213 @@ fn inter_residual_tx(
     (res.eob as usize, res.qcoeff)
 }
 
-/// Encode a single keyframe of `src` at `base_qindex`.
+/// Maximum tile-column split (`log2`) this encoder will request. Caps the
+/// resolution-derived legal maximum so the tile count is a pure function of frame
+/// width — independent of the machine's core count — which keeps the emitted
+/// bitstream identical regardless of how many threads encode it. `2` permits up
+/// to 4 tile columns (reached at 1280 px / 720p and wider); 640-wide frames top
+/// out at the legal maximum of 1 (2 columns). Frames up to 448 px wide
+/// (`mi_cols <= 56`, so `vp9_get_tile_n_bits` yields `max_log2 = 0`) resolve to a
+/// single tile, byte-for-byte identical to the pre-tiling encoder; the first
+/// 2-column width is 449 px (`mi_cols = 57`).
+const MAX_TILE_COLS_LOG2: u32 = 2;
+
+/// One tile column's mi-column span `[col_start, col_end)` (SB64-aligned).
+#[derive(Clone, Copy)]
+struct TileGeom {
+    col_start: u32,
+    col_end: u32,
+}
+
+/// `log2` of the tile-column count for a frame of `mi_cols`: the resolution's
+/// legal maximum (`vp9_get_tile_n_bits`) capped by [`MAX_TILE_COLS_LOG2`].
+fn tile_cols_log2_for(mi_cols: u32) -> u32 {
+    let (_min, max) = tile_cols_log2_range(mi_cols);
+    max.min(MAX_TILE_COLS_LOG2)
+}
+
+/// `get_tile_offset`: the SB64-aligned mi column at which tile `idx` starts.
+fn tile_offset(idx: u32, mi_cols: u32, log2: u32) -> u32 {
+    let sb_cols = sb64_cols_from_mi(mi_cols);
+    let offset = ((idx * sb_cols) >> log2) << 3; // << MI_BLOCK_SIZE_LOG2
+    offset.min(mi_cols)
+}
+
+/// The `1 << log2` tile columns spanning `mi_cols`.
+fn tile_geometry(mi_cols: u32, log2: u32) -> Vec<TileGeom> {
+    (0..(1u32 << log2))
+        .map(|i| TileGeom {
+            col_start: tile_offset(i, mi_cols, log2),
+            col_end: tile_offset(i + 1, mi_cols, log2),
+        })
+        .collect()
+}
+
+/// Encode and pack one tile column, returning its bool-coded byte payload and a
+/// reconstruction buffer whose `[col_start, col_end)` mi band is populated.
 ///
-/// Returns the complete VP9 frame bitstream and the reconstruction buffer (which
-/// equals what a conformant decoder produces, and becomes the reference for later
-/// inter frames). `src` must already hold the imported, mi-padded frame.
-pub fn encode_keyframe(src: &FrameBuffer, base_qindex: u8) -> (Vec<u8>, FrameBuffer) {
+/// Fully self-contained: it reads only its own band of `src` and the shared,
+/// read-only `reference`, and writes only its own private buffers, so tile
+/// columns can run concurrently with no synchronization.
+#[allow(clippy::too_many_arguments)]
+fn encode_pack_tile(
+    src: &FrameBuffer,
+    reference: Option<&FrameBuffer>,
+    base_qindex: u8,
+    sf: &SpeedFeatures,
+    mi_rows: u32,
+    mi_cols: u32,
+    mi_cols_aligned: usize,
+    geom: TileGeom,
+    is_keyframe: bool,
+) -> (Vec<u8>, FrameBuffer) {
+    let mut recon = FrameBuffer::new(src.crop_width, src.crop_height);
+    let mut frame = Frame {
+        mi_rows,
+        mi_cols,
+        qp: QuantParams::new(base_qindex as i32, 0, 0),
+        grid: vec![Mi::default(); (mi_rows * mi_cols) as usize],
+        sf: *sf,
+        tile_col_start: geom.col_start,
+        tile_col_end: geom.col_end,
+    };
+
+    // --- Phase 1: encode + tokenize this tile's SB columns, top to bottom. ---
+    let mut ec = EntropyContext::new(mi_cols_aligned);
+    let mut mi_row = 0;
+    while mi_row < mi_rows {
+        ec.reset_left();
+        let mut mi_col = geom.col_start;
+        while mi_col < geom.col_end {
+            if is_keyframe {
+                frame.encode_sb(src, &mut recon, &mut ec, mi_row, mi_col, BlockSize::B64X64);
+            } else {
+                frame.encode_inter_sb(
+                    src,
+                    reference.expect("inter frame requires a reference"),
+                    &mut recon,
+                    &mut ec,
+                    mi_row,
+                    mi_col,
+                    BlockSize::B64X64,
+                );
+            }
+            mi_col += 8;
+        }
+        mi_row += 8;
+    }
+
+    // --- Phase 2: pack this tile's mode/token stream. ---
+    let mut w = BoolWriter::new();
+    let mut pc = PartitionContext::new(mi_cols_aligned);
+    let mut mi_row = 0;
+    while mi_row < mi_rows {
+        pc.reset_left();
+        let mut mi_col = geom.col_start;
+        while mi_col < geom.col_end {
+            frame.pack_sb(
+                &mut w,
+                &mut pc,
+                mi_row,
+                mi_col,
+                BlockSize::B64X64,
+                is_keyframe,
+            );
+            mi_col += 8;
+        }
+        mi_row += 8;
+    }
+
+    (w.finalize(), recon)
+}
+
+/// Encode every tile column and assemble the frame: the uncompressed header
+/// (carrying the tile-column count), then each tile's payload prefixed with a
+/// 4-byte big-endian size (all but the last, per `vp9_bitstream.c:encode_tiles`),
+/// with the per-tile reconstructions stitched back into one frame buffer.
+///
+/// Tile columns are independent (VP9 severs the left neighbor at a tile's left
+/// edge), so on native they run in parallel via rayon; wasm runs the identical
+/// sequential loop. The tile count is a pure function of frame width, so both
+/// paths — and any thread count — emit byte-for-byte the same bitstream.
+fn encode_frame_tiled(
+    src: &FrameBuffer,
+    reference: Option<&FrameBuffer>,
+    base_qindex: u8,
+    sf: &SpeedFeatures,
+    is_keyframe: bool,
+) -> (Vec<u8>, FrameBuffer) {
     let width = src.crop_width;
     let height = src.crop_height;
     let mi_rows = src.mi_rows();
     let mi_cols = src.mi_cols();
     let mi_cols_aligned = ((mi_cols + 7) & !7) as usize;
 
-    let mut recon = FrameBuffer::new(width, height);
-    let qp = QuantParams::new(base_qindex as i32, 0, 0);
-    let grid = vec![Mi::default(); (mi_rows * mi_cols) as usize];
+    let log2_tile_cols = tile_cols_log2_for(mi_cols);
+    let tiles = tile_geometry(mi_cols, log2_tile_cols);
 
-    let mut frame = Frame {
-        mi_rows,
-        mi_cols,
-        qp,
-        grid,
-        // Keyframes do no motion search; the value is unused.
-        sf: SpeedFeatures::default(),
+    let encode_one = |geom: TileGeom| {
+        encode_pack_tile(
+            src,
+            reference,
+            base_qindex,
+            sf,
+            mi_rows,
+            mi_cols,
+            mi_cols_aligned,
+            geom,
+            is_keyframe,
+        )
     };
 
-    // --- Phase 1: tokenize walk (also builds the reconstruction). ---
-    let mut ec = EntropyContext::new(mi_cols_aligned);
-    let mut mi_row = 0;
-    while mi_row < mi_rows {
-        ec.reset_left();
-        let mut mi_col = 0;
-        while mi_col < mi_cols {
-            frame.encode_sb(src, &mut recon, &mut ec, mi_row, mi_col, BlockSize::B64X64);
-            mi_col += 8;
-        }
-        mi_row += 8;
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut results: Vec<(Vec<u8>, FrameBuffer)> = {
+        use rayon::prelude::*;
+        tiles.par_iter().copied().map(encode_one).collect()
+    };
+    #[cfg(target_arch = "wasm32")]
+    let mut results: Vec<(Vec<u8>, FrameBuffer)> = tiles.iter().copied().map(encode_one).collect();
+
+    // Header carrying the tile-column count, then the concatenated tiles.
+    let mut header = if is_keyframe {
+        UncompressedHeader::keyframe(width, height, base_qindex)
+    } else {
+        UncompressedHeader::inter(width, height, base_qindex)
+    };
+    header.log2_tile_cols = log2_tile_cols;
+    let (mut out, _) = pack_frame_header(&header, TxMode::Allow8X8);
+
+    // Single tile (frames ≤ ~504 wide, and the wasm/single-core common case): the
+    // one tile band *is* the whole frame, so return its reconstruction directly —
+    // no fresh full-frame allocation and no per-row stitch copy. No size prefix is
+    // written for the last (here, only) tile.
+    if results.len() == 1 {
+        let (bytes, recon) = results.pop().expect("exactly one tile");
+        out.extend_from_slice(&bytes);
+        return (out, recon);
     }
 
-    // --- Phase 2: pack the frame. ---
-    let header = UncompressedHeader::keyframe(width, height, base_qindex);
-    let out = pack(&frame, &header, true);
+    let mut recon = FrameBuffer::new(width, height);
+    let n = results.len();
+    for (i, (bytes, tile_recon)) in results.iter().enumerate() {
+        // All tiles but the last carry a 4-byte big-endian size prefix.
+        if i + 1 < n {
+            out.extend_from_slice(&(bytes.len() as u32).to_be_bytes());
+        }
+        out.extend_from_slice(bytes);
+        recon.copy_tile_band(tile_recon, tiles[i].col_start, tiles[i].col_end);
+    }
     (out, recon)
+}
+
+/// Encode a single keyframe of `src` at `base_qindex`.
+///
+/// Returns the complete VP9 frame bitstream and the reconstruction buffer (which
+/// equals what a conformant decoder produces, and becomes the reference for later
+/// inter frames). `src` must already hold the imported, mi-padded frame.
+pub fn encode_keyframe(src: &FrameBuffer, base_qindex: u8) -> (Vec<u8>, FrameBuffer) {
+    // Keyframes do no motion search; the speed knobs are unused.
+    encode_frame_tiled(src, None, base_qindex, &SpeedFeatures::default(), true)
 }
 
 /// Encode a single inter frame of `src` against `reference` (the previous
@@ -1250,78 +1443,7 @@ pub fn encode_inter_frame(
     base_qindex: u8,
     sf: &SpeedFeatures,
 ) -> (Vec<u8>, FrameBuffer) {
-    let width = src.crop_width;
-    let height = src.crop_height;
-    let mi_rows = src.mi_rows();
-    let mi_cols = src.mi_cols();
-    let mi_cols_aligned = ((mi_cols + 7) & !7) as usize;
-
-    let mut recon = FrameBuffer::new(width, height);
-    let qp = QuantParams::new(base_qindex as i32, 0, 0);
-    let grid = vec![Mi::default(); (mi_rows * mi_cols) as usize];
-
-    let mut frame = Frame {
-        mi_rows,
-        mi_cols,
-        qp,
-        grid,
-        sf: *sf,
-    };
-
-    // --- Phase 1: motion estimation + tokenize walk (builds reconstruction). ---
-    let mut ec = EntropyContext::new(mi_cols_aligned);
-    let mut mi_row = 0;
-    while mi_row < mi_rows {
-        ec.reset_left();
-        let mut mi_col = 0;
-        while mi_col < mi_cols {
-            frame.encode_inter_sb(
-                src,
-                reference,
-                &mut recon,
-                &mut ec,
-                mi_row,
-                mi_col,
-                BlockSize::B64X64,
-            );
-            mi_col += 8;
-        }
-        mi_row += 8;
-    }
-
-    // --- Phase 2: pack the frame. ---
-    let header = UncompressedHeader::inter(width, height, base_qindex);
-    let out = pack(&frame, &header, false);
-    (out, recon)
-}
-
-/// Pack a fully-encoded [`Frame`]: header, compressed header, and the single-tile
-/// mode/token stream.
-fn pack(frame: &Frame, header: &UncompressedHeader, is_keyframe: bool) -> Vec<u8> {
-    let mi_cols_aligned = ((frame.mi_cols + 7) & !7) as usize;
-    let (mut out, _) = pack_frame_header(header, TxMode::Allow8X8);
-
-    let mut tile = BoolWriter::new();
-    let mut pc = PartitionContext::new(mi_cols_aligned);
-    let mut mi_row = 0;
-    while mi_row < frame.mi_rows {
-        pc.reset_left();
-        let mut mi_col = 0;
-        while mi_col < frame.mi_cols {
-            frame.pack_sb(
-                &mut tile,
-                &mut pc,
-                mi_row,
-                mi_col,
-                BlockSize::B64X64,
-                is_keyframe,
-            );
-            mi_col += 8;
-        }
-        mi_row += 8;
-    }
-    out.extend_from_slice(&tile.finalize());
-    out
+    encode_frame_tiled(src, Some(reference), base_qindex, sf, false)
 }
 
 #[cfg(test)]
@@ -1417,5 +1539,66 @@ mod tests {
         );
         assert!(!bytes.is_empty());
         assert_eq!((recon.crop_width, recon.crop_height), (636, 476));
+    }
+
+    #[test]
+    fn tile_count_is_a_pure_function_of_width() {
+        use crate::vp9::common::block::mi_cols;
+        // Tiny frames stay single-tile (byte-identical to the pre-tiling path).
+        assert_eq!(tile_cols_log2_for(mi_cols(64)), 0);
+        assert_eq!(tile_cols_log2_for(mi_cols(128)), 0);
+        assert_eq!(tile_cols_log2_for(mi_cols(176)), 0);
+        // 640-wide tops out at the legal maximum of 1 (2 tile columns).
+        assert_eq!(tile_cols_log2_for(mi_cols(640)), 1);
+        assert_eq!(tile_cols_log2_for(mi_cols(636)), 1);
+        // 720p reaches 4 tile columns; the cap holds it there.
+        assert_eq!(tile_cols_log2_for(mi_cols(1280)), 2);
+
+        // The two 640-wide tiles are contiguous, SB64-aligned, and cover the frame.
+        let tiles = tile_geometry(mi_cols(640), 1);
+        assert_eq!(tiles.len(), 2);
+        assert_eq!(tiles[0].col_start, 0);
+        assert_eq!(tiles[0].col_end, tiles[1].col_start);
+        assert_eq!(tiles[1].col_end, mi_cols(640));
+        assert_eq!(tiles[0].col_end % 8, 0, "tile edge must be SB64-aligned");
+    }
+
+    /// The emitted bitstream must not depend on how many threads encode it: the
+    /// tile count is fixed by resolution and each tile is independent, so a
+    /// 1-thread and a 4-thread rayon pool must produce identical bytes. Uses a
+    /// 640×480 frame (2 tile columns → real parallelism).
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn tiled_output_is_independent_of_thread_count() {
+        fn encode_kf_on(threads: usize, src: &FrameBuffer) -> Vec<u8> {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| encode_keyframe(src, 96).0)
+        }
+        fn encode_inter_on(threads: usize, src: &FrameBuffer, r: &FrameBuffer) -> Vec<u8> {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap()
+                .install(|| encode_inter_frame(src, r, 96, &SpeedFeatures::default()).0)
+        }
+
+        let src = make_src(640, 480);
+        assert_eq!(
+            encode_kf_on(1, &src),
+            encode_kf_on(4, &src),
+            "keyframe bytes must be thread-count independent"
+        );
+
+        let key = encode_keyframe(&src, 96);
+        let mut reference = key.1;
+        reference.extend_borders();
+        assert_eq!(
+            encode_inter_on(1, &src, &reference),
+            encode_inter_on(4, &src, &reference),
+            "inter bytes must be thread-count independent"
+        );
     }
 }

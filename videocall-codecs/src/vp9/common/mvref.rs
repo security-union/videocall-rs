@@ -244,8 +244,10 @@ fn add_mv_ref(mv: Mv, list: &mut [Mv; MAX_MV_REF_CANDIDATES], count: &mut usize)
 /// clamp + precision-lowering of the candidates it uses.
 ///
 /// `neighbor(row, col)` returns the mi at absolute grid position `(row, col)` if
-/// it is inside the frame (single tile: `0 <= row < mi_rows`, `0 <= col <
-/// mi_cols`), else `None` — this is libvpx's `is_inside` folded into the lookup.
+/// it is a valid candidate, else `None` — this is libvpx's `is_inside` folded
+/// into the lookup. Callers bound the rows to the frame (`0 <= row < mi_rows`)
+/// and the columns to the current tile (`tile_col_start <= col < tile_col_end`),
+/// which for a single-tile frame is the whole width (`0 <= col < mi_cols`).
 ///
 /// Returns `(mode_context, [nearest, near])`.
 pub fn find_mv_refs<F>(

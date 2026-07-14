@@ -80,6 +80,9 @@ pub struct UncompressedHeader {
     pub allow_high_precision_mv: bool,
     /// Inter only: interpolation filter (`INTERP_EIGHTTAP`).
     pub interp_filter: u8,
+    /// `log2` of the number of tile columns (0 = single tile). Emitted by
+    /// `write_tile_info`; the encoder derives it from the frame width.
+    pub log2_tile_cols: u32,
 }
 
 impl UncompressedHeader {
@@ -96,6 +99,7 @@ impl UncompressedHeader {
             ref_sign_bias: [false; REFS_PER_FRAME],
             allow_high_precision_mv: false,
             interp_filter: INTERP_EIGHTTAP,
+            log2_tile_cols: 0,
         }
     }
 
@@ -113,6 +117,7 @@ impl UncompressedHeader {
             ref_sign_bias: [false; REFS_PER_FRAME],
             allow_high_precision_mv: false,
             interp_filter: INTERP_EIGHTTAP,
+            log2_tile_cols: 0,
         }
     }
 }
@@ -169,16 +174,26 @@ fn write_quantization(wb: &mut BitBufferWriter, base_qindex: u8) {
     wb.write_bit(0);
 }
 
-/// `write_tile_info` for a single tile column/row (`log2_tile_cols/rows = 0`).
-fn write_tile_info(wb: &mut BitBufferWriter, width: u32) {
+/// `write_tile_info` for `log2_tile_cols` tile columns and a single tile row
+/// (`log2_tile_rows = 0`). Port of `vp9_bitstream.c:write_tile_info`: emit
+/// `log2_tile_cols - min_log2` one-bits, then a `0` terminator unless we are at
+/// the maximum, then the single-tile-row flag.
+fn write_tile_info(wb: &mut BitBufferWriter, width: u32, log2_tile_cols: u32) {
     let (min_log2, max_log2) = tile_cols_log2_range(mi_cols(width));
-    // columns: log2_tile_cols (0) - min_log2 increment ones, then a 0 terminator
+    // The tile-column cap must never drop the count below the legal minimum for
+    // this width, or the `saturating_sub` below would silently emit zero
+    // increment bits for an under-minimum count and desync the decoder.
+    debug_assert!(
+        log2_tile_cols >= min_log2,
+        "log2_tile_cols ({log2_tile_cols}) < min_log2 ({min_log2}) for width {width}"
+    );
+    // columns: log2_tile_cols - min_log2 increment ones, then a 0 terminator
     // if we are below max.
-    let ones = 0u32.saturating_sub(min_log2); // log2_tile_cols is 0
+    let ones = log2_tile_cols.saturating_sub(min_log2);
     for _ in 0..ones {
         wb.write_bit(1);
     }
-    if 0 < max_log2 {
+    if log2_tile_cols < max_log2 {
         wb.write_bit(0);
     }
     // rows: log2_tile_rows == 0.
@@ -224,7 +239,7 @@ pub fn write_uncompressed_header(wb: &mut BitBufferWriter, p: &UncompressedHeade
     write_loopfilter_off(wb);
     write_quantization(wb, p.base_qindex);
     wb.write_bit(0); // segmentation enabled = 0
-    write_tile_info(wb, p.width);
+    write_tile_info(wb, p.width, p.log2_tile_cols);
 }
 
 /// `tx_mode_to_biggest_tx_size`: largest TX size (0..=3) permitted by `tx_mode`.
@@ -358,6 +373,7 @@ mod tests {
         assert_eq!(parsed.width, p.width);
         assert_eq!(parsed.height, p.height);
         assert_eq!(parsed.base_qindex, p.base_qindex);
+        assert_eq!(parsed.log2_tile_cols, p.log2_tile_cols);
         assert_eq!(parsed.profile, 0);
         assert!(!parsed.show_existing_frame);
         assert_eq!(parsed.frame_context_idx, 0);
@@ -430,5 +446,22 @@ mod tests {
         let mut p = UncompressedHeader::inter(640, 480, 100);
         p.allow_high_precision_mv = true;
         check_roundtrip(&p, TxMode::Allow16X16);
+    }
+
+    #[test]
+    fn multi_tile_header_round_trips() {
+        // 640-wide legally allows up to `log2_tile_cols == 1` (2 columns); the
+        // header must encode the tile-column count and parse back to the same
+        // value, exercising the increment-bit path `write_tile_info` emits for
+        // multi-tile streams (and `parse_tile_info`'s inverse).
+        for &(w, h) in &[(640u32, 480u32), (636, 476)] {
+            let mut kf = UncompressedHeader::keyframe(w, h, 96);
+            kf.log2_tile_cols = 1;
+            check_roundtrip(&kf, TxMode::Allow8X8);
+
+            let mut inter = UncompressedHeader::inter(w, h, 96);
+            inter.log2_tile_cols = 1;
+            check_roundtrip(&inter, TxMode::Allow8X8);
+        }
     }
 }

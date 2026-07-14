@@ -265,6 +265,17 @@ impl FrameBuffer {
         self.v.extend_borders();
     }
 
+    /// Copy the reconstructed samples of one tile column's mi-column band
+    /// `[mi_col_start, mi_col_end)` from `src` into `self`, across the full active
+    /// height. Used to assemble the frame reconstruction from independently
+    /// encoded per-tile buffers. Luma spans 8 samples per mi column, chroma 4.
+    pub fn copy_tile_band(&mut self, src: &FrameBuffer, mi_col_start: u32, mi_col_end: u32) {
+        let (s, e) = (mi_col_start as usize, mi_col_end as usize);
+        copy_col_band(&mut self.y, &src.y, s * 8, e * 8);
+        copy_col_band(&mut self.u, &src.u, s * 4, e * 4);
+        copy_col_band(&mut self.v, &src.v, s * 4, e * 4);
+    }
+
     /// Export the active region back to a tight-packed I420 buffer at the
     /// cropped dimensions.
     pub fn export_i420(&self) -> Vec<u8> {
@@ -297,6 +308,21 @@ fn import_plane(p: &mut Plane, src: &[u8], crop_w: usize, crop_h: usize) {
     for r in crop_h..p.height {
         let (src_row, dst_row) = (p.origin + (crop_h - 1) * p.stride, p.origin + r * p.stride);
         p.data.copy_within(src_row..src_row + p.width, dst_row);
+    }
+}
+
+/// Copy active-region columns `[c0, c1)` (clamped to the active width) from
+/// `src` into `dst` for every active row. Both planes share geometry.
+fn copy_col_band(dst: &mut Plane, src: &Plane, c0: usize, c1: usize) {
+    let c1 = c1.min(dst.width);
+    if c0 >= c1 {
+        return;
+    }
+    let len = c1 - c0;
+    for r in 0..dst.height {
+        let d = dst.origin + r * dst.stride + c0;
+        let s = src.origin + r * src.stride + c0;
+        dst.data[d..d + len].copy_from_slice(&src.data[s..s + len]);
     }
 }
 

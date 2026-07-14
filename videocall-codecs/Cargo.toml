@@ -86,6 +86,12 @@ videocall-diagnostics = { path = "../videocall-diagnostics", optional = true, ve
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
+# rayon powers the native tile-column-parallel VP9 encode. It does not support
+# wasm32 (no threads), where the encoder falls back to the identical sequential
+# tile loop, producing byte-for-byte the same bitstream.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.12.0"
+
 [dev-dependencies]
 approx = "0.5.1"
 wasm-bindgen-test = "0.3.42"

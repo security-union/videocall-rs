@@ -30,46 +30,48 @@ use videocall_codecs::testing::i420::moving_box;
 use videocall_codecs::vp9::Vp9Encoder as PureVp9Encoder;
 
 fn bench_encoders(c: &mut Criterion) {
-    let (w, h) = (640u32, 480u32);
-    let frames: Vec<Vec<u8>> = (0..90u32).map(|t| moving_box(w, h, t)).collect();
-    let cfg = EncoderConfig {
-        width: w,
-        height: h,
-        ..Default::default()
-    };
-
     let mut group = c.benchmark_group("vp9_encode");
     group.throughput(Throughput::Elements(1));
 
-    group.bench_function("pure_rust_vp9/640x480", |b| {
-        let mut enc = PureVp9Encoder::new(cfg).expect("pure encoder init");
-        let mut i = 0usize;
-        b.iter(|| {
-            let frame = &frames[i % frames.len()];
-            // Encoder is a stub for now; black_box either arm so the bench runs.
-            match enc.encode(i as i64, frame) {
-                Ok(out) => {
-                    black_box(out);
-                }
-                Err(e) => {
-                    black_box(e);
-                }
-            }
-            i += 1;
-        });
-    });
+    // 640x480 → 2 tile columns; 1280x720 → 4 tile columns (the tiling ceiling
+    // rises with width, so the parallel speedup should grow at 720p).
+    for &(w, h) in &[(640u32, 480u32), (1280u32, 720u32)] {
+        let frames: Vec<Vec<u8>> = (0..90u32).map(|t| moving_box(w, h, t)).collect();
+        let cfg = EncoderConfig {
+            width: w,
+            height: h,
+            ..Default::default()
+        };
 
-    group.bench_function("libvpx_vp9/640x480", |b| {
-        // Disambiguate from the legacy inherent `new`/`encode` via UFCS.
-        let mut enc = <LibvpxVp9Encoder as Encodable>::new(cfg).expect("libvpx encoder init");
-        let mut i = 0usize;
-        b.iter(|| {
-            let frame = &frames[i % frames.len()];
-            let out = Encodable::encode(&mut enc, i as i64, frame).expect("libvpx encode");
-            black_box(out);
-            i += 1;
+        group.bench_function(format!("pure_rust_vp9/{w}x{h}"), |b| {
+            let mut enc = PureVp9Encoder::new(cfg).expect("pure encoder init");
+            let mut i = 0usize;
+            b.iter(|| {
+                let frame = &frames[i % frames.len()];
+                match enc.encode(i as i64, frame) {
+                    Ok(out) => {
+                        black_box(out);
+                    }
+                    Err(e) => {
+                        black_box(e);
+                    }
+                }
+                i += 1;
+            });
         });
-    });
+
+        group.bench_function(format!("libvpx_vp9/{w}x{h}"), |b| {
+            // Disambiguate from the legacy inherent `new`/`encode` via UFCS.
+            let mut enc = <LibvpxVp9Encoder as Encodable>::new(cfg).expect("libvpx encoder init");
+            let mut i = 0usize;
+            b.iter(|| {
+                let frame = &frames[i % frames.len()];
+                let out = Encodable::encode(&mut enc, i as i64, frame).expect("libvpx encode");
+                black_box(out);
+                i += 1;
+            });
+        });
+    }
 
     group.finish();
 }

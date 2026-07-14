@@ -16,7 +16,7 @@
  * conditions.
  */
 
-//! Legacy libvpx-backed VP9 encoder.
+//! libvpx-backed VP9 encoder.
 //!
 //! This wraps the C libvpx VP9 encoder (`env-libvpx-sys`). It is compiled only
 //! on native targets with the `libvpx` feature, where it serves both as the
@@ -197,7 +197,7 @@ impl<'a> Iterator for Frames<'a> {
 // This mirrors the libvpx configuration used by `videocall-cli`'s
 // `video_encoder.rs` (one-pass realtime VBR, error-resilient, CPUUSED 5, tile
 // columns, row-mt, frame-parallel) so that this backend can drive the CLI's
-// `--features libvpx` path with identical behaviour to today.
+// `--features libvpx` path with identical behaviour.
 
 impl Encodable for Vp9Encoder {
     fn new(config: EncoderConfig) -> Result<Self> {

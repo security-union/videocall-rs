@@ -33,11 +33,10 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter", "fmt", "ans
 url = "2.4.1"
 thiserror = "1.0.51"
 cpal = "0.15.2"
-ropus = "0.12"  # Pure-Rust Opus encoding (replaces C libopus/audiopus-sys)
+ropus = "0.12"  # Pure-Rust Opus encoding
 image = "0.25.5"
-# Pure-Rust VP9 encoding (replaces C libvpx/env-libvpx-sys). Default features pull
-# in zero C dependencies; the legacy libvpx backend is opt-in via the `libvpx`
-# feature below.
+# Pure-Rust VP9 encoding. Default features pull in zero C dependencies; the
+# libvpx backend is opt-in via the `libvpx` feature below.
 videocall-codecs = { path = "../videocall-codecs", version = "0.1.14" }
 videocall-nokhwa = { path = "nokhwa", version = "0.10.9", features = ["input-native", "output-threaded"] }
 
@@ -49,6 +48,6 @@ version = "6.0.0"
 [features]
 # Default: pure-Rust VP9 encoder (no C dependencies).
 default = []
-# Legacy C libvpx encode backend, opt-in for comparison/rollback. Same public API.
+# C libvpx encode backend, opt-in via this feature. Same public API.
 libvpx = ["videocall-codecs/libvpx"]
 

@@ -49,9 +49,8 @@ ringbuf = "0.3"
 hound = { version = "3.5", optional = true }
 rand = { version = "0.9.1", optional = true, default-features = false, features = ["thread_rng"] }
 cpal = { version = "0.15", optional = true }
-# Pure-Rust Opus (xiph/opus port, bit-exact, BSD-3). Replaces the C `opus`
-# crate (libopus/audiopus-sys) as the native Opus codec — no C toolchain,
-# wasm-clean core, single `wide` dependency.
+# Pure-Rust Opus (xiph/opus port, bit-exact, BSD-3): the native Opus codec —
+# no C toolchain, wasm-clean core, single `wide` dependency.
 ropus = { version = "0.12", optional = true }
 clap = { version = "4.5", features = ["derive"], optional = true }
 env_logger = { version = "0.10", optional = true }

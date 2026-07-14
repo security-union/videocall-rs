@@ -23,7 +23,7 @@
 //! (no camera hardware). It must pass identically for both backends:
 //!
 //! - `cargo test -p videocall-cli`                (pure-Rust VP9, default)
-//! - `cargo test -p videocall-cli --features libvpx` (legacy C libvpx backend)
+//! - `cargo test -p videocall-cli --features libvpx` (C libvpx backend)
 //!
 //! That parity is the real proof the swap is a drop-in replacement.
 

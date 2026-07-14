@@ -24,8 +24,7 @@
 //!
 //! - Default build (no `libvpx` feature): the pure-Rust
 //!   [`videocall_codecs::vp9::Vp9Encoder`] — zero C dependencies.
-//! - `--features libvpx`: the legacy C libvpx-backed encoder, kept for
-//!   comparison and rollback.
+//! - `--features libvpx`: the C libvpx-backed encoder, opt-in for comparison.
 //!
 //! The public API (`VideoEncoderBuilder`, `VideoEncoder`, `Frame`, `Frames`) is
 //! identical across both backends, so downstream code (`encoder_thread`,
@@ -34,12 +33,11 @@
 use anyhow::{anyhow, Result};
 use videocall_codecs::encoder::{Encodable, EncodedFrame, EncoderConfig};
 
-/// Maximum distance between keyframes, in frames. Matches the legacy libvpx
-/// configuration (`kf_max_dist`/`kf_min_dist` = 150).
+/// Maximum distance between keyframes, in frames (`kf_max_dist`/`kf_min_dist` = 150).
 const KEYFRAME_INTERVAL: u32 = 150;
 
 // Backend selection. The default (C-free) path uses the pure-Rust encoder; the
-// `libvpx` feature swaps in the legacy C wrapper. Both are used through the
+// `libvpx` feature swaps in the C wrapper. Both are used through the
 // `Encodable` trait, so the rest of this file is backend-agnostic.
 #[cfg(feature = "libvpx")]
 use videocall_codecs::encoder::Vp9Encoder as Inner;
@@ -97,7 +95,7 @@ impl VideoEncoderBuilder {
         };
 
         // Fully-qualified so we always hit the `Encodable` trait method: the
-        // legacy libvpx backend also has an inherent `new`/`encode` with a
+        // libvpx backend also has an inherent `new`/`encode` with a
         // different signature that would otherwise shadow the trait.
         let inner = <Inner as Encodable>::new(config)?;
         Ok(VideoEncoder {
@@ -146,7 +144,7 @@ pub struct Frame<'a> {
 ///
 /// The backend emits at most one compressed frame per input frame, so this
 /// yields either zero or one [`Frame`]. Downstream code already tolerates a
-/// zero-frame result (the legacy libvpx path buffered with `lag_in_frames = 1`).
+/// zero-frame result (the libvpx backend buffers with `lag_in_frames = 1`).
 pub struct Frames<'a> {
     frame: Option<Frame<'a>>,
 }

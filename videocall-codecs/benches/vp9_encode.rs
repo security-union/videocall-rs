@@ -16,11 +16,10 @@
  * conditions.
  */
 
-//! Encode-throughput benchmarks: pure-Rust VP9 vs legacy libvpx VP9.
+//! Encode-throughput benchmarks: pure-Rust VP9 vs libvpx VP9.
 //!
-//! Requires `--features "libvpx test-utils"`. While the pure-Rust encoder is
-//! unimplemented its bench still compiles and runs (the error is black-boxed),
-//! so the harness is exercised from day one.
+//! Requires `--features "libvpx test-utils"`. Encode errors are black-boxed, so
+//! the bench runs regardless of the encoder's result.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
@@ -61,7 +60,7 @@ fn bench_encoders(c: &mut Criterion) {
         });
 
         group.bench_function(format!("libvpx_vp9/{w}x{h}"), |b| {
-            // Disambiguate from the legacy inherent `new`/`encode` via UFCS.
+            // Disambiguate from the inherent `new`/`encode` via UFCS.
             let mut enc = <LibvpxVp9Encoder as Encodable>::new(cfg).expect("libvpx encoder init");
             let mut i = 0usize;
             b.iter(|| {

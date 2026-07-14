@@ -61,20 +61,21 @@ fn sad_block(
 ) -> u32 {
     let base_row = mi_row * 8 + dy;
     let base_col = mi_col * 8 + dx;
-    let mut src_p = src.off;
-    let mut ref_p =
-        (reference.origin as i32 + base_row * reference.stride as i32 + base_col) as usize;
-    let mut sad = 0u32;
-    for _ in 0..bh {
-        for c in 0..bw {
-            let s = src.data[src_p + c] as i32;
-            let r = reference.data[ref_p + c] as i32;
-            sad += (s - r).unsigned_abs();
-        }
-        src_p += src.stride;
-        ref_p += reference.stride;
-    }
-    sad
+    let src_p = src.off;
+    let ref_p = (reference.origin as i32 + base_row * reference.stride as i32 + base_col) as usize;
+    // The reference plane is border-extended (64 px) and the search is clamped
+    // within it, so every sampled byte is in bounds. SIMD-accelerated, but the
+    // result is a bit-identical integer SAD.
+    crate::vp9::enc::sad::sad(
+        src.data,
+        src_p,
+        src.stride,
+        reference.data,
+        ref_p,
+        reference.stride,
+        bw,
+        bh,
+    )
 }
 
 /// A crude bit-count proxy for a motion vector difference (mimics the log-ish

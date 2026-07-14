@@ -32,5 +32,6 @@ pub mod mcomp;
 pub mod pack;
 pub mod quantize;
 pub mod ratectrl;
+pub mod sad;
 pub mod speed;
 pub mod tokenize;

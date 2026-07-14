@@ -47,7 +47,7 @@ async fn device_selector_renders_all_three_dropdowns() {
             }
         }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     assert!(
@@ -89,7 +89,7 @@ async fn device_selector_renders_multiple_device_labels() {
             }
         }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let select = mount
@@ -135,7 +135,7 @@ async fn device_selector_preselects_correct_device() {
             }
         }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let opt2 = mount
@@ -167,7 +167,7 @@ async fn device_selector_empty_list_renders_empty_dropdown() {
             }
         }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let select = mount
@@ -204,7 +204,7 @@ async fn device_selector_empty_labels_render_empty_option_text() {
             }
         }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let opt = mount
@@ -244,7 +244,7 @@ async fn device_settings_modal_hidden_when_not_visible() {
             }
         }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     // Dioxus may render placeholder nodes (e.g. empty comment) for rsx! {}.
@@ -285,7 +285,7 @@ async fn device_settings_modal_renders_audio_section_dropdowns_when_visible() {
         }
     }
 
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     assert!(
@@ -333,7 +333,7 @@ async fn device_settings_modal_close_button_present() {
             }
         }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let btn = mount.query_selector(".close-button").unwrap().unwrap();
@@ -378,7 +378,7 @@ async fn device_settings_modal_defaults_to_audio_section() {
         }
     }
 
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let audio_btn = mount
@@ -444,7 +444,7 @@ async fn device_settings_modal_switches_to_video_section_on_click() {
         }
     }
 
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let video_btn = mount
@@ -510,7 +510,7 @@ async fn device_settings_modal_updates_active_nav_highlighting() {
         }
     }
 
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let audio_btn = mount
@@ -583,7 +583,7 @@ async fn device_settings_modal_renders_only_audio_and_video_navigation() {
         }
     }
 
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let nav_buttons = mount.query_selector_all(".settings-nav-button").unwrap();

@@ -83,6 +83,27 @@ jobs:
 
       - name: Run dioxus-ui component tests
         run: |
-          nix develop .#frontend --command bash -c "\
-            cd dioxus-ui && \
-            CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown"
+          # device_integration's getUserMedia/fake-device path intermittently
+          # hangs the Chrome renderer (chromedriver's 300s "Timed out receiving
+          # message from renderer"), independent of the runtime-leak teardown
+          # fix. --no-fail-fast (below) stops one flaky binary from masking the
+          # other 7; this bounded retry rides out the transient renderer hang.
+          max_attempts=2
+          attempt=1
+          while true; do
+            echo "::group::dioxus-ui component tests (attempt ${attempt}/${max_attempts})"
+            if nix develop .#frontend --command bash -c "\
+              cd dioxus-ui && \
+              CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --no-fail-fast"; then
+              echo "::endgroup::"
+              echo "dioxus-ui component tests passed on attempt ${attempt}"
+              exit 0
+            fi
+            echo "::endgroup::"
+            if [ "${attempt}" -ge "${max_attempts}" ]; then
+              echo "::error::dioxus-ui component tests failed after ${max_attempts} attempts"
+              exit 1
+            fi
+            echo "::warning::dioxus-ui component tests failed on attempt ${attempt}; retrying (headless-Chrome renderer flake)"
+            attempt=$((attempt + 1))
+          done

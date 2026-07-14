@@ -36,7 +36,7 @@ async fn mic_button_enabled_shows_mute_tooltip() {
     fn wrapper() -> Element {
         rsx! { MicButton { enabled: true, available: true, onclick: move |_| {} } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let tooltip = mount.query_selector(".tooltip").unwrap().unwrap();
@@ -62,7 +62,7 @@ async fn mic_button_disabled_shows_unmute_tooltip() {
     fn wrapper() -> Element {
         rsx! { MicButton { enabled: false, available: true, onclick: move |_| {} } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let tooltip = mount.query_selector(".tooltip").unwrap().unwrap();
@@ -92,7 +92,7 @@ async fn camera_button_enabled_shows_stop_video_tooltip() {
     fn wrapper() -> Element {
         rsx! { CameraButton { enabled: true, available: true, onclick: move |_| {} } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let tooltip = mount.query_selector(".tooltip").unwrap().unwrap();
@@ -107,7 +107,7 @@ async fn camera_button_disabled_shows_start_video_tooltip() {
     fn wrapper() -> Element {
         rsx! { CameraButton { enabled: false, available: true, onclick: move |_| {} } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let tooltip = mount.query_selector(".tooltip").unwrap().unwrap();
@@ -126,7 +126,7 @@ async fn screen_share_button_disabled_prop_renders_disabled_attribute() {
     fn wrapper() -> Element {
         rsx! { ScreenShareButton { active: false, disabled: true, onclick: move |_| {} } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let button = mount
@@ -155,7 +155,7 @@ async fn hang_up_button_has_danger_class() {
     fn wrapper() -> Element {
         rsx! { HangUpButton { onclick: move |_| {} } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let button = mount

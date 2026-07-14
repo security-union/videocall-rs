@@ -93,7 +93,7 @@ async fn device_selector_renders_real_fake_devices() {
     FAKE_SPKS.with(|s| *s.borrow_mut() = speakers);
 
     let mount = create_mount_point();
-    render_into(&mount, wrapper_with_fake_devices);
+    let _app = render_into(&mount, wrapper_with_fake_devices);
     yield_now().await;
 
     // Audio dropdown should contain at least one option with a real label
@@ -146,7 +146,7 @@ async fn device_selector_real_device_ids_match_option_values() {
     FAKE_SPKS.with(|s| *s.borrow_mut() = speakers);
 
     let mount = create_mount_point();
-    render_into(&mount, wrapper_with_fake_devices);
+    let _app = render_into(&mount, wrapper_with_fake_devices);
     yield_now().await;
 
     // Each mic's device_id should match the corresponding option's value

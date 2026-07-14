@@ -9,6 +9,7 @@
 #![allow(dead_code)]
 
 use dioxus::prelude::*;
+use futures::future::{AbortHandle, Abortable};
 use js_sys::Array;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
@@ -39,21 +40,68 @@ pub fn cleanup(mount: &web_sys::Element) {
 // Dioxus rendering helper
 // ---------------------------------------------------------------------------
 
-/// Render a Dioxus component into the given mount element and wait one
-/// animation frame for the renderer to flush its initial mutations.
+/// Owns a running Dioxus app and tears it down when dropped.
+///
+/// Dropping the handle aborts the future returned by [`dioxus::web::run`],
+/// which drops the `VirtualDom` together with its scheduler, spawned tasks,
+/// effects, and event-listener closures. Without this, every `render_into`
+/// call would leave a "zombie" app that keeps waking on the scheduler for the
+/// lifetime of the test binary — the runtime leak that made the wasm test
+/// binaries accumulate work and intermittently blow past chromedriver's 300s
+/// renderer timeout in CI.
+#[must_use = "bind the AppHandle for the test's lifetime; dropping it tears down the Dioxus app"]
+pub struct AppHandle {
+    abort: AbortHandle,
+}
+
+impl Drop for AppHandle {
+    fn drop(&mut self) {
+        // `abort()` flags the shared abort state and wakes the spawned task.
+        // On its next poll, `Abortable` short-circuits to `Err(Aborted)`,
+        // completing (and thus dropping) the `run` future and everything it
+        // owns. This is the only teardown path dioxus-web 0.7 exposes: the
+        // public `launch`/`launch_virtual_dom` helpers are launch-and-forget
+        // and return no handle, but `run` itself is a plain public async fn we
+        // can own and cancel.
+        self.abort.abort();
+    }
+}
+
+/// Render a Dioxus component into the given mount element and return a handle
+/// that tears the app down when dropped.
+///
+/// Wait one animation frame (via [`yield_now`]) after calling so the renderer
+/// can flush its initial mutations. Bind the returned [`AppHandle`] for the
+/// duration of the test — when it drops at end of scope the app runtime is
+/// stopped, so the next test starts with zero live app runtimes regardless of
+/// how many tests ran before it.
 ///
 /// Use this in `#[wasm_bindgen_test] async fn` tests:
 ///
 /// ```ignore
 /// let mount = create_mount_point();
-/// render_into(&mount, || rsx! { MyComponent { prop: "value" } });
+/// let _app = render_into(&mount, || rsx! { MyComponent { prop: "value" } });
 /// yield_now().await;
 /// // assert on mount.query_selector(...)
 /// cleanup(&mount);
+/// // `_app` drops here, aborting the app runtime.
 /// ```
-pub fn render_into(mount: &web_sys::Element, root: fn() -> Element) {
+pub fn render_into(mount: &web_sys::Element, root: fn() -> Element) -> AppHandle {
     let cfg = dioxus::web::Config::new().rootelement(mount.clone());
-    dioxus::web::launch::launch_virtual_dom(VirtualDom::new(root), cfg);
+    let vdom = VirtualDom::new(root);
+    let (abort, registration) = AbortHandle::new_pair();
+    // `dioxus::web::run` is the same infinite work-loop that
+    // `launch_virtual_dom` spawns internally, but by owning the future we can
+    // abort it. `run` returns `!`, so the async block's output type is `!`
+    // (no trailing unit) and `Abortable`'s output is `Result<!, Aborted>`.
+    let app = Abortable::new(
+        async move { dioxus::web::run(vdom, cfg).await },
+        registration,
+    );
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = app.await;
+    });
+    AppHandle { abort }
 }
 
 /// Yield to the browser event loop so Dioxus can process its initial render.

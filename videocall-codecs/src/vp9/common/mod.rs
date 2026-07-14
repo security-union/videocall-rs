@@ -30,6 +30,7 @@ pub mod bool_coder;
 pub mod frame_buffer;
 pub mod generated;
 pub mod idct;
+pub mod inter_ctx;
 pub mod inter_pred;
 pub mod intra_pred;
 pub mod mvref;

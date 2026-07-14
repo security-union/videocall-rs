@@ -37,6 +37,13 @@ pub enum FrameType {
     Inter,
 }
 
+/// `REFS_PER_FRAME` — LAST / GOLDEN / ALTREF reference index slots.
+const REFS_PER_FRAME: usize = 3;
+/// `REF_FRAMES` — number of reference-buffer slots the refresh mask selects.
+pub const REF_FRAMES: usize = 8;
+/// `REF_FRAMES_LOG2` — bit width of one reference-slot index.
+const REF_FRAMES_LOG2: u32 = 3;
+
 /// The header fields the decoder needs to reconstruct a frame of the encoder's
 /// subset.
 #[derive(Clone, Debug)]
@@ -49,6 +56,13 @@ pub struct FrameHeader {
     pub log2_tile_cols: u32,
     /// Transform mode from the compressed header (`ALLOW_8X8` for this encoder).
     pub tx_mode: TxMode,
+    /// 8-bit reference-slot refresh mask (`refresh_frame_flags`). Keyframes
+    /// refresh every slot (`0xFF`); this encoder's inter frames refresh slot 0.
+    pub refresh_frame_flags: u8,
+    /// Reference-slot indices for LAST/GOLDEN/ALTREF (inter only; `[0; 3]` on a
+    /// keyframe). `ref_frame_idx[0]` is the LAST slot this encoder motion
+    /// compensates against.
+    pub ref_frame_idx: [u8; REFS_PER_FRAME],
     /// Byte offset at which the compressed header begins (end of the uncompressed
     /// header including the 16-bit size field).
     pub compressed_header_offset: usize,
@@ -68,10 +82,16 @@ const SYNC_CODE: u32 = 0x0049_8342 & 0x00FF_FFFF;
 
 /// Parse the uncompressed header and the compressed header's transform mode.
 ///
-/// `bytes` is the whole frame. Returns the recovered [`FrameHeader`] or a
-/// [`DecodeError`] when the stream is truncated or uses a feature outside the
-/// supported subset.
-pub fn parse_frame_header(bytes: &[u8]) -> Result<FrameHeader, DecodeError> {
+/// `bytes` is the whole frame. `ref_sizes` supplies the `(width, height)` of each
+/// of the eight reference-buffer slots (or `None` for an empty slot); it is
+/// required to parse an inter frame, which inherits its size from a reference
+/// rather than coding it, and is ignored for keyframes. Returns the recovered
+/// [`FrameHeader`] or a [`DecodeError`] when the stream is truncated, references
+/// an empty slot, or uses a feature outside the supported subset.
+pub fn parse_frame_header(
+    bytes: &[u8],
+    ref_sizes: Option<&[Option<(u32, u32)>; REF_FRAMES]>,
+) -> Result<FrameHeader, DecodeError> {
     let mut rb = BitBufferReader::new(bytes);
 
     if rb.read_literal(2) != 2 {
@@ -91,10 +111,18 @@ pub fn parse_frame_header(bytes: &[u8]) -> Result<FrameHeader, DecodeError> {
     } else {
         FrameType::Inter
     };
-    let _show_frame = rb.read_bit() != 0;
+    let show_frame = rb.read_bit() != 0;
     let error_resilient = rb.read_bit() != 0;
+    // Both frame types in this subset are always coded error-resilient, which
+    // determines the header bit layout (no reset_frame_context / refresh /
+    // frame_parallel bits). Reject anything else before reading further.
+    if !error_resilient {
+        return Err(DecodeError::Unsupported("non-error-resilient stream"));
+    }
 
     let (width, height);
+    let mut refresh_frame_flags = 0xFFu8;
+    let mut ref_frame_idx = [0u8; REFS_PER_FRAME];
     match frame_type {
         FrameType::Key => {
             if rb.read_literal(24) != SYNC_CODE {
@@ -108,23 +136,58 @@ pub fn parse_frame_header(bytes: &[u8]) -> Result<FrameHeader, DecodeError> {
             if rb.read_bit() != 0 {
                 return Err(DecodeError::Unsupported("render size != frame size"));
             }
+            // A keyframe refreshes every reference slot (the `0xFF` default).
         }
         FrameType::Inter => {
-            // Inter frames are decoded in a later milestone (they inherit their
-            // size from a reference buffer, which M0 has no keyframe history for).
-            return Err(DecodeError::Unsupported("inter frame decode (M1)"));
+            // show_frame == 1 ⇒ no intra_only bit; error_resilient ⇒ no
+            // reset_frame_context bit. This encoder always shows inter frames.
+            if !show_frame {
+                return Err(DecodeError::Unsupported("hidden inter frame"));
+            }
+            let sizes = ref_sizes.ok_or(DecodeError::Corrupt(
+                "inter frame decoded without reference sizes",
+            ))?;
+            refresh_frame_flags = rb.read_literal(8) as u8;
+            for idx in ref_frame_idx.iter_mut() {
+                *idx = rb.read_literal(REF_FRAMES_LOG2) as u8;
+                let _ref_sign_bias = rb.read_bit();
+            }
+            // write_frame_size_with_refs: a `1` bit means "size taken from the
+            // first reference"; this encoder always sets it. The size is inherited
+            // from that reference's buffer, not coded in the header.
+            if rb.read_bit() != 1 {
+                return Err(DecodeError::Unsupported("inter frame codes its own size"));
+            }
+            let (w, h) = sizes[ref_frame_idx[0] as usize]
+                .ok_or(DecodeError::Corrupt("inter frame references an empty slot"))?;
+            width = w;
+            height = h;
+            if rb.read_bit() != 0 {
+                return Err(DecodeError::Unsupported("render size != frame size"));
+            }
+            // This encoder always codes integer-pel MVs (allow_high_precision_mv
+            // = 0). A foreign hp=1 stream reads its MV components with an extra
+            // high-precision bit each, which would silently desync the boolean
+            // reader from this decoder's fixed `usehp = false` MV reader — reject
+            // it loudly at the subset boundary instead.
+            if rb.read_bit() != 0 {
+                return Err(DecodeError::Unsupported("high-precision MV"));
+            }
+            // interp filter: a `0` bit (not SWITCHABLE) then a 2-bit literal.
+            if rb.read_bit() != 0 {
+                return Err(DecodeError::Unsupported("switchable interp filter"));
+            }
+            let _interp_filter = rb.read_literal(2);
         }
     }
 
     // Trust boundary: reject oversized dimensions from the untrusted header BEFORE
     // the caller allocates any dimension-derived buffer. This transitively bounds
-    // the reconstruction buffer and every context/grid vector.
+    // the reconstruction buffer and every context/grid vector. (Inter sizes come
+    // from an already-validated reference, so this only ever triggers on a
+    // keyframe, but the check is unconditional for defense in depth.)
     if width > MAX_DIM || height > MAX_DIM {
         return Err(DecodeError::TooLarge);
-    }
-
-    if !error_resilient {
-        return Err(DecodeError::Unsupported("non-error-resilient stream"));
     }
 
     // error_resilient ⇒ no refresh_frame_context / frame_parallel bits.
@@ -177,6 +240,8 @@ pub fn parse_frame_header(bytes: &[u8]) -> Result<FrameHeader, DecodeError> {
         base_qindex,
         log2_tile_cols,
         tx_mode,
+        refresh_frame_flags,
+        ref_frame_idx,
         compressed_header_offset,
         compressed_header_size,
     })

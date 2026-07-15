@@ -9,6 +9,7 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'dioxus-ui/**'
+      - '.github/workflows/wasm-test.yaml'
   pull_request:
     paths:
       - 'videocall-client/**'
@@ -17,6 +18,7 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'dioxus-ui/**'
+      - '.github/workflows/wasm-test.yaml'
 
 jobs:
   wasm-test:
@@ -86,27 +88,45 @@ jobs:
 
       - name: Run dioxus-ui component tests
         run: |
-          # device_integration's getUserMedia/fake-device path intermittently
-          # hangs the Chrome renderer (chromedriver's 300s "Timed out receiving
-          # message from renderer"), independent of the runtime-leak teardown
-          # fix. --no-fail-fast (below) stops one flaky binary from masking the
-          # other 7; this bounded retry rides out the transient renderer hang.
-          max_attempts=2
-          attempt=1
-          while true; do
-            echo "::group::dioxus-ui component tests (attempt ${attempt}/${max_attempts})"
-            if nix develop .#frontend --command bash -c "\
-              cd dioxus-ui && \
-              CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown --no-fail-fast"; then
+          # Headless Chrome intermittently wedges its renderer at webdriver
+          # session startup (chromedriver's 300s "Timed out receiving message
+          # from renderer"), before any test code runs. Each test binary
+          # spawns its own chromedriver+Chrome, so retry per binary rather
+          # than per suite: a whole-suite retry re-rolls the flake across all
+          # binaries, and the SIGKILLed chromedriver leaves the wedged Chrome
+          # orphaned, starving later startups on the 2-core runner. Killing
+          # leftover Chrome processes between attempts stops that cascade.
+          run_target() {
+            local desc="$1"
+            shift
+            local max_attempts=3
+            local attempt
+            for attempt in $(seq 1 "${max_attempts}"); do
+              echo "::group::dioxus-ui ${desc} (attempt ${attempt}/${max_attempts})"
+              if nix develop .#frontend --command bash -c "\
+                cd dioxus-ui && \
+                CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown $*"; then
+                echo "::endgroup::"
+                echo "dioxus-ui ${desc} passed on attempt ${attempt}"
+                return 0
+              fi
               echo "::endgroup::"
-              echo "dioxus-ui component tests passed on attempt ${attempt}"
-              exit 0
-            fi
-            echo "::endgroup::"
-            if [ "${attempt}" -ge "${max_attempts}" ]; then
-              echo "::error::dioxus-ui component tests failed after ${max_attempts} attempts"
-              exit 1
-            fi
-            echo "::warning::dioxus-ui component tests failed on attempt ${attempt}; retrying (headless-Chrome renderer flake)"
-            attempt=$((attempt + 1))
+              pkill -9 -f 'chromedriver|chrome|chromium' || true
+              sleep 2
+              if [ "${attempt}" -ge "${max_attempts}" ]; then
+                echo "::error::dioxus-ui ${desc} failed after ${max_attempts} attempts"
+                return 1
+              fi
+              echo "::warning::dioxus-ui ${desc} failed on attempt ${attempt}; retrying (headless-Chrome renderer flake)"
+            done
+          }
+          failed_targets=()
+          run_target "unit tests" --lib --bins || failed_targets+=("unit-tests")
+          for test_file in dioxus-ui/tests/*.rs; do
+            test_name="$(basename "${test_file}" .rs)"
+            run_target "integration test ${test_name}" --test "${test_name}" || failed_targets+=("${test_name}")
           done
+          if [ "${#failed_targets[@]}" -gt 0 ]; then
+            echo "::error::dioxus-ui targets failed: ${failed_targets[*]}"
+            exit 1
+          fi

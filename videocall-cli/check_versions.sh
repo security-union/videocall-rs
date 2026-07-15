@@ -5,7 +5,6 @@ packages=(
     "build-essential"
     "pkg-config"
     "libclang-dev"
-    "libvpx-dev"
     "libasound2-dev"
     "cmake"
     "libv4l-dev"

@@ -21,7 +21,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake
+          sudo apt-get install -y pkg-config libclang-dev libasound2-dev libv4l-dev cmake
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz
@@ -53,7 +53,7 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake
+          sudo apt-get install -y pkg-config libclang-dev libasound2-dev libv4l-dev cmake
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
       - name: Run release-plz

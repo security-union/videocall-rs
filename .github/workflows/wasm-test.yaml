@@ -53,8 +53,11 @@ jobs:
       - name: Run wasm-pack tests for videocall-client
         run: cd videocall-client && wasm-pack test --node
 
-      - name: Run wasm-pack tests for videocall-codecs
+      - name: Run tests for videocall-codecs (default, C-free)
         run: cd videocall-codecs && cargo test
+
+      - name: Run oracle tests for videocall-codecs (libvpx)
+        run: cargo test -p videocall-codecs --features "libvpx test-utils"
 
       - name: Run tests for neteq
         run: cd neteq && cargo test --no-default-features --features web

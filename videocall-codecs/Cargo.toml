@@ -12,12 +12,28 @@ authors = [
 keywords = ["video", "codec", "webrtc", "vpx", "wasm"]
 categories = ["multimedia::video", "wasm", "web-programming"]
 description = "Cross-platform video codec library with VP8/VP9 support for native and WebAssembly environments"
-include = ["src/**/*", "assets/**/*"]
+include = [
+    "src/**/*",
+    "assets/**/*",
+    "tests/**/*",
+    "benches/**/*",
+    "uniffi-bindgen.rs",
+    "build_ios.sh",
+]
 
 [lib]
 name = "videocall_codecs"
 path = "src/lib.rs"
-crate-type = ["cdylib", "rlib"]
+# `staticlib` powers the UniFFI/iOS `.xcframework` (see build_ios.sh); the
+# existing `cdylib`/`rlib` remain for wasm and native Rust consumers.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+# UniFFI binding generator, mirroring videocall-sdk. Native-only: the `uniffi`
+# feature pulls in the CLI machinery, which does not build for wasm32.
+[[bin]]
+name = "uniffi-bindgen"
+path = "uniffi-bindgen.rs"
+required-features = ["uniffi"]
 
 [[bin]]
 name = "worker_decoder"
@@ -36,7 +52,12 @@ required-features = ["native"]
 
 [features]
 default = []
-native = []
+libvpx = ["dep:env-libvpx-sys"]
+native = ["libvpx"]
+test-utils = []
+# Swift/Kotlin FFI bindings for the pure-Rust VP9 encoder + decoder. Native-only,
+# zero libvpx/C. Gates `src/ffi.rs` and the `uniffi-bindgen` bin.
+uniffi = ["dep:uniffi", "dep:thiserror"]
 wasm = [
     "wasm-bindgen",
     "web-sys",
@@ -81,13 +102,43 @@ web-sys = { version = "0.3", optional = true, features = [
 ] }
 videocall-diagnostics = { path = "../videocall-diagnostics", optional = true, version = "0.1.4" }
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-env-libvpx-sys = { workspace = true }
+# UniFFI Swift/Kotlin bindings (native-only, behind the `uniffi` feature).
+uniffi = { version = "0.29", features = ["cli"], optional = true }
+thiserror = { version = "1.0", optional = true }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 getrandom = { version = "0.2", features = ["js"] }
 
+# rayon powers the native tile-column-parallel VP9 encode. It does not support
+# wasm32 (no threads), where the encoder falls back to the identical sequential
+# tile loop, producing byte-for-byte the same bitstream.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = "1.12.0"
+
 [dev-dependencies]
 approx = "0.5.1"
 wasm-bindgen-test = "0.3.42"
+criterion = { workspace = true }
+
+[[example]]
+name = "dump_vp9_ivf"
+required-features = ["test-utils"]
+
+[[test]]
+name = "oracle_vp9"
+required-features = ["libvpx", "test-utils"]
+
+[[test]]
+name = "perf_gate"
+required-features = ["test-utils"]
+
+[[bench]]
+name = "vp9_encode"
+harness = false
+required-features = ["libvpx", "test-utils"]
+
+[[bench]]
+name = "vp9_decode"
+harness = false
+required-features = ["libvpx", "test-utils"]
 

@@ -1,7 +1,7 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-interop e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
 
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
@@ -102,6 +102,12 @@ e2e-headed:
 # Run e2e tests in debug mode (step through in Playwright Inspector)
 e2e-debug:
 	cd e2e && npx playwright test --debug $(if $(SPEC),tests/$(SPEC).spec.ts,)
+
+# Run the WebCodecs VP9 interop gate standalone — needs no docker stack.
+# Regenerates the fixture from the current encoder, then decodes it in Chromium.
+e2e-interop:
+	cargo run -p videocall-codecs --example dump_vp9_ivf --features test-utils -- e2e/fixtures/pure_rust_vp9.ivf
+	cd e2e && E2E_SKIP_SERVICE_WAIT=1 npx playwright test tests/webcodecs-vp9-interop.spec.ts
 
 # Full CI pipeline: build stack, start it, run tests, tear down
 e2e-ci: e2e-build e2e-install

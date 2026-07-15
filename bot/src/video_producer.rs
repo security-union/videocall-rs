@@ -31,8 +31,6 @@ use videocall_types::protos::media_packet::{MediaPacket, VideoCodec, VideoMetada
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 
-// Real VP9 encoder - exactly same approach as videocall-cli
-
 pub struct VideoProducer {
     #[allow(dead_code)]
     user_id: String,
@@ -110,11 +108,11 @@ impl VideoProducer {
 
         info!("Loaded {} frames for {}", frames.len(), user_id);
 
-        // Initialize VP9 encoder (exactly same as videocall-cli)
-        let mut video_encoder = VideoEncoderBuilder::new(framerate, 5) // cpu_used=5 like videocall-cli
+        // Initialize VP9 encoder
+        let mut video_encoder = VideoEncoderBuilder::new(framerate, 5) // cpu_used=5
             .set_resolution(width, height)
             .build()?;
-        video_encoder.update_bitrate_kbps(500)?; // 500kbps default like videocall-cli
+        video_encoder.update_bitrate_kbps(500)?; // 500kbps default
 
         let mut frame_iterator = frames.into_iter().cycle();
         let mut sequence = 0u64;

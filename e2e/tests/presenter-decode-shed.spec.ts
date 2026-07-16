@@ -2,6 +2,7 @@ import { test, expect, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * Presenter-aware decode-shedding E2E coverage (issue #1559).
@@ -240,7 +241,7 @@ test.describe("Presenter-aware decode shedding (#1559)", () => {
   // once the share button flips to its active ("Stop Screen Share") state, i.e.
   // is_sharing() == true.
   async function startLocalShare(page: Page): Promise<boolean> {
-    await page.mouse.move(400, 400);
+    await wakeControls(page);
     await page.waitForTimeout(400);
     const btn = idleShareBtn(page);
     if ((await btn.count()) === 0) {
@@ -259,7 +260,7 @@ test.describe("Presenter-aware decode shedding (#1559)", () => {
   }
 
   async function stopLocalShare(page: Page): Promise<void> {
-    await page.mouse.move(400, 400);
+    await wakeControls(page);
     await page.waitForTimeout(400);
     await activeShareBtn(page).first().click();
     // Back to idle: is_sharing() == false.

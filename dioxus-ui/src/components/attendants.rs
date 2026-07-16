@@ -18,12 +18,12 @@
 
 use crate::components::action_bar_layout::{
     apply_keyboard_reorder, load_action_bar_layout, remove_action_bar_layout,
-    save_action_bar_layout, slot_index, ActionBarSlot, DEFAULT_SLOTS,
+    save_action_bar_layout, ActionBarSlot, DEFAULT_SLOTS,
 };
 use crate::components::decode_budget::{
-    decide_step, effective_cap, expand_decoded_for_requested, ios_decode_tile_ceiling,
-    is_sole_real_tile, merge_pinned_decode, merge_user_requested_decode, partition_camera_tiles,
-    presenter_cap_ceiling, presenter_extra_shed_pressure, promote_pinned_into_decoded,
+    build_decoded_bucket, decide_step, effective_cap, expand_decoded_for_requested,
+    ios_decode_tile_ceiling, is_sole_real_tile, merge_pinned_decode, merge_user_requested_decode,
+    partition_camera_tiles, presenter_cap_ceiling, presenter_extra_shed_pressure,
     promote_requested_into_decoded, should_clear_force_decode_on_override_change, BudgetSample,
     BudgetState, BudgetStep, MIN_CAP,
 };
@@ -68,9 +68,10 @@ use crate::context::{
     save_dock_autohide, save_dock_position, save_preferred_camera_id, save_preferred_camera_on,
     save_preferred_mic_id, save_preferred_mic_on, save_preferred_speaker_id, validate_display_name,
     AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride,
-    DensityModeCtx, DisplayNameCtx, DockPosition, DockPositionCtx, HostRefreshNonceCtx, HostSetCtx,
-    LocalAudioLevelCtx, MeetingTime, PeerMediaState, PeerSignalHistoryMap, PeerStatusMap,
-    SignalPopupStateMap, TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
+    DensityModeCtx, DetachedShareCtx, DisplayNameCtx, DockPosition, DockPositionCtx,
+    HostRefreshNonceCtx, HostSetCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
+    PeerSignalHistoryMap, PeerStatusMap, ScreenZoomCtx, ScreenZoomState, SignalPopupStateMap,
+    TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
 };
 use crate::local_storage::{load_bool, load_f64, save_f64};
 use crate::types::DeviceInfo;
@@ -285,6 +286,28 @@ fn permission_probe_error_target(state: &PermissionState) -> Option<MediaErrorSt
     }
 }
 
+/// Whether a `bool` UI signal actually needs to be written, given its current
+/// value and the `target` value the caller is about to set.
+///
+/// `Signal::set` marks the owning component dirty UNCONDITIONALLY — it does not
+/// value-dedupe (that is `Memo`, not `Signal`). Writing a value identical to the
+/// one already stored therefore forces an avoidable full re-render of the
+/// ~9,900-line `AttendantsComponent`. Routing the `mic_enabled` /
+/// `video_enabled` / `pending_*_enable` / `show_device_warning` writes in the
+/// device-permission FAILURE paths through this guard makes:
+///   * a steady-state-blocked-device background auto-retry tick (issue #1793),
+///     where every side is already `false` and the modal is already up, a true
+///     no-op — ZERO re-renders per repeat probe; and
+///   * the failure-ONSET burst (the live encoder's up-to-`MAX_RESTARTS` rapid
+///     restart attempts, all classifying to the SAME error) collapse to exactly
+///     ONE effective write per signal.
+///
+/// Mirrors the set-if-changed guard already used for `mic_error`/`video_error`
+/// via [`permission_probe_error_target`]. Pure, so it is unit-tested directly.
+fn should_write_bool_signal(current: bool, target: bool) -> bool {
+    current != target
+}
+
 const SUBTLE_HELP_TEXT_STYLE: &str = "font-size: 0.9rem; opacity: 0.8;";
 
 fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
@@ -312,15 +335,54 @@ fn render_single_device_error(device: &str, err: &MediaErrorState) -> Element {
 /// two call sites is what dismissing does (`on_dismiss`): pre-join connects +
 /// joins, in-meeting just closes the modal. Kept as a plain free function (like
 /// [`render_single_device_error`]) so both call sites share one source of truth.
+///
+/// `in_meeting` selects the backdrop weight: the pre-join path keeps the fully
+/// opaque `.modal-overlay` (nothing live is happening yet, so blacking out the
+/// pre-join screen is fine), while the in-meeting path adds the `.in-meeting`
+/// modifier which swaps to the app's semi-transparent `--overlay-backdrop`
+/// token so the live call (other participants, the still-working device) stays
+/// visible-but-dimmed behind the warning instead of vanishing entirely.
+///
+/// Accessibility (mirrors `about_modal.rs`): the inner window is a
+/// `role="dialog"` / `aria-modal="true"` labelled by its heading, is focused on
+/// mount so a keyboard/SR user's next Tab stays scoped to the dialog rather than
+/// leaking to the (visually obscured) background, and Escape dismisses it via the
+/// SAME `on_dismiss` the "Ok" button uses.
 fn render_device_warning_modal(
     mic_error: Option<&MediaErrorState>,
     video_error: Option<&MediaErrorState>,
     on_dismiss: EventHandler<()>,
+    in_meeting: bool,
 ) -> Element {
+    let overlay_class = if in_meeting {
+        "modal-overlay in-meeting"
+    } else {
+        "modal-overlay"
+    };
     rsx! {
-        div { class: "modal-overlay", "data-testid": "device-warning-modal",
-            div { class: "modal-window",
-                h3 { "Device access problem" }
+        div { class: "{overlay_class}", "data-testid": "device-warning-modal",
+            div {
+                class: "modal-window",
+                role: "dialog",
+                "aria-modal": "true",
+                "aria-labelledby": "device-warning-modal-heading",
+                tabindex: "0",
+                onkeydown: move |e: Event<KeyboardData>| {
+                    if e.key() == Key::Escape {
+                        on_dismiss.call(());
+                    }
+                },
+                // Autofocus the dialog on mount so keyboard/screen-reader users
+                // can press Escape (or Tab) immediately, and so focus does not
+                // remain on a now-obscured background control. Mirrors
+                // `about_modal.rs`.
+                onmounted: move |element| {
+                    let element = element.data();
+                    spawn(async move {
+                        let _ = element.set_focus(true).await;
+                    });
+                },
+                h3 { id: "device-warning-modal-heading", "Device access problem" }
                 if let Some(err) = mic_error {
                     {render_single_device_error("Microphone", err)}
                 }
@@ -418,6 +480,35 @@ fn play_user_joined() {
 fn play_user_left() {
     // Descending two-tone: E5 -> A4 (subtle, muted)
     play_tone_pair(659.25, 440.0, 0.12, 0.25);
+}
+
+// Deferred leave-sound debounce for the exit-notifications-OFF + exit-sound-ON
+// path, where there is no leave toast to anchor the 500ms reconnect-flicker check
+// on. Leaves are tracked as `(unique_id, user_id)` pairs so each timer checks its
+// own event — matching the toast path's per-event keying, so overlapping
+// leave/join flickers for one user net zero sounds. Factored into helpers so the
+// sequence is unit-testable without a Dioxus runtime.
+
+/// Peer left: record a deferred leave sound for `user_id` under the unique `id`.
+fn mark_pending_leave_sound(pending: &mut Vec<(u64, String)>, id: u64, user_id: String) {
+    pending.push((id, user_id));
+}
+
+/// Peer joined: cancel every pending leave sound for `user_id` (a rejoin inside
+/// the flicker window), mirroring the toast-path retain().
+fn clear_pending_leave_sound(pending: &mut Vec<(u64, String)>, user_id: &str) {
+    pending.retain(|(_, uid)| uid != user_id);
+}
+
+/// 500ms timeout fired: play only if this event's `id` is still pending (no
+/// intervening join cleared it). Removes the entry and returns whether to play.
+fn take_pending_leave_sound(pending: &mut Vec<(u64, String)>, id: u64) -> bool {
+    if let Some(pos) = pending.iter().position(|(pid, _)| *pid == id) {
+        pending.remove(pos);
+        true
+    } else {
+        false
+    }
 }
 
 /// Play two short sine-wave tones in sequence using the Web Audio API.
@@ -628,7 +719,7 @@ fn schedule_reconnect_no_jwt(
 use super::attendants_layout::{
     compute_effective_density, compute_layout, promote_speakers, TILE_AR,
 };
-use super::density::{DensityMode, DENSITY_MODES};
+use super::density::{next_density_mode, DensityMode, DENSITY_MODES};
 
 /// Bump the host-event counter from the HOST_GRANTED/HOST_REVOKED handlers, so
 /// the roster seed can tell a host event landed during its in-flight fetch and
@@ -934,10 +1025,7 @@ fn focus_glass_option_relative(delta: i32) {
     }
 }
 
-/// Focus the first element matching `selector`. Used to move focus onto a
-/// button that is only rendered by a state transition the caller just made
-/// (e.g. focusing the `.action-bar-done-trigger` after `customize_mode.set(true)`
-/// swaps out the dock-menu trigger for the Done button on next render).
+/// Focus the first element matching `selector`.
 fn focus_by_selector(selector: &str) {
     if let Some(el) = web_sys::window()
         .and_then(|w| w.document())
@@ -947,6 +1035,100 @@ fn focus_by_selector(selector: &str) {
             let _ = html.focus();
         }
     }
+}
+
+/// Focus the first actionable slot button in the action bar. Prefer Mic
+/// (`data-slot="mic"`) so keyboard navigation starts at the default first
+/// user-facing control; fall back to the first enabled (or first present)
+/// slot button if Mic is unavailable.
+fn focus_first_action_bar_button() {
+    let selectors = [
+        ".video-controls-container .action-bar-slot-wrapper[data-slot=\"mic\"] > button.video-control-button:not([disabled])",
+        ".video-controls-container .action-bar-slot-wrapper[data-slot] > button.video-control-button:not([disabled])",
+        ".video-controls-container .action-bar-slot-wrapper[data-slot=\"mic\"] > button.video-control-button",
+        ".video-controls-container .action-bar-slot-wrapper[data-slot] > button.video-control-button",
+    ];
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    for selector in selectors {
+        if let Ok(Some(el)) = doc.query_selector(selector) {
+            if let Ok(html) = el.dyn_into::<web_sys::HtmlElement>() {
+                let _ = html.focus();
+                return;
+            }
+        }
+    }
+}
+
+fn is_action_bar_slot_visible(
+    slot: ActionBarSlot,
+    customize_mode: bool,
+    ios_device: bool,
+    has_screen_share: bool,
+    is_owner: bool,
+) -> bool {
+    match slot {
+        ActionBarSlot::ScreenShare => customize_mode || !ios_device,
+        ActionBarSlot::DensityMode => customize_mode || !has_screen_share,
+        ActionBarSlot::MeetingOptions => is_owner,
+        _ => true,
+    }
+}
+
+fn visible_action_bar_slots(
+    slots: &[ActionBarSlot],
+    customize_mode: bool,
+    ios_device: bool,
+    has_screen_share: bool,
+    is_owner: bool,
+) -> Vec<ActionBarSlot> {
+    slots
+        .iter()
+        .copied()
+        .filter(|slot| {
+            is_action_bar_slot_visible(
+                *slot,
+                customize_mode,
+                ios_device,
+                has_screen_share,
+                is_owner,
+            )
+        })
+        .collect()
+}
+
+fn merge_visible_action_bar_slots(
+    full_slots: &[ActionBarSlot],
+    reordered_visible_slots: &[ActionBarSlot],
+    customize_mode: bool,
+    ios_device: bool,
+    has_screen_share: bool,
+    is_owner: bool,
+) -> Vec<ActionBarSlot> {
+    let mut visible_idx = 0usize;
+    full_slots
+        .iter()
+        .copied()
+        .map(|slot| {
+            if is_action_bar_slot_visible(
+                slot,
+                customize_mode,
+                ios_device,
+                has_screen_share,
+                is_owner,
+            ) {
+                let mapped_slot = reordered_visible_slots
+                    .get(visible_idx)
+                    .copied()
+                    .unwrap_or(slot);
+                visible_idx += 1;
+                mapped_slot
+            } else {
+                slot
+            }
+        })
+        .collect()
 }
 
 /// Returns true if the keyboard event carries an "activate this option" key:
@@ -1099,6 +1281,24 @@ pub fn AttendantsComponent(
             }
         });
     }
+
+    // Always seed keyboard focus on customize-mode entry at the first
+    // actionable slot button (Mic/Sound by default). This runs on every
+    // false->true transition so re-entering customize mode is consistent,
+    // independent of which menu activation path was used.
+    use_effect(move || {
+        if customize_mode() {
+            Timeout::new(0, || {
+                focus_first_action_bar_button();
+            })
+            .forget();
+        }
+    });
+
+    // DOM reorder shim removed: slots are now rendered in
+    // `action_bar_slots` order directly, so DOM order IS visual order
+    // and keyboard Tab order follows naturally without post-render
+    // DOM manipulation.
     let encoder_settings = use_signal(|| None::<String>);
     // Last peer count logged by the meeting-view render log below — lets that
     // log fire only on changes (edge-trigger) instead of every re-render.
@@ -1112,6 +1312,25 @@ pub fn AttendantsComponent(
     let mut peer_join_time: Signal<HashMap<String, f64>> = use_signal(HashMap::new);
     let mut density_mode: Signal<DensityMode> = use_signal(load_density_mode);
     let mut density_open = use_signal(|| false);
+    // Which density option is visually highlighted (keyboard navigation).
+    // Initialized to the current density_mode when the popover opens;
+    // arrow keys move it; Enter/Space commits it as the new density_mode.
+    let mut density_highlight: Signal<DensityMode> = use_signal(|| DensityMode::Auto);
+
+    // When the popover opens, seed the highlight from the current mode
+    // and auto-focus that option after the DOM settles.
+    use_effect(move || {
+        if density_open() {
+            let current = density_mode();
+            density_highlight.set(current);
+            let active_id = format!("density-opt-{}", current.label().to_lowercase());
+            Timeout::new(100, move || {
+                focus_element_by_id(&active_id);
+            })
+            .forget();
+        }
+    });
+
     // --- Adaptive decode budget (issue #987, task 1a.3) ---
     // Manual override for the adaptive controller. `Auto` runs the loop;
     // `Fixed(n)` is a hard override that bypasses the loop entirely. Task 1a.5
@@ -1464,26 +1683,6 @@ pub fn AttendantsComponent(
     let mut ss_resizing: Signal<bool> = use_signal(|| false);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
-    // Read-and-cleared once per background auto-retry tick. When a background
-    // tick's `on_result` reports another failure, we suppress re-popping the
-    // blocking modal (it's already been shown for the initial failure); only a
-    // user-initiated request or the first failure surfaces it.
-    //
-    // INVARIANT: this flag is only read-and-cleared inside the
-    // `session_loaded() || connecting()` branch of `on_result`. The background
-    // retry loop fires for ANY `DeviceInUse` error (see `should_auto_retry`),
-    // both pre-join and post-join, so a retry tick's `on_result` can land
-    // pre-join. The flag-clearing stays safe there: a background retry result
-    // pre-join lands in the `else if !join_requested()` (pre-join preview)
-    // branch, which neither reads/clears this flag NOR pops the modal — so a
-    // flag left `true` by a pre-join retry tick is inert (nothing pre-join
-    // consumes it) and no modal-suppression is needed there (that branch never
-    // pops the modal in the first place). When the user dismisses the failure
-    // modal into the meeting, control moves to the `session_loaded() ||
-    // connecting()` branch, which clears the flag and OR-s it with the
-    // single-device-probe inference, so in-meeting modal suppression remains
-    // correct regardless of the flag's stale pre-join value.
-    let is_background_retry: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     // True only when the user explicitly clicked Join/Start (vs. granting
     // permission just to preview devices). Gates the auto-connect in the
     // MediaDeviceAccess callback so a preview-permission grant does NOT join
@@ -1536,6 +1735,9 @@ pub fn AttendantsComponent(
     let peer_toasts: Signal<Vec<(u64, String, String, bool)>> = use_signal(Vec::new);
     let toast_counter: Signal<u64> = use_signal(|| 0);
     let toast_version: Signal<u32> = use_signal(|| 0);
+    // Pending deferred leave sounds as `(unique_id, user_id)` pairs; the unique id
+    // is drawn from `toast_counter`. See the debounce helpers near play_user_left.
+    let pending_leave_sounds: Signal<Vec<(u64, String)>> = use_signal(Vec::new);
     let show_muted_toast: Signal<bool> = use_signal(|| false);
     let toast_timer: Signal<Option<gloo_timers::callback::Timeout>> = use_signal(|| None);
     let show_video_off_toast: Signal<bool> = use_signal(|| false);
@@ -1616,6 +1818,12 @@ pub fn AttendantsComponent(
 
     // Per-tile crop state — created early so on_peer_removed can clean up.
     let cropped_tiles_signal: Signal<HashMap<String, bool>> = use_signal(HashMap::new);
+
+    // Issue 1175: per-tile zoom/pan state for received shared content, and the
+    // single peer whose share is detached into a separate window. Created here
+    // (like crop) so `on_peer_removed` can clean them up when a sharer leaves.
+    let screen_zoom_signal: Signal<HashMap<String, ScreenZoomState>> = use_signal(HashMap::new);
+    let detached_share_signal: Signal<Option<String>> = use_signal(|| None);
 
     // Read transport preference from context BEFORE use_hook (hooks must not
     // be called inside the hook closure).
@@ -1856,7 +2064,24 @@ pub fn AttendantsComponent(
                 jt_map.write().remove(&peer_id);
                 let mut ct_map = cropped_tiles_signal;
                 ct_map.write().remove(&peer_id);
-                ct_map.write().remove(&format!("screen-share-{peer_id}"));
+                // Single source of truth for the screen-share canvas id (issue
+                // 1175), so this cleanup key can't drift from the rendered id.
+                ct_map
+                    .write()
+                    .remove(&crate::components::screen_share_zoom::screen_canvas_id(
+                        &peer_id,
+                    ));
+                // Issue 1175: drop this peer's zoom state, and if its share was
+                // detached, tear the detached window down and clear the flag so
+                // a departed sharer can't leave a frozen popped-out window.
+                let mut zoom_map = screen_zoom_signal;
+                zoom_map.write().remove(&peer_id);
+                let mut detached = detached_share_signal;
+                if detached.peek().as_deref() == Some(peer_id.as_str()) {
+                    #[cfg(target_arch = "wasm32")]
+                    crate::components::screen_share_detach::teardown(&peer_id);
+                    detached.set(None);
+                }
             })),
             on_peers_removed_batch: Some(VcCallback::from(move |peer_ids: Vec<String>| {
                 // Phase 6 fix: bump `peer_list_version` exactly once per
@@ -1878,7 +2103,9 @@ pub fn AttendantsComponent(
                 v.set(next);
             })),
             get_peer_video_canvas_id: VcCallback::from(|id| id),
-            get_peer_screen_canvas_id: VcCallback::from(|id| format!("screen-share-{}", &id)),
+            get_peer_screen_canvas_id: VcCallback::from(|id: String| {
+                crate::components::screen_share_zoom::screen_canvas_id(&id)
+            }),
             enable_diagnostics: true,
             diagnostics_update_interval_ms: Some(1000),
             enable_health_reporting: true,
@@ -2186,7 +2413,27 @@ pub fn AttendantsComponent(
                             })
                             .forget();
                         } else if play_sound {
-                            play_user_left();
+                            // Notifications OFF, sounds ON: no toast to anchor on, so
+                            // defer the sound 500ms under a unique id and play only if
+                            // no rejoin clears it (reconnect-flicker suppression).
+                            let mut pending_leave_sounds = pending_leave_sounds;
+                            let mut toast_counter = toast_counter;
+                            let leave_id = *toast_counter.peek();
+                            toast_counter.set(leave_id + 1);
+                            mark_pending_leave_sound(
+                                &mut pending_leave_sounds.write(),
+                                leave_id,
+                                user_id,
+                            );
+                            Timeout::new(500, move || {
+                                if take_pending_leave_sound(
+                                    &mut pending_leave_sounds.write(),
+                                    leave_id,
+                                ) {
+                                    play_user_left();
+                                }
+                            })
+                            .forget();
                         }
                     },
                 ))
@@ -2253,6 +2500,13 @@ pub fn AttendantsComponent(
                         let mut toast_version = toast_version;
                         let mut current = peer_toasts.peek().clone();
                         current.retain(|(_, _, uid, is_joined)| *is_joined || uid != &user_id);
+
+                        // Cancel any deferred leave sound for this user (the
+                        // notifications-OFF path), mirroring the toast retain() above.
+                        {
+                            let mut pending_leave_sounds = pending_leave_sounds;
+                            clear_pending_leave_sound(&mut pending_leave_sounds.write(), &user_id);
+                        }
 
                         if !suppress_toast && show_toast {
                             if play_sound {
@@ -2490,10 +2744,6 @@ pub fn AttendantsComponent(
         let mut mda = MediaDeviceAccess::new();
         let client_cell = RefCell::new(client.clone());
         let preview_engine_for_mda = preview_engine.clone();
-        // Read-and-cleared once per `on_result` (in the in-meeting branch) to
-        // decide whether THIS result came from a background auto-retry tick (in
-        // which case we must NOT re-pop the blocking modal).
-        let is_background_retry = is_background_retry.clone();
         mda.on_result = VcCallback::from(move |permit: MediaPermission| {
             let mut connection_error = connection_error;
             let mut media_access_granted = media_access_granted;
@@ -2597,24 +2847,18 @@ pub fn AttendantsComponent(
 
             if session_loaded() || connecting() {
                 // In-meeting result (initial retry click, focus re-check, or a
-                // background auto-retry tick). Read-and-clear the background flag
-                // EXACTLY once here, on both success and failure, so it can never
-                // stay stuck: a success clears it (so the next genuine failure
-                // pops the modal) and a background failure clears it (so it stays
-                // silent this tick).
+                // background auto-retry tick).
                 //
-                // A single-device probe (exactly one side left `Unknown`) is the
-                // AUTHORITATIVE background signal: only the auto-retry tick issues
-                // `request_audio_only`/`request_video_only`, so a lone `Unknown`
-                // side means "background". We OR it with the flag because a
-                // both-device retry tick fires TWO single-device probes → TWO
-                // `on_result`s, and the read-and-clear flag would only cover the
-                // first; the inference covers the second so it can never re-pop
-                // the modal. A manual full request probes BOTH sides (no
-                // `Unknown`), so it is never misclassified as background.
-                let single_device_probe = audio_probed != video_probed;
-                let was_background_retry =
-                    is_background_retry.replace(false) || single_device_probe;
+                // A single-device probe (exactly one side left `Unknown`) is
+                // AUTHORITATIVE for "this result came from the background
+                // auto-retry tick": the ONLY callers of `request_audio_only`/
+                // `request_video_only` are that tick (a manual click always calls
+                // the combined `request()`, probing both sides with no `Unknown`).
+                // A both-device retry tick fires two INDEPENDENT single-device
+                // probes → two `on_result`s, and each one independently has
+                // exactly one `Unknown` side, so this inference covers both on its
+                // own — no separate flag needed.
+                let was_background_retry = audio_probed != video_probed;
                 // Diagnostic (step 4): record the CLASSIFIED outcome of every
                 // in-meeting probe — especially the background auto-retry ticks —
                 // so a recurrence of the "badge never clears after the app releases
@@ -2634,18 +2878,46 @@ pub fn AttendantsComponent(
                 // actually probed it — an audio-only tick must never touch the
                 // camera's enabled state (and vice versa), even if the other
                 // side happens to carry a stale error signal.
+                //
+                // On a steady-state-blocked device these sides are ALREADY
+                // `false` on every repeat background tick (set `false` on the
+                // first failure; nothing re-enables them in between), so the
+                // `should_write_bool_signal` guard makes the repeat a true no-op
+                // and eliminates the per-tick re-render (issue #1793).
                 if audio_probed && mic_failed {
-                    mic_enabled.set(false);
-                    pending_mic_enable.set(false);
+                    if should_write_bool_signal(*mic_enabled.peek(), false) {
+                        mic_enabled.set(false);
+                    }
+                    if should_write_bool_signal(*pending_mic_enable.peek(), false) {
+                        pending_mic_enable.set(false);
+                    }
                 }
                 if video_probed && video_failed {
-                    video_enabled.set(false);
-                    pending_video_enable.set(false);
+                    if should_write_bool_signal(*video_enabled.peek(), false) {
+                        video_enabled.set(false);
+                    }
+                    if should_write_bool_signal(*pending_video_enable.peek(), false) {
+                        pending_video_enable.set(false);
+                    }
                 }
                 // Surface the blocking modal for a user-initiated failure (or the
                 // first failure), but NOT for a background auto-retry tick that
                 // failed again — the modal is already up from the initial failure.
-                if (mic_failed || video_failed) && !was_background_retry {
+                //
+                // The `!was_background_retry` gate ALREADY makes this structurally
+                // unreachable on a background tick: a background auto-retry only
+                // ever issues a single-device probe (`request_audio_only` /
+                // `request_video_only`), so `was_background_retry` (inferred
+                // directly from the lone `Unknown` side) is always true for it —
+                // meaning `!was_background_retry` is always false here for
+                // background ticks. The added `should_write_bool_signal` guard is
+                // pure defense-in-depth: it also collapses the manual failure-ONSET
+                // burst (a first failure that fires this while the modal is already
+                // up) to a single effective write, with no behavior change.
+                if (mic_failed || video_failed)
+                    && !was_background_retry
+                    && should_write_bool_signal(*show_device_warning.peek(), true)
+                {
                     show_device_warning.set(true);
                 }
             } else if !join_requested() {
@@ -2804,7 +3076,6 @@ pub fn AttendantsComponent(
         let retry_gap_ticks: Rc<Cell<u32>> = use_hook(|| Rc::new(Cell::new(1)));
         let cell_effect = cell.clone();
         let mda_effect = mda.clone();
-        let is_background_retry_effect = is_background_retry.clone();
         let since_probe_effect = retry_since_probe.clone();
         let gap_ticks_effect = retry_gap_ticks.clone();
         use_effect(move || {
@@ -2845,7 +3116,6 @@ pub fn AttendantsComponent(
                     return;
                 }
                 let mda_tick = mda_effect.clone();
-                let is_background_retry_tick = is_background_retry_effect.clone();
                 let since_probe_tick = since_probe_effect.clone();
                 let gap_ticks_tick = gap_ticks_effect.clone();
                 let interval = gloo_timers::callback::Interval::new(
@@ -2888,12 +3158,14 @@ pub fn AttendantsComponent(
                              gap_ticks_before={gap_before} next_gap_ticks={}",
                             decision.gap,
                         );
-                        // Mark the upcoming `on_result`(s) as background-originated
-                        // so a repeated failure does NOT re-pop the blocking modal.
-                        // (A both-device retry fires two single-device probes → two
-                        // `on_result`s; `on_result` additionally infers "background"
-                        // from a lone `Unknown` side, covering the second one.)
-                        is_background_retry_tick.set(true);
+                        // No explicit "this is a background tick" marking is
+                        // needed: `on_result` infers "background" authoritatively
+                        // from the lone `Unknown` side left by a single-device
+                        // probe (a both-device retry fires two single-device
+                        // probes → two `on_result`s, and each independently has
+                        // exactly one `Unknown` side), so a repeated failure never
+                        // re-pops the blocking modal.
+                        //
                         // Deliberately DO NOT set `pending_mic_enable`/
                         // `pending_video_enable` here. A background recovery probe
                         // must only CLEAR the blocked-state error (removing the
@@ -3257,6 +3529,13 @@ pub fn AttendantsComponent(
     // Per-tile crop state — signal created early (near peer_status_map) so
     // on_peer_removed can clean up; context provided here for child access.
     use_context_provider(|| CroppedTilesCtx(cropped_tiles_signal));
+
+    // Issue 1175: provide the received-shared-content zoom/pan state and the
+    // detached-share flag. Created near `cropped_tiles_signal` (above) so
+    // `on_peer_removed` can clean them up; consumed by the screen-share tile's
+    // zoom viewport / controls in `canvas_generator`.
+    use_context_provider(|| ScreenZoomCtx(screen_zoom_signal));
+    use_context_provider(|| DetachedShareCtx(detached_share_signal));
 
     // Issue 1768: media-metrics overlay toggle. `MediaMetricsOverlayCtx` is the
     // enabled flag every PeerTile (remote overlays) and `Host` (the self overlay)
@@ -5321,94 +5600,46 @@ pub fn AttendantsComponent(
         );
     }
 
-    // --- Pinned-peer promotion (HCL #987 review FIX 7; bounded per issue #1470) ---
-    // A pinned peer is force-added to `active_decode_set` (phase 3, below) when it
-    // got a decoded slot this render. If that peer is ranked in the displayed
-    // off-budget window, it would otherwise land in `avatar_tiles` and render with
-    // `force_avatar = true` ("Video paused") while it is in fact being decoded —
-    // wasted decode AND a misleading UI. `promote_pinned_into_decoded` swaps it
-    // into the LAST decoded slot so decode and render agree, BOUNDED to
-    // `[visible_tile_count, displayed_tile_count)` so a true-overflow pin can't
-    // evict a displayed tile off the grid (issue #1470 — the same defect bounded
-    // on the PLAY path). A true-overflow pin is NOT promoted, gets no decoded
-    // slot, and so phase 3's `decoded_bucket` intersection (#1489) keeps it OUT of
-    // the decode set — it is neither decoded nor shown live (decode⇄render agree).
-    if visible_tile_count > 0 && visible_tile_count < all_tiles.len() {
-        if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
-            // `all_tiles` holds session_ids; the pin is keyed by user_id. Find
-            // the pinned peer's tile index by mapping each session_id back to
-            // its user_id. Mock tiles ("mock-N") never match a real user_id.
-            let pinned_idx = all_tiles.iter().position(|tile_id| {
-                client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
-            });
-            if let Some(idx) = pinned_idx {
-                promote_pinned_into_decoded(
-                    &mut all_tiles,
-                    visible_tile_count,
-                    displayed_tile_count,
-                    idx,
-                );
-            }
-        }
-    }
-
-    // --- User-requested decode promotion (issue #1466 / #1286) ---
-    // `visible_tile_count` was just EXPANDED above to admit the user's PLAY
-    // requests, so the decoded window already has room for the requested peers
-    // (up to the device ceiling, the canvas limit, and `displayed_tile_count`).
-    // This step swaps each requested peer that is still ranked beyond the window
-    // INWARD into a decoded slot, so it renders live (`force_avatar = false`)
-    // instead of decoded-but-shown-paused — the SAME render-must-agree-with-
-    // decode lesson as the pinned peer above (a peer that is decoded but rendered
-    // as a paused avatar wastes decode AND shows a misleading "Video paused"
-    // placeholder).
-    //
-    // CRITICAL — distinct slots: several peers may be requested at once, so we
-    // must NOT reuse `visible_tile_count - 1` for every one (that would overwrite
-    // a previously-promoted requested peer). We walk a `next_free_slot` cursor
-    // DOWN from `visible_tile_count - 1`, the same end of the decoded region the
-    // pin-swap targets, filling distinct slots toward index 0. The cursor skips
-    // the slot now holding the pinned peer (`visible_tile_count - 1` after the
-    // pin-swap, if a pin was promoted) so we never evict the pin.
-    //
-    // POST-EXPANSION INVARIANT (issue #1466 / #1286): the expansion sized
-    // `visible_tile_count` to fit every requested off-budget peer EXCEPT those it
-    // could not admit — the requests beyond the device ceiling (#1286) or beyond
-    // `displayed_tile_count` (true overflow → +N badge). For those un-admittable
-    // requests there is deliberately NO decoded slot: the cursor runs out and the
-    // peer correctly STAYS a paused avatar. This is NOT the old "decode-but-show-
-    // paused" bug: phase 4 below intersects the merge with the decoded bucket, so
-    // an un-promoted requested peer is NOT placed in `active_decode_set` either —
-    // decode and render agree (it is neither decoded nor shown live). On a phone
-    // this is exactly the desired hardware-ceiling behaviour: PLAY cannot force
-    // more simultaneous decodes than the device can sustain.
-    //
+    // --- Pinned + requested decoded-window promotion → decoded_bucket (issues #1489 / #1509) ---
+    // Load-bearing ORDER, owned by `build_decoded_bucket` so a future refactor
+    // cannot silently reorder it (previously these steps lived inline here and
+    // were pinned by no test — see #1509):
+    //   1. Pin-swap FIRST — a pinned peer ranked in the displayed off-budget window
+    //      `[visible_tile_count, displayed_tile_count)` is swapped INTO the decoded
+    //      window BEFORE `decoded_bucket_non_ss` is built, so it is a member of the
+    //      bucket and the phase-3 merge below admits it. Otherwise it would land in
+    //      `avatar_tiles`, render "Video paused" while being decoded (wasted decode
+    //      + misleading UI), OR — worse — be dropped from the decode set entirely.
+    //      A true-overflow pin (`idx >= displayed_tile_count`) is NOT promoted
+    //      (#1470), gets no decoded slot, and is correctly excluded from the bucket.
+    //   2. Requested ("PLAY") promotion SECOND — swaps each requested off-budget
+    //      peer into a DISTINCT decoded slot (cursor down from
+    //      `visible_tile_count - 1`, skipping the pin's slot so it is never evicted)
+    //      so it renders live. Requests the expansion could not admit get no slot
+    //      and stay paused avatars; the phase-4 merge keeps them out of the decode
+    //      set so decode⇄render agree.
+    //   3. Bucket build LAST from the promoted decoded window `[0, visible_tile_count)`.
+    // `all_tiles` holds session_ids; the pin is keyed by user_id, so resolve the
+    // pin's index via `client.get_peer_user_id` (mock "mock-N" tiles never match a
+    // real user_id) and pass it in — the helper is kept pure / DOM-free.
+    let pinned_idx = pinned_peer_id.peek().as_deref().and_then(|pinned_user_id| {
+        all_tiles
+            .iter()
+            .position(|tile_id| client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id))
+    });
     // Reading `user_requested_decode.read()` HERE is one of the two parent-scope
     // reactive reads (the other is the phase-4 merge) that make a per-tile PLAY
     // click re-render the parent — see the reactivity note on the signal.
-    {
+    let decoded_bucket_non_ss: HashSet<u64> = {
         let requested = user_requested_decode.read();
-        // The slot the pinned peer occupies after the pin-swap (if it was
-        // promoted into the decoded region), so the cursor can skip it. Resolved
-        // here (needs `client`) and passed into the pure promotion helper.
-        let pinned_slot: Option<usize> = if visible_tile_count > 0 && !requested.is_empty() {
-            pinned_peer_id.peek().as_deref().and_then(|pu| {
-                all_tiles
-                    .iter()
-                    .take(visible_tile_count)
-                    .position(|tile_id| client.get_peer_user_id(tile_id).as_deref() == Some(pu))
-            })
-        } else {
-            None
-        };
-        promote_requested_into_decoded(
+        build_decoded_bucket(
             &mut all_tiles,
             visible_tile_count,
             displayed_tile_count,
+            pinned_idx,
             &requested,
-            pinned_slot,
-        );
-    }
+        )
+    };
 
     // Bucket 1: the DECODED portion of the unified tile list. These render live
     // video and seed `active_decode_set` below. (Used by the normal grid layout.)
@@ -5707,12 +5938,13 @@ pub fn AttendantsComponent(
             .filter_map(|pid| pid.parse::<u64>().ok())
             .collect()
     } else {
-        // Use visible_tiles (post-expansion/promotion) so promoted speakers and
-        // PLAY-requested peers are decoded. .parse::<u64>() filters out mock-N.
-        visible_tiles
-            .iter()
-            .filter_map(|id| id.parse::<u64>().ok())
-            .collect()
+        // Built by `build_decoded_bucket` above, which ran the pin-swap BEFORE
+        // slicing the decoded window (issues #1489 / #1509) so a promoted
+        // avatar-region pin and PLAY-requested peers are members here. Equal to
+        // `visible_tiles.filter_map(parse)` (same `all_tiles[..visible_tile_count]`
+        // source, post-promotion) — reused directly so the ordering the phase-3
+        // merge below depends on lives in one place.
+        decoded_bucket_non_ss
     };
     let mut active_decode_set: HashSet<u64> = decoded_bucket.clone();
     if let Some(active_peer) = active_screen_sharer.as_ref() {
@@ -5802,10 +6034,17 @@ pub fn AttendantsComponent(
     // .decode-paused-pill`. `container_class` is consumed only at the
     // `#grid-container` `class:` binding below — nothing keys off the exact
     // string — so appending the modifier is safe.
-    let container_class = if has_screen_share {
-        format!("participants-{tile_count} has-screen-share")
-    } else {
-        format!("participants-{tile_count}")
+    // Issue 1175: while a received share is detached into a separate window, the
+    // main window renders as a regular no-share meeting. We KEEP the split layout
+    // mounted (so the screen canvas keeps its node identity + keeps painting to
+    // feed the detached mirror — recreating it would trip the issue-508 rebuild
+    // and stall for a keyframe), and add `share-detached` so CSS hides the share
+    // pane OFF-SCREEN (canvas stays composited) and expands the peer grid to full.
+    let share_detached = has_screen_share && detached_share_signal.read().is_some();
+    let container_class = match (has_screen_share, share_detached) {
+        (true, true) => format!("participants-{tile_count} has-screen-share share-detached"),
+        (true, false) => format!("participants-{tile_count} has-screen-share"),
+        (false, _) => format!("participants-{tile_count}"),
     };
 
     let meeting_link = {
@@ -5949,6 +6188,7 @@ pub fn AttendantsComponent(
                             mic_error.read().as_ref(),
                             video_error.read().as_ref(),
                             on_dismiss,
+                            false,
                         )
                     }
                 }
@@ -6216,21 +6456,28 @@ pub fn AttendantsComponent(
                     }
                 },
                 onkeydown: move |evt: Event<KeyboardData>| {
-                    // Escape light-dismisses an open side panel and restores focus
-                    // to that panel's action-bar toggle (WAI-ARIA APG disclosure
-                    // pattern) so focus never drops to `<body>` (issue #1790).
-                    //
-                    // If PR #1777 (popover Esc) lands, its popover cases (density,
-                    // mock-peers) belong in this branch ABOVE the panel handling:
-                    // popovers are more transient than panels, so Escape should peel
-                    // them first. The dock menu keeps its own Esc handler.
-                    //
-                    // The chat drawer is DELIBERATELY excluded from this
-                    // light-dismiss: its message composer means a stray background
-                    // Escape must not risk discarding an in-progress draft. That is
-                    // out of issue-1790 scope.
-                    if evt.key() == Key::Escape {
-                        if let Some(target) =
+                    // Escape light-dismisses the topmost transient surface and
+                    // restores focus to its action-bar toggle (WAI-ARIA APG
+                    // disclosure pattern) so focus never drops to `<body>`. Popovers
+                    // (density, mock-peers) are more transient than the side panels,
+                    // so Escape peels them FIRST (#1777); only when no popover is
+                    // open does it close the topmost side panel — diagnostics, then
+                    // the peer list (issue #1790). The `else if` chain guarantees
+                    // each Escape closes EXACTLY one surface. The dock menu keeps its
+                    // own Esc handler (with stop_propagation).
+                    let key = evt.key();
+                    if key == Key::Escape {
+                        if density_open() {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            density_open.set(false);
+                            focus_element_by_id("density-mode-trigger");
+                        } else if mock_peers_open() {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            mock_peers_open.set(false);
+                            focus_element_by_id("mock-peers-trigger");
+                        } else if let Some(target) =
                             esc_panel_close_target(diagnostics_open(), peer_list_open())
                         {
                             evt.prevent_default();
@@ -6238,12 +6485,22 @@ pub fn AttendantsComponent(
                                 EscCloseTarget::Diagnostics => diagnostics_open.set(false),
                                 EscCloseTarget::PeerList => peer_list_open.set(false),
                             }
-                            // The trigger button always persists in the action bar,
-                            // so focus restore is synchronous (no deferral needed —
-                            // unlike the dock trigger, which is swapped for Done in
-                            // customize mode).
                             focus_element_by_id(target.trigger_id());
                         }
+                    } else if density_open()
+                        && (key == Key::ArrowDown
+                            || key == Key::ArrowUp
+                            || key == Key::Home
+                            || key == Key::End)
+                    {
+                        // Focus isn't inside the popover yet — jump in.
+                        evt.stop_propagation();
+                        evt.prevent_default();
+                        let hl = density_highlight();
+                        focus_element_by_id(&format!(
+                            "density-opt-{}",
+                            hl.label().to_lowercase()
+                        ));
                     }
                 },
                 BrowserCompatibility {}
@@ -6509,7 +6766,11 @@ pub fn AttendantsComponent(
                     }
                 }
 
-                div { id: "grid-container", class: "{container_class}", style: "{container_style}",
+                // tabindex=-1 (issue 1175): programmatically focusable (not
+                // tab-reachable) so focus can land on the grid as a sensible
+                // fallback when a detached shared-content tile unmounts (presenter
+                // stops) and the detach toggle that would receive focus is gone.
+                div { id: "grid-container", tabindex: "-1", class: "{container_class}", style: "{container_style}",
                     onmousemove: move |evt| {
                         if ss_resizing() {
                             let native = evt.as_web_event();
@@ -6610,8 +6871,17 @@ pub fn AttendantsComponent(
                                 "screen-share-resize-handle"
                             };
                             rsx! {
-                                // Left panel — ONLY the most recent (active) screen sharer
-                                div { style: "width: {left_pct:.2}%; min-width: 0; height: 100%; display: flex; flex-direction: column; \
+                                // Left panel — ONLY the most recent (active) screen sharer.
+                                // `ss-left-pane` lets `.share-detached` CSS hide this pane
+                                // off-screen (issue 1175) while keeping the canvas composited.
+                                // `inert` while detached removes the (off-screen, invisible)
+                                // pane from the tab order + AT tree so keyboard/SR users can't
+                                // wander into controls the UI says don't exist. `inert`
+                                // affects focus/interaction/AT only — NOT compositing — so the
+                                // canvas keeps painting and the mirror keeps flowing.
+                                // `then_some` → `Some("true")` (present → inert) or `None`
+                                // (attribute omitted; never `inert="false"`).
+                                div { class: "ss-left-pane", "inert": share_detached.then_some("true"), style: "width: {left_pct:.2}%; min-width: 0; height: 100%; display: flex; flex-direction: column; \
                                                                             align-items: center; justify-content: center; overflow: hidden;",
                                     if let Some(ref active_peer) = active_screen_sharer {
                                         PeerTile {
@@ -6931,6 +7201,21 @@ pub fn AttendantsComponent(
                         }
                     } // end of else (normal grid layout)
 
+                    // Issue 1175: single meeting-level SR announcer for
+                    // detach/reattach. Visually-hidden role=status region — works
+                    // identically anywhere in the container, stays outside the
+                    // hidden `.ss-left-pane`, and in the a11y tree.
+                    //
+                    // Deliberately placed LAST — AFTER the split `if has_screen_share`
+                    // panes/grid block, never before it. The screen-share specs
+                    // locate the split panes POSITIONALLY as `#grid-container > div`
+                    // children (left/handle/right = 1/2/3): screen-share-panel.spec.ts
+                    // (:338/:673/:686), screen-share-layout.spec.ts (:365/:450/:542),
+                    // wt-screen-share-split-layout.spec.ts (:441 right / :448 left).
+                    // A child preceding the panes shifts those indices and breaks
+                    // bvt1 — future edits must keep this after the panes.
+                    crate::components::canvas_generator::ScreenDetachAnnouncer {}
+
                     // Controls nav
                     if can_stream {
                         nav {
@@ -7075,9 +7360,17 @@ pub fn AttendantsComponent(
                                         // mode never scrolls the meeting view. Even a no-op key
                                         // (already at the edge) should not scroll.
                                         evt.prevent_default();
-                                        let mut next = action_bar_slots.read().clone();
-                                        let Some(result) = apply_keyboard_reorder(&mut next, slot, delta, absolute) else { return; };
-                                        let len = next.len();
+                                        let ios_device = is_ios();
+                                        let current_full = action_bar_slots.read().clone();
+                                        let mut visible_slots = visible_action_bar_slots(
+                                            &current_full,
+                                            customize_mode(),
+                                            ios_device,
+                                            has_screen_share,
+                                            is_owner,
+                                        );
+                                        let Some(result) = apply_keyboard_reorder(&mut visible_slots, slot, delta, absolute) else { return; };
+                                        let len = visible_slots.len();
                                         if result.new_idx == result.old_idx {
                                             action_bar_announce.set(format!(
                                                 "{} is already at position {} of {}.",
@@ -7087,6 +7380,14 @@ pub fn AttendantsComponent(
                                             ));
                                             return;
                                         }
+                                        let next = merge_visible_action_bar_slots(
+                                            &current_full,
+                                            &visible_slots,
+                                            customize_mode(),
+                                            ios_device,
+                                            has_screen_share,
+                                            is_owner,
+                                        );
                                         action_bar_slots.set(next);
                                         save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
                                         action_bar_announce.set(format!(
@@ -7095,6 +7396,17 @@ pub fn AttendantsComponent(
                                             result.new_idx + 1,
                                             len,
                                         ));
+                                        // Preserve keyboard continuity after reorder: keep
+                                        // focus on the moved slot's primary button so Tab
+                                        // continues from the user's current position.
+                                        let moved_selector = format!(
+                                            ".video-controls-container .action-bar-slot-wrapper[data-slot=\"{}\"] > button.video-control-button",
+                                            slot.slug()
+                                        );
+                                        Timeout::new(0, move || {
+                                            focus_by_selector(&moved_selector);
+                                        })
+                                        .forget();
                                     },
                                     onpointermove: {
                                         let drag_slot_size = drag_slot_size.clone();
@@ -7120,22 +7432,46 @@ pub fn AttendantsComponent(
                                             if slot_size <= 0.0 { return; }
                                             let is_vertical = dock_position() != DockPosition::Bottom;
                                             let dragged = dragging_slot().unwrap();
-                                            // Compute insertion index from ORIGINAL position + cursor delta
+                                            let ios_device = is_ios();
+                                            // Compute insertion index from ORIGINAL visible position +
+                                            // cursor delta so drag math follows the rendered bar order.
                                             let orig_slots = drag_orig_layout();
-                                            let orig_idx = orig_slots.iter().position(|s| *s == dragged).unwrap_or(0);
-                                            let num_slots = action_bar_slots.read().len();
+                                            let orig_visible = visible_action_bar_slots(
+                                                &orig_slots,
+                                                customize_mode(),
+                                                ios_device,
+                                                has_screen_share,
+                                                is_owner,
+                                            );
+                                            let orig_idx = orig_visible.iter().position(|s| *s == dragged).unwrap_or(0);
+                                            let num_slots = orig_visible.len();
+                                            if num_slots == 0 { return; }
                                             let cursor = if is_vertical { cy } else { cx };
                                             let origin = if is_vertical { drag_start_y.get() } else { drag_start_x.get() };
                                             let delta = cursor - origin;
                                             let shift_count = (delta / slot_size).round() as i32;
                                             let new_idx = (orig_idx as i32 + shift_count).clamp(0, num_slots as i32 - 1) as usize;
                                             if drag_insertion_idx() != Some(new_idx) {
-                                                // Live-slots model: actually move the slot in the array
-                                                let mut next = action_bar_slots.read().clone();
-                                                if let Some(cur) = next.iter().position(|s| *s == dragged) {
-                                                    next.remove(cur);
-                                                    next.insert(new_idx.min(next.len()), dragged);
-                                                    action_bar_slots.set(next);
+                                                let current_full = action_bar_slots.read().clone();
+                                                let mut next_visible = visible_action_bar_slots(
+                                                    &current_full,
+                                                    customize_mode(),
+                                                    ios_device,
+                                                    has_screen_share,
+                                                    is_owner,
+                                                );
+                                                if let Some(cur) = next_visible.iter().position(|s| *s == dragged) {
+                                                    next_visible.remove(cur);
+                                                    next_visible.insert(new_idx.min(next_visible.len()), dragged);
+                                                    let next_full = merge_visible_action_bar_slots(
+                                                        &current_full,
+                                                        &next_visible,
+                                                        customize_mode(),
+                                                        ios_device,
+                                                        has_screen_share,
+                                                        is_owner,
+                                                    );
+                                                    action_bar_slots.set(next_full);
                                                 }
                                                 drag_insertion_idx.set(Some(new_idx));
                                             }
@@ -7228,374 +7564,375 @@ pub fn AttendantsComponent(
                                             }
                                         }
                                     },
-                                    // Primary: Mic button
-                                    if action_bar_slots.read().contains(&ActionBarSlot::Mic) {
+                                    // Customizable slots: render only the visible subset so every
+                                    // emitted sibling is keyed (no keyed+keyless fragment mix).
+                                    for slot in visible_action_bar_slots(
+                                        &action_bar_slots.read(),
+                                        customize_mode(),
+                                        is_ios(),
+                                        has_screen_share,
+                                        is_owner,
+                                    ) {
                                         {
-                                            let mic_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Mic).unwrap_or(0);
-                                            let mic_style = format!("order: {mic_idx};");
-                                            let mda_mic = mda.clone();
-                                            let drag_slot_size_mic = drag_slot_size.clone();
-                                            let drag_pointer_id_mic = drag_pointer_id.clone();
-                                            let drag_grab_dx_mic = drag_grab_dx.clone();
-                                            let drag_grab_dy_mic = drag_grab_dy.clone();
-                                            let drag_start_x_mic = drag_start_x.clone();
-                                            let drag_start_y_mic = drag_start_y.clone();
-                                            let drag_nav_left_mic = drag_nav_left.clone();
-                                            let drag_nav_top_mic = drag_nav_top.clone();
-                                            rsx! {
-                                                div {
-                                                    // Keyboard reorder a11y (WCAG 2.1.1): the wrapper is
-                                                    // NOT focusable itself. The inner button is already a
-                                                    // real `<button>` and takes focus normally. In
-                                                    // customize mode, ArrowLeft/Right/Up/Down/Home/End
-                                                    // pressed on that focused button bubble to the nav's
-                                                    // onkeydown, which resolves the slot via this
-                                                    // `data-slot` attribute. Adding tabindex here would
-                                                    // create a second tab stop per slot (see live-tester
-                                                    // report: "focus only moves after Tab twice").
-                                                    "data-slot": ActionBarSlot::Mic.slug(),
-                                                    class: if dragging_slot() == Some(ActionBarSlot::Mic) && drag_started() { "action-bar-slot-wrapper slot-primary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-primary" },
-                                                    style: "{mic_style}",
-                                                    onpointerdown: move |evt: PointerEvent| {
-                                                        if !customize_mode() { return; }
-                                                        let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                        let cx = pe.client_x() as f64;
-                                                        let cy = pe.client_y() as f64;
-                                                        drag_start_x_mic.set(cx);
-                                                        drag_start_y_mic.set(cy);
-                                                        drag_started.set(false);
-                                                        drag_pointer_id_mic.set(pe.pointer_id());
-                                                        drag_orig_layout.set(action_bar_slots.read().clone());
-                                                        let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Mic).unwrap_or(0);
-                                                        dragging_slot.set(Some(ActionBarSlot::Mic));
-                                                        drag_pointer_x.set(cx);
-                                                        drag_pointer_y.set(cy);
-                                                        drag_insertion_idx.set(Some(src_idx));
-                                                        // `Event.target` survives after dispatch (currentTarget does not in
-                                                        // Dioxus synthetic handlers). Walk up to the slot wrapper for our rect.
-                                                        if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                            if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                let rect = el.get_bounding_client_rect();
-                                                                drag_grab_dx_mic.set(cx - rect.left());
-                                                                drag_grab_dy_mic.set(cy - rect.top());
-                                                                let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                // Capture on the NAV so its move/up/cancel handlers receive events.
-                                                                if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                    let nrect = nav.get_bounding_client_rect();
-                                                                    drag_nav_left_mic.set(nrect.left());
-                                                                    drag_nav_top_mic.set(nrect.top());
-                                                                    let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                    drag_slot_size_mic.set(size + gap);
-                                                                    let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                }
-                                                            }
-                                                        }
-                                                    },
-                                                    MicButton {
-                                                        enabled: mic_enabled(),
-                                                        available: mic_error.read().is_none(),
-                                                        onclick: move |_| {
-                                                            if customize_mode() { return; }
-                                                            if !mic_enabled() {
-                                                                // Turn the mic ON. If acquisition is blocked
-                                                                // (DeviceInUse), `pending_mic_enable` lets a
-                                                                // later successful probe fulfil the enable;
-                                                                // the background retry loop arms itself off
-                                                                // the error signal alone (see should_auto_retry).
-                                                                if mda_mic.borrow().is_granted(MediaAccessKind::AudioCheck) {
-                                                                    mic_enabled.set(true);
-                                                                } else {
-                                                                    pending_mic_enable.set(true);
-                                                                    mda_mic.borrow().request();
-                                                                }
-                                                            } else {
-                                                                mic_enabled.set(false);
-                                                            }
-                                                        },
-                                                    }
-                                                    // Mic is non-removable (see NON_REMOVABLE_SLOTS): it can be
-                                                    // dragged to reorder, but the remove button is intentionally
-                                                    // not rendered so the user cannot strand themselves
-                                                    // without a mute control mid-call.
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Primary: Camera button
-                                    if action_bar_slots.read().contains(&ActionBarSlot::Camera) {
-                                        {
-                                            let cam_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Camera).unwrap_or(1);
-                                            let cam_style = format!("order: {cam_idx};");
-                                            let mda_cam = mda.clone();
-                                            let drag_slot_size_cam = drag_slot_size.clone();
-                                            let drag_pointer_id_cam = drag_pointer_id.clone();
-                                            let drag_grab_dx_cam = drag_grab_dx.clone();
-                                            let drag_grab_dy_cam = drag_grab_dy.clone();
-                                            let drag_start_x_cam = drag_start_x.clone();
-                                            let drag_start_y_cam = drag_start_y.clone();
-                                            let drag_nav_left_cam = drag_nav_left.clone();
-                                            let drag_nav_top_cam = drag_nav_top.clone();
-                                            rsx! {
-                                                div {
-                                                    "data-slot": ActionBarSlot::Camera.slug(),
-                                                    class: if dragging_slot() == Some(ActionBarSlot::Camera) && drag_started() { "action-bar-slot-wrapper slot-primary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-primary" },
-                                                    style: "{cam_style}",
-                                                    onpointerdown: move |evt: PointerEvent| {
-                                                        if !customize_mode() { return; }
-                                                        let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                        let cx = pe.client_x() as f64;
-                                                        let cy = pe.client_y() as f64;
-                                                        drag_start_x_cam.set(cx);
-                                                        drag_start_y_cam.set(cy);
-                                                        drag_started.set(false);
-                                                        drag_pointer_id_cam.set(pe.pointer_id());
-                                                        drag_orig_layout.set(action_bar_slots.read().clone());
-                                                        let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Camera).unwrap_or(0);
-                                                        dragging_slot.set(Some(ActionBarSlot::Camera));
-                                                        drag_pointer_x.set(cx);
-                                                        drag_pointer_y.set(cy);
-                                                        drag_insertion_idx.set(Some(src_idx));
-                                                        if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                            if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                let rect = el.get_bounding_client_rect();
-                                                                drag_grab_dx_cam.set(cx - rect.left());
-                                                                drag_grab_dy_cam.set(cy - rect.top());
-                                                                let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                    let nrect = nav.get_bounding_client_rect();
-                                                                    drag_nav_left_cam.set(nrect.left());
-                                                                    drag_nav_top_cam.set(nrect.top());
-                                                                    let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                    drag_slot_size_cam.set(size + gap);
-                                                                    let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                }
-                                                            }
-                                                        }
-                                                    },
-                                                    CameraButton {
-                                                        enabled: video_enabled(),
-                                                        available: video_error.read().is_none(),
-                                                        onclick: move |_| {
-                                                            if customize_mode() { return; }
-                                                            if !video_enabled() {
-                                                                // Turn the camera ON. If acquisition is blocked
-                                                                // (DeviceInUse), `pending_video_enable` lets a
-                                                                // later successful probe fulfil the enable;
-                                                                // the background retry loop arms itself off
-                                                                // the error signal alone (see should_auto_retry).
-                                                                if mda_cam.borrow().is_granted(MediaAccessKind::VideoCheck) {
-                                                                    video_enabled.set(true);
-                                                                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
-                                                                        if let Some(elem) = doc.get_element_by_id("webcam") {
-                                                                            if let Ok(v) = elem.dyn_into::<web_sys::HtmlVideoElement>() {
-                                                                                let _ = v.play();
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                } else {
-                                                                    pending_video_enable.set(true);
-                                                                    mda_cam.borrow().request();
-                                                                }
-                                                            } else {
-                                                                video_enabled.set(false);
-                                                            }
-                                                        },
-                                                    }
-                                                    // Camera is non-removable (see NON_REMOVABLE_SLOTS): it can
-                                                    // be dragged to reorder, but the remove button is
-                                                    // intentionally not rendered so the user cannot strand
-                                                    // themselves without a camera-mute control mid-call.
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Secondary buttons: hidden by default, revealed on hover via
-                                    // .slot-secondary. All slots are DIRECT flex children of the nav so
-                                    // flex `order:` resolves in a single context — required for reorder.
-                                    if (customize_mode() || !is_ios()) && action_bar_slots.read().contains(&ActionBarSlot::ScreenShare) {
-                                            {
-                                                let ss_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::ScreenShare).unwrap_or(2);
-                                                let ss_style = format!("order: {ss_idx};");
-                                                let is_active = matches!(screen_share_state(), ScreenShareState::Active);
-                                                let is_disabled = matches!(
-                                                    screen_share_state(),
-                                                    ScreenShareState::Requesting | ScreenShareState::StreamReady
-                                                );
-                                                let drag_slot_size_ss = drag_slot_size.clone();
-                                                let drag_pointer_id_ss = drag_pointer_id.clone();
-                                                let drag_grab_dx_ss = drag_grab_dx.clone();
-                                                let drag_grab_dy_ss = drag_grab_dy.clone();
-                                                let drag_start_x_ss = drag_start_x.clone();
-                                                let drag_start_y_ss = drag_start_y.clone();
-                                                let drag_nav_left_ss = drag_nav_left.clone();
-                                                let drag_nav_top_ss = drag_nav_top.clone();
+                                        let slug = slot.slug();
+                                                let tier = match slot {
+                                                    ActionBarSlot::Mic | ActionBarSlot::Camera => "slot-primary",
+                                                    _ => "slot-secondary",
+                                                };
+                                                let is_dragging = dragging_slot() == Some(slot) && drag_started();
+                                                let wrapper_class = if is_dragging {
+                                                    format!("action-bar-slot-wrapper {tier} is-drag-placeholder")
+                                                } else {
+                                                    format!("action-bar-slot-wrapper {tier}")
+                                                };
+                                                let drag_slot_size_c = drag_slot_size.clone();
+                                                let drag_pointer_id_c = drag_pointer_id.clone();
+                                                let drag_grab_dx_c = drag_grab_dx.clone();
+                                                let drag_grab_dy_c = drag_grab_dy.clone();
+                                                let drag_start_x_c = drag_start_x.clone();
+                                                let drag_start_y_c = drag_start_y.clone();
+                                                let drag_nav_left_c = drag_nav_left.clone();
+                                                let drag_nav_top_c = drag_nav_top.clone();
                                                 rsx! {
                                                     div {
-                                                        "data-slot": ActionBarSlot::ScreenShare.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::ScreenShare) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{ss_style}",
+                                                        key: "{slug}",
+                                                        "data-slot": slug,
+                                                        class: "{wrapper_class}",
                                                         onpointerdown: move |evt: PointerEvent| {
                                                             if !customize_mode() { return; }
                                                             let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
                                                             let cx = pe.client_x() as f64;
                                                             let cy = pe.client_y() as f64;
-                                                            drag_start_x_ss.set(cx);
-                                                            drag_start_y_ss.set(cy);
+                                                            drag_start_x_c.set(cx);
+                                                            drag_start_y_c.set(cy);
                                                             drag_started.set(false);
-                                                            drag_pointer_id_ss.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::ScreenShare).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::ScreenShare));
+                                                            drag_pointer_id_c.set(pe.pointer_id());
+                                                            let current_full = action_bar_slots.read().clone();
+                                                            drag_orig_layout.set(current_full.clone());
+                                                            let src_visible = visible_action_bar_slots(
+                                                                &current_full,
+                                                                customize_mode(),
+                                                                is_ios(),
+                                                                has_screen_share,
+                                                                is_owner,
+                                                            );
+                                                            let src_idx = src_visible.iter().position(|s| *s == slot).unwrap_or(0);
+                                                            dragging_slot.set(Some(slot));
                                                             drag_pointer_x.set(cx);
                                                             drag_pointer_y.set(cy);
                                                             drag_insertion_idx.set(Some(src_idx));
                                                             if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
                                                                 if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
                                                                     let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_ss.set(cx - rect.left());
-                                                                    drag_grab_dy_ss.set(cy - rect.top());
+                                                                    drag_grab_dx_c.set(cx - rect.left());
+                                                                    drag_grab_dy_c.set(cy - rect.top());
                                                                     let is_vertical = dock_position() != DockPosition::Bottom;
                                                                     let size = if is_vertical { rect.height() } else { rect.width() };
                                                                     if let Ok(Some(nav)) = el.closest(".video-controls-container") {
                                                                         let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_ss.set(nrect.left());
-                                                                        drag_nav_top_ss.set(nrect.top());
+                                                                        drag_nav_left_c.set(nrect.left());
+                                                                        drag_nav_top_c.set(nrect.top());
                                                                         let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_ss.set(size + gap);
+                                                                        drag_slot_size_c.set(size + gap);
                                                                         let _ = nav.set_pointer_capture(pe.pointer_id());
                                                                     }
                                                                 }
                                                             }
                                                         },
-                                                        ScreenShareButton {
-                                                            active: is_active,
-                                                            // Do NOT set `disabled` from customize_mode.
-                                                            // The HTML `disabled` attribute strips the
-                                                            // button from the tab order, which is what
-                                                            // caused Tab to skip ScreenShare in customize
-                                                            // mode (live report: "Tab doesn't work for
-                                                            // screen share, only for its remove"). Every
-                                                            // other slot stays focusable in customize
-                                                            // mode and relies on CSS `pointer-events:none`
-                                                            // (via `.customize-mode .action-bar-slot-wrapper
-                                                            // > .video-control-button`) plus the
-                                                            // `if customize_mode() { return; }` guard in
-                                                            // the onclick below for click-inertness.
-                                                            disabled: is_disabled,
-                                                            onclick: {
-                                                                let stream_cell = pre_acquired_screen_stream.clone();
-                                                                move |_| {
-                                                                    if customize_mode() { return; }
-                                                                    if matches!(screen_share_state(), ScreenShareState::Idle) {
-                                                                        let navigator = gloo_utils::window().navigator();
-                                                                        let media_devices = match navigator.media_devices() {
-                                                                            Ok(md) => md,
-                                                                            Err(e) => {
-                                                                                log::error!("Failed to get media devices: {e:?}");
-                                                                                return;
-                                                                            }
-                                                                        };
-
-                                                                        let width_constraint = js_sys::Object::new();
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &width_constraint,
-                                                                            &JsValue::from_str("ideal"),
-                                                                            &JsValue::from_f64(1920.0),
-                                                                        );
-                                                                        let height_constraint = js_sys::Object::new();
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &height_constraint,
-                                                                            &JsValue::from_str("ideal"),
-                                                                            &JsValue::from_f64(1080.0),
-                                                                        );
-                                                                        let framerate_constraint = js_sys::Object::new();
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &framerate_constraint,
-                                                                            &JsValue::from_str("ideal"),
-                                                                            &JsValue::from_f64(10.0),
-                                                                        );
-                                                                        let video_constraints = js_sys::Object::new();
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &video_constraints,
-                                                                            &JsValue::from_str("width"),
-                                                                            &width_constraint.into(),
-                                                                        );
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &video_constraints,
-                                                                            &JsValue::from_str("height"),
-                                                                            &height_constraint.into(),
-                                                                        );
-                                                                        let _ = js_sys::Reflect::set(
-                                                                            &video_constraints,
-                                                                            &JsValue::from_str("frameRate"),
-                                                                            &framerate_constraint.into(),
-                                                                        );
-
-                                                                        let constraints = web_sys::DisplayMediaStreamConstraints::new();
-                                                                        constraints.set_video(&video_constraints.into());
-                                                                        constraints.set_audio(&JsValue::FALSE);
-
-                                                                        let promise = match media_devices
-                                                                            .get_display_media_with_constraints(&constraints)
-                                                                        {
-                                                                            Ok(p) => p,
-                                                                            Err(e) => {
-                                                                                log::error!("getDisplayMedia failed synchronously: {e:?}");
-                                                                                return;
-                                                                            }
-                                                                        };
-                                                                        screen_share_state.set(ScreenShareState::Requesting);
-                                                                        let cell = stream_cell.clone();
-                                                                        wasm_bindgen_futures::spawn_local(async move {
-                                                                            match JsFuture::from(promise).await {
-                                                                                Ok(stream) => {
-                                                                                    let media_stream: web_sys::MediaStream = stream
-                                                                                        .unchecked_into();
-                                                                                    cell.borrow_mut().replace(media_stream);
-                                                                                    screen_share_state.set(ScreenShareState::StreamReady);
+                                                        // Slot-specific inner content
+                                                        match slot {
+                                                            ActionBarSlot::Mic => {
+                                                                let mda_mic = mda.clone();
+                                                                rsx! {
+                                                                    MicButton {
+                                                                        enabled: mic_enabled(),
+                                                                        available: mic_error.read().is_none(),
+                                                                        onclick: move |_| {
+                                                                            if customize_mode() { return; }
+                                                                            if !mic_enabled() {
+                                                                                // Turn the mic ON. If acquisition is blocked
+                                                                                // (DeviceInUse), `pending_mic_enable` lets a
+                                                                                // later successful probe fulfil the enable;
+                                                                                // the background retry loop arms itself off
+                                                                                // the error signal alone (see should_auto_retry).
+                                                                                if mda_mic.borrow().is_granted(MediaAccessKind::AudioCheck) {
+                                                                                    mic_enabled.set(true);
+                                                                                } else {
+                                                                                    pending_mic_enable.set(true);
+                                                                                    mda_mic.borrow().request();
                                                                                 }
-                                                                                Err(e) => {
-                                                                                    let is_cancel = js_sys::Reflect::get(
-                                                                                            &e,
-                                                                                            &JsValue::from_str("name"),
-                                                                                        )
-                                                                                        .ok()
-                                                                                        .and_then(|v| v.as_string())
-                                                                                        .map(|n| n == "NotAllowedError")
-                                                                                        .unwrap_or(false);
-                                                                                    if is_cancel {
-                                                                                        log::info!("User cancelled screen sharing");
-                                                                                    } else {
-                                                                                        log::error!("getDisplayMedia rejected: {e:?}");
+                                                                            } else {
+                                                                                mic_enabled.set(false);
+                                                                            }
+                                                                        },
+                                                                    }
+                                                                }
+                                                            }
+                                                            ActionBarSlot::Camera => {
+                                                                let mda_cam = mda.clone();
+                                                                rsx! {
+                                                                    CameraButton {
+                                                                        enabled: video_enabled(),
+                                                                        available: video_error.read().is_none(),
+                                                                        onclick: move |_| {
+                                                                            if customize_mode() { return; }
+                                                                            if !video_enabled() {
+                                                                                // Turn the camera ON. If acquisition is blocked
+                                                                                // (DeviceInUse), `pending_video_enable` lets a
+                                                                                // later successful probe fulfil the enable;
+                                                                                // the background retry loop arms itself off
+                                                                                // the error signal alone (see should_auto_retry).
+                                                                                if mda_cam.borrow().is_granted(MediaAccessKind::VideoCheck) {
+                                                                                    video_enabled.set(true);
+                                                                                    if let Some(doc) = web_sys::window().and_then(|w| w.document()) {
+                                                                                        if let Some(elem) = doc.get_element_by_id("webcam") {
+                                                                                            if let Ok(v) = elem.dyn_into::<web_sys::HtmlVideoElement>() {
+                                                                                                let _ = v.play();
+                                                                                            }
+                                                                                        }
                                                                                     }
-                                                                                    screen_share_state.set(ScreenShareState::Idle);
+                                                                                } else {
+                                                                                    pending_video_enable.set(true);
+                                                                                    mda_cam.borrow().request();
                                                                                 }
+                                                                            } else {
+                                                                                video_enabled.set(false);
                                                                             }
-                                                                        });
-                                                                    } else {
-                                                                        screen_share_state.set(ScreenShareState::Idle);
+                                                                        },
                                                                     }
+                                                                }
+                                                            }
+                                                            ActionBarSlot::ScreenShare => {
+                                                                let is_active = matches!(screen_share_state(), ScreenShareState::Active);
+                                                                let is_disabled = matches!(
+                                                                    screen_share_state(),
+                                                                    ScreenShareState::Requesting | ScreenShareState::StreamReady
+                                                                );
+                                                                let stream_cell = pre_acquired_screen_stream.clone();
+                                                                rsx! {
+                                                                    ScreenShareButton {
+                                                                        active: is_active,
+                                                                        disabled: is_disabled,
+                                                                        onclick: move |_| {
+                                                                            if customize_mode() { return; }
+                                                                            if matches!(screen_share_state(), ScreenShareState::Idle) {
+                                                                                let navigator = gloo_utils::window().navigator();
+                                                                                let media_devices = match navigator.media_devices() {
+                                                                                    Ok(md) => md,
+                                                                                    Err(e) => {
+                                                                                        log::error!("Failed to get media devices: {e:?}");
+                                                                                        return;
+                                                                                    }
+                                                                                };
+
+                                                                                let width_constraint = js_sys::Object::new();
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &width_constraint,
+                                                                                    &JsValue::from_str("ideal"),
+                                                                                    &JsValue::from_f64(1920.0),
+                                                                                );
+                                                                                let height_constraint = js_sys::Object::new();
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &height_constraint,
+                                                                                    &JsValue::from_str("ideal"),
+                                                                                    &JsValue::from_f64(1080.0),
+                                                                                );
+                                                                                let framerate_constraint = js_sys::Object::new();
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &framerate_constraint,
+                                                                                    &JsValue::from_str("ideal"),
+                                                                                    &JsValue::from_f64(10.0),
+                                                                                );
+                                                                                let video_constraints = js_sys::Object::new();
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &video_constraints,
+                                                                                    &JsValue::from_str("width"),
+                                                                                    &width_constraint.into(),
+                                                                                );
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &video_constraints,
+                                                                                    &JsValue::from_str("height"),
+                                                                                    &height_constraint.into(),
+                                                                                );
+                                                                                let _ = js_sys::Reflect::set(
+                                                                                    &video_constraints,
+                                                                                    &JsValue::from_str("frameRate"),
+                                                                                    &framerate_constraint.into(),
+                                                                                );
+
+                                                                                let constraints = web_sys::DisplayMediaStreamConstraints::new();
+                                                                                constraints.set_video(&video_constraints.into());
+                                                                                constraints.set_audio(&JsValue::FALSE);
+
+                                                                                let promise = match media_devices
+                                                                                    .get_display_media_with_constraints(&constraints)
+                                                                                {
+                                                                                    Ok(p) => p,
+                                                                                    Err(e) => {
+                                                                                        log::error!("getDisplayMedia failed synchronously: {e:?}");
+                                                                                        return;
+                                                                                    }
+                                                                                };
+                                                                                screen_share_state.set(ScreenShareState::Requesting);
+                                                                                let cell = stream_cell.clone();
+                                                                                wasm_bindgen_futures::spawn_local(async move {
+                                                                                    match JsFuture::from(promise).await {
+                                                                                        Ok(stream) => {
+                                                                                            let media_stream: web_sys::MediaStream = stream
+                                                                                                .unchecked_into();
+                                                                                            cell.borrow_mut().replace(media_stream);
+                                                                                            screen_share_state.set(ScreenShareState::StreamReady);
+                                                                                        }
+                                                                                        Err(e) => {
+                                                                                            let is_cancel = js_sys::Reflect::get(
+                                                                                                    &e,
+                                                                                                    &JsValue::from_str("name"),
+                                                                                                )
+                                                                                                .ok()
+                                                                                                .and_then(|v| v.as_string())
+                                                                                                .map(|n| n == "NotAllowedError")
+                                                                                                .unwrap_or(false);
+                                                                                            if is_cancel {
+                                                                                                log::info!("User cancelled screen sharing");
+                                                                                            } else {
+                                                                                                log::error!("getDisplayMedia rejected: {e:?}");
+                                                                                            }
+                                                                                            screen_share_state.set(ScreenShareState::Idle);
+                                                                                        }
+                                                                                    }
+                                                                                });
+                                                                            } else {
+                                                                                screen_share_state.set(ScreenShareState::Idle);
+                                                                            }
+                                                                        },
+                                                                    }
+                                                                }
+                                                            }
+                                                            ActionBarSlot::PeerList => rsx! {
+                                                                PeerListButton {
+                                                                    id: "peer-list-trigger",
+                                                                    open: peer_list_open(),
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        // Mirror the density toggle: stop the click
+                                                                        // reaching `#main-container`'s handler (the
+                                                                        // toggle is inside the action bar, so it would
+                                                                        // be ignored there anyway, but stopping here
+                                                                        // keeps the popover-close identical to density).
+                                                                        e.stop_propagation();
+                                                                        let opening = !peer_list_open();
+                                                                        peer_list_open.set(opening);
+                                                                        if opening {
+                                                                            density_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::DensityMode => rsx! {
+                                                                DensityModeButton {
+                                                                    label: density_mode().label().to_string(),
+                                                                    open: density_open(),
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        e.stop_propagation();
+                                                                        let opening = !density_open();
+                                                                        if opening {
+                                                                            // Seed highlight synchronously before
+                                                                            // setting open to avoid a one-frame
+                                                                            // flash where the stale highlight is
+                                                                            // visible before use_effect runs.
+                                                                            density_highlight.set(density_mode());
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                        }
+                                                                        density_open.set(opening);
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::Diagnostics => rsx! {
+                                                                DiagnosticsButton {
+                                                                    id: "diagnostics-trigger",
+                                                                    open: diagnostics_open(),
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        // Mirror the density toggle (see PeerListButton
+                                                                        // above): stop the click reaching
+                                                                        // `#main-container`'s background handler.
+                                                                        e.stop_propagation();
+                                                                        let opening = !diagnostics_open();
+                                                                        diagnostics_open.set(opening);
+                                                                        if opening {
+                                                                            device_settings_open.set(false);
+                                                                            density_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                            meeting_options_open.set(false);
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::DeviceSettings => rsx! {
+                                                                DeviceSettingsButton {
+                                                                    open: device_settings_open(),
+                                                                    onclick: move |_| {
+                                                                        if customize_mode() { return; }
+                                                                        device_settings_initial_section.set(None);
+                                                                        let was_closed = !device_settings_open();
+                                                                        device_settings_open.set(!device_settings_open());
+                                                                        if was_closed {
+                                                                            device_settings_generation
+                                                                                .set(device_settings_generation() + 1);
+                                                                            peer_list_open.set(false);
+                                                                            diagnostics_open.set(false);
+                                                                            density_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                            meeting_options_open.set(false);
+                                                                        }
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::MeetingOptions => rsx! {
+                                                                MeetingOptionsButton {
+                                                                    open: meeting_options_open(),
+                                                                    onclick: move |_| {
+                                                                        if customize_mode() { return; }
+                                                                        let was_closed = !meeting_options_open();
+                                                                        meeting_options_open.set(!meeting_options_open());
+                                                                        if was_closed {
+                                                                            device_settings_open.set(false);
+                                                                            peer_list_open.set(false);
+                                                                            diagnostics_open.set(false);
+                                                                            density_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                        }
+                                                                    },
                                                                 }
                                                             },
                                                         }
-                                                        if customize_mode() {
+                                                        // Remove button: shown in customize mode for
+                                                        // removable slots only. Mic/Camera are pinned
+                                                        // (NON_REMOVABLE_SLOTS) to prevent mid-call loss
+                                                        // of mute/camera-mute controls.
+                                                        if customize_mode() && slot.is_removable() {
                                                             button {
                                                                 class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::ScreenShare.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::ScreenShare.display_name()),
+                                                                "aria-label": format!("Remove {}", slot.display_name()),
+                                                                title: format!("Remove {}", slot.display_name()),
                                                                 onpointerdown: move |evt: PointerEvent| {
                                                                     evt.stop_propagation();
                                                                 },
                                                                 onclick: move |e| {
                                                                     e.stop_propagation();
                                                                     let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::ScreenShare);
+                                                                    slots.retain(|s| *s != slot);
                                                                     action_bar_slots.set(slots);
                                                                     let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::ScreenShare) {
-                                                                        hidden.push(ActionBarSlot::ScreenShare);
+                                                                    if !hidden.contains(&slot) {
+                                                                        hidden.push(slot);
                                                                     }
                                                                     action_bar_hidden.set(hidden);
                                                                     save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
@@ -7606,472 +7943,7 @@ pub fn AttendantsComponent(
                                                     }
                                                 }
                                             }
-                                        }
-                                        if action_bar_slots.read().contains(&ActionBarSlot::PeerList) {
-                                            {
-                                                let pl_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::PeerList).unwrap_or(3);
-                                                let pl_style = format!("order: {pl_idx};");
-                                                let drag_slot_size_pl = drag_slot_size.clone();
-                                                let drag_pointer_id_pl = drag_pointer_id.clone();
-                                                let drag_grab_dx_pl = drag_grab_dx.clone();
-                                                let drag_grab_dy_pl = drag_grab_dy.clone();
-                                                let drag_start_x_pl = drag_start_x.clone();
-                                                let drag_start_y_pl = drag_start_y.clone();
-                                                let drag_nav_left_pl = drag_nav_left.clone();
-                                                let drag_nav_top_pl = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::PeerList.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::PeerList) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{pl_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_pl.set(cx);
-                                                            drag_start_y_pl.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_pl.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::PeerList).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::PeerList));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_pl.set(cx - rect.left());
-                                                                    drag_grab_dy_pl.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_pl.set(nrect.left());
-                                                                        drag_nav_top_pl.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_pl.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        PeerListButton {
-                                                            id: "peer-list-trigger",
-                                                            open: peer_list_open(),
-                                                            onclick: move |e: MouseEvent| {
-                                                                if customize_mode() { return; }
-                                                                // Mirror the density toggle: stop the click
-                                                                // reaching `#main-container`'s handler (the
-                                                                // toggle is inside the action bar, so it would
-                                                                // be ignored there anyway, but stopping here
-                                                                // keeps the popover-close identical to density).
-                                                                e.stop_propagation();
-                                                                let opening = !peer_list_open();
-                                                                peer_list_open.set(opening);
-                                                                if opening {
-                                                                    density_open.set(false);
-                                                                    dock_menu_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                }
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::PeerList.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::PeerList.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::PeerList);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::PeerList) {
-                                                                        hidden.push(ActionBarSlot::PeerList);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if (customize_mode() || !has_screen_share) && action_bar_slots.read().contains(&ActionBarSlot::DensityMode) {
-                                            {
-                                                let dm_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::DensityMode).unwrap_or(4);
-                                                let dm_style = format!("order: {dm_idx};");
-                                                let drag_slot_size_dm = drag_slot_size.clone();
-                                                let drag_pointer_id_dm = drag_pointer_id.clone();
-                                                let drag_grab_dx_dm = drag_grab_dx.clone();
-                                                let drag_grab_dy_dm = drag_grab_dy.clone();
-                                                let drag_start_x_dm = drag_start_x.clone();
-                                                let drag_start_y_dm = drag_start_y.clone();
-                                                let drag_nav_left_dm = drag_nav_left.clone();
-                                                let drag_nav_top_dm = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::DensityMode.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::DensityMode) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{dm_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_dm.set(cx);
-                                                            drag_start_y_dm.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_dm.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::DensityMode).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::DensityMode));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_dm.set(cx - rect.left());
-                                                                    drag_grab_dy_dm.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_dm.set(nrect.left());
-                                                                        drag_nav_top_dm.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_dm.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        DensityModeButton {
-                                                            label: density_mode().label().to_string(),
-                                                            open: density_open(),
-                                                            onclick: move |e: MouseEvent| {
-                                                                if customize_mode() { return; }
-                                                                e.stop_propagation();
-                                                                let opening = !density_open();
-                                                                density_open.set(opening);
-                                                                if opening {
-                                                                    dock_menu_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                }
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::DensityMode.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::DensityMode.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::DensityMode);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::DensityMode) {
-                                                                        hidden.push(ActionBarSlot::DensityMode);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if action_bar_slots.read().contains(&ActionBarSlot::Diagnostics) {
-                                            {
-                                                let diag_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Diagnostics).unwrap_or(5);
-                                                let diag_style = format!("order: {diag_idx};");
-                                                let drag_slot_size_diag = drag_slot_size.clone();
-                                                let drag_pointer_id_diag = drag_pointer_id.clone();
-                                                let drag_grab_dx_diag = drag_grab_dx.clone();
-                                                let drag_grab_dy_diag = drag_grab_dy.clone();
-                                                let drag_start_x_diag = drag_start_x.clone();
-                                                let drag_start_y_diag = drag_start_y.clone();
-                                                let drag_nav_left_diag = drag_nav_left.clone();
-                                                let drag_nav_top_diag = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::Diagnostics.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::Diagnostics) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{diag_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_diag.set(cx);
-                                                            drag_start_y_diag.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_diag.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::Diagnostics).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::Diagnostics));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_diag.set(cx - rect.left());
-                                                                    drag_grab_dy_diag.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_diag.set(nrect.left());
-                                                                        drag_nav_top_diag.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_diag.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        DiagnosticsButton {
-                                                            id: "diagnostics-trigger",
-                                                            open: diagnostics_open(),
-                                                            onclick: move |e: MouseEvent| {
-                                                                if customize_mode() { return; }
-                                                                // Mirror the density toggle (see PeerListButton
-                                                                // above): stop the click reaching
-                                                                // `#main-container`'s background handler.
-                                                                e.stop_propagation();
-                                                                let opening = !diagnostics_open();
-                                                                diagnostics_open.set(opening);
-                                                                if opening {
-                                                                    device_settings_open.set(false);
-                                                                    density_open.set(false);
-                                                                    dock_menu_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                    meeting_options_open.set(false);
-                                                                }
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::Diagnostics.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::Diagnostics.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::Diagnostics);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::Diagnostics) {
-                                                                        hidden.push(ActionBarSlot::Diagnostics);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if action_bar_slots.read().contains(&ActionBarSlot::DeviceSettings) {
-                                            {
-                                                let ds_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::DeviceSettings).unwrap_or(6);
-                                                let ds_style = format!("order: {ds_idx};");
-                                                let drag_slot_size_ds = drag_slot_size.clone();
-                                                let drag_pointer_id_ds = drag_pointer_id.clone();
-                                                let drag_grab_dx_ds = drag_grab_dx.clone();
-                                                let drag_grab_dy_ds = drag_grab_dy.clone();
-                                                let drag_start_x_ds = drag_start_x.clone();
-                                                let drag_start_y_ds = drag_start_y.clone();
-                                                let drag_nav_left_ds = drag_nav_left.clone();
-                                                let drag_nav_top_ds = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::DeviceSettings.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::DeviceSettings) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{ds_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_ds.set(cx);
-                                                            drag_start_y_ds.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_ds.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::DeviceSettings).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::DeviceSettings));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_ds.set(cx - rect.left());
-                                                                    drag_grab_dy_ds.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_ds.set(nrect.left());
-                                                                        drag_nav_top_ds.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_ds.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        DeviceSettingsButton {
-                                                            open: device_settings_open(),
-                                                            onclick: move |_| {
-                                                                if customize_mode() { return; }
-                                                                device_settings_initial_section.set(None);
-                                                                let was_closed = !device_settings_open();
-                                                                device_settings_open.set(!device_settings_open());
-                                                                if was_closed {
-                                                                    device_settings_generation
-                                                                        .set(device_settings_generation() + 1);
-                                                                    peer_list_open.set(false);
-                                                                    diagnostics_open.set(false);
-                                                                    density_open.set(false);
-                                                                    dock_menu_open.set(false);
-                                                                    mock_peers_open.set(false);
-                                                                    meeting_options_open.set(false);
-                                                                }
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::DeviceSettings.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::DeviceSettings.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::DeviceSettings);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::DeviceSettings) {
-                                                                        hidden.push(ActionBarSlot::DeviceSettings);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        if is_owner && action_bar_slots.read().contains(&ActionBarSlot::MeetingOptions) {
-                                            {
-                                                let mo_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::MeetingOptions).unwrap_or(8);
-                                                let mo_style = format!("order: {mo_idx};");
-                                                let drag_slot_size_mo = drag_slot_size.clone();
-                                                let drag_pointer_id_mo = drag_pointer_id.clone();
-                                                let drag_grab_dx_mo = drag_grab_dx.clone();
-                                                let drag_grab_dy_mo = drag_grab_dy.clone();
-                                                let drag_start_x_mo = drag_start_x.clone();
-                                                let drag_start_y_mo = drag_start_y.clone();
-                                                let drag_nav_left_mo = drag_nav_left.clone();
-                                                let drag_nav_top_mo = drag_nav_top.clone();
-                                                rsx! {
-                                                    div {
-                                                        "data-slot": ActionBarSlot::MeetingOptions.slug(),
-                                                        class: if dragging_slot() == Some(ActionBarSlot::MeetingOptions) && drag_started() { "action-bar-slot-wrapper slot-secondary is-drag-placeholder" } else { "action-bar-slot-wrapper slot-secondary" },
-                                                        style: "{mo_style}",
-                                                        onpointerdown: move |evt: PointerEvent| {
-                                                            if !customize_mode() { return; }
-                                                            let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
-                                                            let cx = pe.client_x() as f64;
-                                                            let cy = pe.client_y() as f64;
-                                                            drag_start_x_mo.set(cx);
-                                                            drag_start_y_mo.set(cy);
-                                                            drag_started.set(false);
-                                                            drag_pointer_id_mo.set(pe.pointer_id());
-                                                            drag_orig_layout.set(action_bar_slots.read().clone());
-                                                            let src_idx = slot_index(&action_bar_slots.read(), ActionBarSlot::MeetingOptions).unwrap_or(0);
-                                                            dragging_slot.set(Some(ActionBarSlot::MeetingOptions));
-                                                            drag_pointer_x.set(cx);
-                                                            drag_pointer_y.set(cy);
-                                                            drag_insertion_idx.set(Some(src_idx));
-                                                            if let Some(target) = pe.target().and_then(|t| t.dyn_into::<web_sys::Element>().ok()) {
-                                                                if let Ok(Some(el)) = target.closest(".action-bar-slot-wrapper") {
-                                                                    let rect = el.get_bounding_client_rect();
-                                                                    drag_grab_dx_mo.set(cx - rect.left());
-                                                                    drag_grab_dy_mo.set(cy - rect.top());
-                                                                    let is_vertical = dock_position() != DockPosition::Bottom;
-                                                                    let size = if is_vertical { rect.height() } else { rect.width() };
-                                                                    if let Ok(Some(nav)) = el.closest(".video-controls-container") {
-                                                                        let nrect = nav.get_bounding_client_rect();
-                                                                        drag_nav_left_mo.set(nrect.left());
-                                                                        drag_nav_top_mo.set(nrect.top());
-                                                                        let gap = read_nav_axis_gap_px(&nav, is_vertical);
-                                                                        drag_slot_size_mo.set(size + gap);
-                                                                        let _ = nav.set_pointer_capture(pe.pointer_id());
-                                                                    }
-                                                                }
-                                                            }
-                                                        },
-                                                        MeetingOptionsButton {
-                                                            open: meeting_options_open(),
-                                                            onclick: move |_| {
-                                                                if customize_mode() { return; }
-                                                                meeting_options_open.set(!meeting_options_open());
-                                                            },
-                                                        }
-                                                        if customize_mode() {
-                                                            button {
-                                                                class: "action-bar-remove-btn",
-                                                                "aria-label": format!("Remove {}", ActionBarSlot::MeetingOptions.display_name()),
-                                                                title: format!("Remove {}", ActionBarSlot::MeetingOptions.display_name()),
-                                                                onpointerdown: move |evt: PointerEvent| {
-                                                                    evt.stop_propagation();
-                                                                },
-                                                                onclick: move |e| {
-                                                                    e.stop_propagation();
-                                                                    let mut slots = action_bar_slots.read().clone();
-                                                                    slots.retain(|s| *s != ActionBarSlot::MeetingOptions);
-                                                                    action_bar_slots.set(slots);
-                                                                    let mut hidden = action_bar_hidden.read().clone();
-                                                                    if !hidden.contains(&ActionBarSlot::MeetingOptions) {
-                                                                        hidden.push(ActionBarSlot::MeetingOptions);
-                                                                    }
-                                                                    action_bar_hidden.set(hidden);
-                                                                    save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
-                                                                },
-                                                                "\u{2212}"
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    }
                                         // (а) Dock position dropdown — not customizable (houses Customize/Reset)
                                         div { class: "dock-position-wrapper",
                                             style: "order: 90",
@@ -8118,8 +7990,9 @@ pub fn AttendantsComponent(
                                                     // focus here via `focus_element_by_id`. Same id
                                                     // is intentionally NOT reused on the Done button
                                                     // (customize-mode branch above); Customize's
-                                                    // activation focuses `.action-bar-done-trigger`
-                                                    // directly instead.
+                                                    // activation now shifts focus to the first
+                                                    // action-bar slot button (Mic/Sound by default)
+                                                    // via the customize-mode entry effect.
                                                     id: "dock-menu-trigger",
                                                     class: if dock_menu_open() { "video-control-button active" } else { "video-control-button" },
                                                     title: "Action bar position",
@@ -8345,15 +8218,6 @@ pub fn AttendantsComponent(
                                                                 evt.prevent_default();
                                                                 customize_mode.set(true);
                                                                 dock_menu_open.set(false);
-                                                                // The dock-menu trigger button is swapped
-                                                                // out for the Done button on the next
-                                                                // render. Focus that Done button so the
-                                                                // keyboard user has an obvious way back
-                                                                // out of customize mode.
-                                                                Timeout::new(0, || {
-                                                                    focus_by_selector(".action-bar-done-trigger");
-                                                                })
-                                                                .forget();
                                                             },
                                                             "Customize"
                                                         }
@@ -8549,6 +8413,10 @@ pub fn AttendantsComponent(
                                                 rsx! {}
                                             }
                                         }
+                                                                        // Keep ScreenShare focusable in customize mode.
+                                                                        // Including `customize_mode` in `disabled` would
+                                                                        // remove it from tab order and reintroduce a11y
+                                                                        // tab-skip regressions.
                                     }
                                 }
                             }
@@ -8587,6 +8455,7 @@ pub fn AttendantsComponent(
                                         mic_error.read().as_ref(),
                                         video_error.read().as_ref(),
                                         on_dismiss,
+                                        true,
                                     )
                                 }
                             }
@@ -8630,8 +8499,20 @@ pub fn AttendantsComponent(
                                         if mic_error.peek().as_ref() != Some(&target) {
                                             mic_error.set(Some(target));
                                         }
-                                        mic_enabled.set(false);
-                                        show_device_warning.set(true);
+                                        // Guard the sibling bool writes the same way
+                                        // (issue #1793): the restart-loop burst reaches
+                                        // this callback up to MAX_RESTARTS times with
+                                        // `mic_enabled` already `false` and the modal
+                                        // already up, so an unconditional `.set` would
+                                        // re-render per repeat. `should_write_bool_signal`
+                                        // makes each repeat a no-op.
+                                        if should_write_bool_signal(*mic_enabled.peek(), false) {
+                                            mic_enabled.set(false);
+                                        }
+                                        if should_write_bool_signal(*show_device_warning.peek(), true)
+                                        {
+                                            show_device_warning.set(true);
+                                        }
                                     },
                                     on_camera_permission_error: move |err: MediaPermissionsErrorState| {
                                         log::warn!("Camera permission error in-meeting: {err:?}");
@@ -8640,8 +8521,13 @@ pub fn AttendantsComponent(
                                         if video_error.peek().as_ref() != Some(&target) {
                                             video_error.set(Some(target));
                                         }
-                                        video_enabled.set(false);
-                                        show_device_warning.set(true);
+                                        if should_write_bool_signal(*video_enabled.peek(), false) {
+                                            video_enabled.set(false);
+                                        }
+                                        if should_write_bool_signal(*show_device_warning.peek(), true)
+                                        {
+                                            show_device_warning.set(true);
+                                        }
                                     },
                                     on_screen_share_state: move |event: ScreenShareEvent| {
                                         log::info!("Screen share state changed: {event:?}");
@@ -9162,6 +9048,14 @@ pub fn AttendantsComponent(
                 if mock_peers_enabled() && mock_peers_open() {
                     div { class: "mock-peers-popover",
                         onclick: move |e: MouseEvent| e.stop_propagation(),
+                        onkeydown: move |evt: Event<KeyboardData>| {
+                            if evt.key() == Key::Escape {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                mock_peers_open.set(false);
+                                focus_element_by_id("mock-peers-trigger");
+                            }
+                        },
                         div { class: "mock-peers-popover-header",
                             span { "Mock Peers" }
                             button {
@@ -9208,11 +9102,61 @@ pub fn AttendantsComponent(
                 // Density mode popover
                 if !has_screen_share && density_open() {
                     div { class: "density-popover",
+                        role: "menu",
+                        "aria-label": "Layout density",
                         onclick: move |e: MouseEvent| e.stop_propagation(),
+                        // Keyboard navigation: arrows move the highlight,
+                        // Enter/Space commits it. Handled on the container
+                        // so it works regardless of which child has DOM focus.
+                        onkeydown: move |evt: Event<KeyboardData>| {
+                            let key = evt.key();
+                            if is_option_activate_key(&evt) {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                let selected = density_highlight();
+                                density_mode.set(selected);
+                                save_density_mode(selected);
+                                density_open.set(false);
+                                focus_element_by_id("density-mode-trigger");
+                            } else if key == Key::ArrowDown {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                let next = next_density_mode(density_highlight(), 1);
+                                density_highlight.set(next);
+                                focus_element_by_id(&format!("density-opt-{}", next.label().to_lowercase()));
+                            } else if key == Key::ArrowUp {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                let prev = next_density_mode(density_highlight(), -1);
+                                density_highlight.set(prev);
+                                focus_element_by_id(&format!("density-opt-{}", prev.label().to_lowercase()));
+                            } else if key == Key::Home {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                let first = DENSITY_MODES[0];
+                                density_highlight.set(first);
+                                focus_element_by_id(&format!("density-opt-{}", first.label().to_lowercase()));
+                            } else if key == Key::End {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                let last = DENSITY_MODES[DENSITY_MODES.len() - 1];
+                                density_highlight.set(last);
+                                focus_element_by_id(&format!("density-opt-{}", last.label().to_lowercase()));
+                            } else if key == Key::Tab {
+                                // APG menu pattern: Tab closes the menu and
+                                // returns focus to the trigger.
+                                density_open.set(false);
+                                focus_element_by_id("density-mode-trigger");
+                            }
+                        },
                         for mode in DENSITY_MODES {
                             div {
                                 key: "{mode.label()}",
-                                class: if density_mode() == mode { "density-option active" } else { "density-option" },
+                                id: "density-opt-{mode.label().to_lowercase()}",
+                                class: if density_highlight() == mode { "density-option active" } else { "density-option" },
+                                role: "menuitemradio",
+                                tabindex: if density_highlight() == mode { "0" } else { "-1" },
+                                "aria-checked": if density_mode() == mode { "true" } else { "false" },
                                 onclick: move |_| {
                                     density_mode.set(mode);
                                     save_density_mode(mode);
@@ -9342,6 +9286,65 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    // ── Deferred leave-sound debounce (notifications-OFF + sound-ON) ──
+    // Pure host `#[test]`s over the helpers on_peer_left / on_peer_joined call.
+
+    /// No rejoin → the leave sound plays. Breaking `mark` or `take` fails this.
+    #[test]
+    fn deferred_leave_sound_plays_when_peer_stays_gone() {
+        let mut pending = Vec::new();
+        mark_pending_leave_sound(&mut pending, 1, "bob".to_string());
+        assert!(
+            take_pending_leave_sound(&mut pending, 1),
+            "a peer that leaves and does not rejoin must play the leave sound"
+        );
+    }
+
+    /// Rejoin within 500ms → no sound. Regression guard: the un-fixed code played
+    /// immediately. Breaking `clear` (no retain) makes `take` return true.
+    #[test]
+    fn deferred_leave_sound_suppressed_by_rejoin_within_window() {
+        let mut pending = Vec::new();
+        mark_pending_leave_sound(&mut pending, 1, "alice".to_string());
+        clear_pending_leave_sound(&mut pending, "alice");
+        assert!(
+            !take_pending_leave_sound(&mut pending, 1),
+            "a peer that rejoins within 500ms must not play a spurious leave sound"
+        );
+    }
+
+    /// A different peer's join must not cancel an unrelated pending leave sound.
+    #[test]
+    fn deferred_leave_sound_not_cancelled_by_other_peer_join() {
+        let mut pending = Vec::new();
+        mark_pending_leave_sound(&mut pending, 1, "alice".to_string());
+        clear_pending_leave_sound(&mut pending, "carol");
+        assert!(
+            take_pending_leave_sound(&mut pending, 1),
+            "another peer joining must not suppress alice's leave sound"
+        );
+    }
+
+    /// Rapid leave→join→leave→join for one user nets zero sounds — the per-event
+    /// id is why: leave #1's timer checks its own (cleared) id, not whether "bob"
+    /// is pending again from leave #2. A per-user key would wrongly play here.
+    #[test]
+    fn interleaved_leave_join_cycles_for_one_user_play_no_sound() {
+        let mut pending = Vec::new();
+        mark_pending_leave_sound(&mut pending, 1, "bob".to_string());
+        clear_pending_leave_sound(&mut pending, "bob");
+        mark_pending_leave_sound(&mut pending, 2, "bob".to_string());
+        assert!(
+            !take_pending_leave_sound(&mut pending, 1),
+            "an earlier leave's timer must not fire for a later, still-pending leave"
+        );
+        clear_pending_leave_sound(&mut pending, "bob");
+        assert!(
+            !take_pending_leave_sound(&mut pending, 2),
+            "the second flicker's rejoin must also suppress its leave sound"
+        );
+    }
 
     // ── #1790 Escape panel-close precedence ──
     // Plain host `#[test]`s (not browser tests): `esc_panel_close_target` and
@@ -9592,6 +9595,33 @@ mod tests {
             )),
             Some(MediaErrorState::DeviceInUse)
         );
+    }
+
+    // ── sibling bool-signal set-if-changed dedupe (issue #1793) ──
+
+    /// The set-if-changed decision for the `bool` signals (`mic_enabled`,
+    /// `video_enabled`, `pending_*_enable`, `show_device_warning`) written in the
+    /// device-permission failure paths. This is the guard that makes a
+    /// steady-state-blocked-device background retry tick, and each repeat fire of
+    /// the live encoder's restart-loop burst, a true no-op instead of a re-render.
+    ///
+    /// Truth-table pin against literals (not a `current != target` recompute), so
+    /// mutating the production body to `true` (revert to unconditional writes)
+    /// fails the "already at target" cases, and mutating it to `current == target`
+    /// (invert) fails the "value actually changes" cases.
+    #[test]
+    fn write_bool_signal_only_on_change() {
+        // Steady state: value already at target → no write, no re-render.
+        // `false → false`: an already-disabled side on a repeat background probe.
+        assert!(!should_write_bool_signal(false, false));
+        // `true → true`: the modal is already up when a later failure re-fires.
+        assert!(!should_write_bool_signal(true, true));
+
+        // Genuine transition: the FIRST write of each burst must go through.
+        // `true → false`: onset disables an enabled side.
+        assert!(should_write_bool_signal(true, false));
+        // `false → true`: onset raises the not-yet-shown modal.
+        assert!(should_write_bool_signal(false, true));
     }
 
     // ── reconnect host-state reconcile gate ──

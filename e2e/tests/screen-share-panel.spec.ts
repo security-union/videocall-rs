@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 import { fillAndSubmitJoinForm } from "../helpers/join-meeting";
 
 /**
@@ -227,7 +228,7 @@ async function setupTwoUserMeeting(
  */
 async function startScreenShare(sharerPage: Page, viewerPage: Page): Promise<boolean> {
   // Wake auto-hidden controls bar, then find the share button by tooltip.
-  await sharerPage.mouse.move(400, 400);
+  await wakeControls(sharerPage);
   await sharerPage.waitForTimeout(300);
   const shareButton = sharerPage.locator("button.video-control-button", {
     has: sharerPage.locator(".tooltip", { hasText: "Share Screen" }),
@@ -762,7 +763,7 @@ test.describe("Screen share right panel layout", () => {
 
       // ---- ACT: guest stops screen sharing ----
       // Wake the auto-hidden controls bar on the guest page.
-      await guestPage.mouse.move(400, 400);
+      await wakeControls(guestPage);
       await guestPage.waitForTimeout(300);
       await guestPage.locator(".video-controls-container").hover();
       await guestPage.waitForTimeout(500);

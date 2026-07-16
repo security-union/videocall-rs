@@ -129,18 +129,39 @@ validate_key_type() {
   return 0
 }
 
+# Parse an openssl date string (`MMM DD HH:MM:SS YYYY GMT`) to a Unix epoch,
+# portably across GNU date (Linux/WSL: `date -d`) and BSD date (macOS: `date -j
+# -f`). Prints the epoch on success; returns non-zero if neither parser handles
+# the string. macOS ships BSD date, which has no `-d`, so the previous
+# `date -u -d` path failed there with "could not parse notBefore from cert".
+openssl_date_to_epoch() {
+  local s="$1" epoch
+  # GNU date first (also covers busybox date on some CI images).
+  if epoch="$(date -u -d "$s" +%s 2>/dev/null)"; then
+    printf '%s' "$epoch"
+    return 0
+  fi
+  # BSD date (macOS). `%e` handles the space-padded day openssl emits for
+  # single-digit dates; `%Z` consumes the trailing `GMT`.
+  if epoch="$(date -u -j -f "%b %e %T %Y %Z" "$s" +%s 2>/dev/null)"; then
+    printf '%s' "$epoch"
+    return 0
+  fi
+  return 1
+}
+
 validate_validity_period() {
   local not_before_epoch not_after_epoch
   # `openssl x509 -dates` emits notBefore=... and notAfter=... in default
-  # `MMM DD HH:MM:SS YYYY GMT` format. `date -d` parses that on Linux/WSL.
+  # `MMM DD HH:MM:SS YYYY GMT` format.
   local not_before_str not_after_str
   not_before_str="$(openssl x509 -in "${CERT_PEM}" -noout -startdate 2>/dev/null | sed 's/notBefore=//')"
   not_after_str="$(openssl x509 -in "${CERT_PEM}" -noout -enddate 2>/dev/null | sed 's/notAfter=//')"
-  if ! not_before_epoch="$(date -u -d "${not_before_str}" +%s 2>/dev/null)"; then
+  if ! not_before_epoch="$(openssl_date_to_epoch "${not_before_str}")"; then
     add_reason "could not parse notBefore from cert"
     return 1
   fi
-  if ! not_after_epoch="$(date -u -d "${not_after_str}" +%s 2>/dev/null)"; then
+  if ! not_after_epoch="$(openssl_date_to_epoch "${not_after_str}")"; then
     add_reason "could not parse notAfter from cert"
     return 1
   fi

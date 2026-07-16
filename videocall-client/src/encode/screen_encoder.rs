@@ -111,6 +111,14 @@ struct LayerEncoder {
     /// dims, so a non-16:9 capture is not squashed on rungs 1..n.
     tier_w: u32,
     tier_h: u32,
+    /// This simulcast rung's fixed `target_fps` (issue #1832), captured at build
+    /// time from the rung's `SCREEN_QUALITY_TIERS` tier. Used to set the WebCodecs
+    /// `framerate` rate-control hint every time this rung's `config` is (re)built
+    /// — construction and the mid-share per-rung dimension re-fit — so the rung's
+    /// bitrate is budgeted across its real cadence (the screen ladder's rungs run
+    /// 5–10 fps), matching the base layer and the camera encoder. The rung's fps
+    /// is fixed, so it is stored once and never mutated.
+    target_fps: u32,
     /// Cached bitrate (bps) last applied to this layer's encoder.
     local_bitrate: u32,
     /// Kept alive so the JS output callback stays valid.
@@ -296,6 +304,55 @@ fn set_vbr_mode(config: &VideoEncoderConfig) {
         &JsValue::from_str("bitrateMode"),
         &JsValue::from_str("variable"),
     );
+}
+
+/// Sets the WebCodecs `framerate` rate-control hint on a [`VideoEncoderConfig`]
+/// (issue #1832).
+///
+/// This is a rate-control BUDGETING hint: it tells the encoder's rate controller
+/// how many frames per second the configured target bitrate is meant to be
+/// spread across, so it budgets bitrate-per-frame for the screen share's slow
+/// 5–10 fps cadence instead of assuming a fast (~30/60 fps) default. It does NOT
+/// change the bitrate CAP ([`VideoEncoderConfig::set_bitrate`]) or any adaptation
+/// path — but it is NOT byte-neutral: the encoder now SPENDS more of the existing
+/// budget instead of leaving it unspent, so static screen keyframes grow toward
+/// the provisioned target (measured ~52KB → ~158KB, ~3×) and shared text/code
+/// stops looking soft. Without the hint the rate controller budgets blind to the
+/// cadence and starves each frame of bits even when budget is available.
+///
+/// SIBLING-PATH NOTE (camera↔screen): the camera encoder ALREADY sets this hint
+/// from each layer's `target_fps` (see `camera_encoder.rs`, `Reflect::set(...,
+/// "framerate", ...)`). Setting it here brings the screen encoder to PARITY, so
+/// this introduces no camera↔screen divergence — it CLOSES one.
+///
+/// web-sys' `VideoEncoderConfig` exposes no `framerate` setter, so it is set via
+/// `Reflect`, the same established pattern as [`set_vbr_mode`]'s `bitrateMode`.
+fn set_framerate_hint(config: &VideoEncoderConfig, fps: u32) {
+    let _ = Reflect::set(
+        config,
+        &JsValue::from_str("framerate"),
+        &JsValue::from_f64(fps as f64),
+    );
+}
+
+/// Resolve the ACTIVE screen tier's `target_fps` (issue #1832) for the BASE
+/// (single-stream / layer-0) screen encoder from the live
+/// `shared_screen_tier_index`.
+///
+/// The base `screen_encoder` follows the adaptive `SCREEN_QUALITY_TIERS` tier —
+/// its dimensions are already driven by that tier's `max_width`/`max_height`
+/// (via the `tier_max_width`/`tier_max_height` atomics) — so the framerate
+/// rate-control hint for the base encoder is that SAME tier's `target_fps`
+/// (high=10, medium=8, low=5). Reading the shared tier index keeps the hint in
+/// lockstep with the ACTIVE tier index (medium and low share dims but differ in
+/// fps, so the hint is a function of the index, not the resolution), including
+/// across tier changes (the reconfigure paths re-read it). The index is clamped
+/// into the ladder so a stale/out-of-range value degrades to the lowest tier
+/// rather than panicking (mirrors the clamps elsewhere in this file). Higher
+/// simulcast rungs carry their own fixed `target_fps` and do NOT use this.
+fn active_screen_tier_fps(tier_index: u32) -> u32 {
+    let idx = (tier_index as usize).min(SCREEN_QUALITY_TIERS.len().saturating_sub(1));
+    SCREEN_QUALITY_TIERS[idx].target_fps
 }
 
 /// One AQ tick of the screen share's WebTransport uplink-DROP self-congestion
@@ -1852,6 +1909,9 @@ impl ScreenEncoder {
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
+        // Issue #1832: hand the encode loop the active screen tier index so its
+        // base-encoder config (re)builds can set the framerate rate-control hint.
+        let shared_screen_tier_index = self.shared_screen_tier_index.clone();
         let force_keyframe = self.force_keyframe.clone();
         // Issue #1311: hand the encode loop its own clone of the cooldown-reset atom.
         let keyframe_cooldown_reset = self.keyframe_cooldown_reset.clone();
@@ -1889,6 +1949,7 @@ impl ScreenEncoder {
                 tier_max_width,
                 tier_max_height,
                 tier_keyframe_interval,
+                shared_screen_tier_index,
                 force_keyframe,
                 keyframe_cooldown_reset,
                 active_video_track,
@@ -1943,6 +2004,9 @@ impl ScreenEncoder {
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
+        // Issue #1832: hand the encode loop the active screen tier index so its
+        // base-encoder config (re)builds can set the framerate rate-control hint.
+        let shared_screen_tier_index = self.shared_screen_tier_index.clone();
         let force_keyframe = self.force_keyframe.clone();
         // Issue #1311: hand the encode loop its own clone of the cooldown-reset atom.
         let keyframe_cooldown_reset = self.keyframe_cooldown_reset.clone();
@@ -2068,6 +2132,7 @@ impl ScreenEncoder {
                 tier_max_width,
                 tier_max_height,
                 tier_keyframe_interval,
+                shared_screen_tier_index,
                 force_keyframe,
                 keyframe_cooldown_reset,
                 active_video_track,
@@ -2114,6 +2179,13 @@ impl ScreenEncoder {
         tier_max_width: Rc<AtomicU32>,
         tier_max_height: Rc<AtomicU32>,
         tier_keyframe_interval: Rc<AtomicU32>,
+        // Issue #1832: the active adaptive SCREEN_QUALITY_TIERS index. Read at
+        // each BASE (single-stream / layer-0) `VideoEncoderConfig` (re)build to
+        // resolve that tier's `target_fps` for the framerate rate-control hint,
+        // so the base encoder budgets bitrate across its real 5–10 fps cadence.
+        // Already updated on every tier change (kept in lockstep with the active
+        // tier index this loop consumes); higher rungs use their own fps.
+        shared_screen_tier_index: Rc<AtomicU32>,
         force_keyframe: Arc<AtomicBool>,
         // Issue #1311: forced-keyframe cooldown reset. The encode loop CONSUMES this
         // each frame (`.swap(false)`) and clears `last_keyframe_emit_ms` when set, so
@@ -2594,6 +2666,14 @@ impl ScreenEncoder {
             screen_encoder_config.set_bitrate(local_bitrate as f64);
             screen_encoder_config.set_latency_mode(LatencyMode::Realtime);
             set_vbr_mode(&screen_encoder_config);
+            // Framerate rate-control hint (issue #1832): the base encoder follows
+            // the active SCREEN_QUALITY_TIERS tier, so budget its bitrate across
+            // that tier's target fps (10/8/5) rather than a fast (~30/60 fps)
+            // default. Camera parity — see `set_framerate_hint`.
+            set_framerate_hint(
+                &screen_encoder_config,
+                active_screen_tier_fps(shared_screen_tier_index.load(Ordering::Relaxed)),
+            );
             if let Err(e) = screen_encoder.configure(&screen_encoder_config) {
                 SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                 let msg = format!("Error configuring screen encoder: {e:?}");
@@ -2720,6 +2800,11 @@ impl ScreenEncoder {
                 config.set_bitrate(init_bitrate_bps);
                 config.set_latency_mode(LatencyMode::Realtime);
                 set_vbr_mode(&config);
+                // Framerate rate-control hint (issue #1832): budget this rung's
+                // bitrate across its FIXED tier cadence (this rung's `target_fps`,
+                // 5–10 fps) instead of a fast default. Camera parity — the camera's
+                // per-layer path sets the same hint from `layer_fps`.
+                set_framerate_hint(&config, tier.target_fps);
                 if let Err(e) = encoder.configure(&config) {
                     SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                     error!("Error configuring screen encoder (layer {layer_id}): {e:?}");
@@ -2737,6 +2822,9 @@ impl ScreenEncoder {
                     current_h: layer_h,
                     tier_w: tier.max_width,
                     tier_h: tier.max_height,
+                    // Issue #1832: retain this rung's fixed tier fps for the
+                    // framerate hint on every future per-rung config rebuild.
+                    target_fps: tier.target_fps,
                     local_bitrate: init_bitrate_bps as u32,
                     _output_closure: output_closure,
                     _error_closure: error_closure,
@@ -2950,6 +3038,14 @@ impl ScreenEncoder {
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     set_vbr_mode(&new_config);
+                    // Framerate hint (issue #1832): a tier change moves the base
+                    // encoder's target fps (10/8/5), so re-apply it here from the
+                    // now-current tier index — the new fps MUST be set, not just
+                    // the initial configure.
+                    set_framerate_hint(
+                        &new_config,
+                        active_screen_tier_fps(shared_screen_tier_index.load(Ordering::Relaxed)),
+                    );
                     if let Err(e) = screen_encoder.configure(&new_config) {
                         SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                         error!("Error reconfiguring screen encoder for tier change: {e:?}");
@@ -2998,6 +3094,13 @@ impl ScreenEncoder {
                     new_config.set_bitrate(local_bitrate as f64);
                     new_config.set_latency_mode(LatencyMode::Realtime);
                     set_vbr_mode(&new_config);
+                    // Framerate hint (issue #1832): re-apply on every rebuilt base
+                    // config so the per-frame bitrate budget tracks the active
+                    // tier's fps (a bitrate change alone keeps the tier's fps).
+                    set_framerate_hint(
+                        &new_config,
+                        active_screen_tier_fps(shared_screen_tier_index.load(Ordering::Relaxed)),
+                    );
                     if let Err(e) = screen_encoder.configure(&new_config) {
                         SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL.fetch_add(1, Ordering::Relaxed);
                         error!("Error configuring screen encoder: {e:?}");
@@ -3182,6 +3285,15 @@ impl ScreenEncoder {
                             cfg.set_bitrate(local_bitrate as f64);
                             cfg.set_latency_mode(LatencyMode::Realtime);
                             set_vbr_mode(&cfg);
+                            // Framerate hint (issue #1832): the base layer (0)
+                            // follows the active tier fps; re-apply on this rebuilt
+                            // config (simulcast per-layer bitrate path).
+                            set_framerate_hint(
+                                &cfg,
+                                active_screen_tier_fps(
+                                    shared_screen_tier_index.load(Ordering::Relaxed),
+                                ),
+                            );
                             if let Err(e) = screen_encoder.configure(&cfg) {
                                 SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
                                     .fetch_add(1, Ordering::Relaxed);
@@ -3292,6 +3404,15 @@ impl ScreenEncoder {
                             new_config.set_bitrate(local_bitrate as f64);
                             new_config.set_latency_mode(LatencyMode::Realtime);
                             set_vbr_mode(&new_config);
+                            // Framerate hint (issue #1832): re-apply on the
+                            // source-dimension-driven rebuild so the base encoder's
+                            // per-frame budget still reflects the active tier fps.
+                            set_framerate_hint(
+                                &new_config,
+                                active_screen_tier_fps(
+                                    shared_screen_tier_index.load(Ordering::Relaxed),
+                                ),
+                            );
                             if let Err(e) = screen_encoder.configure(&new_config) {
                                 SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
                                     .fetch_add(1, Ordering::Relaxed);
@@ -3488,6 +3609,10 @@ impl ScreenEncoder {
                                 layer.config.set_bitrate(layer.local_bitrate as f64);
                                 layer.config.set_latency_mode(LatencyMode::Realtime);
                                 set_vbr_mode(&layer.config);
+                                // Framerate hint (issue #1832): this rung's fixed
+                                // tier cadence, re-applied on the rebuilt config so
+                                // a mid-share per-rung re-fit does not drop it.
+                                set_framerate_hint(&layer.config, layer.target_fps);
                                 if let Err(e) = layer.encoder.configure(&layer.config) {
                                     SCREEN_ENCODER_ERRORS_CONFIGURE_FATAL
                                         .fetch_add(1, Ordering::Relaxed);
@@ -3642,6 +3767,7 @@ mod tests {
     use std::rc::Rc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use super::active_screen_tier_fps;
     use super::cause_hint_from_trigger;
     use super::clamp_screen_layer_count;
     use super::clear_screen_sharing_flags;
@@ -3666,6 +3792,43 @@ mod tests {
         WT_SELF_CONGESTION_DROP_THRESHOLD, WT_SELF_CONGESTION_WINDOW_MS,
     };
     use crate::{Callback, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
+
+    /// Issue #1832: the BASE (single-stream / layer-0) screen encoder resolves
+    /// its `framerate` rate-control hint from the ACTIVE `SCREEN_QUALITY_TIERS`
+    /// tier via `active_screen_tier_fps`, so it budgets bitrate across the share's
+    /// real 5–10 fps cadence instead of a fast (~30/60 fps) default (the #1832
+    /// defect). Pin that tier→fps mapping and the out-of-range clamp directly on
+    /// the production helper. Assertions use the LITERAL contract fps (high=10 /
+    /// medium=8 / low=5) — NOT a re-read of `SCREEN_QUALITY_TIERS` — so mutating
+    /// the helper (e.g. back to a blind constant, or dropping the clamp) FAILS
+    /// here, and a deliberate retune of the screen ladder's fps is forced through
+    /// review rather than passing silently.
+    #[test]
+    fn active_screen_tier_fps_maps_each_tier_and_clamps() {
+        assert_eq!(
+            active_screen_tier_fps(0),
+            10,
+            "tier 0 (high) budgets at 10 fps"
+        );
+        assert_eq!(
+            active_screen_tier_fps(1),
+            8,
+            "tier 1 (medium) budgets at 8 fps"
+        );
+        assert_eq!(
+            active_screen_tier_fps(2),
+            5,
+            "tier 2 (low) budgets at 5 fps"
+        );
+        // A stale / out-of-range tier index must clamp to the LOWEST tier's fps
+        // (5), never panic — mirrors the defensive clamps elsewhere in this file.
+        assert_eq!(
+            active_screen_tier_fps(99),
+            5,
+            "out-of-range tier index clamps to the lowest tier, no panic"
+        );
+        assert_eq!(active_screen_tier_fps(u32::MAX), 5);
+    }
 
     #[test]
     fn record_screen_restart_increments_each_reason_counter() {

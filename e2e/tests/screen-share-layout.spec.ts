@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * Screen-share split-layout E2E tests.
@@ -347,7 +348,7 @@ test.describe("Screen-share split-layout", () => {
       });
 
       // Guest starts the mocked screen share.
-      await guestPage.mouse.move(400, 400);
+      await wakeControls(guestPage);
       await guestPage.waitForTimeout(300);
       const shareButton = guestPage.locator("button.video-control-button", {
         has: guestPage.locator(".tooltip", { hasText: "Share Screen" }),
@@ -436,7 +437,7 @@ test.describe("Screen-share split-layout", () => {
       });
 
       // Guest triggers screen share.
-      await guestPage.mouse.move(400, 400);
+      await wakeControls(guestPage);
       await guestPage.waitForTimeout(300);
       const shareButton = guestPage.locator("button.video-control-button", {
         has: guestPage.locator(".tooltip", { hasText: "Share Screen" }),
@@ -527,7 +528,7 @@ test.describe("Screen-share split-layout", () => {
       });
 
       // Guest triggers screen share.
-      await guestPage.mouse.move(400, 400);
+      await wakeControls(guestPage);
       await guestPage.waitForTimeout(300);
       const shareButton = guestPage.locator("button.video-control-button", {
         has: guestPage.locator(".tooltip", { hasText: "Share Screen" }),

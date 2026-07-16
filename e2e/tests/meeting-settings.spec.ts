@@ -59,6 +59,86 @@ test.describe("Meeting settings – Options toggles", () => {
       .locator('button[role="switch"]');
   }
 
+  /**
+   * Locate an Activity-card stat row by the EXACT text of its
+   * `.settings-stat-label` span. Anchored on the RSX structure
+   * (`<div class="settings-stat-row"><span class="settings-stat-label">…`) so
+   * the match is stable against timestamp/value text and copy changes elsewhere
+   * on the page. The exact-match regex avoids "Started"/"Ended" substring
+   * collisions with any other row.
+   */
+  function statRow(page: Page, label: string): Locator {
+    return page.locator(".settings-stat-row").filter({
+      has: page.locator(".settings-stat-label", { hasText: new RegExp(`^${label}$`) }),
+    });
+  }
+
+  // Issue 1672: the Activity card renders the meeting time as SEPARATE labeled
+  // field-lines ("Started", optionally "Ended", "Duration") instead of the old
+  // single-line "started – ended" range that overflowed the dialog at narrow
+  // widths. These two tests pin the new per-state row structure.
+  test("open meeting Activity card shows Started and Duration rows but no Ended row (issue 1672)", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_activity_open_${Date.now()}`;
+    await createMeetingAndOpenSettings(page, meetingId, "activity-open-user");
+
+    // Open (idle/active) meeting: "Started" and "Duration" each render as their
+    // own labeled row with a non-empty value.
+    const startedRow = statRow(page, "Started");
+    await expect(startedRow).toBeVisible();
+    await expect(startedRow.locator(".settings-stat-value")).toHaveText(/\S/);
+
+    const durationRow = statRow(page, "Duration");
+    await expect(durationRow).toBeVisible();
+    await expect(durationRow.locator(".settings-stat-value")).toHaveText(/\S/);
+
+    // No "Ended" row while the meeting is still open (ended_at is None).
+    await expect(page.locator(".settings-stat-label", { hasText: /^Ended$/ })).toHaveCount(0);
+
+    // The pre-1672 combined single-line range is gone: no "Time" label and no
+    // ".settings-stat-separator" span. (For an OPEN meeting the pre-fix label
+    // was already "Started", so this documents the new structure — the ended
+    // test below carries the discriminating assertion.)
+    await expect(page.locator(".settings-stat-label", { hasText: /^Time$/ })).toHaveCount(0);
+    await expect(page.locator(".settings-stat-separator")).toHaveCount(0);
+  });
+
+  test("ended meeting Activity card shows distinct Started, Ended, and Duration rows (issue 1672)", async ({
+    page,
+  }) => {
+    const meetingId = `e2e_activity_ended_${Date.now()}`;
+    await createMeetingAndOpenSettings(page, meetingId, "activity-ended-user");
+
+    // Drive the real end-meeting flow from the settings page. The page uses
+    // window.confirm, which Playwright auto-DISMISSES unless we explicitly
+    // accept it, so register the handler before clicking.
+    page.once("dialog", (dialog) => dialog.accept());
+    await page.getByRole("button", { name: /End Meeting/ }).click();
+
+    // Once ended, the Activity card renders THREE separate labeled rows. The
+    // distinct "Ended" row is the discriminator: the pre-1672 code rendered a
+    // single combined "Time" label whose value was a ".settings-stat-separator"
+    // range and had NO "Ended" label — so this row's presence (and the absence
+    // of "Time" / the separator asserted below) fails on the un-fixed code.
+    const endedRow = statRow(page, "Ended");
+    await expect(endedRow).toBeVisible({ timeout: 10_000 });
+    await expect(endedRow.locator(".settings-stat-value")).toHaveText(/\S/);
+
+    const startedRow = statRow(page, "Started");
+    await expect(startedRow).toBeVisible();
+    await expect(startedRow.locator(".settings-stat-value")).toHaveText(/\S/);
+
+    const durationRow = statRow(page, "Duration");
+    await expect(durationRow).toBeVisible();
+    await expect(durationRow.locator(".settings-stat-value")).toHaveText(/\S/);
+
+    // The old single-line combined range must be fully gone in the new layout:
+    // no "Time" label (it is now "Started"/"Ended") and no range separator span.
+    await expect(page.locator(".settings-stat-label", { hasText: /^Time$/ })).toHaveCount(0);
+    await expect(page.locator(".settings-stat-separator")).toHaveCount(0);
+  });
+
   test("settings page displays both Waiting Room and Participants can admit others toggles", async ({
     page,
   }) => {
@@ -172,6 +252,55 @@ test.describe("Meeting settings – Options toggles", () => {
       timeout: 5_000,
     });
     await expect(acaToggle).toBeDisabled();
+  });
+
+  // Regression: disabling Waiting Room optimistically clears "Admitted can
+  // admit" (ACA). If the update_meeting PATCH then FAILS, the client must roll
+  // BOTH toggles back — pre-fix, only Waiting Room was restored, leaving ACA
+  // stuck OFF on screen while the server still had it ON. This drives the
+  // error-branch wiring (secondary rollback) that the pure unit tests cannot:
+  // reverting the rollback wiring in meeting_options_controls.rs makes the
+  // final ACA assertion below time out.
+  test("failed Waiting Room disable restores Admitted can admit", async ({ page }) => {
+    const meetingId = `e2e_opt_rollback_${Date.now()}`;
+    await createMeetingAndOpenSettings(page, meetingId, "rollback-user");
+
+    const wrToggle = optionToggle(page, "Waiting Room");
+    const acaToggle = optionToggle(page, "Admitted can admit");
+
+    // Precondition: Waiting Room ON (default) and ACA turned ON via a REAL
+    // (succeeding) PATCH — the route interceptor is installed only afterwards.
+    await expect(wrToggle).toHaveAttribute("aria-checked", "true");
+    await acaToggle.click();
+    await expect(acaToggle).toHaveAttribute("aria-checked", "true", {
+      timeout: 5_000,
+    });
+
+    // Force the NEXT update_meeting PATCH (the Waiting-Room disable) to fail.
+    // Installed after the ACA-enable PATCH already succeeded, so only the
+    // disable call fails; all other meeting API traffic passes through.
+    await page.route("**/api/v1/meetings/**", async (route) => {
+      if (route.request().method() === "PATCH") {
+        await route.fulfill({
+          status: 500,
+          contentType: "application/json",
+          body: JSON.stringify({ success: false, error: "e2e forced failure" }),
+        });
+        return;
+      }
+      await route.continue();
+    });
+
+    // Disable Waiting Room: optimistically clears both toggles, PATCH fails,
+    // client rolls BOTH back to ON.
+    await wrToggle.click();
+
+    await expect(wrToggle).toHaveAttribute("aria-checked", "true", {
+      timeout: 5_000,
+    });
+    await expect(acaToggle).toHaveAttribute("aria-checked", "true", {
+      timeout: 5_000,
+    });
   });
 
   test("toggle state persists after page reload", async ({ page }) => {

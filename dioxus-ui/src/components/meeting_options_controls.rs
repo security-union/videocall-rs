@@ -58,6 +58,18 @@ fn info_icon(title: &str) -> Element {
     }
 }
 
+/// Disabling the waiting room also clears admitted-can-admit, so on failure both
+/// roll back: the waiting-room value and the prior admitted-can-admit value.
+/// Enabling touches only the waiting-room value.
+///
+/// Returns `(waiting_room_restore, admitted_can_admit_restore)`; the second
+/// element is `Some(prev)` only when the disable cleared it.
+fn waiting_room_rollback(new_val: bool, prev_aca: bool) -> (bool, Option<bool>) {
+    let waiting_room_restore = !new_val;
+    let admitted_can_admit_restore = if new_val { None } else { Some(prev_aca) };
+    (waiting_room_restore, admitted_can_admit_restore)
+}
+
 /// The four owner-editable meeting-option rows, wired to caller-owned signals.
 #[component]
 pub fn MeetingOptionsControls(
@@ -78,6 +90,7 @@ pub fn MeetingOptionsControls(
                   allow_guests_opt: Option<bool>,
                   mut rollback_signal: Signal<bool>,
                   old_val: bool,
+                  secondary_rollback: Option<(Signal<bool>, bool)>,
                   mut saving: Signal<bool>,
                   mut toggle_error: Signal<Option<String>>| {
                 saving.set(true);
@@ -102,6 +115,12 @@ pub fn MeetingOptionsControls(
                         Err(e) => {
                             log::error!("Failed to update meeting setting: {e}");
                             rollback_signal.set(old_val);
+                            // Restore any signal cleared as a side effect
+                            // (waiting-room disable also clears admitted-can-admit).
+                            if let Some((mut secondary_signal, secondary_old)) = secondary_rollback
+                            {
+                                secondary_signal.set(secondary_old);
+                            }
                             saving.set(false);
                             toggle_error.set(Some(format!("Failed to update setting: {e}")));
                         }
@@ -130,12 +149,18 @@ pub fn MeetingOptionsControls(
                             if saving() {
                                 return;
                             }
-                            let old_val = !new_val;
+                            // Capture prior admitted-can-admit before the optimistic
+                            // clear, so a failed PATCH can restore it.
+                            let prev_aca = admitted_can_admit_toggle();
+                            let (old_val, aca_restore) =
+                                waiting_room_rollback(new_val, prev_aca);
                             waiting_room_toggle.set(new_val);
                             // Disabling the waiting room also disables admitted-can-admit.
                             if !new_val {
                                 admitted_can_admit_toggle.set(false);
                             }
+                            let secondary_rollback =
+                                aca_restore.map(|prev| (admitted_can_admit_toggle, prev));
                             let aca = if new_val { None } else { Some(false) };
                             update_setting(
                                 meeting_id.clone(),
@@ -145,6 +170,7 @@ pub fn MeetingOptionsControls(
                                 None,
                                 waiting_room_toggle,
                                 old_val,
+                                secondary_rollback,
                                 saving,
                                 toggle_error,
                             );
@@ -181,6 +207,7 @@ pub fn MeetingOptionsControls(
                                 None,
                                 admitted_can_admit_toggle,
                                 old_val,
+                                None,
                                 saving,
                                 toggle_error,
                             );
@@ -215,6 +242,7 @@ pub fn MeetingOptionsControls(
                                 None,
                                 end_on_host_leave_toggle,
                                 old_val,
+                                None,
                                 saving,
                                 toggle_error,
                             );
@@ -249,6 +277,7 @@ pub fn MeetingOptionsControls(
                                 Some(new_val),
                                 allow_guests_toggle,
                                 old_val,
+                                None,
                                 saving,
                                 toggle_error,
                             );
@@ -261,5 +290,45 @@ pub fn MeetingOptionsControls(
         if let Some(err) = toggle_error() {
             p { class: "toggle-error", "{err}" }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Disabling the waiting room clears admitted-can-admit, so a failed PATCH
+    /// must restore both to ON. Fails if the second element is `None`.
+    #[test]
+    fn disabling_waiting_room_with_aca_on_rolls_back_both() {
+        // Host flips Waiting Room OFF while admitted-can-admit was ON.
+        let (wr_restore, aca_restore) = waiting_room_rollback(false, true);
+        assert!(wr_restore, "waiting room must roll back to ON");
+        assert_eq!(
+            aca_restore,
+            Some(true),
+            "admitted-can-admit must roll back to its prior ON value, not stay cleared",
+        );
+    }
+
+    /// Disabling with admitted-can-admit already OFF restores it to OFF, never
+    /// spuriously turns it on.
+    #[test]
+    fn disabling_waiting_room_with_aca_off_restores_off() {
+        let (wr_restore, aca_restore) = waiting_room_rollback(false, false);
+        assert!(wr_restore);
+        assert_eq!(aca_restore, Some(false));
+    }
+
+    /// Enabling never touches admitted-can-admit, so there is no secondary
+    /// rollback target.
+    #[test]
+    fn enabling_waiting_room_has_no_secondary_rollback() {
+        let (wr_restore, aca_restore) = waiting_room_rollback(true, true);
+        assert!(!wr_restore, "waiting room must roll back to OFF");
+        assert_eq!(
+            aca_restore, None,
+            "enabling must not schedule an admitted-can-admit rollback",
+        );
     }
 }

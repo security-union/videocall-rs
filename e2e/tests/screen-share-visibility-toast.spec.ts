@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * Screen-share visibility toast E2E (HCL issue 893).
@@ -218,7 +219,7 @@ test.describe("Screen-share visibility toast", () => {
       });
 
       // Reveal dock controls.
-      await hostPage.mouse.move(400, 400);
+      await wakeControls(hostPage);
       await hostPage.waitForTimeout(500);
 
       await clickScreenShareButton(hostPage);
@@ -285,7 +286,7 @@ test.describe("Screen-share visibility toast", () => {
         timeout: 10_000,
       });
 
-      await hostPage.mouse.move(400, 400);
+      await wakeControls(hostPage);
       await hostPage.waitForTimeout(500);
 
       await clickScreenShareButton(hostPage);

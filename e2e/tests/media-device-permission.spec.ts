@@ -52,9 +52,25 @@ const PREJOIN_PREVIEW = '[data-testid="prejoin-preview"]';
 const CAMERA_BTN = '[data-testid="camera-toggle-button"]';
 const MIC_BTN = '[data-testid="mic-toggle-button"]';
 const MODAL = '[data-testid="device-warning-modal"]';
+// The inner dialog surface. `.modal-overlay.in-meeting .modal-window` in
+// global.css must give this a SOLID, theme-aware background so its actionable
+// error text is readable over the translucent in-meeting backdrop + live video.
+const MODAL_WINDOW = `${MODAL} .modal-window`;
 
 const MEETING_READY = "Your meeting is ready!";
 
+/**
+ * Alpha channel of a CSS computed color. `getComputedStyle().backgroundColor`
+ * renders a fully-opaque fill as `rgb(...)` (implicit alpha 1) and any
+ * translucency as `rgba(..., a)` with an explicit sub-1 alpha; `transparent`
+ * renders as `rgba(0, 0, 0, 0)`. Returns 1 for the opaque `rgb(...)` form.
+ */
+function cssAlpha(color: string): number {
+  const m = color.match(/^rgba?\(([^)]+)\)$/);
+  if (!m) return 1;
+  const parts = m[1].split(",").map((s) => s.trim());
+  return parts.length === 4 ? parseFloat(parts[3]) : 1;
+}
 // Exact in-meeting copy for the DeviceInUse case (attendants.rs
 // render_single_device_error). The leading device name is substituted per side.
 const CAMERA_IN_USE_COPY =
@@ -383,6 +399,127 @@ test.describe("In-meeting device-permission handling", () => {
     await expect(mic).not.toBeDisabled();
     await expect(mic).toHaveClass(/\berror\b/);
     await expect(mic.locator(".device-warning")).toBeVisible();
+  });
+
+  // ─── Item 1 (a11y): Escape dismisses the device-warning modal ──────────────
+  //
+  // The dialog now carries role="dialog"/aria-modal + an Escape handler that
+  // calls the SAME on_dismiss the "Ok" button uses. A permanently blocked
+  // (NotAllowedError → PermissionDenied) camera raises the modal and is NOT
+  // auto-retried, so it stays up until the user dismisses it — here via the
+  // keyboard. Mutation sensitivity: remove the onkeydown/Escape handler in
+  // render_device_warning_modal and this times out (the modal never hides).
+  test("Escape dismisses the in-meeting device-warning modal", async ({ page }) => {
+    await gotoAndJoin(page, `e2e_perm_escape_${Date.now()}`);
+
+    await setGumFail(page, { errorName: "NotAllowedError", video: -1 });
+
+    const camera = page.locator(CAMERA_BTN);
+    const modal = page.locator(MODAL);
+
+    await camera.click();
+    await expect(modal).toBeVisible({ timeout: 15_000 });
+    await expect(modal).toContainText(CAMERA_BLOCKED_COPY);
+
+    // The dialog announces itself and is the focus target on open, so Escape is
+    // delivered to its onkeydown handler without any prior click inside.
+    const dialog = modal.getByRole("dialog");
+    await expect(dialog).toHaveAttribute("aria-modal", "true");
+
+    await page.keyboard.press("Escape");
+
+    // Escape closes the modal exactly like clicking "Ok".
+    await expect(modal).toBeHidden({ timeout: 5_000 });
+    // The control remains clickable afterward (no deadlock).
+    await expect(camera).not.toBeDisabled();
+  });
+
+  // ─── Item 2: the in-meeting warning does NOT fully black out the live call ──
+  //
+  // Pre-join uses the opaque `.modal-overlay`; the in-meeting call site adds the
+  // `.in-meeting` modifier which swaps the backdrop to the semi-transparent
+  // `--overlay-backdrop` token so remote peers / the still-working device stay
+  // visible-but-dimmed. Mutation sensitivity: drop the `.in-meeting` class at the
+  // in-meeting call site (or revert the CSS) and the computed backdrop reverts to
+  // fully opaque `rgb(0, 0, 0)`, failing the alpha assertion below.
+  test("in-meeting device-warning overlay is translucent, not fully opaque black", async ({
+    page,
+  }) => {
+    await gotoAndJoin(page, `e2e_perm_overlay_${Date.now()}`);
+
+    await setGumFail(page, { errorName: "NotAllowedError", video: -1 });
+
+    const camera = page.locator(CAMERA_BTN);
+    const modal = page.locator(MODAL);
+
+    await camera.click();
+    await expect(modal).toBeVisible({ timeout: 15_000 });
+
+    // The in-meeting call site tags the overlay with `.in-meeting`.
+    await expect(modal).toHaveClass(/\bin-meeting\b/);
+
+    // The computed backdrop is the semi-transparent token (rgba with alpha < 1),
+    // NOT the opaque `rgb(0, 0, 0)` the pre-join overlay uses. getComputedStyle
+    // renders a sub-1 alpha as an `rgba(...)` string, so an opaque backdrop would
+    // read as `rgb(0, 0, 0)` and fail both assertions.
+    const bg = await modal.evaluate((el) => getComputedStyle(el).backgroundColor);
+    expect(bg).not.toBe("rgb(0, 0, 0)");
+    expect(bg).toMatch(/^rgba\(0,\s*0,\s*0,\s*0?\.\d+\)$/);
+
+    // ── Regression guard for the readability bug ──────────────────────────────
+    // Because the overlay backdrop above is translucent AND sits over a live,
+    // blurred call, the inner `.modal-window` MUST supply its own SOLID surface
+    // (via `.modal-overlay.in-meeting .modal-window` → --surface-elevated) so the
+    // actionable error copy is readable regardless of the video luminance behind
+    // it. Without that rule `.modal-window` has no matching background and
+    // computes `rgba(0, 0, 0, 0)` (transparent) — failing the alpha assertion.
+    // Mutation sensitivity: delete the `.modal-overlay.in-meeting .modal-window`
+    // rule and `windowBg` reverts to `rgba(0, 0, 0, 0)`, breaking both asserts.
+    const windowBg = await page
+      .locator(MODAL_WINDOW)
+      .evaluate((el) => getComputedStyle(el).backgroundColor);
+    // Fully opaque (alpha === 1), and NOT the see-through overlay backdrop.
+    expect(cssAlpha(windowBg)).toBe(1);
+    expect(windowBg).not.toBe("rgba(0, 0, 0, 0)");
+    expect(windowBg).not.toBe(bg);
+    // Default (no `ui-theme`) is the dark palette → --surface-elevated #2c2c2e.
+    expect(windowBg).toBe("rgb(44, 44, 46)");
+  });
+
+  // ─── Same solid-surface guard, LIGHT theme ─────────────────────────────────
+  //
+  // The readability failure is content- AND theme-dependent: in light theme
+  // --text-primary is near-black (#1a1a1a) and, without a solid window, would
+  // render dark-on-dimmed-dark video. --surface-elevated is theme-aware
+  // (#f9f9fb light / #2c2c2e dark), so this asserts the light-theme window is a
+  // solid LIGHT surface — proving the fix adapts and did not hardcode a color.
+  // Theme is selected the same way theme-init.spec.ts does: seed
+  // localStorage["ui-theme"] before boot so apply_and_save_theme() applies it on
+  // mount. Mutation sensitivity: revert to a hardcoded dark `background: #1c1c1e`
+  // (the `.modal-content` mistake CLAUDE.md warns against) and this fails.
+  test("in-meeting device-warning modal window has a solid light surface in light theme", async ({
+    page,
+  }) => {
+    await page.addInitScript(() => localStorage.setItem("ui-theme", "light"));
+
+    await gotoAndJoin(page, `e2e_perm_window_light_${Date.now()}`);
+
+    // Confirm the light palette is actually active before asserting its token.
+    await expect
+      .poll(() => page.evaluate(() => document.documentElement.getAttribute("data-theme")))
+      .toBe("light");
+
+    await setGumFail(page, { errorName: "NotAllowedError", video: -1 });
+
+    await page.locator(CAMERA_BTN).click();
+    await expect(page.locator(MODAL)).toBeVisible({ timeout: 15_000 });
+
+    const windowBg = await page
+      .locator(MODAL_WINDOW)
+      .evaluate((el) => getComputedStyle(el).backgroundColor);
+    // Solid (alpha 1) and the light-theme token --surface-elevated #f9f9fb.
+    expect(cssAlpha(windowBg)).toBe(1);
+    expect(windowBg).toBe("rgb(249, 249, 251)");
   });
 
   // ─── Extended-duration: the 60s backoff plateau does NOT wedge ─────────────

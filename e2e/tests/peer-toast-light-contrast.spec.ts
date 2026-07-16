@@ -200,6 +200,92 @@ function luminance(value: string): number {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b;
 }
 
+// data-testid on the synthetic container so every assertion below is scoped to
+// OUR injected nodes and can never collide with a real toast the app happens to
+// render (e.g. a "Host muted your microphone" toast, which also carries
+// `.toast-left`).
+const SYNTHETIC_TESTID = "synthetic-peer-toasts";
+
+/**
+ * Inject the leave / loading / error toast variants into the LIVE meeting
+ * document, faithfully mirroring the markup that `attendants.rs` renders
+ * (peer join/leave block ~L6616-6685, screen-share loading ~L6444-6465, error
+ * ~L6496-6528). We inject rather than produce these toasts through the app for
+ * two reasons the harness makes unavoidable:
+ *
+ *   1. The "left the meeting" toast is SUPPRESSED in this harness by a known
+ *      videocall-client callback-ordering bug — the peer is removed from the
+ *      decode manager before `on_peer_left` fires, so `has_peer_with_user_id()`
+ *      returns false and the toast is never pushed. This is why the two
+ *      leave-toast tests in toast-notifications.spec.ts are `test.skip`; a real
+ *      `guestPage.close()` leave flow TIMES OUT and cannot run green.
+ *   2. The screen-share loading/error toasts require a `ScreenShareToastState`
+ *      transition the fake-media harness does not deterministically produce.
+ *      Issue #1281 explicitly sanctions driving these "synthetically".
+ *
+ * What is under test here is the CSS RULE, not the toast-production path: the
+ * real stylesheet is loaded, the real `html[data-theme="light"]` is set via the
+ * real toggle, and the injected DOM matches the exact selectors the rules
+ * target. Reverting any of the guarded rules to a theme-flipping token makes
+ * `getComputedStyle().color` near-black under light theme and fails the
+ * assertion below — the same mutation-honesty the join-toast test above relies
+ * on. The nodes are appended OUTSIDE the Dioxus tree, so the framework's
+ * reconciler never touches or removes them.
+ */
+async function injectSyntheticToasts(page: Page): Promise<void> {
+  await page.evaluate((testid: string) => {
+    // Remove a prior injection if the test re-runs within the same page.
+    document.querySelector(`[data-testid="${testid}"]`)?.remove();
+
+    // NOTE: `<svg>` inside an HTML `innerHTML` string is parsed into the SVG
+    // namespace by the HTML fragment parser, so these become real SVGElements
+    // whose computed `color` (driving `stroke="currentColor"`) is exactly what
+    // the `.toast-icon svg` rules set.
+    const container = document.createElement("div");
+    container.className = "peer-toasts";
+    container.setAttribute("data-testid", testid);
+    container.innerHTML = `
+      <div class="peer-toast toast-left">
+        <span class="toast-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"></path>
+            <circle cx="9" cy="7" r="4"></circle>
+            <line x1="22" y1="11" x2="16" y2="11"></line>
+          </svg>
+        </span>
+        <span class="toast-text">
+          <span class="toast-name">SyntheticLeaver</span>
+          <br />
+          <span class="toast-action">left the meeting</span>
+        </span>
+      </div>
+      <div class="peer-toast toast-loading screen-share-toast" role="status" aria-live="polite" aria-label="Starting to share content">
+        <span class="toast-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M21 12a9 9 0 1 1-6.219-8.56"></path>
+          </svg>
+        </span>
+        <span class="toast-text">
+          <span class="toast-name">Starting to share content...</span>
+        </span>
+      </div>
+      <div class="peer-toast toast-error screen-share-toast" role="alert" aria-live="assertive" aria-label="Screen share visibility error">
+        <span class="toast-icon">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="8" x2="12" y2="12"></line>
+            <line x1="12" y1="16" x2="12.01" y2="16"></line>
+          </svg>
+        </span>
+        <span class="toast-text">
+          <span class="toast-name">Screen share failed</span>
+        </span>
+      </div>
+    `;
+    document.body.appendChild(container);
+  }, SYNTHETIC_TESTID);
+}
+
 test.describe("Peer toast text contrast in light theme (#1189)", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -290,6 +376,101 @@ test.describe("Peer toast text contrast in light theme (#1189)", () => {
     } finally {
       await browser1.close();
       await browser2.close();
+    }
+  });
+
+  // Companion to the join-toast test above. The join flow only exercises TWO of
+  // the six literal-light rules PR #1280 changed (`.toast-name` and the green
+  // join `.toast-action`); the leave-variant faint text/icon, the base
+  // `.peer-toast` color, and the loading/error icons went unpinned — issue
+  // #1281. Because the leave toast is suppressed in the harness (callback-order
+  // bug; see toast-notifications.spec.ts `test.skip`) and the screen-share
+  // loading/error states are not deterministically producible with fake media,
+  // we drive those variants synthetically (issue #1281 sanctions this) against
+  // the REAL stylesheet under the REAL light-theme toggle. See
+  // `injectSyntheticToasts` for the full rationale and mutation-honesty note.
+  test("leave/loading/error toast variants stay light-on-dark in light theme @bvt1", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(120_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `e2e_toast_light_variants_${Date.now()}`;
+
+    // Single participant: we inject the toast DOM, so no guest is needed. The
+    // host only has to reach the grid (for the in-meeting Appearance toggle).
+    const browser1 = await chromium.launch({ args: BROWSER_ARGS });
+
+    try {
+      const hostCtx = await createAuthenticatedContext(
+        browser1,
+        "host-toast-variants@videocall.rs",
+        "ToastVariantsHost",
+        uiURL,
+      );
+
+      const hostPage = await hostCtx.newPage();
+
+      // Host starts the meeting.
+      await navigateToMeeting(hostPage, meetingId, "ToastVariantsHost");
+      const hostResult = await joinMeetingFromPage(hostPage);
+      expect(hostResult).toBe("in-meeting");
+      await expect(hostPage.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+      // Force LIGHT theme via the real Appearance toggle — the theme under which
+      // the #1189 bug manifested.
+      await setLightThemeFromMeeting(hostPage);
+
+      // Inject the leave/loading/error toast variants into the live document.
+      await injectSyntheticToasts(hostPage);
+
+      const container = hostPage.locator(`[data-testid="${SYNTHETIC_TESTID}"]`);
+      await expect(container).toBeVisible();
+
+      // Confirm we are still in light theme at assertion time (a stray re-init
+      // flipping back to dark would make the assertions pass for the wrong
+      // reason — every guarded token is already light on dark).
+      expect(
+        await hostPage.evaluate(() => document.documentElement.getAttribute("data-theme")),
+      ).toBe("light");
+
+      // ── Base `.peer-toast` color (guards the `--on-dark-text` / former
+      // `#ffffff` base rule; a revert to `--text-primary` = `#1a1a1a` under
+      // light theme has luminance ~26, failing the floor). Read on the leave
+      // toast div itself, whose own `color` is the un-overridden base value. ──
+      const baseColor = await container
+        .locator(".peer-toast.toast-left")
+        .evaluate((el) => window.getComputedStyle(el).color);
+      expect(luminance(baseColor)).toBeGreaterThan(LIGHT_LUMINANCE_FLOOR);
+
+      // ── Leave-variant action text ("left the meeting"). The strongest gap:
+      // #1189 explicitly names "join/leave". Reverting `.toast-left
+      // .toast-action` restores `--text-on-glass-faint` = rgba(0,0,0,0.44)
+      // under light theme (luminance 0), failing the floor. ──
+      const leaveActionColor = await container
+        .locator(".peer-toast.toast-left .toast-action")
+        .evaluate((el) => window.getComputedStyle(el).color);
+      expect(luminance(leaveActionColor)).toBeGreaterThan(LIGHT_LUMINANCE_FLOOR);
+
+      // ── Leave-variant icon SVG (reverts to rgba(0,0,0,0.45), luminance 0).
+      // getComputedStyle(svg).color drives the `stroke="currentColor"`. ──
+      const leaveIconColor = await container
+        .locator(".peer-toast.toast-left .toast-icon svg")
+        .evaluate((el) => window.getComputedStyle(el).color);
+      expect(luminance(leaveIconColor)).toBeGreaterThan(LIGHT_LUMINANCE_FLOOR);
+
+      // ── Loading-variant icon SVG (screen-share "Starting..." toast). ──
+      const loadingIconColor = await container
+        .locator(".peer-toast.toast-loading .toast-icon svg")
+        .evaluate((el) => window.getComputedStyle(el).color);
+      expect(luminance(loadingIconColor)).toBeGreaterThan(LIGHT_LUMINANCE_FLOOR);
+
+      // ── Error-variant icon SVG (screen-share failure toast). ──
+      const errorIconColor = await container
+        .locator(".peer-toast.toast-error .toast-icon svg")
+        .evaluate((el) => window.getComputedStyle(el).color);
+      expect(luminance(errorIconColor)).toBeGreaterThan(LIGHT_LUMINANCE_FLOOR);
+    } finally {
+      await browser1.close();
     }
   });
 });

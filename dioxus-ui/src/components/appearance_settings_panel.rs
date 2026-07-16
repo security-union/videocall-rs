@@ -117,6 +117,7 @@ pub fn AppearanceSettingsPanel() -> Element {
     let preview_style = preview_glow_style(&appearance);
     let brightness_slider_style = slider_fill_style(appearance.glow_brightness);
     let inner_slider_style = slider_fill_style(appearance.inner_glow_strength);
+    let decay_slider_style = slider_fill_style(appearance.glow_decay);
 
     let mut custom_colors = use_signal(load_custom_colors_from_storage);
     let mut show_picker = use_signal(|| false);
@@ -823,6 +824,7 @@ pub fn AppearanceSettingsPanel() -> Element {
                                 input {
                                     r#type: "range",
                                     class: "appearance-slider",
+                                    "data-testid": "speaker-highlight-brightness-slider",
                                     style: "{brightness_slider_style}",
                                     min: "0",
                                     max: "100",
@@ -844,10 +846,11 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
 
                             div { class: "appearance-slider-row",
-                                label { class: "appearance-slider-label", "Inner Glow" }
+                                label { class: "appearance-slider-label", "Glow" }
                                 input {
                                     r#type: "range",
                                     class: "appearance-slider",
+                                    "data-testid": "speaker-highlight-glow-slider",
                                     style: "{inner_slider_style}",
                                     min: "0",
                                     max: "100",
@@ -866,6 +869,60 @@ pub fn AppearanceSettingsPanel() -> Element {
                                 span { class: "appearance-slider-value",
                                     "{(appearance.inner_glow_strength * 100.0) as i32}%"
                                 }
+                            }
+
+                            div { class: "appearance-slider-row",
+                                label { class: "appearance-slider-label", "Decay" }
+                                input {
+                                    r#type: "range",
+                                    class: "appearance-slider",
+                                    "data-testid": "speaker-highlight-decay-slider",
+                                    "aria-label": "Decay",
+                                    style: "{decay_slider_style}",
+                                    min: "0",
+                                    max: "100",
+                                    value: "{(appearance.glow_decay * 100.0) as i32}",
+                                    oninput: move |evt: Event<FormData>| {
+                                        if let Ok(value) = evt.value().parse::<f32>() {
+                                            appearance_ctx
+                                                .0
+                                                .set(AppearanceSettings {
+                                                    glow_decay: (value / 100.0).clamp(0.0, 1.0),
+                                                    ..appearance_ctx.0()
+                                                });
+                                        }
+                                    },
+                                }
+                                span { class: "appearance-slider-value",
+                                    "{(appearance.glow_decay * 100.0) as i32}%"
+                                }
+                            }
+
+                            p { class: "appearance-section-helper",
+                                "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail."
+                            }
+
+                            div { class: "appearance-slider-row",
+                                span { class: "appearance-slider-label", "" }
+                                button {
+                                    r#type: "button",
+                                    class: "theme-reset-btn",
+                                    "data-testid": "speaker-highlight-reset-btn",
+                                    "aria-label": "Reset speaker highlight settings to defaults",
+                                    onclick: move |_| {
+                                        let defaults = AppearanceSettings::default();
+                                        appearance_ctx.0.set(AppearanceSettings {
+                                            glow_enabled: defaults.glow_enabled,
+                                            glow_color: defaults.glow_color,
+                                            glow_brightness: defaults.glow_brightness,
+                                            inner_glow_strength: defaults.inner_glow_strength,
+                                            glow_decay: defaults.glow_decay,
+                                            ..appearance_ctx.0()
+                                        });
+                                    },
+                                    "Reset highlight"
+                                }
+                                span { class: "appearance-slider-value", "" }
                             }
                         } // speaker-highlight-controls
 
@@ -936,6 +993,13 @@ fn preview_glow_style(settings: &AppearanceSettings) -> String {
 
     let (r, g, b) = settings.glow_color.to_rgb();
     let p = calculate_glow_params(0.55, settings.glow_brightness, settings.inner_glow_strength);
+    if settings.inner_glow_strength <= f32::EPSILON {
+        // @token-exempt: dynamic rgba from settings.glow_color.to_rgb(), not a hardcoded color
+        return format!(
+            "box-shadow: none; border-color: rgba({r}, {g}, {b}, {:.2});",
+            p.border_alpha,
+        );
+    }
     let blur_scale = 0.60_f32;
     let spread_scale = 0.70_f32;
     let alpha_scale = if is_light_theme() { 0.42_f32 } else { 0.60_f32 };

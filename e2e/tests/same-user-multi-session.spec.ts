@@ -1,6 +1,7 @@
 import { test, expect, chromium, BrowserContext, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * Regression coverage for HCL issue #828 — "same authed user multiple times not
@@ -418,7 +419,7 @@ test.describe("Same authed user — multiple sessions in one meeting", () => {
       // ---- Session A starts screen sharing ----
       // The Share Screen button auto-hides; nudge the mouse to reveal the
       // control bar before clicking.
-      await pageA.mouse.move(400, 400);
+      await wakeControls(pageA);
       await pageA.waitForTimeout(300);
       const shareButton = pageA.locator("button.video-control-button", {
         has: pageA.locator(".tooltip", { hasText: "Share Screen" }),

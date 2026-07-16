@@ -628,7 +628,10 @@ impl HealthReporter {
         let bytes = pb.write_to_bytes().unwrap_or_default();
         Some(PacketWrapper {
             packet_type: PacketType::HEALTH.into(),
-            user_id: reporting_peer.as_bytes().to_vec(),
+            // Envelope carries no email; the relay stamps the authenticated
+            // session_id. (Inner HealthPacket.reporting_user_id is a separate
+            // follow-up.)
+            user_id: Vec::new(),
             data: bytes,
             ..Default::default()
         })

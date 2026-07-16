@@ -640,6 +640,14 @@ pub struct PeerDecodeManager {
     /// creates a peer later (after the first media packet arrives), the display
     /// name is immediately available and does not fall back to user_id/email.
     display_name_cache: HashMap<String, String>,
+    /// Cache of session_id -> user_id (email), populated from the server-authored
+    /// PARTICIPANT_JOINED roster (`target_user_id`). This is the ONLY source of
+    /// peer identity: media/control packets no longer carry an email on the
+    /// envelope, so `add_peer()` resolves `peer.user_id` from here (falling back
+    /// to empty until the roster lands), and the roster handler backfills live
+    /// peers via `set_peer_user_id_by_session_id()`. Keyed by session_id because
+    /// that is the only identifier present on an incoming media packet.
+    user_id_cache: HashMap<u64, String>,
     pub on_first_frame: Callback<(String, MediaType)>,
     pub get_video_canvas_id: Callback<String, String>,
     pub get_screen_canvas_id: Callback<String, String>,
@@ -649,8 +657,6 @@ pub struct PeerDecodeManager {
     /// Callback for sending packets back through the connection (used for
     /// KEYFRAME_REQUEST). Set by `VideoCallClient` after construction.
     send_packet: Option<Callback<PacketWrapper>>,
-    /// The local user_id, needed to construct outgoing KEYFRAME_REQUEST packets.
-    local_user_id: String,
 }
 
 impl Default for PeerDecodeManager {
@@ -664,6 +670,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            user_id_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -671,7 +678,6 @@ impl PeerDecodeManager {
             on_peer_removed: Callback::noop(),
             vad_threshold: None,
             send_packet: None,
-            local_user_id: String::new(),
         }
     }
 
@@ -679,6 +685,7 @@ impl PeerDecodeManager {
         Self {
             connected_peers: HashMapWithOrderedKeys::new(),
             display_name_cache: HashMap::new(),
+            user_id_cache: HashMap::new(),
             on_first_frame: Callback::noop(),
             get_video_canvas_id: Callback::from(|key| format!("video-{}", &key)),
             get_screen_canvas_id: Callback::from(|key| format!("screen-{}", &key)),
@@ -686,15 +693,13 @@ impl PeerDecodeManager {
             on_peer_removed: Callback::noop(),
             vad_threshold: None,
             send_packet: None,
-            local_user_id: String::new(),
         }
     }
 
     /// Set the callback used to send packets back through the connection.
     /// This is required for the PLI (keyframe request) mechanism.
-    pub fn set_send_packet_callback(&mut self, callback: Callback<PacketWrapper>, user_id: String) {
+    pub fn set_send_packet_callback(&mut self, callback: Callback<PacketWrapper>) {
         self.send_packet = Some(callback);
-        self.local_user_id = user_id;
     }
 
     pub fn set_vad_threshold(&mut self, threshold: Option<f32>) {
@@ -865,9 +870,13 @@ impl PeerDecodeManager {
             }
         };
 
+        // Envelope carries no identity: the relay stamps the authenticated
+        // session_id, and the target peer is addressed by the inner
+        // MediaPacket.user_id above. Leaving the envelope user_id empty keeps
+        // the sender's email off the wire.
         let wrapper = PacketWrapper {
             packet_type: PacketType::MEDIA.into(),
-            user_id: self.local_user_id.as_bytes().to_vec(),
+            user_id: Vec::new(),
             data: media_data,
             ..Default::default()
         };
@@ -880,25 +889,39 @@ impl PeerDecodeManager {
         send_packet.emit(wrapper);
     }
 
-    fn add_peer(
-        &mut self,
-        user_id: &str,
-        session_id: u64,
-        aes: Option<Aes128State>,
-    ) -> Result<(), JsValue> {
+    /// Resolve a peer's identity (email) from the roster cache by session_id.
+    ///
+    /// Returns an empty string when the roster has not yet arrived for this
+    /// session (media-before-roster); the identity is backfilled later by
+    /// `set_peer_user_id_by_session_id()`. This is the sole identity source —
+    /// the media envelope no longer carries an email.
+    fn cached_user_id(&self, session_id: u64) -> String {
+        self.user_id_cache
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    fn add_peer(&mut self, session_id: u64, aes: Option<Aes128State>) -> Result<(), JsValue> {
         let sid_str = session_id.to_string();
+        // Peer identity comes solely from the server-authored PARTICIPANT_JOINED
+        // roster, keyed by session_id — the media envelope no longer carries an
+        // email. If the first media packet beat the roster, `user_id` is empty
+        // here; `set_peer_user_id_by_session_id()` backfills it when the roster
+        // lands (mirroring how the display name is backfilled).
+        let user_id = self.cached_user_id(session_id);
         debug!("Adding peer {user_id} with session_id {sid_str}");
         let mut peer = Peer::new(
             self.get_video_canvas_id.emit(sid_str.clone()),
             self.get_screen_canvas_id.emit(sid_str),
             session_id,
-            user_id.to_owned(),
+            user_id.clone(),
             aes,
             self.vad_threshold,
         )?;
         // Apply cached display name if PARTICIPANT_JOINED arrived before
         // the first media packet created this peer entry.
-        if let Some(cached_name) = self.display_name_cache.get(user_id) {
+        if let Some(cached_name) = self.display_name_cache.get(&user_id) {
             debug!(
                 "Applying cached display_name '{}' for peer {} (user_id={})",
                 cached_name, session_id, user_id
@@ -924,16 +947,25 @@ impl PeerDecodeManager {
         for (_session_id, peer) in removed {
             self.on_peer_removed.emit(peer.sid_str);
         }
-        // Clear the display name cache so stale names don't persist
-        // across reconnections.
+        // Clear the identity caches so stale names/emails don't persist
+        // across reconnections (a re-elected/reconnected session gets a fresh
+        // session_id, and the roster is replayed on rejoin).
         self.display_name_cache.clear();
+        self.user_id_cache.clear();
         // Peers are dropped here, triggering Worker::terminate() via Drop impl
     }
 
-    pub fn ensure_peer(&mut self, session_id: u64, user_id: &str) -> PeerStatus {
+    /// Ensure a peer entry exists for `session_id`, creating it if needed.
+    ///
+    /// Identity is intentionally NOT taken from any envelope field: a forged or
+    /// empty envelope `user_id` on the incoming packet is ignored. The new
+    /// peer's `user_id` is resolved from the roster cache (see `add_peer`), and
+    /// backfilled later by `set_peer_user_id_by_session_id()` if the roster has
+    /// not arrived yet.
+    pub fn ensure_peer(&mut self, session_id: u64) -> PeerStatus {
         if self.connected_peers.contains_key(&session_id) {
             PeerStatus::NoChange
-        } else if let Err(e) = self.add_peer(user_id, session_id, None) {
+        } else if let Err(e) = self.add_peer(session_id, None) {
             log::error!("Error adding peer: {e:?}");
             PeerStatus::NoChange
         } else {
@@ -985,6 +1017,37 @@ impl PeerDecodeManager {
     /// if the PARTICIPANT_JOINED event arrives before the first media packet
     /// creates the peer entry via `ensure_peer()`, the display name is
     /// still available when the peer is created later.
+    /// Set the user_id (email) for a peer identified by session_id, from the
+    /// server-authored PARTICIPANT_JOINED roster (`target_user_id`).
+    ///
+    /// This is the ONLY source of peer identity now that the media envelope no
+    /// longer carries an email. It mirrors `set_peer_display_name_by_user_id`:
+    /// the value is persisted in `user_id_cache` so a peer created later (media
+    /// before roster) picks it up in `add_peer`, AND any already-created peer
+    /// with this session_id is backfilled immediately (media before roster,
+    /// peer already exists).
+    ///
+    /// Callers must invoke this BEFORE `set_peer_display_name_by_user_id` for
+    /// the same participant, because the display-name backfill matches on
+    /// `peer.user_id`, which this method populates.
+    pub fn set_peer_user_id_by_session_id(&mut self, session_id: u64, user_id: String) {
+        // session_id 0 is reserved (unassigned / system) and must never key an
+        // identity — ignore it defensively.
+        if session_id == 0 {
+            return;
+        }
+        self.user_id_cache.insert(session_id, user_id.clone());
+        if let Some(peer) = self.connected_peers.get_mut(&session_id) {
+            if peer.user_id != user_id {
+                debug!(
+                    "Backfilling user_id '{}' for live peer session_id={}",
+                    user_id, session_id
+                );
+                peer.user_id = user_id;
+            }
+        }
+    }
+
     pub fn set_peer_display_name_by_user_id(&mut self, user_id: &str, display_name: String) {
         // Always persist in the cache so that future `add_peer()` calls
         // can pick it up even if no peer entry exists yet.
@@ -2489,6 +2552,146 @@ mod tests {
             kf_req,
             Some(MediaType::SCREEN),
             "Gap-based keyframe request should propagate even when invisible"
+        );
+    }
+
+    // -- roster-sourced identity (forged/empty envelope ignored) ----------
+    //
+    // These are plain `#[test]` (not `#[wasm_bindgen_test]`) so they run under
+    // `cargo test -p videocall-client` on the host target — the ONLY place
+    // videocall-client unit tests actually execute (CI's `wasm-pack test --node`
+    // runs none because the module is `run_in_browser`, and there is no browser
+    // CI job for this crate). They drive a REAL forged/empty-envelope
+    // `PacketWrapper` through the production identity path:
+    //   * `cached_user_id(session_id)` is the exact resolver `add_peer` calls to
+    //     stamp a new peer's identity (before it spawns browser-only decoders).
+    //   * `set_peer_user_id_by_session_id` is the roster setter the
+    //     PARTICIPANT_JOINED handler drives.
+    // The peer-creation call site itself (`ensure_peer` -> `add_peer` ->
+    // `Peer::new`) is browser-only (WebCodecs) and panics natively, so it cannot
+    // be driven in a runnable host test; the session-vs-envelope gate at that
+    // call site is covered natively by `peer_session_to_ensure` tests in
+    // `video_call_client.rs`.
+
+    /// Build a real inbound MEDIA `PacketWrapper` with a chosen (forgeable)
+    /// envelope `user_id` and the server-assigned `session_id`.
+    fn media_wrapper(session_id: u64, envelope_user_id: &[u8]) -> PacketWrapper {
+        PacketWrapper {
+            packet_type: PacketType::MEDIA.into(),
+            user_id: envelope_user_id.to_vec(),
+            session_id,
+            data: vec![9, 9, 9],
+            ..Default::default()
+        }
+    }
+
+    /// A MEDIA packet with a FORGED envelope email that arrives BEFORE the
+    /// roster contributes NO identity: `cached_user_id` (the resolver `add_peer`
+    /// uses) ignores the envelope entirely and returns empty. When the
+    /// server-authored roster lands, the live peer is backfilled to the
+    /// authenticated `target_user_id` — never the forged envelope value.
+    ///
+    /// FAILS on the un-fixed code: identity was threaded in from the envelope via
+    /// `ensure_peer(session_id, user_id)` with no session_id-keyed resolver or
+    /// backfill, so the forged envelope email would become `peer.user_id`.
+    #[test]
+    fn forged_envelope_media_before_roster_yields_roster_identity() {
+        let mut manager = PeerDecodeManager::new();
+        let packet = media_wrapper(4242, b"attacker@evil.com");
+
+        // The resolver `add_peer` would use for this packet's session ignores
+        // the forged envelope email — it resolves empty until the roster lands.
+        assert_eq!(
+            manager.cached_user_id(packet.session_id),
+            "",
+            "the forged envelope user_id must never be the source of identity"
+        );
+
+        // Simulate the peer created by that media packet (native tests cannot
+        // spawn the browser-only decoders, so we insert the peer entry directly
+        // with the empty identity `add_peer` would have assigned).
+        let (mut peer, _muted) = make_test_peer(packet.session_id);
+        peer.user_id.clear();
+        manager.connected_peers.insert(packet.session_id, peer);
+
+        // The server-authored roster (PARTICIPANT_JOINED) lands for this session.
+        manager.set_peer_user_id_by_session_id(packet.session_id, "real@corp.com".to_string());
+
+        let resolved = &manager.get(&packet.session_id).unwrap().user_id;
+        assert_eq!(
+            resolved, "real@corp.com",
+            "identity must come from the roster"
+        );
+        assert_ne!(
+            resolved.as_bytes(),
+            &packet.user_id[..],
+            "identity must NOT be the forged envelope email"
+        );
+    }
+
+    /// The server roster is authoritative: even if a peer somehow already
+    /// carried a (forged) identity, a PARTICIPANT_JOINED for that session
+    /// overwrites it with the authenticated value.
+    ///
+    /// FAILS on un-fixed code: the session_id-keyed setter did not exist, so a
+    /// forged/stale peer identity would stand.
+    #[test]
+    fn roster_overwrites_stale_peer_identity_for_session() {
+        let mut manager = PeerDecodeManager::new();
+        let packet = media_wrapper(777, b"attacker@evil.com");
+
+        // A peer that somehow holds a forged identity (e.g. a hypothetical
+        // regression that trusted the envelope).
+        let (mut peer, _muted) = make_test_peer(packet.session_id);
+        peer.user_id = String::from_utf8_lossy(&packet.user_id).into_owned();
+        manager.connected_peers.insert(packet.session_id, peer);
+
+        manager.set_peer_user_id_by_session_id(packet.session_id, "victim@corp.com".to_string());
+
+        assert_eq!(
+            manager.get(&packet.session_id).unwrap().user_id,
+            "victim@corp.com",
+            "the roster (keyed by authenticated session_id) is authoritative"
+        );
+    }
+
+    /// Roster-before-media: when PARTICIPANT_JOINED arrives first, the identity
+    /// is cached by session_id, and `cached_user_id` — the exact call `add_peer`
+    /// makes when a later MEDIA packet creates the peer — returns the roster
+    /// value, never the packet's forged envelope email.
+    ///
+    /// FAILS on un-fixed code: `add_peer` took identity from the envelope and
+    /// there was no session_id cache/resolver.
+    #[test]
+    fn roster_before_media_resolves_identity_ignoring_envelope() {
+        let mut manager = PeerDecodeManager::new();
+        let packet = media_wrapper(909, b"attacker@evil.com");
+
+        // Roster lands before any media for this session.
+        manager.set_peer_user_id_by_session_id(packet.session_id, "early@corp.com".to_string());
+
+        // The exact resolution `add_peer` performs for this packet's session.
+        let resolved = manager.cached_user_id(packet.session_id);
+        assert_eq!(
+            resolved, "early@corp.com",
+            "new peer adopts the roster identity"
+        );
+        assert_ne!(
+            resolved.as_bytes(),
+            &packet.user_id[..],
+            "the forged envelope email must be ignored"
+        );
+    }
+
+    /// session_id 0 is reserved (unassigned / system) and must never key an
+    /// identity in the roster cache.
+    #[test]
+    fn roster_ignores_reserved_session_zero() {
+        let mut manager = PeerDecodeManager::new();
+        manager.set_peer_user_id_by_session_id(0, "nobody@nowhere.com".to_string());
+        assert!(
+            !manager.user_id_cache.contains_key(&0),
+            "session_id 0 must not be cached as an identity"
         );
     }
 }

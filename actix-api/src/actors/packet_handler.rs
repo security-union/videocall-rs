@@ -71,6 +71,29 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
         return PacketKind::Dropped;
     }
 
+    // Drop client-originated SESSION_ASSIGNED packets.
+    // SESSION_ASSIGNED is authored solely by the server (ws/wt session actors)
+    // to tell a client its authoritative session_id. If a client sends one it
+    // would otherwise be relayed as Data, letting a peer adopt the forged
+    // session_id as its own before the self-filter runs (a peer-tile-hijack).
+    if packet_wrapper.packet_type == PacketType::SESSION_ASSIGNED.into() {
+        return PacketKind::Dropped;
+    }
+
+    // Drop client-originated MEETING packets.
+    // MEETING packets (MEETING_STARTED/ENDED, PARTICIPANT_JOINED/LEFT) are
+    // authored solely by the server's SessionManager. They are the SOLE source
+    // of peer identity on the receiving client (session_id -> {email,
+    // display_name}). A relayed forged MEETING PARTICIPANT_JOINED would let an
+    // authenticated attacker rewrite an arbitrary session's identity in every
+    // peer's cache (impersonation, spoofed host badges, mis-targeted
+    // moderation). Production clients never send MEETING; only the server does,
+    // and server-authored MEETING packets go outbound (never through this
+    // inbound classifier), so dropping inbound client MEETING is safe.
+    if packet_wrapper.packet_type == PacketType::MEETING.into() {
+        return PacketKind::Dropped;
+    }
+
     // Check if it's a MEDIA packet (RTT, keyframe request, or regular media).
     if packet_wrapper.packet_type == PacketType::MEDIA.into() {
         // Try to parse inner MediaPacket to distinguish control sub-types.
@@ -353,6 +376,46 @@ mod tests {
         };
         let bytes = wrapper.write_to_bytes().unwrap();
         assert_eq!(classify_packet(&bytes), PacketKind::Rtt);
+    }
+
+    #[test]
+    fn test_classify_session_assigned_from_client_dropped() {
+        // A client has no business sending SESSION_ASSIGNED — it is server-authored.
+        // If relayed, a peer would adopt the forged session_id as its own before the
+        // client-side self-filter runs (peer-tile-hijack). It must be Dropped, never Data.
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::SESSION_ASSIGNED.into(),
+            session_id: 9999,
+            data: vec![1, 2, 3],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
+    }
+
+    #[test]
+    fn test_classify_meeting_from_client_dropped() {
+        // MEETING packets are server-authored only and are the sole source of
+        // peer identity on the receiving client. A relayed forged MEETING
+        // (e.g. PARTICIPANT_JOINED with an attacker-chosen target_user_id and
+        // session_id) would poison every peer's identity cache. A client MEETING
+        // packet must be Dropped, never relayed as Data.
+        use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
+        use videocall_types::protos::meeting_packet::MeetingPacket;
+        let meeting = MeetingPacket {
+            event_type: MeetingEventType::PARTICIPANT_JOINED.into(),
+            session_id: 4242,
+            target_user_id: b"ceo@company.com".to_vec(),
+            display_name: b"CEO".to_vec(),
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::MEETING.into(),
+            data: meeting.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(classify_packet(&bytes), PacketKind::Dropped);
     }
 
     #[test]

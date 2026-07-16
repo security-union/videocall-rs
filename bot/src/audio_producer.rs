@@ -163,7 +163,7 @@ impl AudioProducer {
 
                     // Create media packet
                     let media_packet = MediaPacket {
-                        user_id: user_id_bytes.clone(),
+                        user_id: user_id_bytes,
                         media_type: MediaType::AUDIO.into(),
                         data: encoded,
                         frame_type: "key".to_string(),
@@ -179,7 +179,8 @@ impl AudioProducer {
                     // Wrap in packet wrapper
                     let packet_wrapper = PacketWrapper {
                         data: media_packet.write_to_bytes()?,
-                        user_id: user_id_bytes,
+                        // Envelope user_id left empty; peer identity is delivered
+                        // via the server-authored PARTICIPANT_JOINED roster.
                         packet_type: PacketType::MEDIA.into(),
                         ..Default::default()
                     };

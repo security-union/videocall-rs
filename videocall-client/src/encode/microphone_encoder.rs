@@ -85,7 +85,6 @@ fn pack_redundant_audio(primary: &[u8], redundant: &PreviousAudioFrame) -> Vec<u
 
 pub fn transform_audio_chunk(
     chunk: &Uint8Array,
-    user_id: &str,
     sequence: u64,
     aes: Rc<Aes128State>,
     previous_frame: Option<&PreviousAudioFrame>,
@@ -124,7 +123,10 @@ pub fn transform_audio_chunk(
     let data = aes.encrypt(&data).unwrap();
     PacketWrapper {
         data,
-        user_id: user_id.as_bytes().to_vec(),
+        // Envelope carries no email; the relay stamps the authenticated
+        // session_id. Peers identify the sender via the roster, keyed by
+        // session_id.
+        user_id: Vec::new(),
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }
@@ -231,7 +233,6 @@ impl MicrophoneEncoder {
     }
 
     pub fn start(&mut self) {
-        let user_id = self.client.user_id().clone();
         let client = self.client.clone();
         let device_id = if let Some(mic) = &self.state.selected {
             mic.to_string()
@@ -306,13 +307,8 @@ impl MicrophoneEncoder {
                         None
                     };
 
-                    let packet: PacketWrapper = transform_audio_chunk(
-                        &data,
-                        &user_id,
-                        sequence_number,
-                        aes.clone(),
-                        red_ref,
-                    );
+                    let packet: PacketWrapper =
+                        transform_audio_chunk(&data, sequence_number, aes.clone(), red_ref);
                     client_for_send.send_media_packet(packet);
 
                     // Store current frame as the previous frame for the next

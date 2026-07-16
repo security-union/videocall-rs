@@ -37,7 +37,6 @@ pub fn transform_video_chunk(
     chunk: EncodedVideoChunk,
     sequence: u64,
     buffer: &mut [u8],
-    user_id: &str,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
@@ -65,7 +64,10 @@ pub fn transform_video_chunk(
     let data = aes.encrypt(&data).unwrap();
     PacketWrapper {
         data,
-        user_id: user_id.as_bytes().to_vec(),
+        // Envelope carries no email; the relay stamps the authenticated
+        // session_id. Peers identify the sender via the roster, keyed by
+        // session_id.
+        user_id: Vec::new(),
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }
@@ -75,7 +77,6 @@ pub fn transform_screen_chunk(
     chunk: EncodedVideoChunk,
     sequence: u64,
     buffer: &mut [u8],
-    user_id: &str,
     aes: Rc<Aes128State>,
 ) -> PacketWrapper {
     let byte_length = chunk.byte_length() as usize;
@@ -103,7 +104,10 @@ pub fn transform_screen_chunk(
     let data = aes.encrypt(&data).unwrap();
     PacketWrapper {
         data,
-        user_id: user_id.as_bytes().to_vec(),
+        // Envelope carries no email; the relay stamps the authenticated
+        // session_id. Peers identify the sender via the roster, keyed by
+        // session_id.
+        user_id: Vec::new(),
         packet_type: PacketType::MEDIA.into(),
         ..Default::default()
     }

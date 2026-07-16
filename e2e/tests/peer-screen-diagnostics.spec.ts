@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * Per-peer screen-share diagnostics (HCL issue #883).
@@ -129,7 +130,7 @@ async function admitGuestIfNeeded(hostPage: Page, guestPage: Page): Promise<void
 }
 
 async function startScreenShare(sharerPage: Page, viewerPage: Page): Promise<boolean> {
-  await sharerPage.mouse.move(400, 400);
+  await wakeControls(sharerPage);
   await sharerPage.waitForTimeout(300);
   const shareButton = sharerPage.locator("button.video-control-button", {
     has: sharerPage.locator(".tooltip", { hasText: "Share Screen" }),

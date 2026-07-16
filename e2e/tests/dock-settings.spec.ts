@@ -1,6 +1,7 @@
 import { test, expect, Page } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 test.describe("Dock settings", () => {
   test.beforeAll(async () => {
@@ -210,7 +211,7 @@ test.describe("Dock settings", () => {
       .click();
 
     // Move mouse to trigger visibility, then move it away to a neutral spot
-    await page.mouse.move(400, 400);
+    await wakeControls(page);
     await page.mouse.move(0, 0);
 
     // Wait for the idle timeout and assert controls become hidden

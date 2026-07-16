@@ -64,6 +64,18 @@ pub const DENSITY_MODES: [DensityMode; 4] = [
     DensityMode::Maximum,
 ];
 
+/// Return the density mode `delta` steps from `current` in the
+/// `DENSITY_MODES` array, wrapping at the ends.
+pub fn next_density_mode(current: DensityMode, delta: i32) -> DensityMode {
+    let len = DENSITY_MODES.len() as i32;
+    let pos = DENSITY_MODES
+        .iter()
+        .position(|&m| m == current)
+        .unwrap_or(0) as i32;
+    let next = ((pos + delta) % len + len) % len;
+    DENSITY_MODES[next as usize]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -135,5 +147,63 @@ mod tests {
                 mode
             );
         }
+    }
+
+    #[test]
+    fn next_density_mode_forward_step() {
+        assert_eq!(
+            next_density_mode(DensityMode::Auto, 1),
+            DensityMode::Standard
+        );
+        assert_eq!(
+            next_density_mode(DensityMode::Standard, 1),
+            DensityMode::Dense
+        );
+        assert_eq!(
+            next_density_mode(DensityMode::Dense, 1),
+            DensityMode::Maximum
+        );
+    }
+
+    #[test]
+    fn next_density_mode_backward_step() {
+        assert_eq!(
+            next_density_mode(DensityMode::Maximum, -1),
+            DensityMode::Dense
+        );
+        assert_eq!(
+            next_density_mode(DensityMode::Dense, -1),
+            DensityMode::Standard
+        );
+        assert_eq!(
+            next_density_mode(DensityMode::Standard, -1),
+            DensityMode::Auto
+        );
+    }
+
+    #[test]
+    fn next_density_mode_wraps_forward() {
+        // Maximum is last → wraps to Auto (first).
+        assert_eq!(
+            next_density_mode(DensityMode::Maximum, 1),
+            DensityMode::Auto
+        );
+    }
+
+    #[test]
+    fn next_density_mode_wraps_backward() {
+        // Auto is first → wraps to Maximum (last).
+        assert_eq!(
+            next_density_mode(DensityMode::Auto, -1),
+            DensityMode::Maximum
+        );
+    }
+
+    #[test]
+    fn next_density_mode_home_end_indices() {
+        // Home/End use DENSITY_MODES[0] and DENSITY_MODES[len-1] directly.
+        // Verify those indices match expectations.
+        assert_eq!(DENSITY_MODES[0], DensityMode::Auto);
+        assert_eq!(DENSITY_MODES[DENSITY_MODES.len() - 1], DensityMode::Maximum);
     }
 }

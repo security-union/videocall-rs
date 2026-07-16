@@ -40,6 +40,23 @@ pub fn format_duration(duration_ms: i64) -> String {
     }
 }
 
+/// issue 1672: elapsed duration (in milliseconds) of a meeting for the Activity
+/// card, defined for every state.
+///
+/// While the meeting is still open (`ended_at` is `None`) this is the *running*
+/// time `now_ms - started_at`; once it has ended it is the *final*
+/// `ended_at - started_at` (and `now_ms` is ignored). The result is clamped to
+/// `>= 0` so clock skew or a `started_at` in the future never yields a negative
+/// duration. Pure arithmetic (host-testable) — the caller supplies `now_ms`
+/// from `js_sys::Date::now()` so this stays free of browser interop.
+pub(crate) fn meeting_activity_duration_ms(
+    started_at: i64,
+    ended_at: Option<i64>,
+    now_ms: i64,
+) -> i64 {
+    (ended_at.unwrap_or(now_ms) - started_at).max(0)
+}
+
 /// Format a meeting state string (`"active"`, `"idle"`, `"ended"`) as a
 /// title-cased label suitable for the inline state badge.
 ///
@@ -246,6 +263,45 @@ mod tests {
     fn format_duration_exact_two_days() {
         // 48h boundary — multi-day plural-style values still pad zero units.
         assert_eq!(format_duration(172_800_000), "2d 0h 0m 0s");
+    }
+
+    // -------------------------------------------------------------------------
+    // meeting_activity_duration_ms tests (issue 1672)
+    //
+    // Pure arithmetic (no js_sys / web-sys), so these run as ordinary
+    // host-target unit tests via `cargo test -p videocall-ui`. They call the
+    // production fn directly and are constructed to FAIL if the running/final
+    // branch is inverted or if the `>= 0` clamp is dropped.
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn meeting_activity_duration_ms_running_uses_now_minus_started() {
+        // Open meeting (ended_at None): running duration is now - started.
+        assert_eq!(meeting_activity_duration_ms(1_000, None, 6_000), 5_000);
+    }
+
+    #[test]
+    fn meeting_activity_duration_ms_final_uses_ended_minus_started() {
+        // Ended meeting: final duration is ended - started; `now` is IGNORED.
+        // `now` is deliberately far past `ended`, so a branch that wrongly used
+        // `now` for an ended meeting would return 998_999 and fail here.
+        assert_eq!(
+            meeting_activity_duration_ms(1_000, Some(4_000), 999_999),
+            3_000
+        );
+    }
+
+    #[test]
+    fn meeting_activity_duration_ms_clamps_negative_running_to_zero() {
+        // started_at in the future relative to now (clock skew) → clamp to 0.
+        // Without the `.max(0)` clamp this would be -5_000 and fail.
+        assert_eq!(meeting_activity_duration_ms(10_000, None, 5_000), 0);
+    }
+
+    #[test]
+    fn meeting_activity_duration_ms_clamps_negative_final_to_zero() {
+        // started_at after ended_at (clock skew) → clamp to 0, never negative.
+        assert_eq!(meeting_activity_duration_ms(10_000, Some(4_000), 0), 0);
     }
 
     // -------------------------------------------------------------------------

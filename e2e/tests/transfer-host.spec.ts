@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * E2E coverage for the transfer-host feature.
@@ -105,7 +106,7 @@ async function admitIfNeeded(
  */
 async function openPeerListSidebar(page: Page): Promise<void> {
   await page.locator(".video-controls-container").hover();
-  await page.mouse.move(400, 400);
+  await wakeControls(page);
   await page.waitForTimeout(300);
 
   const openPeersBtn = page.locator("button.video-control-button", {

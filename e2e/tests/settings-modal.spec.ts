@@ -2,6 +2,43 @@ import { test, expect } from "@playwright/test";
 import { injectSessionCookie } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
+async function openAppearanceTab(
+  page: import("@playwright/test").Page,
+  meetingId: string,
+  username: string,
+): Promise<void> {
+  await page.goto("/");
+  await page.waitForTimeout(1500);
+
+  await page.locator("#meeting-id").click();
+  await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 80 });
+
+  await page.locator("#username").click();
+  await page.locator("#username").fill("");
+  await page.locator("#username").pressSequentially(username, { delay: 80 });
+  await page.waitForTimeout(500);
+  await page.locator("#username").press("Enter");
+
+  await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+
+  const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+  await expect(joinButton).toBeVisible({ timeout: 20_000 });
+  await joinButton.click();
+
+  await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+
+  await page.locator('[data-testid="open-settings"]').click();
+  await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+  await page.getByRole("tab", { name: "Appearance" }).click();
+  await expect(page.locator("#settings-panel-appearance")).toBeVisible({ timeout: 5_000 });
+}
+
+function speakerHighlightRow(page: import("@playwright/test").Page, label: string) {
+  return page.locator(".speaker-highlight-controls .appearance-slider-row").filter({
+    has: page.getByText(label, { exact: true }),
+  });
+}
+
 test.describe("Device settings modal", () => {
   test.beforeAll(async () => {
     await waitForServices();
@@ -101,6 +138,104 @@ test.describe("Device settings modal", () => {
     await expect(dropdownMenu).toHaveCount(0);
     await expect(page.locator(".settings-nav-button.active")).toContainText("Video");
     await expect(page.locator("#settings-panel-video")).toBeVisible();
+  });
+
+  test("Decay slider updates the speaker glow persistence setting", async ({ page }) => {
+    const meetingId = `e2e_settings_decay_${Date.now()}`;
+
+    await openAppearanceTab(page, meetingId, "decay-user");
+
+    const decaySlider = page.locator('[data-testid="speaker-highlight-decay-slider"]');
+    const decayValue = decaySlider.locator(
+      "xpath=ancestor::div[contains(@class, 'appearance-slider-row')]//span[contains(@class, 'appearance-slider-value')]",
+    );
+    const decayHelper = page
+      .locator(".speaker-highlight-controls .appearance-section-helper")
+      .filter({ hasText: "Decay controls how long the glow lingers after speech." });
+
+    await expect(decaySlider).toHaveValue("50");
+    await expect(decayValue).toHaveText("50%");
+    await expect(decayHelper).toBeVisible();
+
+    await decaySlider.fill("20");
+    await expect(decayValue).toHaveText("20%");
+
+    await page.waitForTimeout(500);
+
+    await expect
+      .poll(async () => page.evaluate(() => localStorage.getItem("vc_appearance_glow_decay")), {
+        timeout: 5_000,
+      })
+      .toBe("0.2");
+
+    await page.reload();
+    await page.waitForTimeout(1500);
+
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+    await page.getByRole("tab", { name: "Appearance" }).click();
+
+    const decaySliderAfterReload = page.locator('[data-testid="speaker-highlight-decay-slider"]');
+    const decayValueAfterReload = decaySliderAfterReload.locator(
+      "xpath=ancestor::div[contains(@class, 'appearance-slider-row')]//span[contains(@class, 'appearance-slider-value')]",
+    );
+    await expect(decaySliderAfterReload).toHaveValue("20");
+    await expect(decayValueAfterReload).toHaveText("20%");
+  });
+
+  test("Reset restores the speaker highlight defaults", async ({ page }) => {
+    const meetingId = `e2e_settings_reset_${Date.now()}`;
+
+    await openAppearanceTab(page, meetingId, "reset-user");
+
+    const glowToggle = page.locator('.glow-switch input[type="checkbox"]');
+    const mintSwatch = page.locator('[aria-label="Select Mint Green highlight"]');
+    const cyanSwatch = page.locator('[aria-label="Select Cyan highlight"]');
+    const brightnessRow = speakerHighlightRow(page, "Brightness");
+    const glowRow = speakerHighlightRow(page, "Glow");
+    const decaySlider = page.locator('[data-testid="speaker-highlight-decay-slider"]');
+    const brightnessSlider = page.locator('[data-testid="speaker-highlight-brightness-slider"]');
+    const glowSlider = page.locator('[data-testid="speaker-highlight-glow-slider"]');
+    const resetButton = page.locator('[data-testid="speaker-highlight-reset-btn"]');
+
+    const brightnessValue = brightnessRow.locator(".appearance-slider-value");
+    const glowValue = glowRow.locator(".appearance-slider-value");
+    const decayValue = decaySlider.locator(
+      "xpath=ancestor::div[contains(@class, 'appearance-slider-row')]//span[contains(@class, 'appearance-slider-value')]",
+    );
+
+    await cyanSwatch.click();
+    await glowToggle.uncheck();
+    await brightnessSlider.fill("70");
+    await glowSlider.fill("30");
+    await decaySlider.fill("10");
+
+    await expect(cyanSwatch).toHaveAttribute("aria-pressed", "true");
+    await expect(glowToggle).not.toBeChecked();
+    await expect(brightnessValue).toHaveText("70%");
+    await expect(glowValue).toHaveText("30%");
+    await expect(decayValue).toHaveText("10%");
+    await expect(resetButton).toHaveText("Reset highlight");
+
+    await resetButton.click();
+
+    await expect(glowToggle).toBeChecked();
+    await expect(mintSwatch).toHaveAttribute("aria-pressed", "true");
+    await expect(cyanSwatch).toHaveAttribute("aria-pressed", "false");
+    await expect(brightnessValue).toHaveText("50%");
+    await expect(glowValue).toHaveText("50%");
+    await expect(decayValue).toHaveText("50%");
+    await expect(brightnessSlider).toHaveValue("50");
+    await expect(glowSlider).toHaveValue("50");
+    await expect(decaySlider).toHaveValue("50");
+
+    await page.waitForTimeout(500);
+
+    await expect
+      .poll(async () => page.evaluate(() => localStorage.getItem("vc_appearance_glow_decay")), {
+        timeout: 5_000,
+      })
+      .toBe("0.5");
   });
 
   // FIXME(#727): Tests below have stale UI selectors after the Appearance

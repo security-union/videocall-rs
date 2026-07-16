@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * Screen-share state-machine E2E tests.
@@ -137,7 +138,7 @@ test.describe("Screen-share state transitions", () => {
       await joinMeeting(page);
 
       // Move mouse to make controls visible (dock auto-hide)
-      await page.mouse.move(400, 400);
+      await wakeControls(page);
       await page.waitForTimeout(500);
 
       // Find the screen share button
@@ -182,7 +183,7 @@ test.describe("Screen-share state transitions", () => {
       await expect(screenTile).toBeVisible({ timeout: 5_000 });
 
       // Click again to stop sharing
-      await page.mouse.move(400, 400); // ensure controls visible
+      await wakeControls(page); // ensure controls visible
       await page.waitForTimeout(500);
       await screenShareBtn.first().click();
       await page.waitForTimeout(1000);

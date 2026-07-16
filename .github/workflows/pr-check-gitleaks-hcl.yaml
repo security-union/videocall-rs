@@ -1,0 +1,74 @@
+name: Secret Scan (HCL)
+
+# Forward-prevention secret-scanning gate. Runs gitleaks against the tracked
+# working tree on every PR and push so a real OAuth client secret, API key, or
+# JWT signing key can never be (re)committed. Placeholder templates are
+# allowlisted in .gitleaks.toml; a genuine high-entropy secret fails the build.
+#
+# Scope is deliberately the CURRENT tracked tree, NOT git history: pre-existing
+# local-dev-only secrets in history are out of scope (history-scrub is blocked)
+# and would otherwise make this gate permanently red. `git archive HEAD` gives
+# us exactly the committable surface and naturally excludes gitignored paths
+# such as target/ and the real .env.
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    # No path filter: a secret can be committed in ANY file, so this gate must
+    # run on every PR. The workflow's own file is in-scope by virtue of having
+    # no exclusions, so a PR that edits this gate is validated by it.
+  push:
+    branches: [hcl-main, PR-staging]
+  workflow_dispatch:
+
+concurrency:
+  group: pr-check-gitleaks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+env:
+  GITLEAKS_VERSION: "8.30.1"
+
+jobs:
+  gitleaks:
+    name: gitleaks secret scan
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4.2.0
+        with:
+          clean: false
+          path: scan-repo
+
+      - name: Install gitleaks
+        working-directory: scan-repo
+        run: |
+          mkdir -p "$RUNNER_TEMP/gitleaks"
+          curl -fsSL -o "$RUNNER_TEMP/gitleaks/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/gitleaks/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks" gitleaks
+          "$RUNNER_TEMP/gitleaks/gitleaks" version
+
+      - name: Scan tracked tree for secrets
+        working-directory: scan-repo
+        run: |
+          # Materialize ONLY the tracked HEAD snapshot (excludes gitignored
+          # target/, real .env, node_modules, etc.) and scan it as plain files.
+          rm -rf "$RUNNER_TEMP/tree"
+          mkdir -p "$RUNNER_TEMP/tree"
+          git archive HEAD | tar -x -C "$RUNNER_TEMP/tree"
+          # --no-git: scan the materialized files (not history).
+          # --redact: never print secret values into CI logs.
+          # --exit-code 1: a finding fails the build (gitleaks default; pinned
+          #                explicitly so a future default change can't soften it).
+          "$RUNNER_TEMP/gitleaks/gitleaks" detect \
+            --source "$RUNNER_TEMP/tree" \
+            --config "$GITHUB_WORKSPACE/scan-repo/.gitleaks.toml" \
+            --no-git \
+            --redact \
+            --exit-code 1 \
+            --no-banner \
+            --verbose

@@ -4393,22 +4393,16 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   white-space: nowrap;
 }
 
-/* Time row may render a "from – to" range; allow it to wrap between the two
-   timestamps (right-aligned) while each timestamp stays an atomic unit.
-   A no-range value has no internal break point, so it stays on one line. */
-.settings-stat-value--range {
+/* issue 1672: the Started/Ended timestamp values can be long (date + time +
+   zone). Override the default `white-space: nowrap` of .settings-stat-value so
+   a single long timestamp wraps (right-aligned) instead of overflowing the
+   dialog at narrow widths. min-width:0 lets the value flex-shrink below its
+   content width so overflow-wrap can take effect. */
+.settings-stat-value--time {
   white-space: normal;
+  overflow-wrap: anywhere;
   text-align: right;
-}
-
-.settings-stat-time-part,
-.settings-stat-separator {
-  white-space: nowrap;
-}
-
-.settings-stat-separator {
-  color: var(--text-tertiary);
-  font-weight: 400;
+  min-width: 0;
 }
 
 .settings-stat-warning .settings-stat-label,
@@ -8531,6 +8525,23 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
 .density-option.active {
   background: var(--settings-ghost-bg-selected);
   color: var(--text-primary);
+}
+
+/* Persistent indicator for the committed (aria-checked) density mode,
+   distinct from the .active navigation highlight. */
+.density-option[aria-checked="true"] {
+  border-left: 2px solid var(--accent, rgba(120, 160, 220, 0.55));
+  /* @token-exempt: var() fallback */
+  color: var(--text-primary);
+}
+
+/* The .active class highlights the keyboard-navigated option via
+   density_highlight signal. The outline is a secondary cue for
+   screen-magnifier users. */
+.density-option:focus-visible {
+  outline: 2px solid var(--accent, rgba(120, 160, 220, 0.55));
+  /* @token-exempt: var() fallback */
+  outline-offset: -2px;
 }
 
 .density-option-label {

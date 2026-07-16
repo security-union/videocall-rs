@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * Crop toggle E2E tests.
@@ -553,7 +554,7 @@ test.describe("Crop toggle", () => {
       await expect(peerTile.first()).toBeVisible({ timeout: 30_000 });
 
       // Guest starts screen sharing.
-      await guestPage.mouse.move(400, 400);
+      await wakeControls(guestPage);
       await guestPage.waitForTimeout(300);
       const shareButton = guestPage.locator("button.video-control-button", {
         has: guestPage.locator(".tooltip", { hasText: "Share Screen" }),

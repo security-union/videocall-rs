@@ -93,6 +93,7 @@ import { generateSessionToken } from "../helpers/auth";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForVisibleState } from "../helpers/visible-state";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 type TransportMode = "webtransport" | "websocket";
 
@@ -304,7 +305,7 @@ async function startScreenShareAndAwaitSplitLayout(
   viewerPage: Page,
 ): Promise<boolean> {
   // Wake auto-hidden controls bar, then find the share button by tooltip.
-  await publisherPage.mouse.move(400, 400);
+  await wakeControls(publisherPage);
   await publisherPage.waitForTimeout(300);
   const shareButton = publisherPage.locator("button.video-control-button", {
     has: publisherPage.locator(".tooltip", { hasText: "Share Screen" }),

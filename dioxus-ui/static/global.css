@@ -1577,6 +1577,25 @@ html[data-theme="light"] #invite-overlay p {
   --speaker-value-width: 44px;
   --speaker-preview-column: 260px;
   --speaker-preview-shift-x: 25px;
+
+  /* Chat sidebar — Google-Meet-style surface. Theme-agnostic on purpose: the
+     chat panel keeps a fixed dark Meet palette regardless of the app's
+     light/dark theme, so these tokens live in :root rather than the paired
+     html[data-theme] blocks. Values mirror Google Meet's chat greys/blue. */
+  --chat-surface: #202124;
+  --chat-surface-notice: #2d2e30;
+  --chat-surface-raised: #3c4043;
+  --chat-surface-input-focus: #4a4d50;
+  --chat-text-primary: #e8eaed;
+  --chat-text-secondary: #9aa0a6;
+  --chat-text-muted: #5f6368;
+  --chat-accent: #1a73e8;
+  --chat-accent-hover: #1557b0;
+  --chat-on-accent: #fff;
+  --chat-border: #3c4043;
+  --chat-shadow: rgba(0, 0, 0, 0.4);
+  --chat-error-text: #f28b82;
+  --chat-error-bg: #3c2a2a;
 }
 
 /* Accessibility: high-contrast fallback */
@@ -1830,6 +1849,32 @@ html[data-theme="light"] #invite-overlay p {
   align-items: center;
   justify-content: center;
   z-index: 2000;
+}
+
+/* In-meeting device-warning backdrop: reuse the app's semi-transparent
+   --overlay-backdrop token (the same one .glass-backdrop uses) plus its blur
+   treatment, so a blocked device is reported without fully blacking out a live
+   call. Only the in-meeting call site adds `.in-meeting`; the pre-join path
+   keeps the opaque `.modal-overlay` above. */
+.modal-overlay.in-meeting {
+  background: var(--overlay-backdrop);
+  backdrop-filter: saturate(180%) blur(var(--effect-blur-md));
+  -webkit-backdrop-filter: saturate(180%) blur(var(--effect-blur-md));
+}
+
+/* The in-meeting backdrop is translucent (--overlay-backdrop) and sits over a
+   live, blurred call, so the inner .modal-window MUST supply its own solid,
+   theme-aware surface -- otherwise its actionable error text would render
+   directly on content-dependent video luminance and fail contrast in BOTH
+   themes. Scoped to `.modal-overlay.in-meeting` only; the pre-join call site
+   (bare `.modal-overlay`, opaque black) is intentionally left untouched. Uses
+   --surface-elevated (theme-aware) rather than a hardcoded color. */
+.modal-overlay.in-meeting .modal-window {
+  background: var(--surface-elevated);
+  color: var(--text-primary);
+  padding: 2rem;
+  border-radius: 12px;
+  max-width: 28rem;
 }
 
 .modal-content {
@@ -2268,6 +2313,26 @@ html[data-theme="light"] #invite-overlay p {
   box-shadow:
     0 0 0 2px #1c1c1e,
     0 0 10px rgba(255, 69, 58, 0.6);
+  z-index: 2;
+  pointer-events: none;
+}
+
+/* Unread-chat indicator dot on the OpenChatButton */
+@keyframes chat-badge-pulse {
+  0%, 100% { box-shadow: 0 0 0 2px var(--surface), 0 0 6px 2px rgba(48, 209, 88, 0.7); }
+  50%       { box-shadow: 0 0 0 2px var(--surface), 0 0 10px 4px rgba(48, 209, 88, 0.4); }
+}
+
+.video-control-button .chat-unread-badge {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #30D158;
+  box-shadow: 0 0 0 2px var(--surface), 0 0 6px 2px rgba(48, 209, 88, 0.7);
+  animation: chat-badge-pulse 1.8s ease-in-out infinite;
   z-index: 2;
   pointer-events: none;
 }
@@ -3141,6 +3206,196 @@ html[data-theme="light"] #invite-overlay p {
   min-width: 0 !important;
   object-fit: contain !important;
   object-position: center center !important;
+}
+
+/* ============================================================
+   issue 1175: zoom / pan / detach for RECEIVED shared content.
+
+   Zoom + pan are a CSS transform on `.ss-zoom-wrapper`, driven
+   declaratively from per-tile signal state. The wrapper holds the
+   SAME decoder canvas the whole time, so a zoom/pan change only
+   patches the transform and never recreates the canvas. The
+   viewport clips the scaled wrapper (overflow hidden) and is the
+   focusable pan group.
+   ============================================================ */
+/* issue 1175: while a received share is detached into a separate window, the
+   main window looks like a regular no-share meeting. The split layout stays
+   MOUNTED (canvas keeps its node identity + keeps painting to feed the detached
+   mirror), but the share pane is moved OFF-SCREEN (position, NOT display:none —
+   display:none can drop a canvas from compositing and stall captureStream; a
+   still-composited off-screen canvas keeps delivering frames) and the peer grid
+   expands to full width. */
+.share-detached .ss-left-pane {
+  position: absolute !important;
+  left: -99999px !important;
+  top: 0 !important;
+  width: 640px !important;
+  height: 360px !important;
+}
+
+.share-detached .screen-share-resize-handle {
+  display: none !important;
+}
+
+.share-detached .ss-peer-panel {
+  width: 100% !important;
+}
+
+.ss-zoom-viewport {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  /* Let a pointer drag pan the content instead of scrolling / gesturing. */
+  touch-action: none;
+}
+
+.ss-zoom-viewport:focus-visible {
+  outline: 2px solid var(--focus-ring, #4c8bf5);
+  outline-offset: -2px;
+}
+
+/* issue 1175: grab affordance only while zoomed (the class is toggled from
+   scale > 1). No cursor change at fit, where dragging does nothing. */
+.ss-zoom-viewport.is-zoomed {
+  cursor: grab;
+}
+
+.ss-zoom-viewport.is-zoomed:active {
+  cursor: grabbing;
+}
+
+.ss-zoom-wrapper {
+  width: 100%;
+  height: 100%;
+  transform-origin: center center;
+}
+
+/* issue 1175: promote to a GPU layer ONLY while zoomed (scoped under the
+   viewport's is-zoomed class), so an idle tile carries no blanket
+   `will-change` promotion and its cost is released at fit. */
+.ss-zoom-viewport.is-zoomed .ss-zoom-wrapper {
+  will-change: transform;
+}
+
+/* Zoom / reset / detach control bar. Revealed on hover or keyboard
+   focus (matching the crop control), and always reachable by keyboard
+   because focus-within reveals it and its buttons stay in the tab order. */
+.ss-zoom-controls {
+  position: absolute;
+  /* issue 1175: raise the bar ABOVE the meeting action bar so it is never
+     obscured (user-test round 2). Anchored to --controls-dock-clearance
+     (global.css:1525) — the shared clearance token the decode-paused pill
+     already uses; a static constant DERIVED from the dock-bottom geometry (20px
+     + ~79px + gap = 112px), kept in sync manually if the dock ever changes
+     height (the dock itself does not reference the token). It clears the dock in
+     its BOTTOM position (the reported overlap); LEFT/RIGHT docks sit on the
+     edge-midlines, which a lower-CENTER bar never meets; and in screen-share
+     mode the decode-paused pill has already moved to the TOP, so this
+     lower-center zone is otherwise empty. */
+  bottom: var(--controls-dock-clearance, 112px);
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 6px;
+  border-radius: var(--radius-md, 8px);
+  /* issue 1175 (contrast): a near-opaque dark bar so the white glyphs keep
+     >=3:1 over ANY shared content — a translucent bar fails over a bright
+     document, especially in the light theme. Same dark bar reads well in both
+     themes (white glyphs on dark), so it is intentionally theme-independent. */
+  background: rgba(20, 22, 28, 0.82);
+  backdrop-filter: blur(6px);
+  z-index: 6;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+  /* Never exceed the tile width on narrow / mobile tiles. The bar sits
+     lower-center; the floating name is top-left and the tile icons top-right
+     (opposite edges), so they never overlap; this only guards horizontal
+     overflow. */
+  max-width: calc(100% - 16px);
+  box-sizing: border-box;
+}
+
+.split-screen-tile:hover .ss-zoom-controls,
+.split-screen-tile:focus-within .ss-zoom-controls {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.ss-zoom-btn {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: #fff;
+  width: 28px;
+  height: 28px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm, 6px);
+  padding: 0;
+  cursor: pointer;
+}
+
+.ss-zoom-btn svg {
+  width: 18px;
+  height: 18px;
+}
+
+.ss-zoom-btn:hover {
+  background: rgba(255, 255, 255, 0.16);
+}
+
+.ss-zoom-btn:focus-visible {
+  outline: 2px solid var(--focus-ring, #4c8bf5);
+  outline-offset: 1px;
+}
+
+.ss-zoom-btn--disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.ss-zoom-btn--disabled:hover {
+  background: transparent;
+}
+
+.ss-detach-btn[aria-pressed="true"] {
+  background: rgba(76, 139, 245, 0.35);
+}
+
+.ss-zoom-label {
+  min-width: 42px;
+  text-align: center;
+  color: #fff;
+  font-size: var(--font-size-xs, 12px);
+  font-variant-numeric: tabular-nums;
+  user-select: none;
+}
+
+.ss-zoom-sep {
+  width: 1px;
+  height: 18px;
+  background: rgba(255, 255, 255, 0.25);
+  margin: 0 2px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .ss-zoom-controls {
+    transition: none;
+  }
+}
+
+/* issue 1175 (touch): hover-reveal is dead where the primary input can't hover,
+   and zoom matters most on phones, so keep the controls persistently visible
+   (slightly dimmed) on touch devices. */
+@media (hover: none) {
+  .ss-zoom-controls {
+    opacity: 0.9;
+    pointer-events: auto;
+  }
 }
 
 /* ============================================================

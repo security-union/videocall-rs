@@ -137,6 +137,23 @@ async fn mic_button_stays_clickable_when_unavailable() {
         button.class_list().contains("error"),
         "unavailable MicButton should carry the 'error' CSS class"
     );
+    // Issue #1793 follow-up: the unavailable tooltip becomes part of the button's
+    // accessible name, so it must be accurate for EVERY unavailable reason (in
+    // use / denied / unplugged), not just "not detected". Assert the generalized
+    // wording and that it no longer makes the misleading "detected" claim.
+    let desc = mount
+        .query_selector(".tooltip .tooltip-desc")
+        .unwrap()
+        .expect(".tooltip-desc should exist so users see what the button does");
+    let desc_text = desc.text_content().unwrap();
+    assert_eq!(
+        desc_text, "Microphone unavailable — click to retry.",
+        "unavailable MicButton tooltip must use the generalized wording, got: {desc_text:?}"
+    );
+    assert!(
+        !desc_text.contains("detected"),
+        "unavailable MicButton tooltip must not claim the device was 'not detected', got: {desc_text:?}"
+    );
 
     cleanup(&mount);
 }
@@ -223,6 +240,20 @@ async fn camera_button_stays_clickable_when_unavailable() {
     assert!(
         button.class_list().contains("error"),
         "unavailable CameraButton should carry the 'error' CSS class"
+    );
+    // Issue #1793 follow-up: symmetric to the MicButton assertion above.
+    let desc = mount
+        .query_selector(".tooltip .tooltip-desc")
+        .unwrap()
+        .expect(".tooltip-desc should exist so users see what the button does");
+    let desc_text = desc.text_content().unwrap();
+    assert_eq!(
+        desc_text, "Camera unavailable — click to retry.",
+        "unavailable CameraButton tooltip must use the generalized wording, got: {desc_text:?}"
+    );
+    assert!(
+        !desc_text.contains("detected"),
+        "unavailable CameraButton tooltip must not claim the device was 'not detected', got: {desc_text:?}"
     );
 
     cleanup(&mount);

@@ -1,0 +1,32 @@
+name: Grafana Dashboard Guardrails (HCL)
+
+on:
+  pull_request:
+    branches: [hcl-main, PR-staging]
+    paths:
+      - 'helm/grafana/dashboards/**'
+      # Run when the guard script or this workflow changes, so the check
+      # self-tests in real CI (mirrors pr-check-dioxus-ui-hcl's scripts/ci/** trigger).
+      - 'scripts/check-grafana-panel-ids.sh'
+      - '.github/workflows/pr-check-grafana-dashboards-hcl.yaml'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash --noprofile --norc -euo pipefail {0}
+
+jobs:
+  panel-id-uniqueness:
+    name: Grafana panel id uniqueness
+    runs-on: [self-hosted, linux, x64, hcl-ci]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4.2.0
+        with:
+          clean: false
+
+      # jq is preinstalled on the hcl-ci runners (used by other guard scripts).
+      - name: Check Grafana dashboards for duplicate panel ids
+        run: bash scripts/check-grafana-panel-ids.sh

@@ -1146,6 +1146,88 @@ pub fn promote_pinned_into_decoded(
     }
 }
 
+/// Run the in-order decoded-window promotions on `all_tiles` (pinned peer FIRST,
+/// then user-requested "PLAY" peers) and return the resulting `decoded_bucket` —
+/// the set of `session_id`s that occupy a decoded slot and so render live video
+/// this frame. `all_tiles` is mutated in place (the promotion swaps); the caller
+/// slices `visible_tiles` / `avatar_tiles` from it afterward.
+///
+/// ## Load-bearing partition ORDER (issues #1489 / #1509)
+///
+/// The correctness of the pinned-peer decode admission depends on this exact
+/// order, which previously lived only as inline statements at the render
+/// callsite (`attendants.rs`) and was pinned by no test — a future refactor
+/// could silently reorder it. The order is:
+///
+/// 1. **Pin-swap FIRST** ([`promote_pinned_into_decoded`]). An avatar-region pin
+///    (`[visible_tile_count, displayed_tile_count)`) is swapped INTO the decoded
+///    window BEFORE the bucket below is built, so it is a member of the returned
+///    `decoded_bucket` and the phase-3 [`merge_pinned_decode`] admits it. If the
+///    bucket were built BEFORE the swap, an avatar-region pin would be absent
+///    from `decoded_bucket`, the #1489 intersection would drop it, and a pinned,
+///    on-grid peer would render a stuck "Video paused" avatar despite being
+///    decoded — the exact regression #1509 guards against.
+/// 2. **Requested promotion SECOND** ([`promote_requested_into_decoded`]), which
+///    walks a cursor down from `visible_tile_count - 1` and SKIPS the pin's slot
+///    (`pinned_slot`) so a PLAY promotion never evicts the pin. Running it before
+///    the pin-swap would let a requested peer claim the last decoded slot the pin
+///    needs; running it after the bucket build would leave PLAY-requested peers
+///    out of `decoded_bucket` (breaking the phase-4 merge).
+/// 3. **Bucket build LAST**: `session_id`s of the (now fully promoted) decoded
+///    window `[0, visible_tile_count)`. `.parse::<u64>()` drops `mock-N`.
+///
+/// A true-overflow pin (`pinned_idx >= displayed_tile_count`) is deliberately NOT
+/// promoted (#1470 — it would evict a displayed tile off-grid), gets no decoded
+/// slot, and so is correctly absent from the returned bucket.
+///
+/// `pinned_idx` is the pin's index in `all_tiles` after speaker promotion,
+/// resolved by the caller via `client.get_peer_user_id` (not host-testable, so
+/// passed in). The pin's post-swap decoded slot is derived here purely from
+/// `pinned_idx`: an in-window pin keeps its index; a promoted avatar-region pin
+/// is now at `visible_tile_count - 1`; a true-overflow pin has no slot. This
+/// matches the swap's actual effect because `pinned_idx` is the FIRST tile
+/// matching the pinned user, so no earlier same-user tile can sit in the decoded
+/// window ahead of it. Kept pure / DOM-free / signal-free so the ordering
+/// invariant is host-unit-testable without a DOM.
+pub fn build_decoded_bucket(
+    all_tiles: &mut [String],
+    visible_tile_count: usize,
+    displayed_tile_count: usize,
+    pinned_idx: Option<usize>,
+    requested: &std::collections::HashSet<String>,
+) -> std::collections::HashSet<u64> {
+    // 1. Pin-swap FIRST — an avatar-region pin lands in the decoded window before
+    //    the bucket below reads it (issues #1489 / #1509).
+    if let Some(idx) = pinned_idx {
+        promote_pinned_into_decoded(all_tiles, visible_tile_count, displayed_tile_count, idx);
+    }
+    // The pin's decoded slot after the swap (so requested promotion skips it).
+    let pinned_slot = pinned_idx.and_then(|idx| {
+        if idx < visible_tile_count {
+            Some(idx)
+        } else if idx < displayed_tile_count && visible_tile_count > 0 {
+            Some(visible_tile_count - 1)
+        } else {
+            None
+        }
+    });
+    // 2. Requested ("PLAY") promotion SECOND — swaps requested off-budget peers
+    //    into distinct decoded slots, skipping the pinned slot.
+    promote_requested_into_decoded(
+        all_tiles,
+        visible_tile_count,
+        displayed_tile_count,
+        requested,
+        pinned_slot,
+    );
+    // 3. Build the decoded bucket LAST from the fully promoted decoded window.
+    all_tiles
+        .iter()
+        .take(visible_tile_count)
+        .filter_map(|id| id.parse::<u64>().ok())
+        .collect()
+}
+
 /// Presenter-aware decode-shed factor (issue #1559).
 ///
 /// While the LOCAL user is screen-sharing, the sharer's CPU is split between the
@@ -3891,6 +3973,139 @@ mod tests {
         assert_eq!(
             all, before,
             "a pin already in the decoded window is left untouched"
+        );
+    }
+
+    // ── issue #1509: partition-ordering across the three pin index regions ────
+    //
+    // The `promote_pinned_into_decoded` / `merge_pinned_decode` helpers are
+    // already unit-tested in ISOLATION above. These tests pin the load-bearing
+    // COMPOSITION ORDER that the real callsite (`attendants.rs`) depends on and
+    // that `build_decoded_bucket` now owns: pin-swap → decoded-window slice →
+    // `decoded_bucket` build → phase-3 `merge_pinned_decode`. The concern (#1509):
+    // a future refactor that reordered those steps — building the bucket before
+    // the swap — would strand an avatar-region pin as a stuck "Video paused"
+    // avatar on a pinned, on-grid peer, and no isolated-helper test would catch it.
+
+    /// Pin the ordering across all three pin index regions, reproducing the
+    /// callsite tail (bucket build → `active = bucket.clone()` → phase-3 merge).
+    ///
+    /// Layout: 6 camera-on tiles, decoded window `[0, 3)`, displayed grid `[0, 5)`
+    /// (index 5 folds into the +N badge). Avatar region = `[3, 5)`.
+    ///
+    /// MUTATION SENSITIVITY: moving the pin-swap to run AFTER the bucket build
+    /// inside `build_decoded_bucket` (the #1509 regression) leaves the
+    /// avatar-region pin (region 2) out of `decoded_bucket`; `merge_pinned_decode`
+    /// then drops it and the region-2 `contains(&13)` / `admitted` asserts fail.
+    /// Verified by actually reordering the two statements in the helper.
+    #[test]
+    fn build_decoded_bucket_partition_ordering_across_pin_regions() {
+        // Mirrors attendants.rs: `build_decoded_bucket` owns swap → window →
+        // bucket; the render then seeds `active_decode_set` from the bucket and
+        // runs the phase-3 `merge_pinned_decode`. Returns (bucket, pin admitted?).
+        fn admits(
+            all: &[&str],
+            visible: usize,
+            displayed: usize,
+            pinned_idx: usize,
+            pin_sid: u64,
+        ) -> (HashSet<u64>, bool) {
+            let mut all_tiles = tiles(all);
+            let decoded_bucket = build_decoded_bucket(
+                &mut all_tiles,
+                visible,
+                displayed,
+                Some(pinned_idx),
+                &req(&[]),
+            );
+            let mut active = decoded_bucket.clone();
+            merge_pinned_decode(&mut active, pin_sid, &decoded_bucket);
+            (decoded_bucket, active.contains(&pin_sid))
+        }
+
+        // Region 1 — in-window pin (idx 1 < visible 3): already decoded, admitted.
+        let (bucket1, admitted1) = admits(&["10", "11", "12", "13", "14", "15"], 3, 5, 1, 11);
+        assert_eq!(
+            bucket1,
+            bucket(&[10, 11, 12]),
+            "region 1: in-window pin leaves the decoded window unchanged"
+        );
+        assert!(
+            admitted1,
+            "region 1: an in-window pin is admitted to the decode set"
+        );
+
+        // Region 2 — avatar-region pin (idx 3 in [3,5)): swapped INTO the window
+        // BEFORE the bucket is read, so it is a member and is admitted. This is the
+        // ordering-sensitive case #1509 guards.
+        let (bucket2, admitted2) = admits(&["10", "11", "12", "13", "14", "15"], 3, 5, 3, 13);
+        assert!(
+            bucket2.contains(&13),
+            "region 2: avatar-region pin swapped into decoded_bucket BEFORE it is read"
+        );
+        assert_eq!(
+            bucket2,
+            bucket(&[10, 11, 13]),
+            "region 2: pin (13) took the last decoded slot, displacing tile 12"
+        );
+        assert!(
+            admitted2,
+            "region 2: avatar-region pin is admitted — FAILS if the swap runs after the bucket build"
+        );
+
+        // Region 3 — true-overflow pin (idx 5 >= displayed 5): NOT promoted, absent
+        // from the bucket, NOT admitted (stays in the +N badge — #1470 / #1489).
+        let (bucket3, admitted3) = admits(&["10", "11", "12", "13", "14", "15"], 3, 5, 5, 15);
+        assert!(
+            !bucket3.contains(&15),
+            "region 3: true-overflow pin gets no decoded slot"
+        );
+        assert_eq!(
+            bucket3,
+            bucket(&[10, 11, 12]),
+            "region 3: decoded window unchanged by a true-overflow pin"
+        );
+        assert!(
+            !admitted3,
+            "region 3: a true-overflow pin is NOT force-decoded (decode⇄render agree)"
+        );
+    }
+
+    /// With BOTH a pinned peer AND a PLAY-requested peer in the avatar region, the
+    /// pin-swap must run BEFORE requested promotion, and requested promotion must
+    /// SKIP the pin's derived slot — so neither evicts the other and both land in
+    /// `decoded_bucket`. `build_decoded_bucket` owns that order and derives the
+    /// pin's post-swap slot.
+    ///
+    /// Layout: window `[0, 3)`, displayed `[0, 5)`. Pin at idx 3 (session 13),
+    /// PLAY-requested peer "14" at idx 4 — both in the avatar region.
+    ///
+    /// MUTATION SENSITIVITY: if the derived `pinned_slot` were wrong (e.g. `None`),
+    /// requested promotion would reuse slot 2 and evict the pin (13) out of the
+    /// decoded window, so `contains(&13)` fails. If requested promotion ran BEFORE
+    /// the pin-swap, "14" would claim the last decoded slot the pin needs.
+    #[test]
+    fn build_decoded_bucket_pin_and_requested_coexist() {
+        let mut all_tiles = tiles(&["10", "11", "12", "13", "14", "15"]);
+        let decoded_bucket = build_decoded_bucket(
+            &mut all_tiles,
+            3,
+            5,
+            Some(3),       // pin at avatar-region idx 3 (session 13)
+            &req(&["14"]), // PLAY-requested peer at avatar-region idx 4
+        );
+        assert!(
+            decoded_bucket.contains(&13),
+            "pinned peer kept its decoded slot (requested promotion skipped it)"
+        );
+        assert!(
+            decoded_bucket.contains(&14),
+            "requested peer promoted into a decoded slot"
+        );
+        assert_eq!(
+            decoded_bucket,
+            bucket(&[10, 13, 14]),
+            "pin + requested both decoded; peer 11 displaced to the avatar region"
         );
     }
 

@@ -1317,145 +1317,99 @@ test.describe("Meeting-list section expand/collapse persistence", () => {
   });
 });
 
-// Issue #1601: on the meeting settings page, an ENDED meeting's Activity card
-// renders the "Time" stat as a `from – to` range (e.g.
-// `Jun 22, 2026, 10:00 AM EDT – Jun 22, 2026, 10:32 AM EDT`). The value span
-// used to inherit `.settings-stat-value { white-space: nowrap }`, so the long
-// range stayed on one line and OVERFLOWED the compact card horizontally. The
-// fix gives the ended-Time value the `.settings-stat-value--range` modifier
-// (`white-space: normal; text-align: right`) and wraps each timestamp in an
-// atomic `.settings-stat-time-part` / `.settings-stat-separator` nowrap unit,
-// so the value wraps between the two timestamps (each timestamp staying intact)
-// instead of overflowing. Single-value rows (Participants, Duration, and the
-// non-ended "Started" case) keep the bare nowrap `.settings-stat-value`.
+// Issue #1601 originally made an ENDED meeting's Activity-card "Time" stat — a
+// `from – to` range that overflowed the compact card — WRAP between the two
+// timestamps. Issue #1672 supersedes that: the range is gone entirely, replaced
+// by three separate labeled field-lines ("Started", "Ended", "Duration"), each
+// with a single value that wraps/contains via `.settings-stat-value--time`.
 //
-// These assertions are written to FAIL on the un-fixed CSS: under
-// `white-space: nowrap` the long range cannot wrap, so at a narrow viewport it
-// (a) renders on a single line — same height as the single-line "Participants"
-// value — and (b) overflows the card's content box. Reverting the production
-// CSS to nowrap breaks both checks below; they are not satisfiable on one line.
-test.describe("Meeting settings – ended Time range wraps without overflow (issue 1601)", () => {
+// This test carries the #1601 overflow-regression intent forward onto the #1672
+// layout: at a narrow viewport it asserts the three rows are present, the legacy
+// one-line-range DOM ("Time" label, `.settings-stat-value--range`,
+// `.settings-stat-separator`) is gone, and neither timestamp row overflows the
+// card. It FAILS on the un-fixed code: reverting #1672 re-introduces the "Time"
+// range row (no distinct "Ended" row, separator present), breaking the
+// row-presence and legacy-DOM-absent assertions below.
+test.describe("Meeting settings – ended meeting time renders as separate field lines without overflow (issues 1601, 1672)", () => {
   test.beforeAll(async () => {
     await waitForServices();
   });
 
-  test("ended meeting Time range wraps after the from-time and does not overflow the card", async ({
+  test("ended meeting shows Started/Ended/Duration rows, drops the legacy range, and does not overflow at narrow width", async ({
     context,
     baseURL,
     page,
   }) => {
-    const email = `time-range-wrap-${Date.now()}@videocall.rs`;
-    const name = "TimeRangeWrapUser";
+    const email = `time-fields-${Date.now()}@videocall.rs`;
+    const name = "TimeFieldsUser";
     // The settings page fetches meeting info in-browser as the cookie identity,
     // so the injected session must own the seeded meeting to load its Activity
     // card. Use the SAME email/name for the cookie and the REST seeding calls.
     await injectSessionCookie(context, { baseURL, email, name });
 
     // Seed an ENDED meeting (host-join activates it, then end sets ended_at +
-    // state="ended"). With both started_at and ended_at present, the Activity
-    // card's Time row renders the `from – to` range and the "Duration" row.
-    const meetingId = `e2e_time_range_wrap_${Date.now()}`;
+    // state="ended") so the Activity card has both started_at and ended_at.
+    const meetingId = `e2e_time_fields_${Date.now()}`;
     await createMeeting(email, name, { meetingId, waitingRoomEnabled: false });
     await joinMeeting(email, name, meetingId, name);
     await endMeeting(email, name, meetingId);
 
-    // Force a narrow viewport so the ~50-char range CANNOT fit on one line.
-    // This makes the wrap (fixed) vs. overflow (un-fixed) divergence
-    // deterministic regardless of the default desktop width: without the fix
-    // the line cannot wrap and must overflow; with the fix it wraps to 2 lines.
+    // Narrow viewport: the #1601 overflow condition (a ~50-char one-line range
+    // could not fit) — now guarded against the #1672 three-line layout, whose
+    // per-timestamp values must wrap/contain rather than spill out of the card.
     await page.setViewportSize({ width: 380, height: 800 });
 
     await page.goto(`/meeting/${meetingId}/settings`);
     await expect(page.getByText("Activity")).toBeVisible({ timeout: 15_000 });
 
-    // The ended-meeting row is labelled "Time" (the non-ended case is "Started").
-    const timeRow = page.locator(".settings-stat-row").filter({ hasText: "Time" });
-    await expect(timeRow).toBeVisible({ timeout: 10_000 });
+    // RSX-anchored: a .settings-stat-row whose .settings-stat-label text is an
+    // exact match (so "Ended" can't collide with the lowercase "ended" state
+    // badge, and "Started" can't match a substring).
+    const statRow = (label: string) =>
+      page.locator(".settings-stat-row").filter({
+        has: page.locator(".settings-stat-label", { hasText: new RegExp(`^${label}$`) }),
+      });
 
-    // The range value carries the modifier class added by the fix.
-    const rangeValue = timeRow.locator(".settings-stat-value--range");
-    await expect(rangeValue).toBeVisible({ timeout: 5_000 });
+    // #1672: three separate labeled field-lines for an ended meeting, each with
+    // its own timestamp/duration value (Started + Ended carry a 4-digit year).
+    await expect(statRow("Started")).toBeVisible({ timeout: 10_000 });
+    await expect(statRow("Ended")).toBeVisible();
+    await expect(statRow("Duration")).toBeVisible();
+    await expect(statRow("Started").locator(".settings-stat-value")).toContainText(/\b20\d{2}\b/);
+    await expect(statRow("Ended").locator(".settings-stat-value")).toContainText(/\b20\d{2}\b/);
 
-    // It is a genuine `from – to` range: two atomic timestamp parts joined by
-    // the en-dash separator. (One part = the from-time, the separator span =
-    // " – {ended}".) If this row only had a single timestamp there would be
-    // nothing to wrap and the test would be meaningless, so assert the range
-    // structure is present first.
-    const fromPart = rangeValue.locator(".settings-stat-time-part");
-    const separator = rangeValue.locator(".settings-stat-separator");
-    await expect(fromPart).toHaveCount(1);
-    await expect(separator).toHaveCount(1);
-    await expect(separator).toContainText("–");
+    // Fails-on-unfixed: the pre-#1672 code rendered a single "Time" label whose
+    // value was a `from – to` range (.settings-stat-value--range with a
+    // .settings-stat-separator), and NO distinct "Ended" row. Assert that DOM
+    // is gone — reverting #1672 re-introduces "Time"/the separator and drops the
+    // "Ended" row, breaking the assertions above and below.
+    await expect(page.locator(".settings-stat-label", { hasText: /^Time$/ })).toHaveCount(0);
+    await expect(page.locator(".settings-stat-separator")).toHaveCount(0);
+    await expect(page.locator(".settings-stat-value--range")).toHaveCount(0);
 
-    // ── Regression assertion 1: no horizontal overflow ──
-    // The stat row is a `display: flex` (block-level) container, so its
-    // scrollWidth/clientWidth are reliable (unlike a pure-inline <span>). Under
-    // the un-fixed nowrap CSS the long single line forces the flex row's
-    // content wider than its card-constrained box, so scrollWidth exceeds
-    // clientWidth. The fix wraps the value so the row's content fits its box.
-    const rowOverflows = await timeRow.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
-    expect(rowOverflows, "ended Time row must not overflow the card").toBe(false);
+    // #1601 regression, re-expressed for the new layout: at 380px neither
+    // timestamp row overflows the card horizontally — the .settings-stat-value--time
+    // wrap (white-space:normal; overflow-wrap:anywhere; min-width:0) contains a
+    // long timestamp instead of spilling past the card's right content edge.
+    for (const label of ["Started", "Ended"]) {
+      const row = statRow(label);
+      const rowOverflows = await row.evaluate((el) => el.scrollWidth > el.clientWidth + 1);
+      expect(rowOverflows, `ended ${label} row must not overflow the card`).toBe(false);
 
-    // The range value's rendered box must stay within the card's content box
-    // (right edge containment). bounding-rect math is reliable for the inline
-    // value span where scrollWidth/clientWidth are not. Under nowrap the single
-    // long line pushes the value's right edge past the card's right content
-    // edge; the fix wraps it so the box stays inside the card.
-    const card = timeRow.locator("xpath=ancestor::div[contains(@class,'settings-card')][1]");
-    const cardRight = await card.evaluate((el) => {
-      const r = el.getBoundingClientRect();
-      const cs = getComputedStyle(el);
-      // Inner content right edge = box right minus right border + right padding.
-      return r.right - parseFloat(cs.borderRightWidth) - parseFloat(cs.paddingRight);
-    });
-    const valueRight = await rangeValue.evaluate(
-      (el) => (el as HTMLElement).getBoundingClientRect().right,
-    );
-    expect(
-      valueRight,
-      `ended Time range right edge (${valueRight}) must stay within the card content edge (${cardRight})`,
-    ).toBeLessThanOrEqual(cardRight + 1);
-
-    // ── Regression assertion 2: the value actually wrapped to >1 line ──
-    // Calibrate a single-line baseline from the "Participants" stat value in
-    // the same card (same font-size, guaranteed single line — bare
-    // .settings-stat-value, no range). The wrapped Time range must be
-    // meaningfully taller (≈2 lines). Under nowrap the range stays on ONE line,
-    // so its height would match the baseline and this assertion would fail.
-    const baselineValue = page
-      .locator(".settings-stat-row")
-      .filter({ hasText: "Participants" })
-      .locator(".settings-stat-value");
-    await expect(baselineValue).toBeVisible({ timeout: 5_000 });
-
-    const baselineHeight = await baselineValue.evaluate(
-      (el) => (el as HTMLElement).getBoundingClientRect().height,
-    );
-    const rangeHeight = await rangeValue.evaluate(
-      (el) => (el as HTMLElement).getBoundingClientRect().height,
-    );
-    // ≥1.5× the single-line height proves it occupies more than one line
-    // without demanding an exact 2.0× (line-box rounding / descenders vary).
-    expect(
-      rangeHeight,
-      `ended Time range must wrap to >1 line (range=${rangeHeight}px, single-line baseline=${baselineHeight}px)`,
-    ).toBeGreaterThan(baselineHeight * 1.5);
-
-    // ── Assertion 3: each timestamp is an atomic, intact unit ──
-    // Both atomic parts carry `white-space: nowrap`, so each timestamp is a
-    // single unbreakable unit and the wrap can only happen BETWEEN them. We
-    // assert the computed style is nowrap (so a future refactor that drops the
-    // nowrap on the parts — allowing a mid-date break — would fail here) and
-    // that each part renders a complete date string (year present), confirming
-    // no character-level fragmentation of a timestamp.
-    const fromWhiteSpace = await fromPart.evaluate((el) => getComputedStyle(el).whiteSpace);
-    expect(fromWhiteSpace, "from-time must be an atomic nowrap unit").toBe("nowrap");
-    const separatorWhiteSpace = await separator.evaluate((el) => getComputedStyle(el).whiteSpace);
-    expect(separatorWhiteSpace, "ended-time must be an atomic nowrap unit").toBe("nowrap");
-
-    // Each part is a complete localized datetime (contains the 4-digit year),
-    // so neither timestamp was split across the wrap boundary.
-    await expect(fromPart).toContainText(/\b20\d{2}\b/);
-    await expect(separator).toContainText(/\b20\d{2}\b/);
+      const card = row.locator("xpath=ancestor::div[contains(@class,'settings-card')][1]");
+      const cardRight = await card.evaluate((el) => {
+        const r = el.getBoundingClientRect();
+        const cs = getComputedStyle(el);
+        // Inner content right edge = box right minus right border + right padding.
+        return r.right - parseFloat(cs.borderRightWidth) - parseFloat(cs.paddingRight);
+      });
+      const valueRight = await row
+        .locator(".settings-stat-value")
+        .evaluate((el) => (el as HTMLElement).getBoundingClientRect().right);
+      expect(
+        valueRight,
+        `ended ${label} value right edge (${valueRight}) must stay within the card content edge (${cardRight})`,
+      ).toBeLessThanOrEqual(cardRight + 1);
+    }
   });
 });

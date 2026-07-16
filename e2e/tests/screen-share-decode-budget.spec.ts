@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page, BrowserContext } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * Screen-share panel decode-budget render-wiring E2E coverage (issue #1471,
@@ -185,7 +186,7 @@ async function admitGuestIfNeeded(
  * layout appears on `viewerPage`. Mirrors screen-share-panel.spec.ts.
  */
 async function startScreenShare(sharerPage: Page, viewerPage: Page): Promise<boolean> {
-  await sharerPage.mouse.move(400, 400);
+  await wakeControls(sharerPage);
   await sharerPage.waitForTimeout(300);
   const shareButton = sharerPage.locator("button.video-control-button", {
     has: sharerPage.locator(".tooltip", { hasText: "Share Screen" }),

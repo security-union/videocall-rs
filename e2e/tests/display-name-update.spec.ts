@@ -1,6 +1,7 @@
 import { test, expect, chromium, Page } from "@playwright/test";
 import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 const COOKIE_NAME = process.env.COOKIE_NAME || "session";
 const API_URL = process.env.API_BASE_URL || "http://localhost:8081";
@@ -612,7 +613,7 @@ test.describe("Display name live update", () => {
 
       // ---- Open peer list sidebar, then click Edit display name ----
       // Move mouse to wake auto-hidden controls bar before clicking.
-      await guestPage.mouse.move(400, 400);
+      await wakeControls(guestPage);
       await guestPage.waitForTimeout(300);
       const openPeersBtn = guestPage.locator("button.video-control-button", {
         has: guestPage.locator("span.tooltip", { hasText: "Open Peers" }),

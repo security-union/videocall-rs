@@ -12,10 +12,11 @@ use wasm_bindgen_test::*;
 
 use dioxus_ui::context::{
     apply_notification_prefs, apply_transport_decision, clear_display_name_from_storage,
-    clear_transport_sticky_and_pref, email_to_display_name, load_display_name_from_storage,
-    load_transport_preference, resolve_transport_config, save_display_name_to_storage,
-    save_transport_preference, save_transport_sticky, validate_display_name, AppearanceSettings,
-    TransportPreference, DISPLAY_NAME_MAX_LEN,
+    clear_transport_sticky_and_pref, email_to_display_name, load_appearance_settings_from_storage,
+    load_display_name_from_storage, load_transport_preference, resolve_transport_config,
+    save_appearance_settings_to_storage, save_display_name_to_storage, save_transport_preference,
+    save_transport_sticky, validate_display_name, AppearanceSettings, TransportPreference,
+    DISPLAY_NAME_MAX_LEN,
 };
 use videocall_types::validation::normalize_spaces;
 
@@ -179,6 +180,27 @@ fn storage_round_trip() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item("vc_display_name");
     }
+}
+
+#[wasm_bindgen_test]
+fn appearance_glow_decay_defaults_to_midpoint_when_missing() {
+    let storage = web_sys::window()
+        .and_then(|w| w.local_storage().ok().flatten())
+        .expect("test environment must have localStorage");
+    let _ = storage.remove_item("vc_appearance_glow_decay");
+
+    let settings = load_appearance_settings_from_storage();
+    assert_eq!(settings.glow_decay, 0.5);
+}
+
+#[wasm_bindgen_test]
+fn appearance_glow_decay_round_trips_through_storage() {
+    let mut settings = AppearanceSettings::default();
+    settings.glow_decay = 0.1;
+    save_appearance_settings_to_storage(&settings);
+
+    let loaded = load_appearance_settings_from_storage();
+    assert_eq!(loaded.glow_decay, 0.1);
 }
 
 #[wasm_bindgen_test]

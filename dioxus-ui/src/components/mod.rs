@@ -37,6 +37,13 @@ pub mod okta_sign_in_button;
 pub mod peer_list_item;
 pub mod performance_settings;
 pub mod preferences_settings_panel;
+// Issue 1175: pure zoom/pan math for received shared content (host-testable).
+pub mod screen_share_zoom;
+// Issue 1175: imperative glue to detach shared content into a separate window.
+// wasm-only: it touches `web_sys::window`, Document PiP / window.open, and
+// `captureStream`.
+#[cfg(target_arch = "wasm32")]
+pub mod screen_share_detach;
 pub mod search_modal;
 pub mod signal_quality;
 pub mod toggle_switch;

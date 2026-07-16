@@ -16,6 +16,52 @@ use videocall_client::VideoCallClient;
 #[derive(Clone, Copy)]
 pub struct CroppedTilesCtx(pub Signal<std::collections::HashMap<String, bool>>);
 
+/// Issue 1175: per-tile zoom / pan state for a RECEIVED shared-content tile.
+///
+/// `scale` is the CSS transform scale applied to the content wrapper (1.0 ==
+/// fit-to-tile, the resting state; clamped to `[1.0, 4.0]` by
+/// `screen_share_zoom`). `off_x` / `off_y` are the pan translation in CSS
+/// pixels applied together with the scale. An entry absent from the map is the
+/// default fit state (`scale = 1.0`, no pan), so the common un-zoomed tile
+/// stores nothing.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct ScreenZoomState {
+    pub scale: f64,
+    pub off_x: f64,
+    pub off_y: f64,
+}
+
+impl Default for ScreenZoomState {
+    fn default() -> Self {
+        Self {
+            scale: 1.0,
+            off_x: 0.0,
+            off_y: 0.0,
+        }
+    }
+}
+
+/// Issue 1175: per-tile zoom/pan state for received shared content, keyed by
+/// peer session id. Mirrors [`CroppedTilesCtx`] deliberately — a single shared
+/// signal so a zoom change re-renders only the affected screen-share tile
+/// (there is at most one active sharer) and survives peer-list re-renders. The
+/// state is rendered DECLARATIVELY as a CSS `transform` on a wrapper around the
+/// canvas, so the `<canvas>` node the decoder paints into is never recreated
+/// (the whole point of the issue-1175 v2 rewrite).
+#[derive(Clone, Copy)]
+pub struct ScreenZoomCtx(pub Signal<std::collections::HashMap<String, ScreenZoomState>>);
+
+/// Issue 1175: the single peer whose shared content is currently detached into
+/// a separate window, or `None`. One-at-a-time by design (the Document
+/// Picture-in-Picture API allows only one window; the `window.open` fallback
+/// keeps the same invariant). Drives the `.share-detached` class on
+/// `#grid-container`, which hides the split share pane OFF-SCREEN (and marks it
+/// `inert`) so the main window looks like a regular no-share meeting — while the
+/// canvas stays mounted, composited, and painting so the detached-window mirror
+/// keeps flowing and reattach is instant.
+#[derive(Clone, Copy)]
+pub struct DetachedShareCtx(pub Signal<Option<String>>);
+
 /// Action bar dock position (Bottom / Left / Right).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DockPosition {
@@ -419,6 +465,7 @@ pub struct AppearanceSettings {
     pub glow_color: GlowColor,
     pub glow_brightness: f32,     // 0.0–1.0 scale factor
     pub inner_glow_strength: f32, // 0.0–1.0 scale factor
+    pub glow_decay: f32,          // 0.0–1.0 scale factor
     pub show_entry_notifications: bool,
     pub show_exit_notifications: bool,
     pub play_entry_sound: bool,
@@ -430,8 +477,9 @@ impl Default for AppearanceSettings {
         AppearanceSettings {
             glow_enabled: true,
             glow_color: GlowColor::MintGreen,
-            glow_brightness: 1.0,
-            inner_glow_strength: 1.0,
+            glow_brightness: 0.5,
+            inner_glow_strength: 0.5,
+            glow_decay: 0.5,
             show_entry_notifications: true,
             show_exit_notifications: true,
             play_entry_sound: true,
@@ -448,6 +496,7 @@ const APPEARANCE_GLOW_ENABLED_STORAGE_KEY: &str = "vc_appearance_glow_enabled";
 const APPEARANCE_COLOR_STORAGE_KEY: &str = "vc_appearance_glow_color";
 const APPEARANCE_BRIGHTNESS_STORAGE_KEY: &str = "vc_appearance_glow_brightness";
 const APPEARANCE_INNER_STORAGE_KEY: &str = "vc_appearance_inner_glow_strength";
+const APPEARANCE_DECAY_STORAGE_KEY: &str = "vc_appearance_glow_decay";
 const APPEARANCE_ENTRY_NOTIFICATIONS_KEY: &str = "vc_appearance_entry_notifications";
 const APPEARANCE_EXIT_NOTIFICATIONS_KEY: &str = "vc_appearance_exit_notifications";
 const APPEARANCE_ENTRY_SOUND_KEY: &str = "vc_appearance_entry_sound";
@@ -482,6 +531,12 @@ pub fn load_appearance_settings_from_storage() -> AppearanceSettings {
         read_local_storage(APPEARANCE_INNER_STORAGE_KEY).and_then(|v| v.parse::<f32>().ok())
     {
         settings.inner_glow_strength = value.clamp(0.0, 1.0);
+    }
+
+    if let Some(value) =
+        read_local_storage(APPEARANCE_DECAY_STORAGE_KEY).and_then(|v| v.parse::<f32>().ok())
+    {
+        settings.glow_decay = value.clamp(0.0, 1.0);
     }
 
     apply_notification_prefs(
@@ -548,6 +603,10 @@ pub fn save_appearance_settings_to_storage(settings: &AppearanceSettings) {
     write_local_storage(
         APPEARANCE_INNER_STORAGE_KEY,
         &settings.inner_glow_strength.clamp(0.0, 1.0).to_string(),
+    );
+    write_local_storage(
+        APPEARANCE_DECAY_STORAGE_KEY,
+        &settings.glow_decay.clamp(0.0, 1.0).to_string(),
     );
     write_local_storage(
         APPEARANCE_ENTRY_NOTIFICATIONS_KEY,

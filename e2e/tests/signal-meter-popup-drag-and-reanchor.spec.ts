@@ -2,6 +2,7 @@ import { test, expect, Page, BrowserContext, Locator } from "@playwright/test";
 import { chromium } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
+import { wakeControls } from "../helpers/controls";
 
 /**
  * HCL follow-up 952: addInitScript payload that replaces
@@ -604,7 +605,7 @@ test.describe("Signal-meter popup — drag-and-drop + reanchor (HCL bug #9)", ()
       await hostPage.waitForTimeout(8_000);
 
       // Guest starts the share — host enters split layout.
-      await guestPage.mouse.move(400, 400);
+      await wakeControls(guestPage);
       await guestPage.waitForTimeout(300);
       const shareBtn = guestPage.locator("button.video-control-button", {
         has: guestPage.locator(".tooltip", { hasText: "Share Screen" }),

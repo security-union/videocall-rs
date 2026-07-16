@@ -110,6 +110,17 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
     await page.mouse.click(x, y);
   }
 
+  // Meeting Options is a host-only glass-backdrop modal. Its open state is
+  // uniquely identifiable by the "Close meeting options" Done button, which
+  // only exists while the panel is mounted.
+  const meetingOptionsPanel = (page: Page) => page.locator('[aria-label="Close meeting options"]');
+
+  async function openMeetingOptions(page: Page): Promise<void> {
+    await page.locator(".video-controls-container").hover();
+    await page.locator('[data-testid="open-meeting-options"]').click();
+    await expect(meetingOptionsPanel(page)).toBeVisible({ timeout: 10_000 });
+  }
+
   test("opening dock menu closes density popover", async ({ page }) => {
     await joinMeeting(page, "dock_closes_density");
 
@@ -180,6 +191,36 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
 
     await expect(page.locator(".glass-select-menu")).not.toBeVisible({ timeout: 5_000 });
     await expect(page.locator("#diagnostics-sidebar")).toHaveClass(/visible/, { timeout: 5_000 });
+  });
+
+  // The six sibling `.set(false)` calls in MeetingOptionsButton's onclick
+  // share one code path, so a representative sibling
+  // of each kind — a popover (density) and a sidebar (peer list) — pins the
+  // whole set. Reverting those six lines turns these red.
+  test("opening Meeting Options closes density popover", async ({ page }) => {
+    await joinMeeting(page, "meetopts_closes_density");
+
+    await openDensityPopover(page);
+    await expect(page.locator(".density-popover")).toBeVisible();
+
+    await openMeetingOptions(page);
+
+    await expect(page.locator(".density-popover")).not.toBeVisible({ timeout: 5_000 });
+    await expect(meetingOptionsPanel(page)).toBeVisible();
+  });
+
+  test("opening Meeting Options closes peer list", async ({ page }) => {
+    await joinMeeting(page, "meetopts_closes_peers");
+
+    await clickPeerListButton(page);
+    await expect(page.locator("#peer-list-container")).toHaveClass(/visible/, { timeout: 5_000 });
+
+    await openMeetingOptions(page);
+
+    await expect(page.locator("#peer-list-container")).not.toHaveClass(/visible/, {
+      timeout: 5_000,
+    });
+    await expect(meetingOptionsPanel(page)).toBeVisible();
   });
 
   test("clicking outside the density popover closes it", async ({ page }) => {
@@ -516,5 +557,91 @@ test.describe("Popup/dropdown layering and mutual exclusivity", () => {
     // Focus must land on the density trigger, not on <body>
     const trigger = page.locator("#density-mode-trigger");
     await expect(trigger).toBeFocused({ timeout: 3_000 });
+  });
+
+  test("density popover auto-focuses the active option on open", async ({ page }) => {
+    await joinMeeting(page, "density_autofocus");
+
+    await openDensityPopover(page);
+    await expect(page.locator(".density-popover")).toBeVisible();
+
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const el = document.activeElement;
+          return (
+            el?.getAttribute("role") === "menuitemradio" &&
+            el?.getAttribute("aria-checked") === "true"
+          );
+        }),
+      )
+      .toBe(true);
+  });
+
+  test("ArrowDown moves focus between density options", async ({ page }) => {
+    await joinMeeting(page, "density_arrow_nav");
+
+    await openDensityPopover(page);
+    await expect(page.locator(".density-popover")).toBeVisible();
+
+    // Wait for auto-focus to land on a menuitemradio (the committed option).
+    // This eliminates the race where firstLabel captures the trigger instead
+    // of an option, which would let the auto-focus timer satisfy the assertion
+    // even if ArrowDown navigation were completely removed.
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const el = document.activeElement;
+          return el?.getAttribute("role") === "menuitemradio";
+        }),
+      )
+      .toBe(true);
+
+    const firstId = await page.evaluate(() => document.activeElement?.id ?? "");
+
+    await page.keyboard.press("ArrowDown");
+
+    // The focused option must have advanced to a different element.
+    await expect
+      .poll(() => page.evaluate(() => document.activeElement?.id ?? ""))
+      .not.toBe(firstId);
+
+    // Confirm the new focus is still on a menuitemradio (not the trigger).
+    const role = await page.evaluate(() => document.activeElement?.getAttribute("role") ?? "");
+    expect(role).toBe("menuitemradio");
+  });
+
+  test("Enter activates a density option and closes the popover", async ({ page }) => {
+    await joinMeeting(page, "density_enter_activate");
+
+    await openDensityPopover(page);
+    await expect(page.locator(".density-popover")).toBeVisible();
+
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Enter");
+
+    await expect(page.locator(".density-popover")).not.toBeVisible({
+      timeout: 3_000,
+    });
+    await expect(page.locator("#density-mode-trigger")).toBeFocused({
+      timeout: 3_000,
+    });
+  });
+
+  test("Space activates a density option and closes the popover", async ({ page }) => {
+    await joinMeeting(page, "density_space_activate");
+
+    await openDensityPopover(page);
+    await expect(page.locator(".density-popover")).toBeVisible();
+
+    await page.keyboard.press("ArrowDown");
+    await page.keyboard.press("Space");
+
+    await expect(page.locator(".density-popover")).not.toBeVisible({
+      timeout: 3_000,
+    });
+    await expect(page.locator("#density-mode-trigger")).toBeFocused({
+      timeout: 3_000,
+    });
   });
 });

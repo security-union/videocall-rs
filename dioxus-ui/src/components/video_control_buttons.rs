@@ -96,7 +96,7 @@ pub fn MicButton(enabled: bool, available: bool, onclick: EventHandler<MouseEven
                 }
                 span { class: "tooltip",
                     span { class: "tooltip-title", "Microphone — Unmute" }
-                    span { class: "tooltip-desc", "No microphone detected. Connect or grant access to a mic, then try again." }
+                    span { class: "tooltip-desc", "Microphone unavailable — click to retry." }
                 }
                 span { class: "device-warning", "!" }
             }
@@ -176,7 +176,7 @@ pub fn CameraButton(enabled: bool, available: bool, onclick: EventHandler<MouseE
                 }
                 span { class: "tooltip",
                     span { class: "tooltip-title", "Camera — Start Video" }
-                    span { class: "tooltip-desc", "No camera detected. Connect or grant access to a camera, then try again." }
+                    span { class: "tooltip-desc", "Camera unavailable — click to retry." }
                 }
                 span { class: "device-warning", "!" }
             }
@@ -527,6 +527,8 @@ pub fn DensityModeButton(label: String, open: bool, onclick: EventHandler<MouseE
             id: "density-mode-trigger",
             class,
             title: "Layout density: {label}",
+            "aria-haspopup": "menu",
+            "aria-expanded": if open { "true" } else { "false" },
             onclick: move |evt| onclick.call(evt),
             svg {
                 xmlns: "http://www.w3.org/2000/svg",

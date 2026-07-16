@@ -22,18 +22,26 @@ use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
+use crate::components::icons::zoom::{DetachIcon, ZoomInIcon, ZoomOutIcon, ZoomResetIcon};
 use crate::components::media_metrics_overlay::media_metrics_overlay;
+use crate::components::screen_share_zoom;
 use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
 // SignalMeterMode is referenced via SignalInfo internally — no direct import
 // needed in this file (yet); attendants/peer_tile own the call-site values.
 use crate::constants::users_allowed_to_stream;
-use crate::context::{AppearanceSettings, CroppedTilesCtx, HostSetCtx, VideoCallClientCtx};
+use crate::context::{
+    AppearanceSettings, CroppedTilesCtx, DetachedShareCtx, HostSetCtx, ScreenZoomCtx,
+    ScreenZoomState, VideoCallClientCtx,
+};
 use dioxus::prelude::*;
+use dioxus::web::WebEventExt;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use videocall_client::VideoCallClient;
+use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{window, HtmlCanvasElement};
+use web_sys::{window, HtmlCanvasElement, HtmlElement};
 
 // ─── Glow formula constants ───────────────────────────────────────────────────
 
@@ -41,15 +49,19 @@ use web_sys::{window, HtmlCanvasElement};
 const OUTER_BLUR_BASE: f32 = 14.0;
 /// Outer blur radius contribution per unit of audio intensity.
 const OUTER_BLUR_INTENSITY: f32 = 14.0;
-/// Additional outer blur contributed by brightness² per unit of intensity.
-const OUTER_BLUR_BRIGHTNESS: f32 = 10.0;
 
 /// Base outer spread in pixels at zero audio level.
 const OUTER_SPREAD_BASE: f32 = 1.0;
 /// Outer spread contribution per unit of audio intensity.
 const OUTER_SPREAD_INTENSITY: f32 = 2.0;
-/// Additional outer spread contributed by brightness² per unit of intensity.
-const OUTER_SPREAD_BRIGHTNESS: f32 = 4.0;
+/// Scale for glow bleed at 0% slider: no glow shadow.
+const GLOW_BLEED_MIN: f32 = 0.0;
+/// Additional glow bleed scale from slider 0% -> 100%.
+const GLOW_BLEED_RANGE: f32 = 3.80;
+/// Scale for color intensity at 0% brightness: keep a faint hint visible.
+const BRIGHTNESS_INTENSITY_MIN: f32 = 0.05;
+/// Additional color intensity from brightness 0% -> 100%.
+const BRIGHTNESS_INTENSITY_RANGE: f32 = 1.95;
 
 /// Base outer shadow alpha at zero audio level.
 const OUTER_ALPHA_BASE: f32 = 0.18;
@@ -77,6 +89,10 @@ const BORDER_ALPHA_BASE: f32 = 0.50;
 /// Border alpha increase per unit of audio intensity.
 const BORDER_ALPHA_INTENSITY: f32 = 0.42;
 pub(crate) const DEFAULT_TILE_BORDER_COLOR: &str = "rgba(100, 100, 100, 0.30)";
+const SILENT_BORDER_RESET_SECONDS: f32 = 0.30;
+const GLOW_FADE_IN_SECONDS_DEFAULT: f32 = 0.15;
+const GLOW_FADE_OUT_SECONDS_DEFAULT: f32 = 1.50;
+const GLOW_FADE_OUT_SECONDS_MAX: f32 = 3.00;
 
 // ─── Shared glow parameter struct ────────────────────────────────────────────
 
@@ -88,8 +104,8 @@ pub(crate) struct GlowParams {
     pub inner_blur: f32,
     pub inner_spread: f32,
     pub inner_alpha: f32,
-    /// Border alpha is independent of brightness so the colored border stays
-    /// clearly visible even when glow brightness is turned down to zero.
+    /// Border alpha follows brightness intensity so very low brightness can
+    /// render a subtle border while higher brightness remains clearly visible.
     pub border_alpha: f32,
 }
 
@@ -106,21 +122,27 @@ pub(crate) fn calculate_glow_params(
     let i = intensity.clamp(0.0, 1.0);
     let b = brightness.clamp(0.0, 1.0);
     let s = inner_strength.clamp(0.0, 1.0);
-    let brightness_curve = b * b;
-    let inner_curve = s * s;
+    // Brightness changes ONLY color intensity (alpha), not glow geometry.
+    // 50% maps to roughly the previous full-brightness intensity.
+    let brightness_intensity = BRIGHTNESS_INTENSITY_MIN + b * BRIGHTNESS_INTENSITY_RANGE;
+    // The "Glow" slider controls shadow/bleed geometry. 0% must produce no
+    // glow shadow, while 50% is the practical default and 100% is exaggerated.
+    let glow_bleed = GLOW_BLEED_MIN + s * GLOW_BLEED_RANGE;
     GlowParams {
-        outer_blur: OUTER_BLUR_BASE
-            + i * (OUTER_BLUR_INTENSITY + brightness_curve * OUTER_BLUR_BRIGHTNESS),
-        outer_spread: OUTER_SPREAD_BASE
-            + i * (OUTER_SPREAD_INTENSITY + brightness_curve * OUTER_SPREAD_BRIGHTNESS),
-        outer_alpha: (OUTER_ALPHA_BASE + i * OUTER_ALPHA_INTENSITY) * brightness_curve,
-        inner_blur: INNER_BLUR_BASE
-            + i * (INNER_BLUR_INTENSITY + inner_curve * INNER_BLUR_STRENGTH),
+        outer_blur: OUTER_BLUR_BASE + i * OUTER_BLUR_INTENSITY * glow_bleed,
+        outer_spread: OUTER_SPREAD_BASE + i * OUTER_SPREAD_INTENSITY * glow_bleed,
+        outer_alpha: ((OUTER_ALPHA_BASE + i * OUTER_ALPHA_INTENSITY) * brightness_intensity * s)
+            .clamp(0.0, 1.0),
+        inner_blur: INNER_BLUR_BASE + i * (INNER_BLUR_INTENSITY + INNER_BLUR_STRENGTH * glow_bleed),
         inner_spread: 0.0,
-        inner_alpha: (INNER_ALPHA_BASE + i * INNER_ALPHA_INTENSITY)
-            * brightness_curve
-            * (INNER_ALPHA_STRENGTH_MIN + inner_curve * INNER_ALPHA_STRENGTH_RANGE),
-        border_alpha: (BORDER_ALPHA_BASE + i * BORDER_ALPHA_INTENSITY).clamp(0.45, 0.92),
+        inner_alpha: ((INNER_ALPHA_BASE + i * INNER_ALPHA_INTENSITY)
+            * brightness_intensity
+            * (INNER_ALPHA_STRENGTH_MIN
+                + INNER_ALPHA_STRENGTH_RANGE * glow_bleed / (GLOW_BLEED_MIN + GLOW_BLEED_RANGE))
+            * s)
+            .clamp(0.0, 1.0),
+        border_alpha: ((BORDER_ALPHA_BASE + i * BORDER_ALPHA_INTENSITY) * brightness_intensity)
+            .clamp(0.05, 1.0),
     }
 }
 
@@ -132,9 +154,16 @@ pub(crate) fn speak_style(
     speaking_active: bool,
     settings: &AppearanceSettings,
 ) -> String {
-    if !settings.glow_enabled || !speaking_active || audio_level <= 0.0 {
+    if !settings.glow_enabled {
         return format!(
-            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;"
+            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out, box-shadow {GLOW_FADE_OUT_SECONDS_DEFAULT:.2}s ease-out;"
+        );
+    }
+
+    let (fade_in_seconds, fade_out_seconds) = glow_transition_seconds(settings.glow_decay);
+    if !speaking_active || audio_level <= 0.0 {
+        return format!(
+            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out, box-shadow {fade_out_seconds:.2}s ease-out;"
         );
     }
 
@@ -144,11 +173,18 @@ pub(crate) fn speak_style(
         settings.glow_brightness,
         settings.inner_glow_strength,
     );
+    if settings.inner_glow_strength <= f32::EPSILON {
+        // @token-exempt: dynamic rgba from settings.glow_color.to_rgb(), not a hardcoded color
+        return format!(
+            "box-shadow: none; border-color: rgba({r}, {g}, {b}, {:.2}); transition: border-color {fade_in_seconds:.2}s ease-in, box-shadow {fade_in_seconds:.2}s ease-in;", // @token-exempt: dynamic rgba from settings.glow_color.to_rgb(), not a hardcoded color
+            p.border_alpha,
+        );
+    }
     format!(
         "box-shadow: 0 0 {:.0}px {:.0}px rgba({r}, {g}, {b}, {:.2}), \
              inset 0 0 {:.0}px {:.0}px rgba({r}, {g}, {b}, {:.2}); \
              border-color: rgba({r}, {g}, {b}, {:.2}); \
-             transition: border-color 0.15s ease-in, box-shadow 0.15s ease-in;",
+             transition: border-color {fade_in_seconds:.2}s ease-in, box-shadow {fade_in_seconds:.2}s ease-in;",
         p.outer_blur,
         p.outer_spread,
         p.outer_alpha,
@@ -175,14 +211,20 @@ pub(crate) fn is_speaking_suppressed(is_pinned: bool, pinned_peer_id: Option<&st
 /// Color and glow intensity are driven by the viewer's local
 /// [`AppearanceSettings`].
 fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceSettings) -> String {
-    if mic_audio_level <= 0.0 && glow_audio_level <= 0.0 {
-        // Fully silent: fade out both color and filter
-        return "color: inherit; filter: none; transition: color 5.0s ease-out, filter 1.5s ease-out;".to_string();
-    }
-
     if !settings.glow_enabled {
         // Respect the global glow toggle for mic visuals too.
-        return "color: inherit; filter: none; transition: color 5.0s ease-out, filter 1.5s ease-out;".to_string();
+        return format!(
+            "color: inherit; filter: none; transition: color 5.0s ease-out, filter {GLOW_FADE_OUT_SECONDS_DEFAULT:.2}s ease-out;"
+        );
+    }
+
+    let (fade_in_seconds, fade_out_seconds) = glow_transition_seconds(settings.glow_decay);
+
+    if mic_audio_level <= 0.0 && glow_audio_level <= 0.0 {
+        // Fully silent: fade out both color and filter
+        return format!(
+            "color: inherit; filter: none; transition: color 5.0s ease-out, filter {fade_out_seconds:.2}s ease-out;"
+        );
     }
 
     let (r, g, b) = settings.glow_color.to_rgb();
@@ -201,7 +243,7 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceS
             "color: inherit; \
              filter: drop-shadow(0 0 {:.0}px rgba({r}, {g}, {b}, {:.2})) \
                      drop-shadow(0 0 {:.0}px rgba({r}, {g}, {b}, {:.2})); \
-             transition: color 5.0s ease-out, filter 0.15s ease-in;",
+             transition: color 5.0s ease-out, filter {fade_in_seconds:.2}s ease-in;",
             8.0 + glow_i * 16.0,
             (0.55 + glow_i * 0.45) * brightness_curve,
             3.0 + glow_i * 8.0,
@@ -210,7 +252,9 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceS
     }
     if mic_audio_level > 0.0 && glow_audio_level <= 0.0 {
         // Held color but raw glow has faded — no drop-shadow
-        return format!("color: {icon_color}; filter: none; transition: color 0.05s ease-in, filter 1.5s ease-out;");
+        return format!(
+            "color: {icon_color}; filter: none; transition: color 0.05s ease-in, filter {fade_out_seconds:.2}s ease-out;"
+        );
     }
     // Both positive: colored icon + scaled drop-shadow glow
     let clamped = glow_audio_level.clamp(0.0, 1.0);
@@ -219,12 +263,35 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceS
         "color: {icon_color}; \
          filter: drop-shadow(0 0 {:.0}px rgba({r}, {g}, {b}, {:.2})) \
                  drop-shadow(0 0 {:.0}px rgba({r}, {g}, {b}, {:.2})); \
-         transition: color 0.05s ease-in, filter 0.15s ease-in;",
+         transition: color 0.05s ease-in, filter {fade_in_seconds:.2}s ease-in;",
         8.0 + glow_i * 16.0,
         (0.55 + glow_i * 0.45) * brightness_curve,
         3.0 + glow_i * 8.0,
         (0.60 + glow_i * 0.40) * brightness_curve,
     )
+}
+
+/// Map the 0.0..1.0 decay slider to glow fade-in/fade-out timings.
+///
+/// Contracts:
+/// - 0% decay -> instant glow on/off; border reset still uses 0.3s
+/// - non-zero decay -> fixed 0.15s fade-in (current behavior)
+/// - 50% decay -> current 1.50s glow fade-out
+/// - 100% decay -> longer 3.00s glow fade-out tail
+fn glow_transition_seconds(decay: f32) -> (f32, f32) {
+    let d = decay.clamp(0.0, 1.0);
+    if d <= f32::EPSILON {
+        return (0.0, 0.0);
+    }
+
+    let fade_out_seconds = if d <= 0.5 {
+        GLOW_FADE_OUT_SECONDS_DEFAULT * (d / 0.5)
+    } else {
+        GLOW_FADE_OUT_SECONDS_DEFAULT
+            + (d - 0.5) / 0.5 * (GLOW_FADE_OUT_SECONDS_MAX - GLOW_FADE_OUT_SECONDS_DEFAULT)
+    };
+
+    (GLOW_FADE_IN_SECONDS_DEFAULT, fade_out_seconds)
 }
 
 /// Issue #1483: which transport a peer's media is flowing over, for the
@@ -679,7 +746,7 @@ pub fn generate_for_peer(
 
     // ---- Split-layout: screen-share left panel --------------------------------
     if decision == TileDecision::RenderScreenShare {
-        let ss_canvas_crop = format!("screen-share-{}", key);
+        let ss_canvas_crop = screen_share_zoom::screen_canvas_id(key);
         let ss_div_id = Rc::new(format!("screen-share-{}-div", &key));
         let ss_div_pin = (*ss_div_id).clone();
         let peer_user_id_for_pin_ss = peer_user_id.clone();
@@ -703,6 +770,12 @@ pub fn generate_for_peer(
         // `position: fixed` portal that escapes the tile's `overflow: hidden`,
         // so the legacy `signal-popup-open` overflow-visible toggle is dead and
         // its class is no longer emitted.
+        // Issue 1175 (user-test round): while detached the WHOLE share pane is
+        // hidden off-screen at the layout level (`.share-detached` on the grid
+        // container), so this tile needs no detached-state markup — no overlay,
+        // no inert wrapper. The canvas stays mounted + painting (feeding the
+        // detached-window mirror); the pane is just moved off-screen. Detach /
+        // zoom / reattach affordances all live in the detached window.
         let ss_split_class = "split-screen-tile";
         return rsx! {
             div {
@@ -711,7 +784,10 @@ pub fn generate_for_peer(
                 "data-tile-root": "true",
                 div {
                     class: "canvas-container video-on",
-                    ScreenCanvas { peer_id: key.clone() }
+                    // Issue 1175: zoom/pan viewport wrapping the SAME decoder
+                    // canvas. The canvas is never recreated — zoom/pan are a CSS
+                    // transform driven declaratively from per-tile signal state.
+                    ScreenShareZoomable { peer_id: key.clone() }
                     h4 {
                         id: "{ss_name_id}",
                         class: "floating-name",
@@ -722,6 +798,10 @@ pub fn generate_for_peer(
                             span { class: "guest-badge", "Guest" }
                         }
                     }
+                    // Issue 1175: zoom / reset / detach controls for the ATTACHED
+                    // state (in-window). All handlers are ordinary main-document
+                    // Dioxus handlers, so they are always live.
+                    ScreenShareZoomControls { peer_id: key.clone(), name: peer_display_name.clone() }
                     div {
                         class: "tile-top-icons",
                         // HCL bug #2: signal-meter icon button on the
@@ -1106,7 +1186,7 @@ pub fn generate_for_peer(
 
     let ss_div_mobile = (*screen_share_div_id).clone();
     let ss_div_pin = (*screen_share_div_id).clone();
-    let ss_canvas_crop = format!("screen-share-{}", key);
+    let ss_canvas_crop = screen_share_zoom::screen_canvas_id(key);
     let ss_name = format!("{}-screen", peer_display_name);
 
     let pv_div_mobile = (*peer_video_div_id).clone();
@@ -1130,6 +1210,17 @@ pub fn generate_for_peer(
 
     rsx! {
         // Canvas for Screen share.
+        //
+        // Issue 1175: this grid-arm (`TileMode::Full`) screen-share render is
+        // UNREACHABLE for a RECEIVED (non-self) share, so it deliberately carries
+        // no zoom/detach — that's not an asymmetry with the split-layout tile.
+        // Any displayed non-self sharer forces `has_screen_share = true` in
+        // `AttendantsComponent` (the `active_screen_sharer` stack and this arm's
+        // `is_screen_share_enabled_for_peer` prop derive from the SAME
+        // `client.is_screen_share_enabled_for_peer`), which routes the sharer to
+        // the split layout (`TileMode::ScreenOnly` → `RenderScreenShare`, the
+        // zoom/detach-enhanced arm above). This arm is only reached when
+        // `has_screen_share = false`, i.e. no displayed non-self peer is sharing.
         if peer_session_id != my_session_id_str && is_screen_share_enabled_for_peer {
             div {
                 class: "{screen_share_css}",
@@ -1559,7 +1650,8 @@ fn UserVideo(id: String, hidden: bool) -> Element {
 fn ScreenCanvas(peer_id: String) -> Element {
     let client = use_context::<VideoCallClientCtx>();
     let cropped_tiles = try_use_context::<CroppedTilesCtx>().map(|c| c.0);
-    let canvas_id = format!("screen-share-{}", peer_id);
+    // Single source of truth (shared with the detach path + client callback).
+    let canvas_id = screen_share_zoom::screen_canvas_id(&peer_id);
     let canvas_id_for_effect = canvas_id.clone();
     let canvas_id_for_class = canvas_id.clone();
     let peer_id_for_effect = peer_id.clone();
@@ -1586,6 +1678,570 @@ fn ScreenCanvas(peer_id: String) -> Element {
         canvas {
             id: "{canvas_id}",
             class: crop_class,
+        }
+    }
+}
+
+// ─── Issue 1175: received-shared-content zoom / pan / detach ──────────────────
+
+/// Read the current zoom state for `peer` from the shared per-tile map.
+fn read_zoom_state(ctx: &Signal<HashMap<String, ScreenZoomState>>, peer: &str) -> ScreenZoomState {
+    ctx.read().get(peer).copied().unwrap_or_default()
+}
+
+/// Write the zoom state for `peer`, pruning the entry back out when it returns
+/// to the default fit state so an un-zoomed tile stores nothing.
+fn write_zoom_state(
+    ctx: &mut Signal<HashMap<String, ScreenZoomState>>,
+    peer: &str,
+    state: ScreenZoomState,
+) {
+    ctx.with_mut(|map| {
+        if state == ScreenZoomState::default() {
+            map.remove(peer);
+        } else {
+            map.insert(peer.to_string(), state);
+        }
+    });
+}
+
+/// Half the zoom viewport's client width/height (CSS px), for pan clamping.
+/// `None` when the element isn't in the DOM yet or has zero size.
+fn viewport_half_dims(viewport_id: &str) -> Option<(f64, f64)> {
+    let el = window()?.document()?.get_element_by_id(viewport_id)?;
+    let w = el.client_width() as f64;
+    let h = el.client_height() as f64;
+    if w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    Some((w / 2.0, h / 2.0))
+}
+
+/// Move keyboard focus to the element with `id`, if present and focusable.
+/// Used to keep focus with the detach/reattach mode change so it never drops to
+/// `<body>` (the a11y blocker class). No-op if the element is gone.
+fn focus_element_by_id(id: &str) {
+    if let Some(el) = window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id(id))
+    {
+        if let Ok(html) = el.dyn_into::<HtmlElement>() {
+            let _ = html.focus();
+        }
+    }
+}
+
+/// Map a Dioxus [`Key`] to the canonical key name the pure `pan_key_delta`
+/// helper matches on. `None` for keys that aren't pan keys.
+fn pan_key_name(key: &Key) -> Option<&'static str> {
+    match key {
+        Key::ArrowLeft => Some("ArrowLeft"),
+        Key::ArrowRight => Some("ArrowRight"),
+        Key::ArrowUp => Some("ArrowUp"),
+        Key::ArrowDown => Some("ArrowDown"),
+        Key::PageUp => Some("PageUp"),
+        Key::PageDown => Some("PageDown"),
+        _ => None,
+    }
+}
+
+/// Per-tile drag accumulator for pointer panning. Deltas accumulate here and are
+/// flushed to the zoom signal at most once per animation frame.
+#[derive(Default)]
+struct ScreenPanDrag {
+    active: bool,
+    last: Option<(f64, f64)>,
+    pending_dx: f64,
+    pending_dy: f64,
+    raf_scheduled: bool,
+}
+
+/// End an in-progress pointer pan (pointerup / leave / cancel): clear the drag
+/// and release pointer capture on the viewport.
+fn end_screen_pan(drag: &Rc<RefCell<ScreenPanDrag>>, viewport_id: &str, evt: &PointerEvent) {
+    let was_active = {
+        let mut d = drag.borrow_mut();
+        let a = d.active;
+        d.active = false;
+        d.last = None;
+        a
+    };
+    if was_active {
+        if let Some(web_evt) = evt.try_as_web_event() {
+            if let Some(el) = window()
+                .and_then(|w| w.document())
+                .and_then(|doc| doc.get_element_by_id(viewport_id))
+            {
+                let _ = el.release_pointer_capture(web_evt.pointer_id());
+            }
+        }
+    }
+}
+
+/// Issue 1175: the zoom/pan viewport for a RECEIVED shared-content tile. Wraps
+/// the SAME decoder `<canvas>` (via [`ScreenCanvas`]) in a `.ss-zoom-wrapper`
+/// whose CSS `transform` is driven declaratively from [`ScreenZoomCtx`], so a
+/// zoom/pan change only patches an attribute and never recreates the canvas the
+/// decoder paints into. The viewport is a focusable group; arrow / page / Home /
+/// End keys and drag pan it when zoomed (no-op at fit, so keys aren't trapped).
+#[component]
+fn ScreenShareZoomable(peer_id: String) -> Element {
+    let zoom_ctx = use_context::<ScreenZoomCtx>().0;
+    let viewport_id = format!("screen-share-{}-viewport", peer_id);
+
+    // Declarative transform from current state (subscribes this tile to zoom).
+    let zoom_state = read_zoom_state(&zoom_ctx, &peer_id);
+    let transform = screen_share_zoom::transform_css(&zoom_state);
+    // Issue 1175 (item 6): only promote to a GPU layer (`will-change`) and show
+    // the grab cursor while actually zoomed; both are released at fit via this
+    // class so an idle tile carries no blanket compositor promotion.
+    let viewport_class = if screen_share_zoom::is_zoomed(zoom_state.scale) {
+        "ss-zoom-viewport is-zoomed"
+    } else {
+        "ss-zoom-viewport"
+    };
+
+    // Persistent drag accumulator + one reusable rAF closure. Panning writes the
+    // signal at most once per animation frame (not at raw input rate), so a fast
+    // drag re-renders this single tile ~once/frame — the canvas node is retained,
+    // so each re-render only patches the wrapper's `transform`.
+    let drag = use_hook(|| Rc::new(RefCell::new(ScreenPanDrag::default())));
+    let raf: Rc<Closure<dyn FnMut()>> = use_hook({
+        let drag = drag.clone();
+        let peer = peer_id.clone();
+        let vp = viewport_id.clone();
+        let mut ctx = zoom_ctx;
+        move || {
+            Rc::new(Closure::<dyn FnMut()>::new(move || {
+                let (dx, dy) = {
+                    let mut d = drag.borrow_mut();
+                    d.raf_scheduled = false;
+                    let v = (d.pending_dx, d.pending_dy);
+                    d.pending_dx = 0.0;
+                    d.pending_dy = 0.0;
+                    v
+                };
+                if dx == 0.0 && dy == 0.0 {
+                    return;
+                }
+                if let Some((hw, hh)) = viewport_half_dims(&vp) {
+                    let next =
+                        screen_share_zoom::pan_by(read_zoom_state(&ctx, &peer), dx, dy, hw, hh);
+                    write_zoom_state(&mut ctx, &peer, next);
+                }
+            }))
+        }
+    });
+
+    // Clear the drag accumulator on unmount so a late rAF flush is a no-op.
+    {
+        let drag = drag.clone();
+        use_drop(move || {
+            let mut d = drag.borrow_mut();
+            d.active = false;
+            d.pending_dx = 0.0;
+            d.pending_dy = 0.0;
+        });
+    }
+
+    let on_down = {
+        let drag = drag.clone();
+        let ctx = zoom_ctx;
+        let peer = peer_id.clone();
+        let vp = viewport_id.clone();
+        move |evt: PointerEvent| {
+            // Nothing to pan at fit — leave the event alone.
+            if !screen_share_zoom::is_zoomed(read_zoom_state(&ctx, &peer).scale) {
+                return;
+            }
+            if let Some(web_evt) = evt.try_as_web_event() {
+                if let Some(el) = window()
+                    .and_then(|w| w.document())
+                    .and_then(|doc| doc.get_element_by_id(&vp))
+                {
+                    let _ = el.set_pointer_capture(web_evt.pointer_id());
+                }
+            }
+            let c = evt.element_coordinates();
+            let mut d = drag.borrow_mut();
+            d.active = true;
+            d.last = Some((c.x, c.y));
+        }
+    };
+
+    let on_move = {
+        let drag = drag.clone();
+        let raf = raf.clone();
+        move |evt: PointerEvent| {
+            let c = evt.element_coordinates();
+            let schedule = {
+                let mut d = drag.borrow_mut();
+                if !d.active {
+                    return;
+                }
+                let (lx, ly) = d.last.unwrap_or((c.x, c.y));
+                d.pending_dx += c.x - lx;
+                d.pending_dy += c.y - ly;
+                d.last = Some((c.x, c.y));
+                if d.raf_scheduled {
+                    false
+                } else {
+                    d.raf_scheduled = true;
+                    true
+                }
+            };
+            if schedule {
+                if let Some(win) = window() {
+                    let cb: &js_sys::Function = (*raf).as_ref().unchecked_ref();
+                    let _ = win.request_animation_frame(cb);
+                }
+            }
+        }
+    };
+
+    let on_key = {
+        let mut ctx = zoom_ctx;
+        let peer = peer_id.clone();
+        let vp = viewport_id.clone();
+        move |evt: KeyboardEvent| {
+            let cur = read_zoom_state(&ctx, &peer);
+            // Don't trap keys when there's nothing to pan.
+            if !screen_share_zoom::is_zoomed(cur.scale) {
+                return;
+            }
+            let (hw, hh) = match viewport_half_dims(&vp) {
+                Some(v) => v,
+                None => return,
+            };
+            let next = match evt.key() {
+                // Home / End jump to the top-left / bottom-right extents (they
+                // need the max offset the pure delta helper can't know).
+                Key::Home => Some(ScreenZoomState {
+                    scale: cur.scale,
+                    off_x: screen_share_zoom::max_pan_offset(cur.scale, hw),
+                    off_y: screen_share_zoom::max_pan_offset(cur.scale, hh),
+                }),
+                Key::End => Some(ScreenZoomState {
+                    scale: cur.scale,
+                    off_x: -screen_share_zoom::max_pan_offset(cur.scale, hw),
+                    off_y: -screen_share_zoom::max_pan_offset(cur.scale, hh),
+                }),
+                other => pan_key_name(&other)
+                    .and_then(screen_share_zoom::pan_key_delta)
+                    .map(|(dx, dy)| screen_share_zoom::pan_by(cur, dx, dy, hw, hh)),
+            };
+            if let Some(next) = next {
+                evt.prevent_default();
+                write_zoom_state(&mut ctx, &peer, next);
+            }
+        }
+    };
+
+    let on_up = {
+        let drag = drag.clone();
+        let vp = viewport_id.clone();
+        move |e: PointerEvent| end_screen_pan(&drag, &vp, &e)
+    };
+    let on_leave = {
+        let drag = drag.clone();
+        let vp = viewport_id.clone();
+        move |e: PointerEvent| end_screen_pan(&drag, &vp, &e)
+    };
+    let on_cancel = {
+        let drag = drag.clone();
+        let vp = viewport_id.clone();
+        move |e: PointerEvent| end_screen_pan(&drag, &vp, &e)
+    };
+
+    rsx! {
+        div {
+            id: "{viewport_id}",
+            class: "{viewport_class}",
+            "data-testid": "ss-zoom-viewport",
+            tabindex: "0",
+            role: "group",
+            "aria-label": "Shared content. Zoom with the controls, then drag or use the arrow keys to pan.",
+            onpointerdown: on_down,
+            onpointermove: on_move,
+            onpointerup: on_up,
+            onpointerleave: on_leave,
+            onpointercancel: on_cancel,
+            onkeydown: on_key,
+            div {
+                class: "ss-zoom-wrapper",
+                style: "transform: {transform};",
+                ScreenCanvas { peer_id: peer_id.clone() }
+            }
+        }
+    }
+}
+
+/// Issue 1175: zoom / reset / detach controls for a RECEIVED shared-content
+/// tile. Always-present markup (its shape never changes with zoom/detach state)
+/// so re-renders never tear down the canvas. Every handler is an ordinary
+/// main-document Dioxus handler, so they are always live — unlike v1's dead
+/// in-PiP delegated handlers. The detach button is omitted where no separate
+/// window is available (see `screen_share_detach::detach_supported`).
+#[component]
+fn ScreenShareZoomControls(peer_id: String, name: String) -> Element {
+    let zoom_ctx = use_context::<ScreenZoomCtx>().0;
+    let detached_ctx = use_context::<DetachedShareCtx>().0;
+    let viewport_id = format!("screen-share-{}-viewport", peer_id);
+
+    // Issue 1175 (item 4): read ONLY the scale, through a memo, so an offset-only
+    // pan write (scale + offsets share the one `ScreenZoomCtx` map) does NOT
+    // re-render this controls bar every animation frame. The memo re-runs on any
+    // map change but its `f64` output is unchanged on a pan, so it doesn't notify
+    // subscribers; zoom-in/out/reset (which change scale) still update the bar.
+    let scale_memo = use_memo({
+        let peer = peer_id.clone();
+        move || read_zoom_state(&zoom_ctx, &peer).scale
+    });
+    let scale = scale_memo();
+    let label = screen_share_zoom::zoom_percent_label(scale);
+    let at_min = screen_share_zoom::at_min_zoom(scale);
+    let at_max = screen_share_zoom::at_max_zoom(scale);
+    let is_detached = detached_ctx.read().as_deref() == Some(peer_id.as_str());
+
+    // Stable, peer-scoped ids so focus management can find the detach toggle and
+    // the overlay's "Bring it back" button (which lives in `generate_for_peer`,
+    // a sibling subtree of this component) across the mode change.
+    let detach_btn_dom_id = format!("screen-share-{}-detach-btn", peer_id);
+
+    #[cfg(target_arch = "wasm32")]
+    let can_detach = crate::components::screen_share_detach::detach_supported();
+    #[cfg(not(target_arch = "wasm32"))]
+    let can_detach = false;
+
+    // A11y (blocker class from PR #1756): keep focus WITH the detach/reattach
+    // mode change instead of letting it drop to <body>. Traces BOTH halves:
+    //   * ENTER (not-detached → detached): the whole share pane (incl. the detach
+    //     toggle) is hidden off-screen, so there is no in-pane control to focus.
+    //     Focus the meeting grid landmark (`#grid-container`, tabindex=-1) and let
+    //     the OS focus the newly-opened window; reattach affordances live there.
+    //   * EXIT  (detached → not-detached), covering the detached window's Reattach
+    //     button, Escape, and closing the window: the pane reappears, so focus
+    //     returns to the detach toggle.
+    // A prev-state cell ensures mount doesn't steal focus and only real
+    // transitions act. Presenter-stops-while-detached unmounts this tile (no
+    // toggle to focus) and is handled in `use_drop` below.
+    {
+        let detach_target = detach_btn_dom_id.clone();
+        let peer_fx = peer_id.clone();
+        let detached_fx = detached_ctx;
+        let prev = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+        use_effect(move || {
+            let now = detached_fx.read().as_deref() == Some(peer_fx.as_str());
+            if now != prev.get() {
+                prev.set(now);
+                if now {
+                    focus_element_by_id("grid-container");
+                } else {
+                    focus_element_by_id(&detach_target);
+                }
+            }
+        });
+    }
+
+    // If this shared-content tile unmounts while detached (presenter stops
+    // sharing, receiver reconnects, meeting ends), close the detached window so
+    // it can't linger showing a now-frozen mirror, and move focus to the meeting
+    // grid — the detach toggle that would otherwise receive it is gone with the
+    // tile, so without this focus would drop to <body>. `teardown` is a no-op
+    // when this peer isn't the detached one.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let peer_drop = peer_id.clone();
+        let detached_drop = detached_ctx;
+        use_drop(move || {
+            let was_detached = detached_drop.peek().as_deref() == Some(peer_drop.as_str());
+            crate::components::screen_share_detach::teardown(&peer_drop);
+            if was_detached {
+                focus_element_by_id("grid-container");
+            }
+        });
+    }
+
+    let on_zoom_out = {
+        let vp = viewport_id.clone();
+        let peer = peer_id.clone();
+        let mut ctx = zoom_ctx;
+        move |e: MouseEvent| {
+            e.stop_propagation();
+            let (hw, hh) = viewport_half_dims(&vp).unwrap_or((0.0, 0.0));
+            let cur = read_zoom_state(&ctx, &peer);
+            let next =
+                screen_share_zoom::zoom_to(cur, screen_share_zoom::zoom_out(cur.scale), hw, hh);
+            write_zoom_state(&mut ctx, &peer, next);
+        }
+    };
+    let on_zoom_in = {
+        let vp = viewport_id.clone();
+        let peer = peer_id.clone();
+        let mut ctx = zoom_ctx;
+        move |e: MouseEvent| {
+            e.stop_propagation();
+            let (hw, hh) = viewport_half_dims(&vp).unwrap_or((0.0, 0.0));
+            let cur = read_zoom_state(&ctx, &peer);
+            let next =
+                screen_share_zoom::zoom_to(cur, screen_share_zoom::zoom_in(cur.scale), hw, hh);
+            write_zoom_state(&mut ctx, &peer, next);
+        }
+    };
+    let on_reset = {
+        let vp = viewport_id.clone();
+        let peer = peer_id.clone();
+        let mut ctx = zoom_ctx;
+        move |e: MouseEvent| {
+            e.stop_propagation();
+            let (hw, hh) = viewport_half_dims(&vp).unwrap_or((0.0, 0.0));
+            let cur = read_zoom_state(&ctx, &peer);
+            let next = screen_share_zoom::zoom_to(cur, screen_share_zoom::RESET_ZOOM, hw, hh);
+            write_zoom_state(&mut ctx, &peer, next);
+        }
+    };
+    let on_detach = {
+        let peer = peer_id.clone();
+        let name = name.clone();
+        move |e: MouseEvent| {
+            e.stop_propagation();
+            #[cfg(target_arch = "wasm32")]
+            {
+                use crate::components::screen_share_detach as ssd;
+                let mut dctx = detached_ctx;
+                if dctx.read().as_deref() == Some(peer.as_str()) {
+                    // Already detached → reattach (teardown flips the signal).
+                    ssd::reattach(&peer);
+                } else {
+                    // Optimistically mark detached, then open. Every failure /
+                    // close path calls the callback below to reset the signal.
+                    dctx.set(Some(peer.clone()));
+                    let dctx_cb = detached_ctx;
+                    ssd::open(
+                        &peer,
+                        &name,
+                        Box::new(move || {
+                            // `Signal` is `Copy`, so copy into a local to satisfy
+                            // the `Fn` callback (`set` needs `&mut self`).
+                            let mut d = dctx_cb;
+                            d.set(None);
+                        }),
+                    );
+                }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let _ = (&peer, &name, &detached_ctx);
+            }
+        }
+    };
+
+    let out_class = if at_min {
+        "ss-zoom-btn ss-zoom-btn--disabled"
+    } else {
+        "ss-zoom-btn"
+    };
+    let in_class = if at_max {
+        "ss-zoom-btn ss-zoom-btn--disabled"
+    } else {
+        "ss-zoom-btn"
+    };
+
+    rsx! {
+        div { class: "ss-zoom-controls", "data-testid": "ss-zoom-controls",
+            // aria-disabled (not the native `disabled`) at the clamps: the pure
+            // step helpers already saturate, so a click at the limit is a
+            // harmless no-op — and keeping the button focusable means a keyboard
+            // user isn't dumped to <body> when they reach min/max.
+            button {
+                r#type: "button",
+                class: "{out_class}",
+                "data-testid": "ss-zoom-out",
+                title: "Zoom out",
+                "aria-label": "Zoom out shared content",
+                "aria-disabled": if at_min { "true" } else { "false" },
+                onclick: on_zoom_out,
+                ZoomOutIcon {}
+            }
+            span {
+                class: "ss-zoom-label",
+                "data-testid": "ss-zoom-label",
+                role: "status",
+                "aria-live": "polite",
+                "{label}"
+            }
+            button {
+                r#type: "button",
+                class: "{in_class}",
+                "data-testid": "ss-zoom-in",
+                title: "Zoom in",
+                "aria-label": "Zoom in shared content",
+                "aria-disabled": if at_max { "true" } else { "false" },
+                onclick: on_zoom_in,
+                ZoomInIcon {}
+            }
+            span { class: "ss-zoom-sep", "aria-hidden": "true" }
+            button {
+                r#type: "button",
+                class: "ss-zoom-btn",
+                "data-testid": "ss-zoom-reset",
+                title: "Reset zoom to 100%",
+                "aria-label": "Reset shared content zoom to 100 percent",
+                onclick: on_reset,
+                ZoomResetIcon {}
+            }
+            if can_detach {
+                button {
+                    r#type: "button",
+                    id: "{detach_btn_dom_id}",
+                    class: "ss-zoom-btn ss-detach-btn",
+                    "data-testid": "ss-detach",
+                    title: if is_detached { "Return shared content to the meeting window" } else { "Open shared content in a separate window" },
+                    "aria-label": if is_detached { "Return shared content to the meeting window" } else { "Open shared content in a separate window" },
+                    "aria-pressed": if is_detached { "true" } else { "false" },
+                    onclick: on_detach,
+                    DetachIcon {}
+                }
+            }
+        }
+    }
+}
+
+/// Issue 1175: a visually-hidden polite live region that announces detach /
+/// reattach to screen-reader users. Rendered ONCE at the meeting level (by
+/// `AttendantsComponent`), OUTSIDE the share pane that gets hidden off-screen
+/// while detached, so it stays in the a11y tree and is read. Announces on REAL
+/// transitions only (a prev-state cell): focus-land alone under-announces (on
+/// ENTER the OS focus moves to the new window; on EXIT the detach toggle's label
+/// describes its function, not the outcome). One detached share at a time, so it
+/// keys off `DetachedShareCtx` being Some vs None, not a specific peer.
+#[component]
+pub fn ScreenDetachAnnouncer() -> Element {
+    let detached_ctx = use_context::<DetachedShareCtx>().0;
+    let mut message = use_signal(String::new);
+    let prev = use_hook(|| Rc::new(std::cell::Cell::new(false)));
+    use_effect(move || {
+        let now = detached_ctx.read().is_some();
+        if now != prev.get() {
+            prev.set(now);
+            message.set(
+                if now {
+                    "Shared content opened in a separate window"
+                } else {
+                    "Shared content returned to the meeting"
+                }
+                .to_string(),
+            );
+        }
+    });
+
+    rsx! {
+        div {
+            class: "visually-hidden",
+            "data-testid": "ss-detach-announce",
+            role: "status",
+            "aria-live": "polite",
+            "{message}"
         }
     }
 }
@@ -1771,6 +2427,101 @@ mod tests {
         assert!(style.contains(DEFAULT_TILE_BORDER_COLOR));
     }
 
+    #[test]
+    fn glow_decay_zero_is_instant_on_and_off() {
+        let settings = AppearanceSettings {
+            glow_decay: 0.0,
+            ..AppearanceSettings::default()
+        };
+
+        let on = speak_style(0.8, true, &settings);
+        let off = speak_style(0.0, false, &settings);
+
+        assert!(on.contains("border-color 0.00s ease-in"));
+        assert!(on.contains("box-shadow 0.00s ease-in"));
+        assert!(off.contains("border-color 0.3s ease-out"));
+        assert!(off.contains("box-shadow 0.00s ease-out"));
+    }
+
+    #[test]
+    fn glow_decay_midpoint_preserves_border_reset_timing() {
+        let settings = AppearanceSettings {
+            glow_decay: 0.5,
+            ..AppearanceSettings::default()
+        };
+        let on = speak_style(0.8, true, &settings);
+        let off = speak_style(0.0, false, &settings);
+
+        assert!(on.contains("border-color 0.15s ease-in"));
+        assert!(on.contains("box-shadow 0.15s ease-in"));
+        assert!(off.contains("border-color 0.3s ease-out"));
+        assert!(off.contains("box-shadow 1.50s ease-out"));
+    }
+
+    #[test]
+    fn glow_decay_full_extends_fade_out_tail() {
+        let settings = AppearanceSettings {
+            glow_decay: 1.0,
+            ..AppearanceSettings::default()
+        };
+        let off = speak_style(0.0, false, &settings);
+
+        assert!(off.contains("border-color 0.3s ease-out"));
+        assert!(off.contains("box-shadow 3.00s ease-out"));
+    }
+
+    #[test]
+    fn glow_brightness_changes_intensity_not_geometry() {
+        let low = calculate_glow_params(0.65, 0.0, 0.5);
+        let high = calculate_glow_params(0.65, 1.0, 0.5);
+
+        assert_eq!(low.outer_blur, high.outer_blur);
+        assert_eq!(low.outer_spread, high.outer_spread);
+        assert_eq!(low.inner_blur, high.inner_blur);
+        assert!(high.outer_alpha > low.outer_alpha);
+        assert!(high.inner_alpha > low.inner_alpha);
+        assert!(high.border_alpha > low.border_alpha);
+    }
+
+    #[test]
+    fn glow_slider_scales_bleed_from_subtle_to_exaggerated() {
+        let subtle = calculate_glow_params(0.65, 0.5, 0.0);
+        let balanced = calculate_glow_params(0.65, 0.5, 0.5);
+        let strong = calculate_glow_params(0.65, 0.5, 1.0);
+
+        assert!(subtle.outer_blur < balanced.outer_blur);
+        assert!(balanced.outer_blur < strong.outer_blur);
+        assert!(subtle.outer_spread < balanced.outer_spread);
+        assert!(balanced.outer_spread < strong.outer_spread);
+        assert!(subtle.inner_blur < balanced.inner_blur);
+        assert!(balanced.inner_blur < strong.inner_blur);
+    }
+
+    #[test]
+    fn glow_midpoint_is_much_stronger_than_zero_point_bleed() {
+        let subtle = calculate_glow_params(1.0, 0.5, 0.0);
+        let balanced = calculate_glow_params(1.0, 0.5, 0.5);
+
+        let subtle_delta = subtle.outer_blur - OUTER_BLUR_BASE;
+        let balanced_delta = balanced.outer_blur - OUTER_BLUR_BASE;
+        assert!(balanced_delta > subtle_delta * 1.8);
+    }
+
+    #[test]
+    fn glow_zero_disables_shadow_but_keeps_colored_border() {
+        let settings = AppearanceSettings {
+            glow_enabled: true,
+            glow_brightness: 1.0,
+            inner_glow_strength: 0.0,
+            ..AppearanceSettings::default()
+        };
+        let style = speak_style(0.7, true, &settings);
+
+        assert!(style.contains("box-shadow: none;"));
+        // @token-exempt: tests the presence of a dynamic rgba() token, not a color literal
+        assert!(style.contains("border-color: rgba("));
+    }
+
     // -- Crop state: HashMap toggle/lookup logic ---------------------------------
 
     #[test]
@@ -1797,14 +2548,17 @@ mod tests {
         let mut map = HashMap::<String, bool>::new();
         let peer_id = "session-123";
 
-        // Set crop state for both video and screen-share canvases
+        // Set crop state for both video and screen-share canvases. The
+        // screen-share key is built via the production single-source-of-truth
+        // getter (issue 1175), so this test tracks the real id format instead of
+        // re-hardcoding the literal.
         map.insert(peer_id.to_string(), true);
-        map.insert(format!("screen-share-{peer_id}"), true);
+        map.insert(screen_share_zoom::screen_canvas_id(peer_id), true);
         assert_eq!(map.len(), 2);
 
-        // Simulate on_peer_removed cleanup
+        // Simulate on_peer_removed cleanup (same getter the production path uses).
         map.remove(peer_id);
-        map.remove(&format!("screen-share-{peer_id}"));
+        map.remove(&screen_share_zoom::screen_canvas_id(peer_id));
         assert!(map.is_empty());
     }
 

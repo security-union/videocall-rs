@@ -3,7 +3,9 @@
 //! Dedicated meeting settings page — the full management hub for a meeting.
 
 use crate::auth::{check_session, redirect_to_login};
-use crate::components::meeting_format::format_datetime_zoned;
+use crate::components::meeting_format::{
+    format_datetime_zoned, format_duration, meeting_activity_duration_ms,
+};
 use crate::constants::oauth_enabled;
 use crate::meeting_api::{delete_meeting, end_meeting, get_meeting_info, MeetingInfo};
 use crate::routing::Route;
@@ -234,10 +236,16 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let is_ended = info.state == "ended";
     let is_active = info.state == "active";
 
-    // Compute display strings for stats
-    let duration_str = info
-        .ended_at
-        .map(|ended| format_duration(ended - info.started_at));
+    // Compute display strings for stats.
+    // issue 1672: duration is shown for EVERY state — running (now - started)
+    // while the meeting is open, final (ended - started) once it has ended —
+    // so it is always a String rather than an Option.
+    let now_ms = js_sys::Date::now() as i64;
+    let duration_str = format_duration(meeting_activity_duration_ms(
+        info.started_at,
+        info.ended_at,
+        now_ms,
+    ));
     let started_str = format_datetime_zoned(info.started_at);
     let ended_str = info.ended_at.map(format_datetime_zoned);
     let participant_count = info.participant_count;
@@ -392,20 +400,9 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                 }
             }
 
-            if let Some(ref dur) = duration_str {
-                div { class: "settings-stat-row",
-                    svg {
-                        xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
-                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
-                        stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
-                        circle { cx: "12", cy: "12", r: "10" }
-                        polyline { points: "12 6 12 12 16 14" }
-                    }
-                    span { class: "settings-stat-label", "Duration" }
-                    span { class: "settings-stat-value", "{dur}" }
-                }
-            }
-
+            // issue 1672: three separate labeled field-lines (Started, then Ended
+            // for ended meetings, then Duration) replace the old single-line
+            // "started – ended" range that overflowed the dialog at narrow widths.
             div { class: "settings-stat-row",
                 svg {
                     xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
@@ -416,13 +413,36 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                     line { x1: "8", y1: "2", x2: "8", y2: "6" }
                     line { x1: "3", y1: "10", x2: "21", y2: "10" }
                 }
-                span { class: "settings-stat-label", if is_ended { "Time" } else { "Started" } }
-                span { class: "settings-stat-value settings-stat-value--range",
-                    span { class: "settings-stat-time-part", "{started_str}" }
-                    if let Some(ref ended) = ended_str {
-                        span { class: "settings-stat-separator", " – {ended}" }
+                span { class: "settings-stat-label", "Started" }
+                span { class: "settings-stat-value settings-stat-value--time", "{started_str}" }
+            }
+
+            if let Some(ref ended) = ended_str {
+                div { class: "settings-stat-row",
+                    svg {
+                        xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
+                        view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                        stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                        rect { x: "3", y: "4", width: "18", height: "18", rx: "2", ry: "2" }
+                        line { x1: "16", y1: "2", x2: "16", y2: "6" }
+                        line { x1: "8", y1: "2", x2: "8", y2: "6" }
+                        line { x1: "3", y1: "10", x2: "21", y2: "10" }
                     }
+                    span { class: "settings-stat-label", "Ended" }
+                    span { class: "settings-stat-value settings-stat-value--time", "{ended}" }
                 }
+            }
+
+            div { class: "settings-stat-row",
+                svg {
+                    xmlns: "http://www.w3.org/2000/svg", width: "14", height: "14",
+                    view_box: "0 0 24 24", fill: "none", stroke: "currentColor",
+                    stroke_width: "2", stroke_linecap: "round", stroke_linejoin: "round",
+                    circle { cx: "12", cy: "12", r: "10" }
+                    polyline { points: "12 6 12 12 16 14" }
+                }
+                span { class: "settings-stat-label", "Duration" }
+                span { class: "settings-stat-value", "{duration_str}" }
             }
         }
 
@@ -554,19 +574,4 @@ pub fn MeetingSettingsPage(id: String) -> Element {
             }
         }
     })
-}
-
-fn format_duration(duration_ms: i64) -> String {
-    let total_seconds = duration_ms / 1000;
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-
-    if hours > 0 {
-        format!("{hours}h {minutes}m")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
-    } else {
-        format!("{seconds}s")
-    }
 }

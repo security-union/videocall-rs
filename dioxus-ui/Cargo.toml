@@ -79,6 +79,9 @@ features = [
     "HtmlDocument",
     "HtmlElement",
     "HtmlInputElement",
+    # Issue 1175: `HtmlVideoElement::set_src_object` / `set_muted` live on
+    # `HtmlMediaElement`; needed to feed the detached-window mirror video.
+    "HtmlMediaElement",
     "HtmlSelectElement",
     "HtmlVideoElement",
     "IntersectionObserver",

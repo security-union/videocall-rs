@@ -48,10 +48,13 @@ use std::rc::Rc;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use web_sys::{
-    Document, Element, HtmlCanvasElement, HtmlElement, HtmlVideoElement, KeyboardEvent,
-    MediaStream, PointerEvent, Window,
+    CanvasRenderingContext2d, Document, Element, HtmlCanvasElement, HtmlElement, HtmlVideoElement,
+    KeyboardEvent, MediaStream, PointerEvent, Window,
 };
 
+use super::screen_share_detach_sizing::{
+    detached_window_inner_dims, DETACHED_BAR_H_PX, DETACHED_MIN_H, DETACHED_MIN_W,
+};
 use super::screen_share_zoom as zoom;
 use crate::context::ScreenZoomState;
 
@@ -73,6 +76,28 @@ const ZOOM_LABEL_ID: &str = "ss-detached-zoom-label";
 /// peer-controlled text must not reach OS window chrome (security), and a fixed
 /// string also fixes the blank `about:blank` popup title.
 const DETACHED_WINDOW_TITLE: &str = "Shared content";
+
+// ---------------------------------------------------------------------------
+// Detached-window sizing (issue #1842): the pure aspect-fit / clamp math lives in
+// `screen_share_detach_sizing` (host-testable). This module reads the live decoded
+// canvas dims + the available screen and calls it.
+// ---------------------------------------------------------------------------
+
+/// Upper clamp for the undecoded-fallback client-box path (pre-#1842 behavior).
+const DETACHED_FALLBACK_MAX_W: i32 = 2560;
+const DETACHED_FALLBACK_MAX_H: i32 = 1600;
+
+/// Available screen size (`screen.availWidth`/`availHeight`) for sizing the
+/// detached window, with a sane 1920x1080 fallback when the API is unavailable.
+fn available_screen(win: &Window) -> (i32, i32) {
+    match win.screen() {
+        Ok(s) => (
+            s.avail_width().unwrap_or(1920),
+            s.avail_height().unwrap_or(1080),
+        ),
+        Err(_) => (1920, 1080),
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The single detached window's live state (one-at-a-time by design).
@@ -182,6 +207,13 @@ impl Mirror {
         };
         video.set_src_object(Some(&stream));
         play_video(video);
+        // Prime the popup with the CURRENT canvas still (issue #1841). An auto-rate
+        // captureStream emits a frame only when the source canvas REPAINTS, and a
+        // static screen share leaves the receiver's source canvas painted but idle
+        // (the decoder repaints only on new decoded frames, issue #1783) — so the
+        // capture is starved and the popup mirror never receives a frame. Force a
+        // no-op source-canvas repaint so captureStream emits the current bitmap.
+        prime_static_source(source);
         Some(Mirror { stream })
     }
 
@@ -210,6 +242,49 @@ fn play_video(video: &HtmlVideoElement) {
             }
         });
     }
+}
+
+/// Surface the source canvas's CURRENT contents into a freshly-started mirror
+/// (issue #1841).
+///
+/// A detached mirror of a STATIC share would otherwise stay black. `capture_stream()`
+/// runs at AUTO frame rate, which emits a frame only when the source canvas next
+/// REPAINTS — and a static share's source canvas does not repaint (the decoder
+/// repaints on new decoded frames only, issue #1783). `CanvasCaptureMediaStreamTrack.
+/// requestFrame()` does NOT help: it is defined for a 0-fps (manual) track, so on an
+/// auto-rate track it is a no-op — verified empirically, the popup `<video>` never
+/// reached `readyState >= 2` (an earlier `requestFrame`-based prime failed the live
+/// headed receipt).
+///
+/// The robust fix is to REPAINT the source canvas so the auto-rate capture emits the
+/// current bitmap. Reading a 1px `ImageData` and writing it straight back dirties the
+/// 2D canvas WITHOUT changing any pixel, so the browser captures the WHOLE current
+/// bitmap on the next compositing step. Once ONE frame reaches the paused mirror it
+/// holds the still, so this is repeated a few times over ~1s to cover the case where
+/// the first repaint lands before the fresh stream/video capture pipeline is ready to
+/// receive it. Harmless for a LIVE source (the decoder overwrites on its next frame),
+/// and every step is fail-soft (missing canvas / non-2D context / tainted read is
+/// skipped) — it never panics.
+fn prime_static_source(source: &HtmlCanvasElement) {
+    let source = source.clone();
+    wasm_bindgen_futures::spawn_local(async move {
+        for delay_ms in [0u32, 80, 200, 400, 700, 1100] {
+            if delay_ms > 0 {
+                gloo_timers::future::TimeoutFuture::new(delay_ms).await;
+            }
+            let Ok(Some(obj)) = source.get_context("2d") else {
+                continue;
+            };
+            let Ok(ctx) = obj.dyn_into::<CanvasRenderingContext2d>() else {
+                continue;
+            };
+            // Read-and-write-back a 1px region: a genuine no-op that still marks the
+            // canvas dirty so the auto-rate captureStream captures the current frame.
+            if let Ok(px) = ctx.get_image_data(0.0, 0.0, 1.0, 1.0) {
+                let _ = ctx.put_image_data(&px, 0.0, 0.0);
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -281,8 +356,26 @@ pub fn open(peer: &str, display_name: &str, on_reattach: Box<dyn Fn()>) {
         }
     };
 
-    let w = source.client_width().clamp(320, 2560);
-    let h = source.client_height().clamp(240, 1600);
+    // Size the detached window to the shared content's aspect (issue #1842). The
+    // source canvas's width/height are the DECODED resolution (the decoder sets
+    // them per frame; peer_decoder.rs). Before the first decode the canvas is the
+    // HTML default 300x150 — fall back to the pre-#1842 client-box clamp then, and
+    // resize-on-first-decode is out of scope (a rare race; object-fit letterboxes).
+    let content_w = source.width() as i32;
+    let content_h = source.height() as i32;
+    let (w, h) = if content_w <= 0 || content_h <= 0 || (content_w == 300 && content_h == 150) {
+        (
+            source
+                .client_width()
+                .clamp(DETACHED_MIN_W, DETACHED_FALLBACK_MAX_W),
+            source
+                .client_height()
+                .clamp(DETACHED_MIN_H, DETACHED_FALLBACK_MAX_H),
+        )
+    } else {
+        let (avail_w, avail_h) = available_screen(&win);
+        detached_window_inner_dims(content_w, content_h, avail_w, avail_h, DETACHED_BAR_H_PX)
+    };
 
     PENDING.with(|p| p.set(true));
     CANCEL_PENDING.with(|c| c.set(false));
@@ -952,8 +1045,12 @@ const DETACHED_CSS: &str = "\
 html,body{margin:0;height:100%;background:#0b0d10;color:#e8eaed;\
 font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;}\
 .ss-detached-body{display:flex;flex-direction:column;height:100%;overflow:hidden;}\
-.ss-detached-bar{display:flex;align-items:center;gap:12px;padding:6px 10px;\
-background:rgba(255,255,255,0.06);flex:0 0 auto;}\
+/* .ss-detached-bar height (40px, border-box) is LOAD-BEARING: detached_window_inner_dims \
+adds it as BAR_H when sizing the window to content aspect (issue #1842). Keep in sync with \
+DETACHED_BAR_H_PX; do NOT revert it to content-driven. */\
+/* @token-exempt: detached popup is a separate document; app :root tokens unavailable */\
+.ss-detached-bar{box-sizing:border-box;height:40px;display:flex;align-items:center;\
+gap:12px;padding:6px 10px;background:rgba(255,255,255,0.06);flex:0 0 auto;}\
 .ss-detached-name{font-size:13px;font-weight:600;white-space:nowrap;\
 overflow:hidden;text-overflow:ellipsis;flex:1 1 auto;min-width:0;}\
 .ss-detached-controls{display:flex;align-items:center;gap:2px;flex:0 0 auto;}\

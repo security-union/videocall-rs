@@ -247,6 +247,28 @@ fn should_reacquire_screen_capture(media_acquired: bool, restart_count: u32) -> 
 /// unrelated — it governs the crash-CEILING decay axis, not layer earn-up.)
 const SHED_TEARDOWN_DWELL_MS: f64 = 30_000.0;
 
+/// Poll interval (ms) the screen encode loop uses to race `reader.read()` against
+/// a timer (issue #1841). A real `getDisplayMedia` track delivers frames ONLY on
+/// visual change, so on a STATIC share the encode loop would otherwise park on
+/// `read()` indefinitely — and a late joiner's `KEYFRAME_REQUEST` (which merely
+/// sets `force_keyframe`) would never be serviced because the decision that reads
+/// that flag runs only after a real frame. Racing the read against this timer lets
+/// the loop wake on a quiet track and, when a PLI is pending, re-encode the
+/// retained frame as a keyframe.
+///
+/// 150ms: bounds worst-case joiner-visible latency to ~1 tick + encode + relay
+/// (well under the <1s bar) while keeping the idle timer branch near-free (two
+/// atomic peeks, then loop back). It comfortably exceeds a 60fps frame interval
+/// (~16ms) so it never races ahead of a genuinely live track.
+const SCREEN_STATIC_REENCODE_POLL_MS: u32 = 150;
+
+/// Minimum wall-clock gap (ms) between the throttled DEBUG lines emitted on a
+/// synthetic (retained-frame) re-encode (issue #1841). The FIRST synthetic emit
+/// logs once at INFO for field visibility; every subsequent one logs at DEBUG no
+/// more than once per this window so even a debug build can't spam it under a
+/// sustained joiner churn.
+const SCREEN_SYNTHETIC_LOG_THROTTLE_MS: f64 = 1_000.0;
+
 /// Pure teardown decision (issue #1230, host-testable single source of truth) —
 /// sibling of the camera helper. Returns `true` iff `shed_since_ms` is `Some(t)`
 /// AND `now_ms - t >= dwell_threshold_ms`; `None` ⇒ `false` (not currently shed,
@@ -2304,6 +2326,24 @@ impl ScreenEncoder {
         // We store it here so it isn't dropped when the inner loop restarts.
         let mut _onended_handler: Option<Closure<dyn FnMut()>> = None;
 
+        // Retained last-encoded VideoFrame for the static-share keyframe path (issue
+        // #1841). Declared OUTSIDE `'restart` so it is in scope for BOTH the
+        // per-restart cleanup (which closes it before a rebuild, since a frame at the
+        // OLD encoder dims must never reach a rebuilt encoder) and the final cleanup
+        // (which closes it on user-stop / unrecoverable exit). Set only inside the
+        // `'encode` loop, right after a successful encode, and holds EXACTLY ONE open
+        // frame at a time (close-prior-on-replace). A retained frame that outlived the
+        // encoder would leak a native/GPU buffer and stall the capture pipeline, so
+        // every teardown path closes it.
+        let mut last_encoded_frame: Option<VideoFrame> = None;
+        // One-time INFO latch: `true` once the retained-frame path has served a
+        // keyframe request, so the first engagement of the #1841 static path is a
+        // single clear signal in field logs rather than a per-emit stream.
+        let mut served_synthetic_once = false;
+        // `performance.now()` of the last throttled synthetic-re-encode DEBUG line
+        // (issue #1841), so the DEBUG path can't spam under sustained joiner churn.
+        let mut last_synthetic_log_ms: f64 = 0.0;
+
         // Setup FPS tracking and screen output handler.
         // These closures are created once and shared across encoder restarts
         // because the VideoEncoderInit callbacks are wired to the same output
@@ -2916,6 +2956,14 @@ impl ScreenEncoder {
                 }
             };
 
+            // The single outstanding read on this reader (issue #1841). The encode
+            // loop races THIS future against a timer each iteration; on a timer tick
+            // (quiet track) the still-pending read is preserved and re-selected, so
+            // exactly one read is ever in flight — issuing a second `read()` on the
+            // same `ReadableStreamDefaultReader` while one is pending is an error.
+            // Re-armed in the loop the moment a frame (or read error) resolves.
+            let mut read_fut = Box::pin(JsFuture::from(screen_reader.read()));
+
             let mut screen_frame_counter: u32 = 0;
             // Wall-clock (`performance.now()`, ms) of the last keyframe this screen
             // publisher emitted — periodic OR PLI-forced. Drives the forced-keyframe
@@ -3337,7 +3385,124 @@ impl ScreenEncoder {
                     }
                 }
 
-                match JsFuture::from(screen_reader.read()).await {
+                // Race the outstanding read against a poll timer (issue #1841) so a
+                // STATIC screen share (a real getDisplayMedia track that has stopped
+                // emitting frames) does not park this loop and strand late-joiner
+                // keyframe requests. `Box::pin` the timer so both arms are `Unpin` as
+                // `select` requires; `read_fut` is already a pinned box.
+                let timer = Box::pin(gloo_timers::future::TimeoutFuture::new(
+                    SCREEN_STATIC_REENCODE_POLL_MS,
+                ));
+                let read_outcome = match futures::future::select(read_fut, timer).await {
+                    futures::future::Either::Left((read_result, _timer)) => {
+                        // A real track frame (or a read error) resolved first. Re-arm
+                        // the read IMMEDIATELY so exactly one read is ever outstanding
+                        // on this reader; the resolved result is processed below.
+                        read_fut = Box::pin(JsFuture::from(screen_reader.read()));
+                        read_result
+                    }
+                    futures::future::Either::Right((_elapsed, pending_read)) => {
+                        // Timer won: no damage frame arrived within
+                        // SCREEN_STATIC_REENCODE_POLL_MS — the static-share case. Keep
+                        // the still-pending read alive (moving it back into `read_fut`)
+                        // so we never start a second read on the same reader.
+                        read_fut = pending_read;
+
+                        // ON-DEMAND ONLY: service a pending PLI by re-encoding the
+                        // retained frame as a keyframe. We deliberately do NOT
+                        // synthesize the periodic GOP here — a static share emitting an
+                        // unchanged keyframe room-wide every interval would waste
+                        // idle bandwidth for no benefit, and any decoder that actually
+                        // needs a frame reliably fires a KEYFRAME_REQUEST (with backoff
+                        // + escalation; see videocall-codecs jitter_buffer), which sets
+                        // `force_keyframe`. If a future no-PLI decoder path is found,
+                        // this gate — not a periodic timer — is where to revisit it.
+                        let pli_pending = force_keyframe.load(Ordering::Acquire);
+                        if pli_pending {
+                            if let Some(retained) = last_encoded_frame.as_ref() {
+                                let now = window()
+                                    .performance()
+                                    .expect("Performance API not available")
+                                    .now();
+                                // Consume the #1311 cooldown-reset edge ONLY when
+                                // actually servicing a PLI. On a static share the
+                                // real-frame arm never runs, so the timer branch is the
+                                // only consumer that can un-gate the first post-reconnect
+                                // PLI — but it must NOT consume the edge on a quiet
+                                // no-PLI tick. Unlike the real arm (which folds the
+                                // reset into `last_keyframe_emit_ms` every frame via the
+                                // decision), the timer arm has no per-tick store, so
+                                // consuming it early would discard the reset before a
+                                // later joiner PLI could use it. Same task as the real
+                                // arm (mutually exclusive per select tick), so this is
+                                // not a new racing consumer.
+                                let cooldown_reset =
+                                    keyframe_cooldown_reset.swap(false, Ordering::AcqRel);
+                                // Reuse the SAME shared keyframe decision the real arm
+                                // calls, so the screen PLI coalescer
+                                // (ENCODER_PLI_COOLDOWN_MS = 2000ms) collapses a
+                                // late-joiner WAVE into a single synthetic re-encode.
+                                let decision = keyframe_tick_decision(KeyframeTickInput {
+                                    now_ms: now,
+                                    pli_pending: true,
+                                    // The synthetic path never drives the periodic GOP.
+                                    is_periodic: false,
+                                    cooldown_reset,
+                                    last_keyframe_emit_ms,
+                                    cooldown_ms: ENCODER_PLI_COOLDOWN_MS,
+                                });
+                                last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
+                                if decision.want_keyframe {
+                                    let opts = VideoEncoderEncodeOptions::new();
+                                    opts.set_key_frame(true);
+                                    // Re-encode the retained frame on the base encoder
+                                    // AND every active higher layer, mirroring the
+                                    // real-frame fan-out so all published rungs stay
+                                    // keyframe-synchronized. Encoding a retained frame
+                                    // is valid: the real path already encodes ONE frame
+                                    // up to N times (base + layers) before its single
+                                    // close, so encode() does not consume the frame.
+                                    if let Err(e) =
+                                        screen_encoder.encode_with_options(retained, &opts)
+                                    {
+                                        error!("ScreenEncoder: static-share synthetic re-encode failed (base): {e:?}");
+                                    }
+                                    for layer in extra_layers.iter_mut() {
+                                        if (layer.layer_id as usize) < local_active_layers {
+                                            if let Err(e) =
+                                                layer.encoder.encode_with_options(retained, &opts)
+                                            {
+                                                error!("ScreenEncoder: static-share synthetic re-encode failed (layer {}): {e:?}", layer.layer_id);
+                                            }
+                                        }
+                                    }
+                                    if decision.clear_force_keyframe {
+                                        force_keyframe.store(false, Ordering::Release);
+                                    }
+                                    if !served_synthetic_once {
+                                        served_synthetic_once = true;
+                                        log::info!(
+                                            "ScreenEncoder: static screen share — served a late keyframe request by re-encoding the retained frame (issue #1841)"
+                                        );
+                                    } else if now - last_synthetic_log_ms
+                                        >= SCREEN_SYNTHETIC_LOG_THROTTLE_MS
+                                    {
+                                        last_synthetic_log_ms = now;
+                                        log::debug!(
+                                            "ScreenEncoder: synthetic keyframe re-encode of retained frame (static share, PLI held/emitted)"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        // Loop back and re-select the preserved read against a fresh
+                        // timer. The top-of-loop stop/reconfigure checks run again, so
+                        // stop() stays responsive within one poll interval even while
+                        // the track is quiet.
+                        continue 'encode;
+                    }
+                };
+                match read_outcome {
                     Ok(js_frame) => {
                         let value = match Reflect::get(&js_frame, &JsString::from("value")) {
                             Ok(v) => v,
@@ -3663,7 +3828,16 @@ impl ScreenEncoder {
                             }
                         }
 
-                        video_frame.close();
+                        // Retain the just-encoded frame instead of closing it, so the
+                        // static-share timer branch can re-encode it as a keyframe for
+                        // a late joiner with no content change (issue #1841). Close the
+                        // PREVIOUS retained frame first: exactly one VideoFrame is ever
+                        // held open. The frame is not used past this point in the
+                        // iteration (the queue-depth sample below reads encoder state,
+                        // not the frame).
+                        if let Some(prev) = last_encoded_frame.replace(video_frame) {
+                            prev.close();
+                        }
 
                         // Sender encoder backpressure (issue #1108, Phase B).
                         // After submitting this frame to the base encoder and
@@ -3706,6 +3880,13 @@ impl ScreenEncoder {
             for layer in &extra_layers {
                 let _ = layer.encoder.close();
             }
+            // Close the retained static-share frame before the next 'restart rebuilds
+            // the encoder(s) (issue #1841 reconfigure-invalidation): a frame captured
+            // at the OLD encoder dims must never reach a rebuilt encoder. The next real
+            // frame re-seeds it.
+            if let Some(frame) = last_encoded_frame.take() {
+                frame.close();
+            }
             // Drop the higher layers (and their closures) before the next
             // 'restart iteration rebuilds them.
             drop(extra_layers);
@@ -3729,6 +3910,14 @@ impl ScreenEncoder {
         } // end 'restart
 
         // --- Final cleanup (reached on shutdown or unrecoverable failure) ---
+        // Close any retained static-share frame (issue #1841) so a held VideoFrame
+        // never outlives the encoder — a leaked frame stalls the capture pipeline.
+        // Reached via `break 'restart` (user stop), which skips the per-restart
+        // cleanup above.
+        if let Some(frame) = last_encoded_frame.take() {
+            frame.close();
+        }
+
         // Clear the active track reference so stop() doesn't try to stop it again.
         active_video_track.borrow_mut().take();
 

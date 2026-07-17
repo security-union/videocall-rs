@@ -56,6 +56,10 @@ const MODAL = '[data-testid="device-warning-modal"]';
 // global.css must give this a SOLID, theme-aware background so its actionable
 // error text is readable over the translucent in-meeting backdrop + live video.
 const MODAL_WINDOW = `${MODAL} .modal-window`;
+// The empty-meeting "Your meeting is ready!" invite overlay (attendants.rs,
+// `id: "invite-overlay"`). style.css must hide it while any `.modal-overlay`
+// (the device-warning modal) is open, so the modal isn't occluded by it.
+const INVITE_OVERLAY = "#invite-overlay";
 
 const MEETING_READY = "Your meeting is ready!";
 
@@ -71,6 +75,7 @@ function cssAlpha(color: string): number {
   const parts = m[1].split(",").map((s) => s.trim());
   return parts.length === 4 ? parseFloat(parts[3]) : 1;
 }
+
 // Exact in-meeting copy for the DeviceInUse case (attendants.rs
 // render_single_device_error). The leading device name is substituted per side.
 const CAMERA_IN_USE_COPY =
@@ -401,6 +406,253 @@ test.describe("In-meeting device-permission handling", () => {
     await expect(mic.locator(".device-warning")).toBeVisible();
   });
 
+  // ─── Single-device activation must not prompt for the OTHER device ──────────
+  //
+  // THE BUG this fix closes. Reported: "if I have state for camera 'ask before
+  // allow' and try to switch on microphone in the meeting — browser asks me to
+  // allow camera before switching on the microphone. But asking for allow should
+  // be activated only for the device I try to activate."
+  //
+  // Root cause: the in-meeting Mic/Camera click handlers called the COMBINED
+  // `MediaDeviceAccess::request()`, which probes BOTH audio and video
+  // getUserMedia. `is_granted()` is dead code (always false), so every click fell
+  // into the `else` branch and issued the combined probe — clicking the mic
+  // therefore also fired a video-requesting getUserMedia, popping the browser's
+  // camera permission prompt. The fix switches the handlers to the single-device
+  // `request_audio_only()` / `request_video_only()` probes.
+  //
+  // How this is observable: the Chromium fake-UI flags auto-grant everything
+  // silently, so there is no visible native "ask" prompt to assert on. The exact
+  // proxy for "was the browser asked for this side" is whether a NEW
+  // getUserMedia call REQUESTING that side occurred at all — `getGumCalls()`
+  // counts video-requesting vs audio-requesting calls independently. The combined
+  // `request()` fires one audio-only AND one video-only getUserMedia (both counts
+  // increment); a single-device probe fires only its own side. So a mic-only
+  // click must leave the VIDEO call count unchanged.
+  //
+  // Mutation sensitivity: revert the mic handler to `mda_mic.borrow().request()`
+  // and the combined probe fires a video-requesting getUserMedia on the mic
+  // click, so `.video` increases and the `toBe(videoCallsBefore)` assertion
+  // fails. (Symmetrically for the camera handler / `.audio` in the next test.)
+  test("activating the mic does not prompt for camera permission", async ({ page }) => {
+    await gotoAndJoin(page, `e2e_perm_mic_no_cam_${Date.now()}`);
+
+    const mic = page.locator(MIC_BTN);
+    await expect(mic).not.toBeDisabled();
+
+    // Snapshot both sides' call counts AFTER join settled. The mic click must
+    // touch ONLY the audio side.
+    const before = await getGumCalls(page);
+
+    await mic.click();
+    // The mic actually turns on (audio-only probe succeeded → pending-enable
+    // fulfilled → encoder started): class becomes `active`. Gating on this
+    // guarantees the async probe completed before we read the counts — under the
+    // old combined-probe code the video-requesting call would already have fired
+    // by this point too.
+    await expect(mic).toHaveClass(/\bactive\b/, { timeout: 15_000 });
+
+    // Settle briefly so a late-scheduled video probe (there should be none) would
+    // be caught; nothing re-probes video here (camera off, never failed).
+    await page.waitForTimeout(1_500);
+
+    const after = await getGumCalls(page);
+    // THE REGRESSION CHECK: no video-requesting getUserMedia fired — the mic
+    // activation never asked the browser for the camera.
+    expect(
+      after.video,
+      "a mic-only activation must not trigger any video-side getUserMedia (no camera prompt)",
+    ).toBe(before.video);
+    // The mic side DID get a fresh audio-requesting call (the probe + encoder),
+    // proving the click did real work and the flat video count isn't a no-op.
+    expect(after.audio).toBeGreaterThan(before.audio);
+  });
+
+  test("activating the camera does not prompt for microphone permission", async ({ page }) => {
+    await gotoAndJoin(page, `e2e_perm_cam_no_mic_${Date.now()}`);
+
+    const camera = page.locator(CAMERA_BTN);
+    await expect(camera).not.toBeDisabled();
+
+    const before = await getGumCalls(page);
+
+    await camera.click();
+    await expect(camera).toHaveClass(/\bactive\b/, { timeout: 15_000 });
+
+    await page.waitForTimeout(1_500);
+
+    const after = await getGumCalls(page);
+    // The camera activation never asked the browser for the microphone.
+    expect(
+      after.audio,
+      "a camera-only activation must not trigger any audio-side getUserMedia (no mic prompt)",
+    ).toBe(before.audio);
+    // The video side DID get a fresh call (the probe + encoder).
+    expect(after.video).toBeGreaterThan(before.video);
+  });
+
+  // ─── In-meeting modal is scoped to the device the user is CURRENTLY using ───
+  //
+  // THE EXACT BUG this fix closes. Reported: "if the user is already in the
+  // meeting and tries to activate camera or microphone, show the error only for
+  // the device they are trying to activate. If another device has a problem and
+  // the user isn't trying to use it, don't show any error for it."
+  //
+  // The failure mode: `mic_error`/`video_error` stay `Some` long after the user
+  // stops interacting with that device — a NotReadableError arms the background
+  // auto-retry loop, which keeps the error `Some` for as long as the device is
+  // held, even after the user has SEEN and DISMISSED that device's modal. The
+  // old in-meeting modal render passed `mic_error`/`video_error` UNCONDITIONALLY,
+  // so the moment the OTHER device failed and re-raised the modal, the still-
+  // `Some` (but already-dismissed, not-currently-touched) device's row appeared
+  // alongside it — surfacing an error for a device the user is not interacting
+  // with. The fix masks each side on a per-device relevance flag
+  // (`mic_error_relevant`/`video_error_relevant`), set true only for a manual
+  // click on THAT device or its live encoder breaking, and cleared on dismiss.
+  //
+  // This test: block the MIC (NotReadableError), click it, see & dismiss its
+  // modal — leaving `mic_error` still `Some` in the background (retry loop keeps
+  // finding it blocked) but its relevance cleared. THEN block the CAMERA too and
+  // click it. The re-raised modal must show ONLY the camera row, never the mic's.
+  //
+  // Mutation sensitivity: revert the in-meeting render call to pass
+  // `mic_error.read().as_ref()` / `video_error.read().as_ref()` unconditionally
+  // (dropping the `mic_error_relevant()` / `video_error_relevant()` mask) and the
+  // MIC_IN_USE_COPY assertion below fails — the still-blocked mic's row reappears.
+  test("in-meeting modal shows only the device the user is currently activating, not an unrelated already-dismissed device error", async ({
+    page,
+  }) => {
+    await gotoAndJoin(page, `e2e_perm_scope_${Date.now()}`);
+
+    const mic = page.locator(MIC_BTN);
+    const camera = page.locator(CAMERA_BTN);
+    const modal = page.locator(MODAL);
+
+    // ── Step 1: MIC held by another app → click → modal → dismiss ────────────
+    // NotReadableError so the mic stays genuinely blocked in the background (the
+    // auto-retry loop keeps re-probing audio-only and keeps failing on audio:-1),
+    // keeping `mic_error` = Some(DeviceInUse) even after the modal is dismissed.
+    await setGumFail(page, { errorName: "NotReadableError", audio: -1 });
+
+    await mic.click();
+    await expect(modal).toBeVisible({ timeout: 15_000 });
+    await expect(modal).toContainText(MIC_IN_USE_COPY);
+    // Only the mic is failing so far, so the camera row must NOT be present yet.
+    await expect(modal).not.toContainText(CAMERA_IN_USE_COPY);
+
+    // Dismiss with "Ok": clears BOTH sides' relevance flags (the user has seen
+    // and acknowledged what was shown), even though `mic_error` remains Some in
+    // the background. Background retry ticks do NOT re-raise the modal.
+    await modal.getByRole("button", { name: "Ok" }).click();
+    await expect(modal).toBeHidden();
+    // The mic is still flagged blocked (its badge persists) — proving the error
+    // is genuinely still present, only its modal-row RELEVANCE was cleared.
+    await expect(mic).toHaveClass(/\berror\b/);
+
+    // ── Step 2: now the CAMERA fails independently → click camera ────────────
+    // Set BOTH sides failing in one call so the mic is unambiguously STILL
+    // blocked when the camera probe runs (per-side budgets are independent, but
+    // this makes the "mic is still genuinely blocked" precondition explicit).
+    await setGumFail(page, { errorName: "NotReadableError", video: -1, audio: -1 });
+
+    await camera.click();
+
+    // ── Step 3: the re-raised modal is SCOPED to the camera only ─────────────
+    const dialog = page.locator(MODAL_WINDOW);
+    await expect(modal).toBeVisible({ timeout: 15_000 });
+    await expect(dialog).toContainText(CAMERA_IN_USE_COPY);
+    // THE REGRESSION CHECK: the mic is still genuinely blocked (a background
+    // probe would find it so), but the user is NOT currently interacting with
+    // the mic, so its row must NOT appear. On the un-fixed code (unconditional
+    // `mic_error.read()`), the still-Some mic error resurfaces here and this
+    // assertion fails.
+    await expect(dialog).not.toContainText(MIC_IN_USE_COPY);
+  });
+
+  // ─── Follow-up: activating a PROBLEM-FREE device never pops the modal ───────
+  //
+  // User's clarification: "When I try to activate microphone or camera within a
+  // meeting, show the error message only if I try to activate a device WITH a
+  // problem. If the device I'm activating has no errors, don't show any error at
+  // all — the device should just switch on."
+  //
+  // The empty-modal pop: the in-meeting trigger used to key off
+  // `mic_failed || video_failed` ("does ANY device currently carry an error"),
+  // which includes a stale, unrelated, already-dismissed error on the OTHER
+  // device (e.g. the mic still blocked in the background by another app). So
+  // turning the CAMERA on successfully while the mic was still blocked popped the
+  // blocking modal — and, because the mic's row is relevance-masked out and the
+  // camera succeeded, it popped with NO rows: an empty "Device access problem"
+  // dialog for an activation that actually WORKED. The fix keys the trigger off
+  // the per-device relevance flags (`mic_error_relevant`/`video_error_relevant`,
+  // set true only for a clicked-and-failed device or a live encoder that broke),
+  // so an unrelated device's pre-existing error can no longer pop the modal.
+  //
+  // This test: block the MIC (audio:-1 leaves video passing through), click it,
+  // see & dismiss its modal — leaving `mic_error` still Some in the background.
+  // THEN click the CAMERA, which is NOT blocked. The modal must NEVER appear, and
+  // the camera must simply turn on with no further action.
+  //
+  // Mutation sensitivity: revert the in-meeting trigger to
+  // `(mic_failed || video_failed)` (dropping the relevance flags) and the
+  // still-blocked mic makes `mic_failed` true, so the camera click pops the empty
+  // modal — `popped` becomes true and the `toBe(false)` assertion below fails.
+  test("activating a problem-free device never pops the modal, even while an unrelated device is still blocked", async ({
+    page,
+  }) => {
+    await gotoAndJoin(page, `e2e_perm_nopop_${Date.now()}`);
+
+    const mic = page.locator(MIC_BTN);
+    const camera = page.locator(CAMERA_BTN);
+    const modal = page.locator(MODAL);
+
+    // ── Step 1: MIC held by another app → click → modal → dismiss ────────────
+    // audio:-1 fails every audio-requesting call indefinitely; video stays at its
+    // default budget 0 (pass through), so the camera can still be acquired. The
+    // NotReadableError → DeviceInUse arms the background audio-only retry loop,
+    // keeping `mic_error` = Some in the background after dismissal.
+    await setGumFail(page, { errorName: "NotReadableError", audio: -1 });
+
+    await mic.click();
+    await expect(modal).toBeVisible({ timeout: 15_000 });
+    await expect(modal).toContainText(MIC_IN_USE_COPY);
+
+    // Dismiss with "Ok": clears both sides' relevance flags. The underlying
+    // `mic_error` stays Some (the retry loop keeps re-finding audio:-1 blocked).
+    await modal.getByRole("button", { name: "Ok" }).click();
+    await expect(modal).toBeHidden();
+    // Proof the mic is GENUINELY still blocked (only its modal-row relevance was
+    // cleared) — its badge persists.
+    await expect(mic).toHaveClass(/\berror\b/);
+
+    // ── Step 2: activate the CAMERA, which has NO problem ────────────────────
+    // Video was never opted into failure, so the camera's getUserMedia passes
+    // through to the fake device and the camera simply turns on.
+    await camera.click();
+
+    // ── Step 3: the modal must NEVER appear ──────────────────────────────────
+    // `waitFor(visible)` resolves the instant the modal pops (→ popped=true) or
+    // rejects on timeout if it never does (→ popped=false). This catches even a
+    // transient pop that a later retry tick might auto-close, which a plain
+    // `not.toBeVisible` (satisfied by any single hidden sample) could miss. 4s is
+    // long enough to catch a false pop without needlessly slowing the suite.
+    const popped = await modal
+      .waitFor({ state: "visible", timeout: 4_000 })
+      .then(() => true)
+      .catch(() => false);
+    expect(
+      popped,
+      "device-warning modal must not appear when activating a problem-free device while an unrelated device is blocked",
+    ).toBe(false);
+
+    // ── Step 4: the camera just switched on — no dismiss, no extra action ─────
+    await expect(camera).toHaveClass(/\bactive\b/, { timeout: 15_000 });
+    await expect(camera).not.toHaveClass(/\berror\b/);
+    // The mic remains blocked in the background — the camera activation didn't
+    // touch it, and no modal surfaced for it.
+    await expect(mic).toHaveClass(/\berror\b/);
+  });
+
   // ─── Item 1 (a11y): Escape dismisses the device-warning modal ──────────────
   //
   // The dialog now carries role="dialog"/aria-modal + an Escape handler that
@@ -484,6 +736,73 @@ test.describe("In-meeting device-permission handling", () => {
     expect(windowBg).not.toBe(bg);
     // Default (no `ui-theme`) is the dark palette → --surface-elevated #2c2c2e.
     expect(windowBg).toBe("rgb(44, 44, 46)");
+  });
+
+  // ─── The device-warning modal renders ABOVE the invite overlay ─────────────
+  //
+  // THE BUG this fix closes. In an empty meeting (no peers) the "Your meeting is
+  // ready!" invite overlay (`#invite-overlay.invite-glass-card`) is shown. Its
+  // z-index is 30, far below the device-warning `.modal-overlay` (z-index 2000),
+  // but the invite overlay covers the full viewport (`position: fixed; inset: 0`)
+  // and, absent an explicit rule, stayed VISIBLE while the modal was up — visually
+  // sitting over the dimmed backdrop and competing with the modal for attention.
+  // style.css already suppresses the invite overlay while other modals/popovers
+  // are open (device-settings, search, mock-peers, density); the fix adds
+  // `.modal-overlay` (the device-warning modal, both the bare pre-join and the
+  // `in-meeting` variants share that base class) to that same suppression group,
+  // so the overlay goes `visibility: hidden; opacity: 0` whenever the modal is up.
+  //
+  // Setup: gotoAndJoin lands in the empty-meeting lobby (invite overlay visible),
+  // then a blocked-camera click raises the in-meeting modal. Assert the modal is
+  // visible AND the invite overlay is computed-hidden underneath it.
+  //
+  // Mutation sensitivity: revert the `body:has(.modal-overlay) #invite-overlay...`
+  // line in style.css and the invite overlay stays `visibility: visible` while the
+  // modal is open, failing both the computed-visibility and the `toBeHidden`
+  // assertions below.
+  test("device-warning modal is not occluded by the invite overlay in an empty meeting", async ({
+    page,
+  }) => {
+    await gotoAndJoin(page, `e2e_perm_invite_z_${Date.now()}`);
+
+    const invite = page.locator(INVITE_OVERLAY);
+    const modal = page.locator(MODAL);
+
+    // The empty-meeting invite overlay is up and visible BEFORE the modal opens —
+    // establishes the precondition the fix must override.
+    await expect(invite).toBeVisible();
+    expect(await invite.evaluate((el) => getComputedStyle(el).visibility)).toBe("visible");
+
+    // Block the camera and click it → the in-meeting device-warning modal opens
+    // over the still-present invite overlay.
+    await setGumFail(page, { errorName: "NotAllowedError", video: -1 });
+    await page.locator(CAMERA_BTN).click();
+    await expect(modal).toBeVisible({ timeout: 15_000 });
+    await expect(modal).toContainText(CAMERA_BLOCKED_COPY);
+
+    // THE REGRESSION CHECK: while the modal is up, the invite overlay is
+    // suppressed — computed `visibility: hidden` and `opacity: 0` (mirroring the
+    // getComputedStyle pattern used for the modal-window solid-surface test). The
+    // element is still in the DOM (empty meeting → it renders) but is CSS-hidden,
+    // so it can neither occlude nor intercept the modal.
+    const inviteStyle = await invite.evaluate((el) => {
+      const s = getComputedStyle(el);
+      return { visibility: s.visibility, opacity: s.opacity };
+    });
+    expect(inviteStyle.visibility).toBe("hidden");
+    expect(inviteStyle.opacity).toBe("0");
+    // Playwright agrees the overlay is hidden (visibility:hidden counts), while
+    // the modal remains fully visible on top.
+    await expect(invite).toBeHidden();
+    await expect(modal).toBeVisible();
+
+    // And the modal is genuinely interactive on top: "Ok" dismisses it. If the
+    // invite overlay were still occluding (it isn't — it also has
+    // pointer-events:none), this would not reliably close the modal.
+    await modal.getByRole("button", { name: "Ok" }).click();
+    await expect(modal).toBeHidden({ timeout: 5_000 });
+    // With the modal gone, the invite overlay returns to visible.
+    await expect(invite).toBeVisible();
   });
 
   // ─── Same solid-surface guard, LIGHT theme ─────────────────────────────────

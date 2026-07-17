@@ -40,6 +40,13 @@ pub mod preferences_settings_panel;
 // Issue 1175: pure zoom/pan math for received shared content (host-testable).
 pub mod screen_share_zoom;
 // Issue 1175: imperative glue to detach shared content into a separate window.
+// Pure detached-window sizing math (host-testable), split out of the wasm-only
+// detach module below (issue #1842). Its only non-test consumer
+// (`screen_share_detach`) is `#[cfg(target_arch = "wasm32")]`-gated, so on native
+// builds the items look unused (the host `#[test]`s still exercise them) — allow
+// dead_code off-wasm so the native `-D warnings` clippy job stays clean.
+#[cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+pub(crate) mod screen_share_detach_sizing;
 // wasm-only: it touches `web_sys::window`, Document PiP / window.open, and
 // `captureStream`.
 #[cfg(target_arch = "wasm32")]

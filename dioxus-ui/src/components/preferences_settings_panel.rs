@@ -11,6 +11,35 @@ use crate::context::{
 };
 use dioxus::prelude::*;
 
+/// Which announcement-channel help tooltip is currently latched open by a
+/// tap/click, or Escape-dismissed. Touch devices have no hover, so tapping the
+/// (?) icon toggles the open latch; keyboard and pointer users still get the
+/// tooltip purely via CSS (`:hover` / `:focus-within`), mirroring the shipped
+/// `field-label__info` pattern in `home.rs`. Escape adds a per-icon
+/// *suppression* that hides a still-focused tooltip without blurring or closing
+/// the modal — see the Escape handling in the render below.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnnounceHelp {
+    Message,
+    Sound,
+}
+
+/// Class string for an announcement help (?) icon given whether its tooltip is
+/// click-latched open and/or Escape-suppressed. `--open` forces the tooltip
+/// visible (the touch tap-latch); `--suppressed` forces it hidden even while the
+/// icon keeps focus. The two are mutually exclusive by construction (opening
+/// clears suppression and vice-versa), so suppression is checked first only
+/// defensively.
+fn announce_help_class(is_open: bool, is_suppressed: bool) -> &'static str {
+    if is_suppressed {
+        "field-label__info announce-help announce-help--right announce-help--suppressed"
+    } else if is_open {
+        "field-label__info announce-help announce-help--right field-label__info--open"
+    } else {
+        "field-label__info announce-help announce-help--right"
+    }
+}
+
 #[component]
 pub fn PreferencesSettingsPanel() -> Element {
     // Fallback signals for when contexts are not provided (e.g. in tests or
@@ -32,6 +61,14 @@ pub fn PreferencesSettingsPanel() -> Element {
         try_use_context::<DecodeBudgetCtx>().unwrap_or(DecodeBudgetCtx(fallback_decode_budget));
     let mut appearance_ctx = use_context::<AppearanceSettingsCtx>();
     let appearance = (appearance_ctx.0)();
+
+    // Latches the tapped/clicked announcement-channel tooltip open (touch has no
+    // hover). Hover and keyboard focus still reveal the tooltip via CSS alone.
+    let mut open_help = use_signal(|| Option::<AnnounceHelp>::None);
+    // Escape-dismissal: while the icon keeps focus, `:focus-within` would keep
+    // its tooltip on screen, so a dismissed icon is tracked here and hidden via
+    // CSS — without blurring (focus stays on the trigger) or closing the modal.
+    let mut suppressed_help = use_signal(|| Option::<AnnounceHelp>::None);
 
     rsx! {
         div { class: "appearance-settings-panel",
@@ -156,36 +193,181 @@ pub fn PreferencesSettingsPanel() -> Element {
 
                 // ── Section 3: Notifications ─────────────────────────────────
                 //
-                // Four independent toggles: entry/exit messages and entry/exit
-                // sounds. Each row's helper <p> carries an id wired to the input
-                // via `aria-describedby`, so a screen reader announces the name
-                // AND the clarifying description. The visible `for=` label is the
-                // sole accessible name — the switch wrapper deliberately has no
-                // `aria-label` to avoid doubling the announced name.
+                // A 2×2 announcement matrix: rows are the participant events
+                // (joins / leaves), columns are the delivery channels (an
+                // on-screen Message and a Sound). Each of the four cells is one
+                // `.glow-switch`, preserving the original input ids so stored
+                // preferences and existing selectors keep working. The per-cell
+                // meaning is carried by the grid axes: each switch is named via
+                // `aria-labelledby="<row-id> <col-id>"` (e.g. "Participant joins
+                // Message"), and the two column headers carry a reused
+                // `field-label__info` (?) help icon whose tooltip explains the
+                // channel — so the four helper sentences collapse to two column
+                // tooltips.
                 section { class: "appearance-section",
                     div { class: "appearance-section-header",
                         h3 { class: "appearance-section-title", "Notifications" }
                     }
 
-                    // Entry message toggle
-                    div { class: "appearance-section-header dock-autohide-row",
-                        div { class: "appearance-section-heading-stack",
-                            label {
-                                class: "appearance-section-title appearance-section-title--sm",
-                                r#for: "entry-notifications-toggle",
-                                "Entry message"
+                    div {
+                        class: "announce-matrix",
+                        role: "group",
+                        "aria-label": "Participant announcements",
+                        "data-testid": "announce-matrix",
+
+                        // ── Header row: empty corner + two channel headers ──
+                        span { class: "announce-matrix__corner" }
+
+                        div { class: "announce-matrix__col-head",
+                            span {
+                                id: "announce-col-message",
+                                class: "announce-matrix__col-label",
+                                "Message"
                             }
-                            p {
-                                id: "entry-notifications-desc",
-                                class: "appearance-section-helper",
-                                "Show a message when a participant joins."
+                            span {
+                                class: announce_help_class(
+                                    open_help() == Some(AnnounceHelp::Message),
+                                    suppressed_help() == Some(AnnounceHelp::Message),
+                                ),
+                                role: "button",
+                                tabindex: 0,
+                                "aria-label": "About message announcements",
+                                "aria-describedby": "announce-tip-message",
+                                "data-testid": "announce-help-message",
+                                onclick: move |e| {
+                                    e.stop_propagation();
+                                    // Explicit open wins over a prior Escape-dismissal.
+                                    suppressed_help.set(None);
+                                    open_help.set(if open_help() == Some(AnnounceHelp::Message) { None } else { Some(AnnounceHelp::Message) });
+                                },
+                                onkeydown: move |e| {
+                                    let key = e.key();
+                                    if key == Key::Enter || key == Key::Character(" ".to_string()) {
+                                        e.prevent_default();
+                                        e.stop_propagation();
+                                        suppressed_help.set(None);
+                                        open_help.set(if open_help() == Some(AnnounceHelp::Message) { None } else { Some(AnnounceHelp::Message) });
+                                    } else if key == Key::Escape && suppressed_help() != Some(AnnounceHelp::Message) {
+                                        // First Escape while the tooltip shows: dismiss ONLY the
+                                        // tooltip. Stop propagation so the modal's own Escape
+                                        // handler does NOT close it, and do NOT blur — focus stays
+                                        // on the trigger (WCAG 2.1 SC 1.4.13). A second Escape
+                                        // (already suppressed) falls through and bubbles, letting
+                                        // the modal close as usual.
+                                        e.stop_propagation();
+                                        open_help.set(None);
+                                        suppressed_help.set(Some(AnnounceHelp::Message));
+                                    }
+                                },
+                                onfocusout: move |_| {
+                                    open_help.set(None);
+                                    suppressed_help.set(None);
+                                },
+                                svg {
+                                    class: "field-label__info-icon",
+                                    xmlns: "http://www.w3.org/2000/svg",
+                                    width: 14,
+                                    height: 14,
+                                    view_box: "0 0 16 16",
+                                    fill: "none",
+                                    stroke: "currentColor",
+                                    stroke_width: 1.6,
+                                    stroke_linecap: "round",
+                                    stroke_linejoin: "round",
+                                    circle { cx: 8, cy: 8, r: 6.75 }
+                                    line { x1: 8, y1: 7.25, x2: 8, y2: 11.25 }
+                                    circle { cx: 8, cy: 5, r: 0.55, fill: "currentColor", stroke: "none" }
+                                }
+                                span {
+                                    id: "announce-tip-message",
+                                    class: "field-label__tooltip",
+                                    role: "tooltip",
+                                    "Show an on-screen message when someone joins or leaves."
+                                }
                             }
+                        }
+
+                        div { class: "announce-matrix__col-head",
+                            span {
+                                id: "announce-col-sound",
+                                class: "announce-matrix__col-label",
+                                "Sound"
+                            }
+                            span {
+                                class: announce_help_class(
+                                    open_help() == Some(AnnounceHelp::Sound),
+                                    suppressed_help() == Some(AnnounceHelp::Sound),
+                                ),
+                                role: "button",
+                                tabindex: 0,
+                                "aria-label": "About sound announcements",
+                                "aria-describedby": "announce-tip-sound",
+                                "data-testid": "announce-help-sound",
+                                onclick: move |e| {
+                                    e.stop_propagation();
+                                    // Explicit open wins over a prior Escape-dismissal.
+                                    suppressed_help.set(None);
+                                    open_help.set(if open_help() == Some(AnnounceHelp::Sound) { None } else { Some(AnnounceHelp::Sound) });
+                                },
+                                onkeydown: move |e| {
+                                    let key = e.key();
+                                    if key == Key::Enter || key == Key::Character(" ".to_string()) {
+                                        e.prevent_default();
+                                        e.stop_propagation();
+                                        suppressed_help.set(None);
+                                        open_help.set(if open_help() == Some(AnnounceHelp::Sound) { None } else { Some(AnnounceHelp::Sound) });
+                                    } else if key == Key::Escape && suppressed_help() != Some(AnnounceHelp::Sound) {
+                                        // First Escape while the tooltip shows: dismiss ONLY the
+                                        // tooltip. Stop propagation so the modal's own Escape
+                                        // handler does NOT close it, and do NOT blur — focus stays
+                                        // on the trigger (WCAG 2.1 SC 1.4.13). A second Escape
+                                        // (already suppressed) falls through and bubbles, letting
+                                        // the modal close as usual.
+                                        e.stop_propagation();
+                                        open_help.set(None);
+                                        suppressed_help.set(Some(AnnounceHelp::Sound));
+                                    }
+                                },
+                                onfocusout: move |_| {
+                                    open_help.set(None);
+                                    suppressed_help.set(None);
+                                },
+                                svg {
+                                    class: "field-label__info-icon",
+                                    xmlns: "http://www.w3.org/2000/svg",
+                                    width: 14,
+                                    height: 14,
+                                    view_box: "0 0 16 16",
+                                    fill: "none",
+                                    stroke: "currentColor",
+                                    stroke_width: 1.6,
+                                    stroke_linecap: "round",
+                                    stroke_linejoin: "round",
+                                    circle { cx: 8, cy: 8, r: 6.75 }
+                                    line { x1: 8, y1: 7.25, x2: 8, y2: 11.25 }
+                                    circle { cx: 8, cy: 5, r: 0.55, fill: "currentColor", stroke: "none" }
+                                }
+                                span {
+                                    id: "announce-tip-sound",
+                                    class: "field-label__tooltip",
+                                    role: "tooltip",
+                                    "Play a chime when someone joins or leaves."
+                                }
+                            }
+                        }
+
+                        // ── Row 1: Participant joins ──
+                        span {
+                            id: "announce-row-join",
+                            class: "announce-matrix__row-label",
+                            "Participant joins"
                         }
                         label { class: "glow-switch",
                             input {
                                 id: "entry-notifications-toggle",
                                 r#type: "checkbox",
-                                "aria-describedby": "entry-notifications-desc",
+                                "aria-labelledby": "announce-row-join announce-col-message",
+                                "data-testid": "announce-join-message",
                                 checked: appearance.show_entry_notifications,
                                 onchange: move |evt: Event<FormData>| {
                                     let enabled = evt.checked();
@@ -197,59 +379,12 @@ pub fn PreferencesSettingsPanel() -> Element {
                             }
                             span { class: "glow-switch-track" }
                         }
-                    }
-
-                    // Exit message toggle
-                    div { class: "appearance-section-header dock-autohide-row",
-                        div { class: "appearance-section-heading-stack",
-                            label {
-                                class: "appearance-section-title appearance-section-title--sm",
-                                r#for: "exit-notifications-toggle",
-                                "Exit message"
-                            }
-                            p {
-                                id: "exit-notifications-desc",
-                                class: "appearance-section-helper",
-                                "Show a message when a participant leaves."
-                            }
-                        }
-                        label { class: "glow-switch",
-                            input {
-                                id: "exit-notifications-toggle",
-                                r#type: "checkbox",
-                                "aria-describedby": "exit-notifications-desc",
-                                checked: appearance.show_exit_notifications,
-                                onchange: move |evt: Event<FormData>| {
-                                    let enabled = evt.checked();
-                                    appearance_ctx.0.set(AppearanceSettings {
-                                        show_exit_notifications: enabled,
-                                        ..appearance_ctx.0()
-                                    });
-                                },
-                            }
-                            span { class: "glow-switch-track" }
-                        }
-                    }
-
-                    // Entry sound toggle
-                    div { class: "appearance-section-header dock-autohide-row",
-                        div { class: "appearance-section-heading-stack",
-                            label {
-                                class: "appearance-section-title appearance-section-title--sm",
-                                r#for: "entry-sound-toggle",
-                                "Entry sound"
-                            }
-                            p {
-                                id: "entry-sound-desc",
-                                class: "appearance-section-helper",
-                                "Play a sound when a participant joins."
-                            }
-                        }
                         label { class: "glow-switch",
                             input {
                                 id: "entry-sound-toggle",
                                 r#type: "checkbox",
-                                "aria-describedby": "entry-sound-desc",
+                                "aria-labelledby": "announce-row-join announce-col-sound",
+                                "data-testid": "announce-join-sound",
                                 checked: appearance.play_entry_sound,
                                 onchange: move |evt: Event<FormData>| {
                                     let enabled = evt.checked();
@@ -261,27 +396,36 @@ pub fn PreferencesSettingsPanel() -> Element {
                             }
                             span { class: "glow-switch-track" }
                         }
-                    }
 
-                    // Exit sound toggle
-                    div { class: "appearance-section-header dock-autohide-row",
-                        div { class: "appearance-section-heading-stack",
-                            label {
-                                class: "appearance-section-title appearance-section-title--sm",
-                                r#for: "exit-sound-toggle",
-                                "Exit sound"
+                        // ── Row 2: Participant leaves ──
+                        span {
+                            id: "announce-row-leave",
+                            class: "announce-matrix__row-label",
+                            "Participant leaves"
+                        }
+                        label { class: "glow-switch",
+                            input {
+                                id: "exit-notifications-toggle",
+                                r#type: "checkbox",
+                                "aria-labelledby": "announce-row-leave announce-col-message",
+                                "data-testid": "announce-leave-message",
+                                checked: appearance.show_exit_notifications,
+                                onchange: move |evt: Event<FormData>| {
+                                    let enabled = evt.checked();
+                                    appearance_ctx.0.set(AppearanceSettings {
+                                        show_exit_notifications: enabled,
+                                        ..appearance_ctx.0()
+                                    });
+                                },
                             }
-                            p {
-                                id: "exit-sound-desc",
-                                class: "appearance-section-helper",
-                                "Play a sound when a participant leaves."
-                            }
+                            span { class: "glow-switch-track" }
                         }
                         label { class: "glow-switch",
                             input {
                                 id: "exit-sound-toggle",
                                 r#type: "checkbox",
-                                "aria-describedby": "exit-sound-desc",
+                                "aria-labelledby": "announce-row-leave announce-col-sound",
+                                "data-testid": "announce-leave-sound",
                                 checked: appearance.play_exit_sound,
                                 onchange: move |evt: Event<FormData>| {
                                     let enabled = evt.checked();

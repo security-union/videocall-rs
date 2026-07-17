@@ -6456,6 +6456,69 @@ html[data-theme="light"] .transport-segmented-option:active:not(.selected) {
 }
 
 
+/* ── Notifications: participant-announcement matrix (issue 1845) ─────────────
+   A compact 2×2 grid — rows are join/leave events, columns are the Message and
+   Sound channels — replacing four full-width toggle rows. All colors are tokens
+   the `.settings-modal` scope already remaps for light theme, so no separate
+   light-mode rules are needed. */
+.announce-matrix {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  column-gap: var(--space-5);
+  row-gap: var(--space-3);
+  max-width: 100%;
+}
+
+.announce-matrix__col-head {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  justify-self: center;
+}
+
+.announce-matrix__col-label {
+  font-size: var(--fs-3);
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  color: var(--text-secondary);
+}
+
+.announce-matrix__row-label {
+  font-size: var(--fs-4);
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 0;
+}
+
+.announce-matrix > .glow-switch {
+  justify-self: center;
+}
+
+/* Keep the right-column tooltip inside the panel: the base tooltip grows
+   rightward from left:-8px, which would spill past the panel edge in these
+   right-aligned toggle columns — flip it to grow leftward instead. */
+.announce-help--right .field-label__tooltip {
+  left: auto;
+  right: -8px;
+}
+
+.announce-help--right .field-label__tooltip::before {
+  left: auto;
+  right: 13px;
+}
+
+/* Escape-dismissal: hide a tooltip whose (?) icon still holds keyboard focus.
+   Uses !important to beat the compound reveal rules in global.css (e.g.
+   `.field-label__info:focus-within .field-label__tooltip`, specificity 0,3,0) —
+   matching that with selector specificity alone would rely on cross-file source
+   order, so !important is the robust "force hidden" for this explicit state. */
+.announce-help--suppressed .field-label__tooltip {
+  opacity: 0 !important;
+  visibility: hidden !important;
+}
+
+
 .color-swatches {
   display: flex;
   align-items: flex-start;
@@ -8583,7 +8646,8 @@ FLOATING GLASS INVITE
 body:has(.device-settings-modal-overlay) #invite-overlay.invite-glass-card,
 body:has(.search-modal-overlay) #invite-overlay.invite-glass-card,
 body:has(.mock-peers-popover) #invite-overlay.invite-glass-card,
-body:has(.density-popover) #invite-overlay.invite-glass-card {
+body:has(.density-popover) #invite-overlay.invite-glass-card,
+body:has(.modal-overlay) #invite-overlay.invite-glass-card {
   opacity: 0;
   visibility: hidden;
   pointer-events: none;
@@ -10092,6 +10156,7 @@ details.perf-peers[open] .perf-peers__chev {
 .action-bar-slot-wrapper {
   position: relative;
   display: inline-flex;
+  flex-shrink: 0;
   transition: transform 200ms cubic-bezier(0.2, 0.7, 0.3, 1), box-shadow 200ms ease;
 }
 

@@ -240,13 +240,30 @@ fn retry_tick_decision(since: u32, gap: u32, max_gap: u32) -> RetryTickDecision 
 ///
 /// The modal renders whenever `show_device_warning` is true, INDEPENDENT of the
 /// current error signals (see `render_device_warning_modal`). A background
-/// auto-retry can clear `mic_error`/`video_error` while the user has left the
-/// modal open, which would strand them on an empty dialog with no error rows.
-/// So once a probe result leaves BOTH sides error-free, close the modal if it is
-/// still showing. `warning_shown` gates the write so we never call `.set(false)`
-/// on an already-closed modal, and the both-sides-clear check means a probe that
-/// recovers one side while the other is still (or newly) failing keeps the modal
-/// up to display the remaining error.
+/// auto-retry can clear the shown error(s) while the user has left the modal
+/// open, which would strand them on an empty dialog with no error rows. So once
+/// nothing remains to show, close the modal if it is still up.
+///
+/// This is pure boolean logic (`warning_shown && a && b`); the MEANING of `a`/`b`
+/// is supplied by the call site, which differs by context:
+/// * In-meeting, the call passes RELEVANCE-absence (`!*_error_relevant`). The
+///   in-meeting modal renders a device's row only while that device is the one
+///   the user is interacting with, so it must close once neither side has a
+///   currently-RELEVANT (displayed) error — a device the user never touched, or
+///   whose error was already dismissed, does NOT block auto-close even if its
+///   underlying `*_error` technically persists in the background (e.g. a mic
+///   still blocked by another app while the user successfully turns the camera
+///   on). Requiring both raw `*_error`s to be `None` here would strand the modal
+///   open and empty until that unrelated, never-displayed error also cleared.
+/// * Pre-join / join-failed, the call passes raw error-absence (`*_error.is_none()`).
+///   The relevance flags are only ever written from in-meeting code and stay
+///   `false` throughout pre-join, so passing them would auto-close the
+///   "device blocked — click OK to join" modal on the very first background
+///   retry tick while the device is still blocked. Raw-error absence keeps that
+///   modal up until genuine recovery, exactly as before this scoping was added.
+///
+/// `warning_shown` gates the write so we never call `.set(false)` on an
+/// already-closed modal.
 fn should_auto_close_device_warning(
     mic_error_is_none: bool,
     video_error_is_none: bool,
@@ -1061,6 +1078,109 @@ fn focus_first_action_bar_button() {
     }
 }
 
+/// Read the computed `font-size` of an element, returning pixels as `f64`.
+fn w_sys_computed_font_size(el: &web_sys::Element) -> Option<f64> {
+    let win = web_sys::window()?;
+    let style = win.get_computed_style(el).ok()??;
+    let val = style.get_property_value("font-size").ok()?;
+    val.trim_end_matches("px").parse::<f64>().ok()
+}
+
+/// Render a small SVG icon for a secondary action-bar slot, used inside the
+/// narrow-viewport overflow popover. Icons match the ones in
+/// `video_control_buttons.rs` but are rendered inline so the popover items
+/// are self-contained (no nested component state needed).
+fn overflow_slot_icon(slot: ActionBarSlot) -> Element {
+    match slot {
+        ActionBarSlot::ScreenShare => rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                rect { x: "2", y: "3", width: "20", height: "14", rx: "2", ry: "2" }
+                line { x1: "8", y1: "21", x2: "16", y2: "21" }
+                line { x1: "12", y1: "17", x2: "12", y2: "21" }
+            }
+        },
+        ActionBarSlot::PeerList => rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2" }
+                circle { cx: "9", cy: "7", r: "4" }
+                path { d: "M23 21v-2a4 4 0 0 0-3-3.87" }
+                path { d: "M16 3.13a4 4 0 0 1 0 7.75" }
+            }
+        },
+        ActionBarSlot::DensityMode => rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "currentColor",
+                rect { x: "3", y: "3", width: "8", height: "8", rx: "1" }
+                rect { x: "13", y: "3", width: "8", height: "8", rx: "1" }
+                rect { x: "3", y: "13", width: "8", height: "8", rx: "1" }
+                rect { x: "13", y: "13", width: "8", height: "8", rx: "1" }
+            }
+        },
+        ActionBarSlot::Diagnostics => rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M2 12h2l3.5-7L12 19l2.5-5H20" }
+            }
+        },
+        ActionBarSlot::DeviceSettings => rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                circle { cx: "12", cy: "12", r: "3" }
+                path { d: "M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06-.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1 1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06-.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z" }
+            }
+        },
+        ActionBarSlot::MeetingOptions => rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                path { d: "M12 20h9" }
+                path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
+            }
+        },
+        // Mic + Camera never appear in the overflow popover.
+        _ => rsx! {},
+    }
+}
+
 fn is_action_bar_slot_visible(
     slot: ActionBarSlot,
     customize_mode: bool,
@@ -1222,6 +1342,17 @@ pub fn AttendantsComponent(
     let left_raf_valid: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     let right_raf_valid: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
     let mut mock_peers_open = use_signal(|| false);
+    let mut overflow_menu_open = use_signal(|| false);
+    // Dynamically-computed set of secondary slots that don't fit in the
+    // action bar at the current viewport width. Populated by a pure
+    // signal-driven `use_effect` — no DOM measurement. The effect reads
+    // `viewport_width`, the slot list, and visibility filters to decide
+    // which slots overflow. Dioxus render is sole authority on visibility.
+    let mut overflowed_slots: Signal<Vec<ActionBarSlot>> = use_signal(Vec::new);
+    // Tracks whether an active screen share exists — set in the render body
+    // (after `active_screen_sharer` is computed) and read by the overflow
+    // effect so it can filter slots correctly.
+    let mut has_screen_share_sig: Signal<bool> = use_signal(|| false);
     let mut controls_visible = use_signal(|| true);
     let mut controls_expanded = use_signal(|| true);
     let mut dock_position: Signal<DockPosition> = use_signal(load_dock_position);
@@ -1299,6 +1430,193 @@ pub fn AttendantsComponent(
     // `action_bar_slots` order directly, so DOM order IS visual order
     // and keyboard Tab order follows naturally without post-render
     // DOM manipulation.
+
+    // ── Dynamic overflow detection for the action bar ──
+    //
+    // Pure signal-based: a `viewport_width` signal tracks window size via
+    // a resize event listener.  The render function reads viewport_width,
+    // the visible slots, and computes which secondary slots don't fit
+    // using known button sizes (matching the CSS media query breakpoints).
+    // No DOM measurement, no style manipulation — Dioxus is the sole
+    // authority on element visibility.
+    let mut viewport_width = use_signal(|| {
+        web_sys::window()
+            .and_then(|w| w.inner_width().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1200.0)
+    });
+    let mut viewport_height = use_signal(|| {
+        web_sys::window()
+            .and_then(|w| w.inner_height().ok())
+            .and_then(|v| v.as_f64())
+            .unwrap_or(800.0)
+    });
+
+    // Listen for window resize events to keep viewport signals current.
+    {
+        type ResizeCb = Rc<RefCell<Option<Closure<dyn FnMut()>>>>;
+        let resize_cb: ResizeCb = use_hook(|| Rc::new(RefCell::new(None)));
+
+        let resize_cb_drop = resize_cb.clone();
+        use_drop(move || {
+            if let Some(cb) = resize_cb_drop.borrow_mut().take() {
+                if let Some(win) = web_sys::window() {
+                    let _ = win
+                        .remove_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+                }
+            }
+        });
+
+        // rAF-pending flag shared between the resize listener and the rAF
+        // callback.  Ensures at most one rAF is scheduled at a time, so rapid
+        // resize events coalesce into one signal write per painted frame.
+        let raf_pending: Rc<Cell<bool>> = use_hook(|| Rc::new(Cell::new(false)));
+
+        let resize_cb_effect = resize_cb.clone();
+        use_effect(move || {
+            // One-shot: install the listener once.
+            if resize_cb_effect.borrow().is_some() {
+                return;
+            }
+            let raf_flag = raf_pending.clone();
+            let cb = Closure::<dyn FnMut()>::new(move || {
+                if raf_flag.get() {
+                    return; // rAF already scheduled — coalesce
+                }
+                raf_flag.set(true);
+                let flag = raf_flag.clone();
+                let raf_cb = Closure::<dyn FnMut()>::once(move || {
+                    flag.set(false);
+                    if let Some(win) = web_sys::window() {
+                        if let Ok(w) = win.inner_width() {
+                            if let Some(v) = w.as_f64() {
+                                viewport_width.set(v);
+                            }
+                        }
+                        if let Ok(h) = win.inner_height() {
+                            if let Some(v) = h.as_f64() {
+                                viewport_height.set(v);
+                            }
+                        }
+                    }
+                });
+                if let Some(win) = web_sys::window() {
+                    let _ = win.request_animation_frame(raf_cb.as_ref().unchecked_ref());
+                }
+                raf_cb.forget();
+            });
+            if let Some(win) = web_sys::window() {
+                let _ = win.add_event_listener_with_callback("resize", cb.as_ref().unchecked_ref());
+            }
+            *resize_cb_effect.borrow_mut() = Some(cb);
+        });
+    }
+
+    // Compute which secondary slots overflow — pure function of viewport
+    // size, visible slot count, dock position, customize mode, and slot
+    // visibility filters (iOS, screen-share, owner).
+    // No DOM style writes — Dioxus render is sole authority on visibility.
+    use_effect(move || {
+        let vw = viewport_width();
+        let vh = viewport_height();
+        let is_customize = customize_mode();
+        let dock = dock_position();
+        let slots = action_bar_slots.read();
+        // Read visibility-filter deps so the effect re-runs when they change.
+        let has_ss = has_screen_share_sig();
+
+        if is_customize {
+            if !overflowed_slots.peek().is_empty() {
+                overflowed_slots.set(Vec::new());
+            }
+            overflow_menu_open.set(false);
+            return;
+        }
+
+        // Filter to only the slots that are actually rendered. This prevents
+        // dead popover items (e.g. ScreenShare on iOS, MeetingOptions for
+        // non-owners, DensityMode during screen-share).
+        let ios_device = is_ios();
+        let visible = visible_action_bar_slots(&slots, false, ios_device, has_ss, is_owner);
+
+        let is_vertical = dock != DockPosition::Bottom;
+        let available = if is_vertical { vh } else { vw } - 40.0;
+
+        // Button size is 3.1rem. Scale by computed root font-size to handle
+        // browser zoom and OS text-size settings (where 1rem > 16px).
+        let rem_px = web_sys::window()
+            .and_then(|w| w.document())
+            .and_then(|d| d.document_element())
+            .and_then(|el| w_sys_computed_font_size(&el))
+            .unwrap_or(16.0);
+        let btn_size = 3.1 * rem_px;
+
+        // Gap/padding shrink at narrow viewports to match CSS media queries.
+        let (gap, pad) = if !is_vertical && vw <= 440.0 {
+            (0.4 * rem_px, 0.8 * rem_px * 2.0) // 0.4rem gap, 0.8rem×2 pad
+        } else if !is_vertical && vw <= 540.0 {
+            (0.6 * rem_px, 1.0 * rem_px * 2.0) // 0.6rem gap, 1rem×2 pad
+        } else {
+            (1.2 * rem_px, 1.5 * rem_px * 2.0) // 1.2rem gap, 1.5rem×2 pad
+        };
+
+        // Sacred = Mic + Camera + Hangup — always visible.
+        let primary_count = visible
+            .iter()
+            .filter(|s| matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
+            .count();
+        let secondary: Vec<ActionBarSlot> = visible
+            .iter()
+            .copied()
+            .filter(|s| !matches!(s, ActionBarSlot::Mic | ActionBarSlot::Camera))
+            .collect();
+
+        let sacred_count = primary_count + 1; // +1 hangup
+        let sacred_width =
+            (sacred_count as f64) * btn_size + (sacred_count as f64) * gap + pad + 2.0;
+
+        let trigger_width = btn_size + gap;
+
+        // --- Single-pass overflow with consistent budgeting ---
+        // Budget when no overflow: sacred + dock + all secondary.
+        // Budget when overflow: sacred + trigger (dock hides) + fitting secondary.
+        //
+        // We compute the overflow-mode budget directly. If ALL secondary
+        // slots fit in the overflow budget, no overflow is needed (they'd
+        // also fit with the larger dock). This eliminates the dead zone
+        // where pass-1 detected overflow but pass-2 fit everything.
+        let budget = available - sacred_width - trigger_width;
+        let mut fit_count = 0usize;
+        let mut used = 0.0_f64;
+
+        for (i, _) in secondary.iter().enumerate() {
+            let needed = btn_size + if i > 0 { gap } else { 0.0 };
+            if used + needed <= budget {
+                used += needed;
+                fit_count += 1;
+            } else {
+                break;
+            }
+        }
+
+        let hidden: Vec<ActionBarSlot> = if fit_count == secondary.len() {
+            // Everything fits even with the smaller trigger budget,
+            // so it certainly fits with the larger dock. No overflow.
+            Vec::new()
+        } else {
+            // At least one slot overflows — hide from fit_count onward.
+            secondary[fit_count..].to_vec()
+        };
+
+        if *overflowed_slots.peek() != hidden {
+            overflowed_slots.set(hidden.clone());
+        }
+        // Close the overflow menu when nothing is hidden (e.g. user resized wider).
+        if hidden.is_empty() && *overflow_menu_open.peek() {
+            overflow_menu_open.set(false);
+        }
+    });
+
     let encoder_settings = use_signal(|| None::<String>);
     // Last peer count logged by the meeting-view render log below — lets that
     // log fire only on changes (edge-trigger) instead of every re-render.
@@ -1683,6 +2001,20 @@ pub fn AttendantsComponent(
     let mut ss_resizing: Signal<bool> = use_signal(|| false);
     let mut pending_mic_enable = use_signal(|| false);
     let mut pending_video_enable = use_signal(|| false);
+    // Whether the IN-MEETING device-warning modal should currently include a
+    // row for this device — distinct from "does this device currently have an
+    // error" (`mic_error`/`video_error` can stay `Some` from a background retry
+    // or a dismissed-but-unresolved failure long after the user stopped caring
+    // about that specific device). Only set `true` when THIS device is what the
+    // user is actively trying to use: a manual click on its button that fails,
+    // or its LIVE encoder failing while already streaming. Reset to `false` on
+    // recovery and on modal dismiss, so an unrelated later failure for the OTHER
+    // device doesn't resurrect a stale row for this one. Read only by the
+    // IN-MEETING modal render call — the pre-join modal is unaffected (see its
+    // own call site) since a fresh join-time probe legitimately represents "the
+    // user is trying to use whatever they configured pre-join."
+    let mut mic_error_relevant = use_signal(|| false);
+    let mut video_error_relevant = use_signal(|| false);
     // True only when the user explicitly clicked Join/Start (vs. granting
     // permission just to preview devices). Gates the auto-connect in the
     // MediaDeviceAccess callback so a preview-permission grant does NOT join
@@ -2754,6 +3086,8 @@ pub fn AttendantsComponent(
             let mut pending_video_enable = pending_video_enable;
             let mut mic_error = mic_error;
             let mut video_error = video_error;
+            let mut mic_error_relevant = mic_error_relevant;
+            let mut video_error_relevant = video_error_relevant;
             let mut show_device_warning = show_device_warning;
             let mut reload_devices_counter = reload_devices_counter;
             let mut device_was_denied = device_was_denied;
@@ -2797,14 +3131,30 @@ pub fn AttendantsComponent(
             // closure, not render, matching `.peek()` use elsewhere in this file).
             if audio_probed {
                 let target = permission_probe_error_target(&permit.audio);
+                // Capture recovery BEFORE `target` is moved into the set below.
+                let mic_recovered = target.is_none();
                 if mic_error.peek().as_ref() != target.as_ref() {
                     mic_error.set(target);
+                }
+                // On recovery (error clearing to `None`), reset this side's
+                // modal-row relevance so a later unrelated failure for the OTHER
+                // device can't resurrect a stale row for this one. Defensive
+                // hygiene: the in-meeting render mask already ignores a stale
+                // `true` once the error itself is `None` (it renders a row only
+                // for a `Some` value), but keep the state consistent.
+                if mic_recovered && should_write_bool_signal(*mic_error_relevant.peek(), false) {
+                    mic_error_relevant.set(false);
                 }
             }
             if video_probed {
                 let target = permission_probe_error_target(&permit.video);
+                let video_recovered = target.is_none();
                 if video_error.peek().as_ref() != target.as_ref() {
                     video_error.set(target);
+                }
+                if video_recovered && should_write_bool_signal(*video_error_relevant.peek(), false)
+                {
+                    video_error_relevant.set(false);
                 }
             }
             // Only a genuine full request (both sides probed) touches these; a
@@ -2814,6 +3164,19 @@ pub fn AttendantsComponent(
                 connection_error.set(None);
                 media_access_granted.set(true);
             }
+
+            // Capture whether THIS probe was manually triggered by a click on
+            // either device's Mic/Camera button, BEFORE any pending-enable flag is
+            // cleared below. `pending_mic_enable`/`pending_video_enable` are set
+            // ONLY by the manual click handlers; the background auto-retry tick
+            // deliberately never sets them (it does not auto-enable on recovery —
+            // see the tick's own comment). This must be read here, ahead of BOTH
+            // the success-path clear immediately below AND the later failure-path
+            // clear, because a successful single-device click clears its pending
+            // flag in that success block — reading after it would misclassify a
+            // successful manual probe as a background tick. Consumed by
+            // `was_background_retry` in the in-meeting branch further down.
+            let manually_triggered = *pending_mic_enable.peek() || *pending_video_enable.peek();
 
             // Fulfil any pending mic/camera enables that triggered the permission request.
             if matches!(permit.audio, PermissionState::Granted) && pending_mic_enable() {
@@ -2825,21 +3188,38 @@ pub fn AttendantsComponent(
                 pending_video_enable.set(false);
             }
 
-            // If a probe (typically a background auto-retry tick) has left BOTH
-            // sides error-free while the blocking modal is still open — the user
-            // never dismissed it because the retry loop is designed to recover
-            // without user action — auto-close it. Otherwise the user is stranded
-            // on an empty "Device access problem" dialog with no error rows, just
-            // an "Ok" button. This runs AFTER the per-side set-if-changed writes
-            // above so the reads see the final error state for THIS result; the
-            // both-None gate means a probe that recovers one side while the other
-            // is still (or newly) failing keeps the modal up to show the remainder.
-            // Placed before the branch below so it applies uniformly to the
-            // in-meeting, pre-join-preview, and join flows that all share this
-            // handler.
+            // If a probe (typically a background auto-retry tick) has left nothing
+            // left to SHOW while the blocking modal is still open — the user never
+            // dismissed it because the retry loop is designed to recover without
+            // user action — auto-close it. Otherwise the user is stranded on an
+            // empty "Device access problem" dialog with no error rows, just an
+            // "Ok" button. This runs AFTER the per-side relevance-reset writes
+            // above (which clear `*_error_relevant` on recovery), so the reads see
+            // the final state for THIS result.
+            //
+            // What counts as "nothing left to show" is context-dependent, and this
+            // check is intentionally placed before the branch below so it applies
+            // to the in-meeting, pre-join-preview, and join flows that share this
+            // handler:
+            //   * In-meeting, the modal renders relevance-MASKED rows, so it must
+            //     close once neither side has a currently-RELEVANT error — even if
+            //     the OTHER (never-displayed) device still carries a background
+            //     error. Using raw `*_error` here would strand the modal open and
+            //     empty (mic's row masked out, camera never had a row to show).
+            //   * Pre-join / join-failed, the relevance flags are never written
+            //     (they stay `false`), so relevance-absence would be trivially
+            //     `true` and auto-close the "device blocked — click OK to join"
+            //     modal on the first background retry tick while the device is
+            //     STILL blocked. Raw-error absence keeps it up until real recovery.
+            let in_meeting_for_autoclose = session_loaded() || connecting();
+            let (mic_side_clear, video_side_clear) = if in_meeting_for_autoclose {
+                (!*mic_error_relevant.peek(), !*video_error_relevant.peek())
+            } else {
+                (mic_error.read().is_none(), video_error.read().is_none())
+            };
             if should_auto_close_device_warning(
-                mic_error.read().is_none(),
-                video_error.read().is_none(),
+                mic_side_clear,
+                video_side_clear,
                 show_device_warning(),
             ) {
                 show_device_warning.set(false);
@@ -2849,16 +3229,23 @@ pub fn AttendantsComponent(
                 // In-meeting result (initial retry click, focus re-check, or a
                 // background auto-retry tick).
                 //
-                // A single-device probe (exactly one side left `Unknown`) is
-                // AUTHORITATIVE for "this result came from the background
-                // auto-retry tick": the ONLY callers of `request_audio_only`/
-                // `request_video_only` are that tick (a manual click always calls
-                // the combined `request()`, probing both sides with no `Unknown`).
-                // A both-device retry tick fires two INDEPENDENT single-device
-                // probes → two `on_result`s, and each one independently has
-                // exactly one `Unknown` side, so this inference covers both on its
-                // own — no separate flag needed.
-                let was_background_retry = audio_probed != video_probed;
+                // Classify whether this probe came from the background auto-retry
+                // tick (as opposed to a user action). A single-device probe shape
+                // (exactly one side left `Unknown`) is NO LONGER an exclusive
+                // signature of the background tick: the in-meeting Mic/Camera
+                // click handlers now call `request_audio_only`/`request_video_only`
+                // too (so activating one device never prompts the browser for the
+                // OTHER), which produces the same single-device shape. The
+                // probe-shape-independent signal for "user-initiated" is
+                // `manually_triggered`, captured above from
+                // `pending_mic_enable`/`pending_video_enable` BEFORE any pending
+                // clear in this closure — those flags are set ONLY by the manual
+                // click handlers (the background tick never sets them). A probe is
+                // background only if it is BOTH not manually pending AND
+                // single-device-shaped (the shape check is retained as
+                // defense-in-depth; a both-device retry tick fires two independent
+                // single-device probes, each with exactly one `Unknown` side).
+                let was_background_retry = !manually_triggered && (audio_probed != video_probed);
                 // Diagnostic (step 4): record the CLASSIFIED outcome of every
                 // in-meeting probe — especially the background auto-retry ticks —
                 // so a recurrence of the "badge never clears after the app releases
@@ -2885,36 +3272,71 @@ pub fn AttendantsComponent(
                 // `should_write_bool_signal` guard makes the repeat a true no-op
                 // and eliminates the per-tick re-render (issue #1793).
                 if audio_probed && mic_failed {
+                    // Capture BEFORE clearing below: was THIS failure the result
+                    // of the user clicking "turn mic on" (as opposed to a
+                    // background retry tick re-discovering the same still-blocked
+                    // device)? Only a manual click sets `pending_mic_enable`; a
+                    // background tick's `audio_probed` side never does, so this is
+                    // `false` for background-originated failures — exactly the
+                    // distinction needed for modal-row relevance.
+                    let mic_was_pending = *pending_mic_enable.peek();
                     if should_write_bool_signal(*mic_enabled.peek(), false) {
                         mic_enabled.set(false);
                     }
                     if should_write_bool_signal(*pending_mic_enable.peek(), false) {
                         pending_mic_enable.set(false);
                     }
+                    if mic_was_pending && should_write_bool_signal(*mic_error_relevant.peek(), true)
+                    {
+                        mic_error_relevant.set(true);
+                    }
                 }
                 if video_probed && video_failed {
+                    let video_was_pending = *pending_video_enable.peek();
                     if should_write_bool_signal(*video_enabled.peek(), false) {
                         video_enabled.set(false);
                     }
                     if should_write_bool_signal(*pending_video_enable.peek(), false) {
                         pending_video_enable.set(false);
                     }
+                    if video_was_pending
+                        && should_write_bool_signal(*video_error_relevant.peek(), true)
+                    {
+                        video_error_relevant.set(true);
+                    }
                 }
-                // Surface the blocking modal for a user-initiated failure (or the
-                // first failure), but NOT for a background auto-retry tick that
-                // failed again — the modal is already up from the initial failure.
+                // Surface the blocking modal ONLY when the device the user is
+                // actually interacting with is the one that failed — i.e. a
+                // clicked-and-failed device (its `*_error_relevant` flag set just
+                // above, in this SAME `on_result` invocation) — NOT for a
+                // background auto-retry tick that failed again, and NOT for an
+                // unrelated device's pre-existing error.
+                //
+                // Keying off the already-computed relevance flags rather than the
+                // broader `mic_failed`/`video_failed` ("does ANY device currently
+                // carry an error") is the fix for the empty-modal pop: when the
+                // user turns the CAMERA on successfully while the MIC is
+                // independently still blocked in the background, `mic_failed` is
+                // `true` but `mic_error_relevant` is `false` (the user didn't click
+                // mic), so the modal must NOT pop — it would render no rows (mic's
+                // row is masked out, camera succeeded). A live encoder failure sets
+                // its own relevance flag too, so that path still pops correctly.
                 //
                 // The `!was_background_retry` gate ALREADY makes this structurally
-                // unreachable on a background tick: a background auto-retry only
-                // ever issues a single-device probe (`request_audio_only` /
-                // `request_video_only`), so `was_background_retry` (inferred
-                // directly from the lone `Unknown` side) is always true for it —
-                // meaning `!was_background_retry` is always false here for
-                // background ticks. The added `should_write_bool_signal` guard is
+                // unreachable on a background tick: a background auto-retry issues
+                // a single-device probe (`request_audio_only`/`request_video_only`)
+                // and never sets `pending_mic_enable`/`pending_video_enable`, so
+                // `was_background_retry` (`!manually_triggered && single-device
+                // shape`) is always true for it — meaning `!was_background_retry`
+                // is always false here for background ticks. A manual click sets
+                // its pending flag, so `manually_triggered` is true and this gate
+                // correctly lets the modal pop for it even though the click now
+                // also produces a single-device probe shape. The added
+                // `should_write_bool_signal` guard is
                 // pure defense-in-depth: it also collapses the manual failure-ONSET
                 // burst (a first failure that fires this while the modal is already
                 // up) to a single effective write, with no behavior change.
-                if (mic_failed || video_failed)
+                if (*mic_error_relevant.peek() || *video_error_relevant.peek())
                     && !was_background_retry
                     && should_write_bool_signal(*show_device_warning.peek(), true)
                 {
@@ -5762,6 +6184,10 @@ pub fn AttendantsComponent(
         stack.last().cloned()
     };
     let has_screen_share = active_screen_sharer.is_some();
+    // Keep the signal in sync so the overflow effect can react to screen-share changes.
+    if has_screen_share != *has_screen_share_sig.peek() {
+        has_screen_share_sig.set(has_screen_share);
+    }
 
     // --- Screen-share right panel: separate capacity & speaker promotion ---
     //
@@ -6440,6 +6866,7 @@ pub fn AttendantsComponent(
                     dock_menu_open.set(false);
                     density_open.set(false);
                     mock_peers_open.set(false);
+                    overflow_menu_open.set(false);
                     // Background (video-grid) clicks also light-dismiss the open
                     // side panels — the peer list and diagnostics drawer (issue
                     // #1790). Clicks on the action bar (`.video-controls-container`)
@@ -6465,9 +6892,19 @@ pub fn AttendantsComponent(
                     // the peer list (issue #1790). The `else if` chain guarantees
                     // each Escape closes EXACTLY one surface. The dock menu keeps its
                     // own Esc handler (with stop_propagation).
+                    //
+                    // The chat drawer is DELIBERATELY excluded from this
+                    // light-dismiss: its message composer means a stray background
+                    // Escape must not risk discarding an in-progress draft. That is
+                    // out of issue-1790 scope.
                     let key = evt.key();
                     if key == Key::Escape {
-                        if density_open() {
+                        if overflow_menu_open() {
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            overflow_menu_open.set(false);
+                            focus_element_by_id("overflow-menu-trigger");
+                        } else if density_open() {
                             evt.stop_propagation();
                             evt.prevent_default();
                             density_open.set(false);
@@ -7593,11 +8030,22 @@ pub fn AttendantsComponent(
                                                 let drag_start_y_c = drag_start_y.clone();
                                                 let drag_nav_left_c = drag_nav_left.clone();
                                                 let drag_nav_top_c = drag_nav_top.clone();
+                                                // Hide secondary slots that the overflow
+                                                // detector determined don't fit.
+                                                let overflow_hidden = tier == "slot-secondary"
+                                                    && !customize_mode()
+                                                    && overflowed_slots.read().contains(&slot);
+                                                let overflow_style = if overflow_hidden {
+                                                    "display: none !important"
+                                                } else {
+                                                    ""
+                                                };
                                                 rsx! {
                                                     div {
                                                         key: "{slug}",
                                                         "data-slot": slug,
                                                         class: "{wrapper_class}",
+                                                        style: "{overflow_style}",
                                                         onpointerdown: move |evt: PointerEvent| {
                                                             if !customize_mode() { return; }
                                                             let pe: web_sys::PointerEvent = evt.as_web_event().unchecked_into();
@@ -7659,7 +8107,13 @@ pub fn AttendantsComponent(
                                                                                     mic_enabled.set(true);
                                                                                 } else {
                                                                                     pending_mic_enable.set(true);
-                                                                                    mda_mic.borrow().request();
+                                                                                    // Probe ONLY the microphone — a manual mic
+                                                                                    // activation must never prompt the browser for
+                                                                                    // camera permission. The combined `request()`
+                                                                                    // probes both sides, so clicking mic while the
+                                                                                    // camera is in an "ask" state would pop the
+                                                                                    // camera permission prompt too (bug fix).
+                                                                                    mda_mic.borrow().request_audio_only();
                                                                                 }
                                                                             } else {
                                                                                 mic_enabled.set(false);
@@ -7693,7 +8147,11 @@ pub fn AttendantsComponent(
                                                                                     }
                                                                                 } else {
                                                                                     pending_video_enable.set(true);
-                                                                                    mda_cam.borrow().request();
+                                                                                    // Probe ONLY the camera — a manual camera
+                                                                                    // activation must never prompt the browser for
+                                                                                    // microphone permission (mirror of the mic
+                                                                                    // handler above; bug fix).
+                                                                                    mda_cam.borrow().request_video_only();
                                                                                 }
                                                                             } else {
                                                                                 video_enabled.set(false);
@@ -7944,9 +8402,165 @@ pub fn AttendantsComponent(
                                                 }
                                             }
                                     }
+                                        // Overflow "more" button — shown dynamically when the
+                                        // viewport-based overflow detector hides one or
+                                        // more secondary slots.  Hidden in customize mode.
+                                        div {
+                                            class: "action-bar-overflow-wrapper action-bar-overflow-trigger",
+                                            style: {
+                                                let has_overflow = !overflowed_slots.read().is_empty() && !customize_mode();
+                                                if has_overflow {
+                                                    "order: 89; position: relative; display: inline-flex"
+                                                } else {
+                                                    "order: 89; position: relative; display: none"
+                                                }
+                                            },
+                                        button {
+                                            id: "overflow-menu-trigger",
+                                            class: "video-control-button",
+                                            title: "More actions",
+                                            "aria-label": "More actions",
+                                            "aria-expanded": if overflow_menu_open() { "true" } else { "false" },
+                                            onclick: move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                let opening = !overflow_menu_open();
+                                                overflow_menu_open.set(opening);
+                                                if opening {
+                                                    dock_menu_open.set(false);
+                                                    density_open.set(false);
+                                                    mock_peers_open.set(false);
+                                                }
+                                            },
+                                            // Horizontal three-dot icon
+                                            svg {
+                                                "aria-hidden": "true",
+                                                xmlns: "http://www.w3.org/2000/svg",
+                                                view_box: "0 0 24 24",
+                                                width: "24",
+                                                height: "24",
+                                                fill: "currentColor",
+                                                circle { cx: "5", cy: "12", r: "2" }
+                                                circle { cx: "12", cy: "12", r: "2" }
+                                                circle { cx: "19", cy: "12", r: "2" }
+                                            }
+                                        }
+                                        // Overflow popover — lists only the secondary slots
+                                        // that the dynamic overflow detector has hidden from
+                                        // the bar. Each item mirrors the action of its
+                                        // corresponding action-bar button.
+                                        if overflow_menu_open() {
+                                            div {
+                                                class: "action-bar-overflow-popover",
+                                                onclick: move |e: MouseEvent| e.stop_propagation(),
+                                                {
+                                                    let secondary_slots: Vec<ActionBarSlot> =
+                                                        overflowed_slots.read().clone();
+                                                    rsx! {
+                                                        for slot in secondary_slots.iter().copied() {
+                                                            {
+                                                                let label = slot.display_name();
+                                                                rsx! {
+                                                                    button {
+                                                                        class: "overflow-item",
+                                                                        onclick: move |_| {
+                                                                            overflow_menu_open.set(false);
+                                                                            match slot {
+                                                                                ActionBarSlot::ScreenShare => {
+                                                                                    // Toggle screen share by clicking the
+                                                                                    // main slot button. The button is only
+                                                                                    // in the DOM on non-iOS (filtered by
+                                                                                    // visible_action_bar_slots), and may be
+                                                                                    // display:none when overflowed.
+                                                                                    if let Some(win) = web_sys::window() {
+                                                                                        if let Some(doc) = win.document() {
+                                                                                            if let Some(el) = doc.query_selector("[data-slot='screen'] button").ok().flatten() {
+                                                                                                use wasm_bindgen::JsCast;
+                                                                                                if let Ok(html_el) = el.dyn_into::<web_sys::HtmlElement>() {
+                                                                                                    html_el.click();
+                                                                                                }
+                                                                                            }
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                ActionBarSlot::PeerList => {
+                                                                                    let opening = !peer_list_open();
+                                                                                    peer_list_open.set(opening);
+                                                                                    if opening {
+                                                                                        density_open.set(false);
+                                                                                        dock_menu_open.set(false);
+                                                                                        mock_peers_open.set(false);
+                                                                                    }
+                                                                                }
+                                                                                ActionBarSlot::DensityMode => {
+                                                                                    let opening = !density_open();
+                                                                                    density_open.set(opening);
+                                                                                    if opening {
+                                                                                        dock_menu_open.set(false);
+                                                                                        mock_peers_open.set(false);
+                                                                                    }
+                                                                                }
+                                                                                ActionBarSlot::Diagnostics => {
+                                                                                    let opening = !diagnostics_open();
+                                                                                    diagnostics_open.set(opening);
+                                                                                    if opening {
+                                                                                        device_settings_open.set(false);
+                                                                                        density_open.set(false);
+                                                                                        dock_menu_open.set(false);
+                                                                                        mock_peers_open.set(false);
+                                                                                        meeting_options_open.set(false);
+                                                                                    }
+                                                                                }
+                                                                                ActionBarSlot::DeviceSettings => {
+                                                                                    device_settings_initial_section.set(None);
+                                                                                    let was_closed = !device_settings_open();
+                                                                                    device_settings_open.set(!device_settings_open());
+                                                                                    if was_closed {
+                                                                                        device_settings_generation
+                                                                                            .set(device_settings_generation() + 1);
+                                                                                        peer_list_open.set(false);
+                                                                                        diagnostics_open.set(false);
+                                                                                        density_open.set(false);
+                                                                                        dock_menu_open.set(false);
+                                                                                        mock_peers_open.set(false);
+                                                                                        meeting_options_open.set(false);
+                                                                                    }
+                                                                                }
+                                                                                ActionBarSlot::MeetingOptions => {
+                                                                                    let was_closed = !meeting_options_open();
+                                                                                    meeting_options_open.set(!meeting_options_open());
+                                                                                    if was_closed {
+                                                                                        device_settings_open.set(false);
+                                                                                        peer_list_open.set(false);
+                                                                                        diagnostics_open.set(false);
+                                                                                        density_open.set(false);
+                                                                                        dock_menu_open.set(false);
+                                                                                        mock_peers_open.set(false);
+                                                                                    }
+                                                                                }
+                                                                                // Mic + Camera are never in overflow
+                                                                                _ => {}
+                                                                            }
+                                                                        },
+                                                                        // Per-slot SVG icon
+                                                                        {overflow_slot_icon(slot)}
+                                                                        span { "{label}" }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        } // close action-bar-overflow-wrapper div
                                         // (а) Dock position dropdown — not customizable (houses Customize/Reset)
+                                        // Hidden when overflow is active to save space for sacred buttons.
                                         div { class: "dock-position-wrapper",
-                                            style: "order: 90",
+                                            style: if !overflowed_slots.read().is_empty() && !customize_mode() {
+                                                "order: 90; display: none"
+                                            } else {
+                                                "order: 90"
+                                            },
                                             if customize_mode() {
                                                 button {
                                                     class: "video-control-button action-bar-done-trigger",
@@ -8450,13 +9064,39 @@ pub fn AttendantsComponent(
                                 {
                                     let on_dismiss = EventHandler::new(move |()| {
                                         show_device_warning.set(false);
+                                        // Acknowledging the modal clears relevance for
+                                        // BOTH sides, even if the underlying error(s)
+                                        // are still unresolved (e.g. mic still blocked
+                                        // in the background) — the user has seen and
+                                        // dismissed what was shown; a later unrelated
+                                        // failure for the OTHER device must not
+                                        // resurrect this one's row. A fresh click or a
+                                        // new live failure re-marks relevance if this
+                                        // device fails again.
+                                        mic_error_relevant.set(false);
+                                        video_error_relevant.set(false);
                                     });
-                                    render_device_warning_modal(
-                                        mic_error.read().as_ref(),
-                                        video_error.read().as_ref(),
-                                        on_dismiss,
-                                        true,
-                                    )
+                                    // Include a device's row ONLY when the user is
+                                    // currently interacting with THAT device (its
+                                    // relevance flag). `mic_error`/`video_error` can
+                                    // stay `Some` from a background retry or a
+                                    // dismissed-but-unresolved failure for a device the
+                                    // user isn't touching; masking on relevance keeps
+                                    // the in-meeting modal scoped to the device the
+                                    // current action concerns. Bind the read guards to
+                                    // locals so the borrowed `&MediaErrorState` lives
+                                    // for the whole call (an inline `if`-expression
+                                    // guard would drop the temporary too early).
+                                    let mic_err = mic_error.read();
+                                    let video_err = video_error.read();
+                                    let mic_row =
+                                        if mic_error_relevant() { mic_err.as_ref() } else { None };
+                                    let video_row = if video_error_relevant() {
+                                        video_err.as_ref()
+                                    } else {
+                                        None
+                                    };
+                                    render_device_warning_modal(mic_row, video_row, on_dismiss, true)
                                 }
                             }
                             // Host component (encoders)
@@ -8499,6 +9139,15 @@ pub fn AttendantsComponent(
                                         if mic_error.peek().as_ref() != Some(&target) {
                                             mic_error.set(Some(target));
                                         }
+                                        // A LIVE encoder failure means the device WAS
+                                        // actively streaming and just broke — that is
+                                        // unambiguously "the device the user is using",
+                                        // so its in-meeting modal row is always relevant,
+                                        // unlike a background-retry rediscovery of an
+                                        // already-known, not-currently-touched failure.
+                                        if should_write_bool_signal(*mic_error_relevant.peek(), true) {
+                                            mic_error_relevant.set(true);
+                                        }
                                         // Guard the sibling bool writes the same way
                                         // (issue #1793): the restart-loop burst reaches
                                         // this callback up to MAX_RESTARTS times with
@@ -8520,6 +9169,11 @@ pub fn AttendantsComponent(
                                         let target = map_permission_error(&err);
                                         if video_error.peek().as_ref() != Some(&target) {
                                             video_error.set(Some(target));
+                                        }
+                                        // A live encoder failure is always relevant — see
+                                        // the microphone handler above for rationale.
+                                        if should_write_bool_signal(*video_error_relevant.peek(), true) {
+                                            video_error_relevant.set(true);
                                         }
                                         if should_write_bool_signal(*video_enabled.peek(), false) {
                                             video_enabled.set(false);

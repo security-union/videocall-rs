@@ -17,22 +17,27 @@ unchanged and still builds for wasm and native Rust as before.
 
 | xcframework slice          | Rust target(s)                          | Toolchain          | Min OS     |
 | -------------------------- | --------------------------------------- | ------------------ | ---------- |
-| `ios-arm64`                | `aarch64-apple-ios`                     | stable (Tier 2)    | iOS 15     |
-| `ios-arm64-simulator`      | `aarch64-apple-ios-sim`                 | stable (Tier 2)    | iOS 15     |
-| `ios-arm64-maccatalyst`    | `aarch64-apple-ios-macabi`              | stable (Tier 2)    | iOS 15     |
-| `macos-arm64`              | `aarch64-apple-darwin`                  | stable (Tier 2)    | macOS 12   |
-| `watchos-arm64_arm64_32`   | `arm64_32-apple-watchos` + `aarch64-apple-watchos` (lipo'd) | **nightly (Tier 3)** | watchOS 10 |
-| `watchos-arm64-simulator`  | `aarch64-apple-watchos-sim`             | **nightly (Tier 3)** | watchOS 10 |
+| `ios-arm64`                    | `aarch64-apple-ios`                     | stable (Tier 2)    | iOS 15     |
+| `ios-arm64-simulator`          | `aarch64-apple-ios-sim`                 | stable (Tier 2)    | iOS 15     |
+| `ios-arm64_x86_64-maccatalyst` | `aarch64-apple-ios-macabi` + `x86_64-apple-ios-macabi` (lipo'd) | stable (Tier 2) | iOS 15 |
+| `macos-arm64_x86_64`           | `aarch64-apple-darwin` + `x86_64-apple-darwin` (lipo'd) | stable (Tier 2) | macOS 12   |
+| `watchos-arm64_arm64_32`       | `arm64_32-apple-watchos` + `aarch64-apple-watchos` (lipo'd) | **nightly (Tier 3)** | watchOS 10 |
+| `watchos-arm64-simulator`      | `aarch64-apple-watchos-sim`             | **nightly (Tier 3)** | watchOS 10 |
 
 The watchOS device slice is a single fat static library containing both
 `arm64_32` (Apple Watch Series 4-8, the broad-coverage 32-bit-pointer ABI) and
 `arm64` (Series 9 / Ultra 2 and newer).
 
-**Mac Catalyst** (`ios-arm64-maccatalyst`) is a *distinct* slice from native
-`macos-arm64`: a Catalyst app (`SUPPORTS_MACCATALYST=YES`, iOS-on-Mac) links the
-`-macabi` ABI, which the native macOS slice does not provide. The remote-shutter
-app is a Catalyst app, so this slice is required; both it and `macos-arm64`
-coexist in the framework.
+**Mac Catalyst** (`ios-arm64_x86_64-maccatalyst`) is a *distinct* slice from
+native `macos-arm64_x86_64`: a Catalyst app (`SUPPORTS_MACCATALYST=YES`,
+iOS-on-Mac) links the `-macabi` ABI, which the native macOS slice does not
+provide. The remote-shutter app is a Catalyst app, so this slice is required;
+both it and the native macOS slice coexist in the framework.
+
+Both macOS-family slices are **fat (arm64 + x86_64)**: Apple Silicon *and* Intel
+Macs. This matters for the App Store — a Catalyst app whose deployment target is
+below macOS 13 must ship the x86_64 slice or upload is rejected with
+`ITMS-90981` (bundle supports Apple Silicon but not Intel).
 
 ---
 

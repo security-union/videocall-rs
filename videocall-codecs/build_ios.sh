@@ -8,8 +8,8 @@
 # Slices produced (see README-ios.md for the full rationale):
 #   * ios-arm64               aarch64-apple-ios          device       (stable, Tier 2)
 #   * ios-arm64-simulator     aarch64-apple-ios-sim      simulator    (stable, Tier 2)
-#   * ios-arm64-maccatalyst   aarch64-apple-ios-macabi   Catalyst     (stable, Tier 2)
-#   * macos-arm64             aarch64-apple-darwin       macOS        (stable, Tier 2)
+#   * ios-arm64_x86_64-maccatalyst  arm64+x86_64-apple-ios-macabi  Catalyst  (stable, Tier 2)
+#   * macos-arm64_x86_64      arm64+x86_64-apple-darwin  macOS        (stable, Tier 2)
 #   * watchos                 arm64_32 + arm64           device (fat) (NIGHTLY, Tier 3)
 #   * watchos-simulator       aarch64-apple-watchos-sim  simulator    (NIGHTLY, Tier 3)
 #
@@ -58,18 +58,54 @@ RUSTFLAGS="-C link-arg=-mios-simulator-version-min=15.0" \
   cargo build -p videocall-codecs --no-default-features --features "$FEATURES" \
   --release --target aarch64-apple-ios-sim
 
+# macOS is fat (arm64 + x86_64) for the same reason as Catalyst below: the
+# `macosx` SDK spans both native macOS and Catalyst, so a consumer that drops
+# the x86_64 arch exclusion needs Intel objects on every macosx-SDK slice.
+MACOS_FAT_DIR="target/macos-fat"
+
 echo "Building for macOS (arm64)..."
 RUSTFLAGS="-C link-arg=-mmacosx-version-min=12.0" \
   cargo build -p videocall-codecs --no-default-features --features "$FEATURES" \
   --release --target aarch64-apple-darwin
 
+echo "Building for macOS (x86_64)..."
+RUSTFLAGS="-C link-arg=-mmacosx-version-min=12.0" \
+  cargo build -p videocall-codecs --no-default-features --features "$FEATURES" \
+  --release --target x86_64-apple-darwin
+
+echo "Fusing macOS slices (arm64 + x86_64) with lipo..."
+mkdir -p "$MACOS_FAT_DIR"
+lipo -create \
+  "target/aarch64-apple-darwin/release/$LIB_NAME" \
+  "target/x86_64-apple-darwin/release/$LIB_NAME" \
+  -output "$MACOS_FAT_DIR/$LIB_NAME"
+
 # Mac Catalyst: the `-macabi` variant needs the deployment target expressed via a
-# full `-target arm64-apple-ios<min>-macabi` triple (there is no `-macabi`
+# full `-target <arch>-apple-ios<min>-macabi` triple (there is no `-macabi`
 # min-version flag), otherwise clang defaults the object's Catalyst minos.
+#
+# The Catalyst slice is fat (arm64 + x86_64): Apple Silicon *and* Intel Macs. A
+# Catalyst app whose deployment target is below macOS 13 must ship x86_64 or the
+# App Store rejects it (ITMS-90981) — an arm64-only slice would force the host app
+# arm64-only via CocoaPods' auto-generated `EXCLUDED_ARCHS[sdk=macosx*] = x86_64`.
+MACCATALYST_FAT_DIR="target/maccatalyst-fat"
+
 echo "Building for Mac Catalyst (arm64, ios-macabi)..."
 RUSTFLAGS="-C link-arg=-target -C link-arg=arm64-apple-ios15.0-macabi" \
   cargo build -p videocall-codecs --no-default-features --features "$FEATURES" \
   --release --target aarch64-apple-ios-macabi
+
+echo "Building for Mac Catalyst (x86_64, ios-macabi)..."
+RUSTFLAGS="-C link-arg=-target -C link-arg=x86_64-apple-ios15.0-macabi" \
+  cargo build -p videocall-codecs --no-default-features --features "$FEATURES" \
+  --release --target x86_64-apple-ios-macabi
+
+echo "Fusing Mac Catalyst slices (arm64 + x86_64) with lipo..."
+mkdir -p "$MACCATALYST_FAT_DIR"
+lipo -create \
+  "target/aarch64-apple-ios-macabi/release/$LIB_NAME" \
+  "target/x86_64-apple-ios-macabi/release/$LIB_NAME" \
+  -output "$MACCATALYST_FAT_DIR/$LIB_NAME"
 
 # --- watchOS: NIGHTLY + build-std, Tier 3 ------------------------------------
 #
@@ -138,8 +174,8 @@ cat "$OUT_SWIFT"/*FFI.modulemap > "$OUT_SWIFT/include/module.modulemap"
 SIGN_LIBS=(
   "target/aarch64-apple-ios/release/$LIB_NAME"
   "target/aarch64-apple-ios-sim/release/$LIB_NAME"
-  "target/aarch64-apple-ios-macabi/release/$LIB_NAME"
-  "target/aarch64-apple-darwin/release/$LIB_NAME"
+  "$MACCATALYST_FAT_DIR/$LIB_NAME"
+  "$MACOS_FAT_DIR/$LIB_NAME"
 )
 if [ "$BUILD_WATCHOS" = "1" ]; then
   SIGN_LIBS+=(
@@ -156,8 +192,8 @@ rm -rf target/VideocallCodecs.xcframework
 XCARGS=(
   -library "target/aarch64-apple-ios/release/$LIB_NAME" -headers "$OUT_SWIFT/include"
   -library "target/aarch64-apple-ios-sim/release/$LIB_NAME" -headers "$OUT_SWIFT/include"
-  -library "target/aarch64-apple-ios-macabi/release/$LIB_NAME" -headers "$OUT_SWIFT/include"
-  -library "target/aarch64-apple-darwin/release/$LIB_NAME" -headers "$OUT_SWIFT/include"
+  -library "$MACCATALYST_FAT_DIR/$LIB_NAME" -headers "$OUT_SWIFT/include"
+  -library "$MACOS_FAT_DIR/$LIB_NAME" -headers "$OUT_SWIFT/include"
 )
 if [ "$BUILD_WATCHOS" = "1" ]; then
   XCARGS+=(
@@ -172,9 +208,9 @@ echo "=== Build completed successfully ==="
 echo "XCFramework:    $ROOT_DIR/target/VideocallCodecs.xcframework"
 echo "Swift bindings: $ROOT_DIR/$OUT_SWIFT/videocall_codecs.swift"
 if [ "$BUILD_WATCHOS" = "1" ]; then
-  echo "Slices:         ios-arm64, ios-arm64-simulator, ios-arm64-maccatalyst, macos-arm64, watchos (arm64_32+arm64), watchos-simulator"
+  echo "Slices:         ios-arm64, ios-arm64-simulator, ios-arm64_x86_64-maccatalyst, macos-arm64_x86_64, watchos (arm64_32+arm64), watchos-simulator"
 else
-  echo "Slices:         ios-arm64, ios-arm64-simulator, ios-arm64-maccatalyst, macos-arm64  (watchOS skipped)"
+  echo "Slices:         ios-arm64, ios-arm64-simulator, ios-arm64_x86_64-maccatalyst, macos-arm64  (watchOS skipped)"
 fi
 echo ""
 echo "To use in Swift:"

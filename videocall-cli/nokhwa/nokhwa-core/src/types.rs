@@ -1755,12 +1755,49 @@ pub fn nv12_to_rgb(
     Ok(dest)
 }
 
-pub fn nv12_to_i420(nv12: &[u8], width: usize, height: usize, i420: &mut [u8]) {
-    // assert that the nv12 has the expected size
-    assert!(
-        width % 2 == 0 && height % 2 == 0,
-        "Width and height must be even numbers."
-    );
+/// Convert an NV12 (4:2:0 bi-planar) frame to I420 (planar).
+///
+/// # Errors
+/// Returns [`NokhwaError::ProcessFrameError`] when the dimensions are odd, or
+/// when either buffer is smaller than the frame size (`width * height * 3 / 2`)
+/// requires. This guards against a source (e.g. an external/virtual camera)
+/// delivering a frame at a resolution that does not match the buffers sized for
+/// it — the mismatch that previously panicked in `split_at_mut`.
+pub fn nv12_to_i420(
+    nv12: &[u8],
+    width: usize,
+    height: usize,
+    i420: &mut [u8],
+) -> Result<(), NokhwaError> {
+    if width % 2 != 0 || height % 2 != 0 {
+        return Err(NokhwaError::ProcessFrameError {
+            src: FrameFormat::NV12,
+            destination: "I420".to_string(),
+            error: format!("dimensions must be even, got {width}x{height}"),
+        });
+    }
+
+    let frame_size = width * height * 3 / 2;
+    if nv12.len() < frame_size {
+        return Err(NokhwaError::ProcessFrameError {
+            src: FrameFormat::NV12,
+            destination: "I420".to_string(),
+            error: format!(
+                "input buffer too small for {width}x{height}: have {}, need {frame_size}",
+                nv12.len()
+            ),
+        });
+    }
+    if i420.len() < frame_size {
+        return Err(NokhwaError::ProcessFrameError {
+            src: FrameFormat::NV12,
+            destination: "I420".to_string(),
+            error: format!(
+                "output buffer too small for {width}x{height}: have {}, need {frame_size}",
+                i420.len()
+            ),
+        });
+    }
 
     let y_plane_size = width * height;
     let uv_plane_size = y_plane_size / 2; // Interleaved UV plane size
@@ -1784,6 +1821,8 @@ pub fn nv12_to_i420(nv12: &[u8], width: usize, height: usize, i420: &mut [u8]) {
             v_plane[uv_index] = nv12_uv[nv12_index + 1]; // V value
         }
     }
+
+    Ok(())
 }
 
 // this depresses me

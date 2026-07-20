@@ -49,6 +49,22 @@ impl Buffer {
         }
     }
 
+    /// Creates a new buffer that takes ownership of `buf` without copying it.
+    ///
+    /// Prefer this over [`Buffer::new`] when the caller already owns a
+    /// [`Vec<u8>`] of frame data (e.g. a capture backend that just copied the
+    /// bytes out of a platform pixel buffer): it avoids a second full-frame
+    /// copy on the hot path.
+    #[must_use]
+    #[inline]
+    pub fn new_from_vec(res: Resolution, buf: Vec<u8>, source_frame_format: FrameFormat) -> Self {
+        Self {
+            resolution: res,
+            buffer: Bytes::from(buf),
+            source_frame_format,
+        }
+    }
+
     /// Get the [`Resolution`] of this buffer.
     #[must_use]
     pub fn resolution(&self) -> Resolution {

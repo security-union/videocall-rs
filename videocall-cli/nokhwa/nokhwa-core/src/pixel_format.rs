@@ -492,15 +492,12 @@ impl FormatDecoder for I420Format {
                 )?;
                 Ok(())
             }
-            FrameFormat::NV12 => {
-                nv12_to_i420(
-                    data,
-                    resolution.width() as usize,
-                    resolution.height() as usize,
-                    dest,
-                );
-                Ok(())
-            }
+            FrameFormat::NV12 => nv12_to_i420(
+                data,
+                resolution.width() as usize,
+                resolution.height() as usize,
+                dest,
+            ),
             _ => Err(NokhwaError::GeneralError("Invalid FrameFormat".into())),
         }
     }
@@ -543,6 +540,15 @@ fn convert_yuyv_to_i420_direct(
     width: usize,
     height: usize,
 ) -> Result<(), NokhwaError> {
+    // Ensure the source buffer holds a full YUYV frame (2 bytes/pixel). Without
+    // this, a frame mis-tagged as YUYV (or genuinely YUYV but shorter than its
+    // resolution implies) would index out of bounds below and panic.
+    if yuyv.len() < width * height * 2 {
+        return Err(NokhwaError::GeneralError(
+            "YUYV source buffer is too small".into(),
+        ));
+    }
+
     // Ensure the destination buffer is large enough
     if dest.len() < width * height + 2 * (width / 2) * (height / 2) {
         return Err(NokhwaError::GeneralError(
@@ -574,4 +580,100 @@ fn convert_yuyv_to_i420_direct(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::I420Format;
+    use crate::buffer::Buffer;
+    use crate::types::{FrameFormat, Resolution};
+
+    // Regression: an external/virtual camera (e.g. OBS) can deliver frames at a
+    // resolution different from the one the consumer sized its I420 buffer for.
+    // Decoding must return an error, never panic in `nv12_to_i420`'s `split_at`.
+
+    #[test]
+    fn nv12_decode_short_input_errors_not_panics() {
+        // A 4x4 NV12 frame needs 4*4*3/2 = 24 bytes; supply only 10.
+        let buffer = Buffer::new_from_vec(Resolution::new(4, 4), vec![0u8; 10], FrameFormat::NV12);
+        let mut dest = vec![0u8; 24];
+        let result = buffer.decode_image_to_buffer::<I420Format>(&mut dest);
+        assert!(result.is_err(), "short NV12 input must error, not panic");
+    }
+
+    #[test]
+    fn nv12_decode_short_dest_errors_not_panics() {
+        // Correctly sized 4x4 input, but the destination is too small (10 < 24) —
+        // exactly the live-stream case where the frame is larger than the buffer.
+        let buffer = Buffer::new_from_vec(Resolution::new(4, 4), vec![0u8; 24], FrameFormat::NV12);
+        let mut dest = vec![0u8; 10];
+        let result = buffer.decode_image_to_buffer::<I420Format>(&mut dest);
+        assert!(
+            result.is_err(),
+            "undersized I420 destination must error, not panic"
+        );
+    }
+
+    #[test]
+    fn nv12_decode_matched_sizes_succeeds() {
+        // The happy path still works: matched input, dest, and even dimensions.
+        let buffer = Buffer::new_from_vec(Resolution::new(4, 4), vec![0u8; 24], FrameFormat::NV12);
+        let mut dest = vec![0u8; 24];
+        let result = buffer.decode_image_to_buffer::<I420Format>(&mut dest);
+        assert!(result.is_ok(), "matched NV12 decode must succeed");
+    }
+
+    // Mis-tagged-format cases: the delivered pixel format (byte layout) does not
+    // match the FrameFormat the Buffer is tagged with — the historically likely
+    // cause of this panic class. Decoding must always error or succeed cleanly,
+    // never panic on an out-of-bounds index.
+
+    #[test]
+    fn nv12_tagged_but_gray_sized_input_errors_not_panics() {
+        // 8x8 tagged NV12 needs 8*8*3/2 = 96 bytes; a GRAY frame is only 8*8 = 64.
+        let buffer = Buffer::new_from_vec(Resolution::new(8, 8), vec![0u8; 64], FrameFormat::NV12);
+        let mut dest = vec![0u8; 96];
+        let result = buffer.decode_image_to_buffer::<I420Format>(&mut dest);
+        assert!(
+            result.is_err(),
+            "NV12-tagged GRAY-sized input must error, not panic"
+        );
+    }
+
+    #[test]
+    fn yuyv_tagged_but_nv12_sized_input_errors_not_panics() {
+        // 8x8 tagged YUYV needs 8*8*2 = 128 bytes; an NV12 frame is only 96.
+        let buffer = Buffer::new_from_vec(Resolution::new(8, 8), vec![0u8; 96], FrameFormat::YUYV);
+        let mut dest = vec![0u8; 96];
+        let result = buffer.decode_image_to_buffer::<I420Format>(&mut dest);
+        assert!(
+            result.is_err(),
+            "YUYV-tagged NV12-sized input must error, not panic"
+        );
+    }
+
+    #[test]
+    fn nv12_tagged_but_larger_input_does_not_panic() {
+        // Tagged NV12 but carrying a YUYV-sized (2 bytes/px) frame: larger than
+        // required, so decoding the leading bytes is safe — must not panic.
+        let buffer = Buffer::new_from_vec(Resolution::new(8, 8), vec![0u8; 128], FrameFormat::NV12);
+        let mut dest = vec![0u8; 96];
+        let result = buffer.decode_image_to_buffer::<I420Format>(&mut dest);
+        assert!(
+            result.is_ok(),
+            "oversized NV12 input must decode without panic"
+        );
+    }
+
+    #[test]
+    fn nv12_decode_odd_width_errors_not_panics() {
+        // NV12's 4:2:0 chroma subsampling assumes even dimensions. An odd width
+        // must be rejected up front rather than producing desynced plane math.
+        // Buffers are sized generously (5*4*2 = 40) so the ONLY reason to error
+        // is the odd dimension, not a size mismatch.
+        let buffer = Buffer::new_from_vec(Resolution::new(5, 4), vec![0u8; 40], FrameFormat::NV12);
+        let mut dest = vec![0u8; 40];
+        let result = buffer.decode_image_to_buffer::<I420Format>(&mut dest);
+        assert!(result.is_err(), "odd width must error, not panic or desync");
+    }
 }

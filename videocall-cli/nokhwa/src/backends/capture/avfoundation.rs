@@ -17,14 +17,7 @@
  */
 
 #[cfg(target_os = "macos")]
-use flume::{Receiver, Sender};
-#[cfg(target_os = "macos")]
-use std::{ffi::CString, sync::Arc};
-#[cfg(target_os = "macos")]
-use videocall_nokhwa_bindings_macos::{
-    AVCaptureDevice, AVCaptureDeviceInput, AVCaptureSession, AVCaptureVideoCallback,
-    AVCaptureVideoDataOutput,
-};
+use videocall_nokhwa_bindings_macos::{CaptureDevice, CaptureStream};
 use videocall_nokhwa_core::{
     buffer::Buffer,
     error::NokhwaError,
@@ -49,56 +42,30 @@ use std::{borrow::Cow, collections::HashMap};
 #[cfg_attr(feature = "docs-features", doc(cfg(feature = "input-avfoundation")))]
 #[cfg(target_os = "macos")]
 pub struct AVFoundationCaptureDevice {
-    device: AVCaptureDevice,
-    dev_input: Option<AVCaptureDeviceInput>,
-    session: Option<AVCaptureSession>,
-    data_out: Option<AVCaptureVideoDataOutput>,
-    data_collect: Option<AVCaptureVideoCallback>,
+    device: CaptureDevice,
     info: CameraInfo,
-    buffer_name: CString,
     format: CameraFormat,
-    frame_buffer_receiver: Arc<Receiver<(Vec<u8>, FrameFormat)>>,
-    fbufsnd: Arc<Sender<(Vec<u8>, FrameFormat)>>,
+    stream: Option<CaptureStream>,
 }
 
 #[cfg(target_os = "macos")]
 impl AVFoundationCaptureDevice {
-    /// Creates a new capture device using the `AVFoundation` backend. Indexes are gives to devices by the OS, and usually numbered by order of discovery.
+    /// Creates a new capture device using the `AVFoundation` backend. Indexes are given to devices by the OS, and usually numbered by order of discovery.
     ///
-    /// If `camera_format` is `None`, it will be spawned with with 640x480@15 FPS, MJPEG [`CameraFormat`] default.
     /// # Errors
-    /// This function will error if the camera is currently busy or if `AVFoundation` can't read device information, or permission was not given by the user.
+    /// This function will error if the device cannot be found, `AVFoundation` can't read device information, or the requested format cannot be fulfilled.
     pub fn new(index: &CameraIndex, req_fmt: RequestedFormat) -> Result<Self, NokhwaError> {
-        let mut device = AVCaptureDevice::new(index)?;
-
-        // device.lock()?;
+        let device = CaptureDevice::new(index)?;
         let formats = device.supported_formats()?;
         let camera_fmt = req_fmt.fulfill(&formats).ok_or_else(|| {
             NokhwaError::OpenDeviceError("Cannot fulfill request".to_string(), req_fmt.to_string())
         })?;
-        device.set_all(camera_fmt)?;
-
-        let device_descriptor = device.info().clone();
-        let buffername =
-            CString::new(format!("{}_INDEX{}_", device_descriptor, index)).map_err(|why| {
-                NokhwaError::StructureError {
-                    structure: "CString Buffername".to_string(),
-                    error: why.to_string(),
-                }
-            })?;
-
-        let (send, recv) = flume::unbounded();
+        let info = device.info().clone();
         Ok(AVFoundationCaptureDevice {
             device,
-            dev_input: None,
-            session: None,
-            data_out: None,
-            data_collect: None,
-            info: device_descriptor,
-            buffer_name: buffername,
+            info,
             format: camera_fmt,
-            frame_buffer_receiver: Arc::new(recv),
-            fbufsnd: Arc::new(send),
+            stream: None,
         })
     }
 
@@ -134,7 +101,11 @@ impl CaptureBackendTrait for AVFoundationCaptureDevice {
     }
 
     fn refresh_camera_format(&mut self) -> Result<(), NokhwaError> {
-        self.format = self.device.active_format()?;
+        // Once a stream is open, the Swift side is the source of truth for the
+        // negotiated geometry; before that, keep the requested format.
+        if let Some(stream) = &self.stream {
+            self.format = stream.negotiated_format();
+        }
         Ok(())
     }
 
@@ -143,7 +114,8 @@ impl CaptureBackendTrait for AVFoundationCaptureDevice {
     }
 
     fn set_camera_format(&mut self, new_fmt: CameraFormat) -> Result<(), NokhwaError> {
-        self.device.set_all(new_fmt)?;
+        // Takes effect on the next `open_stream`; AVFoundation cannot re-pin the
+        // format of a running session without tearing it down.
         self.format = new_fmt;
         Ok(())
     }
@@ -214,135 +186,67 @@ impl CaptureBackendTrait for AVFoundationCaptureDevice {
     }
 
     fn camera_control(&self, control: KnownCameraControl) -> Result<CameraControl, NokhwaError> {
-        for ctrl in self.device.get_controls()? {
-            if ctrl.control() == control {
-                return Ok(ctrl);
-            }
-        }
-
+        // Camera controls (focus/exposure/zoom) are unused by videocall-cli and
+        // not exposed by the Swift capture layer.
         Err(NokhwaError::GetPropertyError {
             property: control.to_string(),
-            error: "Not Found".to_string(),
+            error: "Camera controls are unsupported".to_string(),
         })
     }
 
     fn camera_controls(&self) -> Result<Vec<CameraControl>, NokhwaError> {
-        self.device.get_controls()
+        Ok(Vec::new())
     }
 
     fn set_camera_control(
         &mut self,
-        id: KnownCameraControl,
-        value: ControlValueSetter,
+        _id: KnownCameraControl,
+        _value: ControlValueSetter,
     ) -> Result<(), NokhwaError> {
-        self.device.lock()?;
-        let res = self.device.set_control(id, value);
-        self.device.unlock();
-        res
+        Err(NokhwaError::UnsupportedOperationError(
+            ApiBackend::AVFoundation,
+        ))
     }
 
     fn open_stream(&mut self) -> Result<(), NokhwaError> {
-        self.refresh_camera_format()?;
-
-        let input = AVCaptureDeviceInput::new(&self.device)?;
-        let session = AVCaptureSession::new();
-        session.begin_configuration();
-        session.add_input(&input)?;
-
-        self.device.set_all(self.format)?; // hurr durr im an apple api and im fucking dumb hurr durr
-
-        let bufname = &self.buffer_name;
-        let videocallback = AVCaptureVideoCallback::new(bufname, &self.fbufsnd)?;
-        let output = AVCaptureVideoDataOutput::new();
-        output.add_delegate(&videocallback)?;
-        output.set_frame_format(self.camera_format().format())?;
-        session.add_output(&output)?;
-        session.commit_configuration();
-        session.start()?;
-
-        self.dev_input = Some(input);
-        self.session = Some(session);
-        self.data_collect = Some(videocallback);
-        self.data_out = Some(output);
+        let stream = self.device.open(self.format)?;
+        // Adopt the geometry the Swift side actually negotiated.
+        self.format = stream.negotiated_format();
+        self.stream = Some(stream);
         Ok(())
     }
 
     fn is_stream_open(&self) -> bool {
-        if self.session.is_some()
-            && self.data_out.is_some()
-            && self.data_collect.is_some()
-            && self.dev_input.is_some()
-        {
-            return true;
-        }
-        match &self.session {
-            Some(session) => (!session.is_interrupted()) && session.is_running(),
-            None => false,
-        }
+        self.stream.is_some()
     }
 
     fn frame(&mut self) -> Result<Buffer, NokhwaError> {
-        self.refresh_camera_format()?;
-        let cfmt = self.camera_format();
-        let b = self.frame_raw()?;
-        let buffer = Buffer::new(cfmt.resolution(), b.as_ref(), cfmt.format());
-        let _ = self.frame_buffer_receiver.drain();
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| NokhwaError::ReadFrameError("Stream is not open".to_string()))?;
+        let (data, format) = stream.recv()?;
+        // Take ownership of the frame bytes rather than re-copying them.
+        let buffer = Buffer::new_from_vec(self.format.resolution(), data, format);
+        // Drop any frame that queued behind this one so the next `frame()`
+        // returns fresh data instead of a backlog (the channel is bounded, so
+        // this is at most one buffered frame).
+        stream.drain();
         Ok(buffer)
     }
 
     fn frame_raw(&mut self) -> Result<Cow<[u8]>, NokhwaError> {
-        let result = match self.frame_buffer_receiver.recv() {
-            Ok(recv) => Ok(Cow::from(recv.0)),
-            Err(why) => Err(NokhwaError::ReadFrameError(why.to_string())),
-        };
-        result
+        let stream = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| NokhwaError::ReadFrameError("Stream is not open".to_string()))?;
+        let (data, _format) = stream.recv()?;
+        Ok(Cow::from(data))
     }
 
     fn stop_stream(&mut self) -> Result<(), NokhwaError> {
-        if !self.is_stream_open() {
-            return Ok(());
-        }
-
-        let session = match &self.session {
-            Some(session) => session,
-            None => {
-                return Err(NokhwaError::GetPropertyError {
-                    property: "AVCaptureSession".to_string(),
-                    error: "Doesnt Exist".to_string(),
-                })
-            }
-        };
-
-        let output = match &self.data_out {
-            Some(output) => output,
-            None => {
-                return Err(NokhwaError::GetPropertyError {
-                    property: "AVCaptureVideoDataOutput".to_string(),
-                    error: "Doesnt Exist".to_string(),
-                })
-            }
-        };
-
-        let input = match &self.dev_input {
-            Some(input) => input,
-            None => {
-                return Err(NokhwaError::GetPropertyError {
-                    property: "AVCaptureDeviceInput".to_string(),
-                    error: "Doesnt Exist".to_string(),
-                })
-            }
-        };
-
-        session.remove_output(output);
-        session.remove_input(input);
-        session.stop();
-
-        self.frame_buffer_receiver.try_iter();
-        self.dev_input = None;
-        self.session = None;
-        self.data_collect = None;
-        self.data_out = None;
-
+        // Dropping the stream stops the Swift session and releases its handle.
+        self.stream = None;
         Ok(())
     }
 }
@@ -350,8 +254,7 @@ impl CaptureBackendTrait for AVFoundationCaptureDevice {
 #[cfg(target_os = "macos")]
 impl Drop for AVFoundationCaptureDevice {
     fn drop(&mut self) {
-        if self.stop_stream().is_err() {}
-        self.device.unlock();
+        let _ = self.stop_stream();
     }
 }
 

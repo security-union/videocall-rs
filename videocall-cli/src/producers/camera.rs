@@ -179,12 +179,12 @@ impl CameraDaemon {
                 )),
             ) {
                 Ok(camera) => camera,
-                Err(e) => {
-                    panic!("{e}\n please run 'info --list-formats' to see the available resolutions, frame formats and fps")
-                }
+                Err(e) => camera_setup_failed("Failed to open camera", e),
             };
             let actual_resolution = camera.resolution();
-            camera.open_stream().unwrap();
+            if let Err(e) = camera.open_stream() {
+                camera_setup_failed("Failed to start camera stream", e);
+            }
             println!("Requested format: {frame_format:?}");
             println!("Actual stream format: {:?}", camera.frame_format());
 
@@ -197,6 +197,11 @@ impl CameraDaemon {
 
             let frame_time = Duration::from_millis(1000u64 / framerate as u64);
             let mut last_frame_time = Instant::now();
+            // A single decode failure can be a transient/malformed frame and
+            // shouldn't kill the call; a sustained run means the stream is
+            // unusable (e.g. a format/size mismatch), so bail out cleanly.
+            let mut consecutive_decode_failures = 0u32;
+            const MAX_CONSECUTIVE_DECODE_FAILURES: u32 = 30;
             loop {
                 // use last_frame_time to calculate if we should skip this frame
                 let elapsed = last_frame_time.elapsed();
@@ -205,9 +210,17 @@ impl CameraDaemon {
                 }
                 last_frame_time = Instant::now();
                 let frame = camera.frame().unwrap();
-                frame
-                    .decode_image_to_buffer::<I420Format>(&mut i420_image_buffer)
-                    .unwrap();
+                if let Err(e) = frame.decode_image_to_buffer::<I420Format>(&mut i420_image_buffer) {
+                    consecutive_decode_failures += 1;
+                    error!(
+                        "Failed to decode camera frame (failure {consecutive_decode_failures}/{MAX_CONSECUTIVE_DECODE_FAILURES}): {e}"
+                    );
+                    if consecutive_decode_failures >= MAX_CONSECUTIVE_DECODE_FAILURES {
+                        camera_setup_failed("Camera frame decoding failed repeatedly", e);
+                    }
+                    continue;
+                }
+                consecutive_decode_failures = 0;
                 // Check if we should quit
                 if quit.load(std::sync::atomic::Ordering::Relaxed) {
                     info!("Quit signal received, exiting frame loop.");
@@ -232,4 +245,19 @@ pub fn buffer_size_i420(width: u32, height: u32) -> u32 {
         .checked_mul(height)
         .and_then(|y_size| y_size.checked_add(y_size / 2)) // Total size = Y + U + V
         .expect("Buffer size calculation overflowed")
+}
+
+/// Report a fatal camera-setup failure and terminate the process.
+///
+/// Camera setup runs on a dedicated thread, so a panic here would only unwind
+/// that thread and leave the process half-alive. Instead we print the (already
+/// user-facing) error plus a pointer to the `info` command and exit non-zero so
+/// the failure is visible and the process stops cleanly.
+fn camera_setup_failed(context: &str, error: impl std::fmt::Display) -> ! {
+    eprintln!("{context}: {error}");
+    eprintln!(
+        "Run `videocall-cli info --list-formats <camera-index>` to see the resolutions, \
+         frame formats, and frame rates this camera supports."
+    );
+    std::process::exit(1);
 }

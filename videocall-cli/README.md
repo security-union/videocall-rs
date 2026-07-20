@@ -50,6 +50,13 @@ On macOS the native build pulls audio/video from CoreAudio and AVFoundation, so 
 brew install pkg-config llvm cmake openssl
 ```
 
+The macOS camera backend is a Swift AVFoundation layer built by `cargo` at compile time, so the Xcode command-line tools (Swift toolchain) above are required — no extra runtime dependency.
+
+Two macOS-specific behaviors to know when streaming:
+
+- **Select the camera by UUID, not name.** Pass the device's UUID (shown in the "Extras" field of `info --list-cameras`) as the `--video-device-index` value. See [Quick Start](#-quick-start) below.
+- **The requested resolution must be exact.** The backend captures at exactly the resolution you request or fails with a clear error; it never silently substitutes a different size. Run `videocall-cli info --list-formats <camera>` to see the resolutions your camera actually supports.
+
 > **VP9 encoding is pure Rust by default** — no C libvpx is required or linked.
 > If you need the legacy C libvpx backend (for A/B comparison or rollback), build
 > with `--features libvpx`, which additionally requires `libvpx-dev` (Linux) /

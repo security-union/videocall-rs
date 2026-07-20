@@ -29,7 +29,7 @@ Historically `src/lib.rs` was ~2,400 lines of raw `objc` `msg_send!` calls; the 
 
 ## C ABI surface
 
-Every symbol is prefixed `vcc_`. Full signatures live in `src/apple.rs` (`extern "C"` block) and `swift/Sources/VideocallCapture/FFI.swift` (`@_cdecl` definitions); they must stay in lockstep.
+Every symbol is prefixed `vcc_` (**v**ideo**c**all **c**apture, after the `VideocallCapture` Swift package) — C has no namespaces, so the prefix keeps our exported symbols collision-free at link time. Full signatures live in `src/apple.rs` (`extern "C"` block) and `swift/Sources/VideocallCapture/FFI.swift` (`@_cdecl` definitions); they must stay in lockstep.
 
 | Function | Purpose |
 |----------|---------|

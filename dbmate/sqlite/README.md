@@ -3,10 +3,8 @@
 The SQLite equivalent of `dbmate/db/`, used when `meeting-api` is built with
 `--no-default-features --features sqlite`.
 
-The layout matches `dbmate/db/` on purpose: `db/migrations` and `db/schema.sql`
-are dbmate's defaults, so no config file is needed. (dbmate only reads
-`.dbmate.yml` from v2.28 onwards; earlier versions silently ignore it and fall
-back to the defaults, so relying on one is a trap.)
+The layout matches `dbmate/db/`: `db/migrations` and `db/schema.sql` are
+dbmate's defaults, so no config file is needed.
 
 Run dbmate from *this* directory, exactly as `dbmate/startup.sh` does for
 PostgreSQL from `dbmate/`:

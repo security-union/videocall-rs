@@ -20,6 +20,12 @@
 //! so a passing test shows that option is load-bearing. Being SQLite-only, this
 //! file binds timestamps directly rather than via the `db::now_sql` shim.
 //!
+//! Every test must `pool.close().await` before returning: they share one file,
+//! and sqlx tears a dropped pool's connections down in the background — the last
+//! runs a WAL checkpoint that takes the write lock. A `busy_timeout(0)` pool
+//! opened by the next test would hit that as an instant `SQLITE_BUSY`. Closing
+//! makes teardown synchronous so opens never overlap it.
+//!
 //! The `db::mod` feature guards (both backends / neither refuse to compile) are
 //! verified by hand rather than with a `trybuild` dev-dependency.
 
@@ -86,6 +92,11 @@ async fn test_every_pooled_connection_has_the_required_pragmas() {
              db::connect sets; it will surface SQLITE_BUSY without waiting"
         );
     }
+
+    // Return the checked-out connections, then close synchronously — see the
+    // module docs.
+    drop(held);
+    pool.close().await;
 }
 
 /// The pragma check above proves the setting is on; this proves it is load

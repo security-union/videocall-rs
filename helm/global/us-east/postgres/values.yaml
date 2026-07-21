@@ -1,22 +1,47 @@
 # PostgreSQL configuration for US East region
 
-# Allow AWS ECR images
+# Allow non-default (Docker Hub legacy / digest-pinned) images
 global:
   security:
     allowInsecureImages: true
 
 postgresql:
-  # Use AWS ECR for Bitnami images (Bitnami no longer hosts on Docker Hub)
+  # Bitnami deleted the entire public.ecr.aws/bitnami/* registry, so the old
+  # ECR coordinates now 404 on every cold pull. Images come from Docker Hub again.
+  #
+  # Pinned by digest on purpose: docker.io/bitnami/postgresql only publishes a
+  # floating `latest` tag now (versioned tags moved behind paid Secure Images),
+  # and the on-disk PVC data directory is PostgreSQL 18. An unpinned `latest`
+  # would silently roll forward to PG 19 and refuse to start against v18 data.
+  # This digest freezes PostgreSQL 18.4.0.
+  # NOTE: bitnamilegacy/postgresql cannot be used here — it tops out at 17.6.
+  #
+  # THIS IS ALSO A VERSION BUMP, not just a registry move: prod was running the
+  # floating `latest` tag (chart appVersion 18.0.0, so most likely an 18.0.x
+  # image), and this pins 18.4.0. Same major version, so the on-disk data
+  # directory is compatible and no pg_upgrade is required — but it is a
+  # patch-level upgrade, unlike the pure registry moves for matomo/mariadb.
   image:
-    registry: public.ecr.aws
+    registry: docker.io
     repository: bitnami/postgresql
-    
+    digest: sha256:db2312d9b243afa8c3b3f5496e478d17d0dff9791d06f3b93b9567abd86ae92f
+    # Tripwire / documentation only. The digest above takes precedence, so this
+    # tag is never what gets pulled. It exists because the subchart's own default
+    # is `image.tag: latest`, which stays merged underneath this block: if the
+    # digest is ever blanked, the image would silently fall back to a floating
+    # `latest` — precisely the failure mode this pin exists to prevent. Keep this
+    # in sync with the digest.
+    tag: "18.4.0"
+
   # Metrics exporter image
+  # bitnamilegacy retains the exact version that runs in production today (0.17.1),
+  # so this is a registry move only — no version change.
   metrics:
     enabled: true
     image:
-      registry: public.ecr.aws
-      repository: bitnami/postgres-exporter
+      registry: docker.io
+      repository: bitnamilegacy/postgres-exporter
+      tag: 0.17.1-debian-12-r16
     serviceMonitor:
       enabled: false
   

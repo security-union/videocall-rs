@@ -5,10 +5,44 @@ videocall-website:
 
   replicaCount: 1
 
+  # TEMPORARY ROLLBACK pending a fix to docker/Dockerfile.website.
+  #
+  # Symptom: the image pulls fine but the container exits 1 immediately with
+  #   exec /app/leptos_website: no such file or directory
+  #
+  # Bisected by booting published tags on the cluster node:
+  #   main-60f7bea7 (Website: SEO improvement #630, 2026-02-18) -> boots,
+  #                 logs "listening on http://0.0.0.0:8080"
+  #   main-1691e5ab (Nixify videocall.rs website #631, 2026-02-19) -> broken
+  # So #631 is the first broken build.
+  #
+  # Cause: the nix build produces a dynamically linked binary whose ELF
+  # interpreter is /nix/store/...-glibc-2.40-66/lib/ld-linux-x86-64.so.2, but the
+  # runtime stage never copies the nix store, so /nix does not exist in the image.
+  # A missing ELF interpreter is reported by the kernel as ENOENT ("no such file
+  # or directory") even though /app/leptos_website is present in the image.
+  #
+  # The fix belongs in docker/Dockerfile.website — build static/musl, copy the nix
+  # closure into the runtime stage, or `patchelf --set-interpreter` to the base
+  # image's loader. It does NOT belong in the CI workflow: an earlier multi-arch
+  # build was already reverted in #665/#666, and upload-website-docker-hub.yaml has
+  # no `platforms:` key today, so this is not an architecture problem.
+  #
+  # main-60f7bea7 is the newest tag verified to boot, so it is pinned here rather
+  # than an older tag that would needlessly discard #630 and everything after it.
+  #
+  # Note: `latest` is currently stuck pointing at the ed4ba314 manifest and will
+  # need one successful republish after the Dockerfile is fixed.
   image:
     repository: securityunion/video-call-rs-website
-    pullPolicy: Always
-    tag: latest
+    # IfNotPresent only protects nodes whose image cache is already warm. A fresh
+    # or recycled node cold-pulls whatever the tag points at — that is the exact
+    # mechanism behind this outage. A `@sha256:` digest would close the hole, but
+    # helm/videocall-website/templates/deployment.yaml renders the image as
+    # "{{ .Values.image.repository }}:{{ .Values.image.tag }}", so digests are not
+    # supported without a template change. Residual risk recorded, not fixed here.
+    pullPolicy: IfNotPresent
+    tag: main-60f7bea7
 
   resources:
     limits:

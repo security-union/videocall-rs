@@ -104,6 +104,21 @@ echo "3. Deploying PostgreSQL into ${NAMESPACE}"
 
 CHART_DIR="helm/global/us-east/postgres"
 
+# The PostgreSQL image is NOT set here on purpose: a fresh install inherits
+# ${CHART_DIR}/values.yaml, which pins docker.io/bitnami/postgresql by digest
+# (PostgreSQL 18.4.0). Bitnami deleted public.ecr.aws/bitnami/* and now publishes
+# only a floating `latest` tag on Docker Hub, so the digest is what keeps this
+# reproducible against the existing PG 18 PVC. Do not add a
+# --set postgresql.image.digest here — it would fork the pin and drift.
+#
+# IMPORTANT: this script will NOT apply that pin to an existing release. The
+# guard below short-circuits whenever a release whose name starts with "postgres"
+# is present in the namespace, and the `postgres` release in preview-infra does
+# exist today — it is in ImagePullBackOff, which still counts as deployed. Moving
+# an already-installed release onto the digest requires a manual:
+#   helm upgrade postgres helm/global/us-east/postgres/ -n preview-infra \
+#     -f helm/global/us-east/postgres/values.yaml
+
 # The chart dependency tgz is committed to the repo; fail early if somehow missing
 if ! ls "${CHART_DIR}/charts/postgresql-"*.tgz &>/dev/null 2>&1; then
   echo "❌ Helm chart dependency missing: ${CHART_DIR}/charts/postgresql-*.tgz"

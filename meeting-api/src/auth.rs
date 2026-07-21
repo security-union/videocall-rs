@@ -125,7 +125,7 @@ mod tests {
                 .connect_lazy("postgres://localhost/unused")
                 .expect("lazy pool creation should not fail")
         };
-        #[cfg(feature = "sqlite")]
+        #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
         let db = {
             use sqlx::sqlite::SqlitePoolOptions;
             SqlitePoolOptions::new()

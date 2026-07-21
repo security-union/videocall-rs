@@ -49,23 +49,27 @@ async fn main() {
         pool
     };
 
-    #[cfg(feature = "sqlite")]
+    #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
     let pool = {
-        use sqlx::sqlite::SqlitePoolOptions;
+        use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+        use std::str::FromStr;
+        use std::time::Duration;
+
+        // Configure PRAGMAs on the connect options so every pooled connection
+        // gets them (a one-shot `PRAGMA` only affects a single connection), and
+        // enable foreign keys so `ON DELETE CASCADE` actually fires. No
+        // create_if_missing: dbmate provisions the file, so a missing database
+        // should fail fast rather than silently create an empty one.
+        let options = SqliteConnectOptions::from_str(&config.database_url)
+            .expect("invalid SQLite DATABASE_URL")
+            .journal_mode(SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true);
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
-            .connect(&config.database_url)
+            .connect_with(options)
             .await
             .expect("failed to connect to SQLite");
-        // Enable WAL mode for better concurrent read performance.
-        sqlx::query("PRAGMA journal_mode=WAL")
-            .execute(&pool)
-            .await
-            .expect("failed to set WAL mode");
-        sqlx::query("PRAGMA busy_timeout=5000")
-            .execute(&pool)
-            .await
-            .expect("failed to set busy timeout");
         tracing::info!("Connected to SQLite");
         pool
     };

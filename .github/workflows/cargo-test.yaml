@@ -10,6 +10,7 @@ on:
       - 'docker/**'
       - 'neteq/**'
       - 'videocall-client/**'
+      - 'meeting-api/**'
       - 'dbmate/**'
 name: check backend
 
@@ -28,3 +29,42 @@ jobs:
       - name: Teardown
         if: always()
         run: make tests_down
+
+  meeting-api-sqlite:
+    name: meeting-api (sqlite)
+    runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: sqlite:/tmp/meeting_api_test.sqlite3
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-meeting-api-sqlite-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-meeting-api-sqlite-
+
+      - name: Install dbmate
+        run: |
+          curl -fsSL -o /usr/local/bin/dbmate \
+            https://github.com/amacneil/dbmate/releases/download/v2.34.1/dbmate-linux-amd64
+          chmod +x /usr/local/bin/dbmate
+
+      - name: Run SQLite migrations
+        run: cd dbmate/sqlite && dbmate up
+
+      - name: Clippy (sqlite feature)
+        run: cargo clippy -p meeting-api --no-default-features --features sqlite -- -D warnings
+
+      - name: Test (sqlite feature)
+        run: cargo test -p meeting-api --no-default-features --features sqlite -- --test-threads=1

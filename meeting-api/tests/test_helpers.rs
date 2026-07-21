@@ -37,22 +37,15 @@ pub async fn get_test_pool() -> DbPool {
 
 /// Delete all test data for a given `room_id` (participants first due to FK).
 pub async fn cleanup_test_data(pool: &DbPool, room_id: &str) {
-    #[cfg(feature = "postgres")]
-    const PARAM: &str = "$1";
-    #[cfg(feature = "sqlite")]
-    const PARAM: &str = "?1";
-
-    let delete_participants = format!(
-        "DELETE FROM meeting_participants WHERE meeting_id IN \
-         (SELECT id FROM meetings WHERE room_id = {PARAM})"
-    );
-    let _ = sqlx::query(&delete_participants)
+    // `$1` is parsed natively by both the PostgreSQL and SQLite sqlx drivers.
+    let delete_participants = "DELETE FROM meeting_participants WHERE meeting_id IN \
+         (SELECT id FROM meetings WHERE room_id = $1)";
+    let _ = sqlx::query(delete_participants)
         .bind(room_id)
         .execute(pool)
         .await;
 
-    let delete_meetings = format!("DELETE FROM meetings WHERE room_id = {PARAM}");
-    let _ = sqlx::query(&delete_meetings)
+    let _ = sqlx::query("DELETE FROM meetings WHERE room_id = $1")
         .bind(room_id)
         .execute(pool)
         .await;

@@ -1,6 +1,6 @@
 [package]
 name = "bot"
-version = "1.1.3"
+version = "1.2.0"
 edition = "2018"
 license = "MIT OR Apache-2.0"
 description = "A bot for the videocall project"
@@ -17,7 +17,7 @@ tokio = { version = "1.28.1", features = ["full"] }
 # Remove WebSocket, add WebTransport
 web-transport-quinn = { workspace = true }
 futures = "0.3.16"
-videocall-types = { path= "../videocall-types", version = "5.0.0" }
+videocall-types = { path= "../videocall-types", version = "6.0.0" }
 protobuf = "3.3.0"
 chrono = "0.4.25"
 dotenv = "0.15.0"
@@ -25,11 +25,14 @@ url = "2.3.1"
 
 # Audio processing (from neteq_player.rs pattern)
 hound = "3.5"  # WAV file reading
-opus = "0.3.0"  # Opus encoding
+ropus = "0.12"  # Pure-Rust Opus encoding (replaces C libopus/audiopus-sys)
 
-# Video processing (exact same as videocall-cli)
+# Video processing (same approach as videocall-cli)
 image = "0.25.5"  # JPEG processing
-env-libvpx-sys = { version = "5.1.3", features = ["generate"] }  # VP9 encoding (exact same as videocall-cli)
+# Pure-Rust VP9 encoding (replaces C libvpx/env-libvpx-sys). Default features pull
+# in zero C dependencies; the legacy libvpx backend is opt-in via the `libvpx`
+# feature below.
+videocall-codecs = { path = "../videocall-codecs", version = "0.1.14" }
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }
@@ -41,3 +44,9 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 
 # Error handling
 anyhow = "1.0"
+
+[features]
+# Default: pure-Rust VP9 encoder (no C dependencies).
+default = []
+# Legacy C libvpx encode backend, opt-in for comparison/rollback. Same public API.
+libvpx = ["videocall-codecs/libvpx"]

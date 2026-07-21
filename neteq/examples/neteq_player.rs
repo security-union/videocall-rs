@@ -29,8 +29,8 @@ use cpal::BufferSize;
 
 use neteq::codec::OpusDecoder;
 use neteq::{AudioPacket, NetEq, NetEqConfig, RtpHeader};
-use opus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
 use rand::Rng;
+use ropus::{Application as OpusApp, Channels as OpusChannels, Encoder as OpusEncoder};
 
 // This example does the following:
 // 1. Loads a WAV file (passed on the command-line).
@@ -205,7 +205,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         OpusChannels::Stereo
     };
-    let mut opus_encoder = OpusEncoder::new(sample_rate, ch_enum, OpusApp::Audio)?;
+    let mut opus_encoder = OpusEncoder::builder(sample_rate, ch_enum, OpusApp::Audio).build()?;
 
     let mut chunk_index_iter = wav_samples.chunks(packet_samples).enumerate();
 

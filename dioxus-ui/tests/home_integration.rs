@@ -77,9 +77,10 @@ fn home_wrapper_direct() -> Element {
 async fn home_page_renders_with_oauth_disabled() {
     ensure_root_url();
     inject_app_config();
+    mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
     yield_now().await;
 
     // No error banner — config loaded and browser checks passed.
@@ -116,6 +117,7 @@ async fn home_page_renders_with_oauth_disabled() {
     );
 
     cleanup(&mount);
+    restore_fetch();
     remove_app_config();
 }
 
@@ -126,7 +128,7 @@ async fn home_shows_login_when_unauthenticated() {
     mock_fetch_401();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
 
     // Allow the mock fetch to resolve and Dioxus to re-render.
     yield_now().await;
@@ -175,7 +177,7 @@ async fn home_hides_login_when_authenticated() {
     mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
 
     // Allow the mock fetch to resolve and Dioxus to re-render.
     yield_now().await;
@@ -211,9 +213,10 @@ async fn home_hides_login_when_authenticated() {
 #[wasm_bindgen_test]
 async fn missing_config_shows_error_not_home() {
     remove_app_config();
+    mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
     yield_now().await;
 
     // ConfigError should be visible — same as the real app.
@@ -236,6 +239,7 @@ async fn missing_config_shows_error_not_home() {
     );
 
     cleanup(&mount);
+    restore_fetch();
 }
 
 #[wasm_bindgen_test]
@@ -245,7 +249,7 @@ async fn home_rejects_invalid_display_name() {
     mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
     yield_now().await;
 
     let username = mount
@@ -292,7 +296,7 @@ async fn home_normalizes_spaces_in_display_name() {
     mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
     yield_now().await;
 
     let username = mount
@@ -339,7 +343,7 @@ async fn home_rejects_empty_display_name() {
     mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
     yield_now().await;
 
     // Leave username empty, set a meeting ID, and submit.
@@ -378,7 +382,7 @@ async fn home_rejects_display_name_exceeding_max_length() {
     mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
     yield_now().await;
 
     // Create a name that exceeds 50 characters.
@@ -427,7 +431,7 @@ async fn home_accepts_display_name_with_special_characters() {
     mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
     yield_now().await;
 
     // Apostrophes and hyphens are allowed special characters.
@@ -477,9 +481,10 @@ async fn home_accepts_display_name_with_special_characters() {
 async fn home_join_button_disabled_when_no_meeting_id() {
     ensure_root_url();
     inject_app_config();
+    mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
     yield_now().await;
 
     // Find the submit button (type="submit") — "Start or Join Meeting".
@@ -504,6 +509,7 @@ async fn home_join_button_disabled_when_no_meeting_id() {
     );
 
     cleanup(&mount);
+    restore_fetch();
     remove_app_config();
 }
 
@@ -511,9 +517,10 @@ async fn home_join_button_disabled_when_no_meeting_id() {
 async fn home_join_button_enabled_when_meeting_id_entered() {
     ensure_root_url();
     inject_app_config();
+    mock_fetch_meetings_empty();
 
     let mount = create_mount_point();
-    render_into(&mount, home_wrapper_direct);
+    let _app = render_into(&mount, home_wrapper_direct);
     yield_now().await;
 
     // Enter a meeting ID.
@@ -544,5 +551,6 @@ async fn home_join_button_enabled_when_meeting_id_entered() {
     );
 
     cleanup(&mount);
+    restore_fetch();
     remove_app_config();
 }

@@ -49,13 +49,15 @@ The table below lists current Nokhwa API support.
  |-----------------------------------------|-------------------|--------------------|-------------------|--------------------|
  | Video4Linux(`input-native`)          | ✅                 | ✅                 | ✅                | Linux               |
  | MSMF(`input-native`)                 | ✅                 | ✅                 | ✅                | Windows             |
- | AVFoundation(`input-native`)   | ✅                 | ✅                 | ✅                | Mac                 |
+ | AVFoundation(`input-native`)†  | ✅                 | ✅                 | ✅                | Mac, iOS            |
  | OpenCV(`input-opencv`)^              | ✅                 | ❌                 | ❌                | Linux, Windows, Mac |
  | WASM(`input-wasm`)                | ✅                 | ✅                 | ✅                | Browser(Web)        |
 
  ✅: Working, 🔮 : Experimental, ❌ : Not Supported, 🚧: Planned/WIP
 
-  ^ = May be bugged. Also supports IP Cameras. 
+  ^ = May be bugged. Also supports IP Cameras.
+
+  † = Implemented in Swift (`videocall-nokhwa-bindings-macos`); building on macOS requires the Xcode command-line tools (`xcode-select --install`). See that crate's README for details. iOS compiles but has no higher-level backend consumer yet.
 
 ## Feature
 The default feature includes nothing. Anything starting with `input-*` is a feature that enables the specific backend. 

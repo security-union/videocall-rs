@@ -9,6 +9,9 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'dioxus-ui/**'
+      - '.github/workflows/wasm-test.yaml'
+      - 'flake.nix'
+      - 'flake.lock'
   pull_request:
     paths:
       - 'videocall-client/**'
@@ -17,6 +20,9 @@ on:
       - 'videocall-types/**'
       - 'protobuf/**'
       - 'dioxus-ui/**'
+      - '.github/workflows/wasm-test.yaml'
+      - 'flake.nix'
+      - 'flake.lock'
 
 jobs:
   wasm-test:
@@ -53,8 +59,11 @@ jobs:
       - name: Run wasm-pack tests for videocall-client
         run: cd videocall-client && wasm-pack test --node
 
-      - name: Run wasm-pack tests for videocall-codecs
+      - name: Run tests for videocall-codecs (default, C-free)
         run: cd videocall-codecs && cargo test
+
+      - name: Run oracle tests for videocall-codecs (libvpx)
+        run: cargo test -p videocall-codecs --features "libvpx test-utils"
 
       - name: Run tests for neteq
         run: cd neteq && cargo test --no-default-features --features web
@@ -79,10 +88,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-dioxus-tests-
 
-      - uses: nanasess/setup-chromedriver@v2
+      - name: Remove the runner's stock Chrome and chromedriver
+        run: |
+          # The browser for the wasm component tests is pinned via the nix
+          # flake (google-chrome + matching chromedriver from nixpkgs).
+          # Delete the runner image's auto-updating Chrome/chromedriver so
+          # any fallback to them fails loudly instead of silently unpinning.
+          sudo rm -rf /opt/google/chrome
+          sudo rm -f /usr/bin/google-chrome /usr/bin/google-chrome-stable
+          stock_driver="$(command -v chromedriver || true)"
+          if [ -n "${stock_driver}" ]; then
+            sudo rm -f "${stock_driver}"
+          fi
 
       - name: Run dioxus-ui component tests
-        run: |
-          nix develop .#frontend --command bash -c "\
-            cd dioxus-ui && \
-            CHROMEDRIVER=$(which chromedriver) cargo test --target wasm32-unknown-unknown"
+        # All logic (pinned-browser verification, per-binary retry, wedged
+        # Chrome cleanup) lives in nix/dioxus-ui-component-tests.sh, packaged
+        # and shellchecked by the flake.
+        run: nix develop .#frontend-tests --command dioxus-ui-component-tests

@@ -16,31 +16,35 @@
  * conditions.
  */
 
+//! VP9 video encoder adapter.
+//!
+//! This is a thin, backend-generic wrapper over a [`videocall_codecs`] encoder
+//! that implements the [`Encodable`] trait. The concrete backend is chosen at
+//! compile time:
+//!
+//! - Default build (no `libvpx` feature): the pure-Rust
+//!   [`videocall_codecs::vp9::Vp9Encoder`] — zero C dependencies.
+//! - `--features libvpx`: the legacy C libvpx-backed encoder, kept for
+//!   comparison and rollback.
+//!
+//! The public API (`VideoEncoderBuilder`, `VideoEncoder`, `Frame`, `Frames`) is
+//! identical across both backends, so the caller (`video_producer`) is
+//! unaffected by the choice.
+
 use anyhow::{anyhow, Result};
-use std::mem::MaybeUninit;
-use std::os::raw::{c_int, c_ulong};
-use vpx_sys::*;
+use videocall_codecs::encoder::{Encodable, EncodedFrame, EncoderConfig};
 
-macro_rules! vpx {
-    ($f:expr) => {{
-        let res = unsafe { $f };
-        let res_int = unsafe { std::mem::transmute::<vpx_sys::vpx_codec_err_t, i32>(res) };
-        if res_int != 0 {
-            return Err(anyhow!("vpx function error code ({}).", res_int));
-        }
-        res
-    }};
-}
+/// Maximum distance between keyframes, in frames. Matches the legacy libvpx
+/// configuration (`kf_max_dist`/`kf_min_dist` = 150).
+const KEYFRAME_INTERVAL: u32 = 150;
 
-macro_rules! vpx_ptr {
-    ($f:expr) => {{
-        let res = unsafe { $f };
-        if res.is_null() {
-            return Err(anyhow!("vpx function returned null pointer."));
-        }
-        res
-    }};
-}
+// Backend selection. The default (C-free) path uses the pure-Rust encoder; the
+// `libvpx` feature swaps in the legacy C wrapper. Both are used through the
+// `Encodable` trait, so the rest of this file is backend-agnostic.
+#[cfg(feature = "libvpx")]
+use videocall_codecs::encoder::Vp9Encoder as Inner;
+#[cfg(not(feature = "libvpx"))]
+use videocall_codecs::vp9::Vp9Encoder as Inner;
 
 pub struct VideoEncoderBuilder {
     pub min_quantizer: u32,
@@ -48,7 +52,6 @@ pub struct VideoEncoderBuilder {
     pub bitrate_kbps: u32,
     pub fps: u32,
     pub resolution: (u32, u32),
-    #[allow(dead_code)]
     pub cpu_used: u32,
     pub profile: u32,
 }
@@ -81,102 +84,60 @@ impl VideoEncoderBuilder {
         if height % 2 != 0 || height == 0 {
             return Err(anyhow!("Height must be divisible by 2"));
         }
-        let cfg_ptr = vpx_ptr!(vpx_codec_vp9_cx());
-        let mut cfg = unsafe { MaybeUninit::zeroed().assume_init() };
-        vpx!(vpx_codec_enc_config_default(cfg_ptr, &mut cfg, 0));
-
-        cfg.g_w = width;
-        cfg.g_h = height;
-        cfg.g_timebase.num = 1;
-        cfg.g_timebase.den = self.fps as c_int;
-        cfg.rc_target_bitrate = self.bitrate_kbps;
-        cfg.rc_min_quantizer = self.min_quantizer;
-        cfg.rc_max_quantizer = self.max_quantizer;
-        cfg.g_threads = 2;
-        cfg.g_lag_in_frames = 1;
-        cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
-        cfg.g_pass = vpx_enc_pass::VPX_RC_ONE_PASS;
-        cfg.g_profile = self.profile;
-        cfg.rc_end_usage = vpx_rc_mode::VPX_VBR;
-        cfg.kf_max_dist = 150;
-        cfg.kf_min_dist = 150;
-        cfg.kf_mode = vpx_kf_mode::VPX_KF_AUTO;
-
-        let ctx = MaybeUninit::zeroed();
-        let mut ctx = unsafe { ctx.assume_init() };
-
-        vpx!(vpx_codec_enc_init_ver(
-            &mut ctx,
-            cfg_ptr,
-            &cfg,
-            0,
-            VPX_ENCODER_ABI_VERSION as i32
-        ));
-        unsafe {
-            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP8E_SET_CPUUSED as c_int, 5);
-            vpx_codec_control_(
-                &mut ctx,
-                vp8e_enc_control_id::VP9E_SET_TILE_COLUMNS as c_int,
-                4,
-            );
-            vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_ROW_MT as c_int, 1);
-            vpx_codec_control_(
-                &mut ctx,
-                vp8e_enc_control_id::VP9E_SET_FRAME_PARALLEL_DECODING as c_int,
-                1,
-            );
-            // vpx_codec_control_(&mut ctx, vp8e_enc_control_id::VP9E_SET_AQ_MODE as c_int, 3);
+        // The encoder backends only implement VP9 profile 0 (8-bit 4:2:0).
+        // `EncoderConfig` has no profile field, so a non-zero `profile` here
+        // would be silently dropped and produce profile-0 output. Reject it
+        // loudly instead of misleading the caller.
+        if self.profile != 0 {
+            return Err(anyhow!(
+                "Unsupported VP9 profile {}: only profile 0 (8-bit 4:2:0) is supported",
+                self.profile
+            ));
         }
+
+        let config = EncoderConfig {
+            width,
+            height,
+            framerate: self.fps,
+            bitrate_kbps: self.bitrate_kbps,
+            keyframe_interval: KEYFRAME_INTERVAL,
+            min_quantizer: self.min_quantizer,
+            max_quantizer: self.max_quantizer,
+            cpu_used: self.cpu_used as u8,
+        };
+
+        // Fully-qualified so we always hit the `Encodable` trait method: the
+        // legacy libvpx backend also has an inherent `new`/`encode` with a
+        // different signature that would otherwise shadow the trait.
+        let inner = <Inner as Encodable>::new(config)?;
         Ok(VideoEncoder {
-            ctx,
-            cfg,
-            width: self.resolution.0,
-            height: self.resolution.1,
+            inner,
+            pending: None,
         })
     }
 }
 
 pub struct VideoEncoder {
-    ctx: vpx_codec_ctx_t,
-    cfg: vpx_codec_enc_cfg_t,
-    width: u32,
-    height: u32,
+    inner: Inner,
+    /// Owns the most recently encoded frame so [`Frames`] can borrow it. Some
+    /// backends buffer (libvpx `lag_in_frames`), so this may be `None` for a
+    /// call that produced no output yet.
+    pending: Option<EncodedFrame>,
 }
 
 impl VideoEncoder {
     pub fn update_bitrate_kbps(&mut self, bitrate: u32) -> anyhow::Result<()> {
-        self.cfg.rc_target_bitrate = bitrate;
-        vpx!(vpx_codec_enc_config_set(&mut self.ctx, &self.cfg));
-        Ok(())
+        Encodable::update_bitrate_kbps(&mut self.inner, bitrate)
     }
 
     pub fn encode(&mut self, pts: i64, data: &[u8]) -> anyhow::Result<Frames<'_>> {
-        let image = MaybeUninit::zeroed();
-        let mut image = unsafe { image.assume_init() };
-
-        vpx_ptr!(vpx_img_wrap(
-            &mut image,
-            vpx_img_fmt::VPX_IMG_FMT_I420,
-            self.width as _,
-            self.height as _,
-            1,
-            data.as_ptr() as _,
-        ));
-
-        let flags: i64 = 0;
-
-        vpx!(vpx_codec_encode(
-            &mut self.ctx,
-            &image,
-            pts,
-            1,     // Duration
-            flags, // Flags
-            VPX_DL_REALTIME as c_ulong,
-        ));
-
+        self.pending = Encodable::encode(&mut self.inner, pts, data)?;
         Ok(Frames {
-            ctx: &mut self.ctx,
-            iter: std::ptr::null(),
+            frame: self.pending.as_ref().map(|f| Frame {
+                data: &f.data,
+                key: f.is_keyframe,
+                pts: f.pts,
+            }),
         })
     }
 }
@@ -185,39 +146,62 @@ impl VideoEncoder {
 pub struct Frame<'a> {
     /// Compressed data.
     pub data: &'a [u8],
-    /// Whether this is a key frame.
+    /// Whether the frame is a keyframe.
     pub key: bool,
+    /// Presentation timestamp (in timebase units).
     #[allow(dead_code)]
-    /// Whether this frame is invisible.
-    pub invisible: bool,
+    pub pts: i64,
 }
 
+/// Iterator over the frames produced by a single [`VideoEncoder::encode`] call.
+///
+/// The backend emits at most one compressed frame per input frame, so this
+/// yields either zero or one [`Frame`]. Downstream code already tolerates a
+/// zero-frame result (the legacy libvpx path buffered with `lag_in_frames = 1`).
 pub struct Frames<'a> {
-    ctx: &'a mut vpx_codec_ctx_t,
-    iter: vpx_codec_iter_t,
+    frame: Option<Frame<'a>>,
 }
 
 impl<'a> Iterator for Frames<'a> {
     type Item = Frame<'a>;
-
     fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            unsafe {
-                let pkt = vpx_codec_get_cx_data(self.ctx, &mut self.iter);
-                if pkt.is_null() {
-                    return None;
-                } else if (*pkt).kind == vpx_codec_cx_pkt_kind::VPX_CODEC_CX_FRAME_PKT {
-                    let f = &(*pkt).data.frame;
-                    return Some(Frame {
-                        data: std::slice::from_raw_parts(f.buf as _, f.sz),
-                        key: (f.flags & VPX_FRAME_IS_KEY) != 0,
-                        invisible: (f.flags & VPX_FRAME_IS_INVISIBLE) != 0,
-                    });
+        self.frame.take()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VideoEncoderBuilder;
+
+    #[test]
+    fn build_rejects_unsupported_profile() {
+        // Only VP9 profile 0 (8-bit 4:2:0) is supported. A non-zero profile
+        // must fail loudly rather than silently produce profile-0 output.
+        for profile in [1u32, 2, 3] {
+            let mut builder = VideoEncoderBuilder::new(30, 7).set_resolution(640, 480);
+            builder.profile = profile;
+            match builder.build() {
+                // Edition 2018: `panic!`/`assert!` with a single string literal
+                // is not a format string, so pass args positionally.
+                Ok(_) => panic!("build with profile {} should have failed", profile),
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("Unsupported VP9 profile") && msg.contains("profile 0"),
+                        "profile {} error should name the profile and profile 0: {}",
+                        profile,
+                        msg
+                    );
                 }
             }
         }
     }
-}
 
-unsafe impl Send for VideoEncoder {}
-unsafe impl Sync for VideoEncoder {}
+    #[test]
+    fn build_accepts_profile_zero() {
+        // The default profile (0) must still build successfully.
+        let mut builder = VideoEncoderBuilder::new(30, 7).set_resolution(640, 480);
+        builder.profile = 0;
+        assert!(builder.build().is_ok(), "profile 0 must build successfully");
+    }
+}

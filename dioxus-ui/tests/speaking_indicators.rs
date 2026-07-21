@@ -66,7 +66,7 @@ async fn peer_list_item_speaking_adds_speaking_class() {
     fn wrapper() -> Element {
         rsx! { PeerListItem { name: "Alice".to_string(), speaking: true, muted: false } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let mic_div = mount.query_selector(".peer_item_mic").unwrap().unwrap();
@@ -84,7 +84,7 @@ async fn peer_list_item_not_speaking_lacks_speaking_class() {
     fn wrapper() -> Element {
         rsx! { PeerListItem { name: "Bob".to_string(), speaking: false, muted: false } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let mic_div = mount.query_selector(".peer_item_mic").unwrap().unwrap();
@@ -102,7 +102,7 @@ async fn peer_list_item_muted_renders_mic_icon() {
     fn wrapper() -> Element {
         rsx! { PeerListItem { name: "Charlie".to_string(), muted: true, speaking: false } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let mic_div = mount.query_selector(".peer_item_mic").unwrap();
@@ -120,7 +120,7 @@ async fn peer_list_item_speaking_and_muted_has_speaking_class() {
     fn wrapper() -> Element {
         rsx! { PeerListItem { name: "Diana".to_string(), speaking: true, muted: true } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let mic_div = mount.query_selector(".peer_item_mic").unwrap().unwrap();
@@ -138,7 +138,7 @@ async fn peer_list_item_host_with_speaking_shows_crown_and_speaking() {
     fn wrapper() -> Element {
         rsx! { PeerListItem { name: "Host".to_string(), is_host: true, speaking: true, muted: false } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     // Host indicator label should be rendered for host

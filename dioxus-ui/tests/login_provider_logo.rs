@@ -60,7 +60,7 @@ async fn google_provider_shows_google_logo_and_text() {
     inject_app_config_with_provider("google");
 
     let mount = create_mount_point();
-    render_into(&mount, Login);
+    let _app = render_into(&mount, Login);
     yield_now().await;
 
     // The button should use the official GSI Material class.
@@ -108,7 +108,7 @@ async fn okta_provider_shows_okta_logo_and_text() {
     inject_app_config_with_provider("okta");
 
     let mount = create_mount_point();
-    render_into(&mount, Login);
+    let _app = render_into(&mount, Login);
     yield_now().await;
 
     // The button should use the Okta class.
@@ -156,7 +156,7 @@ async fn no_provider_shows_generic_sign_in() {
     inject_app_config_with_provider("");
 
     let mount = create_mount_point();
-    render_into(&mount, Login);
+    let _app = render_into(&mount, Login);
     yield_now().await;
 
     // The button should use the generic class.
@@ -197,7 +197,7 @@ async fn unknown_provider_falls_back_to_generic() {
     inject_app_config_with_provider("azure-ad");
 
     let mount = create_mount_point();
-    render_into(&mount, Login);
+    let _app = render_into(&mount, Login);
     yield_now().await;
 
     // Should fall back to generic.

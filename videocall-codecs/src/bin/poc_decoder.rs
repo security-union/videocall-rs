@@ -21,7 +21,7 @@ use image::{ImageBuffer, Rgb};
 use std::fs;
 use videocall_codecs::decoder::{Decodable, DecodedFrame, Decoder, VideoCodec};
 use videocall_codecs::encoder::Vp9Encoder;
-use videocall_codecs::frame::{FrameType, VideoFrame};
+use videocall_codecs::frame::{FrameCodec, FrameType, VideoFrame};
 use videocall_codecs::jitter_buffer::JitterBuffer;
 
 // Use the full vpx_sys crate
@@ -184,7 +184,7 @@ fn main() -> Result<()> {
         let sequence_number = i as u64;
 
         // --- ENCODE ---
-        let flags = if sequence_number % 10 == 0 {
+        let flags = if sequence_number.is_multiple_of(10) {
             VPX_EFLAG_FORCE_KF as i64
         } else {
             0
@@ -206,6 +206,7 @@ fn main() -> Result<()> {
                 } else {
                     FrameType::DeltaFrame
                 },
+                codec: FrameCodec::Vp9Profile0Level10Bit8,
                 data: frame.data.to_vec(),
                 timestamp: current_time_ms as f64,
             };
@@ -230,6 +231,7 @@ fn main() -> Result<()> {
             } else {
                 FrameType::DeltaFrame
             },
+            codec: FrameCodec::Vp9Profile0Level10Bit8,
             data: frame.data.to_vec(),
             timestamp: current_time_ms as f64,
         };

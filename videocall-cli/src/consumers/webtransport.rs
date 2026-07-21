@@ -83,6 +83,11 @@ impl WebTransportClient {
     async fn start_heartbeat(&self, session: web_transport_quinn::Session, options: &Stream) {
         let interval = time::interval(Duration::from_secs(1));
         let email = options.user_id.clone();
+        // Advertise audio as enabled only when we are actually capturing a mic
+        // (`--audio-device` was provided). Otherwise peers would see the CLI as
+        // unmuted while it sends no audio — and vice-versa, a streamed mic would
+        // be shown muted. Video is always on in stream mode.
+        let audio_enabled = options.audio_device.is_some();
         tokio::spawn(async move {
             let mut interval = interval;
             loop {
@@ -97,6 +102,7 @@ impl WebTransportClient {
                     timestamp: now_ms as f64,
                     heartbeat_metadata: Some(HeartbeatMetadata {
                         video_enabled: true,
+                        audio_enabled,
                         ..Default::default()
                     })
                     .into(),

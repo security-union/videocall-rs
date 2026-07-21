@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.0.0](https://github.com/security-union/videocall-rs/compare/videocall-cli-v3.0.9...videocall-cli-v4.0.0) - 2026-06-30
+
+### Added
+
+- remove C libopus (audiopus-sys) across the board — pure-Rust ropus codec ([#872](https://github.com/security-union/videocall-rs/pull/872))
+
+### Fixed
+
+- email, userid, session usage confusion ([#724](https://github.com/security-union/videocall-rs/pull/724))
+
+### Other
+
+- *(videocall-cli)* add Rust prerequisite and macOS deps to README ([#871](https://github.com/security-union/videocall-rs/pull/871))
+
 ## [3.0.9](https://github.com/security-union/videocall-rs/compare/videocall-cli-v3.0.8...videocall-cli-v3.0.9) - 2026-02-23
 
 ### Other

@@ -19,12 +19,48 @@ This is the official command-line client for [videocall.rs](https://github.com/s
 ### System Requirements
 We recommend using a **Linux machine running Ubuntu 24** for the best experience.
 
-### Install Dependencies (Linux)
+### 1. Install Rust 🦀
+Every install path below (`cargo install`, `cargo run`, `cargo deb`) needs the Rust toolchain, so do this **first**. The easiest way is via [rustup](https://rustup.rs):
+
+```sh
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Then restart your shell (or run `source "$HOME/.cargo/env"`) so `cargo` is on your `PATH`. See the [official install guide](https://www.rust-lang.org/tools/install) for alternatives.
+
+### 2. Install Dependencies
+
+#### Linux
 Make sure you have the required libraries installed:
 
 ```sh
-sudo apt install build-essential pkg-config libclang-dev libvpx-dev libasound2-dev libv4l-dev cmake libssl-dev
+sudo apt install build-essential pkg-config libclang-dev libasound2-dev libv4l-dev cmake libssl-dev
 ```
+
+#### macOS (experimental ⚠️)
+First make sure the Xcode Command Line Tools are installed — they provide the C compiler and SDK headers needed to build native dependencies. (Homebrew's installer also pulls these in automatically if you don't have them yet.)
+
+```sh
+xcode-select --install
+```
+
+On macOS the native build pulls audio/video from CoreAudio and AVFoundation, so the Linux-only ALSA (`libasound2`) and V4L (`libv4l`) packages aren't needed. Install the rest with [Homebrew](https://brew.sh):
+
+```sh
+brew install pkg-config llvm cmake openssl
+```
+
+The macOS camera backend is a Swift AVFoundation layer built by `cargo` at compile time, so the Xcode command-line tools (Swift toolchain) above are required — no extra runtime dependency.
+
+Two macOS-specific behaviors to know when streaming:
+
+- **Select the camera by UUID, not name.** Pass the device's UUID (shown in the "Extras" field of `info --list-cameras`) as the `--video-device-index` value. See [Quick Start](#-quick-start) below.
+- **The requested resolution must be exact.** The backend captures at exactly the resolution you request or fails with a clear error; it never silently substitutes a different size. Run `videocall-cli info --list-formats <camera>` to see the resolutions your camera actually supports.
+
+> **VP9 encoding is pure Rust by default** — no C libvpx is required or linked.
+> If you need the legacy C libvpx backend (for A/B comparison or rollback), build
+> with `--features libvpx`, which additionally requires `libvpx-dev` (Linux) /
+> `libvpx` (macOS). The public behavior is the same either way.
 
 ---
 
@@ -61,6 +97,11 @@ NV12:
  ```
 
 4. Start streaming:
+
+> ⚠️ **The meeting must already exist.** Create the call first from a browser at
+> [videocall.rs](https://videocall.rs) — the CLI can only *join* an existing call,
+> it can no longer create one. If the call's creator is the CLI, it will not work;
+> a browser user has to create it.
 
 ```
 videocall-cli \

@@ -28,7 +28,7 @@ async fn overlay_renders_message_and_heading() {
     fn wrapper() -> Element {
         rsx! { MeetingEndedOverlay { message: "The meeting has ended.".to_string() } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let text = mount.text_content().unwrap_or_default();
@@ -51,7 +51,7 @@ async fn overlay_has_return_home_button() {
     fn wrapper() -> Element {
         rsx! { MeetingEndedOverlay { message: "Host left.".to_string() } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let button = mount
@@ -71,7 +71,7 @@ async fn overlay_has_glass_backdrop() {
     fn wrapper() -> Element {
         rsx! { MeetingEndedOverlay { message: "Done.".to_string() } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let backdrop = mount
@@ -91,7 +91,7 @@ async fn overlay_displays_custom_message() {
     fn wrapper() -> Element {
         rsx! { MeetingEndedOverlay { message: "The host has ended the meeting.".to_string() } }
     }
-    render_into(&mount, wrapper);
+    let _app = render_into(&mount, wrapper);
     yield_now().await;
 
     let msg_element = mount

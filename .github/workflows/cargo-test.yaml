@@ -4,26 +4,49 @@ on:
   pull_request:
     paths:
       - 'actix-api/**'
+      - 'meeting-api/**'
       - 'videocall-types/**'
+      - 'videocall-meeting-types/**'
       - 'protobuf/**'
       - 'dioxus-ui/**'
       - 'docker/**'
       - 'neteq/**'
       - 'videocall-client/**'
       - 'dbmate/**'
+      - 'Makefile'
+      - '.github/workflows/cargo-test.yaml'
 name: check backend
 
 jobs:
+  # meeting-api compiles against either PostgreSQL or SQLite, so the same suite
+  # runs once per backend. Both legs execute the identical cargo command from the
+  # Makefile (`$(MEETING_API_TEST)`) in the same container; only DATABASE_URL,
+  # the dbmate directory and the cargo feature differ. Keeping this a matrix
+  # rather than two hand-written jobs is what stops the two backends' coverage
+  # drifting apart.
+  #
+  # The postgres leg is also the workspace-wide clippy/fmt gate and runs
+  # videocall-api, so it is not merely "the other half" of the matrix.
   test:
-    name: cargo tests_run
+    name: cargo ${{ matrix.target }}
     runs-on: ubuntu-latest
+    strategy:
+      # Report both backends on a failure; knowing whether a break is
+      # backend-specific or shared is most of the diagnosis.
+      fail-fast: false
+      matrix:
+        include:
+          - backend: postgres
+            target: tests_run
+          - backend: sqlite
+            target: tests_run_sqlite
     steps:
       - uses: actions/checkout@v4
 
       - name: Clean up Docker resources
         run: docker system prune -f --volumes
 
-      - run: make tests_run
+      - run: make ${{ matrix.target }}
 
       - name: Teardown
         if: always()

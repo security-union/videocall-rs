@@ -1,8 +1,29 @@
 COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
-.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-interop e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci
+# ---------------------------------------------------------------------------
+# meeting-api backend matrix — one test suite, run twice (postgres + sqlite).
+# ---------------------------------------------------------------------------
+# `tests_run` and `tests_run_sqlite` invoke the identical $(MEETING_API_TEST) /
+# $(MEETING_API_CLIPPY); only DATABASE_URL, the dbmate dir, and the feature flag
+# differ, so coverage is equal by construction. Keep the commands in these
+# variables — spelling them out per target lets the two legs drift.
+#
+# `--test-threads=1` is shared and load-bearing: the suite shares one database
+# and cleans up by room_id, so ~97 tests are `#[serial]`. It does not weaken race
+# coverage — each race test spawns its own writers inside one test.
+MEETING_API_FEATURES ?=
+MEETING_API_TEST = cargo test -p meeting-api $(MEETING_API_FEATURES) -- --nocapture --test-threads=1
+MEETING_API_CLIPPY = cargo clippy -p meeting-api --all-targets $(MEETING_API_FEATURES) -- -D warnings
 
+# SQLite's "instance" is a file; dbmate creates and migrates it like the
+# PostgreSQL database. Kept outside the repo so a run never dirties the tree.
+SQLITE_TEST_DB := /tmp/meeting-api-test.sqlite3
+SQLITE_TEST_URL := sqlite:$(SQLITE_TEST_DB)
+
+.PHONY: tests_up test up down build connect_to_db connect_to_nats clippy-fix fmt check clean clean-docker rebuild rebuild-up e2e e2e-headed e2e-debug e2e-interop e2e-lint e2e-fmt e2e-install e2e-up e2e-down e2e-build e2e-ci tests_run_sqlite
+
+# PostgreSQL leg of the backend matrix (also the workspace-wide lint/fmt gate).
 tests_run:
 	docker compose -f $(COMPOSE_IT) up -d postgres nats && docker compose -f $(COMPOSE_IT) run --rm rust-tests \
 		nix develop /app#backend-dev --command bash -c "\
@@ -12,7 +33,22 @@ tests_run:
 		cargo clippy --all -- -D warnings && \
 		cargo fmt --all --check && \
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
-		cargo test -p meeting-api -- --nocapture --test-threads=1"
+		$(MEETING_API_TEST)"
+
+# SQLite leg: same container and cargo command as `tests_run`; `--no-deps` skips
+# postgres/nats, and dbmate migrates dbmate/sqlite as the pg leg migrates
+# dbmate/db, so the suite runs against production's migration files.
+tests_run_sqlite: MEETING_API_FEATURES = --no-default-features --features sqlite
+tests_run_sqlite:
+	docker compose -f $(COMPOSE_IT) run --rm --no-deps \
+		-e DATABASE_URL=$(SQLITE_TEST_URL) rust-tests \
+		nix develop /app#backend-dev --command bash -c "\
+		set -euo pipefail && \
+		rm -f $(SQLITE_TEST_DB) $(SQLITE_TEST_DB)-wal $(SQLITE_TEST_DB)-shm && \
+		cd /app/dbmate/sqlite && dbmate --no-dump-schema up && \
+		cd /app && \
+		$(MEETING_API_CLIPPY) && \
+		$(MEETING_API_TEST)"
 
 tests_build:
 	docker compose -f $(COMPOSE_IT) build

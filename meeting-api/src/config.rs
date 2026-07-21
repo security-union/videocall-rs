@@ -83,7 +83,12 @@ impl Config {
     /// Load configuration from environment variables.
     ///
     /// # Required
-    /// - `DATABASE_URL`
+    /// - `DATABASE_URL` — the scheme selects the backend and must match the build:
+    ///   - PostgreSQL (default build): `postgres://user:pass@host:5432/dbname`
+    ///   - SQLite (build with `--no-default-features --features sqlite`):
+    ///     `sqlite:/var/lib/videocall/meeting-api.sqlite3`. The file must already
+    ///     exist and be migrated (`dbmate up` against `dbmate/sqlite`) on a
+    ///     persistent volume; the server fails fast at startup if it is missing.
     /// - `JWT_SECRET`
     ///
     /// # Optional

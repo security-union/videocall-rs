@@ -108,7 +108,6 @@ mod tests {
     use super::*;
     use crate::token::generate_session_token;
     use axum::http::Request;
-    use sqlx::postgres::PgPoolOptions;
 
     const TEST_SECRET: &str = "test-secret-for-auth-tests";
 
@@ -119,9 +118,15 @@ mod tests {
     fn make_state_with_cookie_name(name: &str) -> AppState {
         // connect_lazy creates a pool handle without actually connecting.
         // The URL is never used because no queries are executed in unit tests.
-        let db = PgPoolOptions::new()
+        #[cfg(feature = "postgres")]
+        let db = sqlx::postgres::PgPoolOptions::new()
             .max_connections(1)
             .connect_lazy("postgres://localhost/unused")
+            .expect("lazy pool creation should not fail");
+        #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+        let db = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_lazy("sqlite::memory:")
             .expect("lazy pool creation should not fail");
         AppState {
             db,

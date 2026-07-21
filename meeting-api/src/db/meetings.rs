@@ -12,10 +12,17 @@
  */
 
 //! Meeting table queries.
+//!
+//! Every `UPDATE` sets `updated_at` explicitly. On SQLite that is the only thing
+//! maintaining the column (no `updated_at` trigger, because SQLite evaluates
+//! `RETURNING` before AFTER-triggers). On PostgreSQL the `BEFORE UPDATE` trigger
+//! overwrites it with the same `transaction_timestamp()`, so the write is
+//! redundant but not divergent — do not drop it, SQLite depends on it.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
-use sqlx::PgPool;
+
+use crate::db::{bind_now, lock, now_sql, q, with_retry, DbPool};
 
 /// Row returned from the `meetings` table.
 #[derive(Debug, sqlx::FromRow)]
@@ -36,9 +43,23 @@ pub struct MeetingRow {
     pub waiting_room_enabled: bool,
 }
 
-/// Create a new meeting. Uses INSERT ... ON CONFLICT to handle the partial unique index.
+const MEETING_COLUMNS: &str = "id, room_id, started_at, ended_at, created_at, updated_at, \
+    deleted_at, creator_id, password_hash, state, attendees, host_display_name, \
+    waiting_room_enabled";
+
+/// Render a write statement: substitute `{cols}` and `{now}` (at `slot`), rewrite
+/// placeholders. Pair with `bind_now!`.
+fn stmt(template: &str, slot: usize) -> String {
+    now_sql(&template.replace("{cols}", MEETING_COLUMNS), slot)
+}
+
+/// Create a new meeting.
+///
+/// A `room_id` already live violates `idx_meetings_room_id_unique_active` and
+/// surfaces as a unique violation; the index is partial, so a `room_id` frees up
+/// once its meeting is soft-deleted.
 pub async fn create(
-    pool: &PgPool,
+    pool: &DbPool,
     room_id: &str,
     creator_id: &str,
     password_hash: Option<&str>,
@@ -49,45 +70,38 @@ pub async fn create(
 
 /// Create a new meeting with explicit waiting_room_enabled setting.
 pub async fn create_with_options(
-    pool: &PgPool,
+    pool: &DbPool,
     room_id: &str,
     creator_id: &str,
     password_hash: Option<&str>,
     attendees: &JsonValue,
     waiting_room_enabled: bool,
 ) -> Result<MeetingRow, sqlx::Error> {
-    sqlx::query_as::<_, MeetingRow>(
-        r#"
-        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled)
-        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5)
-        RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
-                  deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled
-        "#,
-    )
-    .bind(room_id)
-    .bind(creator_id)
-    .bind(password_hash)
-    .bind(attendees)
-    .bind(waiting_room_enabled)
+    // `created_at` / `updated_at` are left to the column DEFAULTs (the DB clock).
+    let sql = stmt(
+        "INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled)
+         VALUES ($1, $2, {now}, $3, 'idle', $4, $5)
+         RETURNING {cols}",
+        6,
+    );
+    bind_now!(sqlx::query_as::<_, MeetingRow>(&sql)
+        .bind(room_id)
+        .bind(creator_id)
+        .bind(password_hash)
+        .bind(attendees)
+        .bind(waiting_room_enabled))
     .fetch_one(pool)
     .await
 }
 
 /// Get a non-deleted meeting by room_id.
 pub async fn get_by_room_id(
-    pool: &PgPool,
+    pool: &DbPool,
     room_id: &str,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
-    sqlx::query_as::<_, MeetingRow>(
-        r#"
-        SELECT id, room_id, started_at, ended_at, created_at, updated_at,
-               deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled
-        FROM meetings
-        WHERE room_id = $1 AND deleted_at IS NULL
-        "#,
-    )
+    sqlx::query_as::<_, MeetingRow>(&q(&format!(
+        "SELECT {MEETING_COLUMNS} FROM meetings WHERE room_id = $1 AND deleted_at IS NULL"
+    )))
     .bind(room_id)
     .fetch_optional(pool)
     .await
@@ -95,22 +109,15 @@ pub async fn get_by_room_id(
 
 /// List meetings owned by `creator_id` (non-deleted), ordered by created_at DESC.
 pub async fn list_by_owner(
-    pool: &PgPool,
+    pool: &DbPool,
     creator_id: &str,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<MeetingRow>, sqlx::Error> {
-    sqlx::query_as::<_, MeetingRow>(
-        r#"
-        SELECT id, room_id, started_at, ended_at, created_at, updated_at,
-               deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled
-        FROM meetings
-        WHERE deleted_at IS NULL AND creator_id = $1
-        ORDER BY created_at DESC
-        LIMIT $2 OFFSET $3
-        "#,
-    )
+    sqlx::query_as::<_, MeetingRow>(&q(&format!(
+        "SELECT {MEETING_COLUMNS} FROM meetings WHERE deleted_at IS NULL AND creator_id = $1 \
+         ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+    )))
     .bind(creator_id)
     .bind(limit)
     .bind(offset)
@@ -119,10 +126,10 @@ pub async fn list_by_owner(
 }
 
 /// Count meetings owned by `creator_id` (non-deleted).
-pub async fn count_by_owner(pool: &PgPool, creator_id: &str) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
+pub async fn count_by_owner(pool: &DbPool, creator_id: &str) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(&q(
         "SELECT COUNT(*) FROM meetings WHERE deleted_at IS NULL AND creator_id = $1",
-    )
+    ))
     .bind(creator_id)
     .fetch_one(pool)
     .await?;
@@ -131,39 +138,42 @@ pub async fn count_by_owner(pool: &PgPool, creator_id: &str) -> Result<i64, sqlx
 
 /// Soft-delete a meeting (set `deleted_at`).
 pub async fn soft_delete(
-    pool: &PgPool,
+    pool: &DbPool,
     room_id: &str,
     creator_id: &str,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
-    sqlx::query_as::<_, MeetingRow>(
-        r#"
-        UPDATE meetings
-        SET deleted_at = NOW()
-        WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
-        RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
-                  deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled
-        "#,
-    )
-    .bind(room_id)
-    .bind(creator_id)
+    let sql = stmt(
+        "UPDATE meetings SET deleted_at = {now}, updated_at = {now}
+         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
+         RETURNING {cols}",
+        3,
+    );
+    bind_now!(sqlx::query_as::<_, MeetingRow>(&sql)
+        .bind(room_id)
+        .bind(creator_id))
     .fetch_optional(pool)
     .await
 }
 
 /// Activate a meeting (set state to 'active').
-pub async fn activate(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE meetings SET state = 'active' WHERE id = $1")
-        .bind(meeting_id)
+pub async fn activate(pool: &DbPool, meeting_id: i32) -> Result<(), sqlx::Error> {
+    let sql = now_sql(
+        "UPDATE meetings SET state = 'active', updated_at = {now} WHERE id = $1",
+        2,
+    );
+    bind_now!(sqlx::query(&sql).bind(meeting_id))
         .execute(pool)
         .await?;
     Ok(())
 }
 
 /// End a meeting (set state to 'ended', set ended_at).
-pub async fn end_meeting(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE meetings SET state = 'ended', ended_at = NOW() WHERE id = $1")
-        .bind(meeting_id)
+pub async fn end_meeting(pool: &DbPool, meeting_id: i32) -> Result<(), sqlx::Error> {
+    let sql = now_sql(
+        "UPDATE meetings SET state = 'ended', ended_at = {now}, updated_at = {now} WHERE id = $1",
+        2,
+    );
+    bind_now!(sqlx::query(&sql).bind(meeting_id))
         .execute(pool)
         .await?;
     Ok(())
@@ -171,58 +181,62 @@ pub async fn end_meeting(pool: &PgPool, meeting_id: i32) -> Result<(), sqlx::Err
 
 /// Update the cached host display name.
 pub async fn set_host_display_name(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     display_name: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE meetings SET host_display_name = $1 WHERE id = $2")
-        .bind(display_name)
-        .bind(meeting_id)
+    let sql = now_sql(
+        "UPDATE meetings SET host_display_name = $1, updated_at = {now} WHERE id = $2",
+        3,
+    );
+    bind_now!(sqlx::query(&sql).bind(display_name).bind(meeting_id))
         .execute(pool)
         .await?;
     Ok(())
 }
 
-/// Atomically update the waiting_room_enabled setting for a meeting.
-/// When disabling the waiting room, auto-admits all currently waiting participants
-/// within the same transaction to prevent race conditions.
+/// Atomically update `waiting_room_enabled`, admitting everyone waiting when it
+/// is turned off — in one transaction so a concurrent join cannot strand.
+///
+/// Takes the write lock up front via [`lock::begin_write`], matching
+/// [`crate::db::participants::join_attendee`]; only one side being immediate
+/// would move the race, not close it.
 pub async fn update_waiting_room_enabled(
-    pool: &PgPool,
+    pool: &DbPool,
     room_id: &str,
     creator_id: &str,
     enabled: bool,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    with_retry! {
+        let mut tx = lock::begin_write(pool).await?;
 
-    let updated = sqlx::query_as::<_, MeetingRow>(
-        r#"
-        UPDATE meetings
-        SET waiting_room_enabled = $3
-        WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
-        RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
-                  deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled
-        "#,
-    )
-    .bind(room_id)
-    .bind(creator_id)
-    .bind(enabled)
-    .fetch_optional(&mut *tx)
-    .await?;
+        let sql = stmt(
+            "UPDATE meetings SET waiting_room_enabled = $3, updated_at = {now}
+             WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
+             RETURNING {cols}",
+            4,
+        );
+        let updated = bind_now!(sqlx::query_as::<_, MeetingRow>(&sql)
+            .bind(room_id)
+            .bind(creator_id)
+            .bind(enabled))
+        .fetch_optional(&mut *tx)
+        .await?;
 
-    // When disabling the waiting room, admit everyone currently waiting.
-    if let Some(ref row) = updated {
-        if !enabled {
-            sqlx::query(
-                "UPDATE meeting_participants SET status = 'admitted', admitted_at = NOW() \
-                 WHERE meeting_id = $1 AND status = 'waiting'",
-            )
-            .bind(row.id)
-            .execute(&mut *tx)
-            .await?;
+        if let Some(ref row) = updated {
+            if !enabled {
+                let sql = now_sql(
+                    "UPDATE meeting_participants SET status = 'admitted', admitted_at = {now}, \
+                     updated_at = {now} WHERE meeting_id = $1 AND status = 'waiting'",
+                    2,
+                );
+                bind_now!(sqlx::query(&sql).bind(row.id))
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
-    }
 
-    tx.commit().await?;
-    Ok(updated)
+        tx.commit().await?;
+        Ok(updated)
+    }
 }

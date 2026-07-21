@@ -11,48 +11,17 @@
  * at your option.
  */
 
-//! The parts of the SQLite backend that have no PostgreSQL analogue, and so
-//! cannot live in the shared suite: the per-connection pragmas `db::connect`
-//! sets, and the `SQLITE_BUSY` retry in `db::lock::with_write_retry`.
+//! SQLite-only coverage with no PostgreSQL analogue: the per-connection pragmas
+//! `db::connect` sets, and the `SQLITE_BUSY` retry in `db::lock::with_write_retry`.
+//! Everything else runs against both backends from the shared suite.
 //!
-//! Nothing here re-tests behaviour the shared suite already covers. Schema,
-//! queries and the waiting-room race all run against both backends from the
-//! ordinary test files; this file exists only for the two things PostgreSQL has
-//! no equivalent of.
+//! Tests use the same `DATABASE_URL` database dbmate migrated for the rest of the
+//! suite; each pool differs from production in exactly the one option under test,
+//! so a passing test shows that option is load-bearing. Being SQLite-only, this
+//! file binds timestamps directly rather than via the `db::now_sql` shim.
 //!
-//! Because this file is SQLite-only it binds timestamps directly rather than
-//! going through `db::now_expr` / `bind_now!`, which are crate-internal and
-//! exist to keep *shared* SQL dialect-neutral. There is no PostgreSQL run of
-//! these tests for them to diverge from.
-//!
-//! Every test runs against the same `DATABASE_URL` database dbmate migrated for
-//! the rest of the suite. The pools opened here differ from the production pool
-//! in exactly one option each — the one under test — so what they prove is that
-//! the option is load-bearing, not that some separately-built schema behaves
-//! some way.
-//!
-//! ## Feature guards (verified by hand, not by a test)
-//!
-//! `db::mod` refuses to compile with both backends or with neither. Adding
-//! `trybuild` to prove that would cost a dev-dependency and a compile of the
-//! whole crate per case, so it is checked manually instead. Observed on this
-//! branch:
-//!
-//! ```text
-//! $ cargo check -p meeting-api --all-features
-//! error: meeting-api: the `postgres` and `sqlite` features are mutually exclusive.
-//!        Build with `--no-default-features --features sqlite` to select SQLite.
-//!
-//! $ cargo check -p meeting-api --no-default-features
-//! error: meeting-api: exactly one database backend feature must be enabled
-//!        (`postgres` or `sqlite`).
-//! error[E0432]: unresolved import `crate::db::DbPool`
-//! ```
-//!
-//! The `--all-features` case stops at the guard with nothing else reported. The
-//! no-backend case reports the guard first and then the expected cascade of
-//! `DbPool` being undefined, which is why the guard lives in `db/mod.rs`: it is
-//! the first thing the user reads.
+//! The `db::mod` feature guards (both backends / neither refuse to compile) are
+//! verified by hand rather than with a `trybuild` dev-dependency.
 
 #![cfg(all(feature = "sqlite", not(feature = "postgres")))]
 
@@ -69,14 +38,9 @@ use test_helpers::{cleanup_test_data, get_test_pool};
 
 // ── Per-connection pragmas ──────────────────────────────────────────────
 
-/// `foreign_keys`, `journal_mode` and `busy_timeout` are per *connection*, so a
-/// pool that set them only while opening the first one would leave the other
-/// four on SQLite's defaults — foreign keys off, rollback journal, no wait.
-/// Hold every connection in the pool at once and check all three on each.
-///
-/// `busy_timeout` is the one that fails silently: a connection left at the
-/// default of 0 does not misbehave until it is the one that happens to hit
-/// contention, and then it returns `SQLITE_BUSY` instantly instead of waiting.
+/// The pragmas are per *connection*, so setting them on only the first would
+/// leave the rest on SQLite's defaults. Hold all five at once and check each —
+/// `busy_timeout` especially, which fails silently until a connection contends.
 #[tokio::test]
 #[serial]
 async fn test_every_pooled_connection_has_the_required_pragmas() {
@@ -306,14 +270,9 @@ fn hold_write_lock(pool: &DbPool, duration: Duration) -> tokio::task::JoinHandle
     })
 }
 
-/// A pool on the suite's own database, differing from the production pool in
-/// exactly the options passed here.
-///
-/// Only the tests that need to *provoke* what production suppresses use this;
-/// everything else goes through `meeting_api::db::connect` via
-/// [`test_helpers::get_test_pool`]. The database is the dbmate-migrated one
-/// named by `DATABASE_URL` — these tests never build a schema of their own,
-/// because a schema assembled in test code is not the schema production runs.
+/// A pool on the suite's `DATABASE_URL` database, differing from the production
+/// pool only in the options passed here — used by tests that must provoke what
+/// production suppresses. Everything else uses [`test_helpers::get_test_pool`].
 async fn variant_pool(foreign_keys: bool, busy_timeout: Duration) -> DbPool {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
     let options = SqliteConnectOptions::from_str(&url)

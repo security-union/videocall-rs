@@ -13,7 +13,7 @@
 
 //! OAuth request and user storage queries.
 
-use crate::db::{bind_now_naive, now_naive_expr, q, DbPool};
+use crate::db::{bind_now_naive, now_naive_sql, q, DbPool};
 
 /// Stored PKCE challenge/verifier and CSRF state for an in-flight OAuth flow.
 #[derive(Debug, sqlx::FromRow)]
@@ -66,12 +66,9 @@ pub async fn fetch_oauth_request(
 
 /// Upsert a user after successful OAuth login.
 ///
-/// `created_at` / `last_login` go through [`now_naive_expr`] rather than the
-/// usual [`crate::db::now_expr`]: they are the schema's only `TIMESTAMP`
-/// (no time zone) columns. On PostgreSQL that is `CURRENT_TIMESTAMP`, evaluated
-/// server-side; on SQLite it is a bound `NaiveDateTime`. Binding an aware
-/// `DateTime<Utc>` would send a `TIMESTAMPTZ` that PostgreSQL converts using the
-/// session time zone.
+/// `created_at` / `last_login` use [`now_naive_sql`] because they are the
+/// schema's only `TIMESTAMP` (no time zone) columns; an aware `DateTime<Utc>`
+/// would send a `TIMESTAMPTZ` that PostgreSQL casts by session time zone.
 pub async fn upsert_user(
     pool: &DbPool,
     email: &str,
@@ -79,16 +76,13 @@ pub async fn upsert_user(
     access_token: &str,
     refresh_token: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    let sql = format!(
-        r#"
-        INSERT INTO users (email, name, access_token, refresh_token, created_at, last_login)
-        VALUES ($1, $2, $3, $4, {now}, {now})
-        ON CONFLICT (email)
-        DO UPDATE SET access_token = $3, refresh_token = $4, name = $2, last_login = {now}
-        "#,
-        now = now_naive_expr(5)
+    let sql = now_naive_sql(
+        "INSERT INTO users (email, name, access_token, refresh_token, created_at, last_login)
+         VALUES ($1, $2, $3, $4, {now}, {now})
+         ON CONFLICT (email)
+         DO UPDATE SET access_token = $3, refresh_token = $4, name = $2, last_login = {now}",
+        5,
     );
-    let sql = q(&sql);
     bind_now_naive!(sqlx::query(&sql)
         .bind(email)
         .bind(name)

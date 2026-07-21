@@ -11,18 +11,11 @@
  * at your option.
  */
 
-//! Schema-level integration tests, run against both backends.
-//!
-//! `dbmate/sqlite/db/migrations` is a hand-port of `dbmate/db/migrations`; no
-//! compiler compares the two. These tests are that comparison. Each one states
-//! a property of the PostgreSQL schema and asserts the SQLite port has it too,
-//! which is why they are *not* `cfg`-gated: running the identical assertions on
-//! PostgreSQL is what makes them a port check rather than a description of
-//! whatever SQLite happens to do.
-//!
-//! They go through the shared `db` layer wherever a function exists for the
-//! operation, so the `q()` placeholder shim and the bound-timestamp convention
-//! are exercised alongside the DDL.
+//! Schema-level tests, run against both backends. `dbmate/sqlite` is a hand-port
+//! of `dbmate/db` that nothing compares at compile time; these are that
+//! comparison. Each states a property of the PostgreSQL schema and asserts the
+//! SQLite port has it too — hence not `cfg`-gated, so the PostgreSQL run keeps
+//! them honest as a port check rather than a description of SQLite.
 
 mod test_helpers;
 
@@ -249,18 +242,10 @@ async fn test_room_id_is_unique_only_among_live_meetings() {
 
 /// `UPDATE ... RETURNING updated_at` must return the *new* value.
 ///
-/// The two backends satisfy this for different reasons, and this test only has
-/// teeth on one of them. PostgreSQL passes via its `BEFORE UPDATE` trigger,
-/// which runs before `RETURNING` is evaluated — it would pass even if the
-/// statement did not set `updated_at` at all, so on PostgreSQL this is a
-/// regression guard on the trigger, not on the query.
-///
-/// SQLite is the real subject. It has no trigger, because SQLite evaluates
-/// `RETURNING` *before* AFTER-triggers fire and a trigger-driven `updated_at`
-/// would come back stale — the caller would see the value from before its own
-/// write. Every UPDATE therefore sets `updated_at` explicitly, and it is the
-/// SQLite run of this test that stops those writes being dropped or the
-/// triggers being reintroduced.
+/// SQLite is the real subject: it has no trigger (it evaluates `RETURNING`
+/// before AFTER-triggers, so one would return a stale value), and this guards
+/// the explicit `updated_at` writes that stand in for it. PostgreSQL passes via
+/// its `BEFORE UPDATE` trigger regardless, so there it only guards the trigger.
 #[tokio::test]
 #[serial]
 async fn test_update_returning_yields_the_new_updated_at() {

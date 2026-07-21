@@ -11,31 +11,15 @@
  * at your option.
  */
 
-//! Shared test helpers for meeting-api integration tests.
+//! Shared test helpers. One suite, run against whichever backend the crate was
+//! compiled with; CI runs the same commands twice (`make tests_run` /
+//! `tests_run_sqlite`), so coverage is equal by construction.
 //!
-//! There is one suite, not one per backend. Every test here runs against
-//! whichever backend the crate was compiled with, and CI runs the *same*
-//! commands twice — see the `test` matrix in `.github/workflows/cargo-test.yaml`:
-//!
-//! ```text
-//! make tests_run         # postgres
-//! make tests_run_sqlite  # sqlite
-//! ```
-//!
-//! Both legs run the identical `$(MEETING_API_TEST)` command from the Makefile,
-//! differing only in `DATABASE_URL`, which dbmate directory is migrated, and the
-//! cargo feature. Coverage is therefore equal by construction: a test added here
-//! is automatically run against both backends, and there is no second harness to
-//! keep in sync.
-//!
-//! That matters most for the schema. `dbmate/sqlite/db/migrations` is a
-//! hand-written transliteration of `dbmate/db/migrations` and nothing compares
-//! the two at compile time, so this suite is the entire safety net against them
-//! drifting apart.
-//!
-//! Tests only ever see [`meeting_api::db::DbPool`], and statements written here
-//! go through [`meeting_api::db::q`] exactly like the ones in `src/db`, so a
-//! test file never needs a `cfg` of its own.
+//! Both legs go through [`meeting_api::db::connect`] on a database dbmate has
+//! already migrated — the SQLite leg exercises `dbmate/sqlite`, the same files
+//! production runs, so drift between the two dbmate dirs is caught here. Tests
+//! only see [`meeting_api::db::DbPool`] and route SQL through
+//! [`meeting_api::db::q`], so none needs a `cfg` of its own.
 
 #![allow(dead_code)]
 
@@ -51,19 +35,12 @@ pub const TEST_JWT_SECRET: &str = "test-secret-for-integration-tests";
 const TEST_TOKEN_TTL: i64 = 600;
 const TEST_SESSION_TTL: i64 = 3600;
 
-/// Connect to the test database named by `DATABASE_URL`.
+/// Connect to the test database named by `DATABASE_URL`, expected to already be
+/// migrated (`dbmate up` runs first — see the Makefile).
 ///
-/// Identical on both backends, because the backend-specific part is already
-/// handled underneath: [`meeting_api::db::DbPool`] resolves to the right pool
-/// type per feature, and [`meeting_api::db::connect`] — the same constructor
-/// `main` uses — applies the right options for the URL scheme. Tests therefore
-/// exercise the production pragmas (`foreign_keys`, `busy_timeout`, WAL) rather
-/// than a test-only reimplementation of them.
-///
-/// The database is expected to exist and be migrated already: `dbmate up` does
-/// that for both backends before `cargo test` runs (see the Makefile). Nothing
-/// here creates or migrates a database — the SQLite leg must exercise the same
-/// migration files production applies, not a parallel copy of the schema.
+/// Backend-agnostic: [`meeting_api::db::connect`] is the constructor `main` uses,
+/// so tests exercise the production pragmas rather than a reimplementation, and
+/// nothing here builds a schema of its own.
 pub async fn get_test_pool() -> DbPool {
     let url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set for tests");
     meeting_api::db::connect(&url).await

@@ -2,37 +2,22 @@ COMPOSE_IT := docker/docker-compose.integration.yaml
 COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 
 # ---------------------------------------------------------------------------
-# meeting-api backend matrix
+# meeting-api backend matrix — one test suite, run twice (postgres + sqlite).
 # ---------------------------------------------------------------------------
-# meeting-api compiles against either PostgreSQL or SQLite. There is ONE test
-# suite, run twice — not a suite per backend. `tests_run` and `tests_run_sqlite`
-# below invoke the identical $(MEETING_API_TEST) and $(MEETING_API_CLIPPY)
-# commands; the only differences are DATABASE_URL, which dbmate directory is
-# migrated, and this feature flag. Coverage is equal by construction, so a test
-# added to meeting-api/tests is automatically run against both backends and
-# there is no second harness to keep in sync.
+# `tests_run` and `tests_run_sqlite` invoke the identical $(MEETING_API_TEST) /
+# $(MEETING_API_CLIPPY); only DATABASE_URL, the dbmate dir, and the feature flag
+# differ, so coverage is equal by construction. Keep the commands in these
+# variables — spelling them out per target lets the two legs drift.
 #
-# Do not inline these commands into a target. The moment the two legs spell the
-# invocation out separately they can drift, which is the failure mode this
-# structure exists to prevent.
-#
-# `--test-threads=1` is part of the shared command, so both legs run identically;
-# it predates this branch (it was already on the PostgreSQL `cargo test
-# -p meeting-api` line) and it is load-bearing, not defensive. The suite shares a
-# single database and cleans up by `room_id`, so overlapping test functions would
-# delete each other's fixtures — which is why ~97 tests carry `#[serial]`.
-#
-# It does not weaken the concurrency coverage. `--test-threads=1` bounds how many
-# `#[test]` functions run at once; every race test builds its concurrency *inside*
-# one test with `tokio::spawn` (two writers on the same pool), which this flag
-# cannot serialize. The race tests are `#[serial]` regardless.
+# `--test-threads=1` is shared and load-bearing: the suite shares one database
+# and cleans up by room_id, so ~97 tests are `#[serial]`. It does not weaken race
+# coverage — each race test spawns its own writers inside one test.
 MEETING_API_FEATURES ?=
 MEETING_API_TEST = cargo test -p meeting-api $(MEETING_API_FEATURES) -- --nocapture --test-threads=1
 MEETING_API_CLIPPY = cargo clippy -p meeting-api --all-targets $(MEETING_API_FEATURES) -- -D warnings
 
-# SQLite has no server, so its "instance" is a file. dbmate creates and migrates
-# it exactly as it does the PostgreSQL database; it lives outside the bind-mounted
-# repo so a test run never dirties the working tree.
+# SQLite's "instance" is a file; dbmate creates and migrates it like the
+# PostgreSQL database. Kept outside the repo so a run never dirties the tree.
 SQLITE_TEST_DB := /tmp/meeting-api-test.sqlite3
 SQLITE_TEST_URL := sqlite:$(SQLITE_TEST_DB)
 
@@ -50,13 +35,9 @@ tests_run:
 		cargo test -p videocall-api -- --nocapture --test-threads=1 && \
 		$(MEETING_API_TEST)"
 
-# SQLite leg of the backend matrix.
-#
-# Same container, same nix devshell, same cargo command as `tests_run` — so this
-# is genuinely the same suite, not a lookalike. `--no-deps` skips postgres and
-# nats, which SQLite does not need, and dbmate migrates dbmate/sqlite exactly as
-# the PostgreSQL leg migrates dbmate/db. The suite therefore runs against the
-# migration files production applies, not a schema assembled in test code.
+# SQLite leg: same container and cargo command as `tests_run`; `--no-deps` skips
+# postgres/nats, and dbmate migrates dbmate/sqlite as the pg leg migrates
+# dbmate/db, so the suite runs against production's migration files.
 tests_run_sqlite: MEETING_API_FEATURES = --no-default-features --features sqlite
 tests_run_sqlite:
 	docker compose -f $(COMPOSE_IT) run --rm --no-deps \

@@ -13,55 +13,33 @@
 
 //! Concurrency tests for the waiting room, run against both backends.
 //!
-//! `db::participants::join_attendee` reads `waiting_room_enabled` and then
-//! inserts a participant whose status depends on what it read;
-//! `db::meetings::update_waiting_room_enabled` writes that flag and, when
-//! disabling, admits everyone currently waiting. The two must serialize, which
-//! is what `db::lock::begin_write` is for — `SELECT ... FOR UPDATE` on
-//! PostgreSQL, `BEGIN IMMEDIATE` on SQLite. A plain `pool.begin()` is `BEGIN
-//! DEFERRED` and takes no lock at all, which permits:
+//! `join_attendee` reads `waiting_room_enabled` then inserts a participant whose
+//! status depends on the read; `update_waiting_room_enabled` writes that flag and
+//! admits the waiting when disabling. They must serialize via
+//! `db::lock::begin_write` (`FOR UPDATE` on PostgreSQL, `BEGIN IMMEDIATE` on
+//! SQLite). A plain deferred `pool.begin()` takes no lock and permits:
 //!
 //! ```text
 //! T1 join_attendee : BEGIN; SELECT waiting_room_enabled -> true
 //! T2 host toggle   : BEGIN; UPDATE waiting_room_enabled = false;
-//!                           UPDATE participants SET status='admitted' WHERE status='waiting';
-//!                           COMMIT
-//! T1               : INSERT participant status='waiting'; COMMIT
+//!                           UPDATE participants SET status='admitted' WHERE status='waiting'; COMMIT
+//! T1               : INSERT participant status='waiting'; COMMIT   -- stranded, never admitted
 //! ```
 //!
-//! leaving a participant sitting in the waiting room of a meeting that has no
-//! waiting room. Nothing ever admits them: the sweep that would have has
-//! already run.
+//! Reverting `begin_write` to `pool.begin()` fails
+//! [`test_toggle_off_between_a_joins_read_and_write_never_strands`] on PostgreSQL
+//! (the strand above) and [`test_concurrent_writers_do_not_surface_lock_errors`]
+//! on SQLite (its single write lock turns the same revert into `database is
+//! locked`). Those two hold the line; the swept-delay tests cover contention
+//! broadly but the window is too short for timing alone to catch the revert.
 //!
-//! The regression this file exists to catch is `begin_write` reverting to a
-//! plain `pool.begin()`. Both backends were checked against that revert, and
-//! they fail differently:
-//!
-//! - PostgreSQL loses `FOR UPDATE`, produces the stranded participant above,
-//!   and fails [`test_toggle_off_between_a_joins_read_and_write_never_strands`].
-//! - SQLite has one database write lock, so it cannot corrupt the state this
-//!   way; what it does instead is fail the deferred transaction's upgrade to a
-//!   write with `SQLITE_BUSY`, which `with_write_retry` cannot always absorb.
-//!   That surfaces as `database is locked` out of
-//!   [`test_concurrent_writers_do_not_surface_lock_errors`].
-//!
-//! Timing alone does not catch either: the window between the join's read and
-//! its write is far shorter than the competing transaction, so the swept-delay
-//! tests below passed against the reverted code. They stay because they cover
-//! contention broadly, but the two named tests are the ones that hold the line.
-//!
-//! On the *enabling* side there is no equivalent final-state assertion to make,
-//! and it is worth writing down why rather than shipping a test that looks like
-//! one. "Waiting room on, participant admitted" is also the outcome of the
-//! perfectly legal serial order (attendee joins, host then enables the waiting
-//! room) — existing participants are not evicted when the host turns it on. Two
-//! concurrent calls therefore cannot be distinguished from that serial order by
-//! looking at the rows afterwards, so the enabling side is covered here by
-//! [`test_toggle_on_race_stays_internally_consistent`] (the flag each join acts
-//! on is the flag its own row reflects, and nothing errors out) plus
-//! [`test_join_after_a_committed_enable_always_waits`], which pins down the one
-//! ordering that *is* observable: once the host's call has returned, no later
-//! join may be auto-admitted.
+//! The *enabling* side has no final-state assertion: "waiting room on, attendee
+//! admitted" is also the legal serial order (join, then enable — enabling does
+//! not evict), so it is indistinguishable from the rows afterwards. It is instead
+//! covered by [`test_toggle_on_race_stays_internally_consistent`] (each join's
+//! result matches the flag it acted on) and
+//! [`test_join_after_a_committed_enable_always_waits`] (once the host's call
+//! returns, no later join is auto-admitted).
 //!
 //! Where a test does depend on timing it sweeps rather than sleeps: each
 //! iteration offsets the competing task by a slightly larger delay, so the
@@ -118,12 +96,10 @@ async fn fresh_meeting(pool: &DbPool, room_id: &str, waiting_room_enabled: bool)
 /// read, so T2's UPDATE queues behind T1 instead of slipping past it: T1 commits
 /// its `waiting` row first and T2's admit-all then finds and admits it.
 ///
-/// On PostgreSQL the ordering above is exact — W blocks T1 without blocking T2,
-/// because the two contend on different rows. SQLite has a single database
-/// write lock, so W necessarily blocks T2 as well and the interleaving degrades
-/// to "both writers queue behind W"; the assertion still holds there, it just
-/// stops being the reason the test is interesting. That asymmetry is the whole
-/// reason `begin_write` has two implementations.
+/// The interleaving above is exact on PostgreSQL (W blocks T1 but not T2, since
+/// they touch different rows). SQLite's single write lock makes W block T2 too,
+/// so both writers just queue behind W; the assertion still holds, less
+/// pointedly. That asymmetry is why `begin_write` has two implementations.
 #[tokio::test]
 #[serial]
 async fn test_toggle_off_between_a_joins_read_and_write_never_strands() {
@@ -166,10 +142,8 @@ async fn test_toggle_off_between_a_joins_read_and_write_never_strands() {
     // Give the toggle every chance to run to completion ahead of the join.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // Without this the test can pass vacuously: if the join had already run to
-    // completion during the sleeps above, it never sat in the window this test
-    // exists to exercise, and the assertions below would hold for the boring
-    // reason. On a loaded runner that is exactly what a fixed sleep risks.
+    // Guard against a vacuous pass: if the join already finished, it never sat
+    // in the window and the assertions below would hold for the boring reason.
     assert!(
         !joiner.is_finished(),
         "the join completed before the blocking key was released, so it never \

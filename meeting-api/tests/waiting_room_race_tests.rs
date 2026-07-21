@@ -166,6 +166,17 @@ async fn test_toggle_off_between_a_joins_read_and_write_never_strands() {
     // Give the toggle every chance to run to completion ahead of the join.
     tokio::time::sleep(Duration::from_millis(150)).await;
 
+    // Without this the test can pass vacuously: if the join had already run to
+    // completion during the sleeps above, it never sat in the window this test
+    // exists to exercise, and the assertions below would hold for the boring
+    // reason. On a loaded runner that is exactly what a fixed sleep risks.
+    assert!(
+        !joiner.is_finished(),
+        "the join completed before the blocking key was released, so it never \
+         parked between its read of waiting_room_enabled and its INSERT — this \
+         run proves nothing about the race"
+    );
+
     blocker
         .rollback()
         .await

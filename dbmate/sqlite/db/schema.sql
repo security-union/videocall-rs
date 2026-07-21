@@ -26,8 +26,12 @@ CREATE TABLE meetings (
     password_hash        TEXT CHECK (password_hash IS NULL OR length(password_hash) <= 255),
     state                TEXT NOT NULL DEFAULT 'idle'
                          CHECK (state IN ('idle', 'active', 'ended')),
+    -- `json_type(...) = 'array'` is not redundant: json_array_length returns 0
+    -- for a JSON object, so without it `{"a":1}` would pass here while
+    -- PostgreSQL's jsonb_array_length raises.
     attendees            TEXT NOT NULL DEFAULT '[]'
-                         CHECK (json_array_length(attendees) <= 100),
+                         CHECK (json_type(attendees) = 'array'
+                                AND json_array_length(attendees) <= 100),
     host_display_name    TEXT CHECK (host_display_name IS NULL OR length(host_display_name) <= 255),
     waiting_room_enabled BOOLEAN NOT NULL DEFAULT TRUE
 );

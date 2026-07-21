@@ -12,10 +12,24 @@
  */
 
 //! Meeting participant table queries.
+//!
+//! # Why the `_stmt` / `_txn` split
+//!
+//! Every write here is a public wrapper around a private inner function, called
+//! through [`crate::db::lock::with_write_retry`]. On PostgreSQL the wrapper is a
+//! pass-through. On SQLite it absorbs `SQLITE_BUSY`, which a single writer can
+//! still hit once `busy_timeout` expires — without it a busy database surfaces
+//! to the API client as a bare "database is locked".
+//!
+//! Replaying is safe for both shapes. A `_txn` inner has already rolled its
+//! transaction back before returning an error, and a `_stmt` inner is a single
+//! autocommit statement that applied nothing if it failed. The status
+//! predicates (`AND status = 'waiting'`) also make a replay that races a real
+//! change return `None` rather than double-applying.
 
 use chrono::{DateTime, Utc};
 
-use crate::db::{lock, q, DbPool};
+use crate::db::{bind_now, lock, now_expr, q, DbPool};
 
 /// Row returned from the `meeting_participants` table.
 #[derive(Debug, sqlx::FromRow)]
@@ -47,23 +61,36 @@ pub async fn upsert_host(
     user_id: &str,
     display_name: Option<&str>,
 ) -> Result<ParticipantRow, sqlx::Error> {
+    lock::with_write_retry(|| Box::pin(upsert_host_stmt(pool, meeting_id, user_id, display_name)))
+        .await
+}
+
+async fn upsert_host_stmt(
+    pool: &DbPool,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+) -> Result<ParticipantRow, sqlx::Error> {
+    // `joined_at` / `created_at` are left to the column DEFAULTs, which are the
+    // database's clock on both backends.
     let query = format!(
         r#"
-        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at, joined_at, created_at, updated_at)
-        VALUES ($1, $2, 'admitted', TRUE, $3, $4, $4, $4, $4)
+        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
+        VALUES ($1, $2, 'admitted', TRUE, $3, {now})
         ON CONFLICT (meeting_id, user_id)
-        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = $4, updated_at = $4, left_at = NULL,
+        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = {now}, updated_at = {now}, left_at = NULL,
                       display_name = COALESCE($3, meeting_participants.display_name)
         RETURNING {PARTICIPANT_COLUMNS}
-        "#
+        "#,
+        now = now_expr(4)
     );
-    sqlx::query_as::<_, ParticipantRow>(&q(&query))
+    let query = q(&query);
+    bind_now!(sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
         .bind(user_id)
-        .bind(display_name)
-        .bind(Utc::now())
-        .fetch_one(pool)
-        .await
+        .bind(display_name))
+    .fetch_one(pool)
+    .await
 }
 
 /// Atomically join a meeting as an attendee, respecting the current `waiting_room_enabled`
@@ -94,7 +121,6 @@ async fn join_attendee_txn(
     display_name: Option<&str>,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
     let mut tx = lock::begin_write(pool).await?;
-    let now = Utc::now();
 
     // Read the flag under the write lock so a concurrent toggle cannot slip in
     // between this read and the insert below.
@@ -106,39 +132,41 @@ async fn join_attendee_txn(
     let row = if waiting_room_enabled {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, joined_at, created_at, updated_at)
-            VALUES ($1, $2, 'waiting', FALSE, $3, $4, $4, $4)
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name)
+            VALUES ($1, $2, 'waiting', FALSE, $3)
             ON CONFLICT (meeting_id, user_id)
-            DO UPDATE SET status = 'waiting', updated_at = $4, left_at = NULL,
+            DO UPDATE SET status = 'waiting', updated_at = {now}, left_at = NULL,
                           display_name = COALESCE($3, meeting_participants.display_name)
             RETURNING {PARTICIPANT_COLUMNS}
-            "#
+            "#,
+            now = now_expr(4)
         );
-        sqlx::query_as::<_, ParticipantRow>(&q(&query))
+        let query = q(&query);
+        bind_now!(sqlx::query_as::<_, ParticipantRow>(&query)
             .bind(meeting_id)
             .bind(user_id)
-            .bind(display_name)
-            .bind(now)
-            .fetch_one(&mut *tx)
-            .await?
+            .bind(display_name))
+        .fetch_one(&mut *tx)
+        .await?
     } else {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at, joined_at, created_at, updated_at)
-            VALUES ($1, $2, 'admitted', FALSE, $3, $4, $4, $4, $4)
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
+            VALUES ($1, $2, 'admitted', FALSE, $3, {now})
             ON CONFLICT (meeting_id, user_id)
-            DO UPDATE SET status = 'admitted', admitted_at = $4, updated_at = $4, left_at = NULL,
+            DO UPDATE SET status = 'admitted', admitted_at = {now}, updated_at = {now}, left_at = NULL,
                           display_name = COALESCE($3, meeting_participants.display_name)
             RETURNING {PARTICIPANT_COLUMNS}
-            "#
+            "#,
+            now = now_expr(4)
         );
-        sqlx::query_as::<_, ParticipantRow>(&q(&query))
+        let query = q(&query);
+        bind_now!(sqlx::query_as::<_, ParticipantRow>(&query)
             .bind(meeting_id)
             .bind(user_id)
-            .bind(display_name)
-            .bind(now)
-            .fetch_one(&mut *tx)
-            .await?
+            .bind(display_name))
+        .fetch_one(&mut *tx)
+        .await?
     };
 
     tx.commit().await?;
@@ -195,35 +223,51 @@ pub async fn admit(
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
+    lock::with_write_retry(|| Box::pin(admit_stmt(pool, meeting_id, user_id))).await
+}
+
+async fn admit_stmt(
+    pool: &DbPool,
+    meeting_id: i32,
+    user_id: &str,
+) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'admitted', admitted_at = $3, updated_at = $3
+        SET status = 'admitted', admitted_at = {now}, updated_at = {now}
         WHERE meeting_id = $1 AND user_id = $2 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
-        "#
+        "#,
+        now = now_expr(3)
     );
-    sqlx::query_as::<_, ParticipantRow>(&q(&query))
+    let query = q(&query);
+    bind_now!(sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
-        .bind(user_id)
-        .bind(Utc::now())
-        .fetch_optional(pool)
-        .await
+        .bind(user_id))
+    .fetch_optional(pool)
+    .await
 }
 
 /// Admit all waiting participants at once.
 pub async fn admit_all(pool: &DbPool, meeting_id: i32) -> Result<Vec<ParticipantRow>, sqlx::Error> {
+    lock::with_write_retry(|| Box::pin(admit_all_stmt(pool, meeting_id))).await
+}
+
+async fn admit_all_stmt(
+    pool: &DbPool,
+    meeting_id: i32,
+) -> Result<Vec<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'admitted', admitted_at = $2, updated_at = $2
+        SET status = 'admitted', admitted_at = {now}, updated_at = {now}
         WHERE meeting_id = $1 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
-        "#
+        "#,
+        now = now_expr(2)
     );
-    sqlx::query_as::<_, ParticipantRow>(&q(&query))
-        .bind(meeting_id)
-        .bind(Utc::now())
+    let query = q(&query);
+    bind_now!(sqlx::query_as::<_, ParticipantRow>(&query).bind(meeting_id))
         .fetch_all(pool)
         .await
 }
@@ -234,20 +278,29 @@ pub async fn reject(
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
+    lock::with_write_retry(|| Box::pin(reject_stmt(pool, meeting_id, user_id))).await
+}
+
+async fn reject_stmt(
+    pool: &DbPool,
+    meeting_id: i32,
+    user_id: &str,
+) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'rejected', updated_at = $3
+        SET status = 'rejected', updated_at = {now}
         WHERE meeting_id = $1 AND user_id = $2 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
-        "#
+        "#,
+        now = now_expr(3)
     );
-    sqlx::query_as::<_, ParticipantRow>(&q(&query))
+    let query = q(&query);
+    bind_now!(sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
-        .bind(user_id)
-        .bind(Utc::now())
-        .fetch_optional(pool)
-        .await
+        .bind(user_id))
+    .fetch_optional(pool)
+    .await
 }
 
 /// Leave a meeting (set status to 'left').
@@ -256,20 +309,29 @@ pub async fn leave(
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
+    lock::with_write_retry(|| Box::pin(leave_stmt(pool, meeting_id, user_id))).await
+}
+
+async fn leave_stmt(
+    pool: &DbPool,
+    meeting_id: i32,
+    user_id: &str,
+) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'left', left_at = $3, updated_at = $3
+        SET status = 'left', left_at = {now}, updated_at = {now}
         WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')
         RETURNING {PARTICIPANT_COLUMNS}
-        "#
+        "#,
+        now = now_expr(3)
     );
-    sqlx::query_as::<_, ParticipantRow>(&q(&query))
+    let query = q(&query);
+    bind_now!(sqlx::query_as::<_, ParticipantRow>(&query)
         .bind(meeting_id)
-        .bind(user_id)
-        .bind(Utc::now())
-        .fetch_optional(pool)
-        .await
+        .bind(user_id))
+    .fetch_optional(pool)
+    .await
 }
 
 /// Count admitted participants in a meeting.

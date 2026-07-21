@@ -11,15 +11,18 @@
 -- Deviations from a literal transliteration, all deliberate:
 --
 --  * `session_participants` is omitted. It has no Rust references.
---  * Timestamps are TEXT holding RFC 3339. The application always binds
---    `chrono::Utc::now()` rather than writing `datetime('now')`, whose
---    `2026-07-21 04:39:04` rendering would not sort against RFC 3339 in the
---    same column. The DEFAULTs below emit RFC 3339 for the same reason.
+--  * Timestamps are TEXT holding RFC 3339. Where PostgreSQL writes `NOW()`,
+--    the SQLite build binds `chrono::Utc::now()` (see `db::now_expr`) rather
+--    than writing `datetime('now')`, whose `2026-07-21 04:39:04` rendering
+--    would not sort lexicographically against RFC 3339 in the same column and
+--    would break `ORDER BY created_at DESC`. The DEFAULTs below emit RFC 3339
+--    for that same reason, so a DEFAULT and a bound value stay comparable.
 --  * There are no `updated_at` triggers. SQLite evaluates `RETURNING` *before*
 --    AFTER-triggers run, so an `UPDATE ... RETURNING updated_at` driven by a
 --    trigger returns the stale value. Every UPDATE sets `updated_at`
---    explicitly instead (PostgreSQL keeps its BEFORE trigger, which writes the
---    same value a beat later).
+--    explicitly instead. PostgreSQL keeps its BEFORE trigger and overwrites
+--    that explicit write with the same `transaction_timestamp()`, so the two
+--    backends agree without the SQL diverging.
 --  * `VARCHAR(n)` becomes `TEXT` plus a `CHECK (length(col) <= n)`, because
 --    SQLite ignores type-name length limits entirely.
 
@@ -56,8 +59,12 @@ CREATE TABLE meetings (
     password_hash        TEXT CHECK (password_hash IS NULL OR length(password_hash) <= 255),
     state                TEXT NOT NULL DEFAULT 'idle'
                          CHECK (state IN ('idle', 'active', 'ended')),
+    -- `json_type(...) = 'array'` is not redundant: json_array_length returns 0
+    -- for a JSON object, so without it `{"a":1}` would pass here while
+    -- PostgreSQL's jsonb_array_length raises.
     attendees            TEXT NOT NULL DEFAULT '[]'
-                         CHECK (json_array_length(attendees) <= 100),
+                         CHECK (json_type(attendees) = 'array'
+                                AND json_array_length(attendees) <= 100),
     host_display_name    TEXT CHECK (host_display_name IS NULL OR length(host_display_name) <= 255),
     waiting_room_enabled BOOLEAN NOT NULL DEFAULT TRUE
 );
@@ -73,7 +80,8 @@ CREATE UNIQUE INDEX idx_meetings_room_id_unique_active
 
 -- Meeting participants: waiting room and admission tracking.
 -- The ON DELETE CASCADE is inert unless `PRAGMA foreign_keys = ON`, which
--- `connect_db` sets via SqliteConnectOptions::foreign_keys for every connection.
+-- `meeting_api::db::connect` sets via SqliteConnectOptions::foreign_keys on
+-- every pooled connection.
 CREATE TABLE meeting_participants (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     meeting_id   INTEGER NOT NULL REFERENCES meetings(id) ON DELETE CASCADE,

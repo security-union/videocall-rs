@@ -247,11 +247,20 @@ async fn test_room_id_is_unique_only_among_live_meetings() {
 
 // ── updated_at ──────────────────────────────────────────────────────────
 
-/// The SQLite port has no `AFTER UPDATE` trigger for `updated_at`, on purpose:
-/// SQLite evaluates `RETURNING` before AFTER-triggers fire, so a trigger-driven
-/// `updated_at` comes back stale — the caller sees the value from *before* its
-/// own write. Every UPDATE therefore sets `updated_at` explicitly. This test is
-/// what stops the triggers being reintroduced.
+/// `UPDATE ... RETURNING updated_at` must return the *new* value.
+///
+/// The two backends satisfy this for different reasons, and this test only has
+/// teeth on one of them. PostgreSQL passes via its `BEFORE UPDATE` trigger,
+/// which runs before `RETURNING` is evaluated — it would pass even if the
+/// statement did not set `updated_at` at all, so on PostgreSQL this is a
+/// regression guard on the trigger, not on the query.
+///
+/// SQLite is the real subject. It has no trigger, because SQLite evaluates
+/// `RETURNING` *before* AFTER-triggers fire and a trigger-driven `updated_at`
+/// would come back stale — the caller would see the value from before its own
+/// write. Every UPDATE therefore sets `updated_at` explicitly, and it is the
+/// SQLite run of this test that stops those writes being dropped or the
+/// triggers being reintroduced.
 #[tokio::test]
 #[serial]
 async fn test_update_returning_yields_the_new_updated_at() {

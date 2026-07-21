@@ -85,36 +85,71 @@ where
 /// Run a write transaction, retrying it if SQLite reports `SQLITE_BUSY` /
 /// `SQLITE_LOCKED`.
 ///
-/// `busy_timeout` (set on every pooled connection in `main.rs`) already makes
-/// SQLite spin internally, so reaching this retry means contention outlasted
-/// that timeout. `op` must open its own transaction: a failed attempt has been
-/// rolled back, which is what makes replaying it safe.
+/// `busy_timeout` (set on every pooled connection by [`crate::db::connect`])
+/// already makes SQLite spin internally, so reaching this retry means contention
+/// outlasted that timeout. `op` must be replayable — either it opens its own
+/// transaction, which a failed attempt has already rolled back, or it is a
+/// single autocommit statement, which applied nothing if it failed.
+///
+/// # Latency budget
+///
+/// Retries are bounded by [`RETRY_DEADLINE`] wall-clock, not by an attempt
+/// count. This is a real-time conferencing API sitting behind a client timeout:
+/// a bound of "5 attempts" is really "5 × `busy_timeout` + backoff", which at
+/// the production `busy_timeout` of 5s is ~25s of an HTTP handler holding a
+/// connection open long after the caller has given up.
+///
+/// The deadline gates *starting* a new attempt, so the true worst case is
+/// `RETRY_DEADLINE + busy_timeout` (~8s) — an attempt already in flight is not
+/// interrupted, because cancelling a transaction mid-commit is worse than
+/// waiting for it.
+///
+/// Only lock contention is retried. Notably [`sqlx::Error::PoolTimedOut`] is
+/// passed straight through: it means every connection is checked out, so
+/// retrying would queue behind the same exhausted pool and multiply a 30s
+/// acquire timeout rather than shorten it.
 #[cfg(all(feature = "sqlite", not(feature = "postgres")))]
 pub async fn with_write_retry<'a, T, F>(mut op: F) -> Result<T, sqlx::Error>
 where
     F: FnMut() -> BoxFuture<'a, Result<T, sqlx::Error>>,
 {
-    use std::time::Duration;
+    use std::time::Instant;
 
-    const MAX_ATTEMPTS: u32 = 5;
-    const BASE_BACKOFF: Duration = Duration::from_millis(20);
-
+    let started = Instant::now();
+    let mut backoff = BASE_BACKOFF;
     let mut attempt: u32 = 1;
+
     loop {
         match op().await {
-            Err(err) if attempt < MAX_ATTEMPTS && is_lock_contention(&err) => {
-                let backoff = BASE_BACKOFF * (1 << (attempt - 1));
+            Err(err)
+                if is_lock_contention(&err)
+                    && started.elapsed().saturating_add(backoff) < RETRY_DEADLINE =>
+            {
                 tracing::warn!(
-                    "SQLite write contention on attempt {attempt}/{MAX_ATTEMPTS}, \
-                     retrying in {backoff:?}: {err}"
+                    "SQLite write contention on attempt {attempt} ({:?} elapsed of {RETRY_DEADLINE:?}), \
+                     retrying in {backoff:?}: {err}",
+                    started.elapsed()
                 );
                 tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
                 attempt += 1;
             }
             result => return result,
         }
     }
 }
+
+/// How long [`with_write_retry`] may keep starting fresh attempts.
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+pub const RETRY_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Delay before the first retry; doubles up to [`MAX_BACKOFF`].
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+const BASE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// Ceiling on the exponential backoff, so a long deadline still retries often.
+#[cfg(all(feature = "sqlite", not(feature = "postgres")))]
+const MAX_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Whether an error is SQLite refusing to take the write lock.
 #[cfg(all(feature = "sqlite", not(feature = "postgres")))]

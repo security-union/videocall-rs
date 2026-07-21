@@ -12,11 +12,25 @@
  */
 
 //! Meeting table queries.
+//!
+//! # `updated_at` on UPDATE
+//!
+//! Every `UPDATE` here sets `updated_at` explicitly, via [`crate::db::now_expr`].
+//! On SQLite that is the only thing maintaining the column: the port has no
+//! `updated_at` trigger, because SQLite evaluates `RETURNING` *before*
+//! AFTER-triggers fire and a trigger-driven value would come back stale.
+//!
+//! On PostgreSQL the write is redundant — the `update_meetings_updated_at`
+//! `BEFORE UPDATE` trigger overwrites it. It is not, however, a *divergent*
+//! write: `NOW()` is `transaction_timestamp()`, so the statement and the trigger
+//! that fires inside it produce the identical value. That is what lets the same
+//! SQL serve both backends without changing what PostgreSQL stores. Do not
+//! "optimize" these away — SQLite depends on them.
 
 use chrono::{DateTime, Utc};
 use serde_json::Value as JsonValue;
 
-use crate::db::{lock, q, DbPool};
+use crate::db::{bind_now, lock, now_expr, q, DbPool};
 
 /// Row returned from the `meetings` table.
 #[derive(Debug, sqlx::FromRow)]
@@ -37,7 +51,12 @@ pub struct MeetingRow {
     pub waiting_room_enabled: bool,
 }
 
-/// Create a new meeting. Uses INSERT ... ON CONFLICT to handle the partial unique index.
+/// Create a new meeting.
+///
+/// A `room_id` already in use by a live meeting violates the partial unique
+/// index `idx_meetings_room_id_unique_active` and surfaces as a unique-violation
+/// error for the caller to map; the index is partial, so a `room_id` becomes
+/// available again once its meeting is soft-deleted.
 pub async fn create(
     pool: &DbPool,
     room_id: &str,
@@ -57,21 +76,25 @@ pub async fn create_with_options(
     attendees: &JsonValue,
     waiting_room_enabled: bool,
 ) -> Result<MeetingRow, sqlx::Error> {
-    sqlx::query_as::<_, MeetingRow>(&q(
+    // `created_at` / `updated_at` are left to the column DEFAULTs on both
+    // backends, which is the database's clock in each case.
+    let sql = format!(
         r#"
-        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, created_at, updated_at)
-        VALUES ($1, $2, $6, $3, 'idle', $4, $5, $6, $6)
+        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled)
+        VALUES ($1, $2, {now}, $3, 'idle', $4, $5)
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
                   waiting_room_enabled
         "#,
-    ))
-    .bind(room_id)
-    .bind(creator_id)
-    .bind(password_hash)
-    .bind(attendees)
-    .bind(waiting_room_enabled)
-    .bind(Utc::now())
+        now = now_expr(6)
+    );
+    let sql = q(&sql);
+    bind_now!(sqlx::query_as::<_, MeetingRow>(&sql)
+        .bind(room_id)
+        .bind(creator_id)
+        .bind(password_hash)
+        .bind(attendees)
+        .bind(waiting_room_enabled))
     .fetch_one(pool)
     .await
 }
@@ -133,42 +156,48 @@ pub async fn soft_delete(
     room_id: &str,
     creator_id: &str,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
-    sqlx::query_as::<_, MeetingRow>(&q(r#"
+    let sql = format!(
+        r#"
         UPDATE meetings
-        SET deleted_at = $3, updated_at = $3
+        SET deleted_at = {now}, updated_at = {now}
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
                   waiting_room_enabled
-        "#))
-    .bind(room_id)
-    .bind(creator_id)
-    .bind(Utc::now())
+        "#,
+        now = now_expr(3)
+    );
+    let sql = q(&sql);
+    bind_now!(sqlx::query_as::<_, MeetingRow>(&sql)
+        .bind(room_id)
+        .bind(creator_id))
     .fetch_optional(pool)
     .await
 }
 
 /// Activate a meeting (set state to 'active').
 pub async fn activate(pool: &DbPool, meeting_id: i32) -> Result<(), sqlx::Error> {
-    sqlx::query(&q(
-        "UPDATE meetings SET state = 'active', updated_at = $2 WHERE id = $1",
-    ))
-    .bind(meeting_id)
-    .bind(Utc::now())
-    .execute(pool)
-    .await?;
+    let sql = format!(
+        "UPDATE meetings SET state = 'active', updated_at = {now} WHERE id = $1",
+        now = now_expr(2)
+    );
+    let sql = q(&sql);
+    bind_now!(sqlx::query(&sql).bind(meeting_id))
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
 /// End a meeting (set state to 'ended', set ended_at).
 pub async fn end_meeting(pool: &DbPool, meeting_id: i32) -> Result<(), sqlx::Error> {
-    sqlx::query(&q(
-        "UPDATE meetings SET state = 'ended', ended_at = $2, updated_at = $2 WHERE id = $1",
-    ))
-    .bind(meeting_id)
-    .bind(Utc::now())
-    .execute(pool)
-    .await?;
+    let sql = format!(
+        "UPDATE meetings SET state = 'ended', ended_at = {now}, updated_at = {now} WHERE id = $1",
+        now = now_expr(2)
+    );
+    let sql = q(&sql);
+    bind_now!(sqlx::query(&sql).bind(meeting_id))
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -178,14 +207,14 @@ pub async fn set_host_display_name(
     meeting_id: i32,
     display_name: &str,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(&q(
-        "UPDATE meetings SET host_display_name = $1, updated_at = $3 WHERE id = $2",
-    ))
-    .bind(display_name)
-    .bind(meeting_id)
-    .bind(Utc::now())
-    .execute(pool)
-    .await?;
+    let sql = format!(
+        "UPDATE meetings SET host_display_name = $1, updated_at = {now} WHERE id = $2",
+        now = now_expr(3)
+    );
+    let sql = q(&sql);
+    bind_now!(sqlx::query(&sql).bind(display_name).bind(meeting_id))
+        .execute(pool)
+        .await?;
     Ok(())
 }
 
@@ -219,34 +248,38 @@ async fn update_waiting_room_enabled_txn(
     enabled: bool,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
     let mut tx = lock::begin_write(pool).await?;
-    let now = Utc::now();
 
-    let updated = sqlx::query_as::<_, MeetingRow>(&q(r#"
+    let sql = format!(
+        r#"
         UPDATE meetings
-        SET waiting_room_enabled = $3, updated_at = $4
+        SET waiting_room_enabled = $3, updated_at = {now}
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
                   waiting_room_enabled
-        "#))
-    .bind(room_id)
-    .bind(creator_id)
-    .bind(enabled)
-    .bind(now)
+        "#,
+        now = now_expr(4)
+    );
+    let sql = q(&sql);
+    let updated = bind_now!(sqlx::query_as::<_, MeetingRow>(&sql)
+        .bind(room_id)
+        .bind(creator_id)
+        .bind(enabled))
     .fetch_optional(&mut *tx)
     .await?;
 
     // When disabling the waiting room, admit everyone currently waiting.
     if let Some(ref row) = updated {
         if !enabled {
-            sqlx::query(&q(
-                "UPDATE meeting_participants SET status = 'admitted', admitted_at = $2, updated_at = $2 \
-                 WHERE meeting_id = $1 AND status = 'waiting'",
-            ))
-            .bind(row.id)
-            .bind(now)
-            .execute(&mut *tx)
-            .await?;
+            let sql = format!(
+                "UPDATE meeting_participants SET status = 'admitted', admitted_at = {now}, \
+                 updated_at = {now} WHERE meeting_id = $1 AND status = 'waiting'",
+                now = now_expr(2)
+            );
+            let sql = q(&sql);
+            bind_now!(sqlx::query(&sql).bind(row.id))
+                .execute(&mut *tx)
+                .await?;
         }
     }
 

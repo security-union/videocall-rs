@@ -15,6 +15,17 @@ COMPOSE_E2E := docker compose -p videocall-e2e -f docker/docker-compose.e2e.yaml
 # Do not inline these commands into a target. The moment the two legs spell the
 # invocation out separately they can drift, which is the failure mode this
 # structure exists to prevent.
+#
+# `--test-threads=1` is part of the shared command, so both legs run identically;
+# it predates this branch (it was already on the PostgreSQL `cargo test
+# -p meeting-api` line) and it is load-bearing, not defensive. The suite shares a
+# single database and cleans up by `room_id`, so overlapping test functions would
+# delete each other's fixtures — which is why ~97 tests carry `#[serial]`.
+#
+# It does not weaken the concurrency coverage. `--test-threads=1` bounds how many
+# `#[test]` functions run at once; every race test builds its concurrency *inside*
+# one test with `tokio::spawn` (two writers on the same pool), which this flag
+# cannot serialize. The race tests are `#[serial]` regardless.
 MEETING_API_FEATURES ?=
 MEETING_API_TEST = cargo test -p meeting-api $(MEETING_API_FEATURES) -- --nocapture --test-threads=1
 MEETING_API_CLIPPY = cargo clippy -p meeting-api --all-targets $(MEETING_API_FEATURES) -- -D warnings

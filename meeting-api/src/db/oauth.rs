@@ -12,24 +12,17 @@
  */
 
 //! OAuth request and user storage queries.
+//!
+//! Shared across the PostgreSQL and SQLite backends. `$N` placeholders are
+//! parsed natively by both sqlx drivers, so the query strings are identical;
+//! the current-timestamp expression comes from [`crate::db::SQL_NOW`].
 
-use sqlx::PgPool;
-
-/// Stored PKCE challenge/verifier and CSRF state for an in-flight OAuth flow.
-#[derive(Debug, sqlx::FromRow)]
-#[allow(dead_code)]
-pub struct OAuthRequestRow {
-    pub pkce_challenge: Option<String>,
-    pub pkce_verifier: Option<String>,
-    pub csrf_state: Option<String>,
-    pub return_to: Option<String>,
-    pub nonce: Option<String>,
-}
+use crate::db::{DbPool, OAuthRequestRow, SQL_NOW};
 
 /// Store a new OAuth request (PKCE + CSRF state + optional nonce) for later
 /// retrieval in the callback.
 pub async fn store_oauth_request(
-    pool: &PgPool,
+    pool: &DbPool,
     pkce_challenge: &str,
     pkce_verifier: &str,
     csrf_state: &str,
@@ -55,7 +48,7 @@ pub async fn store_oauth_request(
 /// Fetch and consume an OAuth request by CSRF state.
 /// The row is atomically deleted so that each state token can only be used once.
 pub async fn fetch_oauth_request(
-    pool: &PgPool,
+    pool: &DbPool,
     csrf_state: &str,
 ) -> Result<Option<OAuthRequestRow>, sqlx::Error> {
     sqlx::query_as::<_, OAuthRequestRow>(
@@ -68,25 +61,26 @@ pub async fn fetch_oauth_request(
 
 /// Upsert a user after successful OAuth login.
 pub async fn upsert_user(
-    pool: &PgPool,
+    pool: &DbPool,
     email: &str,
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
+    let query = format!(
         r#"
         INSERT INTO users (email, name, access_token, refresh_token, created_at, last_login)
-        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        VALUES ($1, $2, $3, $4, {SQL_NOW}, {SQL_NOW})
         ON CONFLICT (email)
-        DO UPDATE SET access_token = $3, refresh_token = $4, name = $2, last_login = CURRENT_TIMESTAMP
-        "#,
-    )
-    .bind(email)
-    .bind(name)
-    .bind(access_token)
-    .bind(refresh_token)
-    .execute(pool)
-    .await?;
+        DO UPDATE SET access_token = $3, refresh_token = $4, name = $2, last_login = {SQL_NOW}
+        "#
+    );
+    sqlx::query(&query)
+        .bind(email)
+        .bind(name)
+        .bind(access_token)
+        .bind(refresh_token)
+        .execute(pool)
+        .await?;
     Ok(())
 }

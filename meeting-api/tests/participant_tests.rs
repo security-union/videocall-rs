@@ -26,7 +26,7 @@ use videocall_meeting_types::{
 };
 
 /// Helper: create a meeting and have the host join (activates it).
-async fn setup_active_meeting(pool: &sqlx::PgPool, room_id: &str) {
+async fn setup_active_meeting(pool: &meeting_api::db::DbPool, room_id: &str) {
     cleanup_test_data(pool, room_id).await;
 
     // Create meeting.

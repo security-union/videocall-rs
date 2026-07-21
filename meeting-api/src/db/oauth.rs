@@ -13,7 +13,9 @@
 
 //! OAuth request and user storage queries.
 
-use sqlx::PgPool;
+use chrono::Utc;
+
+use crate::db::{q, DbPool};
 
 /// Stored PKCE challenge/verifier and CSRF state for an in-flight OAuth flow.
 #[derive(Debug, sqlx::FromRow)]
@@ -29,19 +31,17 @@ pub struct OAuthRequestRow {
 /// Store a new OAuth request (PKCE + CSRF state + optional nonce) for later
 /// retrieval in the callback.
 pub async fn store_oauth_request(
-    pool: &PgPool,
+    pool: &DbPool,
     pkce_challenge: &str,
     pkce_verifier: &str,
     csrf_state: &str,
     return_to: Option<&str>,
     nonce: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
+    sqlx::query(&q(r#"
         INSERT INTO oauth_requests (pkce_challenge, pkce_verifier, csrf_state, return_to, nonce)
         VALUES ($1, $2, $3, $4, $5)
-        "#,
-    )
+        "#))
     .bind(pkce_challenge)
     .bind(pkce_verifier)
     .bind(csrf_state)
@@ -55,37 +55,41 @@ pub async fn store_oauth_request(
 /// Fetch and consume an OAuth request by CSRF state.
 /// The row is atomically deleted so that each state token can only be used once.
 pub async fn fetch_oauth_request(
-    pool: &PgPool,
+    pool: &DbPool,
     csrf_state: &str,
 ) -> Result<Option<OAuthRequestRow>, sqlx::Error> {
-    sqlx::query_as::<_, OAuthRequestRow>(
+    sqlx::query_as::<_, OAuthRequestRow>(&q(
         "DELETE FROM oauth_requests WHERE csrf_state = $1 RETURNING pkce_challenge, pkce_verifier, csrf_state, return_to, nonce",
-    )
+    ))
     .bind(csrf_state)
     .fetch_optional(pool)
     .await
 }
 
 /// Upsert a user after successful OAuth login.
+///
+/// `created_at` / `last_login` are bound as a `NaiveDateTime` because both
+/// columns are `TIMESTAMP` (no time zone) on PostgreSQL; binding a
+/// `DateTime<Utc>` would send a `TIMESTAMPTZ` that the server converts using
+/// the session time zone.
 pub async fn upsert_user(
-    pool: &PgPool,
+    pool: &DbPool,
     email: &str,
     name: &str,
     access_token: &str,
     refresh_token: Option<&str>,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        r#"
+    sqlx::query(&q(r#"
         INSERT INTO users (email, name, access_token, refresh_token, created_at, last_login)
-        VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        VALUES ($1, $2, $3, $4, $5, $5)
         ON CONFLICT (email)
-        DO UPDATE SET access_token = $3, refresh_token = $4, name = $2, last_login = CURRENT_TIMESTAMP
-        "#,
-    )
+        DO UPDATE SET access_token = $3, refresh_token = $4, name = $2, last_login = $5
+        "#))
     .bind(email)
     .bind(name)
     .bind(access_token)
     .bind(refresh_token)
+    .bind(Utc::now().naive_utc())
     .execute(pool)
     .await?;
     Ok(())

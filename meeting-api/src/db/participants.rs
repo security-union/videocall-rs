@@ -14,7 +14,8 @@
 //! Meeting participant table queries.
 
 use chrono::{DateTime, Utc};
-use sqlx::PgPool;
+
+use crate::db::{lock, q, DbPool};
 
 /// Row returned from the `meeting_participants` table.
 #[derive(Debug, sqlx::FromRow)]
@@ -41,84 +42,101 @@ const PARTICIPANT_COLUMNS: &str = r#"
 
 /// Insert or update a participant as host (admitted immediately).
 pub async fn upsert_host(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
 ) -> Result<ParticipantRow, sqlx::Error> {
     let query = format!(
         r#"
-        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
-        VALUES ($1, $2, 'admitted', TRUE, $3, NOW())
+        INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at, joined_at, created_at, updated_at)
+        VALUES ($1, $2, 'admitted', TRUE, $3, $4, $4, $4, $4)
         ON CONFLICT (meeting_id, user_id)
-        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = NOW(), left_at = NULL,
+        DO UPDATE SET status = 'admitted', is_host = TRUE, admitted_at = $4, updated_at = $4, left_at = NULL,
                       display_name = COALESCE($3, meeting_participants.display_name)
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
-    sqlx::query_as::<_, ParticipantRow>(&query)
+    sqlx::query_as::<_, ParticipantRow>(&q(&query))
         .bind(meeting_id)
         .bind(user_id)
         .bind(display_name)
+        .bind(Utc::now())
         .fetch_one(pool)
         .await
 }
 
 /// Atomically join a meeting as an attendee, respecting the current `waiting_room_enabled`
-/// setting. Locks the meeting row with `FOR UPDATE` to serialize against concurrent
-/// waiting room toggles via `update_waiting_room_enabled`.
+/// setting. Opens the transaction through [`lock::begin_write`] so the meeting row is
+/// serialized against concurrent waiting room toggles via
+/// [`crate::db::meetings::update_waiting_room_enabled`].
 ///
 /// Returns `(auto_admitted, ParticipantRow, waiting_room_enabled)` where `auto_admitted`
 /// is `true` when the participant was immediately admitted (waiting room disabled).
-/// The third element is the `waiting_room_enabled` value observed under the row lock,
+/// The third element is the `waiting_room_enabled` value observed under the write lock,
 /// which avoids stale reads from a pre-transaction fetch.
 pub async fn join_attendee(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
     display_name: Option<&str>,
 ) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
-    let mut tx = pool.begin().await?;
+    lock::with_write_retry(|| Box::pin(join_attendee_txn(pool, meeting_id, user_id, display_name)))
+        .await
+}
 
-    // Lock the meeting row to serialize against concurrent waiting room toggles.
-    let (waiting_room_enabled,): (bool,) =
-        sqlx::query_as("SELECT waiting_room_enabled FROM meetings WHERE id = $1 FOR UPDATE")
-            .bind(meeting_id)
-            .fetch_one(&mut *tx)
-            .await?;
+/// One attempt of [`join_attendee`]. Replayable: a failure rolls the transaction
+/// back before returning.
+async fn join_attendee_txn(
+    pool: &DbPool,
+    meeting_id: i32,
+    user_id: &str,
+    display_name: Option<&str>,
+) -> Result<(bool, ParticipantRow, bool), sqlx::Error> {
+    let mut tx = lock::begin_write(pool).await?;
+    let now = Utc::now();
+
+    // Read the flag under the write lock so a concurrent toggle cannot slip in
+    // between this read and the insert below.
+    let (waiting_room_enabled,): (bool,) = sqlx::query_as(&q(lock::SELECT_WAITING_ROOM_LOCKED))
+        .bind(meeting_id)
+        .fetch_one(&mut *tx)
+        .await?;
 
     let row = if waiting_room_enabled {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name)
-            VALUES ($1, $2, 'waiting', FALSE, $3)
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, joined_at, created_at, updated_at)
+            VALUES ($1, $2, 'waiting', FALSE, $3, $4, $4, $4)
             ON CONFLICT (meeting_id, user_id)
-            DO UPDATE SET status = 'waiting', left_at = NULL,
+            DO UPDATE SET status = 'waiting', updated_at = $4, left_at = NULL,
                           display_name = COALESCE($3, meeting_participants.display_name)
             RETURNING {PARTICIPANT_COLUMNS}
             "#
         );
-        sqlx::query_as::<_, ParticipantRow>(&query)
+        sqlx::query_as::<_, ParticipantRow>(&q(&query))
             .bind(meeting_id)
             .bind(user_id)
             .bind(display_name)
+            .bind(now)
             .fetch_one(&mut *tx)
             .await?
     } else {
         let query = format!(
             r#"
-            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at)
-            VALUES ($1, $2, 'admitted', FALSE, $3, NOW())
+            INSERT INTO meeting_participants (meeting_id, user_id, status, is_host, display_name, admitted_at, joined_at, created_at, updated_at)
+            VALUES ($1, $2, 'admitted', FALSE, $3, $4, $4, $4, $4)
             ON CONFLICT (meeting_id, user_id)
-            DO UPDATE SET status = 'admitted', admitted_at = NOW(), left_at = NULL,
+            DO UPDATE SET status = 'admitted', admitted_at = $4, updated_at = $4, left_at = NULL,
                           display_name = COALESCE($3, meeting_participants.display_name)
             RETURNING {PARTICIPANT_COLUMNS}
             "#
         );
-        sqlx::query_as::<_, ParticipantRow>(&query)
+        sqlx::query_as::<_, ParticipantRow>(&q(&query))
             .bind(meeting_id)
             .bind(user_id)
             .bind(display_name)
+            .bind(now)
             .fetch_one(&mut *tx)
             .await?
     };
@@ -129,13 +147,13 @@ pub async fn join_attendee(
 
 /// Get all participants in 'waiting' status for a meeting.
 pub async fn get_waiting(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
 ) -> Result<Vec<ParticipantRow>, sqlx::Error> {
     let query = format!(
         "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants WHERE meeting_id = $1 AND status = 'waiting'"
     );
-    sqlx::query_as::<_, ParticipantRow>(&query)
+    sqlx::query_as::<_, ParticipantRow>(&q(&query))
         .bind(meeting_id)
         .fetch_all(pool)
         .await
@@ -143,13 +161,13 @@ pub async fn get_waiting(
 
 /// Get all admitted (active) participants in a meeting.
 pub async fn get_admitted(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
 ) -> Result<Vec<ParticipantRow>, sqlx::Error> {
     let query = format!(
         "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants WHERE meeting_id = $1 AND status = 'admitted'"
     );
-    sqlx::query_as::<_, ParticipantRow>(&query)
+    sqlx::query_as::<_, ParticipantRow>(&q(&query))
         .bind(meeting_id)
         .fetch_all(pool)
         .await
@@ -157,14 +175,14 @@ pub async fn get_admitted(
 
 /// Get a single participant's status.
 pub async fn get_status(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         "SELECT {PARTICIPANT_COLUMNS} FROM meeting_participants WHERE meeting_id = $1 AND user_id = $2"
     );
-    sqlx::query_as::<_, ParticipantRow>(&query)
+    sqlx::query_as::<_, ParticipantRow>(&q(&query))
         .bind(meeting_id)
         .bind(user_id)
         .fetch_optional(pool)
@@ -173,88 +191,92 @@ pub async fn get_status(
 
 /// Admit a single participant.
 pub async fn admit(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'admitted', admitted_at = NOW()
+        SET status = 'admitted', admitted_at = $3, updated_at = $3
         WHERE meeting_id = $1 AND user_id = $2 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
-    sqlx::query_as::<_, ParticipantRow>(&query)
+    sqlx::query_as::<_, ParticipantRow>(&q(&query))
         .bind(meeting_id)
         .bind(user_id)
+        .bind(Utc::now())
         .fetch_optional(pool)
         .await
 }
 
 /// Admit all waiting participants at once.
-pub async fn admit_all(pool: &PgPool, meeting_id: i32) -> Result<Vec<ParticipantRow>, sqlx::Error> {
+pub async fn admit_all(pool: &DbPool, meeting_id: i32) -> Result<Vec<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'admitted', admitted_at = NOW()
+        SET status = 'admitted', admitted_at = $2, updated_at = $2
         WHERE meeting_id = $1 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
-    sqlx::query_as::<_, ParticipantRow>(&query)
+    sqlx::query_as::<_, ParticipantRow>(&q(&query))
         .bind(meeting_id)
+        .bind(Utc::now())
         .fetch_all(pool)
         .await
 }
 
 /// Reject a participant.
 pub async fn reject(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'rejected'
+        SET status = 'rejected', updated_at = $3
         WHERE meeting_id = $1 AND user_id = $2 AND status = 'waiting'
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
-    sqlx::query_as::<_, ParticipantRow>(&query)
+    sqlx::query_as::<_, ParticipantRow>(&q(&query))
         .bind(meeting_id)
         .bind(user_id)
+        .bind(Utc::now())
         .fetch_optional(pool)
         .await
 }
 
 /// Leave a meeting (set status to 'left').
 pub async fn leave(
-    pool: &PgPool,
+    pool: &DbPool,
     meeting_id: i32,
     user_id: &str,
 ) -> Result<Option<ParticipantRow>, sqlx::Error> {
     let query = format!(
         r#"
         UPDATE meeting_participants
-        SET status = 'left', left_at = NOW()
+        SET status = 'left', left_at = $3, updated_at = $3
         WHERE meeting_id = $1 AND user_id = $2 AND status IN ('admitted', 'waiting')
         RETURNING {PARTICIPANT_COLUMNS}
         "#
     );
-    sqlx::query_as::<_, ParticipantRow>(&query)
+    sqlx::query_as::<_, ParticipantRow>(&q(&query))
         .bind(meeting_id)
         .bind(user_id)
+        .bind(Utc::now())
         .fetch_optional(pool)
         .await
 }
 
 /// Count admitted participants in a meeting.
-pub async fn count_admitted(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
+pub async fn count_admitted(pool: &DbPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(&q(
         "SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1 AND status = 'admitted'",
-    )
+    ))
     .bind(meeting_id)
     .fetch_one(pool)
     .await?;
@@ -262,10 +284,10 @@ pub async fn count_admitted(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx:
 }
 
 /// Count waiting participants in a meeting.
-pub async fn count_waiting(pool: &PgPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
-    let row: (i64,) = sqlx::query_as(
+pub async fn count_waiting(pool: &DbPool, meeting_id: i32) -> Result<i64, sqlx::Error> {
+    let row: (i64,) = sqlx::query_as(&q(
         "SELECT COUNT(*) FROM meeting_participants WHERE meeting_id = $1 AND status = 'waiting'",
-    )
+    ))
     .bind(meeting_id)
     .fetch_one(pool)
     .await?;

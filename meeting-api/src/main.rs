@@ -20,7 +20,6 @@ use axum::http;
 use meeting_api::config::Config;
 use meeting_api::routes;
 use meeting_api::state::AppState;
-use sqlx::postgres::PgPoolOptions;
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing_subscriber::EnvFilter;
 
@@ -38,13 +37,7 @@ async fn main() {
         .await
         .expect("OIDC discovery failed");
 
-    let pool = PgPoolOptions::new()
-        .max_connections(20)
-        .connect(&config.database_url)
-        .await
-        .expect("failed to connect to PostgreSQL");
-
-    tracing::info!("Connected to PostgreSQL");
+    let pool = meeting_api::db::connect(&config.database_url).await;
 
     // Connect to NATS if configured. The server works without NATS (graceful degradation).
     let nats = match &config.nats_url {

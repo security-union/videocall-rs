@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [4.1.0](https://github.com/security-union/videocall-rs/compare/videocall-cli-v4.0.0...videocall-cli-v4.1.0) - 2026-07-22
+
+### Added
+
+- pure-Rust VP9 codec (encoder + decoder) — remove C libvpx from videocall-cli & bot ([#884](https://github.com/security-union/videocall-rs/pull/884))
+
+### Other
+
+- macOS camera integration rewrite: Swift AVFoundation capture layer replacing objc nokhwa bindings ([#890](https://github.com/security-union/videocall-rs/pull/890))
+
 ## [4.0.0](https://github.com/security-union/videocall-rs/compare/videocall-cli-v3.0.9...videocall-cli-v4.0.0) - 2026-06-30
 
 ### Added

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.5](https://github.com/security-union/videocall-rs/compare/videocall-nokhwa-bindings-macos-v0.2.4...videocall-nokhwa-bindings-macos-v0.2.5) - 2026-07-22
+
+### Other
+
+- macOS camera integration rewrite: Swift AVFoundation capture layer replacing objc nokhwa bindings ([#890](https://github.com/security-union/videocall-rs/pull/890))
+
 ### Changed
 
 - Rewrote the Apple camera backend: the ~2,400-line raw `objc` `msg_send!` AVFoundation binding is replaced by a Swift static library (`VideocallCapture`, in `swift/`) bridged over a hand-written 8-function `vcc_`-prefixed C ABI, with safe RAII wrappers in `src/apple.rs`. `build.rs` cross-builds the Swift package per Cargo target (macOS arm64/x86_64, iOS device, iOS simulator incl. Intel, Mac Catalyst) and is a no-op on non-Apple targets. The public API is unchanged.

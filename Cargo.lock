@@ -1018,7 +1018,7 @@ dependencies = [
 
 [[package]]
 name = "bot"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "chrono",
@@ -4665,7 +4665,7 @@ dependencies = [
 
 [[package]]
 name = "neteq"
-version = "0.9.0"
+version = "0.9.1"
 dependencies = [
  "axum 0.7.9",
  "clap",
@@ -7954,7 +7954,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-cli"
-version = "4.0.0"
+version = "4.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -7975,7 +7975,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-client"
-version = "4.0.6"
+version = "4.0.7"
 dependencies = [
  "aes",
  "anyhow",
@@ -8010,7 +8010,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-codecs"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "anyhow",
  "approx",
@@ -8069,7 +8069,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa"
-version = "0.10.9"
+version = "0.10.10"
 dependencies = [
  "flume",
  "image 0.25.9",
@@ -8103,7 +8103,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa-bindings-macos"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "flume",
  "videocall-nokhwa-core",
@@ -8120,7 +8120,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-nokhwa-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "bytemuck",
  "bytes",
@@ -8134,7 +8134,7 @@ dependencies = [
 
 [[package]]
 name = "videocall-sdk"
-version = "0.1.20"
+version = "0.1.21"
 dependencies = [
  "anyhow",
  "bytes",

@@ -144,7 +144,7 @@ pub const MEETING_HOST_CHANGE_SUBJECT: &str = "internal.meeting_host_changed";
 
 /// Payload published on [`MEETING_SETTINGS_UPDATE_SUBJECT`].
 ///
-/// Carries the four per-meeting policy flags so chat_server can refresh
+/// Carries the five per-meeting policy flags so chat_server can refresh
 /// its full `RoomPolicy` snapshot without a DB round-trip. All flags are
 /// always populated — the consumer overwrites the cache wholesale rather
 /// than merging field-by-field.
@@ -155,6 +155,8 @@ pub struct MeetingSettingsUpdatePayload {
     pub admitted_can_admit: bool,
     pub waiting_room_enabled: bool,
     pub allow_guests: bool,
+    #[serde(default)]
+    pub recording_allowed_for_all: bool,
 }
 
 /// Payload consumed on [`MEETING_ENDED_BY_HOST_SUBJECT`].
@@ -605,13 +607,14 @@ pub async fn publish_internal_meeting_settings_update(
     } else {
         tracing::debug!(
             "Published {} for room {} (end_on_host_leave={}, admitted_can_admit={}, \
-             waiting_room_enabled={}, allow_guests={})",
+             waiting_room_enabled={}, allow_guests={}, recording_allowed_for_all={})",
             MEETING_SETTINGS_UPDATE_SUBJECT,
             payload.room_id,
             payload.end_on_host_leave,
             payload.admitted_can_admit,
             payload.waiting_room_enabled,
-            payload.allow_guests
+            payload.allow_guests,
+            payload.recording_allowed_for_all
         );
     }
 }

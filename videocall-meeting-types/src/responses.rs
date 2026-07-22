@@ -84,6 +84,8 @@ pub struct CreateMeetingResponse {
     pub end_on_host_leave: bool,
     #[serde(default)]
     pub allow_guests: bool,
+    #[serde(default)]
+    pub recording_allowed_for_all: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings/{meeting_id}`.
@@ -112,6 +114,8 @@ pub struct MeetingInfoResponse {
     pub your_status: Option<ParticipantStatusResponse>,
     #[serde(default)]
     pub allow_guests: bool,
+    #[serde(default)]
+    pub recording_allowed_for_all: bool,
 }
 
 /// Response payload for `GET /api/v1/meetings`.
@@ -253,6 +257,8 @@ pub struct MeetingFeedSummary {
     pub has_password: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub allow_guests: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recording_allowed_for_all: bool,
     #[serde(default = "default_true", skip_serializing_if = "is_true")]
     pub waiting_room_enabled: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -301,6 +307,8 @@ pub struct MeetingSummary {
     pub end_on_host_leave: bool,
     #[serde(default)]
     pub allow_guests: bool,
+    #[serde(default)]
+    pub recording_allowed_for_all: bool,
 }
 
 /// Participant status returned by join, status, admit, reject, and leave endpoints.
@@ -348,6 +356,11 @@ pub struct ParticipantStatusResponse {
     /// Meeting-level: whether guests (unauthenticated users) are allowed to join.
     #[serde(default)]
     pub allow_guests: bool,
+    /// Meeting-level: whether the record button is shown to all admitted
+    /// participants. Defaults to `false` so older API responses (that lack
+    /// the field) hide the record button from non-hosts.
+    #[serde(default)]
+    pub recording_allowed_for_all: bool,
 }
 
 /// Returns `true`; used as the serde `default` for meeting-policy booleans
@@ -507,6 +520,7 @@ mod tests {
             waiting_count: 0,
             has_password: false,
             allow_guests: false,
+            recording_allowed_for_all: false,
             waiting_room_enabled: true, // default-true!
             admitted_can_admit: false,
             end_on_host_leave: true, // default-true!
@@ -530,6 +544,7 @@ mod tests {
             waiting_count: 3,
             has_password: true,
             allow_guests: true,
+            recording_allowed_for_all: true,
             waiting_room_enabled: false, // flipped from default-true
             admitted_can_admit: true,
             end_on_host_leave: false, // flipped from default-true

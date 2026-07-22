@@ -52,6 +52,12 @@ pub struct CreateMeetingRequest {
     /// to `false` on the server when omitted.
     #[serde(default)]
     pub allow_guests: Option<bool>,
+
+    /// Whether the record button is shown to all admitted participants
+    /// (not just the host).  Defaults to `false` on the server when omitted
+    /// so the record button is a host-only affordance out of the box.
+    #[serde(default)]
+    pub recording_allowed_for_all: Option<bool>,
 }
 
 /// Request body for `PATCH /api/v1/meetings/{meeting_id}`.
@@ -72,6 +78,10 @@ pub struct UpdateMeetingRequest {
     /// Toggle guest access on or off.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_guests: Option<bool>,
+
+    /// Toggle whether the record button is shown to all admitted participants.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_allowed_for_all: Option<bool>,
 }
 
 /// Request body for `POST /api/v1/meetings/{meeting_id}/join`.

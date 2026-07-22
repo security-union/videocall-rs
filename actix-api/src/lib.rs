@@ -15,7 +15,10 @@
  * license, shall be dual licensed as above, without any additional terms or
  * conditions.
  */
-#![recursion_limit = "256"]
+// Raised from 256 (#1660): the large lazy_static! metrics block expands recursively (one level
+// per static ref), and adding the screen playout-family gauges tipped histogram_opts! macro
+// expansion past 256. Compile-time only; no runtime effect.
+#![recursion_limit = "512"]
 
 pub mod actors;
 pub mod auth;

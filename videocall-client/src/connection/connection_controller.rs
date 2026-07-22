@@ -347,6 +347,18 @@ impl ConnectionController {
         }
     }
 
+    /// Forwards to [`ConnectionManager::active_transport`] (issue #1883): the
+    /// tri-state active transport — `Some(true)` WebTransport, `Some(false)`
+    /// WebSocket, `None` no active connection. Returns `None` when the manager
+    /// cell is momentarily borrowed (can't determine) — the honest "unknown",
+    /// consistent with the render-nothing default the self-tile badge wants.
+    pub fn active_transport(&self) -> Option<bool> {
+        self.manager
+            .try_borrow()
+            .ok()
+            .and_then(|mgr| mgr.active_transport())
+    }
+
     /// Disconnect from the current connection and clean up resources
     pub fn disconnect(&self) -> anyhow::Result<()> {
         let mut mgr = self

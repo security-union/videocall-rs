@@ -351,9 +351,9 @@ services:
   nats:
     image: nats
     command: "--http_port 8222"
-    ports:
-      - "4222:4222"
-      - "8222:8222"
+    # Host publish removed: foundation-core-nats already owns host :4222/:8222.
+    # videocall's app services reach this via the compose network (nats:4222),
+    # so no host port mapping is needed.
 
   nats-box:
     image: natsio/nats-box:latest

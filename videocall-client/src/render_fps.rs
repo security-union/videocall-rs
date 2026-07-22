@@ -47,6 +47,23 @@ pub fn emit_render_fps(fps: f64) -> bool {
     }
 }
 
+/// Gate condition for the 1-second interval emit: only emit a render-FPS metric
+/// when at least one rAF frame fired in the window.
+///
+/// A count of 0 means the page was backgrounded (rAF paused) or the observer
+/// just started — NOT that rendering is under pressure.  Emitting `Some(0.0)`
+/// would be misread by the decode-budget controller as "FPS collapsed → step
+/// down", triggering a false down-step even when no video is being decoded.
+/// Skipping the event leaves the budget controller's sample window incomplete,
+/// so it returns `Hold` — the correct behaviour for an idle or hidden page.
+///
+/// Extracted (and NOT `#[cfg(target_arch = "wasm32")]`-gated) so the interval
+/// closure calls exactly this predicate and host unit tests can pin its
+/// behaviour directly.
+pub fn should_emit_render_fps(frames: u32) -> bool {
+    frames > 0
+}
+
 #[cfg(target_arch = "wasm32")]
 use std::cell::Cell;
 #[cfg(target_arch = "wasm32")]
@@ -101,7 +118,13 @@ impl RenderFpsObserver {
         let interval_closure = Closure::<dyn FnMut()>::new(move || {
             let frames = count_for_interval.get();
             count_for_interval.set(0);
-            emit_render_fps(frames as f64);
+            // Only emit when at least one rAF frame fired.  The gate condition
+            // lives in `should_emit_render_fps` so it is host-testable; see that
+            // function for why a 0-frame window must be skipped rather than
+            // emitted as Some(0.0).
+            if should_emit_render_fps(frames) {
+                emit_render_fps(frames as f64);
+            }
         });
 
         let interval_handle = window
@@ -181,5 +204,55 @@ mod tests {
     #[test]
     fn native_stub_can_be_started() {
         let _ = RenderFpsObserver::start().expect("native stub should start");
+    }
+
+    // ── frames > 0 gate ───────────────────────────────────────────────────────
+    //
+    // The 1-second interval closure only calls `emit_render_fps` when the rAF
+    // frame count is > 0.  Emitting Some(0.0) when the page is backgrounded
+    // would be misread by the decode-budget controller as "FPS collapsed →
+    // step down", triggering a false down-step with no video being decoded.
+    //
+    // These tests pin the CONDITION that gates the emit by calling the exact
+    // production predicate (`should_emit_render_fps`) that the interval closure
+    // uses as its guard (`if should_emit_render_fps(frames) { emit_render_fps(..) }`).
+    // They fail if `should_emit_render_fps` is mutated to always return `true`
+    // or always `false` — i.e. if the gate stops discriminating zero from
+    // non-zero frame counts.
+
+    /// Zero frames must NOT satisfy the gate (`should_emit_render_fps(0)` is
+    /// false), so `emit_render_fps` is skipped.  A 0-fps metric cannot be
+    /// distinguished by the budget controller from a true FPS collapse.
+    #[test]
+    fn zero_frames_does_not_satisfy_gate() {
+        assert!(
+            !should_emit_render_fps(0),
+            "gate must not fire for zero frames"
+        );
+    }
+
+    /// One or more frames MUST satisfy the gate (`should_emit_render_fps` is
+    /// true), so `emit_render_fps` runs.
+    #[test]
+    fn nonzero_frames_satisfies_gate() {
+        for frames in [1u32, 30, 60, 120] {
+            assert!(
+                should_emit_render_fps(frames),
+                "frame count {frames} must pass the gate and trigger emit_render_fps"
+            );
+        }
+    }
+
+    /// The value emitted when the gate passes is `frames as f64` — verify the
+    /// cast is lossless for plausible frame counts (1–240).
+    #[test]
+    fn frames_cast_to_f64_is_lossless_for_normal_rates() {
+        for frames in [1u32, 30, 60, 120, 240] {
+            let fps = frames as f64;
+            assert!(
+                (fps - f64::from(frames)).abs() < 1e-9,
+                "u32→f64 cast must be lossless for frame count {frames}"
+            );
+        }
     }
 }

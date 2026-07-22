@@ -14,6 +14,7 @@ pub const NON_REMOVABLE_SLOTS: &[ActionBarSlot] = &[ActionBarSlot::Mic, ActionBa
 pub enum ActionBarSlot {
     Mic,
     Camera,
+    Reactions,
     #[serde(rename = "screen")]
     ScreenShare,
     #[serde(rename = "participants")]
@@ -23,6 +24,8 @@ pub enum ActionBarSlot {
     Diagnostics,
     #[serde(rename = "settings")]
     DeviceSettings,
+    #[serde(rename = "recording")]
+    Recording,
     #[serde(rename = "meeting_options")]
     MeetingOptions,
 }
@@ -33,11 +36,13 @@ impl ActionBarSlot {
         match self {
             ActionBarSlot::Mic => "Microphone",
             ActionBarSlot::Camera => "Camera",
+            ActionBarSlot::Reactions => "Reactions",
             ActionBarSlot::ScreenShare => "Screen share",
             ActionBarSlot::PeerList => "Participants",
             ActionBarSlot::DensityMode => "Density mode",
             ActionBarSlot::Diagnostics => "Diagnostics",
             ActionBarSlot::DeviceSettings => "Settings",
+            ActionBarSlot::Recording => "Record",
             ActionBarSlot::MeetingOptions => "Meeting options",
         }
     }
@@ -56,11 +61,13 @@ impl ActionBarSlot {
         match self {
             ActionBarSlot::Mic => "mic",
             ActionBarSlot::Camera => "camera",
+            ActionBarSlot::Reactions => "reactions",
             ActionBarSlot::ScreenShare => "screen",
             ActionBarSlot::PeerList => "participants",
             ActionBarSlot::DensityMode => "density",
             ActionBarSlot::Diagnostics => "diagnostics",
             ActionBarSlot::DeviceSettings => "settings",
+            ActionBarSlot::Recording => "recording",
             ActionBarSlot::MeetingOptions => "meeting_options",
         }
     }
@@ -71,11 +78,13 @@ impl ActionBarSlot {
         Some(match s {
             "mic" => ActionBarSlot::Mic,
             "camera" => ActionBarSlot::Camera,
+            "reactions" => ActionBarSlot::Reactions,
             "screen" => ActionBarSlot::ScreenShare,
             "participants" => ActionBarSlot::PeerList,
             "density" => ActionBarSlot::DensityMode,
             "diagnostics" => ActionBarSlot::Diagnostics,
             "settings" => ActionBarSlot::DeviceSettings,
+            "recording" => ActionBarSlot::Recording,
             "meeting_options" => ActionBarSlot::MeetingOptions,
             _ => return None,
         })
@@ -85,11 +94,15 @@ impl ActionBarSlot {
 pub const DEFAULT_SLOTS: &[ActionBarSlot] = &[
     ActionBarSlot::Mic,
     ActionBarSlot::Camera,
+    // Issue #1884: Reactions at index 2 (after Camera). Existing users get it
+    // appended by migrate_stored_layout's forward-compat pass.
+    ActionBarSlot::Reactions,
     ActionBarSlot::ScreenShare,
     ActionBarSlot::PeerList,
     ActionBarSlot::DensityMode,
     ActionBarSlot::Diagnostics,
     ActionBarSlot::DeviceSettings,
+    ActionBarSlot::Recording,
     ActionBarSlot::MeetingOptions,
 ];
 
@@ -284,6 +297,25 @@ pub fn remove_action_bar_layout() {
     if let Some(storage) = web_sys::window().and_then(|w| w.local_storage().ok().flatten()) {
         let _ = storage.remove_item(STORAGE_KEY);
     }
+}
+
+/// Whether the Recording action-bar slot should render for the current user.
+///
+/// Recording is restricted by three conditions:
+///   1. Guests (unauthenticated users) NEVER see the record button, regardless
+///      of any other setting.
+///   2. The host ALWAYS sees the record button (when not a guest).
+///   3. Authenticated non-host participants see the button only when the
+///      meeting's `recording_allowed_for_all` setting is enabled.
+///
+/// Extracted as a pure function so the gating decision is host-testable
+/// without a Dioxus runtime; the production render path calls this directly.
+pub fn record_slot_visible(
+    is_owner: bool,
+    is_guest: bool,
+    recording_allowed_for_all: bool,
+) -> bool {
+    !is_guest && (is_owner || recording_allowed_for_all)
 }
 
 /// Result of a keyboard-reorder attempt on the action-bar. `old_idx` is the
@@ -523,6 +555,72 @@ mod tests {
         );
     }
 
+    // ── record_slot_visible ──────────────────────────────────────────────
+    //
+    // These tests guard the visibility rule for the Recording slot: hosts
+    // always see it, non-hosts only when the setting `recording_allowed_for_all`
+    // is on.  Each test would FAIL if the predicate were mutated:
+    //   • Return `is_owner && ...` → non-host with setting ON hides ← test 3
+    //   • Return `... && recording_allowed_for_all` → host with setting OFF hides ← test 1
+    //   • Return `true` → non-host with setting OFF sees it ← test 4
+    //   • Return `false` → host is never shown ← test 1
+
+    #[test]
+    fn record_slot_visible_for_host_setting_off() {
+        assert!(
+            record_slot_visible(true, false, false),
+            "host must always see record button regardless of the setting"
+        );
+    }
+
+    #[test]
+    fn record_slot_visible_for_host_setting_on() {
+        assert!(
+            record_slot_visible(true, false, true),
+            "host sees record button"
+        );
+    }
+
+    #[test]
+    fn record_slot_visible_for_non_host_setting_on() {
+        assert!(
+            record_slot_visible(false, false, true),
+            "non-host sees record button when the setting is on"
+        );
+    }
+
+    #[test]
+    fn record_slot_hidden_for_non_host_setting_off() {
+        assert!(
+            !record_slot_visible(false, false, false),
+            "non-host must NOT see record button when the setting is off (default)"
+        );
+    }
+
+    #[test]
+    fn record_slot_hidden_for_guest_even_when_setting_on() {
+        assert!(
+            !record_slot_visible(false, true, true),
+            "guest must NEVER see record button, even when recording_allowed_for_all is enabled"
+        );
+    }
+
+    #[test]
+    fn record_slot_hidden_for_guest_when_setting_off() {
+        assert!(
+            !record_slot_visible(false, true, false),
+            "guest must NEVER see record button when setting is off"
+        );
+    }
+
+    #[test]
+    fn record_slot_hidden_for_guest_who_is_host() {
+        assert!(
+            !record_slot_visible(true, true, false),
+            "guest status overrides host status - guests do not see the record button"
+        );
+    }
+
     /// Round-trip proof: `from_slug(slug(x)) == Some(x)` for every enum variant.
     /// Mutation check: swap any pair of arms in either `slug` or `from_slug`
     /// and this test fails. Also asserts the slugs are the same DOM-safe
@@ -551,13 +649,15 @@ mod tests {
     /// wrapping/unchecked expression and this test fails.
     #[test]
     fn keyboard_reorder_arrow_delta_moves_and_clamps() {
-        // Right arrow from the middle.
+        // Right arrow from the middle. ScreenShare sits at index 3 in
+        // DEFAULT_SLOTS (after Mic, Camera, Reactions — issue #1884 inserted
+        // Reactions at index 2), so a +1 arrow moves it to index 4.
         let mut slots: Vec<ActionBarSlot> = DEFAULT_SLOTS.to_vec();
         let result = apply_keyboard_reorder(&mut slots, ActionBarSlot::ScreenShare, Some(1), None)
             .expect("ScreenShare is present");
-        assert_eq!(result.old_idx, 2);
-        assert_eq!(result.new_idx, 3);
-        assert_eq!(slots[3], ActionBarSlot::ScreenShare);
+        assert_eq!(result.old_idx, 3);
+        assert_eq!(result.new_idx, 4);
+        assert_eq!(slots[4], ActionBarSlot::ScreenShare);
 
         // Left arrow at index 0 clamps (no move).
         let mut slots: Vec<ActionBarSlot> = DEFAULT_SLOTS.to_vec();

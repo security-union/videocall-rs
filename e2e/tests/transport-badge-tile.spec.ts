@@ -1,7 +1,8 @@
-import { test, expect, Page, BrowserContext } from "@playwright/test";
+import { test, expect, Page, Locator, BrowserContext } from "@playwright/test";
 import { BROWSER_ARGS, createAuthenticatedContext } from "../helpers/auth-context";
 import { waitForServices } from "../helpers/wait-for-services";
 import { setTransportBadgeFlag } from "../helpers/transport-badge-config";
+import { wakeControls } from "../helpers/controls";
 import { chromium } from "@playwright/test";
 
 /**
@@ -27,12 +28,19 @@ import { chromium } from "@playwright/test";
  *      `peer_status`/`peer_transport` diagnostics metric emitted by the decode
  *      pipeline. `webtransport` → `--wt`/"WT", `websocket` → `--ws`/"WS";
  *      anything else (`unknown`, empty, or not-yet-reported) → NO badge.
- *   3. REMOTE-PEER-ONLY — the local user's own session is filtered out of the
- *      peer-tile list (`attendants.rs`: `display_peers` excludes
- *      `get_own_session_id()`), and the local self-view is a `.host-video-wrapper`
- *      with NO `.tile-top-icons` and NO `.signal-indicator`. The local transport
- *      is not exposed on the public client API, so the local tile NEVER shows a
- *      badge — even with the flag ON.
+ *   3. SELF + PEERS (issue #1883, relocated by #1885 fix) — the local user's own
+ *      session is filtered out of the peer-tile list (`attendants.rs`:
+ *      `display_peers` excludes `get_own_session_id()`), so the peer tiles above
+ *      are all REMOTE. The self-view ALSO shows a badge, sourced from the
+ *      client-wide active transport (`VideoCallClient::active_transport()`)
+ *      rather than a remote `peer_status` metric, labelled "Your connection
+ *      transport: …". It renders in the `.host-tile-chrome` flex cluster (a
+ *      direct `.host` child in attendants.rs) ALONGSIDE the connection LED +
+ *      quality warning, so it never overlaps the LED and persists through camera
+ *      on/off (#1885 fix moved it there from `Host`'s `.tile-top-icons`, which
+ *      had pinned it at the LED's corner). Same server gate + WT/WS mapping as
+ *      peers. (#1483 shipped the peer badge remote-only; #1883 added the self
+ *      badge; #1885 fixed the self badge / LED overlap by clustering them.)
  *
  * ## Why REAL camera-on browser peers (not addMockPeers)
  *
@@ -202,7 +210,7 @@ async function bringUpTwoPeerMeeting(
   uiURL: string,
   meetingId: string,
   profiles: { email: string; name: string }[],
-  opts: { enableBadgeFlag: boolean },
+  opts: { enableBadgeFlag: boolean; pinWebsocket?: boolean },
 ): Promise<{ members: MeetingMember[]; browsers: Awaited<ReturnType<typeof chromium.launch>>[] }> {
   const browsers = await Promise.all([
     chromium.launch({ args: BROWSER_ARGS }),
@@ -218,6 +226,20 @@ async function bringUpTwoPeerMeeting(
       profiles[i].name,
       uiURL,
     );
+    // Deterministically pin WebSocket (issue #1883): seed a STICKY websocket
+    // preference so `load_transport_preference` returns WebSocket authoritatively
+    // (a non-sticky pref is dropped → WT-with-fallback, which CAN elect WT). This
+    // makes the self badge's transport predictable (WS) rather than either-of-two.
+    if (opts.pinWebsocket) {
+      await ctx.addInitScript(() => {
+        try {
+          window.localStorage.setItem("vc_transport_preference", "websocket");
+          window.localStorage.setItem("vc_transport_sticky", "true");
+        } catch {
+          /* storage may be unavailable before origin navigation */
+        }
+      });
+    }
     // Flip the flag BEFORE any navigation so the very first `/config.js`
     // request is intercepted (the route is context-scoped).
     if (opts.enableBadgeFlag) {
@@ -244,6 +266,42 @@ async function bringUpTwoPeerMeeting(
   await admitAndEnterGrid(members[0].page, members[1].page);
 
   return { members, browsers };
+}
+
+/**
+ * Issue 1885 fix: assert the self transport badge and the connection-quality
+ * green circle (`.connection-led`) do NOT overlap. BOTH must be present first
+ * (no vacuous pass), then their bounding boxes must be disjoint on at least one
+ * axis. `boundingBox()` is `getBoundingClientRect()` under the hood.
+ *
+ * This is a FORWARD regression guard, NOT the check that trips on the original
+ * unfixed DOM. The fix RELOCATED the badge into `.host-tile-chrome` (which did
+ * not exist before), so on the truly-unfixed layout this spec fails EARLIER —
+ * at the relocated-location assertions in the test body (`.host-tile-chrome`
+ * count 1, and the badge NOT inside `.host-video-wrapper`). What this disjoint
+ * check guards against is a LATER change that re-overlaps the two while the
+ * cluster still exists (e.g. re-pinning one of them). For the record, the
+ * original overlap that motivated the fix: `.connection-led` (12×12) and the
+ * badge were both pinned at top:8/right:8, so the LED box sat entirely inside
+ * the badge box (≈144px² intersection). After the fix they are flex siblings in
+ * `.host-tile-chrome` with a gap, so the badge is fully left of the LED.
+ */
+async function expectDisjoint(badge: Locator, led: Locator): Promise<void> {
+  await expect(badge, "transport badge must be present").toBeVisible();
+  await expect(led, "connection LED (green circle) must be present").toBeVisible();
+  const b = await badge.boundingBox();
+  const l = await led.boundingBox();
+  expect(b, "badge bounding box").not.toBeNull();
+  expect(l, "LED bounding box").not.toBeNull();
+  const disjoint =
+    b!.x + b!.width <= l!.x ||
+    l!.x + l!.width <= b!.x ||
+    b!.y + b!.height <= l!.y ||
+    l!.y + l!.height <= b!.y;
+  expect(
+    disjoint,
+    `self transport badge ${JSON.stringify(b)} must not overlap the connection LED ${JSON.stringify(l)}`,
+  ).toBe(true);
 }
 
 async function tearDown(
@@ -335,46 +393,92 @@ test.describe("Per-tile transport badge (#1483)", () => {
     }
   });
 
-  test("flag ON: the local user's own self-view tile shows NO transport badge (remote-only)", async ({
+  test("flag ON + WS pinned: the local user's own self-view tile shows its OWN 'WS' transport badge (#1883)", async ({
     baseURL,
   }) => {
     test.setTimeout(180_000);
     const uiURL = baseURL || DEFAULT_UI_URL;
-    const meetingId = `e2e_xport_badge_local_${Date.now()}`;
+    const meetingId = `e2e_xport_badge_self_${Date.now()}`;
 
     const profiles = [
-      { email: "host-xblocal@videocall.rs", name: "XBLocalHost" },
-      { email: "guest-xblocal@videocall.rs", name: "XBLocalGuest" },
+      { email: "host-xbself@videocall.rs", name: "XBSelfHost" },
+      { email: "guest-xbself@videocall.rs", name: "XBSelfGuest" },
     ];
 
+    // Pin WebSocket (sticky) so the self badge's transport is deterministic (WS),
+    // not either-of-two — the discriminating assertion below is WS-specific.
     const { members, browsers } = await bringUpTwoPeerMeeting(uiURL, meetingId, profiles, {
       enableBadgeFlag: true,
+      pinWebsocket: true,
     });
 
     try {
       const hostPage = members[0].page;
 
       // Wait until the remote badge has rendered, so we know the flag is ON and
-      // the badge code path is live in this session — otherwise "no badge on
-      // the local tile" would pass vacuously even if the feature were broken.
+      // the badge code path is live before asserting on the self tile.
       const remoteBadge = hostPage.locator(
         "#grid-container .canvas-container .tile-top-icons .transport-badge",
       );
       await expect(remoteBadge).toHaveCount(1, { timeout: 60_000 });
 
-      // The local self-view is rendered as `.host-video-wrapper` (host.rs); it
-      // has no `.tile-top-icons` and must carry NO transport badge even with the
-      // flag ON, because the local transport is not exposed to the badge.
+      // Issue #1883 / #1885: the local self-view carries its OWN transport
+      // badge. Locate it CAMERA-STATE-INDEPENDENTLY by its SELF-specific
+      // aria-label (peer badges say "reported by peer"). WS pinned → WS self
+      // badge. FAILS-ON-UNFIXED (#1883 gate): if the self-badge gate were
+      // removed the self-view would have no badge → count 0 and page-wide == 1.
       const selfView = hostPage.locator(".host-video-wrapper");
       await expect(selfView).toHaveCount(1, { timeout: 15_000 });
-      await expect(selfView.locator(".transport-badge")).toHaveCount(0);
+      const selfBadge = hostPage.locator(
+        '.transport-badge[aria-label="Your connection transport: WebSocket"]',
+      );
+      await expect(selfBadge).toHaveCount(1, { timeout: 30_000 });
+      await expect(selfBadge).toBeVisible();
 
-      // And the ONLY badge on the whole PAGE is the single remote one — the
-      // local self-view contributes nothing. (Total badge count == remote peers
-      // == 1.) Scoping page-wide (not to `#grid-container`) makes this
-      // independent of whether the self-view is nested inside the grid or a
-      // sibling of it: either way, exactly one badge exists, and it is remote.
-      await expect(hostPage.locator(".transport-badge")).toHaveCount(1);
+      // Its class + text + SELF-specific aria-label all agree (a crossed-wire
+      // regression — WT class with "WS" text, or the peer "reported by peer" label
+      // on the self tile — fails).
+      const cls = (await selfBadge.getAttribute("class")) || "";
+      expect(cls).toMatch(/\btransport-badge--ws\b/);
+      expect(cls).not.toMatch(/\btransport-badge--wt\b/);
+      await expect(selfBadge).toHaveText("WS");
+
+      // Issue 1885 fix: the self badge lives in the `.host-tile-chrome` flex
+      // cluster (with the connection LED + quality warning) — a direct `.host`
+      // child, NOT inside the collapsing `.host-video-wrapper`. That single
+      // cluster is what both removed the LED overlap AND made the badge persist
+      // through camera-off without a per-branch copy.
+      const chrome = hostPage.locator(".host-tile-chrome");
+      await expect(chrome).toHaveCount(1);
+      await expect(chrome.locator(".transport-badge")).toHaveCount(1);
+      // It is NOT inside the camera-on wrapper (where #1885 originally pinned it,
+      // at the LED's corner — the cause of the overlap).
+      await expect(selfView.locator(".transport-badge")).toHaveCount(0);
+      // Exactly TWO badges page-wide: the remote peer + the local self.
+      await expect(hostPage.locator(".transport-badge")).toHaveCount(2);
+
+      // THE REPORTED BUG (camera-ON leg): the badge must NOT sit under the
+      // connection-quality green circle (`.connection-led`) — assert their boxes
+      // are disjoint. (Forward regression guard; on the truly-unfixed DOM the
+      // spec already failed above at the relocated-location assertions — see the
+      // expectDisjoint doc.)
+      const selfLed = chrome.locator(".connection-led");
+      await expectDisjoint(selfBadge, selfLed);
+
+      // UX NB-1 (#1883) + the overlap fix: turn the camera OFF → the badge
+      // PERSISTS and STILL does not overlap the LED. Both live in
+      // `.host-tile-chrome` (independent of the collapsing wrapper), so
+      // persistence AND non-overlap hold in the camera-off state too.
+      await wakeControls(hostPage);
+      await hostPage.locator('[data-testid="camera-toggle-button"]').click();
+      await expect(selfBadge).toHaveCount(1, { timeout: 15_000 });
+      await expect(selfBadge).toBeVisible();
+      // Still in the cluster; never in the (now-collapsed) camera-on wrapper.
+      await expect(chrome.locator(".transport-badge")).toHaveCount(1);
+      await expect(selfView.locator(".transport-badge")).toHaveCount(0, { timeout: 15_000 });
+      await expect(hostPage.locator(".transport-badge")).toHaveCount(2);
+      // THE REPORTED BUG (camera-OFF leg): still disjoint from the LED.
+      await expectDisjoint(selfBadge, selfLed);
     } finally {
       await tearDown(members, browsers);
     }
@@ -394,8 +498,9 @@ test.describe("Per-tile transport badge (#1483)", () => {
 
     // enableBadgeFlag: false → use the committed default
     // (`transportBadgeEnabled: "false"`), so the server gate is OFF. If someone
-    // deletes the `transport_badge_enabled()` gate in peer_tile.rs, the badge
-    // would render here and this test FAILS — that is the mutation this guards.
+    // deletes the `transport_badge_enabled()` gate in peer_tile.rs (peer badge) OR
+    // host.rs (self badge, #1883), a badge would render here and this test FAILS
+    // — the page-wide count-0 assertion below guards BOTH gates.
     const { members, browsers } = await bringUpTwoPeerMeeting(uiURL, meetingId, profiles, {
       enableBadgeFlag: false,
     });

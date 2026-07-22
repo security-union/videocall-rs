@@ -1052,3 +1052,258 @@ test.describe("Meeting settings – in-call Meeting Options panel", () => {
     }
   });
 });
+
+// Issue 1845: the four verbose notification toggle rows were consolidated into a
+// 2×2 "announcement matrix" (rows: participant joins/leaves; columns: the
+// Message and Sound channels) inside the device-settings modal's Preferences
+// tab. These tests pin the new structure, the exact per-cell state mapping (a
+// swap here is the worst-case bug), the reused help-icon tooltips, and the four
+// distinct accessible names. Selectors are anchored to the RSX in
+// preferences_settings_panel.rs.
+test.describe("Meeting settings – announcement notifications matrix (issue 1845)", () => {
+  // testid → the exact AppearanceSettings storage key it must flip, plus the
+  // accessible name the aria-labelledby row/column ids must compose. Column
+  // order in each row is Message then Sound (matches the headers).
+  const ANNOUNCE_TOGGLES = [
+    {
+      testid: "announce-join-message",
+      key: "vc_appearance_entry_notifications",
+      name: "Participant joins Message",
+    },
+    {
+      testid: "announce-join-sound",
+      key: "vc_appearance_entry_sound",
+      name: "Participant joins Sound",
+    },
+    {
+      testid: "announce-leave-message",
+      key: "vc_appearance_exit_notifications",
+      name: "Participant leaves Message",
+    },
+    {
+      testid: "announce-leave-sound",
+      key: "vc_appearance_exit_sound",
+      name: "Participant leaves Sound",
+    },
+  ] as const;
+
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test.beforeEach(async ({ context, baseURL }) => {
+    // The device-settings modal / Preferences panel only exists in the Dioxus UI.
+    test.skip(!baseURL?.includes("3001"), "Preferences panel is Dioxus-only");
+    await injectSessionCookie(context, { baseURL });
+  });
+
+  /**
+   * Join the meeting as a solo host, then open the device-settings modal and
+   * switch to the Preferences tab where the announcement matrix renders. Mirrors
+   * the proven in-call open-settings sequence from
+   * join-leave-notifications.spec.ts, but targets the Preferences tab (the
+   * matrix lives in PreferencesSettingsPanel, not the Appearance tab).
+   */
+  async function openPreferencesPanel(
+    page: Page,
+    meetingId: string,
+    username: string,
+  ): Promise<void> {
+    await page.goto("/");
+    await page.waitForTimeout(1500);
+
+    await page.locator("#meeting-id").click();
+    await page.locator("#meeting-id").pressSequentially(meetingId, { delay: 60 });
+    await page.locator("#username").click();
+    await page.locator("#username").fill("");
+    await page.locator("#username").pressSequentially(username, { delay: 60 });
+    await page.waitForTimeout(500);
+    await page.locator("#username").press("Enter");
+    await expect(page).toHaveURL(new RegExp(`/meeting/${meetingId}`), { timeout: 10_000 });
+    await page.waitForTimeout(1500);
+
+    const joinButton = page.getByRole("button", { name: /Start Meeting|Join Meeting/ });
+    const grid = page.locator("#grid-container");
+    const state = await Promise.race([
+      joinButton.waitFor({ timeout: 30_000 }).then(() => "join" as const),
+      grid.waitFor({ timeout: 30_000 }).then(() => "grid" as const),
+    ]);
+    if (state === "join") {
+      await joinButton.click();
+    }
+    await expect(grid).toBeVisible({ timeout: 15_000 });
+
+    // Reveal the (possibly auto-hidden) action bar, then open device settings.
+    await page.locator(".video-controls-container").hover();
+    await page.locator('[data-testid="open-settings"]').click();
+    await expect(page.locator(".device-settings-modal")).toBeVisible({ timeout: 10_000 });
+
+    // The announcement matrix lives in the Preferences tab.
+    await page.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+    await expect(page.locator("#settings-panel-preferences")).toBeVisible({ timeout: 5_000 });
+  }
+
+  test("renders the 2x2 matrix structure and drops the legacy helper sentences", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    const meetingId = `e2e_announce_structure_${Date.now()}`;
+    await openPreferencesPanel(page, meetingId, "announce-structure-user");
+
+    const matrix = page.locator('[data-testid="announce-matrix"]');
+    await expect(matrix).toHaveCount(1);
+    await expect(matrix).toHaveAttribute("role", "group");
+    await expect(matrix).toHaveAttribute("aria-label", "Participant announcements");
+
+    // Exactly four channel toggles, one per testid.
+    await expect(matrix.locator('input[type="checkbox"]')).toHaveCount(4);
+    for (const { testid } of ANNOUNCE_TOGGLES) {
+      await expect(matrix.locator(`[data-testid="${testid}"]`)).toHaveCount(1);
+    }
+
+    // Axis labels carry the per-cell meaning.
+    await expect(matrix.locator("#announce-col-message")).toHaveText("Message");
+    await expect(matrix.locator("#announce-col-sound")).toHaveText("Sound");
+    await expect(matrix.locator("#announce-row-join")).toHaveText("Participant joins");
+    await expect(matrix.locator("#announce-row-leave")).toHaveText("Participant leaves");
+
+    // The four pre-1845 helper sentences are gone from the DOM.
+    for (const sentence of [
+      "Show a message when a participant joins.",
+      "Show a message when a participant leaves.",
+      "Play a sound when a participant joins.",
+      "Play a sound when a participant leaves.",
+    ]) {
+      await expect(page.getByText(sentence)).toHaveCount(0);
+    }
+  });
+
+  test("each toggle flips exactly its own preference key (swap regression guard)", async ({
+    page,
+  }) => {
+    test.setTimeout(120_000);
+    const meetingId = `e2e_announce_parity_${Date.now()}`;
+    await openPreferencesPanel(page, meetingId, "announce-parity-user");
+
+    const matrix = page.locator('[data-testid="announce-matrix"]');
+
+    // All four default to checked (enabled).
+    for (const { testid } of ANNOUNCE_TOGGLES) {
+      await expect(matrix.locator(`[data-testid="${testid}"]`)).toBeChecked();
+    }
+
+    const allKeys = ANNOUNCE_TOGGLES.map((t) => t.key);
+
+    // Uncheck each toggle in isolation and assert ONLY its mapped key becomes
+    // "false"; then restore it. Persistence is a 300ms-debounced effect and
+    // writes all keys at once (context.rs save_appearance_settings_to_storage),
+    // so a poll accommodates the debounce. If any two cells were cross-wired,
+    // unchecking one would write the wrong key and this assertion would fail.
+    for (const { testid, key } of ANNOUNCE_TOGGLES) {
+      const input = matrix.locator(`[data-testid="${testid}"]`);
+      const label = matrix.locator(`label.glow-switch:has([data-testid="${testid}"])`);
+
+      await label.click();
+      await expect(input).not.toBeChecked({ timeout: 5_000 });
+      await expect
+        .poll(() => page.evaluate((k) => localStorage.getItem(k), key), { timeout: 5_000 })
+        .toBe("false");
+
+      for (const other of allKeys) {
+        if (other === key) continue;
+        const value = await page.evaluate((k) => localStorage.getItem(k), other);
+        expect(value, `${testid} must not disable ${other}`).not.toBe("false");
+      }
+
+      // Restore to a clean all-on baseline before the next toggle.
+      await label.click();
+      await expect(input).toBeChecked({ timeout: 5_000 });
+      await expect
+        .poll(() => page.evaluate((k) => localStorage.getItem(k), key), { timeout: 5_000 })
+        .toBe("true");
+    }
+  });
+
+  test("saved preferences round-trip onto the correct cells on load", async ({ page, context }) => {
+    test.setTimeout(120_000);
+    // Seed a mixed pattern in the CURRENT plain-text storage format (context.rs
+    // writes bool.to_string() and reads value != "false") BEFORE navigation, so
+    // the appearance context reads it during init. A swap in the load/checked
+    // binding would light up the wrong cells here.
+    await context.addInitScript(() => {
+      localStorage.setItem("vc_appearance_entry_notifications", "false"); // joins · Message OFF
+      localStorage.setItem("vc_appearance_exit_sound", "false"); // leaves · Sound OFF
+      // entry_sound and exit_notifications left unset → default ON.
+    });
+
+    const meetingId = `e2e_announce_roundtrip_${Date.now()}`;
+    await openPreferencesPanel(page, meetingId, "announce-roundtrip-user");
+
+    const matrix = page.locator('[data-testid="announce-matrix"]');
+    await expect(matrix.locator('[data-testid="announce-join-message"]')).not.toBeChecked();
+    await expect(matrix.locator('[data-testid="announce-leave-sound"]')).not.toBeChecked();
+    await expect(matrix.locator('[data-testid="announce-join-sound"]')).toBeChecked();
+    await expect(matrix.locator('[data-testid="announce-leave-message"]')).toBeChecked();
+  });
+
+  test("channel help icons reveal on focus and dismiss on Escape", async ({ page }) => {
+    test.setTimeout(120_000);
+    const meetingId = `e2e_announce_help_${Date.now()}`;
+    await openPreferencesPanel(page, meetingId, "announce-help-user");
+
+    const matrix = page.locator('[data-testid="announce-matrix"]');
+
+    const channels = [
+      {
+        help: "announce-help-message",
+        tip: "announce-tip-message",
+        ariaLabel: "About message announcements",
+        text: "Show an on-screen message when someone joins or leaves.",
+      },
+      {
+        help: "announce-help-sound",
+        tip: "announce-tip-sound",
+        ariaLabel: "About sound announcements",
+        text: "Play a chime when someone joins or leaves.",
+      },
+    ];
+
+    for (const channel of channels) {
+      const help = matrix.locator(`[data-testid="${channel.help}"]`);
+      const tip = page.locator(`#${channel.tip}`);
+
+      await expect(help).toHaveAttribute("aria-label", channel.ariaLabel);
+      await expect(help).toHaveAttribute("aria-describedby", channel.tip);
+      await expect(tip).toHaveAttribute("role", "tooltip");
+      await expect(tip).toHaveText(channel.text);
+
+      // Hidden until focused; focus reveals it via CSS :focus-within.
+      await expect(tip).toBeHidden();
+      await help.focus();
+      await expect(tip).toBeVisible();
+
+      // Escape dismisses ONLY the tooltip: it must (a) hide, while (b) the
+      // settings modal stays OPEN and (c) focus stays on the trigger. The
+      // handler stops propagation so the modal's own Escape-to-close does not
+      // fire, and does not blur. On the pre-fix code (Escape bubbled to the
+      // modal handler and blurred the icon) the modal closed and focus fell to
+      // <body>, so (b) and (c) fail — and the sound iteration then can't find
+      // its icon. This pins the scoped-dismissal fix.
+      await page.keyboard.press("Escape");
+      await expect(tip).toBeHidden();
+      await expect(page.locator("#device-settings-dialog")).toBeVisible();
+      await expect(help).toBeFocused();
+    }
+  });
+
+  test("each toggle exposes a distinct accessible name", async ({ page }) => {
+    test.setTimeout(120_000);
+    const meetingId = `e2e_announce_a11y_${Date.now()}`;
+    await openPreferencesPanel(page, meetingId, "announce-a11y-user");
+
+    const matrix = page.locator('[data-testid="announce-matrix"]');
+    for (const { name } of ANNOUNCE_TOGGLES) {
+      await expect(matrix.getByRole("checkbox", { name, exact: true })).toHaveCount(1);
+    }
+  });
+});

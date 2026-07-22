@@ -78,6 +78,7 @@
 //!     on_meeting_settings_updated: None,
 //!     on_peer_left: None,    // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
 //!     on_peer_joined: None,  // Option<Callback<(String, String, String)>> -- (display_name, user_id, session_id)
+//!     on_reaction: None,     // Option<Callback<(u64, i32, String)>> -- (sender_session_id, reaction_enum, resolved_name)
 //!     on_display_name_changed: None,
 //!     on_host_mute: None,
 //!     on_host_disable_video: None,
@@ -123,6 +124,7 @@
 //! #     on_meeting_settings_updated: None,
 //! #     on_peer_left: None,
 //! #     on_peer_joined: None,
+//! #     on_reaction: None,
 //! #     on_display_name_changed: None,
 //! #     on_host_mute: None,
 //! #     on_host_disable_video: None,
@@ -246,6 +248,11 @@ pub mod render_fps;
 pub mod utils;
 mod wrappers;
 pub use adaptive_quality_constants::initial_screen_tier;
+pub use client::reactions::{
+    resolve_reaction_display_name, sanitize_reaction_display_name, ReactionSelfThrottle,
+    REACTION_DISPLAY_NAME_MAX_CHARS, REACTION_SELF_MAX_PER_WINDOW, REACTION_SELF_MIN_INTERVAL_MS,
+    REACTION_SELF_WINDOW_MS, REACTION_UNKNOWN_SENDER_NAME,
+};
 pub use client::{
     RefreshRoomTokenCallback, RefreshedTokens, VideoCallClient, VideoCallClientOptions,
 };
@@ -269,4 +276,7 @@ pub use media_devices::{
     MediaAccessKind, MediaDeviceAccess, MediaDeviceList, MediaPermission,
     MediaPermissionsErrorState, PermissionState, SelectableDevices,
 };
-pub use videocall_types::{Callback, PEER_EVENT_SCREEN_DECODE_STARTED};
+pub use videocall_types::{
+    Callback, PEER_EVENT_RECORDING_STARTED, PEER_EVENT_RECORDING_STOPPED,
+    PEER_EVENT_SCREEN_DECODE_STARTED,
+};

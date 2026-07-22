@@ -13,8 +13,8 @@
 
 //! Shared owner-only meeting-options toggles.
 //!
-//! This is the SINGLE source of truth for the four mutable meeting options
-//! (Waiting Room, Admitted-can-admit, End-on-host-leave, Allow-guests). It is
+//! This is the SINGLE source of truth for the five mutable meeting options
+//! (Waiting Room, Admitted-can-admit, End-on-host-leave, Allow-guests, Recording). It is
 //! rendered in three places so we never maintain duplicate copies of this UI:
 //!   - the pre-join / startup card ([`crate::components::pre_join_settings_card`]),
 //!   - the dedicated meeting-settings page ([`crate::pages::meeting_settings`]),
@@ -70,7 +70,7 @@ fn waiting_room_rollback(new_val: bool, prev_aca: bool) -> (bool, Option<bool>) 
     (waiting_room_restore, admitted_can_admit_restore)
 }
 
-/// The four owner-editable meeting-option rows, wired to caller-owned signals.
+/// The five owner-editable meeting-option rows, wired to caller-owned signals.
 #[component]
 pub fn MeetingOptionsControls(
     meeting_id: String,
@@ -78,6 +78,7 @@ pub fn MeetingOptionsControls(
     admitted_can_admit_toggle: Signal<bool>,
     end_on_host_leave_toggle: Signal<bool>,
     allow_guests_toggle: Signal<bool>,
+    recording_allowed_for_all_toggle: Signal<bool>,
     saving: Signal<bool>,
     toggle_error: Signal<Option<String>>,
 ) -> Element {
@@ -88,6 +89,7 @@ pub fn MeetingOptionsControls(
                   admitted_can_admit: Option<bool>,
                   end_on_host_leave_opt: Option<bool>,
                   allow_guests_opt: Option<bool>,
+                  recording_allowed_for_all_opt: Option<bool>,
                   mut rollback_signal: Signal<bool>,
                   old_val: bool,
                   secondary_rollback: Option<(Signal<bool>, bool)>,
@@ -102,6 +104,7 @@ pub fn MeetingOptionsControls(
                         admitted_can_admit,
                         end_on_host_leave_opt,
                         allow_guests_opt,
+                        recording_allowed_for_all_opt,
                     )
                     .await
                     {
@@ -110,6 +113,7 @@ pub fn MeetingOptionsControls(
                             admitted_can_admit_toggle.set(updated.admitted_can_admit);
                             end_on_host_leave_toggle.set(updated.end_on_host_leave);
                             allow_guests_toggle.set(updated.allow_guests);
+                            recording_allowed_for_all_toggle.set(updated.recording_allowed_for_all);
                             saving.set(false);
                         }
                         Err(e) => {
@@ -168,6 +172,7 @@ pub fn MeetingOptionsControls(
                                 aca,
                                 None,
                                 None,
+                                None,
                                 waiting_room_toggle,
                                 old_val,
                                 secondary_rollback,
@@ -205,6 +210,7 @@ pub fn MeetingOptionsControls(
                                 Some(new_val),
                                 None,
                                 None,
+                                None,
                                 admitted_can_admit_toggle,
                                 old_val,
                                 None,
@@ -239,6 +245,7 @@ pub fn MeetingOptionsControls(
                                 None,
                                 None,
                                 Some(new_val),
+                                None,
                                 None,
                                 end_on_host_leave_toggle,
                                 old_val,
@@ -275,7 +282,49 @@ pub fn MeetingOptionsControls(
                                 None,
                                 None,
                                 Some(new_val),
+                                None,
                                 allow_guests_toggle,
+                                old_val,
+                                None,
+                                saving,
+                                toggle_error,
+                            );
+                        }
+                    },
+                }
+            }
+        }
+
+        // ── Allow recording for all participants ──────────────────────────
+        // When enabled every admitted participant sees the record button on
+        // their action bar.  When disabled (the default) only the host sees
+        // the record button; recording itself is entirely client-side and is
+        // not enforced server-side, so this toggle controls visibility, not
+        // capability.
+        div { class: "settings-option-row", style: "opacity: 1;",
+            span { class: "settings-option-label", "Allow recording for all" }
+            div { class: "settings-option-controls",
+                {info_icon("When on, every admitted participant sees the record button. When off, only the host sees the record button.")}
+                ToggleSwitch {
+                    enabled: recording_allowed_for_all_toggle(),
+                    disabled: saving(),
+                    on_toggle: {
+                        let meeting_id = mid.clone();
+                        let update_setting = update_setting.clone();
+                        move |new_val: bool| {
+                            if saving() {
+                                return;
+                            }
+                            let old_val = !new_val;
+                            recording_allowed_for_all_toggle.set(new_val);
+                            update_setting(
+                                meeting_id.clone(),
+                                None,
+                                None,
+                                None,
+                                None,
+                                Some(new_val),
+                                recording_allowed_for_all_toggle,
                                 old_val,
                                 None,
                                 saving,

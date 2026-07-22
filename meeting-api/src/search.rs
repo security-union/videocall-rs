@@ -427,6 +427,7 @@ mod tests {
             admitted_can_admit: false,
             end_on_host_leave: true,
             allow_guests: false,
+            recording_allowed_for_all: false,
         }
     }
 

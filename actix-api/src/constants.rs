@@ -592,6 +592,65 @@ pub const KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER: u32 = 1;
 /// cap and far short of a storm.
 pub const KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED: u32 = 4;
 
+/// Steady-state per-`(receiver, target_sender)` KEYFRAME_REQUEST budget for a
+/// **SCREEN** stream (issue #1899).
+///
+/// The camera budget ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`], 1/sec) is
+/// tuned for a stream that paints continuously: a dropped keyframe request only
+/// costs a moment of sharpness because the next inter-frame repaints the tile,
+/// and the tight 1/sec cap is what keeps a receiver from melting the publisher
+/// with a PLI storm (OSS #814 / #1479). A **static** SCREEN share inverts that
+/// cost/benefit: new content arrives ONLY on keyframes, so a receiver that
+/// misses one (rejoin, layer switch, a single lost keyframe response) has NO
+/// inter-frame fallback and holds its last-good frame FROZEN until the next
+/// keyframe lands. Field evidence (meeting_sync 2026-07-21, 9 receivers, static
+/// 720p@8fps share): every receiver froze 13–88s while audio stayed clean, and
+/// the relay logged 106 camera-budget rate-limit drops against the broadcaster's
+/// screen in the freeze window. At 1/sec a receiver could re-request at most
+/// once per second, and the #1297 delivery-aware relaxation is DEFEATED here
+/// because each re-encode of the retained static frame (a delta, useless without
+/// its keyframe) is a SCREEN delivery that clears the still-waiting flag and
+/// throws the receiver back onto the strict 1/sec budget.
+///
+/// `4`/sec: a static screen share is permanently in "recovery posture" (no
+/// inter-frame fallback), so its STEADY-STATE budget is set to the camera's
+/// RECOVERY rate ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`], the
+/// value the repo already validated as a safe per-pair upper rate under the
+/// global cap). That gives ~250ms re-request granularity so a frozen tile
+/// recovers within a few hundred ms even if a keyframe response is lost, while
+/// staying at 1/8 of the unchanged global per-receiver ceiling
+/// ([`KEYFRAME_REQUEST_MAX_PER_SEC`], 32/sec). This raises the SCREEN budget
+/// ONLY; VIDEO keeps its 1/sec budget byte-for-byte (the #1479 protection is
+/// unchanged), because the two kinds already occupy separate limiter buckets
+/// (#1297). It does NOT re-open the PLI-storm risk: the client publisher's SCREEN
+/// encoder coalesces incoming PLIs at a 2s encoder-side cooldown
+/// (`ENCODER_PLI_COOLDOWN_MS` = 2000ms, the #1287 emit coalescer in
+/// `videocall-client/src/encode/screen_encoder.rs`), so however many PLIs the
+/// relay forwards, the publisher emits at most one keyframe per cooldown — the
+/// publisher coalescer, not this relay cap, is the storm backstop. The in-flight
+/// #1903 client change adds a wall-clock retained-frame keyframe floor during
+/// static periods, which only strengthens that backstop; this relay cap does not
+/// depend on it.
+pub const KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN: u32 = 4;
+
+/// Relaxed per-`(receiver, target_sender)` KEYFRAME_REQUEST budget for a
+/// **SCREEN** stream while the requesting receiver is in **active congestion**
+/// (issue #1899, the SCREEN analogue of
+/// [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`]).
+///
+/// Mirrors the camera design's "congested is strictly more permissive than
+/// steady-state" relationship: a SCREEN share on a genuinely lossy link (its
+/// [`CongestionTracker`] crossed the drop threshold within
+/// [`KEYFRAME_CONGESTION_RELAX_WINDOW`]) may lose keyframe responses AND has no
+/// inter-frame fallback, the worst case for a frozen tile. `8`/sec (2× the
+/// SCREEN steady-state) buys headroom for lost responses while still sitting at
+/// 1/4 of the unchanged global per-receiver ceiling
+/// ([`KEYFRAME_REQUEST_MAX_PER_SEC`], 32/sec) — the ceiling is NEVER relaxed, so
+/// the storm bound holds, and the publisher-side PLI coalescer (#1287, the 2s
+/// `ENCODER_PLI_COOLDOWN_MS`) remains the actual backstop against publisher
+/// meltdown under a reconnection wave. VIDEO congested behaviour is unchanged.
+pub const KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN_CONGESTED: u32 = 8;
+
 /// How recently the requesting receiver must have been flagged congested
 /// (its [`CongestionTracker`] crossed the drop threshold) for the relaxed
 /// keyframe budget [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`] to
@@ -727,6 +786,57 @@ const _: () = {
 /// PLI pressure. 5 retries/sec recovers a frozen tile within a few hundred ms
 /// even if some keyframe responses are themselves lost.
 pub const KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS: u64 = 200;
+
+// ---------------------------------------------------------------------------
+// REACTION Rate Limiting (issue #1884)
+// ---------------------------------------------------------------------------
+
+/// Maximum number of REACTION packets the relay forwards from a single sending
+/// session within [`REACTION_WINDOW_MS`] (issue #1884).
+///
+/// A REACTION is a client-authored packet the relay RE-BROADCASTS to the whole
+/// room on the media fan-out (unlike VIEWPORT/LAYER_PREFERENCE, which the relay
+/// consumes and never re-broadcasts). That broadcast reach makes it a spam /
+/// amplification surface, so — like the KEYFRAME_REQUEST path — every reaction
+/// is metered per sender at a single tumbling-window bucket (there is no
+/// per-target dimension: a reaction is aimed at the room, not one peer).
+///
+/// `4` per second is the RELAY ceiling. The browser client self-throttles
+/// STRICTLY below it (≤3 per rolling 1000ms AND ≥350ms between sends — see
+/// videocall-client's reaction self-throttle), so a well-behaved client never
+/// reaches this cap; it exists to clamp a misbehaving or forged client. The
+/// closed-enum validation in `classify_packet` runs BEFORE this limiter, so a
+/// flood of invalid reactions is dropped without consuming a sender's valid
+/// budget window.
+pub const REACTION_MAX_PER_WINDOW: u32 = 4;
+
+/// Time window (in milliseconds) for REACTION rate limiting (issue #1884).
+///
+/// Paired with [`REACTION_MAX_PER_WINDOW`] as the per-sender tumbling window.
+/// 1000ms mirrors [`KEYFRAME_REQUEST_WINDOW_MS`]; the two are separate
+/// constants because they meter unrelated surfaces (keyframe requests vs.
+/// reaction broadcasts) and may diverge without affecting each other.
+pub const REACTION_WINDOW_MS: u64 = 1000;
+
+/// Maximum number of BYTES of a REACTION's cosmetic `display_name` the relay
+/// will RE-BROADCAST (issue #1884).
+///
+/// `ReactionPacket.display_name` is an attacker-controlled `bytes` field the
+/// relay fans out room-wide. The browser client caps it at 64 CHARACTERS on
+/// send, but a modified/forged client can put an arbitrarily large value on the
+/// wire — and because a REACTION is re-broadcast to every participant, an
+/// oversized name is an egress-amplification surface (up to the frame limit ×
+/// [`REACTION_MAX_PER_WINDOW`]/sec × O(participants)). The relay therefore
+/// bounds it at ingress, independent of any client cooperation.
+///
+/// 256 bytes is deliberately generous — ~4× the client's 64-char contract, so a
+/// legitimate multi-byte (e.g. CJK/emoji) display name is never truncated —
+/// while still bounding amplification. The REACTION path TRUNCATES to this
+/// bound (at a UTF-8 char boundary) rather than dropping: the reaction itself is
+/// valid (its enum passed ingress validation) and the name is only a cosmetic
+/// fallback, so discarding a valid reaction over an oversized cosmetic field
+/// would be user-hostile. The client re-sanitizes and re-caps on consume.
+pub const REACTION_DISPLAY_NAME_MAX_BYTES: usize = 256;
 
 /// Maximum number of `session_ids` the relay will accept from a single
 /// VIEWPORT control packet (HCL issue #988).

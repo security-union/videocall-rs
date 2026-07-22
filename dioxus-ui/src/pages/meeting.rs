@@ -51,6 +51,7 @@ pub enum MeetingStatus {
         admitted_can_admit: bool,
         end_on_host_leave: bool,
         allow_guests: bool,
+        recording_allowed_for_all: bool,
     },
     Rejected,
     Error(String),
@@ -208,6 +209,10 @@ pub fn MeetingPage(id: String) -> Element {
                 webtransport_urls,
                 enable_e2ee: false,
                 enable_webtransport: effective_wt_enabled,
+                // Issue #1884: this is the pre-meeting OBSERVER client (waiting for
+                // the meeting to start) — it renders no in-call reaction overlay,
+                // so it takes no reaction callback.
+                on_reaction: None,
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting for meeting)");
                 }),
@@ -270,6 +275,8 @@ pub fn MeetingPage(id: String) -> Element {
                                                     admitted_can_admit: response.admitted_can_admit,
                                                     end_on_host_leave: response.end_on_host_leave,
                                                     allow_guests: response.allow_guests,
+                                                    recording_allowed_for_all: response
+                                                        .recording_allowed_for_all,
                                                 });
                                             } else {
                                                 meeting_status.set(MeetingStatus::Error(
@@ -415,6 +422,8 @@ pub fn MeetingPage(id: String) -> Element {
                                         admitted_can_admit: response.admitted_can_admit,
                                         end_on_host_leave: response.end_on_host_leave,
                                         allow_guests: response.allow_guests,
+                                        recording_allowed_for_all: response
+                                            .recording_allowed_for_all,
                                     });
                                 } else {
                                     meeting_status.set(MeetingStatus::Error(
@@ -494,6 +503,7 @@ pub fn MeetingPage(id: String) -> Element {
                 admitted_can_admit: status.admitted_can_admit,
                 end_on_host_leave: status.end_on_host_leave,
                 allow_guests: status.allow_guests,
+                recording_allowed_for_all: status.recording_allowed_for_all,
             });
         }
     };
@@ -534,6 +544,7 @@ pub fn MeetingPage(id: String) -> Element {
                                     admitted_can_admit: status.admitted_can_admit,
                                     end_on_host_leave: status.end_on_host_leave,
                                     allow_guests: status.allow_guests,
+                                    recording_allowed_for_all: status.recording_allowed_for_all,
                                 });
                             }
                         }
@@ -598,6 +609,7 @@ pub fn MeetingPage(id: String) -> Element {
                     admitted_can_admit,
                     allow_guests,
                     end_on_host_leave,
+                    recording_allowed_for_all,
 
                     // Waiting room
                 },
@@ -619,6 +631,7 @@ pub fn MeetingPage(id: String) -> Element {
                     admitted_can_admit: *admitted_can_admit,
                     end_on_host_leave: *end_on_host_leave,
                     allow_guests:*allow_guests,
+                    recording_allowed_for_all: *recording_allowed_for_all,
                 }
             },
             (Some(_), MeetingStatus::Waiting { observer_token }) => rsx! {

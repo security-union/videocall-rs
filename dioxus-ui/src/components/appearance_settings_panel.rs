@@ -872,7 +872,16 @@ pub fn AppearanceSettingsPanel() -> Element {
                             }
 
                             div { class: "appearance-slider-row",
-                                label { class: "appearance-slider-label", "Decay" }
+                                label { class: "appearance-slider-label",
+                                    "Decay "
+                                    span {
+                                        class: "settings-info-icon speaker-highlight-help-icon",
+                                        "data-tooltip": "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail.",
+                                        "aria-label": "Decay help",
+                                        "data-testid": "speaker-highlight-decay-help",
+                                        "(?)"
+                                    }
+                                }
                                 input {
                                     r#type: "range",
                                     class: "appearance-slider",
@@ -896,10 +905,6 @@ pub fn AppearanceSettingsPanel() -> Element {
                                 span { class: "appearance-slider-value",
                                     "{(appearance.glow_decay * 100.0) as i32}%"
                                 }
-                            }
-
-                            p { class: "appearance-section-helper",
-                                "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail."
                             }
 
                             div { class: "appearance-slider-row",

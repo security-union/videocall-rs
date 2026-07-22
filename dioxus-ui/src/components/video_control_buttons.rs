@@ -363,6 +363,59 @@ pub fn DiagnosticsButton(
 }
 
 // =============================================================================
+// Reactions Button (issue #1884)
+// =============================================================================
+
+/// Opens the reactions palette. Mirrors `PeerListButton`/`DiagnosticsButton`,
+/// plus the popup a11y contract: `aria-haspopup="menu"` and `aria-expanded`
+/// bound to `open` (the palette is `role="menu"`). The call site passes
+/// `id="reactions-trigger"` so the Escape/close handlers can restore focus here.
+#[component]
+pub fn ReactionsButton(
+    open: bool,
+    #[props(default)] id: String,
+    onclick: EventHandler<MouseEvent>,
+) -> Element {
+    let class = if open {
+        "video-control-button active"
+    } else {
+        "video-control-button"
+    };
+
+    rsx! {
+        button {
+            id: if id.is_empty() { None } else { Some(id.clone()) },
+            class,
+            "data-testid": "reactions-button",
+            "aria-label": "Reactions",
+            // UX B2: the palette is a role=toolbar, not a menu — drop
+            // aria-haspopup (which announces a menu popup), keep aria-expanded,
+            // and point aria-controls at the palette's id so AT ties the two.
+            "aria-controls": "reactions-palette",
+            "aria-expanded": if open { "true" } else { "false" },
+            onclick: move |evt| onclick.call(evt),
+            svg {
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                circle { cx: "12", cy: "12", r: "10" }
+                path { d: "M8 14s1.5 2 4 2 4-2 4-2" }
+                line { x1: "9", y1: "9", x2: "9.01", y2: "9" }
+                line { x1: "15", y1: "9", x2: "15.01", y2: "9" }
+            }
+            span { class: "tooltip",
+                span { class: "tooltip-title", "Reactions" }
+                span { class: "tooltip-desc", "Send a reaction everyone in the call can see." }
+            }
+        }
+    }
+}
+
+// =============================================================================
 // Device Settings Button (Mobile Only)
 // =============================================================================
 
@@ -572,5 +625,194 @@ pub fn HangUpButton(onclick: EventHandler<MouseEvent>) -> Element {
                 path { d: "M12.017 6.995c-2.306 0-4.534.408-6.215 1.507-1.737 1.135-2.788 2.944-2.797 5.451a4.8 4.8 0 0 0 .01.62c.015.193.047.512.138.763a2.557 2.557 0 0 0 2.579 1.677H7.31a2.685 2.685 0 0 0 2.685-2.684v-.645a.684.684 0 0 1 .684-.684h2.647a.686.686 0 0 1 .686.687v.645c0 .712.284 1.395.787 1.898.478.478 1.101.787 1.847.787h1.647a2.555 2.555 0 0 0 2.575-1.674c.09-.25.123-.57.137-.763.015-.2.022-.433.01-.617-.002-2.508-1.049-4.32-2.785-5.458-1.68-1.1-3.907-1.51-6.213-1.51Z" }
             }
         }
+    }
+}
+
+// =============================================================================
+// Record Button
+// =============================================================================
+
+/// Visual state of the recording button.
+#[derive(Clone, PartialEq, Debug)]
+pub enum RecordButtonState {
+    /// No recording in progress — show "Start Recording".
+    Idle,
+    /// MediaRecorder is being set up — button is disabled.
+    Activating,
+    /// Recording is active — show "Stop Recording".
+    Recording,
+    /// Recording is being stopped.
+    Stopping,
+    /// Recording stopped; file is being saved.
+    Saving,
+}
+
+impl RecordButtonState {
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            RecordButtonState::Activating | RecordButtonState::Stopping | RecordButtonState::Saving
+        )
+    }
+}
+
+#[component]
+pub fn RecordButton(state: RecordButtonState, onclick: EventHandler<MouseEvent>) -> Element {
+    let is_recording = matches!(state, RecordButtonState::Recording);
+    let is_busy = state.is_busy();
+
+    let class = match &state {
+        RecordButtonState::Recording => "video-control-button record-active",
+        _ if is_busy => "video-control-button disabled",
+        _ => "video-control-button",
+    };
+
+    let tooltip = match &state {
+        RecordButtonState::Idle => "Start Recording",
+        RecordButtonState::Activating => "Starting recording\u{2026}",
+        RecordButtonState::Recording => "Stop Recording",
+        RecordButtonState::Stopping => "Stopping recording\u{2026}",
+        RecordButtonState::Saving => "Saving recording\u{2026}",
+    };
+
+    rsx! {
+        button {
+            class,
+            disabled: is_busy,
+            "data-testid": "record-button",
+            onclick: move |evt| {
+                if !is_busy {
+                    onclick.call(evt);
+                }
+            },
+            if is_recording {
+                // Stop icon: solid square
+                svg {
+                    xmlns: "http://www.w3.org/2000/svg",
+                    view_box: "0 0 24 24",
+                    fill: "currentColor",
+                    stroke: "none",
+                    rect { x: "5", y: "5", width: "14", height: "14", rx: "2" }
+                }
+            } else {
+                // Record icon: filled circle with outer ring
+                svg {
+                    xmlns: "http://www.w3.org/2000/svg",
+                    view_box: "0 0 24 24",
+                    fill: "none",
+                    stroke: "currentColor",
+                    stroke_width: "2",
+                    circle { cx: "12", cy: "12", r: "9" }
+                    circle { cx: "12", cy: "12", r: "4", fill: "currentColor", stroke: "none" }
+                }
+            }
+            span { class: "tooltip", "{tooltip}" }
+        }
+    }
+}
+
+/// Map the state-string emitted by `recording.js` `onStateChange` callback to
+/// the corresponding `RecordButtonState`.  Extracted as a pure function so it
+/// can be unit-tested independently of the Dioxus runtime.
+///
+/// The string values must match what `recording.js` passes to `setState()`:
+/// `"activating"`, `"recording"`, `"stopping"`, `"saving"`, `"saved"`,
+/// `"idle"`.  Unknown strings fall back to `Idle` (log-level warn in the
+/// call-site closure).
+pub fn js_state_to_record_button_state(s: &str) -> RecordButtonState {
+    match s {
+        "activating" => RecordButtonState::Activating,
+        "recording" => RecordButtonState::Recording,
+        "stopping" => RecordButtonState::Stopping,
+        "saving" => RecordButtonState::Saving,
+        "saved" | "idle" => RecordButtonState::Idle,
+        _ => RecordButtonState::Idle,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── js_state_to_record_button_state ────────────────────────────────────
+    // Each arm of the JS→Rust mapping must round-trip correctly.
+    // These tests FAIL if any arm is removed or mistyped — a rename in
+    // recording.js that is not mirrored here would silently leave the button
+    // stuck in Idle because the unknown-string fallback also returns Idle.
+
+    #[test]
+    fn js_state_activating_maps_to_activating() {
+        assert_eq!(
+            js_state_to_record_button_state("activating"),
+            RecordButtonState::Activating,
+        );
+    }
+
+    #[test]
+    fn js_state_recording_maps_to_recording() {
+        assert_eq!(
+            js_state_to_record_button_state("recording"),
+            RecordButtonState::Recording,
+        );
+    }
+
+    #[test]
+    fn js_state_stopping_maps_to_stopping() {
+        assert_eq!(
+            js_state_to_record_button_state("stopping"),
+            RecordButtonState::Stopping,
+        );
+    }
+
+    #[test]
+    fn js_state_saving_maps_to_saving() {
+        assert_eq!(
+            js_state_to_record_button_state("saving"),
+            RecordButtonState::Saving,
+        );
+    }
+
+    /// "saved" → Idle: normal recording completion path.
+    #[test]
+    fn js_state_saved_maps_to_idle() {
+        assert_eq!(
+            js_state_to_record_button_state("saved"),
+            RecordButtonState::Idle,
+        );
+    }
+
+    /// "idle" → Idle: abort path (cancel on file picker, MediaRecorder error).
+    /// This is the path fixed in the abort-cleanup bug: if "idle" were mapped
+    /// to any non-Idle state the → Idle cleanup branch in the callback would
+    /// never fire on abort.
+    #[test]
+    fn js_state_idle_maps_to_idle() {
+        assert_eq!(
+            js_state_to_record_button_state("idle"),
+            RecordButtonState::Idle,
+        );
+    }
+
+    /// Unknown strings fall back to Idle (not a panic, not a stuck state).
+    #[test]
+    fn js_state_unknown_falls_back_to_idle() {
+        assert_eq!(
+            js_state_to_record_button_state("bogus"),
+            RecordButtonState::Idle,
+        );
+        assert_eq!(js_state_to_record_button_state(""), RecordButtonState::Idle,);
+    }
+
+    /// "saved" and "idle" must both map to Idle — they are the two terminal
+    /// states recording.js can emit.  If either were forgotten the cleanup
+    /// path (the STOPPED fan-out) would not fire.
+    #[test]
+    fn both_terminal_js_states_reach_idle_branch() {
+        let saved = js_state_to_record_button_state("saved");
+        let idle = js_state_to_record_button_state("idle");
+        assert_eq!(saved, RecordButtonState::Idle);
+        assert_eq!(idle, RecordButtonState::Idle);
+        // The two must be equal to each other — both land on the same variant.
+        assert_eq!(saved, idle);
     }
 }

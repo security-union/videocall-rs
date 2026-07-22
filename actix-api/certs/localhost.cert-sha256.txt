@@ -6,4 +6,4 @@
 # with the cert; the cert's validity is capped at 13 days because
 # Chromium rejects `serverCertificateHashes` entries for any cert with more
 # than 14 days of validity.
-3uIioos0DRWpdZu44SQwDklwO8SBYXZysuP/j/hzWKU=
+5UJe8eKf/WhG+zYnWcK5cl9KydtpXVa3LUeTXTiO4/c=

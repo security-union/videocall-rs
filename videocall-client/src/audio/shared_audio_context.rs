@@ -260,4 +260,39 @@ impl SharedAudioContext {
         });
         ctx.ok_or_else(|| JsValue::from_str("Shared AudioContext not initialized"))
     }
+
+    /// Ensure the `SharedAudioContext` exists and expose it together with the
+    /// master gain node as `window.__vcSharedAudioCtx` / `window.__vcMasterGain`
+    /// so the JS recording module can tap into the live audio graph directly.
+    ///
+    /// The recording pipeline in `recording.js` connects `master_gain` to its
+    /// own `MediaStreamAudioDestinationNode` (mixDest) via a plain AudioNode
+    /// fan-out within the shared context.  No intermediate MediaStream bridge
+    /// is created on the Rust side.
+    ///
+    /// Called from a user-gesture context (Record button click), so
+    /// `AudioContext` creation is permitted by the browser's autoplay policy.
+    pub fn prepare_recording_stream() {
+        if let Err(e) = Self::get_or_init(None) {
+            log::warn!("Failed to initialise SharedAudioContext for recording: {e:?}");
+            return;
+        }
+
+        SHARED.with(|cell| {
+            if let Some(shared) = cell.borrow().as_ref() {
+                if let Some(win) = web_sys::window() {
+                    let _ = js_sys::Reflect::set(
+                        &win,
+                        &JsValue::from_str("__vcSharedAudioCtx"),
+                        &shared.context,
+                    );
+                    let _ = js_sys::Reflect::set(
+                        &win,
+                        &JsValue::from_str("__vcMasterGain"),
+                        &shared.master_gain,
+                    );
+                }
+            }
+        });
+    }
 }

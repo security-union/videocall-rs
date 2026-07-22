@@ -19,7 +19,7 @@
 use crate::components::meeting_info::MeetingInfo;
 use crate::components::peer_list_item::PeerListItem;
 use crate::constants::meeting_api_client;
-use crate::context::{HostSetCtx, VideoCallClientCtx};
+use crate::context::{HostSetCtx, RecordingSetCtx, VideoCallClientCtx};
 use dioxus::prelude::*;
 use futures::future::{AbortHandle, Abortable};
 use std::cell::RefCell;
@@ -144,6 +144,11 @@ pub fn PeerList(
     // (not display names, which are user-chosen and spoofable).
     // We need the current user's user_id from the client context.
     let current_user_id_val = client_ctx.user_id().clone();
+    // Local session id for the self-row's per-recorder indicator. Recording is a
+    // per-session action (see `RecordingSetCtx`), so the self-row keys on THIS
+    // session, not the user_id — a sibling tab of the same account records
+    // independently. Empty when the session has not been assigned yet.
+    let current_session_id = client_ctx.get_own_session_id().unwrap_or_default();
     // Single-host model: the current host comes from the reactive `HostSetCtx`
     // (updated live on HOST_GRANTED/HOST_REVOKED), with a fallback to the
     // `host_user_id` prop when the context is absent.
@@ -155,6 +160,17 @@ pub fn PeerList(
         }
     };
     let is_current_user_host = is_host_uid(&current_user_id_val);
+    // Per-recorder indicator. Unlike `is_host_uid` (per-account role, keyed by
+    // user_id), recording is a per-SESSION action, so this keys on `session_id`.
+    // Sourced only from the reactive `RecordingSetCtx` (no persisted server state
+    // to fall back to); a missing provider means "nobody is recording".
+    let recording_set = try_use_context::<RecordingSetCtx>();
+    let is_recording_session = move |session_id: &str| -> bool {
+        recording_set
+            .as_ref()
+            .map(|rs| rs.is_recording(session_id))
+            .unwrap_or(false)
+    };
 
     rsx! {
         div {
@@ -376,7 +392,7 @@ pub fn PeerList(
                     div { class: "peer-list",
                         ul {
                             // show self as the first item with actual username
-                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_self: true, is_guest: client_ctx.is_local_guest().unwrap_or(false), muted: self_muted, speaking: self_speaking, on_edit_name: on_edit_self_name } }
+                            li { PeerListItem { name: display_name.clone(), is_host: is_current_user_host, is_recording: is_recording_session(&current_session_id), is_self: true, is_guest: client_ctx.is_local_guest().unwrap_or(false), muted: self_muted, speaking: self_speaking, on_edit_name: on_edit_self_name } }
 
                             for peer in filtered_peers.iter() {
                                 {
@@ -548,6 +564,7 @@ pub fn PeerList(
                                                 name: peer_display_name,
                                                 tooltip: tooltip_user_id,
                                                 is_host: is_peer_host,
+                                                is_recording: is_recording_session(sid),
                                                 is_guest: peer_is_guest,
                                                 muted: muted,
                                                 video_disabled: video_disabled,

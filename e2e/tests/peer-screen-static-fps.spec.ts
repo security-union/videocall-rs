@@ -352,3 +352,272 @@ test.describe("Peer screen-share static-FPS tooltip", () => {
     }
   });
 });
+
+/**
+ * Mean luminance (0-255) of the peer's DECODED screen-share canvas, downsampled
+ * to 64x36 so it is cheap to poll and robust to where content sits. `null` when
+ * the canvas is absent or unsampleable.
+ *
+ * A never-decoded canvas is transparent/black (mean ~0). A decoded frame of the
+ * mock — a `#1a1a2e` field (R≈26) with white text and a dot — has a mean clearly
+ * above zero, so mean > 8 cleanly separates "painted a real frame" from "blank,
+ * never received a keyframe".
+ */
+async function screenCanvasMean(page: Page): Promise<number | null> {
+  return page.evaluate(() => {
+    const canvas = document.querySelector(
+      '.split-screen-tile canvas[id^="screen-share-"]',
+    ) as HTMLCanvasElement | null;
+    if (!canvas || canvas.width === 0 || canvas.height === 0) {
+      return null;
+    }
+    const off = document.createElement("canvas");
+    off.width = 64;
+    off.height = 36;
+    const octx = off.getContext("2d");
+    if (!octx) {
+      return null;
+    }
+    try {
+      octx.drawImage(canvas, 0, 0, 64, 36);
+      const data = octx.getImageData(0, 0, 64, 36).data;
+      let sum = 0;
+      let n = 0;
+      for (let i = 0; i < data.length; i += 4) {
+        // Rec.601-ish luma from RGB is overkill here; the red channel alone
+        // separates the dark mock field from a transparent/black blank.
+        sum += data[i];
+        n += 1;
+      }
+      return n === 0 ? null : sum / n;
+    } catch {
+      // A tainted canvas would throw — not expected for our own decoded media.
+      return null;
+    }
+  });
+}
+
+type LateJoinerTransport = "websocket" | "webtransport";
+
+/**
+ * Seed sticky transport preference so the wasm boot elects `mode` before any
+ * signaling. Mirrors `wt-screen-share-split-layout.spec.ts`'s
+ * `forceTransportSticky` (the storage shape the device-settings Network tab
+ * writes: `vc_transport_preference` + `vc_transport_sticky`). Added AFTER
+ * `createAuthenticatedContext` so this init script runs last and wins over the
+ * helper's default (`websocket`); a seed page also persists it for reloads.
+ */
+async function forceTransportSticky(
+  context: BrowserContext,
+  mode: LateJoinerTransport,
+  baseURL: string,
+): Promise<void> {
+  await context.addInitScript((m: string) => {
+    try {
+      localStorage.setItem("vc_transport_preference", m);
+      localStorage.setItem("vc_transport_sticky", "true");
+    } catch {
+      // localStorage may be unavailable in unusual sandbox states; the WT case
+      // then falls back to Auto and the sniffer guard below skips it cleanly.
+    }
+  }, mode);
+  const seedPage = await context.newPage();
+  await seedPage.goto(baseURL, { waitUntil: "domcontentloaded" });
+  await seedPage.evaluate((m: string) => {
+    localStorage.setItem("vc_transport_preference", m);
+    localStorage.setItem("vc_transport_sticky", "true");
+  }, mode);
+  await seedPage.close();
+}
+
+interface TransportSniffer {
+  websocketFallbackHits: number;
+}
+
+/**
+ * Count console lines indicating the WT election lost and the client fell back
+ * to WS (mirrors `wt-screen-share-split-layout.spec.ts`'s
+ * `attachTransportSniffer`). Attached at the CONTEXT level so it catches every
+ * page from creation. Used to skip the WT case cleanly when the e2e stack has no
+ * reachable `webtransport-api` (issue #777) rather than report a misleading green.
+ */
+function attachTransportSniffer(context: BrowserContext): TransportSniffer {
+  const stats: TransportSniffer = { websocketFallbackHits: 0 };
+  context.on("page", (page) => {
+    page.on("console", (msg) => {
+      const text = msg.text();
+      if (
+        text.includes("transport=websocket") ||
+        text.includes("falling back to websocket") ||
+        text.includes("WebTransport failed")
+      ) {
+        stats.websocketFallbackHits += 1;
+      }
+    });
+  });
+  return stats;
+}
+
+/**
+ * Issue #1841 (sender half): a peer that joins AFTER a screen share has gone
+ * STATIC must still see the shared content, WITHOUT the sharer changing anything.
+ *
+ * A real `getDisplayMedia` track delivers frames only on visual change, so once
+ * the share is static the sender's encode loop parks on `reader.read()`. A late
+ * joiner's `KEYFRAME_REQUEST` merely sets a flag the parked loop never reads, so
+ * on the un-fixed code the joiner's screen canvas stays blank indefinitely. The
+ * fix retains the last-encoded frame and re-encodes it as a keyframe on demand.
+ *
+ * FAILS-ON-UNFIXED: revert the sender change and the final `screenCanvasMean`
+ * poll never clears the blank threshold (the joiner receives no keyframe while
+ * the track is quiet), so this test times out and fails.
+ *
+ * Parameterized by transport (issue #1841 follow-up): the fix lives in the
+ * encode loop + KEYFRAME_REQUEST handler and is transport-insensitive, so the
+ * SAME scenario runs over WebSocket AND WebTransport. The WT case forces the
+ * sticky preference and skips cleanly if the stack elected WS anyway (issue #777).
+ */
+async function runLateJoinerScenario(
+  baseURL: string | undefined,
+  transport: LateJoinerTransport,
+): Promise<void> {
+  test.setTimeout(300_000);
+  const uiURL = baseURL || DEFAULT_UI_URL;
+  const meetingId = `e2e_ss_late_${transport}_${Date.now()}`;
+
+  const browsers = await Promise.all([
+    chromium.launch({ args: BROWSER_ARGS }),
+    chromium.launch({ args: BROWSER_ARGS }),
+    chromium.launch({ args: BROWSER_ARGS }),
+  ]);
+
+  const members: MeetingMember[] = [];
+  const sniffers: TransportSniffer[] = [];
+  const wtFellBackToWs = (): boolean => sniffers.some((s) => s.websocketFallbackHits > 0);
+
+  try {
+    const profiles = [
+      { email: "host-1841@videocall.rs", name: "Late1841Host" },
+      { email: "sharer-1841@videocall.rs", name: "Late1841Sharer" },
+      { email: "joiner-1841@videocall.rs", name: "Late1841Joiner" },
+    ];
+
+    for (let i = 0; i < 3; i++) {
+      const ctx = await createAuthenticatedContext(
+        browsers[i],
+        profiles[i].email,
+        profiles[i].name,
+        uiURL,
+      );
+      // Force sticky WebTransport (or WebSocket) BEFORE any meeting page is
+      // created, and attach the fallback sniffer at the context level so it sees
+      // the elected transport from boot.
+      if (transport === "webtransport") {
+        await forceTransportSticky(ctx, "webtransport", uiURL);
+      }
+      sniffers.push(attachTransportSniffer(ctx));
+      await ctx.addInitScript(MOCK_TOGGLEABLE_DISPLAY_MEDIA_SCRIPT);
+      members.push({
+        page: null as unknown as Page,
+        context: ctx,
+        email: profiles[i].email,
+        name: profiles[i].name,
+      });
+    }
+
+    // Host + sharer join first; the joiner is held back until the share is
+    // already static.
+    members[0].page = await joinMeetingAs(members[0].context, meetingId, profiles[0].name);
+    await clickJoinAndEnterGrid(members[0].page);
+
+    members[1].page = await joinMeetingAs(members[1].context, meetingId, profiles[1].name);
+    await admitGuestIfNeeded(members[0].page, members[1].page);
+
+    const hostPage = members[0].page;
+    const sharerPage = members[1].page;
+
+    const shareActivated = await startScreenShare(sharerPage, hostPage);
+    if (!shareActivated) {
+      test.skip(
+        true,
+        "getDisplayMedia mock did not produce a stream that triggered the split layout.",
+      );
+      return;
+    }
+
+    // WT-fallback guard (issue #777): once the publisher is connected + sharing,
+    // the transport has been elected. If any peer fell back to WS, this run did
+    // NOT exercise the WT path — skip rather than report a misleading green.
+    if (transport === "webtransport" && wtFellBackToWs()) {
+      test.skip(
+        true,
+        "WebTransport election fell back to WebSocket in this environment " +
+          "(webtransport-api not reachable). Rerun once the WT service is up " +
+          "(issue #777).",
+      );
+      return;
+    }
+
+    // Let a few live frames flow so the sender has a retained frame to serve.
+    await hostPage.waitForTimeout(4000);
+
+    // Cut off emission → the share is now STATIC. With captureStream(0) the
+    // encoder stops receiving frames the moment requestFrame() stops, so the
+    // encode loop parks on read() — the faithful model of a real getDisplayMedia
+    // track whose content stopped changing (unlike a repainting mock).
+    await sharerPage.evaluate(() => {
+      (window as unknown as { __e2e906_emit_frames: boolean }).__e2e906_emit_frames = false;
+    });
+    // Give the encoder time to fully park on the quiet track before the late
+    // joiner arrives, so the joiner genuinely never sees a damage frame.
+    await sharerPage.waitForTimeout(3000);
+
+    // NOW the late joiner joins — after the share is static.
+    members[2].page = await joinMeetingAs(members[2].context, meetingId, profiles[2].name);
+    await admitGuestIfNeeded(hostPage, members[2].page);
+    const joinerPage = members[2].page;
+
+    // The split layout appears once screen metadata reaches the joiner (this can
+    // happen from metadata alone, so it is NOT the fails-on-unfixed signal).
+    await expect(joinerPage.locator(".split-screen-tile")).toBeVisible({ timeout: 30_000 });
+
+    // FAILS-ON-UNFIXED: the joiner's screen canvas must PAINT a real frame while
+    // the share stays static. Without the sender retain-and-re-encode fix no
+    // keyframe ever arrives, so the canvas stays blank and this poll times out.
+    // With the fix, the on-demand synthetic re-encode delivers a keyframe within
+    // ~1 poll interval and the canvas paints the mock field — all with the sharer
+    // emitting nothing.
+    await expect
+      .poll(async () => (await screenCanvasMean(joinerPage)) ?? 0, {
+        timeout: 25_000,
+        intervals: [500],
+      })
+      .toBeGreaterThan(8);
+  } finally {
+    for (const m of members) {
+      if (m.page) {
+        await m.page.close().catch(() => undefined);
+      }
+      await m.context.close().catch(() => undefined);
+    }
+    await Promise.all(browsers.map((b) => b.close().catch(() => undefined)));
+  }
+}
+
+test.describe("Static screen share reaches a late joiner (issue #1841)", () => {
+  test.beforeAll(async () => {
+    await waitForServices();
+  });
+
+  test("over WebSocket: a peer joining after the share goes static still sees the shared content", async ({
+    baseURL,
+  }) => {
+    await runLateJoinerScenario(baseURL, "websocket");
+  });
+
+  test("over WebTransport: a peer joining after the share goes static still sees the shared content", async ({
+    baseURL,
+  }) => {
+    await runLateJoinerScenario(baseURL, "webtransport");
+  });
+});

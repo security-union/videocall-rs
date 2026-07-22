@@ -56,6 +56,13 @@ message PacketWrapper {
     // Unlike CONGESTION (which was sender-directed), this is RECEIVER-directed:
     // the slow receiver itself must step down. See DownlinkCongestionPacket.
     DOWNLINK_CONGESTION = 14;
+    // Client -> relay -> all-peers ephemeral reaction broadcast (#1884).
+    // 15 and 16 are informally reserved by the unmerged PR #1843
+    // (sfu-capacity `reserved 15, 16`); REACTION takes 17 to avoid a future
+    // collision. See ReactionPacket. Unlike VIEWPORT/LAYER_PREFERENCE this is
+    // RE-BROADCAST (media fan-out), CLEARTEXT (relay validates the enum), and
+    // self-skipped for the sender (client renders a local echo).
+    REACTION = 17;
   }
 
   // Cleartext media-kind discriminator on the OUTER envelope.

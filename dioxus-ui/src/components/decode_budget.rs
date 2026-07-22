@@ -1228,6 +1228,66 @@ pub fn build_decoded_bucket(
         .collect()
 }
 
+/// Render mode for a tile in the unified grid render list.
+///
+/// After the decode-budget logic partitions peers into decoded / avatar /
+/// camera-off buckets, the grid must render ALL tiles in a SINGLE join-time
+/// order so that toggling a camera does not change a peer's grid position.
+/// This enum carries the per-tile decision about WHAT to render (live video,
+/// off-budget avatar placeholder, or camera-off placeholder) without
+/// affecting WHERE in the grid the tile appears.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TileRenderMode {
+    /// Camera-on peer within the decode budget — render live decoded video.
+    Decoded,
+    /// Camera-on peer beyond the decode budget — render as paused avatar
+    /// with `force_avatar: true` and the dashed off-budget outline.
+    Avatar,
+    /// Camera-off peer — render as plain avatar (no `force_avatar`, no dash).
+    /// Never consumes a decode-budget slot.
+    CameraOff,
+}
+
+/// Build a unified, join-time-ordered render list from the three tile buckets.
+///
+/// The caller has already computed:
+/// - `visible_tiles`: camera-on peers within the decode budget (Decoded)
+/// - `avatar_tiles`: camera-on peers beyond the decode budget (Avatar)
+/// - `camera_off_tiles`: camera-off peers to render (CameraOff)
+///
+/// This function merges them into a single list sorted by `peer_join_time`,
+/// preserving stable grid positions regardless of camera state. Toggling a
+/// camera changes WHAT renders in a grid cell (live video vs placeholder)
+/// but NOT WHERE in the grid the peer appears.
+///
+/// Kept pure / DOM-free / signal-free so it is host-unit-testable.
+pub fn build_unified_render_list(
+    visible_tiles: &[String],
+    avatar_tiles: &[String],
+    camera_off_tiles: &[String],
+    peer_join_times: &std::collections::HashMap<String, f64>,
+) -> Vec<(String, TileRenderMode)> {
+    let total = visible_tiles.len() + avatar_tiles.len() + camera_off_tiles.len();
+    let mut unified: Vec<(String, TileRenderMode)> = Vec::with_capacity(total);
+    for tile_id in visible_tiles {
+        unified.push((tile_id.clone(), TileRenderMode::Decoded));
+    }
+    for tile_id in avatar_tiles {
+        unified.push((tile_id.clone(), TileRenderMode::Avatar));
+    }
+    for tile_id in camera_off_tiles {
+        unified.push((tile_id.clone(), TileRenderMode::CameraOff));
+    }
+    // Stable sort by join time (earliest first). Ties preserve insertion
+    // order (Decoded before Avatar before CameraOff for same join time).
+    unified.sort_by(|(a, _), (b, _)| {
+        let jt_a = peer_join_times.get(a).copied().unwrap_or(0.0);
+        let jt_b = peer_join_times.get(b).copied().unwrap_or(0.0);
+        jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal)
+    });
+    unified
+}
+
 /// Presenter-aware decode-shed factor (issue #1559).
 ///
 /// While the LOCAL user is screen-sharing, the sharer's CPU is split between the
@@ -4772,5 +4832,91 @@ mod tests {
             None,
             "no user cap and no protective shed ⇒ no ceiling (full ladder)"
         );
+    }
+
+    // --- build_unified_render_list tests ---
+
+    #[test]
+    fn unified_render_list_sorts_by_join_time() {
+        let mut join_times = std::collections::HashMap::new();
+        join_times.insert("peer-a".to_string(), 300.0);
+        join_times.insert("peer-b".to_string(), 100.0);
+        join_times.insert("peer-c".to_string(), 200.0);
+
+        let visible = vec!["peer-a".to_string()];
+        let avatar = vec![];
+        let camera_off = vec!["peer-b".to_string(), "peer-c".to_string()];
+
+        let result = build_unified_render_list(&visible, &avatar, &camera_off, &join_times);
+
+        assert_eq!(result.len(), 3);
+        // Sorted by join time: peer-b (100), peer-c (200), peer-a (300)
+        assert_eq!(result[0].0, "peer-b");
+        assert_eq!(result[0].1, TileRenderMode::CameraOff);
+        assert_eq!(result[1].0, "peer-c");
+        assert_eq!(result[1].1, TileRenderMode::CameraOff);
+        assert_eq!(result[2].0, "peer-a");
+        assert_eq!(result[2].1, TileRenderMode::Decoded);
+    }
+
+    #[test]
+    fn unified_render_list_preserves_render_modes() {
+        let mut join_times = std::collections::HashMap::new();
+        join_times.insert("d".to_string(), 1.0);
+        join_times.insert("a".to_string(), 2.0);
+        join_times.insert("c".to_string(), 3.0);
+
+        let visible = vec!["d".to_string()];
+        let avatar = vec!["a".to_string()];
+        let camera_off = vec!["c".to_string()];
+
+        let result = build_unified_render_list(&visible, &avatar, &camera_off, &join_times);
+
+        assert_eq!(result[0], ("d".to_string(), TileRenderMode::Decoded));
+        assert_eq!(result[1], ("a".to_string(), TileRenderMode::Avatar));
+        assert_eq!(result[2], ("c".to_string(), TileRenderMode::CameraOff));
+    }
+
+    #[test]
+    fn unified_render_list_camera_toggle_does_not_change_position() {
+        // Scenario: 3 peers join in order A, B, C. Initially all camera-on.
+        let mut join_times = std::collections::HashMap::new();
+        join_times.insert("A".to_string(), 10.0);
+        join_times.insert("B".to_string(), 20.0);
+        join_times.insert("C".to_string(), 30.0);
+
+        // All camera-on: all in visible_tiles
+        let result_before = build_unified_render_list(
+            &["A".to_string(), "B".to_string(), "C".to_string()],
+            &[],
+            &[],
+            &join_times,
+        );
+        assert_eq!(result_before[0].0, "A");
+        assert_eq!(result_before[1].0, "B");
+        assert_eq!(result_before[2].0, "C");
+
+        // B turns camera off: B moves from visible to camera_off
+        let result_after = build_unified_render_list(
+            &["A".to_string(), "C".to_string()],
+            &[],
+            &["B".to_string()],
+            &join_times,
+        );
+        // Grid ORDER must be the same: A, B, C
+        assert_eq!(result_after[0].0, "A");
+        assert_eq!(result_after[1].0, "B");
+        assert_eq!(result_after[2].0, "C");
+        // But render modes change
+        assert_eq!(result_after[0].1, TileRenderMode::Decoded);
+        assert_eq!(result_after[1].1, TileRenderMode::CameraOff);
+        assert_eq!(result_after[2].1, TileRenderMode::Decoded);
+    }
+
+    #[test]
+    fn unified_render_list_empty_inputs() {
+        let join_times = std::collections::HashMap::new();
+        let result = build_unified_render_list(&[], &[], &[], &join_times);
+        assert!(result.is_empty());
     }
 }

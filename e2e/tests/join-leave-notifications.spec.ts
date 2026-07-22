@@ -3,17 +3,17 @@ import { generateSessionToken } from "../helpers/auth";
 import { waitForServices } from "../helpers/wait-for-services";
 
 /**
- * E2E tests for the entry/exit message and sound preference toggles in the
- * Appearance settings (Notifications section).
+ * E2E tests for the participant announcement toggles in the device-settings
+ * Preferences panel (Notifications section — the 2×2 announcement matrix).
  *
- * These are four independent toggles:
- *   - Entry message  -> `vc_appearance_entry_notifications`
- *   - Exit message   -> `vc_appearance_exit_notifications`
- *   - Entry sound    -> `vc_appearance_entry_sound`
- *   - Exit sound     -> `vc_appearance_exit_sound`
+ * The four cells map to their AppearanceSettings storage keys as:
+ *   - joins · Message   -> `vc_appearance_entry_notifications`
+ *   - leaves · Message  -> `vc_appearance_exit_notifications`
+ *   - joins · Sound     -> `vc_appearance_entry_sound`
+ *   - leaves · Sound    -> `vc_appearance_exit_sound`
  * Each defaults to `true` (enabled).
  *
- * The entry (join) toggles gate `on_peer_joined`; the exit (leave) toggles gate
+ * The join (entry) toggles gate `on_peer_joined`; the leave (exit) toggles gate
  * `on_peer_left` (see attendants.rs). The toast UI renders inside the
  * `.peer-toasts` container with class `.peer-toast`.
  */
@@ -343,36 +343,36 @@ test.describe("Entry/exit notifications preference", () => {
         timeout: 10_000,
       });
 
-      // Navigate to the Appearance tab.
-      await hostPage.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
-      await expect(hostPage.locator("#settings-panel-appearance")).toBeVisible({
+      // Navigate to the Preferences tab (the notifications matrix lives here,
+      // not on the Appearance tab).
+      await hostPage.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+      await expect(hostPage.locator("#settings-panel-preferences")).toBeVisible({
         timeout: 5_000,
       });
 
-      // Locate the "Entry message" toggle in the Notifications section. The
-      // input has a stable id and the visible label points to it via `for=`.
+      // Locate the joins·Message toggle in the announcement matrix. Its stable
+      // id is preserved; the visible switch is the wrapping `label.glow-switch`.
       const toggleInput = hostPage.locator("#entry-notifications-toggle");
       await expect(toggleInput).toBeVisible();
       await expect(toggleInput).toBeChecked();
 
-      // Verify the section heading is present.
+      // Verify the section heading and matrix axis labels are present.
       await expect(
         hostPage
-          .locator("#settings-panel-appearance .appearance-section-title")
+          .locator("#settings-panel-preferences .appearance-section-title")
           .filter({ hasText: "Notifications" }),
       ).toBeVisible();
       await expect(
-        hostPage
-          .locator('#settings-panel-appearance label[for="entry-notifications-toggle"]')
-          .filter({ hasText: "Entry message" }),
-      ).toBeVisible();
+        hostPage.locator('[data-testid="announce-matrix"] #announce-row-join'),
+      ).toHaveText("Participant joins");
+      await expect(
+        hostPage.locator('[data-testid="announce-matrix"] #announce-col-message'),
+      ).toHaveText("Message");
 
       // Uncheck the toggle. The checkbox is visually hidden behind a custom
-      // switch UI, so click its visible `for=` label, which natively forwards
-      // activation to the associated input.
-      const toggleLabel = hostPage.locator(
-        '#settings-panel-appearance label[for="entry-notifications-toggle"]',
-      );
+      // switch UI, so click the wrapping `label.glow-switch`, which natively
+      // forwards activation to the associated input.
+      const toggleLabel = hostPage.locator("label.glow-switch:has(#entry-notifications-toggle)");
       await toggleLabel.click();
       await expect(toggleInput).not.toBeChecked({ timeout: 5_000 });
 
@@ -449,9 +449,9 @@ test.describe("Entry/exit notifications preference", () => {
         timeout: 10_000,
       });
 
-      // Navigate to the Appearance tab.
-      await hostPage.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
-      await expect(hostPage.locator("#settings-panel-appearance")).toBeVisible({
+      // Navigate to the Preferences tab (the notifications matrix lives here).
+      await hostPage.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+      await expect(hostPage.locator("#settings-panel-preferences")).toBeVisible({
         timeout: 5_000,
       });
 
@@ -461,18 +461,14 @@ test.describe("Entry/exit notifications preference", () => {
       await expect(hostPage.locator("#entry-sound-toggle")).toHaveCount(1);
       await expect(hostPage.locator("#exit-sound-toggle")).toHaveCount(1);
 
-      // The visible `for=` labels must exist and be visible -- they name the
-      // toggles and are the user-facing click targets.
+      // The Sound-column toggles are named via aria-labelledby from the row and
+      // column labels — one distinct accessible name per row.
       await expect(
-        hostPage
-          .locator('#settings-panel-appearance label[for="entry-sound-toggle"]')
-          .filter({ hasText: "Entry sound" }),
-      ).toBeVisible();
+        hostPage.getByRole("checkbox", { name: "Participant joins Sound", exact: true }),
+      ).toHaveCount(1);
       await expect(
-        hostPage
-          .locator('#settings-panel-appearance label[for="exit-sound-toggle"]')
-          .filter({ hasText: "Exit sound" }),
-      ).toBeVisible();
+        hostPage.getByRole("checkbox", { name: "Participant leaves Sound", exact: true }),
+      ).toHaveCount(1);
     } finally {
       await browser1.close();
     }
@@ -586,9 +582,9 @@ test.describe("Entry/exit notifications preference", () => {
         timeout: 10_000,
       });
 
-      // Navigate to the Appearance tab.
-      await hostPage.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
-      await expect(hostPage.locator("#settings-panel-appearance")).toBeVisible({
+      // Navigate to the Preferences tab (the notifications matrix lives here).
+      await hostPage.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+      await expect(hostPage.locator("#settings-panel-preferences")).toBeVisible({
         timeout: 5_000,
       });
 
@@ -596,11 +592,9 @@ test.describe("Entry/exit notifications preference", () => {
       const soundsToggleInput = hostPage.locator("#entry-sound-toggle");
       await expect(soundsToggleInput).toBeChecked();
 
-      // Click the visible `for=` label to uncheck the toggle (the checkbox is
-      // visually hidden behind the custom switch UI).
-      const soundsToggleLabel = hostPage.locator(
-        '#settings-panel-appearance label[for="entry-sound-toggle"]',
-      );
+      // Click the wrapping `label.glow-switch` to uncheck the toggle (the
+      // checkbox is visually hidden behind the custom switch UI).
+      const soundsToggleLabel = hostPage.locator("label.glow-switch:has(#entry-sound-toggle)");
       await soundsToggleLabel.click();
       await expect(soundsToggleInput).not.toBeChecked({ timeout: 5_000 });
 
@@ -652,8 +646,8 @@ test.describe("Entry/exit notifications preference", () => {
       await expect(hostPage.locator(".device-settings-modal")).toBeVisible({
         timeout: 10_000,
       });
-      await hostPage.locator(".settings-nav-button").filter({ hasText: "Appearance" }).click();
-      await expect(hostPage.locator("#settings-panel-appearance")).toBeVisible({
+      await hostPage.locator(".settings-nav-button").filter({ hasText: "Preferences" }).click();
+      await expect(hostPage.locator("#settings-panel-preferences")).toBeVisible({
         timeout: 5_000,
       });
 
@@ -661,9 +655,9 @@ test.describe("Entry/exit notifications preference", () => {
       const exitSoundInput = hostPage.locator("#exit-sound-toggle");
       await expect(exitSoundInput).toBeChecked();
 
-      // Click the visible `for=` label to uncheck it (the checkbox is visually
-      // hidden behind the custom switch UI).
-      await hostPage.locator('#settings-panel-appearance label[for="exit-sound-toggle"]').click();
+      // Click the wrapping `label.glow-switch` to uncheck it (the checkbox is
+      // visually hidden behind the custom switch UI).
+      await hostPage.locator("label.glow-switch:has(#exit-sound-toggle)").click();
       await expect(exitSoundInput).not.toBeChecked({ timeout: 5_000 });
 
       // Close the settings modal.

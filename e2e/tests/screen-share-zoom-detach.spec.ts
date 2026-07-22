@@ -156,6 +156,53 @@ const ANIMATED_SHARE_MOCK = `
 `;
 
 /**
+ * STOP-EMITTING (static) getDisplayMedia mock for the detach-static case (issue
+ * #1841). Draws content, emits ~8 real frames via `captureStream(0)` +
+ * `requestFrame()` so the RECEIVER decodes and paints its source canvas, then
+ * STOPS — the source canvas keeps its last painted content but never repaints.
+ * This is the faithful model of a real `getDisplayMedia` share whose content went
+ * static: the popup's `captureStream()` of that idle source canvas is starved, so
+ * only the detach fix's one-shot source-canvas repaint prime can surface the still.
+ */
+const STATIC_SHARE_MOCK = `
+  (() => {
+    const md = navigator.mediaDevices;
+    if (!md) return;
+    const makeStream = () => {
+      const c = document.createElement('canvas');
+      c.width = 640; c.height = 480;
+      const ctx = c.getContext('2d');
+      const draw = () => {
+        ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, 0, 640, 480);
+        ctx.fillStyle = '#fff'; ctx.font = '24px sans-serif';
+        ctx.fillText('Mock Screen Share (static)', 120, 240);
+      };
+      draw();
+      const stream = c.captureStream(0);
+      const track = stream.getVideoTracks()[0];
+      let emitted = 0;
+      const tick = () => {
+        if (emitted < 8) {
+          draw();
+          if (typeof track.requestFrame === 'function') {
+            try { track.requestFrame(); } catch (_) { /* ignore */ }
+          }
+          emitted++;
+          setTimeout(tick, 100);
+        }
+        // After 8 frames: STOP. The source is now static — captureStream emits
+        // nothing more and the receiver's decoded canvas stops repainting.
+      };
+      tick();
+      return stream;
+    };
+    Object.defineProperty(md, 'getDisplayMedia', {
+      configurable: true, value: async () => makeStream(),
+    });
+  })();
+`;
+
+/**
  * Force the detach `window.open` fallback path in headless Chromium by
  * shadowing `documentPictureInPicture` with an own-property getter that returns
  * `undefined`. The Rust side reads it via `Reflect::get` and treats
@@ -304,9 +351,10 @@ async function setupViewerSeeingSharedScreen(
   guestName: string,
   hostExtraInit?: string,
   shareMock: string = MOCK_GET_DISPLAY_MEDIA_SCRIPT,
+  headless: boolean = true,
 ): Promise<SharedScreenFixture> {
-  const browser1 = await chromium.launch({ args: BROWSER_ARGS });
-  const browser2 = await chromium.launch({ args: BROWSER_ARGS });
+  const browser1 = await chromium.launch({ args: BROWSER_ARGS, headless });
+  const browser2 = await chromium.launch({ args: BROWSER_ARGS, headless });
 
   const hostCtx = await createAuthenticatedContext(
     browser1,
@@ -1061,6 +1109,536 @@ test.describe("Issue 1175: received screen-share zoom / detach", () => {
 
       // No vertical intersection: zoom bar bottom edge <= action bar top edge.
       expect(zoomBox!.y + zoomBox!.height).toBeLessThanOrEqual(barBox!.y);
+    } finally {
+      await fx.browser1.close();
+      await fx.browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Issue #1842 — the detached window matches the shared content's aspect.
+  //
+  // The window is sized from the source canvas's DECODED dims (canvas.width/
+  // height), so its VIDEO area tracks the content aspect, not the split pane box.
+  // Uses a distinctively WIDE (3.2:1) share so a content-sized window is
+  // unmistakable from the pre-#1842 client-box sizing (which produced the pane's
+  // ~16:9-or-narrower aspect).
+  //
+  // HEADED-gated (HEADED=1): headless Chromium does not honor window.open
+  // width/height, so the popup's innerWidth/innerHeight would be a default there;
+  // a real window sizes to the features. CI (headless) skips cleanly.
+  //
+  // Fails-on-unfixed: the client-box sizing yields the pane aspect (≲1.8), so the
+  // `> 2.0` poll never clears and the aspect-match assertion fails.
+  // ──────────────────────────────────────────────────────────────────────────
+  test("the detached window matches the shared content's aspect (headed)", async ({ baseURL }) => {
+    test.skip(
+      !process.env.HEADED,
+      "Headless Chromium does not honor window.open width/height, so the popup " +
+        "viewport can't be measured against content aspect. Run with HEADED=1. (issue #1842)",
+    );
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `ss_detach_aspect_${Date.now()}`;
+    // A distinctively WIDE 3.2:1 share so a content-sized window is unmistakable.
+    const WIDE_SHARE_MOCK = `
+      (() => {
+        const md = navigator.mediaDevices;
+        if (!md) return;
+        Object.defineProperty(md, 'getDisplayMedia', {
+          configurable: true,
+          value: async () => {
+            const c = document.createElement('canvas');
+            c.width = 1280; c.height = 400;
+            const ctx = c.getContext('2d');
+            ctx.fillStyle = '#1a1a2e'; ctx.fillRect(0, 0, 1280, 400);
+            ctx.fillStyle = '#fff'; ctx.font = '28px sans-serif';
+            ctx.fillText('Wide Mock Screen Share 3.2:1', 200, 200);
+            return c.captureStream(5);
+          },
+        });
+      })();
+    `;
+    const fx = await setupViewerSeeingSharedScreen(
+      uiURL,
+      meetingId,
+      "SsAspectHost",
+      "SsAspectGuest",
+      FORCE_POPUP_DETACH_SCRIPT,
+      WIDE_SHARE_MOCK,
+      false, // headed: window.open size is only real with a compositor
+    );
+    const { hostPage, tile } = fx;
+
+    try {
+      const canvas = tile.locator('canvas[id^="screen-share-"]');
+      await expect(canvas).toHaveCount(1);
+      // The receiver's decoded source-canvas aspect — what the fix sizes to. The
+      // canvas element appears from screen METADATA before the first frame
+      // decodes, when it is still the 300x150 HTML default (aspect 2.0), so POLL
+      // until the decode lands and sets the real (wide) dims before measuring.
+      const canvasAspect = () =>
+        canvas.evaluate((c) => {
+          const cv = c as HTMLCanvasElement;
+          return cv.height > 0 ? cv.width / cv.height : 0;
+        });
+      await expect
+        .poll(canvasAspect, {
+          timeout: 20_000,
+          message: "wide mock never decoded to a wide source canvas",
+        })
+        .toBeGreaterThan(2.0);
+      const contentAspect = await canvasAspect();
+
+      const detach = tile.locator('[data-testid="ss-detach"]');
+      await expect(detach).toBeVisible();
+      const popupPromise = hostPage.context().waitForEvent("page", { timeout: 12_000 });
+      await tile.hover();
+      await detach.click();
+      const popup = await popupPromise;
+
+      // The popup's VIDEO-AREA aspect = innerWidth / (innerHeight - bar). Poll to
+      // let the window settle to its requested size. `> 2.0` is the fails-on-
+      // unfixed discriminator: only a content-sized window is this wide.
+      const BAR = 40;
+      const videoAspect = (bar: number) =>
+        popup.evaluate((b) => {
+          const vh = window.innerHeight - b;
+          return vh > 0 ? window.innerWidth / vh : 0;
+        }, bar);
+      await expect
+        .poll(async () => await videoAspect(BAR), {
+          timeout: 10_000,
+          message: "detached window never sized to the wide content aspect",
+        })
+        .toBeGreaterThan(2.0);
+      // ...and it tracks the content aspect within tolerance (chrome + rounding).
+      const popupAspect = await videoAspect(BAR);
+      expect(Math.abs(popupAspect - contentAspect)).toBeLessThan(0.6);
+    } finally {
+      await fx.browser1.close();
+      await fx.browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Issue #1841 (detach half) — detaching a STATIC share shows the current still
+  // IMMEDIATELY. `canvas.captureStream()` emits only on source-canvas repaint, so
+  // a static source starves the popup mirror; the fix forces a no-op repaint of the
+  // source canvas so the auto-rate capture emits the current bitmap at once.
+  //
+  // HEADLESS GUARD: under headless `--disable-gpu` a static captureStream source's
+  // mirror <video> never reaches readyState>=2 (documented on ANIMATED_SHARE_MOCK
+  // above — the exact reason Test 3a uses an animated source), so the popup cannot
+  // paint a single primed frame there and the assertion could not distinguish the
+  // fix. This test is therefore gated to a HEADED run (HEADED=1), where a real
+  // compositor renders the primed still; CI (headless) skips it cleanly rather
+  // than false-red.
+  //
+  // Presence discriminator (NOT two-advancing-samples): a static source does not
+  // advance, so we assert the popup mirror is NON-BLANK (mean above the near-black
+  // floor). Fails-on-unfixed: without the repaint prime the starved popup
+  // stays black (mean ~0).
+  // ──────────────────────────────────────────────────────────────────────────
+  test("detaching a STATIC share shows the current still immediately (headed)", async ({
+    baseURL,
+  }) => {
+    test.skip(
+      !process.env.HEADED,
+      "Headless --disable-gpu cannot composite a single captureStream frame to the " +
+        "mirror <video> (a static source's mirror never reaches readyState>=2 — see " +
+        "the ANIMATED_SHARE_MOCK note). Run with HEADED=1 so the primed still can " +
+        "paint. (issue #1841 detach half)",
+    );
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `ss_detach_static_${Date.now()}`;
+    const fx = await setupViewerSeeingSharedScreen(
+      uiURL,
+      meetingId,
+      "SsStaticHost",
+      "SsStaticGuest",
+      FORCE_POPUP_DETACH_SCRIPT,
+      STATIC_SHARE_MOCK,
+      false, // headed: a static captureStream mirror only paints with a real compositor
+    );
+    const { hostPage, tile } = fx;
+
+    try {
+      // The receiver decoded the initial burst, so its source canvas is painted;
+      // wait past the mock's ~800ms emit window so the source is now STATIC.
+      await expect(tile.locator('canvas[id^="screen-share-"]')).toHaveCount(1);
+      await hostPage.waitForTimeout(3000);
+
+      const detach = tile.locator('[data-testid="ss-detach"]');
+      await expect(detach).toBeVisible();
+
+      const popupPromise = hostPage.context().waitForEvent("page", { timeout: 12_000 });
+      await tile.hover();
+      await detach.click();
+      const popup = await popupPromise;
+
+      // The popup mirror must show NON-BLANK content — the primed still — even
+      // though the source is static and never advances. >8 separates the mock
+      // field (mean ~33) from a black/starved mirror (~0), matching Test 3a's floor.
+      await expect
+        .poll(async () => (await sampleDetachedMirror(popup))?.mean ?? -1, {
+          timeout: 20_000,
+          message: "detached mirror of a static share never showed the primed still",
+        })
+        .toBeGreaterThan(8);
+    } finally {
+      await fx.browser1.close();
+      await fx.browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Issue #1821 — Ctrl+wheel zoom over the shared-content viewport.
+  //
+  // Fails-on-unfixed: there is NO declarative `onwheel` on the viewport, so the
+  // only thing that can zoom the tile on a wheel event is the imperative
+  // non-passive `wheel` listener (issue 1821). If it is missing / detached, the
+  // label stays "100%" and the poll below times out. The visualViewport-unchanged
+  // guard additionally fails if anyone reverts to a PASSIVE declarative handler
+  // (whose `preventDefault()` no-ops → the browser Ctrl+wheel-zooms the PAGE).
+  // ──────────────────────────────────────────────────────────────────────────
+  test("Ctrl+wheel over the shared-content viewport zooms the tile, not the page", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `ss_wheel_${Date.now()}`;
+    const fx = await setupViewerSeeingSharedScreen(uiURL, meetingId, "SsWheelHost", "SsWheelGuest");
+    const { hostPage, tile } = fx;
+
+    try {
+      const viewport = tile.locator('[data-testid="ss-zoom-viewport"]');
+      const label = tile.locator('[data-testid="ss-zoom-label"]');
+      await expect(viewport).toBeVisible();
+      await expect(label).toHaveText("100%");
+
+      // Chromium Ctrl+wheel is LAYOUT zoom, which changes the CSS-px viewport
+      // width (documentElement.clientWidth) — NOT visualViewport.scale (that
+      // tracks PINCH zoom). Capture the layout width to guard preventDefault.
+      const clientWidthBefore = await hostPage.evaluate(() => document.documentElement.clientWidth);
+
+      // Ctrl+wheel UP over the viewport centre → zoom IN. Move the pointer over
+      // the viewport first (wheel events use the last pointer position), hold
+      // Control so the event carries ctrlKey=true, then wheel.
+      const box = await viewport.boundingBox();
+      expect(box).not.toBeNull();
+      await hostPage.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+      await hostPage.keyboard.down("Control");
+      await hostPage.mouse.wheel(0, -100);
+      await hostPage.keyboard.up("Control");
+
+      // The TILE zoomed: the label rose above 100%. This is the primary
+      // fails-on-unfixed proof — there is NO declarative onwheel on the viewport,
+      // so only the imperative wheel listener can zoom the tile; remove it and the
+      // label stays "100%".
+      await expect
+        .poll(async () => parseInt((await label.textContent()) || "0", 10), {
+          timeout: 5000,
+          message: "Ctrl+wheel did not zoom the shared-content tile",
+        })
+        .toBeGreaterThan(100);
+      // The viewport gained the zoomed state.
+      await expect(viewport).toHaveClass(/\bis-zoomed\b/);
+      // The PAGE did not browser-zoom: preventDefault (non-passive listener) held,
+      // so the layout viewport width is unchanged. A revert to a passive
+      // declarative onwheel (preventDefault no-ops) would let Chromium layout-zoom
+      // and shift clientWidth.
+      const clientWidthAfter = await hostPage.evaluate(() => document.documentElement.clientWidth);
+      expect(clientWidthAfter).toBe(clientWidthBefore);
+    } finally {
+      await fx.browser1.close();
+      await fx.browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Issue #1821 — actual-size (1:1) toggle.
+  //
+  // Fails-on-unfixed: the ss-zoom-actual testid does not exist on the un-fixed
+  // feature (locator times out). The aria-pressed toggle true→false and the
+  // return to the "100%" fit label are specific to the 1:1 control. The engaged
+  // percent is source/viewport/DPR-dependent (a 640×480 mock in a similar-width
+  // tile at DPR 1 legitimately resolves to ~"100%"), so the ROBUST assertion is
+  // the aria-pressed intent flipping — not a specific percentage.
+  // ──────────────────────────────────────────────────────────────────────────
+  test("the actual-size (1:1) button toggles aria-pressed and returns to fit", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `ss_actual_${Date.now()}`;
+    const fx = await setupViewerSeeingSharedScreen(
+      uiURL,
+      meetingId,
+      "SsActualHost",
+      "SsActualGuest",
+    );
+    const { tile } = fx;
+
+    try {
+      const actual = tile.locator('[data-testid="ss-zoom-actual"]');
+      const label = tile.locator('[data-testid="ss-zoom-label"]');
+      const viewport = tile.locator('[data-testid="ss-zoom-viewport"]');
+
+      // Reveal the hover/focus-gated control bar so the button receives clicks.
+      await tile.hover();
+      await expect(actual).toBeVisible();
+      await expect(actual).toHaveAttribute("aria-pressed", "false");
+      await expect(label).toHaveText("100%");
+
+      // Engage 1:1 → aria-pressed flips true; the label reads a percentage.
+      await actual.click();
+      await expect(actual).toHaveAttribute("aria-pressed", "true");
+      await expect(label).toHaveText(/^\d+%$/);
+
+      // Toggle off → back to fit (100%), no longer zoomed, aria-pressed false.
+      await actual.click();
+      await expect(actual).toHaveAttribute("aria-pressed", "false");
+      await expect(label).toHaveText("100%");
+      await expect(viewport).not.toHaveClass(/\bis-zoomed\b/);
+    } finally {
+      await fx.browser1.close();
+      await fx.browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Issue #1821 — shared-content stats overlay (res·fps), gated by the SAME
+  // diagnostics "Show media metrics on tiles" checkbox as the camera overlay.
+  //
+  // Fails-on-unfixed: the media-metrics-overlay-screen testid does not exist on
+  // the un-fixed feature; the OFF→ON reactive appearance + the "↓ WxH · Nfps"
+  // format (no audio segment) are specific to issue 1821.
+  // ──────────────────────────────────────────────────────────────────────────
+  test("the shared-content stats overlay appears with the diagnostics checkbox and reads res·fps", async ({
+    baseURL,
+  }) => {
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `ss_stats_${Date.now()}`;
+    const fx = await setupViewerSeeingSharedScreen(
+      uiURL,
+      meetingId,
+      "SsStatsHost",
+      "SsStatsGuest",
+      undefined,
+      ANIMATED_SHARE_MOCK,
+    );
+    const { hostPage, tile } = fx;
+
+    try {
+      const screenOverlay = tile.locator('[data-testid="media-metrics-overlay-screen"]');
+      // OFF by default: no shared-content stats overlay is in the DOM.
+      await expect(screenOverlay).toHaveCount(0);
+
+      // Turn the diagnostics "Show media metrics on tiles" checkbox ON.
+      await wakeControls(hostPage);
+      const diagButton = hostPage.locator("button", {
+        has: hostPage.locator("span.tooltip", { hasText: "Open Diagnostics" }),
+      });
+      await diagButton.click();
+      const toggle = hostPage.locator('[data-testid="media-metrics-overlay-toggle"]');
+      await expect(toggle).toBeVisible({ timeout: 10_000 });
+      await toggle.check();
+      await expect(toggle).toBeChecked();
+
+      // The shared-content tile now shows a passive, aria-hidden res·fps readout.
+      await expect(screenOverlay).toBeVisible({ timeout: 20_000 });
+      await expect(screenOverlay).toHaveAttribute("aria-hidden", "true");
+      // "↓ 640×480 · 10fps" — poll until the decode populates res + fps. No audio
+      // segment (screen shares carry no audio). `screen_fps` is the ARRIVAL rate,
+      // which is why this test drives an ANIMATED share (see the mock note above):
+      // the default static mock repaints its canvas ONCE, so post-#1841 on-demand
+      // re-encoding leaves the arrival rate at ~0 and the fps segment reads "—fps"
+      // (the honest, correct readout for a genuinely static share — a moving share
+      // shows the real number, which is what this test exercises).
+      await expect
+        .poll(async () => /\d+×\d+ · \d+fps/.test((await screenOverlay.textContent()) || ""), {
+          timeout: 20_000,
+          message: "shared-content stats overlay never populated res·fps",
+        })
+        .toBe(true);
+    } finally {
+      await fx.browser1.close();
+      await fx.browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Issue #1821 (HEADED) — popup Maximize toggles full screen; Escape WHILE
+  // fullscreen does not reattach; Escape when NOT fullscreen reattaches normally.
+  //
+  // HEADED-gated: fullscreen needs a real compositor and window.open needs a real
+  // window; headless skips cleanly. Fails-on-unfixed: no ss-detached-maximize on
+  // the un-fixed feature; without the esc_cb fullscreen guard, a synthetic Escape
+  // in fullscreen would tear the detach down (step 2 goes red).
+  //
+  // A synthetic (CDP) Escape cannot drive Chromium's browser-UI fullscreen exit,
+  // so full-screen exit is exercised through our OWN exit_fullscreen wiring (the
+  // Maximize toggle), not asserted on the synthetic key — see step 2's comment.
+  // ──────────────────────────────────────────────────────────────────────────
+  test("popup Maximize toggles full screen; Escape only reattaches when not fullscreen (headed)", async ({
+    baseURL,
+  }) => {
+    test.skip(
+      !process.env.HEADED,
+      "Fullscreen + window.open need a real compositor/window. Run with HEADED=1. (issue #1821)",
+    );
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `ss_maximize_${Date.now()}`;
+    const fx = await setupViewerSeeingSharedScreen(
+      uiURL,
+      meetingId,
+      "SsMaxHost",
+      "SsMaxGuest",
+      FORCE_POPUP_DETACH_SCRIPT,
+      ANIMATED_SHARE_MOCK,
+      false,
+    );
+    const { hostPage, tile } = fx;
+
+    try {
+      const detach = tile.locator('[data-testid="ss-detach"]');
+      await expect(detach).toBeVisible();
+      const popupPromise = hostPage.context().waitForEvent("page", { timeout: 12_000 });
+      await tile.hover();
+      await detach.click();
+      const popup = await popupPromise;
+
+      const maximize = popup.locator("#ss-detached-maximize");
+      await expect(maximize).toBeVisible({ timeout: 10_000 });
+      await expect(maximize).toHaveAttribute("aria-pressed", "false");
+
+      // 1. Maximize → the popup viewport goes full screen; the fullscreenchange
+      //    listener syncs aria-pressed to "true".
+      await maximize.click();
+      await expect
+        .poll(async () => popup.evaluate(() => document.fullscreenElement !== null), {
+          timeout: 10_000,
+          message: "popup did not enter full screen on Maximize",
+        })
+        .toBe(true);
+      await expect(maximize).toHaveAttribute("aria-pressed", "true");
+
+      // 2. Synthetic Escape while FULLSCREEN. NOTE ON WHY WE DON'T ASSERT A
+      //    FULLSCREEN EXIT: Chromium's Escape-exits-fullscreen is handled at the
+      //    browser-UI layer, which a CDP/Playwright-synthesised key event does not
+      //    reach (verified empirically: after this press, document.fullscreenElement
+      //    stays non-null). The page DOES receive the keydown — so our
+      //    Escape-to-reattach handler runs and its fullscreen early-return is
+      //    exercised. The assertion that matters is therefore that the detach did
+      //    NOT tear down: the share stays detached and the popup stays open.
+      //    FAILS-ON-UNFIXED: revert the esc_cb `fullscreen_element().is_some()`
+      //    guard and this synthetic Escape would `schedule_teardown` even in
+      //    fullscreen → the popup closes and the share reattaches → these go red.
+      //    (Real users get the UA-level Escape exit; that is the browser's
+      //    guarantee, not our code, and a synthetic key cannot emulate it.)
+      await popup.keyboard.press("Escape");
+      await popup.waitForTimeout(1500);
+      expect(popup.isClosed()).toBe(false);
+      await expect(hostPage.locator("#grid-container")).toHaveClass(/\bshare-detached\b/);
+      await expect(popup.locator("#ss-detached-viewport")).toHaveCount(1);
+
+      // 3. Exit full screen via OUR exit_fullscreen wiring: the Maximize toggle's
+      //    click handler calls document.exitFullscreen() when already fullscreen.
+      //    The button is in the DOM during fullscreen but is rendered BEHIND the
+      //    fullscreen viewport (request_fullscreen targets the viewport), so a
+      //    coordinate click can't hit it — dispatch the click on the element
+      //    directly, which still drives our click listener → exit_fullscreen.
+      await popup.evaluate(() =>
+        (document.getElementById("ss-detached-maximize") as HTMLElement | null)?.click(),
+      );
+      await expect
+        .poll(async () => popup.evaluate(() => document.fullscreenElement !== null), {
+          timeout: 10_000,
+          message: "Maximize toggle did not exit full screen",
+        })
+        .toBe(false);
+      // The fullscreenchange listener flips aria-pressed back; still detached.
+      await expect(maximize).toHaveAttribute("aria-pressed", "false");
+      await expect(hostPage.locator("#grid-container")).toHaveClass(/\bshare-detached\b/);
+      expect(popup.isClosed()).toBe(false);
+
+      // 4. Escape while NOT fullscreen → the normal Escape-to-reattach fires: the
+      //    detached window closes and the share returns to the meeting tile.
+      await popup.keyboard.press("Escape");
+      await expect(hostPage.locator("#grid-container")).not.toHaveClass(/\bshare-detached\b/, {
+        timeout: 10_000,
+      });
+      await expect(tile).toBeVisible();
+    } finally {
+      await fx.browser1.close();
+      await fx.browser2.close();
+    }
+  });
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Issue #1821 (HEADED) — Ctrl+wheel zoom inside the DETACHED window.
+  //
+  // HEADED-gated: window.open needs a real window. Fails-on-unfixed: without the
+  // detached non-passive wheel listener the detached zoom label stays "100%".
+  // ──────────────────────────────────────────────────────────────────────────
+  test("detached window Ctrl+wheel zooms the mirror, not the page (headed)", async ({
+    baseURL,
+  }) => {
+    test.skip(
+      !process.env.HEADED,
+      "window.open + wheel need a real window. Run with HEADED=1. (issue #1821)",
+    );
+    test.setTimeout(180_000);
+    const uiURL = baseURL || "http://localhost:3001";
+    const meetingId = `ss_detach_wheel_${Date.now()}`;
+    const fx = await setupViewerSeeingSharedScreen(
+      uiURL,
+      meetingId,
+      "SsDwHost",
+      "SsDwGuest",
+      FORCE_POPUP_DETACH_SCRIPT,
+      ANIMATED_SHARE_MOCK,
+      false,
+    );
+    const { hostPage, tile } = fx;
+
+    try {
+      const detach = tile.locator('[data-testid="ss-detach"]');
+      await expect(detach).toBeVisible();
+      const popupPromise = hostPage.context().waitForEvent("page", { timeout: 12_000 });
+      await tile.hover();
+      await detach.click();
+      const popup = await popupPromise;
+
+      const label = popup.locator("#ss-detached-zoom-label");
+      const viewport = popup.locator("#ss-detached-viewport");
+      await expect(label).toHaveText("100%");
+
+      // Layout-zoom guard (Chromium Ctrl+wheel is LAYOUT zoom → changes the
+      // detached document's CSS-px viewport width, not visualViewport.scale).
+      const clientWidthBefore = await popup.evaluate(() => document.documentElement.clientWidth);
+      const box = await viewport.boundingBox();
+      expect(box).not.toBeNull();
+      await popup.mouse.move(box!.x + box!.width / 2, box!.y + box!.height / 2);
+      await popup.keyboard.down("Control");
+      await popup.mouse.wheel(0, -100);
+      await popup.keyboard.up("Control");
+
+      // Primary fails-on-unfixed proof: the detached mirror zoomed (label > 100%);
+      // only the imperative non-passive wheel listener can do that.
+      await expect
+        .poll(async () => parseInt((await label.textContent()) || "0", 10), {
+          timeout: 5000,
+          message: "Ctrl+wheel did not zoom the detached mirror",
+        })
+        .toBeGreaterThan(100);
+      // preventDefault held → the detached document did not browser layout-zoom.
+      const clientWidthAfter = await popup.evaluate(() => document.documentElement.clientWidth);
+      expect(clientWidthAfter).toBe(clientWidthBefore);
     } finally {
       await fx.browser1.close();
       await fx.browser2.close();

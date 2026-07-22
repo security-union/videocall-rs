@@ -21,17 +21,20 @@ use crate::components::icons::crown::CrownIcon;
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
 use crate::components::icons::push_pin::PushPinIcon;
+use crate::components::icons::recording::RecordingIcon;
 use crate::components::icons::signal_bars::SignalBarsIcon;
-use crate::components::icons::zoom::{DetachIcon, ZoomInIcon, ZoomOutIcon, ZoomResetIcon};
-use crate::components::media_metrics_overlay::media_metrics_overlay;
+use crate::components::icons::zoom::{
+    ActualSizeIcon, DetachIcon, ZoomInIcon, ZoomOutIcon, ZoomResetIcon,
+};
+use crate::components::media_metrics_overlay::{media_metrics_overlay, screen_metrics_overlay};
 use crate::components::screen_share_zoom;
 use crate::components::signal_quality::{SignalInfo, SignalQualityPopup};
 // SignalMeterMode is referenced via SignalInfo internally — no direct import
 // needed in this file (yet); attendants/peer_tile own the call-site values.
 use crate::constants::users_allowed_to_stream;
 use crate::context::{
-    AppearanceSettings, CroppedTilesCtx, DetachedShareCtx, HostSetCtx, ScreenZoomCtx,
-    ScreenZoomState, VideoCallClientCtx,
+    AppearanceSettings, CroppedTilesCtx, DetachedShareCtx, HostSetCtx, RecordingSetCtx,
+    ScreenActualSizeCtx, ScreenZoomCtx, ScreenZoomState, VideoCallClientCtx,
 };
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
@@ -41,7 +44,7 @@ use std::rc::Rc;
 use videocall_client::VideoCallClient;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
-use web_sys::{window, HtmlCanvasElement, HtmlElement};
+use web_sys::{window, AddEventListenerOptions, HtmlCanvasElement, HtmlElement, WheelEvent};
 
 // ─── Glow formula constants ───────────────────────────────────────────────────
 
@@ -56,12 +59,12 @@ const OUTER_SPREAD_BASE: f32 = 1.0;
 const OUTER_SPREAD_INTENSITY: f32 = 2.0;
 /// Scale for glow bleed at 0% slider: no glow shadow.
 const GLOW_BLEED_MIN: f32 = 0.0;
-/// Additional glow bleed scale from slider 0% -> 100%.
-const GLOW_BLEED_RANGE: f32 = 3.80;
+/// Glow bleed value at the old 100% slider position (now anchored at 50%).
+const GLOW_BLEED_OLD_MAX: f32 = 3.80;
 /// Scale for color intensity at 0% brightness: keep a faint hint visible.
 const BRIGHTNESS_INTENSITY_MIN: f32 = 0.05;
-/// Additional color intensity from brightness 0% -> 100%.
-const BRIGHTNESS_INTENSITY_RANGE: f32 = 1.95;
+/// Brightness intensity at the old 100% slider position (now anchored at 50%).
+const BRIGHTNESS_OLD_MAX: f32 = 2.0;
 
 /// Base outer shadow alpha at zero audio level.
 const OUTER_ALPHA_BASE: f32 = 0.18;
@@ -91,8 +94,12 @@ const BORDER_ALPHA_INTENSITY: f32 = 0.42;
 pub(crate) const DEFAULT_TILE_BORDER_COLOR: &str = "rgba(100, 100, 100, 0.30)";
 const SILENT_BORDER_RESET_SECONDS: f32 = 0.30;
 const GLOW_FADE_IN_SECONDS_DEFAULT: f32 = 0.15;
-const GLOW_FADE_OUT_SECONDS_DEFAULT: f32 = 1.50;
-const GLOW_FADE_OUT_SECONDS_MAX: f32 = 3.00;
+/// Fixed fade-out duration (the visual fade after the hold period expires).
+const GLOW_FADE_OUT_DURATION: f32 = 1.50;
+/// Hold time at 50% decay (seconds glow persists before fade begins).
+const GLOW_HOLD_MID: f32 = 1.0;
+/// Hold time at 100% decay.
+const GLOW_HOLD_MAX: f32 = 5.0;
 
 // ─── Shared glow parameter struct ────────────────────────────────────────────
 
@@ -120,14 +127,13 @@ pub(crate) fn calculate_glow_params(
     inner_strength: f32,
 ) -> GlowParams {
     let i = intensity.clamp(0.0, 1.0);
-    let b = brightness.clamp(0.0, 1.0);
     let s = inner_strength.clamp(0.0, 1.0);
     // Brightness changes ONLY color intensity (alpha), not glow geometry.
-    // 50% maps to roughly the previous full-brightness intensity.
-    let brightness_intensity = BRIGHTNESS_INTENSITY_MIN + b * BRIGHTNESS_INTENSITY_RANGE;
-    // The "Glow" slider controls shadow/bleed geometry. 0% must produce no
-    // glow shadow, while 50% is the practical default and 100% is exaggerated.
-    let glow_bleed = GLOW_BLEED_MIN + s * GLOW_BLEED_RANGE;
+    // 50% matches the previous 100%; 100% is 10× that.
+    let brightness_intensity = remap_brightness_slider(brightness);
+    // The "Glow" slider controls shadow/bleed geometry. 0% produces no glow
+    // shadow; 50% matches previous 100%; 100% is 10× that.
+    let glow_bleed = remap_glow_slider(inner_strength);
     GlowParams {
         outer_blur: OUTER_BLUR_BASE + i * OUTER_BLUR_INTENSITY * glow_bleed,
         outer_spread: OUTER_SPREAD_BASE + i * OUTER_SPREAD_INTENSITY * glow_bleed,
@@ -138,7 +144,7 @@ pub(crate) fn calculate_glow_params(
         inner_alpha: ((INNER_ALPHA_BASE + i * INNER_ALPHA_INTENSITY)
             * brightness_intensity
             * (INNER_ALPHA_STRENGTH_MIN
-                + INNER_ALPHA_STRENGTH_RANGE * glow_bleed / (GLOW_BLEED_MIN + GLOW_BLEED_RANGE))
+                + INNER_ALPHA_STRENGTH_RANGE * glow_bleed / (GLOW_BLEED_MIN + GLOW_BLEED_OLD_MAX))
             * s)
             .clamp(0.0, 1.0),
         border_alpha: ((BORDER_ALPHA_BASE + i * BORDER_ALPHA_INTENSITY) * brightness_intensity)
@@ -156,14 +162,15 @@ pub(crate) fn speak_style(
 ) -> String {
     if !settings.glow_enabled {
         return format!(
-            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out, box-shadow {GLOW_FADE_OUT_SECONDS_DEFAULT:.2}s ease-out;"
+            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out, box-shadow {GLOW_FADE_OUT_DURATION:.2}s ease-out;"
         );
     }
 
-    let (fade_in_seconds, fade_out_seconds) = glow_transition_seconds(settings.glow_decay);
+    let (fade_in_seconds, fade_out_duration, hold_delay) =
+        glow_transition_seconds(settings.glow_decay);
     if !speaking_active || audio_level <= 0.0 {
         return format!(
-            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out, box-shadow {fade_out_seconds:.2}s ease-out;"
+            "box-shadow: none; border-color: {DEFAULT_TILE_BORDER_COLOR}; transition: border-color {SILENT_BORDER_RESET_SECONDS:.1}s ease-out {hold_delay:.2}s, box-shadow {fade_out_duration:.2}s ease-out {hold_delay:.2}s;"
         );
     }
 
@@ -214,16 +221,17 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceS
     if !settings.glow_enabled {
         // Respect the global glow toggle for mic visuals too.
         return format!(
-            "color: inherit; filter: none; transition: color 5.0s ease-out, filter {GLOW_FADE_OUT_SECONDS_DEFAULT:.2}s ease-out;"
+            "color: inherit; filter: none; transition: color 5.0s ease-out, filter {GLOW_FADE_OUT_DURATION:.2}s ease-out;"
         );
     }
 
-    let (fade_in_seconds, fade_out_seconds) = glow_transition_seconds(settings.glow_decay);
+    let (fade_in_seconds, fade_out_duration, hold_delay) =
+        glow_transition_seconds(settings.glow_decay);
 
     if mic_audio_level <= 0.0 && glow_audio_level <= 0.0 {
-        // Fully silent: fade out both color and filter
+        // Fully silent: fade out both color and filter with hold delay
         return format!(
-            "color: inherit; filter: none; transition: color 5.0s ease-out, filter {fade_out_seconds:.2}s ease-out;"
+            "color: inherit; filter: none; transition: color 5.0s ease-out {hold_delay:.2}s, filter {fade_out_duration:.2}s ease-out {hold_delay:.2}s;"
         );
     }
 
@@ -251,9 +259,9 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceS
         );
     }
     if mic_audio_level > 0.0 && glow_audio_level <= 0.0 {
-        // Held color but raw glow has faded — no drop-shadow
+        // Held color but raw glow has faded — no drop-shadow, with hold delay
         return format!(
-            "color: {icon_color}; filter: none; transition: color 0.05s ease-in, filter {fade_out_seconds:.2}s ease-out;"
+            "color: {icon_color}; filter: none; transition: color 0.05s ease-in, filter {fade_out_duration:.2}s ease-out {hold_delay:.2}s;"
         );
     }
     // Both positive: colored icon + scaled drop-shadow glow
@@ -271,27 +279,69 @@ fn mic_style(mic_audio_level: f32, glow_audio_level: f32, settings: &AppearanceS
     )
 }
 
-/// Map the 0.0..1.0 decay slider to glow fade-in/fade-out timings.
+/// Remap the glow slider (0.0–1.0) to a bleed scale.
+///
+/// - 0%  → 0.0 (no glow)
+/// - 50% → `GLOW_BLEED_OLD_MAX` (matches previous 100%)
+/// - 100% → 10× `GLOW_BLEED_OLD_MAX`
+fn remap_glow_slider(s: f32) -> f32 {
+    let s = s.clamp(0.0, 1.0);
+    if s <= 0.5 {
+        // Linear 0 → old_max over [0, 0.5]
+        s * 2.0 * GLOW_BLEED_OLD_MAX
+    } else {
+        // Linear old_max → 10×old_max over [0.5, 1.0]
+        GLOW_BLEED_OLD_MAX + (s - 0.5) * 2.0 * 9.0 * GLOW_BLEED_OLD_MAX
+    }
+}
+
+/// Remap the brightness slider (0.0–1.0) to a color intensity multiplier.
+///
+/// - 0%  → `BRIGHTNESS_INTENSITY_MIN` (faint hint)
+/// - 50% → `BRIGHTNESS_OLD_MAX` (matches previous 100%)
+/// - 100% → 10× `BRIGHTNESS_OLD_MAX`
+fn remap_brightness_slider(b: f32) -> f32 {
+    let b = b.clamp(0.0, 1.0);
+    if b <= 0.5 {
+        // Linear min → old_max over [0, 0.5]
+        BRIGHTNESS_INTENSITY_MIN + b * 2.0 * (BRIGHTNESS_OLD_MAX - BRIGHTNESS_INTENSITY_MIN)
+    } else {
+        // Linear old_max → 10×old_max over [0.5, 1.0]
+        BRIGHTNESS_OLD_MAX + (b - 0.5) * 2.0 * (10.0 * BRIGHTNESS_OLD_MAX - BRIGHTNESS_OLD_MAX)
+    }
+}
+
+/// Map the 0.0..1.0 decay slider to glow transition parameters.
+///
+/// Returns `(fade_in_seconds, fade_out_duration, hold_delay_seconds)`:
+/// - `fade_in_seconds`     — CSS transition-duration when glow activates
+/// - `fade_out_duration`   — CSS transition-duration for the visual fade
+/// - `hold_delay_seconds`  — CSS transition-delay before fade-out begins
 ///
 /// Contracts:
-/// - 0% decay -> instant glow on/off; border reset still uses 0.3s
-/// - non-zero decay -> fixed 0.15s fade-in (current behavior)
-/// - 50% decay -> current 1.50s glow fade-out
-/// - 100% decay -> longer 3.00s glow fade-out tail
-fn glow_transition_seconds(decay: f32) -> (f32, f32) {
+/// - 0% decay  → instant on/off, no hold
+/// - 1% decay  → no hold (fade starts immediately)
+/// - 50% decay → 1.0s hold before fade begins
+/// - 100% decay → 5.0s hold before fade begins
+fn glow_transition_seconds(decay: f32) -> (f32, f32, f32) {
     let d = decay.clamp(0.0, 1.0);
     if d <= f32::EPSILON {
-        return (0.0, 0.0);
+        return (0.0, 0.0, 0.0);
     }
 
-    let fade_out_seconds = if d <= 0.5 {
-        GLOW_FADE_OUT_SECONDS_DEFAULT * (d / 0.5)
+    if d <= 0.01 {
+        return (GLOW_FADE_IN_SECONDS_DEFAULT, GLOW_FADE_OUT_DURATION, 0.0);
+    }
+
+    let hold = if d <= 0.5 {
+        // Linear 0 → GLOW_HOLD_MID over [0, 0.5]
+        d * 2.0 * GLOW_HOLD_MID
     } else {
-        GLOW_FADE_OUT_SECONDS_DEFAULT
-            + (d - 0.5) / 0.5 * (GLOW_FADE_OUT_SECONDS_MAX - GLOW_FADE_OUT_SECONDS_DEFAULT)
+        // Linear GLOW_HOLD_MID → GLOW_HOLD_MAX over [0.5, 1.0]
+        GLOW_HOLD_MID + (d - 0.5) * 2.0 * (GLOW_HOLD_MAX - GLOW_HOLD_MID)
     };
 
-    (GLOW_FADE_IN_SECONDS_DEFAULT, fade_out_seconds)
+    (GLOW_FADE_IN_SECONDS_DEFAULT, GLOW_FADE_OUT_DURATION, hold)
 }
 
 /// Issue #1483: which transport a peer's media is flowing over, for the
@@ -334,21 +384,40 @@ pub fn transport_badge_from_str(raw: &str) -> TransportBadge {
 /// re-parse in `transport_badge_enabled()` is paid once, not per render arm).
 /// This helper therefore renders nothing for `None` or `Some(Unknown)`, which
 /// keeps the "flag OFF → nothing" and "Unknown → nothing" contract in one place.
-fn transport_badge(badge: Option<TransportBadge>) -> Element {
+///
+/// Issue #1883: `is_self` selects the a11y label. Peer tiles report a transport
+/// the REMOTE peer announced ("Transport reported by peer: …"); the local
+/// self-view (rendered by `Host`, not a `PeerTile`) shows THIS client's own
+/// active transport, so it reads "Your connection transport: …". The visible
+/// pill (class + "WT"/"WS" text) is identical either way (visual identity with
+/// #1483) — only the label/title differ so a screen-reader user on their own
+/// tile isn't told a peer reported it.
+pub(crate) fn transport_badge(badge: Option<TransportBadge>, is_self: bool) -> Element {
+    let (wt_label, ws_label) = if is_self {
+        (
+            "Your connection transport: WebTransport",
+            "Your connection transport: WebSocket",
+        )
+    } else {
+        (
+            "Transport reported by peer: WebTransport",
+            "Transport reported by peer: WebSocket",
+        )
+    };
     match badge {
         Some(TransportBadge::Wt) => rsx! {
             span {
                 class: "transport-badge transport-badge--wt",
-                "aria-label": "Transport reported by peer: WebTransport",
-                title: "Transport reported by peer: WebTransport",
+                "aria-label": "{wt_label}",
+                title: "{wt_label}",
                 "WT"
             }
         },
         Some(TransportBadge::Ws) => rsx! {
             span {
                 class: "transport-badge transport-badge--ws",
-                "aria-label": "Transport reported by peer: WebSocket",
-                title: "Transport reported by peer: WebSocket",
+                "aria-label": "{ws_label}",
+                title: "{ws_label}",
                 "WS"
             }
         },
@@ -368,6 +437,98 @@ pub enum TileMode {
     ScreenOnly,
     /// Split-layout right panel — renders only the peer video tile (no screen-share canvas).
     VideoOnly,
+}
+
+/// Which of a peer's tiles is pinned/maximized.
+///
+/// During a screen share ONE peer renders as TWO tiles that share a single
+/// `user_id`: their shared SCREEN (`TileMode::ScreenOnly` → `.split-screen-tile`)
+/// and their CAMERA/avatar (`TileMode::VideoOnly` → `.split-peer-tile`). Pin
+/// identity therefore cannot be a bare `user_id`: keyed by user_id alone,
+/// pinning EITHER tile would maximize BOTH (both tiles derive `is_pinned` from
+/// the same id), and the viewer would have no way to express "maximize the
+/// screen" vs "maximize the camera". `PinnedTileKind` is the discriminator that
+/// separates those two intents. Outside screen share every peer has exactly one
+/// tile and it is always `Camera`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinnedTileKind {
+    /// The peer's camera/avatar tile — the normal-grid tile and the split
+    /// layout's right-panel `.split-peer-tile`.
+    Camera,
+    /// The peer's shared-screen tile — the split layout's left-panel
+    /// `.split-screen-tile`.
+    Screen,
+}
+
+/// Identity of the single maximized ("pinned") tile: WHICH peer and WHICH of
+/// their tiles. See [`PinnedTileKind`] for why the kind is load-bearing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedTile {
+    pub user_id: String,
+    pub kind: PinnedTileKind,
+}
+
+impl PinnedTile {
+    /// Pin identity for a peer's camera/avatar tile.
+    pub fn camera(user_id: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            kind: PinnedTileKind::Camera,
+        }
+    }
+
+    /// Pin identity for a peer's shared-screen tile.
+    pub fn screen(user_id: impl Into<String>) -> Self {
+        Self {
+            user_id: user_id.into(),
+            kind: PinnedTileKind::Screen,
+        }
+    }
+}
+
+/// The pin-tile kind a given render mode produces. `ScreenOnly` renders the
+/// shared screen (`.split-screen-tile`); every other mode renders the peer's
+/// camera/avatar tile. This is the single source of truth mapping a tile's
+/// `TileMode` to the [`PinnedTileKind`] its pin button must carry, so a tile's
+/// `is_pinned` state matches only its OWN kind.
+pub(crate) fn tile_pin_kind(mode: &TileMode) -> PinnedTileKind {
+    match mode {
+        TileMode::ScreenOnly => PinnedTileKind::Screen,
+        TileMode::Full | TileMode::VideoOnly => PinnedTileKind::Camera,
+    }
+}
+
+/// Whether the tile identified by `(this_user_id, this_kind)` is the currently
+/// maximized ("pinned") tile. A tile matches ONLY when the pinned identity
+/// agrees on BOTH the peer's user_id AND the tile kind — this is what lets a
+/// screen-share sharer's two tiles (their `.split-screen-tile` and
+/// `.split-peer-tile`, which share one user_id) be pinned independently. This
+/// is the production predicate `generate_for_peer` uses to derive `is_pinned`.
+pub(crate) fn is_tile_pinned(
+    pinned: Option<&PinnedTile>,
+    this_user_id: &str,
+    this_kind: PinnedTileKind,
+) -> bool {
+    pinned
+        .map(|p| p.kind == this_kind && p.user_id.as_str() == this_user_id)
+        .unwrap_or(false)
+}
+
+/// Pure pin toggle/switch reducer. Given the currently pinned tile and the tile
+/// just clicked, returns the next pin state:
+///   - clicking the SAME (peer, kind) that is pinned → `None` (release);
+///   - clicking anything ELSE — a different peer, OR the SAME peer's OTHER tile
+///     kind (their screen while their camera is pinned, or vice versa) →
+///     `Some(clicked)` (switch the spotlight to it).
+///
+/// Equality is by `(user_id, kind)`, so the same peer's screen and camera are
+/// distinct pin targets and switch between each other rather than toggling off.
+pub(crate) fn next_pin_target(cur: Option<&PinnedTile>, clicked: PinnedTile) -> Option<PinnedTile> {
+    if cur == Some(&clicked) {
+        None
+    } else {
+        Some(clicked)
+    }
 }
 
 /// Outcome of the split-layout eligibility check.
@@ -610,8 +771,8 @@ pub fn generate_for_peer(
     on_disable_video: Option<EventHandler<()>>,
     on_kick: Option<EventHandler<()>>,
     on_transfer_host: Option<EventHandler<()>>,
-    pinned_peer_id: Option<&str>,
-    on_toggle_pin: EventHandler<String>,
+    pinned_peer_id: Option<&PinnedTile>,
+    on_toggle_pin: EventHandler<PinnedTile>,
     appearance: &AppearanceSettings,
     // Issue #1466: fired when the user clicks the per-tile PLAY button on a
     // decode-budget-PAUSED tile (only rendered when `paused_by_device`). It
@@ -661,6 +822,12 @@ pub fn generate_for_peer(
     // `media_metrics_overlay` renders nothing. Only the two VIDEO tile arms
     // (grid + split peer-video) inject it; screen-share panels do not.
     let metrics_overlay = signal_info.metrics_overlay;
+    // Issue 1821: shared-content tile stats. `screen_resolution` (always
+    // populated for the sharer tile) drives the actual-size (1:1) live re-derive;
+    // `screen_metrics` is the diagnostics-gated stats overlay payload. Both are
+    // `None` on non-screen tiles.
+    let screen_resolution = signal_info.screen_resolution;
+    let screen_metrics = signal_info.screen_metrics_overlay;
     // Bundled popup handlers (lifted out of per-tile state for bugs #8 + #9).
     let SignalPopupHandlers {
         show: show_signal_popup,
@@ -685,6 +852,18 @@ pub fn generate_for_peer(
         Some(hs) => hs.is_host(&peer_user_id),
         None => host_user_id.map(|h| h == peer_user_id).unwrap_or(false),
     };
+    // Per-recorder indicator: recording is a per-SESSION action, so key on the
+    // tile's session `key` (NOT `peer_user_id`) — a sibling tab of the same
+    // account must be able to differ. This path only ever renders REMOTE peers
+    // (the self tile is filtered out of `display_peers` and drawn by `Host`), so
+    // `key` is always a real remote session id. No prop fallback exists (unlike
+    // host_user_id); a missing provider (isolated tests) means "not recording",
+    // which `unwrap_or(false)` yields.
+    let recording_set = try_use_context::<RecordingSetCtx>();
+    let is_recording = recording_set
+        .as_ref()
+        .map(|rs| rs.is_recording(key))
+        .unwrap_or(false);
     let is_guest = client.get_peer_is_guest(key).unwrap_or(false);
     let allowed = users_allowed_to_stream().unwrap_or_default();
     if !allowed.is_empty() && !allowed.contains(&peer_user_id) {
@@ -704,11 +883,33 @@ pub fn generate_for_peer(
     // behaviour is unchanged.
     let show_canvas = is_video_enabled_for_peer && !force_avatar;
 
-    let is_pinned = pinned_peer_id
-        .map(|p| p == peer_user_id.as_str())
-        .unwrap_or(false);
+    // A tile is maximized only when the pinned identity matches BOTH this peer
+    // AND this tile's kind. Deriving `is_pinned` from `(user_id, kind)` — not
+    // `user_id` alone — is what keeps a screen-share sharer's two tiles (their
+    // `.split-screen-tile` and their `.split-peer-tile`, which share one
+    // `user_id`) independently pinnable: pinning the screen maximizes ONLY the
+    // screen, pinning the camera maximizes ONLY the camera.
+    let this_pin_kind = tile_pin_kind(&mode);
+    let is_pinned = is_tile_pinned(pinned_peer_id, peer_user_id.as_str(), this_pin_kind);
 
-    let is_suppressed = is_speaking_suppressed(is_pinned, pinned_peer_id);
+    // Glow suppression only needs to know whether ANY tile is pinned (a
+    // non-pinned tile's speaking glow is suppressed while a spotlight is
+    // active), so collapse the pin identity to its user_id for the predicate.
+    let is_suppressed =
+        is_speaking_suppressed(is_pinned, pinned_peer_id.map(|p| p.user_id.as_str()));
+
+    // The maximize/spotlight ("pin") state is rendered as a REACTIVE class on the
+    // tile root so it is part of the `class` attribute Dioxus manages. A prior
+    // implementation toggled `grid-item-pinned` imperatively via
+    // `element.class_list().add(...)`, but Dioxus rewrites the tile's `class`
+    // attribute whenever the reactive class STRING changes — e.g. the pinned peer
+    // starts speaking, appending `speaking-tile`. That rewrite silently dropped the
+    // imperatively-added `grid-item-pinned`, un-maximizing the tile the instant the
+    // pinned peer spoke (the pinned peer is exempt from glow suppression, so only
+    // THEY toggle their own `speaking-tile` and wipe their own pin). Deriving the
+    // class from `is_pinned` keeps it inside the managed value so it survives every
+    // re-render. `pinned_class` is the shared source of truth for all tile arms.
+    let pinned_class = if is_pinned { " grid-item-pinned" } else { "" };
 
     let visible_audio_level = if is_suppressed { 0.0 } else { audio_level };
     let visible_mic_level = if is_suppressed { 0.0 } else { mic_audio_level };
@@ -748,7 +949,6 @@ pub fn generate_for_peer(
     if decision == TileDecision::RenderScreenShare {
         let ss_canvas_crop = screen_share_zoom::screen_canvas_id(key);
         let ss_div_id = Rc::new(format!("screen-share-{}-div", &key));
-        let ss_div_pin = (*ss_div_id).clone();
         let peer_user_id_for_pin_ss = peer_user_id.clone();
         let ss_name = format!("{}-screen", peer_display_name);
         let ss_name_title = ss_name.clone();
@@ -776,11 +976,19 @@ pub fn generate_for_peer(
         // no inert wrapper. The canvas stays mounted + painting (feeding the
         // detached-window mirror); the pane is just moved off-screen. Detach /
         // zoom / reattach affordances all live in the detached window.
+        // The maximize ("pin") state is rendered as a REACTIVE class here, exactly
+        // like the split-peer / normal-grid tiles (see `pinned_class`, derived from
+        // this tile's OWN `(user_id, Screen)` identity above). This replaced an
+        // earlier imperative `toggle_pinned_div` DOM toggle, which desynced from
+        // `pinned_peer_id`: the imperative class was never cleared when the pin was
+        // released from another surface, leaving the screen tile stuck maximized
+        // while `pinned_peer_id == None`. A single reactive source of truth removes
+        // that desync.
         let ss_split_class = "split-screen-tile";
         return rsx! {
             div {
                 id: "{ss_div_id}",
-                class: "{ss_split_class}",
+                class: "{ss_split_class}{pinned_class}",
                 "data-tile-root": "true",
                 div {
                     class: "canvas-container video-on",
@@ -788,6 +996,11 @@ pub fn generate_for_peer(
                     // canvas. The canvas is never recreated — zoom/pan are a CSS
                     // transform driven declaratively from per-tile signal state.
                     ScreenShareZoomable { peer_id: key.clone() }
+                    // Issue 1821: shared-content stats overlay (res·fps), bottom-
+                    // anchored + passive; empty node when the diagnostics checkbox
+                    // is off. Sits below the zoom bar (which is raised to the dock
+                    // clearance), so no collision.
+                    {screen_metrics_overlay(screen_metrics.as_ref())}
                     h4 {
                         id: "{ss_name_id}",
                         class: "floating-name",
@@ -800,8 +1013,14 @@ pub fn generate_for_peer(
                     }
                     // Issue 1175: zoom / reset / detach controls for the ATTACHED
                     // state (in-window). All handlers are ordinary main-document
-                    // Dioxus handlers, so they are always live.
-                    ScreenShareZoomControls { peer_id: key.clone(), name: peer_display_name.clone() }
+                    // Dioxus handlers, so they are always live. Issue 1821 adds the
+                    // actual-size (1:1) button; `content_res` feeds its live
+                    // re-derive when the presenter's resolution changes.
+                    ScreenShareZoomControls {
+                        peer_id: key.clone(),
+                        name: peer_display_name.clone(),
+                        content_res: screen_resolution,
+                    }
                     div {
                         class: "tile-top-icons",
                         // HCL bug #2: signal-meter icon button on the
@@ -813,6 +1032,8 @@ pub fn generate_for_peer(
                             id: "{ss_signal_btn_id}",
                             class: "signal-indicator",
                             "aria-label": "Show screen-share signal quality",
+                            "data-signal-level": format!("{}", signal_level.bars()),
+                            "data-signal-lost": format!("{}", signal_level.is_lost()),
                             // stop_propagation: this is a tile-overlay control, not a
                             // background/grid click, so it must not light-dismiss an
                             // open side panel (issue #1790).
@@ -825,16 +1046,22 @@ pub fn generate_for_peer(
                         // Issue #1483: transport badge adjacent to the signal
                         // meter. Renders nothing unless the flag is on AND the
                         // transport is known (gated upstream → `badge_transport`).
-                        {transport_badge(badge_transport)}
+                        {transport_badge(badge_transport, false)}
                         button {
                             onclick: move |e: MouseEvent| {
                                 // stop_propagation: tile-overlay control, not a grid
                                 // click — must not light-dismiss a side panel (#1790).
                                 e.stop_propagation();
-                                toggle_pinned_div(&ss_div_pin);
-                                on_toggle_pin.call(peer_user_id_for_pin_ss.clone());
+                                // Pin the SCREEN tile specifically (Screen kind). The
+                                // maximize is owned entirely by the reactive
+                                // `pinned_class` above — there is no imperative DOM
+                                // toggle here, so the screen tile can never get stuck
+                                // maximized out of sync with `pinned_peer_id`.
+                                on_toggle_pin.call(PinnedTile::screen(peer_user_id_for_pin_ss.clone()));
                             },
                             class: "pin-icon",
+                            "aria-pressed": "{is_pinned}",
+                            "aria-label": "Pin screen share",
                             PushPinIcon {}
                         }
                         {
@@ -889,9 +1116,8 @@ pub fn generate_for_peer(
     // ---- Split-layout: peer video right panel ---------------------------------
     if decision == TileDecision::RenderVideo {
         let peer_video_div_id = Rc::new(format!("peer-video-{}-div", &key));
-        let div_id_mobile = (*peer_video_div_id).clone();
-        let div_id_pin = (*peer_video_div_id).clone();
         let peer_user_id_for_pin_vo = peer_user_id.clone();
+        let peer_user_id_for_mobile_vo = peer_user_id.clone();
         let pv_canvas_crop = key.clone();
         let key_clone = key.clone();
         let peer_display_name_vo = peer_display_name.clone();
@@ -925,15 +1151,18 @@ pub fn generate_for_peer(
         let split_anchor_id = split_signal_btn_id.clone();
         return rsx! {
             div {
-                class: "{split_peer_class}{vo_speaking}",
+                class: "{split_peer_class}{vo_speaking}{pinned_class}",
                 id: "{peer_video_div_id}",
                 "data-tile-root": "true",
                 style: "{vo_tile_style}",
                 div {
                     class: "{grid_class}",
                     onclick: move |_| {
+                        // Mobile tap-to-spotlight routes through the reactive pin
+                        // signal (not an imperative class toggle) so the maximize is
+                        // owned by `is_pinned` and cannot be wiped by a class rewrite.
                         if is_mobile_viewport() {
-                            toggle_pinned_div(&div_id_mobile);
+                            on_toggle_pin.call(PinnedTile::camera(peer_user_id_for_mobile_vo.clone()));
                         }
                     },
                     if show_canvas {
@@ -1029,6 +1258,9 @@ pub fn generate_for_peer(
                         if is_host {
                             CrownIcon {}
                         }
+                        if is_recording {
+                            RecordingIcon {}
+                        }
                         if is_guest {
                             span { class: "guest-badge", "Guest" }
                         }
@@ -1039,6 +1271,7 @@ pub fn generate_for_peer(
                         div {
                             class: "{vo_audio_class}",
                             style: "{vo_mic_style}",
+                            "data-mic-muted": if is_audio_enabled_for_peer { "false" } else { "true" },
                             MicIcon { muted: !is_audio_enabled_for_peer }
                         }
                         // Signal icon (always visible, clickable)
@@ -1046,6 +1279,8 @@ pub fn generate_for_peer(
                             id: "{split_signal_btn_id}",
                             class: "signal-indicator",
                             "aria-label": "Show signal quality",
+                            "data-signal-level": format!("{}", signal_level.bars()),
+                            "data-signal-lost": format!("{}", signal_level.is_lost()),
                             // stop_propagation: tile-overlay control, not a grid
                             // click — must not light-dismiss a side panel (#1790).
                             onclick: move |e: MouseEvent| {
@@ -1056,7 +1291,7 @@ pub fn generate_for_peer(
                         }
                         // Issue #1483: transport badge adjacent to the signal
                         // meter (renders nothing unless flag on + transport known).
-                        {transport_badge(badge_transport)}
+                        {transport_badge(badge_transport, false)}
                         // Crop (visible on hover only, hidden when video disabled)
                         if is_video_enabled_for_peer {
                             {
@@ -1129,10 +1364,11 @@ pub fn generate_for_peer(
                                 // stop_propagation: tile-overlay control, not a grid
                                 // click — must not light-dismiss a side panel (#1790).
                                 e.stop_propagation();
-                                toggle_pinned_div(&div_id_pin);
-                                on_toggle_pin.call(peer_user_id_for_pin_vo.clone());
+                                on_toggle_pin.call(PinnedTile::camera(peer_user_id_for_pin_vo.clone()));
                             },
                             class: "pin-icon",
+                            "aria-pressed": "{is_pinned}",
+                            "aria-label": "Pin this participant",
                             PushPinIcon {}
                         }
                     }
@@ -1189,8 +1425,7 @@ pub fn generate_for_peer(
     let ss_canvas_crop = screen_share_zoom::screen_canvas_id(key);
     let ss_name = format!("{}-screen", peer_display_name);
 
-    let pv_div_mobile = (*peer_video_div_id).clone();
-    let pv_div_pin = (*peer_video_div_id).clone();
+    let peer_user_id_for_mobile = peer_user_id.clone();
     let pv_canvas_crop = key.clone();
     let key_clone = key.clone();
     let peer_display_name_grid = peer_display_name.clone();
@@ -1221,6 +1456,15 @@ pub fn generate_for_peer(
         // the split layout (`TileMode::ScreenOnly` → `RenderScreenShare`, the
         // zoom/detach-enhanced arm above). This arm is only reached when
         // `has_screen_share = false`, i.e. no displayed non-self peer is sharing.
+        //
+        // WARNING for whoever changes that routing invariant: `class:
+        // "{screen_share_css}"` below IS reactive (flips between
+        // `is_awaiting_peer_screen_frame` states), so if this arm ever becomes
+        // reachable again, `toggle_pinned_div`'s imperative `grid-item-pinned`
+        // class would be silently erased on the next reactive class rewrite —
+        // the exact bug fixed for the normal grid and split-peer tiles (see
+        // `pinned_class` there). Route pin through a reactive class here too,
+        // not the imperative DOM toggle, if this arm becomes reachable.
         if peer_session_id != my_session_id_str && is_screen_share_enabled_for_peer {
             div {
                 class: "{screen_share_css}",
@@ -1262,10 +1506,21 @@ pub fn generate_for_peer(
                             // stop_propagation: tile-overlay control, not a grid
                             // click — must not light-dismiss a side panel (#1790).
                             e.stop_propagation();
+                            // NOTE: this whole `TileMode::Full` screen-share arm is
+                            // UNREACHABLE for a received share (see the WARNING above —
+                            // a displayed non-self sharer always routes to the split
+                            // layout). The imperative `toggle_pinned_div` is retained
+                            // only because this arm's root class IS reactive; if it ever
+                            // becomes reachable, mirror the split-screen-tile fix
+                            // (reactive `pinned_class`, drop this toggle). The pin
+                            // carries Screen kind so it stays consistent with the
+                            // split-layout screen tile if reached.
                             toggle_pinned_div(&ss_div_pin);
-                            on_toggle_pin.call(peer_user_id_for_pin_ss.clone());
+                            on_toggle_pin.call(PinnedTile::screen(peer_user_id_for_pin_ss.clone()));
                         },
                         class: "pin-icon",
+                        "aria-pressed": "{is_pinned}",
+                        "aria-label": "Pin screen share",
                         PushPinIcon {}
                     }
                 }
@@ -1366,7 +1621,7 @@ pub fn generate_for_peer(
             };
             rsx! {
                 div {
-                    class: "{grid_item_class}{grid_speaking}{off_budget_class}",
+                    class: "{grid_item_class}{grid_speaking}{off_budget_class}{pinned_class}",
                     id: "{peer_video_div_id}",
                     "data-tile-root": "true",
                     "data-off-budget": if force_avatar { "true" } else { "false" },
@@ -1375,8 +1630,11 @@ pub fn generate_for_peer(
                     div {
                         class: "{grid_class}",
                         onclick: move |_| {
+                            // Mobile tap-to-spotlight routes through the reactive pin
+                            // signal (not an imperative class toggle) so the maximize
+                            // is owned by `is_pinned` and survives class rewrites.
                             if is_mobile_viewport() {
-                                toggle_pinned_div(&pv_div_mobile);
+                                on_toggle_pin.call(PinnedTile::camera(peer_user_id_for_mobile.clone()));
                             }
                         },
                         if show_canvas {
@@ -1466,6 +1724,9 @@ pub fn generate_for_peer(
                             if is_host {
                                 CrownIcon {}
                             }
+                            if is_recording {
+                                RecordingIcon {}
+                            }
                             if is_guest {
                                 span { class: "guest-badge", "Guest" }
                             }
@@ -1476,6 +1737,7 @@ pub fn generate_for_peer(
                             div {
                                 class: "{audio_speaking_class}",
                                 style: "{grid_mic_style}",
+                                "data-mic-muted": if is_audio_enabled_for_peer { "false" } else { "true" },
                                 MicIcon { muted: !is_audio_enabled_for_peer }
                             }
                             // Signal icon (always visible, clickable)
@@ -1483,6 +1745,8 @@ pub fn generate_for_peer(
                                 id: "{grid_signal_btn_id}",
                                 class: "signal-indicator",
                                 "aria-label": "Show signal quality",
+                                "data-signal-level": format!("{}", signal_level.bars()),
+                                "data-signal-lost": format!("{}", signal_level.is_lost()),
                                 // stop_propagation: tile-overlay control, not a grid
                                 // click — must not light-dismiss a side panel (#1790).
                                 onclick: move |e: MouseEvent| {
@@ -1493,7 +1757,7 @@ pub fn generate_for_peer(
                             }
                             // Issue #1483: transport badge adjacent to the signal
                             // meter (renders nothing unless flag on + transport known).
-                            {transport_badge(badge_transport)}
+                            {transport_badge(badge_transport, false)}
                             // Crop (visible on hover only). Gated on `show_canvas`
                             // so off-budget avatar tiles — which have no canvas —
                             // don't show a no-op crop button (task 1a.4).
@@ -1568,10 +1832,11 @@ pub fn generate_for_peer(
                                     // stop_propagation: tile-overlay control, not a grid
                                     // click — must not light-dismiss a side panel (#1790).
                                     e.stop_propagation();
-                                    toggle_pinned_div(&pv_div_pin);
-                                    on_toggle_pin.call(peer_user_id_for_pin.clone());
+                                    on_toggle_pin.call(PinnedTile::camera(peer_user_id_for_pin.clone()));
                                 },
                                 class: "pin-icon",
+                                "aria-pressed": "{is_pinned}",
+                                "aria-label": "Pin this participant",
                                 PushPinIcon {}
                             }
                         }
@@ -1746,7 +2011,9 @@ fn pan_key_name(key: &Key) -> Option<&'static str> {
 }
 
 /// Per-tile drag accumulator for pointer panning. Deltas accumulate here and are
-/// flushed to the zoom signal at most once per animation frame.
+/// flushed to the zoom signal at most once per animation frame. Issue 1821 also
+/// tracks up to two pointers so a two-finger pinch can drive zoom through the
+/// same rAF flush.
 #[derive(Default)]
 struct ScreenPanDrag {
     active: bool,
@@ -1754,28 +2021,118 @@ struct ScreenPanDrag {
     pending_dx: f64,
     pending_dy: f64,
     raf_scheduled: bool,
+    /// Issue 1821: currently-down pointers as `(pointer_id, local_x, local_y)`.
+    /// Two entries → pinch mode. Kept viewport-local (element coordinates).
+    pointers: Vec<(i32, f64, f64)>,
+    /// True once two pointers are down: single-finger drag is suspended and the
+    /// pinch span drives zoom instead.
+    pinching: bool,
+    /// Distance between the two pointers at the previous pinch move, so each move
+    /// applies an incremental ratio.
+    prev_dist: f64,
+    /// Issue 1821: viewport half-dims cached ONCE at pinch start (the viewport
+    /// doesn't resize mid-pinch), so a pinch move does no per-move layout read —
+    /// mirrors the detached path's `pinch_geom`.
+    pinch_half: Option<(f64, f64)>,
+    /// Issue 1821: pinch-computed next state awaiting the rAF flush. Coalesces
+    /// many moves in a frame into ONE signal write; also the BASE for the next
+    /// move (`pending_zoom.unwrap_or(live)`) so the incremental ratio chain
+    /// compounds correctly even before the flush lands. NOT cleared on pointer
+    /// end — the scheduled rAF flushes the final pinch state.
+    pending_zoom: Option<ScreenZoomState>,
 }
 
-/// End an in-progress pointer pan (pointerup / leave / cancel): clear the drag
-/// and release pointer capture on the viewport.
+/// End an in-progress pointer pan/pinch (pointerup / leave / cancel): drop the
+/// lifted pointer, exit pinch when fewer than two remain (the one remaining
+/// pointer may resume a single-finger drag when zoomed), clear the drag, and
+/// release pointer capture on the viewport.
 fn end_screen_pan(drag: &Rc<RefCell<ScreenPanDrag>>, viewport_id: &str, evt: &PointerEvent) {
-    let was_active = {
+    let web_evt = evt.try_as_web_event();
+    {
         let mut d = drag.borrow_mut();
-        let a = d.active;
-        d.active = false;
-        d.last = None;
-        a
-    };
-    if was_active {
-        if let Some(web_evt) = evt.try_as_web_event() {
-            if let Some(el) = window()
-                .and_then(|w| w.document())
-                .and_then(|doc| doc.get_element_by_id(viewport_id))
-            {
-                let _ = el.release_pointer_capture(web_evt.pointer_id());
+        if let Some(pid) = web_evt.as_ref().map(|w| w.pointer_id()) {
+            d.pointers.retain(|(id, _, _)| *id != pid);
+        }
+        if d.pointers.len() < 2 {
+            // Exiting pinch. A single remaining pointer resumes drag from its
+            // last tracked position so the gesture flows pinch → one-finger pan
+            // without a dead frame (a pan at fit is a harmless no-op — `pan_by`
+            // clamps to 0 there); zero pointers just ends the interaction. The
+            // pinch's `pending_zoom` is deliberately left for the scheduled rAF to
+            // flush (it holds the FINAL pinch state).
+            d.pinching = false;
+            d.prev_dist = 0.0;
+            d.pinch_half = None;
+            match d.pointers.first().copied() {
+                Some((_, x, y)) => {
+                    d.active = true;
+                    d.last = Some((x, y));
+                }
+                None => {
+                    d.active = false;
+                    d.last = None;
+                }
             }
         }
     }
+    // Release the lifted pointer's capture (a no-op if it wasn't captured; the
+    // browser also implicitly releases on pointerup).
+    if let Some(web_evt) = web_evt {
+        if let Some(el) = window()
+            .and_then(|w| w.document())
+            .and_then(|doc| doc.get_element_by_id(viewport_id))
+        {
+            let _ = el.release_pointer_capture(web_evt.pointer_id());
+        }
+    }
+}
+
+// ─── Issue 1821: actual-size (1:1) engaged-peer helpers ───────────────────────
+
+/// Whether `peer`'s shared content is currently pinned to actual-size (1:1).
+fn is_actual_size_engaged(ctx: &Signal<Option<String>>, peer: &str) -> bool {
+    ctx.read().as_deref() == Some(peer)
+}
+
+/// Engage actual-size (1:1) for `peer` (one at a time, so this replaces any prior
+/// engaged peer).
+fn set_actual_size_engaged(ctx: &mut Signal<Option<String>>, peer: &str) {
+    ctx.set(Some(peer.to_string()));
+}
+
+/// Clear the actual-size (1:1) intent IF `peer` currently holds it; a no-op
+/// otherwise. Called from every EXPLICIT zoom change (button / wheel / pinch) —
+/// the user has left 1:1 — but never from a pan (`peek` first so a no-op write
+/// doesn't churn the signal). Compares via `peek` so calling it does not
+/// subscribe the caller to the signal.
+fn clear_actual_size(ctx: &mut Signal<Option<String>>, peer: &str) {
+    if ctx.peek().as_deref() == Some(peer) {
+        ctx.set(None);
+    }
+}
+
+/// Issue 1821: the render-clamped scale that shows `peer`'s shared content at
+/// true 1:1, resolved from the LIVE decoded canvas dims + the viewport size +
+/// the device pixel ratio. `RESET_ZOOM` (fit) when the canvas or viewport is
+/// missing / zero-sized (pre-decode), so the caller falls back to fit. The only
+/// new imperative DOM read the feature adds.
+fn actual_size_target_for(peer: &str, viewport_id: &str) -> f64 {
+    let Some(win) = window() else {
+        return screen_share_zoom::RESET_ZOOM;
+    };
+    let dims = win
+        .document()
+        .and_then(|d| d.get_element_by_id(&screen_share_zoom::screen_canvas_id(peer)))
+        .and_then(|e| e.dyn_into::<HtmlCanvasElement>().ok())
+        .map(|c| (c.width() as f64, c.height() as f64));
+    let Some((bw, bh)) = dims else {
+        return screen_share_zoom::RESET_ZOOM;
+    };
+    let Some((hw, hh)) = viewport_half_dims(viewport_id) else {
+        return screen_share_zoom::RESET_ZOOM;
+    };
+    let dpr = win.device_pixel_ratio().max(1.0);
+    screen_share_zoom::actual_size_target(bw, bh, hw * 2.0, hh * 2.0, dpr)
 }
 
 /// Issue 1175: the zoom/pan viewport for a RECEIVED shared-content tile. Wraps
@@ -1787,6 +2144,9 @@ fn end_screen_pan(drag: &Rc<RefCell<ScreenPanDrag>>, viewport_id: &str, evt: &Po
 #[component]
 fn ScreenShareZoomable(peer_id: String) -> Element {
     let zoom_ctx = use_context::<ScreenZoomCtx>().0;
+    // Issue 1821: wheel / pinch gestures leave the actual-size (1:1) intent, so
+    // the gesture handlers clear it (like the button steppers do).
+    let actual_ctx = use_context::<ScreenActualSizeCtx>().0;
     let viewport_id = format!("screen-share-{}-viewport", peer_id);
 
     // Declarative transform from current state (subscribes this tile to zoom).
@@ -1813,14 +2173,21 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
         let mut ctx = zoom_ctx;
         move || {
             Rc::new(Closure::<dyn FnMut()>::new(move || {
-                let (dx, dy) = {
+                let (dx, dy, pending_zoom) = {
                     let mut d = drag.borrow_mut();
                     d.raf_scheduled = false;
-                    let v = (d.pending_dx, d.pending_dy);
+                    let v = (d.pending_dx, d.pending_dy, d.pending_zoom.take());
                     d.pending_dx = 0.0;
                     d.pending_dy = 0.0;
                     v
                 };
+                // Issue 1821: a pending pinch state (already anchored + clamped)
+                // takes precedence and is written directly. Pinch suspends the
+                // pan accumulator, so the two never both apply in one frame.
+                if let Some(next) = pending_zoom {
+                    write_zoom_state(&mut ctx, &peer, next);
+                    return;
+                }
                 if dx == 0.0 && dy == 0.0 {
                     return;
                 }
@@ -1841,6 +2208,95 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
             d.active = false;
             d.pending_dx = 0.0;
             d.pending_dy = 0.0;
+            d.pointers.clear();
+            d.pinching = false;
+            d.pinch_half = None;
+            d.pending_zoom = None;
+        });
+    }
+
+    // Issue 1821: Ctrl+wheel / trackpad-pinch zoom. Dioxus-web `onwheel` is
+    // PASSIVE (root-delegated), so `preventDefault()` there is a no-op and a
+    // Ctrl+wheel would browser-zoom the whole PAGE. Attach an imperative
+    // NON-PASSIVE `wheel` listener on the viewport so `preventDefault()` is
+    // honored, and map the gesture through the pure `wheel_zoom_factor` +
+    // `zoom_to_anchored` (cursor-anchored). The closure is kept alive in a
+    // `use_hook` cell, attached post-mount by the `use_effect` below (the element
+    // id must resolve first), and removed in `use_drop`.
+    let wheel_closure: Rc<Closure<dyn FnMut(WheelEvent)>> = use_hook({
+        let mut ctx = zoom_ctx;
+        let mut actual_ctx = actual_ctx;
+        let peer = peer_id.clone();
+        let vp = viewport_id.clone();
+        move || {
+            Rc::new(Closure::<dyn FnMut(WheelEvent)>::new(
+                move |e: WheelEvent| {
+                    // Mac trackpad pinch dispatches a wheel with ctrlKey=true; a real
+                    // Ctrl/Cmd+wheel is the desktop equivalent. Plain wheel is left
+                    // alone so normal page / panel scroll is not stolen.
+                    if !(e.ctrl_key() || e.meta_key()) {
+                        return;
+                    }
+                    e.prevent_default();
+                    let Some(rect) = window()
+                        .and_then(|w| w.document())
+                        .and_then(|d| d.get_element_by_id(&vp))
+                        .map(|el| el.get_bounding_client_rect())
+                    else {
+                        return;
+                    };
+                    let hw = rect.width() / 2.0;
+                    let hh = rect.height() / 2.0;
+                    if hw <= 0.0 || hh <= 0.0 {
+                        return;
+                    }
+                    let px = e.client_x() as f64 - rect.left();
+                    let py = e.client_y() as f64 - rect.top();
+                    let cur = read_zoom_state(&ctx, &peer);
+                    let factor =
+                        screen_share_zoom::wheel_zoom_factor(e.delta_y(), e.delta_mode(), hh * 2.0);
+                    let next = screen_share_zoom::zoom_to_anchored(
+                        cur,
+                        cur.scale * factor,
+                        px,
+                        py,
+                        hw,
+                        hh,
+                    );
+                    write_zoom_state(&mut ctx, &peer, next);
+                    clear_actual_size(&mut actual_ctx, &peer);
+                },
+            ))
+        }
+    });
+    {
+        let vp = viewport_id.clone();
+        let wheel_closure = wheel_closure.clone();
+        use_effect(move || {
+            if let Some(el) = window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id(&vp))
+            {
+                let opts = AddEventListenerOptions::new();
+                opts.set_passive(false);
+                let cb: &js_sys::Function = (*wheel_closure).as_ref().unchecked_ref();
+                let _ = el.add_event_listener_with_callback_and_add_event_listener_options(
+                    "wheel", cb, &opts,
+                );
+            }
+        });
+    }
+    {
+        let vp = viewport_id.clone();
+        let wheel_closure = wheel_closure.clone();
+        use_drop(move || {
+            if let Some(el) = window()
+                .and_then(|w| w.document())
+                .and_then(|d| d.get_element_by_id(&vp))
+            {
+                let cb: &js_sys::Function = (*wheel_closure).as_ref().unchecked_ref();
+                let _ = el.remove_event_listener_with_callback("wheel", cb);
+            }
         });
     }
 
@@ -1850,46 +2306,117 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
         let peer = peer_id.clone();
         let vp = viewport_id.clone();
         move |evt: PointerEvent| {
-            // Nothing to pan at fit — leave the event alone.
-            if !screen_share_zoom::is_zoomed(read_zoom_state(&ctx, &peer).scale) {
-                return;
-            }
-            if let Some(web_evt) = evt.try_as_web_event() {
+            let pointer_id = evt.try_as_web_event().map(|w| w.pointer_id());
+            let c = evt.element_coordinates();
+            let is_zoomed = screen_share_zoom::is_zoomed(read_zoom_state(&ctx, &peer).scale);
+            // Capture the pointer so moves keep flowing even if it leaves the
+            // element mid-gesture (mirrors the single-pointer drag path). Done for
+            // pinch too so both fingers stay tracked.
+            if let Some(pid) = pointer_id {
                 if let Some(el) = window()
                     .and_then(|w| w.document())
                     .and_then(|doc| doc.get_element_by_id(&vp))
                 {
-                    let _ = el.set_pointer_capture(web_evt.pointer_id());
+                    let _ = el.set_pointer_capture(pid);
                 }
             }
-            let c = evt.element_coordinates();
             let mut d = drag.borrow_mut();
-            d.active = true;
-            d.last = Some((c.x, c.y));
+            let pid = pointer_id.unwrap_or(0);
+            d.pointers.retain(|(id, _, _)| *id != pid);
+            d.pointers.push((pid, c.x, c.y));
+            if d.pointers.len() >= 2 {
+                // Two pointers down → pinch. Suspend single-finger drag and seed
+                // the span. Pinch is allowed from FIT (pinch-out to zoom in), so
+                // this path is NOT gated on `is_zoomed`.
+                let (_, x0, y0) = d.pointers[0];
+                let (_, x1, y1) = d.pointers[1];
+                d.pinching = true;
+                d.active = false;
+                d.prev_dist = screen_share_zoom::pointer_distance(x0, y0, x1, y1);
+                // Cache the viewport half-dims ONCE for this pinch (no per-move
+                // layout read).
+                d.pinch_half = viewport_half_dims(&vp);
+                d.pending_zoom = None;
+            } else if is_zoomed {
+                // Single pointer while zoomed → drag pan (no-op at fit).
+                d.active = true;
+                d.last = Some((c.x, c.y));
+            }
         }
     };
 
     let on_move = {
         let drag = drag.clone();
         let raf = raf.clone();
+        let ctx = zoom_ctx;
+        let mut actual_ctx = actual_ctx;
+        let peer = peer_id.clone();
         move |evt: PointerEvent| {
+            let pointer_id = evt.try_as_web_event().map(|w| w.pointer_id());
             let c = evt.element_coordinates();
+            let mut pinched = false;
             let schedule = {
                 let mut d = drag.borrow_mut();
-                if !d.active {
-                    return;
+                // Keep the moved pointer's tracked position current.
+                if let Some(pid) = pointer_id {
+                    if let Some(p) = d.pointers.iter_mut().find(|(id, _, _)| *id == pid) {
+                        p.1 = c.x;
+                        p.2 = c.y;
+                    }
                 }
-                let (lx, ly) = d.last.unwrap_or((c.x, c.y));
-                d.pending_dx += c.x - lx;
-                d.pending_dy += c.y - ly;
-                d.last = Some((c.x, c.y));
-                if d.raf_scheduled {
-                    false
+                if d.pinching && d.pointers.len() >= 2 {
+                    // Pinch: incremental ratio about the current finger midpoint,
+                    // based on the last pending state (or the live state) so the
+                    // ratio chain compounds even before the rAF flush lands. Uses
+                    // the half-dims cached at pinch start (no per-move layout read).
+                    let (_, x0, y0) = d.pointers[0];
+                    let (_, x1, y1) = d.pointers[1];
+                    let new_dist = screen_share_zoom::pointer_distance(x0, y0, x1, y1);
+                    if new_dist > 0.0 && d.prev_dist > 0.0 {
+                        if let Some((hw, hh)) = d.pinch_half {
+                            let (mx, my) = screen_share_zoom::pointer_midpoint(x0, y0, x1, y1);
+                            let base = d
+                                .pending_zoom
+                                .unwrap_or_else(|| read_zoom_state(&ctx, &peer));
+                            let ratio = new_dist / d.prev_dist;
+                            let next = screen_share_zoom::zoom_to_anchored(
+                                base,
+                                base.scale * ratio,
+                                mx,
+                                my,
+                                hw,
+                                hh,
+                            );
+                            d.pending_zoom = Some(next);
+                            pinched = true;
+                        }
+                    }
+                    d.prev_dist = new_dist;
+                    if d.raf_scheduled {
+                        false
+                    } else {
+                        d.raf_scheduled = true;
+                        true
+                    }
+                } else if d.active {
+                    let (lx, ly) = d.last.unwrap_or((c.x, c.y));
+                    d.pending_dx += c.x - lx;
+                    d.pending_dy += c.y - ly;
+                    d.last = Some((c.x, c.y));
+                    if d.raf_scheduled {
+                        false
+                    } else {
+                        d.raf_scheduled = true;
+                        true
+                    }
                 } else {
-                    d.raf_scheduled = true;
-                    true
+                    false
                 }
             };
+            // A pinch leaves the 1:1 intent (write is a no-op after the first).
+            if pinched {
+                clear_actual_size(&mut actual_ctx, &peer);
+            }
             if schedule {
                 if let Some(win) = window() {
                     let cb: &js_sys::Function = (*raf).as_ref().unchecked_ref();
@@ -1983,9 +2510,19 @@ fn ScreenShareZoomable(peer_id: String) -> Element {
 /// in-PiP delegated handlers. The detach button is omitted where no separate
 /// window is available (see `screen_share_detach::detach_supported`).
 #[component]
-fn ScreenShareZoomControls(peer_id: String, name: String) -> Element {
+fn ScreenShareZoomControls(
+    peer_id: String,
+    name: String,
+    // Issue 1821: the decoded shared-content resolution, threaded as a reactive
+    // prop so the actual-size (1:1) live-tracking effect re-runs when the
+    // presenter's resolution changes (and re-derives the 1:1 scale from the
+    // new decoded dims). `None` pre-decode.
+    content_res: ReadSignal<Option<(u32, u32)>>,
+) -> Element {
     let zoom_ctx = use_context::<ScreenZoomCtx>().0;
     let detached_ctx = use_context::<DetachedShareCtx>().0;
+    // Issue 1821: the actual-size (1:1) engaged-peer intent.
+    let actual_ctx = use_context::<ScreenActualSizeCtx>().0;
     let viewport_id = format!("screen-share-{}-viewport", peer_id);
 
     // Issue 1175 (item 4): read ONLY the scale, through a memo, so an offset-only
@@ -2002,6 +2539,38 @@ fn ScreenShareZoomControls(peer_id: String, name: String) -> Element {
     let at_min = screen_share_zoom::at_min_zoom(scale);
     let at_max = screen_share_zoom::at_max_zoom(scale);
     let is_detached = detached_ctx.read().as_deref() == Some(peer_id.as_str());
+    // Issue 1821: aria-pressed for the 1:1 button is the engaged INTENT (the
+    // single source of truth; the live-tracking effect keeps the scale in sync
+    // while engaged). Reading it subscribes this bar so the pressed state flips
+    // reactively.
+    let is_actual = is_actual_size_engaged(&actual_ctx, &peer_id);
+
+    // Issue 1821: LIVE 1:1 tracking. While engaged, re-derive the actual-size
+    // target from the CURRENT decoded dims whenever the presenter's resolution
+    // changes (the reactive `content_res` prop is the trigger) and re-apply it if
+    // the live scale has drifted past the tolerance. The scale is read with
+    // `peek` (NOT `read`) so this effect does NOT subscribe to zoom_ctx — it must
+    // re-run on resolution / intent changes only, never on every pan frame.
+    {
+        let peer = peer_id.clone();
+        let vp = viewport_id.clone();
+        let mut ctx = zoom_ctx;
+        use_effect(move || {
+            // Subscribe to presenter-resolution changes (the re-derive trigger).
+            let _res = content_res();
+            if !is_actual_size_engaged(&actual_ctx, &peer) {
+                return;
+            }
+            let target = actual_size_target_for(&peer, &vp);
+            let cur_scale = ctx.peek().get(&peer).copied().unwrap_or_default().scale;
+            if !screen_share_zoom::is_actual_size(cur_scale, target) {
+                let (hw, hh) = viewport_half_dims(&vp).unwrap_or((0.0, 0.0));
+                let cur = ctx.peek().get(&peer).copied().unwrap_or_default();
+                let next = screen_share_zoom::zoom_to(cur, target, hw, hh);
+                write_zoom_state(&mut ctx, &peer, next);
+            }
+        });
+    }
 
     // Stable, peer-scoped ids so focus management can find the detach toggle and
     // the overlay's "Bring it back" button (which lives in `generate_for_peer`,
@@ -2066,6 +2635,7 @@ fn ScreenShareZoomControls(peer_id: String, name: String) -> Element {
         let vp = viewport_id.clone();
         let peer = peer_id.clone();
         let mut ctx = zoom_ctx;
+        let mut actual_ctx = actual_ctx;
         move |e: MouseEvent| {
             e.stop_propagation();
             let (hw, hh) = viewport_half_dims(&vp).unwrap_or((0.0, 0.0));
@@ -2073,12 +2643,15 @@ fn ScreenShareZoomControls(peer_id: String, name: String) -> Element {
             let next =
                 screen_share_zoom::zoom_to(cur, screen_share_zoom::zoom_out(cur.scale), hw, hh);
             write_zoom_state(&mut ctx, &peer, next);
+            // An explicit zoom leaves 1:1 (issue 1821).
+            clear_actual_size(&mut actual_ctx, &peer);
         }
     };
     let on_zoom_in = {
         let vp = viewport_id.clone();
         let peer = peer_id.clone();
         let mut ctx = zoom_ctx;
+        let mut actual_ctx = actual_ctx;
         move |e: MouseEvent| {
             e.stop_propagation();
             let (hw, hh) = viewport_half_dims(&vp).unwrap_or((0.0, 0.0));
@@ -2086,18 +2659,47 @@ fn ScreenShareZoomControls(peer_id: String, name: String) -> Element {
             let next =
                 screen_share_zoom::zoom_to(cur, screen_share_zoom::zoom_in(cur.scale), hw, hh);
             write_zoom_state(&mut ctx, &peer, next);
+            clear_actual_size(&mut actual_ctx, &peer);
         }
     };
     let on_reset = {
         let vp = viewport_id.clone();
         let peer = peer_id.clone();
         let mut ctx = zoom_ctx;
+        let mut actual_ctx = actual_ctx;
         move |e: MouseEvent| {
             e.stop_propagation();
             let (hw, hh) = viewport_half_dims(&vp).unwrap_or((0.0, 0.0));
             let cur = read_zoom_state(&ctx, &peer);
             let next = screen_share_zoom::zoom_to(cur, screen_share_zoom::RESET_ZOOM, hw, hh);
             write_zoom_state(&mut ctx, &peer, next);
+            clear_actual_size(&mut actual_ctx, &peer);
+        }
+    };
+    // Issue 1821: actual-size (1:1) toggle. At the target → back to fit (clear
+    // intent). Otherwise engage 1:1: re-derive the target from the LIVE decoded
+    // dims and zoom to it (center-anchored via `zoom_to`, which the render
+    // ceiling lets exceed 4.0), then set the intent so live-tracking re-applies
+    // it across presenter-resolution changes.
+    let on_actual = {
+        let vp = viewport_id.clone();
+        let peer = peer_id.clone();
+        let mut ctx = zoom_ctx;
+        let mut actual_ctx = actual_ctx;
+        move |e: MouseEvent| {
+            e.stop_propagation();
+            let (hw, hh) = viewport_half_dims(&vp).unwrap_or((0.0, 0.0));
+            let cur = read_zoom_state(&ctx, &peer);
+            if is_actual_size_engaged(&actual_ctx, &peer) {
+                let next = screen_share_zoom::zoom_to(cur, screen_share_zoom::RESET_ZOOM, hw, hh);
+                write_zoom_state(&mut ctx, &peer, next);
+                clear_actual_size(&mut actual_ctx, &peer);
+            } else {
+                let target = actual_size_target_for(&peer, &vp);
+                let next = screen_share_zoom::zoom_to(cur, target, hw, hh);
+                write_zoom_state(&mut ctx, &peer, next);
+                set_actual_size_engaged(&mut actual_ctx, &peer);
+            }
         }
     };
     let on_detach = {
@@ -2189,6 +2791,17 @@ fn ScreenShareZoomControls(peer_id: String, name: String) -> Element {
                 "aria-label": "Reset shared content zoom to 100 percent",
                 onclick: on_reset,
                 ZoomResetIcon {}
+            }
+            // Issue 1821: actual-size (1:1) toggle — after Reset, before Detach.
+            button {
+                r#type: "button",
+                class: "ss-zoom-btn ss-actual-btn",
+                "data-testid": "ss-zoom-actual",
+                title: "Actual size (1:1 pixels)",
+                "aria-label": "Show shared content at actual size, one-to-one pixels",
+                "aria-pressed": if is_actual { "true" } else { "false" },
+                onclick: on_actual,
+                ActualSizeIcon {}
             }
             if can_detach {
                 button {
@@ -2419,6 +3032,124 @@ mod tests {
         assert!(is_speaking_suppressed(false, Some("alice")));
     }
 
+    // -- tile_pin_kind: TileMode → PinnedTileKind -----------------------------
+
+    #[test]
+    fn tile_pin_kind_screen_only_is_screen() {
+        assert_eq!(tile_pin_kind(&TileMode::ScreenOnly), PinnedTileKind::Screen);
+    }
+
+    #[test]
+    fn tile_pin_kind_video_only_is_camera() {
+        assert_eq!(tile_pin_kind(&TileMode::VideoOnly), PinnedTileKind::Camera);
+    }
+
+    #[test]
+    fn tile_pin_kind_full_is_camera() {
+        assert_eq!(tile_pin_kind(&TileMode::Full), PinnedTileKind::Camera);
+    }
+
+    // -- is_tile_pinned: the kind-aware maximize predicate --------------------
+    //
+    // These pin the CORE regression: during a screen share the sharer's screen
+    // tile and camera tile share ONE user_id. A user_id-only predicate (the old
+    // bug) maximizes BOTH when either is pinned. `is_tile_pinned` must match
+    // ONLY the tile whose kind agrees, so the two are independently pinnable.
+
+    #[test]
+    fn is_tile_pinned_nothing_pinned_is_false() {
+        assert!(!is_tile_pinned(None, "alice", PinnedTileKind::Camera));
+        assert!(!is_tile_pinned(None, "alice", PinnedTileKind::Screen));
+    }
+
+    #[test]
+    fn is_tile_pinned_screen_pinned_matches_only_screen_tile() {
+        let pinned = PinnedTile::screen("alice");
+        // The SCREEN tile of alice is maximized...
+        assert!(is_tile_pinned(
+            Some(&pinned),
+            "alice",
+            PinnedTileKind::Screen
+        ));
+        // ...but alice's CAMERA tile (SAME user_id) is NOT — this is the exact
+        // assertion that fails on the user_id-only bug.
+        assert!(!is_tile_pinned(
+            Some(&pinned),
+            "alice",
+            PinnedTileKind::Camera
+        ));
+    }
+
+    #[test]
+    fn is_tile_pinned_camera_pinned_matches_only_camera_tile() {
+        let pinned = PinnedTile::camera("alice");
+        assert!(is_tile_pinned(
+            Some(&pinned),
+            "alice",
+            PinnedTileKind::Camera
+        ));
+        assert!(!is_tile_pinned(
+            Some(&pinned),
+            "alice",
+            PinnedTileKind::Screen
+        ));
+    }
+
+    #[test]
+    fn is_tile_pinned_different_peer_is_false() {
+        let pinned = PinnedTile::camera("alice");
+        assert!(!is_tile_pinned(
+            Some(&pinned),
+            "bob",
+            PinnedTileKind::Camera
+        ));
+    }
+
+    // -- next_pin_target: toggle / switch reducer -----------------------------
+
+    #[test]
+    fn next_pin_target_from_none_pins_clicked() {
+        assert_eq!(
+            next_pin_target(None, PinnedTile::screen("alice")),
+            Some(PinnedTile::screen("alice"))
+        );
+    }
+
+    #[test]
+    fn next_pin_target_same_tile_releases() {
+        let cur = PinnedTile::screen("alice");
+        assert_eq!(
+            next_pin_target(Some(&cur), PinnedTile::screen("alice")),
+            None
+        );
+    }
+
+    #[test]
+    fn next_pin_target_same_peer_other_kind_switches() {
+        // Screen is pinned; clicking alice's CAMERA must SWITCH the spotlight to
+        // the camera (not toggle off) — the two tile kinds are distinct targets.
+        let cur = PinnedTile::screen("alice");
+        assert_eq!(
+            next_pin_target(Some(&cur), PinnedTile::camera("alice")),
+            Some(PinnedTile::camera("alice"))
+        );
+        // ...and symmetrically the other way.
+        let cur = PinnedTile::camera("alice");
+        assert_eq!(
+            next_pin_target(Some(&cur), PinnedTile::screen("alice")),
+            Some(PinnedTile::screen("alice"))
+        );
+    }
+
+    #[test]
+    fn next_pin_target_different_peer_switches() {
+        let cur = PinnedTile::camera("alice");
+        assert_eq!(
+            next_pin_target(Some(&cur), PinnedTile::camera("bob")),
+            Some(PinnedTile::camera("bob"))
+        );
+    }
+
     #[test]
     fn speak_style_reset_restores_default_border_color() {
         let style = speak_style(0.0, false, &AppearanceSettings::default());
@@ -2439,12 +3170,13 @@ mod tests {
 
         assert!(on.contains("border-color 0.00s ease-in"));
         assert!(on.contains("box-shadow 0.00s ease-in"));
-        assert!(off.contains("border-color 0.3s ease-out"));
-        assert!(off.contains("box-shadow 0.00s ease-out"));
+        // 0% decay → 0s hold delay, 0s fade duration
+        assert!(off.contains("border-color 0.3s ease-out 0.00s"));
+        assert!(off.contains("box-shadow 0.00s ease-out 0.00s"));
     }
 
     #[test]
-    fn glow_decay_midpoint_preserves_border_reset_timing() {
+    fn glow_decay_midpoint_hold_one_second() {
         let settings = AppearanceSettings {
             glow_decay: 0.5,
             ..AppearanceSettings::default()
@@ -2454,20 +3186,34 @@ mod tests {
 
         assert!(on.contains("border-color 0.15s ease-in"));
         assert!(on.contains("box-shadow 0.15s ease-in"));
-        assert!(off.contains("border-color 0.3s ease-out"));
-        assert!(off.contains("box-shadow 1.50s ease-out"));
+        // 50% decay → 1.0s hold delay before 1.50s fade
+        assert!(off.contains("border-color 0.3s ease-out 1.00s"));
+        assert!(off.contains("box-shadow 1.50s ease-out 1.00s"));
     }
 
     #[test]
-    fn glow_decay_full_extends_fade_out_tail() {
+    fn glow_decay_full_hold_five_seconds() {
         let settings = AppearanceSettings {
             glow_decay: 1.0,
             ..AppearanceSettings::default()
         };
         let off = speak_style(0.0, false, &settings);
 
-        assert!(off.contains("border-color 0.3s ease-out"));
-        assert!(off.contains("box-shadow 3.00s ease-out"));
+        // 100% decay → 5.0s hold delay before 1.50s fade
+        assert!(off.contains("border-color 0.3s ease-out 5.00s"));
+        assert!(off.contains("box-shadow 1.50s ease-out 5.00s"));
+    }
+
+    #[test]
+    fn glow_decay_one_percent_starts_fade_immediately() {
+        let settings = AppearanceSettings {
+            glow_decay: 0.01,
+            ..AppearanceSettings::default()
+        };
+        let off = speak_style(0.0, false, &settings);
+
+        // 1% decay → 0s hold delay (fade starts immediately)
+        assert!(off.contains("box-shadow 1.50s ease-out 0.00s"));
     }
 
     #[test]
@@ -2505,6 +3251,75 @@ mod tests {
         let subtle_delta = subtle.outer_blur - OUTER_BLUR_BASE;
         let balanced_delta = balanced.outer_blur - OUTER_BLUR_BASE;
         assert!(balanced_delta > subtle_delta * 1.8);
+    }
+
+    // -- Remap helper anchor tests -------------------------------------------
+
+    #[test]
+    fn remap_glow_slider_anchors() {
+        let eps = 1e-4;
+        // 0% → no glow bleed
+        assert!((remap_glow_slider(0.0) - GLOW_BLEED_MIN).abs() < eps);
+        // 50% → matches previous 100% (GLOW_BLEED_OLD_MAX)
+        assert!((remap_glow_slider(0.5) - GLOW_BLEED_OLD_MAX).abs() < eps);
+        // 100% → 10× previous 100%
+        assert!((remap_glow_slider(1.0) - 10.0 * GLOW_BLEED_OLD_MAX).abs() < eps);
+    }
+
+    #[test]
+    fn remap_brightness_slider_anchors() {
+        let eps = 1e-4;
+        // 0% → minimum brightness
+        assert!((remap_brightness_slider(0.0) - BRIGHTNESS_INTENSITY_MIN).abs() < eps);
+        // 50% → matches previous 100% (BRIGHTNESS_OLD_MAX)
+        assert!((remap_brightness_slider(0.5) - BRIGHTNESS_OLD_MAX).abs() < eps);
+        // 100% → 10× previous 100%
+        assert!((remap_brightness_slider(1.0) - 10.0 * BRIGHTNESS_OLD_MAX).abs() < eps);
+    }
+
+    #[test]
+    fn remap_glow_slider_monotonic() {
+        let a = remap_glow_slider(0.0);
+        let b = remap_glow_slider(0.25);
+        let c = remap_glow_slider(0.5);
+        let d = remap_glow_slider(0.75);
+        let e = remap_glow_slider(1.0);
+        assert!(a < b);
+        assert!(b < c);
+        assert!(c < d);
+        assert!(d < e);
+    }
+
+    #[test]
+    fn remap_brightness_slider_monotonic() {
+        let a = remap_brightness_slider(0.0);
+        let b = remap_brightness_slider(0.25);
+        let c = remap_brightness_slider(0.5);
+        let d = remap_brightness_slider(0.75);
+        let e = remap_brightness_slider(1.0);
+        assert!(a < b);
+        assert!(b < c);
+        assert!(c < d);
+        assert!(d < e);
+    }
+
+    #[test]
+    fn glow_transition_seconds_hold_anchors() {
+        let eps = 1e-4;
+        // 0% → all zeros (instant)
+        let (fi, fo, h) = glow_transition_seconds(0.0);
+        assert!(fi.abs() < eps);
+        assert!(fo.abs() < eps);
+        assert!(h.abs() < eps);
+        // 50% → 1.0s hold
+        let (_, _, h) = glow_transition_seconds(0.5);
+        assert!((h - GLOW_HOLD_MID).abs() < eps);
+        // 100% → 5.0s hold
+        let (_, _, h) = glow_transition_seconds(1.0);
+        assert!((h - GLOW_HOLD_MAX).abs() < eps);
+        // 1% → immediate fade (0 hold)
+        let (_, _, h) = glow_transition_seconds(0.01);
+        assert!(h.abs() < eps);
     }
 
     #[test]

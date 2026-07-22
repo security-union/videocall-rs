@@ -36,6 +36,16 @@ pub const MIN_ZOOM: f64 = 1.0;
 /// upscaled pixels stop carrying useful detail.
 pub const MAX_ZOOM: f64 = 4.0;
 
+/// Issue 1821: absolute render ceiling. Only the "actual size" (1:1) target can
+/// drive the scale above [`MAX_ZOOM`]; buttons / wheel / pinch stay within
+/// `[MIN_ZOOM, MAX_ZOOM]`. `MAX_ZOOM`'s 4.0 rationale (an upscale of an
+/// already-rasterized frame stops adding detail past ~4x) does NOT bound
+/// actual-size, which reveals REAL source pixels rather than upscaling — a
+/// high-DPR / 5K share legitimately needs a scale > 4.0 to reach true 1:1
+/// (5120-wide in a ~320px tile at DPR 2 → 8.0). 8.0 reaches that while still
+/// capping a pathological decode-glitch dimension.
+pub const MAX_RENDER_ZOOM: f64 = 8.0;
+
 /// Multiplicative step applied per zoom-in / zoom-out click. 1.25 gives a
 /// pleasant ~7 clicks across the full `[1.0, 4.0]` range.
 pub const ZOOM_STEP: f64 = 1.25;
@@ -70,6 +80,22 @@ pub fn clamp_zoom(z: f64) -> f64 {
     z.clamp(MIN_ZOOM, MAX_ZOOM)
 }
 
+/// Issue 1821: clamp for the RENDER / PAN path — the transform, pan extents, and
+/// percent label. Identical to [`clamp_zoom`] on `[MIN_ZOOM, MAX_ZOOM]`, but its
+/// upper bound is the higher [`MAX_RENDER_ZOOM`] so a 1:1 actual-size target
+/// (which can exceed 4.0 on a high-DPR / 5K share) is rendered faithfully rather
+/// than being capped to the interactive ceiling. `NaN` maps to [`RESET_ZOOM`],
+/// same as [`clamp_zoom`], so a `NaN` scale never collapses the wrapper. The
+/// button steppers and gesture handlers still clamp their INPUT with
+/// [`clamp_zoom`], so only the explicit actual-size target ever reaches
+/// `(MAX_ZOOM, MAX_RENDER_ZOOM]`.
+pub fn clamp_render_zoom(z: f64) -> f64 {
+    if z.is_nan() {
+        return RESET_ZOOM;
+    }
+    z.clamp(MIN_ZOOM, MAX_RENDER_ZOOM)
+}
+
 /// Next zoom level after a single zoom-IN click, clamped to range.
 pub fn zoom_in(current: f64) -> f64 {
     clamp_zoom(clamp_zoom(current) * ZOOM_STEP)
@@ -91,7 +117,9 @@ pub fn is_zoomed(z: f64) -> bool {
 /// `1.0 -> "100%"`, `2.5 -> "250%"`). Rounds to the nearest percent so the
 /// label is stable across the multiplicative steps.
 pub fn zoom_percent_label(z: f64) -> String {
-    let pct = (clamp_zoom(z) * 100.0).round() as i64;
+    // Render-ceiling clamp: a 1:1 actual-size scale above 4.0 must read its true
+    // percentage (e.g. "600%"), not be pinned to "400%".
+    let pct = (clamp_render_zoom(z) * 100.0).round() as i64;
     format!("{pct}%")
 }
 
@@ -118,7 +146,9 @@ pub fn at_min_zoom(z: f64) -> bool {
 /// content edge, so the offset is bounded to `±(scale-1)*half`. At fit
 /// (`scale <= 1`) the bound is 0 — nothing to pan.
 pub fn max_pan_offset(scale: f64, half_extent: f64) -> f64 {
-    let over = (clamp_zoom(scale) - 1.0).max(0.0);
+    // Render-ceiling clamp so an actual-size scale above 4.0 pans across its full
+    // overflow (a 1:1 5K share must reach every source pixel, not just the 4x box).
+    let over = (clamp_render_zoom(scale) - 1.0).max(0.0);
     (over * half_extent).max(0.0)
 }
 
@@ -169,7 +199,11 @@ pub fn zoom_to(
     half_w: f64,
     half_h: f64,
 ) -> ScreenZoomState {
-    let scale = clamp_zoom(next_scale);
+    // Render-ceiling clamp: `zoom_to` is the state builder the actual-size (1:1)
+    // control routes through, so it must preserve a target above 4.0. Button
+    // steps still pre-clamp their input with `clamp_zoom`, so the interactive
+    // ceiling is unchanged for them.
+    let scale = clamp_render_zoom(next_scale);
     ScreenZoomState {
         scale,
         off_x: clamp_pan(prev.off_x, scale, half_w),
@@ -203,13 +237,150 @@ pub fn transform_css(state: &ScreenZoomState) -> String {
     if !is_zoomed(state.scale) && state.off_x == 0.0 && state.off_y == 0.0 {
         return "none".to_string();
     }
-    let scale = clamp_zoom(state.scale);
+    // Render-ceiling clamp so a 1:1 actual-size scale above 4.0 renders at its
+    // true factor. The `is_zoomed` guard above still uses the interactive clamp,
+    // which reports `true` for any scale > 1.0 (including actual-size), so the
+    // "none" fast-path is never taken for a zoomed state.
+    let scale = clamp_render_zoom(state.scale);
     format!(
         "translate({}px, {}px) scale({})",
         round2(state.off_x),
         round2(state.off_y),
         round4(scale)
     )
+}
+
+// ─── Issue 1821: actual-size (1:1) target ─────────────────────────────────────
+
+/// Issue 1821: the zoom factor at which the shared content shows true 1:1 SOURCE
+/// pixels — one decoded pixel per physical device pixel.
+///
+/// At scale 1.0 the content is `object-fit: contain`-fitted into the viewport, so
+/// its displayed CSS width is `fitted_css`; each CSS px maps to `dpr` device px.
+/// The decoded frame has `backing_w` px along that axis. The scale making
+/// `displayed_device_px == backing_px` is therefore `backing / (dpr · fitted_css)`.
+/// Aspect is preserved by the fit, so either axis yields the same factor — the
+/// width axis is used. Returns `None` for any non-positive input (e.g. the
+/// pre-decode 0-dimensions) so callers no-op rather than divide by zero.
+pub fn actual_size_factor(
+    backing_w: f64,
+    backing_h: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+    dpr: f64,
+) -> Option<f64> {
+    if backing_w <= 0.0 || backing_h <= 0.0 || viewport_w <= 0.0 || viewport_h <= 0.0 || dpr <= 0.0
+    {
+        return None;
+    }
+    let content_aspect = backing_w / backing_h;
+    let viewport_aspect = viewport_w / viewport_h;
+    // `object-fit: contain`: when the viewport is wider than the content, the fit
+    // is height-bound and the fitted width is `viewport_h * content_aspect`;
+    // otherwise it is width-bound and the fitted width is the full `viewport_w`.
+    let fitted_w = if viewport_aspect >= content_aspect {
+        viewport_h * content_aspect
+    } else {
+        viewport_w
+    };
+    if fitted_w <= 0.0 {
+        return None;
+    }
+    Some(backing_w / (dpr * fitted_w))
+}
+
+/// Issue 1821: the clamped scale target for the actual-size control. Floored to
+/// fit ([`RESET_ZOOM`]) — a source SMALLER than its fitted display gains nothing
+/// from "1:1", so it stays at fit — and capped at the render ceiling
+/// ([`MAX_RENDER_ZOOM`]) so a pathological decode dimension can't drive an
+/// unbounded scale. `None` inputs (pre-decode) resolve to [`RESET_ZOOM`].
+pub fn actual_size_target(
+    backing_w: f64,
+    backing_h: f64,
+    viewport_w: f64,
+    viewport_h: f64,
+    dpr: f64,
+) -> f64 {
+    match actual_size_factor(backing_w, backing_h, viewport_w, viewport_h, dpr) {
+        Some(f) => clamp_render_zoom(f),
+        None => RESET_ZOOM,
+    }
+}
+
+/// Issue 1821: whether `scale` is at the actual-size `target` within a 0.5%
+/// tolerance (relative to `target`). Drives the 1:1 button's `aria-pressed`. Both
+/// values are render-clamped first so an out-of-range input compares against the
+/// same ceiling the render path uses.
+pub fn is_actual_size(scale: f64, target: f64) -> bool {
+    (clamp_render_zoom(scale) - clamp_render_zoom(target)).abs() < 0.005 * target
+}
+
+// ─── Issue 1821: cursor-anchored zoom (wheel / pinch) ─────────────────────────
+
+/// Issue 1821: pointer-anchored zoom for wheel / pinch gestures.
+///
+/// Keeps the content point currently under the pointer FIXED across the scale
+/// change, then clamps the resulting pan to the new scale's pannable range. The
+/// wrapper fills the viewport with `transform-origin: center` and
+/// `translate(off) scale(s)`, so for a pointer offset `q = pointer − center` the
+/// offset that pins the anchor is `off1 = q·(1 − s1/s0) + (s1/s0)·off0` (derived
+/// from equating the pre- and post-scale content coordinate under `q`).
+///
+/// `px`/`py` are viewport-local CSS px; `half_w`/`half_h` are half the viewport
+/// width/height. The scale clamps to the INTERACTIVE range `[MIN_ZOOM, MAX_ZOOM]`
+/// via [`clamp_zoom`] — gestures never exceed the button ceiling (only the
+/// explicit 1:1 control reaches the render ceiling).
+pub fn zoom_to_anchored(
+    prev: ScreenZoomState,
+    next_scale: f64,
+    px: f64,
+    py: f64,
+    half_w: f64,
+    half_h: f64,
+) -> ScreenZoomState {
+    let s0 = clamp_zoom(prev.scale);
+    let s1 = clamp_zoom(next_scale);
+    let ratio = s1 / s0;
+    let qx = px - half_w;
+    let qy = py - half_h;
+    ScreenZoomState {
+        scale: s1,
+        off_x: clamp_pan(qx * (1.0 - ratio) + ratio * prev.off_x, s1, half_w),
+        off_y: clamp_pan(qy * (1.0 - ratio) + ratio * prev.off_y, s1, half_h),
+    }
+}
+
+/// Issue 1821: Euclidean distance between two pointers (touch-pinch span).
+pub fn pointer_distance(x1: f64, y1: f64, x2: f64, y2: f64) -> f64 {
+    ((x2 - x1).powi(2) + (y2 - y1).powi(2)).sqrt()
+}
+
+/// Issue 1821: midpoint of two pointers (the pinch anchor).
+pub fn pointer_midpoint(x1: f64, y1: f64, x2: f64, y2: f64) -> (f64, f64) {
+    ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+}
+
+/// Issue 1821: per-`WheelEvent` sensitivity for [`wheel_zoom_factor`]. Small so a
+/// single notch is a gentle ratio step, not a jump across the range.
+pub const WHEEL_ZOOM_SENSITIVITY: f64 = 0.0025;
+
+/// Issue 1821: map a `wheel` event to a MULTIPLICATIVE scale factor.
+///
+/// Exponential so equal wheel travel produces equal scale RATIO (uniform zoom
+/// feel across the range). `delta_y < 0` (scroll up / pinch out) zooms IN
+/// (factor > 1). `delta_mode` normalises the raw delta to pixels: `0` = px (as
+/// is), `1` = line (~16px), `2` = page (~one viewport). The per-event pixel
+/// magnitude is capped to ±240 so one coarse high-resolution notch cannot jump
+/// the whole range in a single event. A zero delta returns exactly `1.0` (no
+/// change). Pure / host-tested.
+pub fn wheel_zoom_factor(delta_y: f64, delta_mode: u32, viewport_px: f64) -> f64 {
+    let px = match delta_mode {
+        1 => delta_y * 16.0,
+        2 => delta_y * viewport_px.max(1.0),
+        _ => delta_y,
+    };
+    let capped = px.clamp(-240.0, 240.0);
+    (-capped * WHEEL_ZOOM_SENSITIVITY).exp()
 }
 
 /// Round to 2 decimals for compact, stable pixel offsets in the CSS string.
@@ -333,8 +504,11 @@ mod tests {
 
     #[test]
     fn percent_label_clamps_out_of_range() {
+        // Issue 1821: the label now clamps to the RENDER ceiling (8.0 → "800%"),
+        // not the interactive ceiling — a 1:1 actual-size scale above 4.0 must
+        // read its true percentage. (Was "400%" pre-1821.)
         assert_eq!(zoom_percent_label(0.1), "100%");
-        assert_eq!(zoom_percent_label(99.0), "400%");
+        assert_eq!(zoom_percent_label(99.0), "800%");
     }
 
     // --- max_pan_offset / clamp_pan ------------------------------------------
@@ -471,5 +645,255 @@ mod tests {
             off_y: -7.25,
         };
         assert_eq!(transform_css(&s), "translate(12.5px, -7.25px) scale(2)");
+    }
+
+    // --- Issue 1821: dual-ceiling (clamp_render_zoom vs clamp_zoom) ----------
+
+    #[test]
+    fn clamp_render_zoom_matches_clamp_zoom_within_interactive_range() {
+        // Identical to clamp_zoom on [MIN_ZOOM, MAX_ZOOM] and for NaN.
+        assert_eq!(clamp_render_zoom(1.0), clamp_zoom(1.0));
+        assert_eq!(clamp_render_zoom(2.5), clamp_zoom(2.5));
+        assert_eq!(clamp_render_zoom(4.0), clamp_zoom(4.0));
+        assert_eq!(clamp_render_zoom(0.2), MIN_ZOOM);
+        assert_eq!(clamp_render_zoom(f64::NAN), RESET_ZOOM);
+    }
+
+    #[test]
+    fn clamp_render_zoom_diverges_from_clamp_zoom_above_max() {
+        // The load-bearing difference: above the interactive ceiling the two
+        // clamps MUST differ, or actual-size above 4.0 is impossible. If someone
+        // repoints clamp_render_zoom back to MAX_ZOOM, this fails.
+        assert_eq!(clamp_zoom(6.0), MAX_ZOOM);
+        assert_eq!(clamp_render_zoom(6.0), 6.0);
+        assert_eq!(clamp_render_zoom(10.0), MAX_RENDER_ZOOM);
+        assert!(clamp_render_zoom(6.0) > clamp_zoom(6.0));
+    }
+
+    #[test]
+    fn max_pan_offset_uses_render_ceiling_above_max() {
+        // At an actual-size 6.0 the pannable overflow is (6-1)*half, not the
+        // interactive-clamped (4-1)*half — the whole 1:1 image must be reachable.
+        assert_eq!(max_pan_offset(6.0, 400.0), 5.0 * 400.0);
+        // And it caps at the render ceiling, not beyond.
+        assert_eq!(max_pan_offset(99.0, 400.0), (MAX_RENDER_ZOOM - 1.0) * 400.0);
+    }
+
+    #[test]
+    fn zoom_percent_label_reads_actual_size_above_max() {
+        // A 6.0 actual-size scale reads its true percentage, not "400%".
+        assert_eq!(zoom_percent_label(6.0), "600%");
+        assert_eq!(zoom_percent_label(MAX_RENDER_ZOOM), "800%");
+    }
+
+    #[test]
+    fn zoom_out_from_actual_size_drops_into_interactive_range() {
+        // From a 6.0 actual-size state, a zoom-OUT button click clamps the input
+        // to 4.0 first, then steps down to 3.2 — the button ceiling is intact.
+        assert!((zoom_out(6.0) - 3.2).abs() < 1e-9);
+        // And zoom-IN at actual-size is disabled (input clamps to 4.0 == max).
+        assert!(at_max_zoom(6.0));
+    }
+
+    // --- Issue 1821: actual_size_factor / actual_size_target / is_actual_size -
+
+    #[test]
+    fn actual_size_factor_1080p_landscape_by_dpr() {
+        // 1920-wide decoded frame in a 640-wide landscape viewport, DPR 1 → 3.0;
+        // DPR 2 → 1.5 (each CSS px is 2 device px, so half the scale reaches 1:1).
+        // Viewport 640x360 is 16:9, same as the content, so the fit is exact.
+        let f1 = actual_size_factor(1920.0, 1080.0, 640.0, 360.0, 1.0).unwrap();
+        assert!((f1 - 3.0).abs() < 1e-9, "dpr1 → 3.0, got {f1}");
+        let f2 = actual_size_factor(1920.0, 1080.0, 640.0, 360.0, 2.0).unwrap();
+        assert!((f2 - 1.5).abs() < 1e-9, "dpr2 → 1.5, got {f2}");
+    }
+
+    #[test]
+    fn actual_size_target_caps_5k_at_render_ceiling() {
+        // 5120-wide 16:9 share in a 320-wide 16:9 tile at DPR 2:
+        // 5120/(2·320) = 8.0 → exactly the render ceiling.
+        let t = actual_size_target(5120.0, 2880.0, 320.0, 180.0, 2.0);
+        assert_eq!(t, MAX_RENDER_ZOOM);
+    }
+
+    #[test]
+    fn actual_size_target_floors_small_source_to_fit() {
+        // A source SMALLER than its fitted display: 320-wide content in a
+        // 640-wide viewport at DPR 1 → factor 0.5, floored up to RESET (fit).
+        let t = actual_size_target(320.0, 180.0, 640.0, 360.0, 1.0);
+        assert_eq!(t, RESET_ZOOM);
+    }
+
+    #[test]
+    fn actual_size_factor_none_for_predecode_zero_dims() {
+        assert_eq!(actual_size_factor(0.0, 0.0, 640.0, 360.0, 1.0), None);
+        assert_eq!(actual_size_factor(1920.0, 1080.0, 0.0, 0.0, 1.0), None);
+        assert_eq!(actual_size_factor(1920.0, 1080.0, 640.0, 360.0, 0.0), None);
+        // …and the target collapses to RESET (fit) for those, never NaN.
+        assert_eq!(actual_size_target(0.0, 0.0, 640.0, 360.0, 1.0), RESET_ZOOM);
+    }
+
+    #[test]
+    fn actual_size_factor_binding_axis_matches_across_orientations() {
+        // A portrait viewport wider-relative than the content is width-bound; a
+        // landscape viewport is height-bound. Both must still reach the SAME 1:1
+        // factor for the same content because aspect is preserved by the fit.
+        // Content 1000x500 (2:1). Landscape viewport 800x200 (4:1, wider than
+        // content → height-bound): fitted_w = 200*2 = 400 → factor 1000/400 = 2.5.
+        let landscape = actual_size_factor(1000.0, 500.0, 800.0, 200.0, 1.0).unwrap();
+        assert!(
+            (landscape - 2.5).abs() < 1e-9,
+            "height-bound → 2.5, got {landscape}"
+        );
+        // Portrait viewport 400x800 (narrower than content → width-bound):
+        // fitted_w = 400 → factor 1000/400 = 2.5. Same factor.
+        let portrait = actual_size_factor(1000.0, 500.0, 400.0, 800.0, 1.0).unwrap();
+        assert!(
+            (portrait - 2.5).abs() < 1e-9,
+            "width-bound → 2.5, got {portrait}"
+        );
+    }
+
+    #[test]
+    fn is_actual_size_true_within_tolerance_false_outside() {
+        // Exactly at target → pressed.
+        assert!(is_actual_size(6.0, 6.0));
+        // Within 0.5% of a 6.0 target (±0.03) → still pressed.
+        assert!(is_actual_size(6.02, 6.0));
+        // Fit while target is 6.0 → not pressed.
+        assert!(!is_actual_size(1.0, 6.0));
+        // A 4.0 interactive-max while target is 6.0 → not pressed.
+        assert!(!is_actual_size(4.0, 6.0));
+    }
+
+    // --- Issue 1821: zoom_to_anchored ---------------------------------------
+
+    #[test]
+    fn zoom_to_anchored_center_from_rest_equals_zoom_to() {
+        // From the resting (unpanned) state, anchoring at the viewport CENTER
+        // (px==half_w, py==half_h → q == 0) reduces to the plain center-anchored
+        // `zoom_to`: `off1 = ratio·off0 = 0` and `zoom_to` clamps 0 to 0. This is
+        // the reduction the button path relies on (buttons stay on `zoom_to`).
+        let prev = ScreenZoomState::default();
+        let anchored = zoom_to_anchored(prev, 3.0, 400.0, 300.0, 400.0, 300.0);
+        let plain = zoom_to(prev, 3.0, 400.0, 300.0);
+        assert_eq!(anchored, plain);
+        assert_eq!(anchored.off_x, 0.0);
+        assert_eq!(anchored.off_y, 0.0);
+    }
+
+    #[test]
+    fn zoom_to_anchored_identity_when_scale_unchanged() {
+        // s0 == s1 → ratio 1 → the anchor term vanishes and offsets only re-clamp.
+        let prev = ScreenZoomState {
+            scale: 2.0,
+            off_x: 50.0,
+            off_y: -25.0,
+        };
+        let next = zoom_to_anchored(prev, 2.0, 100.0, 90.0, 400.0, 300.0);
+        assert_eq!(next.scale, 2.0);
+        assert_eq!(next.off_x, 50.0);
+        assert_eq!(next.off_y, -25.0);
+    }
+
+    #[test]
+    fn zoom_to_anchored_zoom_out_to_fit_clamps_offsets_to_zero() {
+        // Zooming out to fit at any anchor must zero the pan (nothing to pan at
+        // fit — max_pan_offset is 0 there).
+        let prev = ScreenZoomState {
+            scale: 4.0,
+            off_x: 600.0,
+            off_y: -600.0,
+        };
+        let next = zoom_to_anchored(prev, 1.0, 10.0, 10.0, 400.0, 300.0);
+        assert_eq!(next.scale, 1.0);
+        assert_eq!(next.off_x, 0.0);
+        assert_eq!(next.off_y, 0.0);
+    }
+
+    #[test]
+    fn zoom_to_anchored_edge_anchor_stays_within_pan_bounds() {
+        // Anchoring hard in a corner and zooming in must never exceed the pannable
+        // extent for the new scale (the result is clamped).
+        let prev = ScreenZoomState::default();
+        let next = zoom_to_anchored(prev, 4.0, 0.0, 0.0, 400.0, 300.0);
+        let max_x = max_pan_offset(4.0, 400.0);
+        let max_y = max_pan_offset(4.0, 300.0);
+        assert!(next.off_x.abs() <= max_x + 1e-9);
+        assert!(next.off_y.abs() <= max_y + 1e-9);
+    }
+
+    #[test]
+    fn zoom_to_anchored_never_exceeds_interactive_ceiling() {
+        // A gesture asking for 20x is clamped to the interactive MAX_ZOOM (4.0),
+        // NOT the render ceiling — only the 1:1 control may exceed 4.0.
+        let next = zoom_to_anchored(ScreenZoomState::default(), 20.0, 200.0, 150.0, 400.0, 300.0);
+        assert_eq!(next.scale, MAX_ZOOM);
+    }
+
+    #[test]
+    fn zoom_to_anchored_pins_offset_sign() {
+        // SIGN PIN: anchoring to the RIGHT of centre (px=500 > half_w=400 → qx=+100)
+        // while zooming IN (s0=1 → s1=2, ratio=2) must translate the content by
+        // off_x = qx·(1 − ratio) = 100·(−1) = −100 (content shifts LEFT so the point
+        // under the pointer stays put). A sign inversion in the anchor term yields
+        // +100 and fails this exactly. The magnitude (100) is well within the ±400
+        // pan bound at 2×, so clamping does not mask the sign.
+        let prev = ScreenZoomState::default();
+        let next = zoom_to_anchored(prev, 2.0, 500.0, 300.0, 400.0, 300.0);
+        assert_eq!(next.scale, 2.0);
+        assert_eq!(next.off_x, -100.0);
+        // Anchor at the vertical centre (py == half_h) → qy = 0 → no vertical shift.
+        assert_eq!(next.off_y, 0.0);
+    }
+
+    // --- Issue 1821: pointer helpers + wheel_zoom_factor --------------------
+
+    #[test]
+    fn pointer_distance_and_midpoint() {
+        assert!((pointer_distance(0.0, 0.0, 3.0, 4.0) - 5.0).abs() < 1e-9);
+        assert_eq!(pointer_midpoint(0.0, 0.0, 4.0, 8.0), (2.0, 4.0));
+    }
+
+    #[test]
+    fn wheel_zoom_factor_sign_and_symmetry() {
+        // deltaY < 0 (scroll up) zooms IN (factor > 1); deltaY > 0 zooms OUT (< 1).
+        assert!(wheel_zoom_factor(-40.0, 0, 800.0) > 1.0);
+        assert!(wheel_zoom_factor(40.0, 0, 800.0) < 1.0);
+        // Exponential symmetry: opposite equal travels are reciprocals.
+        let up = wheel_zoom_factor(-40.0, 0, 800.0);
+        let down = wheel_zoom_factor(40.0, 0, 800.0);
+        assert!(
+            (up * down - 1.0).abs() < 1e-9,
+            "up·down must be 1, got {}",
+            up * down
+        );
+    }
+
+    #[test]
+    fn wheel_zoom_factor_zero_delta_is_identity() {
+        assert_eq!(wheel_zoom_factor(0.0, 0, 800.0), 1.0);
+    }
+
+    #[test]
+    fn wheel_zoom_factor_normalizes_delta_mode() {
+        // Line mode (1) scales the delta ×16; page mode (2) ×viewport. A 1-line
+        // scroll must equal a 16-px scroll; a 1-page scroll must equal a
+        // viewport-px scroll.
+        assert!(
+            (wheel_zoom_factor(-1.0, 1, 800.0) - wheel_zoom_factor(-16.0, 0, 800.0)).abs() < 1e-9
+        );
+        assert!(
+            (wheel_zoom_factor(-1.0, 2, 800.0) - wheel_zoom_factor(-800.0, 0, 800.0)).abs() < 1e-9
+        );
+    }
+
+    #[test]
+    fn wheel_zoom_factor_caps_per_event_magnitude() {
+        // A huge single delta is capped so it can't jump the whole range: the
+        // factor for deltaY = -100000 equals the factor at the -240 px cap.
+        let huge = wheel_zoom_factor(-100_000.0, 0, 800.0);
+        let capped = wheel_zoom_factor(-240.0, 0, 800.0);
+        assert!((huge - capped).abs() < 1e-9, "magnitude must cap at 240px");
     }
 }

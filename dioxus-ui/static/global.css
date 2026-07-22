@@ -57,6 +57,21 @@
   width: 100%;
   height: 100%;
 }
+/* Meeting-wide status bar reserve for the full-bleed single-peer tile.
+   Unlike in-flow grid tiles, `.grid-item.full-bleed` is `position: fixed;
+   inset: 0; height: 100vh`, so it escapes the grid's `pad_top` and the bar
+   would otherwise overlap its `.floating-name` label (the reported 2-participant
+   bug). When attendants.rs mounts the bar it adds `status-bar-active` to
+   `#grid-container` and sets `--status-bar-reserve` (px) to the SAME value it
+   adds to `pad_top`, so the tile's top inset always matches the painted bar
+   height. Overriding `top`/`height`/`max-height` shrinks and re-centers the
+   fixed tile into the area BELOW the bar; the rule vanishes (tile back to full
+   viewport) the instant the class/var are gone. */
+#grid-container.status-bar-active .grid-item.full-bleed {
+  top: var(--status-bar-reserve, 0px);
+  height: calc(100vh - var(--status-bar-reserve, 0px));
+  max-height: calc(100vh - var(--status-bar-reserve, 0px));
+}
 /* 2-peer layout: each tile fills its half of the viewport.
    Overrides the `aspect-ratio: 3 / 2` cap from `.grid-item` (style.css) and
    the centering from `place-self: center`. Single-peer is handled by
@@ -1577,25 +1592,6 @@ html[data-theme="light"] #invite-overlay p {
   --speaker-value-width: 44px;
   --speaker-preview-column: 260px;
   --speaker-preview-shift-x: 25px;
-
-  /* Chat sidebar — Google-Meet-style surface. Theme-agnostic on purpose: the
-     chat panel keeps a fixed dark Meet palette regardless of the app's
-     light/dark theme, so these tokens live in :root rather than the paired
-     html[data-theme] blocks. Values mirror Google Meet's chat greys/blue. */
-  --chat-surface: #202124;
-  --chat-surface-notice: #2d2e30;
-  --chat-surface-raised: #3c4043;
-  --chat-surface-input-focus: #4a4d50;
-  --chat-text-primary: #e8eaed;
-  --chat-text-secondary: #9aa0a6;
-  --chat-text-muted: #5f6368;
-  --chat-accent: #1a73e8;
-  --chat-accent-hover: #1557b0;
-  --chat-on-accent: #fff;
-  --chat-border: #3c4043;
-  --chat-shadow: rgba(0, 0, 0, 0.4);
-  --chat-error-text: #f28b82;
-  --chat-error-bg: #3c2a2a;
 }
 
 /* Accessibility: high-contrast fallback */
@@ -2040,6 +2036,9 @@ html[data-theme="light"] #invite-overlay p {
     opacity 0.6s cubic-bezier(0.4, 0, 0.2, 1),
     transform 0.55s cubic-bezier(0.4, 0, 0.2, 1),
     box-shadow 0.3s ease;
+  /* nowrap is the default but stated explicitly: overflow detection
+     hides slots via Dioxus signals, not CSS wrapping. */
+  flex-wrap: nowrap;
 }
 
 /* === (а) Dock positions === */
@@ -2131,9 +2130,95 @@ html[data-theme="light"] #invite-overlay p {
   display: inline-flex;
 }
 
+/* Overflow "more" trigger — hidden by default, shown at narrow viewports */
+.action-bar-overflow-trigger {
+  display: none;
+}
+
+.action-bar-overflow-wrapper {
+  position: relative;
+  flex-shrink: 0;
+}
+
+/* Overflow popover — vertical list of secondary action-bar items */
+.action-bar-overflow-popover {
+  position: absolute;
+  bottom: calc(100% + 12px);
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  padding: 0.5rem;
+  border: 1px solid var(--glass-popover-border);
+  border-radius: 10px;
+  background: var(--glass-popover-bg);
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  box-shadow: var(--glass-popover-shadow);
+  z-index: 9001;
+  animation: overflow-popover-fade-in 0.12s ease-out;
+}
+
+@keyframes overflow-popover-fade-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .action-bar-overflow-popover {
+    animation: none;
+  }
+}
+
+/* Each item in the overflow popover.
+   The popover sits on a fixed-dark glass surface (--glass-popover-bg is
+   dark-navy in both themes), so text must use --on-dark-* tokens — never
+   theme-aware --text-primary which flips to near-black in light theme. */
+.action-bar-overflow-popover .overflow-item {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem;
+  padding: 0.45rem 0.65rem;
+  border-radius: 0.5rem;
+  color: var(--on-dark-text);
+  cursor: pointer;
+  background: none;
+  border: none;
+  font-size: var(--fs-4);
+  white-space: nowrap;
+  min-height: 44px;
+}
+
+.action-bar-overflow-popover .overflow-item:hover {
+  background: var(--settings-ghost-bg-hover);
+}
+
+.action-bar-overflow-popover .overflow-item svg {
+  width: 1.15rem;
+  height: 1.15rem;
+  flex-shrink: 0;
+}
+
+/* Side dock: overflow popover opens to the side */
+.dock-left .action-bar-overflow-popover {
+  bottom: auto !important;
+  left: calc(100% + 12px) !important;
+  right: auto !important;
+  top: 50%;
+  transform: translateY(-50%);
+}
+.dock-right .action-bar-overflow-popover {
+  bottom: auto !important;
+  right: calc(100% + 12px) !important;
+  left: auto !important;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
 /* HangUp ("Leave") wrapper — always visible at the end of the bar. */
 .hangup-wrapper {
   display: inline-flex;
+  flex-shrink: 0;
 }
 
 /* Mock-peers debug button wrapper — visible when the feature flag is on. */
@@ -2317,26 +2402,6 @@ html[data-theme="light"] #invite-overlay p {
   pointer-events: none;
 }
 
-/* Unread-chat indicator dot on the OpenChatButton */
-@keyframes chat-badge-pulse {
-  0%, 100% { box-shadow: 0 0 0 2px var(--surface), 0 0 6px 2px rgba(48, 209, 88, 0.7); }
-  50%       { box-shadow: 0 0 0 2px var(--surface), 0 0 10px 4px rgba(48, 209, 88, 0.4); }
-}
-
-.video-control-button .chat-unread-badge {
-  position: absolute;
-  top: 5px;
-  right: 5px;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: #30D158;
-  box-shadow: 0 0 0 2px var(--surface), 0 0 6px 2px rgba(48, 209, 88, 0.7);
-  animation: chat-badge-pulse 1.8s ease-in-out infinite;
-  z-index: 2;
-  pointer-events: none;
-}
-
 .video-control-button.danger {
   background: #ff453a;
   border-color: #ff453a;
@@ -2471,6 +2536,22 @@ html[data-theme="light"] #invite-overlay p {
 
   .video-control-button .tooltip {
     display: none;
+  }
+}
+
+/* Narrow-viewport: only tighten gap/padding — button sizes stay full
+   because the overflow menu hides buttons that don't fit. */
+@media (max-width: 540px) {
+  .video-controls-container {
+    padding: 0.6rem 1rem;
+    gap: 0.6rem;
+  }
+}
+
+@media (max-width: 440px) {
+  .video-controls-container {
+    padding: 0.5rem 0.8rem;
+    gap: 0.4rem;
   }
 }
 
@@ -3362,7 +3443,10 @@ html[data-theme="light"] #invite-overlay p {
   background: transparent;
 }
 
-.ss-detach-btn[aria-pressed="true"] {
+/* issue 1821: the actual-size (1:1) toggle shares the detach toggle's engaged
+   highlight so a "pinned" control reads the same across the bar. */
+.ss-detach-btn[aria-pressed="true"],
+.ss-actual-btn[aria-pressed="true"] {
   background: rgba(76, 139, 245, 0.35);
 }
 
@@ -4079,4 +4163,147 @@ html[data-theme="light"] #invite-overlay p {
 .split-peer-tile .transport-badge {
   font-size: 9px;
   padding: 1px var(--space-1);
+}
+
+/* ---------------------------------------------------------------
+   Recording UI — button active state, status banners, rec dot
+   --------------------------------------------------------------- */
+
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* Record button — active/recording state */
+.video-control-button.record-active {
+  background: rgba(255, 69, 58, 0.9);
+  border-color: #ff453a;
+  box-shadow: 0 0 0 0 rgba(255, 69, 58, 0.4);
+  animation: rec-pulse 1.5s ease-in-out infinite;
+}
+
+/* Pulsing red dot used in both banners */
+.rec-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff453a;
+  animation: rec-pulse 1.5s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.recording-status-banner,
+.recording-saved-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  background: rgba(13, 19, 31, 0.92);
+  border-radius: 2rem;
+  color: white;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+/* Local recording status (shown only to the participant who started recording) */
+.recording-status-banner {
+  border: 1px solid rgba(255, 69, 58, 0.5);
+}
+
+/* Brief confirmation shown to the recorder when recording has been saved */
+.recording-saved-banner {
+  border: 1px solid rgba(255, 69, 58, 0.5);
+}
+
+/* ---------------------------------------------------------------
+   Meeting-wide status bar (Google-Meet style).
+
+   A general-purpose, in-flow horizontal strip anchored to the TOP of
+   `#main-container`, ABOVE the video-tile grid. Unlike a floating pill,
+   it reserves real vertical space: attendants.rs adds its height
+   (`STATUS_BAR_RESERVE`) to the grid's `pad_top` while it is mounted, so
+   the tiles resize/shift below it and its contents never overlap tile
+   chrome such as the per-tile `.floating-name` label.
+
+   It currently hosts a single item — the meeting-wide recording status —
+   but is structured generically so future meeting-level statuses can be
+   appended as sibling `.meeting-status-item`s.
+
+   The bar's `height` here MUST stay in sync with `STATUS_BAR_RESERVE`
+   (desktop) / `STATUS_BAR_RESERVE_MOBILE` (mobile) in attendants.rs, and
+   the 567px breakpoint below mirrors that file's `vw < 568.0` grid-padding
+   branch, so the reserved space always equals the painted bar height.
+
+   Deliberately NOT built on `.peer-toast` — so it never inherits that
+   class's `toast-exit ... 7.5s forwards` auto-fade, which would silently
+   hide it after ~8s while recording continues. It has only an entrance
+   animation; there is no exit animation, so it stays fully visible until
+   Dioxus unmounts the whole bar when `any_session_recording` flips false.
+   --------------------------------------------------------------- */
+.meeting-status-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.75rem;
+  padding: 0 1rem;
+  box-sizing: border-box;
+  pointer-events: none;
+  animation: status-bar-enter 0.3s ease-out;
+}
+
+.meeting-status-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.9rem;
+  background: rgba(13, 19, 31, 0.92);
+  border: 1px solid rgba(255, 69, 58, 0.7);
+  border-radius: 2rem;
+  color: white;
+  font-size: 0.85rem;
+  font-weight: 600;
+  line-height: 1.2;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.meeting-status-item-label {
+  white-space: nowrap;
+}
+
+@keyframes status-bar-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .meeting-status-bar {
+    animation: none;
+  }
+}
+
+/* Mobile (matches attendants.rs `vw < 568.0`): shorter bar, in sync with
+   STATUS_BAR_RESERVE_MOBILE so the reserved space equals the painted height. */
+@media (max-width: 567px) {
+  .meeting-status-bar {
+    height: 32px;
+    padding: 0 0.5rem;
+  }
+
+  .meeting-status-item {
+    font-size: 0.8rem;
+    padding: 0.3rem 0.7rem;
+  }
 }

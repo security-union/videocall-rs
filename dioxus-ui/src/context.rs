@@ -62,6 +62,17 @@ pub struct ScreenZoomCtx(pub Signal<std::collections::HashMap<String, ScreenZoom
 #[derive(Clone, Copy)]
 pub struct DetachedShareCtx(pub Signal<Option<String>>);
 
+/// Issue 1821: the single peer whose shared content is pinned to actual-size
+/// (1:1), or `None`. One-at-a-time, mirroring [`DetachedShareCtx`] (there is at
+/// most one active sharer). Kept OUT of [`ScreenZoomState`] deliberately: 1:1 is
+/// an INTENT, not a fixed scale — the scale that yields true 1:1 changes when the
+/// presenter's resolution changes, so the engaged peer is tracked here and the
+/// live scale is re-derived from the current decoded dims while engaged. Any
+/// explicit zoom-in/out/reset/wheel/pinch clears the intent (the user has left
+/// 1:1); a pan does not.
+#[derive(Clone, Copy)]
+pub struct ScreenActualSizeCtx(pub Signal<Option<String>>);
+
 /// Action bar dock position (Bottom / Left / Right).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DockPosition {
@@ -766,6 +777,37 @@ impl HostSetCtx {
     /// Whether `user_id` is currently a host.
     pub fn is_host(&self, user_id: &str) -> bool {
         self.0.read().contains(user_id)
+    }
+}
+
+/// Reactive set of the `session_id`(s) currently recording the meeting.
+///
+/// **Deliberately keyed by `session_id`, NOT `user_id`** — do not "fix" this
+/// back to the [`HostSetCtx`] user-keyed model by copying the host pattern.
+/// Host is a per-ACCOUNT role (every session of the host's user_id paints the
+/// crown), but recording is a per-SESSION / per-DEVICE action: one browser tab
+/// can record while another tab of the SAME authenticated user (same `user_id`
+/// = JWT `sub`) does not. Keying on `user_id` would make two sessions of one
+/// account share a single recording bit, so a non-recording sibling tab would
+/// wrongly show the indicator (the shipped bug this fix addresses). Keying on
+/// `session_id` gives each recorder a fully independent, per-tile entry.
+///
+/// Recording is NOT a single-holder role: multiple peers can each start their
+/// own recording at once, and one recorder stopping must not clear another's
+/// icon. A `HashSet` of `session_id`s models this — insert on that session's
+/// `RECORDING_STARTED`, remove on its `RECORDING_STOPPED` (or on its departure),
+/// with no cross-entry coupling. The wire carries the recorder's own session id
+/// in `PeerEvent.stream_id` (see `VideoCallClient::send_peer_event`). There is
+/// no persisted server-side "who is recording" state, so this set is purely
+/// live: driven by peer events plus the local recorder's own JS state-machine
+/// transitions, and never seeded from a roster.
+#[derive(Clone, Copy)]
+pub struct RecordingSetCtx(pub Signal<std::collections::HashSet<String>>);
+
+impl RecordingSetCtx {
+    /// Whether the peer identified by `session_id` is currently recording.
+    pub fn is_recording(&self, session_id: &str) -> bool {
+        self.0.read().contains(session_id)
     }
 }
 

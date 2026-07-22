@@ -3,7 +3,7 @@
 # WARNING!! use this script while running without docker.
 
 export TRUNK_SERVE_PORT=8081
-export ACTIX_PORT=8086
+export ACTIX_PORT=8096
 export LOGIN_URL=${LOGIN_URL:-http://localhost:${ACTIX_PORT:-8080}/login}
 export ACTIX_UI_BACKEND_URL=${ACTIX_UI_BACKEND_URL:-ws://localhost:${ACTIX_PORT:-8080}}
 export WEBTRANSPORT_HOST=${WEBTRANSPORT_HOST:-https://127.0.0.1:4433}

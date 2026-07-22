@@ -182,6 +182,43 @@ pub const STICKY_CONGESTION_SCORE_CAP: u32 = 6;
 /// retune the recovery aggressiveness without touching the state-machine logic.
 pub const STICKY_RECOVERY_CLEAN_TICKS: u32 = 12;
 
+// --- Screen layer-oscillation damping (issue #1899) ---
+//
+// On a STATIC screen share the plain fast-down / conservative-up loop above
+// self-oscillates: a step DOWN advertises a preference, the relay stops
+// forwarding the top layer, availability forgets it, `constrained` clears (we
+// reached the shrunken top), the relay fail-opens, availability RE-learns the
+// top, and the unconstrained follow-top climbs back UP — and every one of those
+// switches re-arms a keyframe wait the new layer cannot paint through until ITS
+// keyframe arrives. On a static screen that keyframe is scarce, so the wait
+// freezes playout and storms PLIs (`kf_per_sec`), which reads as congestion and
+// forces the NEXT step down. The oscillation is self-sustaining (each switch
+// manufactures the congestion that drives the next), which is why a static
+// 720p@8fps share logged 563 screen LAYER_SWITCH + 444 freeze-after-switch skips
+// in one meeting. The sticky-low machinery (#1179) would settle it, but never
+// latches here because the congestion is not *continuously* sustained — the
+// `congestion_score` decays during the clean lulls between switch-induced PLI
+// windows, so it never reaches STICKY_CONGESTION_EVENTS.
+//
+// The damping closes exactly that gap for SCREEN only: a step DOWN that closely
+// follows a step UP (a "yo-yo") is treated as chronic and force-latches the
+// existing sticky floor at the just-dropped rung, so the chooser stops
+// re-climbing into the same freeze and SETTLES. Recovery is the SAME
+// time-bounded STICKY_RECOVERY_CLEAN_TICKS path (~60s of uninterrupted clean
+// raises the floor one rung), so a genuinely-recovered link still climbs out —
+// it cannot wedge. Camera/audio choosers set `screen_mode == false` and are
+// provably unaffected (the camera↔screen divergence is deliberate: camera has
+// continuous motion so it never keyframe-starves the way a static screen does).
+
+/// Max age (ms) of a preceding UP switch for a following DOWN switch to count as
+/// a screen "yo-yo" and force the sticky latch (issue #1899). The oscillation's
+/// up-switch → freeze → PLI → down-switch leg completes within ~1-2 monitor ticks
+/// (the 5s `choose` cadence), so this is sized to a few ticks to catch it
+/// robustly while staying well short of any legitimate minutes-apart adaptation.
+/// A false match is benign for screen: it only holds one rung lower and
+/// re-probes on the time-bounded recovery path.
+pub const SCREEN_LAYER_OSCILLATION_LATCH_MS: u64 = 15_000;
+
 /// A single window's receive-health sample for one source (THIS receiver's
 /// downlink), as produced by the receive-side sequence tracker on ~1s rollover.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -316,6 +353,24 @@ pub struct LayerChooser {
     /// while `sticky`. Reset to 0 by any non-clean (congested or neutral) window,
     /// so recovery requires an *uninterrupted* clean streak.
     recovery_clean_ticks: u32,
+
+    // --- Screen layer-oscillation damping (issue #1899) ---
+    /// SCREEN kind only: enables the yo-yo oscillation latch below. `false` for
+    /// camera VIDEO and AUDIO, which are provably unaffected (the latch and the
+    /// `last_up_switch_ms` bookkeeping are inert). Set at construction via
+    /// [`LayerChooser::new_screen`]; the camera↔screen divergence is deliberate.
+    screen_mode: bool,
+    /// Monotonic: `true` once ANY congested window has been observed. Gates the
+    /// recording of `last_up_switch_ms` so a pristine cold-start acquisition
+    /// (0 → highest_available on the first clean tick, before any congestion) is
+    /// NOT mistaken for an oscillation re-climb — preserving the #1079 M2 "keep
+    /// full quality at join" behavior for screen. Only the yo-yo latch reads it.
+    ever_congested: bool,
+    /// Timestamp (ms) of the most recent UP switch, recorded only after
+    /// `ever_congested` (issue #1899). `0` = none yet. A DOWN switch within
+    /// [`SCREEN_LAYER_OSCILLATION_LATCH_MS`] of this is the screen yo-yo that
+    /// force-latches the sticky floor. Consumed (reset to 0) on a latch.
+    last_up_switch_ms: u64,
 }
 
 impl LayerChooser {
@@ -335,6 +390,25 @@ impl LayerChooser {
             sticky: false,
             sticky_floor: 0,
             recovery_clean_ticks: 0,
+            // Camera/audio default: the screen oscillation latch is inert.
+            screen_mode: false,
+            ever_congested: false,
+            last_up_switch_ms: 0,
+        }
+    }
+
+    /// Construct a SCREEN-kind chooser (issue #1899): identical to [`Self::new`]
+    /// except the yo-yo oscillation latch is enabled (`screen_mode = true`). A
+    /// static screen share re-arms a keyframe wait on every layer switch, which
+    /// on scarce-keyframe static content self-oscillates; this mode force-latches
+    /// the existing sticky floor when a DOWN switch closely follows an UP switch,
+    /// so the share settles to one rung. Camera VIDEO / AUDIO use [`Self::new`]
+    /// and are unaffected — the divergence is deliberate (see the module-level
+    /// oscillation-damping note).
+    pub fn new_screen(now_ms: u64) -> Self {
+        Self {
+            screen_mode: true,
+            ..Self::new(now_ms)
         }
     }
 
@@ -418,6 +492,11 @@ impl LayerChooser {
         // step-down branches below can pin `sticky_floor` to the layer we land on.
         let mut just_latched = false;
         if sample.is_congested() {
+            // Monotonic marker (issue #1899): once congestion has been seen, later
+            // UP switches are eligible to record `last_up_switch_ms` for the screen
+            // yo-yo latch. Kept out of the cold-start acquisition path so a pristine
+            // 0 → top climb (no prior congestion) never arms the latch.
+            self.ever_congested = true;
             self.congestion_score = (self.congestion_score + 1).min(STICKY_CONGESTION_SCORE_CAP);
             if !self.sticky && self.congestion_score >= STICKY_CONGESTION_EVENTS {
                 // Latch: chronic congestion. The floor is pinned AFTER this
@@ -447,6 +526,13 @@ impl LayerChooser {
                     self.sticky_floor = self.current;
                     self.recovery_clean_ticks = 0;
                 }
+                // Screen yo-yo latch (issue #1899): this is the arm the static-share
+                // oscillation lands in — after `constrained` cleared and the
+                // unconstrained follow-top re-climbed, the switch-induced PLI shows
+                // up here as the re-constrain. If it closely follows that re-climb,
+                // force-latch the sticky floor so we stop re-climbing into the same
+                // keyframe-wait freeze. No-op for camera/audio.
+                self.maybe_latch_screen_oscillation(now_ms);
                 return self.current;
             }
             // Otherwise follow the top (no constraint, full quality).
@@ -491,6 +577,11 @@ impl LayerChooser {
             if self.sticky && (just_latched || self.current < self.sticky_floor) {
                 self.sticky_floor = self.current;
             }
+            // Screen yo-yo latch (issue #1899): also cover the purely-constrained
+            // oscillation (conservative-up climb to the top, keyframe-wait PLI,
+            // then this fast step-down) so a static share that never fully clears
+            // `constrained` still settles. No-op for camera/audio.
+            self.maybe_latch_screen_oscillation(now_ms);
             return self.current;
         }
 
@@ -598,9 +689,63 @@ impl LayerChooser {
     /// Apply a layer change and reset the dwell/clean bookkeeping.
     fn set_layer(&mut self, layer: u32, now_ms: u64) {
         if layer != self.current {
+            // Issue #1899: remember the time of an UP switch so a closely-following
+            // DOWN switch can be recognized as the screen yo-yo. Gated on
+            // `ever_congested` so a pristine cold-start acquisition (0 → top before
+            // any congestion) is NOT armed — only re-climbs after real congestion
+            // count. Recorded for every kind but read only by the screen-gated
+            // latch, so camera/audio behavior is unchanged.
+            if layer > self.current && self.ever_congested {
+                self.last_up_switch_ms = now_ms;
+            }
             self.current = layer;
             self.last_change_ms = now_ms;
         }
+    }
+
+    /// Screen-only oscillation guard (issue #1899): force the sticky latch when a
+    /// step DOWN closely follows a step UP — the static-share yo-yo.
+    ///
+    /// Called from the two congested step-down arms of [`Self::choose`] AFTER the
+    /// layer has been lowered. On a static screen share every layer switch re-arms
+    /// a keyframe wait; the new layer cannot paint until its (scarce) keyframe
+    /// arrives, so playout freezes and storms PLIs, which reads as congestion and
+    /// drives the next step down — a self-sustaining oscillation the decaying
+    /// `congestion_score` never latches on because the clean lulls between
+    /// switch-induced PLI windows decay it below [`STICKY_CONGESTION_EVENTS`].
+    ///
+    /// When the just-completed DOWN follows the most recent UP within
+    /// [`SCREEN_LAYER_OSCILLATION_LATCH_MS`], latch the EXISTING sticky floor at
+    /// the layer we just dropped to. The chooser then holds that rung (climb capped
+    /// at the floor, `constrained` never cleared) and recovers ONLY via the
+    /// time-bounded [`STICKY_RECOVERY_CLEAN_TICKS`] path — so it settles to one rung
+    /// yet cannot wedge (a genuinely-recovered link still climbs out ~one rung per
+    /// ~60s of uninterrupted clean).
+    ///
+    /// No-op for camera VIDEO / AUDIO (`screen_mode == false`): the divergence is
+    /// deliberate — camera has continuous motion and does not keyframe-starve on a
+    /// switch the way a static screen does, so its normal fast-down / conservative-up
+    /// adaptation must remain untouched.
+    fn maybe_latch_screen_oscillation(&mut self, now_ms: u64) {
+        if !self.screen_mode {
+            return;
+        }
+        let recent_up = self.last_up_switch_ms != 0
+            && now_ms.saturating_sub(self.last_up_switch_ms) <= SCREEN_LAYER_OSCILLATION_LATCH_MS;
+        if !recent_up {
+            return;
+        }
+        // Force the sticky latch at the just-dropped layer, mirroring the pin the
+        // score-driven latch performs: sticky on, floor = current, recovery reset,
+        // and the score raised to the latch threshold so the state stays consistent
+        // (sticky implies chronic). This reuses the #1179 hold-and-recover machinery
+        // wholesale — nothing about the recovery path changes.
+        self.sticky = true;
+        self.sticky_floor = self.current;
+        self.recovery_clean_ticks = 0;
+        self.congestion_score = self.congestion_score.max(STICKY_CONGESTION_EVENTS);
+        // Consume the up-switch so a single re-climb cannot latch twice.
+        self.last_up_switch_ms = 0;
     }
 }
 
@@ -1635,6 +1780,238 @@ mod tests {
         assert!(!c.is_sticky(), "a clean cold-join must never latch sticky");
         assert_eq!(c.current(), 2, "decodes the top");
         assert_eq!(c.desired_preference(), None, "advertises no preference");
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #1899: screen layer-oscillation damping (yo-yo latch)
+    //
+    // On a STATIC screen share, every layer switch re-arms a keyframe wait that
+    // freezes playout and storms PLIs; that reads as congestion and forces the
+    // next switch, so the share self-oscillates (563 switches in one field
+    // meeting). The SCREEN chooser (`new_screen`) treats a DOWN switch that
+    // closely follows an UP switch as chronic and force-latches the existing
+    // sticky floor, so the share SETTLES. Camera/audio (`new`) are unaffected.
+    // -----------------------------------------------------------------
+
+    /// Drive the exact "kick → clear → re-climb → drop" sequence that a static
+    /// screen share produces at the chooser boundary, using `avail` to model the
+    /// availability feedback (the top is forgotten while we advertise a preference,
+    /// and re-learned once we fail-open). Returns the chooser after the yo-yo DOWN.
+    fn drive_screen_yo_yo(c: &mut LayerChooser) {
+        // t=1000 clean, avail=2 → cold-start acquire of the top (0→2). No prior
+        // congestion, so this UP must NOT arm the yo-yo (M2 cold-start preserved).
+        c.choose(clean(), 2, 1000);
+        assert_eq!(c.current(), 2, "acquires the top on the first clean window");
+        // t=2000 congested, avail=2 → the initial kick down to 1 (constrained).
+        // First-ever congestion: NOT a yo-yo (no prior UP was armed).
+        c.choose(congested(), 2, 2000);
+        assert_eq!(c.current(), 1, "a congested window kicks down one rung");
+        // t=3000 clean, avail=1 → availability forgot the top (we advertise pref=1),
+        // so `current >= highest` clears `constrained` (back to no-preference).
+        c.choose(clean(), 1, 3000);
+        // t=4000 clean, avail=2 → relay fail-opened, the top is re-learned, and the
+        // unconstrained follow-top RE-CLIMBS 1→2. This UP arms the yo-yo.
+        c.choose(clean(), 2, 4000);
+        assert_eq!(
+            c.current(),
+            2,
+            "unconstrained follow-top re-climbs to the top"
+        );
+        // t=6000 congested, avail=2 → the re-climb's keyframe-wait PLI shows up as a
+        // congested window and drops us back to 1 — the yo-yo DOWN, 2s after the UP.
+        c.choose(congested(), 2, 6000);
+        assert_eq!(c.current(), 1, "the switch-induced PLI drops us back down");
+    }
+
+    #[test]
+    fn screen_yo_yo_down_after_up_latches_sticky() {
+        // The core regression: on the SCREEN chooser, a DOWN that closely follows
+        // an UP force-latches the sticky floor so the share stops re-climbing into
+        // the same keyframe-wait freeze and settles.
+        //
+        // MUTATION CHECK: fails on the un-fixed code — without the yo-yo latch the
+        // congestion score after this sequence is only 1 (well below
+        // STICKY_CONGESTION_EVENTS=3), so the chooser would NOT be sticky and would
+        // keep oscillating. Reverting `maybe_latch_screen_oscillation` (or flipping
+        // `screen_mode` off) breaks this assertion.
+        let mut c = LayerChooser::new_screen(0);
+        drive_screen_yo_yo(&mut c);
+        assert!(
+            c.is_sticky(),
+            "a screen yo-yo (down right after up) must latch sticky (#1899)"
+        );
+        assert_eq!(
+            c.sticky_floor(),
+            1,
+            "the floor is pinned to the settled rung we dropped to"
+        );
+        // Now settled: further clean windows must NOT climb back above the floor,
+        // so no more switch-induced freezes. (avail=2 = the real top is available,
+        // but the sticky floor caps the climb at 1.)
+        let mut t = 7000u64;
+        for _ in 0..STEP_UP_CLEAN_WINDOWS + 2 {
+            c.choose(clean(), 2, t);
+            t += 1100;
+        }
+        assert_eq!(
+            c.current(),
+            1,
+            "a settled screen share holds its rung (no re-climb into the freeze)"
+        );
+    }
+
+    #[test]
+    fn camera_yo_yo_does_not_latch_sticky() {
+        // Scoping guard: the SAME yo-yo sequence on the CAMERA chooser (`new`) must
+        // NOT latch — the damping is screen-only (deliberate camera↔screen
+        // divergence). Camera keeps its normal fast-down / conservative-up loop.
+        //
+        // MUTATION CHECK: fails if the latch is not gated on `screen_mode` (i.e. if
+        // it fired for every kind).
+        let mut c = LayerChooser::new(0);
+        drive_screen_yo_yo(&mut c);
+        assert!(
+            !c.is_sticky(),
+            "camera must NOT latch on a yo-yo — the damping is screen-scoped"
+        );
+    }
+
+    #[test]
+    fn screen_cold_start_first_congestion_does_not_latch() {
+        // The `ever_congested` gate: a pristine cold-start acquisition (0→top on the
+        // first clean window, before ANY congestion) must NOT arm the yo-yo, so the
+        // first-ever congested window is a plain fast-down, not a latch. This
+        // preserves the #1079 M2 "keep full quality at join" intent for screen.
+        //
+        // MUTATION CHECK: fails if `set_layer` records `last_up_switch_ms` without
+        // the `ever_congested` guard — then the cold-start acquire would arm the
+        // latch and this first congestion would wrongly stick.
+        let mut c = LayerChooser::new_screen(0);
+        c.choose(clean(), 2, 1000); // cold-start acquire 0→2 (unarmed)
+        assert_eq!(c.current(), 2);
+        c.choose(congested(), 2, 2000); // first-ever congestion → plain fast-down
+        assert_eq!(c.current(), 1, "first congestion steps down one rung");
+        assert!(
+            !c.is_sticky(),
+            "cold-start acquire + first congestion must NOT latch (M2 preserved)"
+        );
+    }
+
+    #[test]
+    fn screen_latched_floor_recovers_time_bounded_no_wedge() {
+        // No-wedge requirement: after the yo-yo latch, a genuinely-recovered link
+        // must still climb out via the SAME time-bounded STICKY_RECOVERY_CLEAN_TICKS
+        // path — the latch settles the share but cannot pin it forever.
+        //
+        // MUTATION CHECK: fails if the forced latch left the sticky machinery in an
+        // inconsistent state that blocks recovery (e.g. never raising the floor).
+        let mut c = LayerChooser::new_screen(0);
+        drive_screen_yo_yo(&mut c);
+        assert!(c.is_sticky());
+        assert_eq!(c.sticky_floor(), 1);
+        // One uninterrupted recovery period of clean windows (avail=2 = real top)
+        // raises the floor one rung to the top → sticky clears.
+        let mut t = 7000u64;
+        for _ in 0..STICKY_RECOVERY_CLEAN_TICKS {
+            c.choose(clean(), 2, t);
+            t += 1100;
+        }
+        assert!(
+            !c.is_sticky(),
+            "sustained clean must clear the latch (time-bounded recovery, no wedge)"
+        );
+        // And the chooser can now climb back to the top.
+        for _ in 0..10 {
+            c.choose(clean(), 2, t);
+            t += 1100;
+        }
+        assert_eq!(c.current(), 2, "recovered link climbs back to the top");
+        assert_eq!(
+            c.desired_preference(),
+            None,
+            "back at the top → no preference"
+        );
+    }
+
+    #[test]
+    fn screen_oscillation_input_settles_camera_does_not() {
+        // Before/after regression (the #1899 brief's "N switches before, few after").
+        // Feed the IDENTICAL self-coupled oscillating input to a SCREEN chooser and a
+        // CAMERA chooser and compare. The camera (baseline = un-fixed behavior) keeps
+        // yo-yoing every few windows; the screen chooser latches after the first
+        // yo-yo and then holds one rung for long stretches, re-probing only on the
+        // time-bounded sticky-recovery cadence (the deliberate no-wedge exit) — so it
+        // switches far less and its longest settled run is far longer.
+        //
+        // MUTATION CHECK: with the latch removed the screen chooser behaves exactly
+        // like the camera one, so the counts/runs are equal and the strict `<` / `>`
+        // comparisons fail.
+        //
+        // Returns (total layer switches, longest run of consecutive windows with NO
+        // switch). The run length is the metric that matters for freeze-per-minute:
+        // a settled static share holds its rung for a long uninterrupted stretch.
+        fn run_oscillation(c: &mut LayerChooser) -> (u32, u32) {
+            let avail = 2;
+            let mut t = 1000u64;
+            let mut switches = 0u32;
+            let mut prev = c.current();
+            let mut cur_run = 0u32;
+            let mut longest_run = 0u32;
+            // 40 periods. Each period is 4 clean windows (enough to satisfy the
+            // 3-window streak + 3s dwell so the constrained loop climbs a rung), then
+            // — ONLY if the chooser actually climbed this period — one congested
+            // window modeling the switch-induced keyframe-wait PLI the up-switch
+            // re-armed. No up-switch ⇒ no fresh keyframe wait ⇒ that window is clean:
+            // this self-coupling is the whole mechanism (a settled share stops
+            // generating the very congestion that drove the oscillation).
+            for _ in 0..40 {
+                let period_start = c.current();
+                for i in 0..5 {
+                    let sample = if i == 4 && c.current() > period_start {
+                        congested()
+                    } else {
+                        clean()
+                    };
+                    let now = c.choose(sample, avail, t);
+                    if now != prev {
+                        switches += 1;
+                        cur_run = 0;
+                    } else {
+                        cur_run += 1;
+                        longest_run = longest_run.max(cur_run);
+                    }
+                    prev = now;
+                    t += 1100;
+                }
+            }
+            (switches, longest_run)
+        }
+
+        let mut screen = LayerChooser::new_screen(0);
+        let mut camera = LayerChooser::new(0);
+        let (screen_switches, screen_run) = run_oscillation(&mut screen);
+        let (camera_switches, camera_run) = run_oscillation(&mut camera);
+
+        // The damped screen chooser switches materially less than the un-damped
+        // baseline over the same input…
+        assert!(
+            screen_switches * 2 <= camera_switches,
+            "screen damping must at least halve the switch count vs the un-damped \
+             camera baseline (screen={screen_switches}, camera={camera_switches})"
+        );
+        // …and holds a far longer uninterrupted settled stretch (the actual UX win:
+        // long freeze-free runs punctuated only by the time-bounded no-wedge probe).
+        assert!(
+            screen_run > camera_run * 2,
+            "a settled screen share must hold its rung far longer than the churning \
+             baseline (screen_run={screen_run}, camera_run={camera_run})"
+        );
+        // Sanity: the un-damped baseline really does churn (guards against the test
+        // passing because BOTH settled for some unrelated reason).
+        assert!(
+            camera_switches >= 20,
+            "the un-damped baseline must keep oscillating, got {camera_switches}"
+        );
     }
 
     // -----------------------------------------------------------------

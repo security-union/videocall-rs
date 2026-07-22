@@ -42,6 +42,7 @@ enum GuestStatus {
         waiting_room_enabled: bool,
         admitted_can_admit: bool,
         allow_guests: bool,
+        recording_allowed_for_all: bool,
     },
     Rejected,
     Error(String),
@@ -73,6 +74,7 @@ fn guest_status_from_join_response(
                     waiting_room_enabled: response.waiting_room_enabled,
                     admitted_can_admit: response.admitted_can_admit,
                     allow_guests: response.allow_guests,
+                    recording_allowed_for_all: response.recording_allowed_for_all,
                 }
             } else {
                 GuestStatus::Error("Admitted but no room token".to_string())
@@ -128,6 +130,7 @@ fn handle_admitted(
         waiting_room_enabled: response.waiting_room_enabled,
         admitted_can_admit: response.admitted_can_admit,
         allow_guests: response.allow_guests,
+        recording_allowed_for_all: response.recording_allowed_for_all,
     });
 }
 
@@ -177,6 +180,9 @@ fn start_observer_connection(
         webtransport_urls,
         enable_e2ee: false,
         enable_webtransport: effective_wt_enabled,
+        // Issue #1884: guest lobby OBSERVER client — no in-call reaction overlay,
+        // so no reaction callback.
+        on_reaction: None,
         on_connected: VcCallback::from(move |_| {
             log::info!("Guest observer connection established (waiting for meeting)");
         }),
@@ -421,7 +427,7 @@ pub fn GuestJoinPage(id: String) -> Element {
     rsx! {
         match &current_guest_status {
             // Admitted — show the meeting
-            GuestStatus::Admitted { host_display_name, host_user_id, room_token, status_observer_token, waiting_room_enabled, admitted_can_admit, allow_guests } => rsx! {
+            GuestStatus::Admitted { host_display_name, host_user_id, room_token, status_observer_token, waiting_room_enabled, admitted_can_admit, allow_guests, recording_allowed_for_all } => rsx! {
                 AttendantsComponent {
                     display_name: display_name_for_render.clone(),
                     id: id.clone(),
@@ -437,6 +443,7 @@ pub fn GuestJoinPage(id: String) -> Element {
                     waiting_room_enabled: *waiting_room_enabled,
                     admitted_can_admit: *admitted_can_admit,
                     allow_guests: *allow_guests,
+                    recording_allowed_for_all: *recording_allowed_for_all,
                 }
             },
 
@@ -662,6 +669,7 @@ mod tests {
             host_display_name: Some("Host".to_string()),
             host_user_id: Some("host-1".to_string()),
             allow_guests: true,
+            recording_allowed_for_all: false,
         }
     }
 

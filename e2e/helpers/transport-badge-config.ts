@@ -65,6 +65,7 @@ export async function setTransportBadgeFlag(
   value: string = "true",
 ): Promise<void> {
   const entry = `${JSON.stringify(TRANSPORT_BADGE_FLAG_KEY)}:${JSON.stringify(value)}`;
+  const injection = `;window.__APP_CONFIG=Object.assign(window.__APP_CONFIG||{},{${entry}});`;
 
   await context.route("**/config.js", async (route) => {
     // Fetch the real config.js the server would have served, then append our
@@ -72,8 +73,6 @@ export async function setTransportBadgeFlag(
     // are preserved.
     const response = await route.fetch();
     const original = await response.text();
-
-    const injection = `;window.__APP_CONFIG=Object.assign(window.__APP_CONFIG||{},{${entry}});`;
 
     // Defensive: if the body is not the expected object-literal assignment
     // (e.g. an SPA HTML fallback), still apply the key rather than lose it.
@@ -85,6 +84,36 @@ export async function setTransportBadgeFlag(
       status: 200,
       contentType: "application/javascript",
       body: patched,
+    });
+  });
+
+  // ALSO patch `config.local.js` (issue #1883): index.html loads a gitignored
+  // developer-override shim AFTER `config.js` (a synchronous XHR eval), and when
+  // a serve ships one (e.g. a local `trunk serve` clone — the e2e docker stack
+  // that mirrors `clone-*/dist`) it `Object.assign`s its own values onto
+  // `__APP_CONFIG`, RE-SETTING `transportBadgeEnabled` and clobbering the
+  // `config.js` patch above. Without re-applying the flag after the shim, the
+  // stack's local value wins and NO badge renders — which is exactly why the
+  // flag-ON tests failed against the docker stack while passing in CI (where no
+  // `config.local.js` is served). Re-apply the flag AFTER the shim's body so ON
+  // wins in BOTH serve shapes: present → append after its overrides; absent
+  // (404 in CI) → serve the patch alone (the index.html XHR evals it and sets
+  // the key). Only `transportBadgeEnabled` is touched; all other shim keys pass
+  // through unchanged.
+  await context.route("**/config.local.js", async (route) => {
+    let original = "";
+    try {
+      const response = await route.fetch();
+      if (response.status() === 200) {
+        original = await response.text();
+      }
+    } catch {
+      /* shim absent on this serve — serve just the patch */
+    }
+    await route.fulfill({
+      status: 200,
+      contentType: "application/javascript",
+      body: original + injection,
     });
   });
 }

@@ -78,6 +78,13 @@ pub struct PeerHealthData {
     pub last_screen_update_ms: u64,
     /// Cumulative decode error count across the session lifetime.
     pub decode_errors_total: u64,
+    /// Issue #1878: windowed receive-side audio DATAGRAM loss (lost audio
+    /// packets/sec) observed for this peer while THIS client is on WebTransport.
+    /// Nonzero only when audio riding unreliable QUIC datagrams is being dropped
+    /// (e.g. the browser's incoming-datagram queue overflowing during a
+    /// main-thread stall) — the pathology was previously invisible in every
+    /// dashboard. ~0 on WebSocket and on E2EE-on WebTransport (reliable paths).
+    pub wt_datagram_audio_loss_per_sec: f64,
 }
 
 impl PeerHealthData {
@@ -94,6 +101,7 @@ impl PeerHealthData {
             last_camera_update_ms: 0,
             last_screen_update_ms: 0,
             decode_errors_total: 0,
+            wt_datagram_audio_loss_per_sec: 0.0,
         }
     }
 
@@ -935,6 +943,23 @@ impl HealthReporter {
                                 );
                             }
                         }
+                        // Issue #1878: receive-side audio DATAGRAM loss rate,
+                        // emitted ~1 Hz per peer by peer_decode_manager when THIS
+                        // client is on WebTransport. Stored on the per-peer health
+                        // data and logged at warn! when nonzero so the pathology —
+                        // previously invisible in every dashboard — is greppable in
+                        // the meeting console-log pipeline (the medium the DRI
+                        // analysis used) and available to the in-process health UI.
+                        "wt_datagram_audio_loss_per_sec" => {
+                            if let MetricValue::F64(loss) = &metric.value {
+                                peer_data.wt_datagram_audio_loss_per_sec = *loss;
+                                if *loss > 0.0 {
+                                    warn!(
+                                        "WT datagram audio loss {loss:.1} pkt/s for peer: {target_peer} (from {reporting_peer})"
+                                    );
+                                }
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -1088,9 +1113,9 @@ impl HealthReporter {
                         }
                         // Resync-to-live governor skips (#1252): lifetime cumulative COUNTER (u64),
                         // not an ms gauge. Stored in the camera/screen bucket that emitted the
-                        // worker stat. The health packet currently exports this counter from the
-                        // camera video_stats path only; screen-share export can be added when the
-                        // server consumes the sibling screen_video_stats playout fields.
+                        // worker stat. Folded into the health packet from BOTH the camera and
+                        // screen video_stats paths (#1660); the server exports the camera and
+                        // screen skip-to-live counters as separate gauges.
                         "playout_skip_to_live_total" => {
                             if let MetricValue::U64(v) = &metric.value {
                                 video_stats["playout_skip_to_live_total"] = json!(v);
@@ -1648,6 +1673,17 @@ impl HealthReporter {
         // and is slated for deprecation in a follow-up PR.
         // The `active_server_url` argument is intentionally swallowed here.
         let _ = active_server_url;
+        // Issue #1878: the receive-side audio-datagram-loss tracker only feeds a
+        // value while THIS client is on WebTransport (the exact
+        // `receiver_on_webtransport` gate in peer_decode_manager); on WebSocket
+        // the emitter never fires, so `wt_datagram_audio_loss_per_sec` retains its
+        // last WT reading. Capture the reporter's transport here, before
+        // `active_server_type` is moved into the proto below, so the per-peer fold
+        // can SELECT the value it emits: the live tracker value on WebTransport,
+        // versus definitional 0.0 on WebSocket (audio there rides ordered TCP — no
+        // datagram loss is possible — and folding 0.0 rather than the stale WT
+        // value un-latches the gauge on a mid-call WT→WS fallback).
+        let reporter_on_webtransport = active_server_type.as_deref() == Some("webtransport");
         if let Some(typ) = active_server_type {
             pb.active_server_type = typ;
         }
@@ -2215,9 +2251,11 @@ impl HealthReporter {
                 }
             }
 
-            // Screen share video mapping (new field, separate from camera). This mirrors the
-            // pre-existing screen export surface: fps/buffered/decoded/bitrate only. The camera
-            // playout/governor fields above are not exported for screen share in this pass.
+            // Screen share video mapping (new field, separate from camera). Folds
+            // fps/buffered/decoded/bitrate AND the playout family (#1660), mirroring the camera
+            // fold above so the server's screen playout gauges (#1660) receive real values instead
+            // of the proto-default 0. PR #1657 routed the screen decoder's playout stats into this
+            // same last_screen_stats blob (Stage A above), so the keys are already present.
             if let Some(screen) = &health_data.last_screen_stats {
                 let mut svs = PbVideoStats::new();
                 if let Some(v) = screen.get("fps_received").and_then(|v| v.as_f64()) {
@@ -2232,6 +2270,41 @@ impl HealthReporter {
                 if let Some(v) = screen.get("bitrate_kbps").and_then(|v| v.as_u64()) {
                     svs.bitrate_kbps = v;
                 }
+
+                // Screen playout family (#1660): same fps_received > 0 gate as the camera fold —
+                // a DecodeBudget-paused or hidden screen tile keeps a stale frame buffered but
+                // decodes nothing, so its arrival-time span would read as latency the viewer isn't
+                // waiting on. When fps == 0 these ms fields stay at their 0.0 default => "at live".
+                if svs.fps_received > 0.0 {
+                    if let Some(v) = screen.get("playout_latency_ms").and_then(|v| v.as_f64()) {
+                        svs.playout_latency_ms = v;
+                    }
+                    if let Some(v) = screen
+                        .get("playout_stage1_span_ms")
+                        .and_then(|v| v.as_f64())
+                    {
+                        svs.playout_stage1_span_ms = v;
+                    }
+                    if let Some(v) = screen.get("playout_paint_lag_ms").and_then(|v| v.as_f64()) {
+                        svs.playout_paint_lag_ms = v;
+                    }
+                    // Content-staleness (#1641): content AGE, not queue DEPTH. UNBOUNDED — can
+                    // legitimately exceed 1800ms — which is why it is the gauge that surfaces a
+                    // screen-share freeze draining stale content. Gated like the other ms gauges.
+                    if let Some(v) = screen.get("content_staleness_ms").and_then(|v| v.as_f64()) {
+                        svs.content_staleness_ms = v;
+                    }
+                }
+                // Resync-to-live governor skips (#1252): cumulative COUNTER, folded
+                // UNCONDITIONALLY (outside the fps gate) exactly like the camera path — a stream
+                // that fell idle must keep reporting its lifetime total, or the governor would
+                // appear to "un-fire".
+                if let Some(v) = screen
+                    .get("playout_skip_to_live_total")
+                    .and_then(|v| v.as_u64())
+                {
+                    svs.playout_skip_to_live_total = v;
+                }
                 ps.screen_video_stats = ::protobuf::MessageField::some(svs);
             }
 
@@ -2239,6 +2312,24 @@ impl HealthReporter {
             if health_data.decode_errors_total > 0 {
                 ps.decoder_errors_total = Some(health_data.decode_errors_total);
             }
+
+            // Issue #1878: receive-side audio DATAGRAM loss (audio sibling of
+            // video_seq_loss_per_sec above). Folded UNCONDITIONALLY as Some — like
+            // its sibling — so the exported gauge recovers to 0 instead of
+            // latching a stale value. On WebTransport we fold the tracker's live
+            // windowed value (refreshed ~1 Hz, including 0.0 when a loss burst
+            // clears). On WebSocket the value is definitionally 0.0 (audio rides
+            // ordered TCP — no datagram loss is possible), and folding 0.0 rather
+            // than `wt_datagram_audio_loss_per_sec` — which the emitter stops
+            // refreshing on WS and so pins at its last WT reading — un-latches the
+            // gauge on a mid-call WT→WS fallback. E2EE-WT is still "webtransport",
+            // so it folds the tracker value, which reads ~0 there because audio
+            // rides the reliable unistream.
+            ps.audio_datagram_loss_per_sec = Some(if reporter_on_webtransport {
+                health_data.wt_datagram_audio_loss_per_sec
+            } else {
+                0.0
+            });
 
             // ── Quality scores ─────────────────────────────────────────────
             // Only set when the stream is active; absent = Grafana shows a gap,
@@ -2779,6 +2870,118 @@ mod tests {
         );
     }
 
+    /// #1878: build a HealthPacket through the production `create_health_packet`
+    /// path for a single peer whose windowed receive-side audio-datagram-loss
+    /// rate is `loss`, reported over the given `active_server_type`, then
+    /// round-trip it through protobuf so the assertions below are on exactly what
+    /// goes on the wire.
+    fn health_packet_with_audio_datagram_loss(
+        loss: f64,
+        active_server_type: &str,
+    ) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.wt_datagram_audio_loss_per_sec = loss;
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some(active_server_type.to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_queue_depth_report
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
+            None,
+            None,
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            0,              // active_audio_layers (#1561)
+            HashMap::new(), // received_layers (#1561)
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #1878: on WebTransport the per-peer audio-datagram-loss rate must fold into
+    /// PeerStats.audio_datagram_loss_per_sec and round-trip as `Some(loss)`.
+    ///
+    /// MUTATION: removing the `ps.audio_datagram_loss_per_sec = Some(...)` fold
+    /// line makes this decode as `None`, failing the `Some(9.0)` assertion.
+    #[test]
+    fn create_health_packet_folds_audio_datagram_loss_on_webtransport() {
+        let pb = health_packet_with_audio_datagram_loss(9.0, "webtransport");
+        let ps = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer-1 must have a PeerStats entry");
+        assert_eq!(
+            ps.audio_datagram_loss_per_sec,
+            Some(9.0),
+            "WT reporter must fold the windowed audio datagram loss as Some(9.0)"
+        );
+    }
+
+    /// #1878: on WebSocket the field must fold as `Some(0.0)` — definitionally
+    /// zero because audio rides ordered TCP — NOT the stale tracker value the
+    /// emitter last wrote on a prior WebTransport leg. Folding 0.0 un-latches the
+    /// exported gauge on a mid-call WT→WS fallback (the recover-to-0 behavior of
+    /// the sibling video_seq_loss_per_sec).
+    ///
+    /// The `7.0` seed is that stale WT reading: the WS leg must OVERRIDE it with
+    /// 0.0. MUTATION: removing the `reporter_on_webtransport` gate (folding the
+    /// tracker value unconditionally) makes this decode as `Some(7.0)`, failing
+    /// the `Some(0.0)` assertion.
+    #[test]
+    fn create_health_packet_folds_zero_audio_datagram_loss_on_websocket() {
+        let pb = health_packet_with_audio_datagram_loss(7.0, "websocket");
+        let ps = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer-1 must have a PeerStats entry");
+        assert_eq!(
+            ps.audio_datagram_loss_per_sec,
+            Some(0.0),
+            "WebSocket reporter must fold definitional 0.0 (not the stale WT tracker value 7.0), \
+             un-latching the gauge on fallback"
+        );
+    }
+
     /// #1032: build a HealthPacket through the production path with the given
     /// cached agent-memory value, then round-trip it through protobuf so the
     /// assertions are on exactly what goes on the wire.
@@ -3150,6 +3353,136 @@ mod tests {
         // ms gauges are gated to 0 at fps 0; the COUNTER is NOT — it still reports its lifetime value.
         assert_eq!(stats.playout_paint_lag_ms, 0.0);
         assert_eq!(stats.playout_skip_to_live_total, 4);
+    }
+
+    /// #1660 sibling of `health_packet_with_camera_playout_stats`, but drives the SCREEN path:
+    /// populates only `last_screen_stats` (camera bucket left empty) so the resulting proto's
+    /// `screen_video_stats` — not `video_stats` — must carry the folded playout family. Values are
+    /// deliberately distinct from the camera helper so a bucket misroute is observable.
+    fn health_packet_with_screen_playout_stats(fps_received: f64) -> PbHealthPacket {
+        let mut peer = PeerHealthData::new("peer-1".to_string());
+        peer.last_screen_stats = Some(json!({
+            "fps_received": fps_received,
+            "playout_latency_ms": 1400.0,
+            "playout_stage1_span_ms": 900.0,
+            "playout_paint_lag_ms": 600.0,
+            "playout_skip_to_live_total": 7u64,
+            // #1660: a 4-minute screen content age — deliberately > the 1800ms playout-latency cap,
+            // to prove the screen content-staleness field is UNBOUNDED like its camera sibling.
+            "content_staleness_ms": 240000.0,
+        }));
+
+        let mut health_map = HashMap::new();
+        health_map.insert("peer-1".to_string(), peer);
+
+        let wrapper = HealthReporter::create_health_packet(
+            "session-id-test",
+            "meeting-id-test",
+            "reporting-peer",
+            "Display Name",
+            &health_map,
+            true,
+            true,
+            None,
+            Some("webtransport".to_string()),
+            Some(42.0),
+            None,
+            None,
+            None,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0.0, // encoder_queue_depth_report
+            0.0, // encoder_target_bitrate_kbps
+            0,
+            false,
+            0,
+            0, // effective_video_layers (#1143)
+            0, // active_video_layers (#1143)
+            Vec::new(),
+            ClimbLimiterSnapshot::default(),
+            Vec::new(),
+            0,
+            0,
+            0,            // rtt_probe_dropped_total
+            0,            // rtt_probe_stale_suppressions_total
+            [0, 0, 0, 0], // reelection_totals [proceeded, aborted, preserved, failed]
+            Vec::new(),
+            None,
+            ClientMetadata::default(),
+            None, // #1482: client_main_thread_load
+            None,
+            None,
+            0,              // effective_screen_layers (#1561)
+            0,              // active_screen_layers (#1561)
+            0,              // effective_audio_layers (#1561)
+            0,              // audio_congestion_ceiling (#1561)
+            0,              // active_audio_layers (#1561)
+            HashMap::new(), // received_layers (#1561)
+        )
+        .expect("create_health_packet must return Some when health_map is non-empty");
+
+        PbHealthPacket::parse_from_bytes(&wrapper.data)
+            .expect("HealthPacket payload must be valid protobuf")
+    }
+
+    /// #1660 END-TO-END BLOCKER GUARD: the server's screen playout gauges read
+    /// `screen_video_stats` on the wire, but they are dead unless the client folds the playout
+    /// family from `last_screen_stats` into that proto. This drives the SCREEN serialization path
+    /// and asserts all five playout fields reach the `screen_video_stats` PROTO (not the JSON blob).
+    ///
+    /// Mutation check: remove any of the five `svs.<field> = v` fold lines in the screen block and
+    /// the matching assert reads the proto default (0 / 0.0) and fails. content_staleness_ms carries
+    /// a value > 1800ms to also prove the screen field is unbounded, like its camera sibling.
+    #[test]
+    fn screen_playout_family_folds_into_proto_when_fps_received_positive() {
+        let pb = health_packet_with_screen_playout_stats(30.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .screen_video_stats
+            .as_ref()
+            .expect("screen video stats must be present");
+
+        assert_eq!(stats.fps_received, 30.0);
+        assert_eq!(stats.playout_latency_ms, 1400.0);
+        assert_eq!(stats.playout_stage1_span_ms, 900.0);
+        assert_eq!(stats.playout_paint_lag_ms, 600.0);
+        assert_eq!(stats.content_staleness_ms, 240000.0);
+        assert!(
+            stats.content_staleness_ms > 1800.0,
+            "screen content_staleness_ms must NOT be capped at the 1800ms playout-latency bound"
+        );
+        assert_eq!(stats.playout_skip_to_live_total, 7);
+    }
+
+    /// #1660: the screen fold must share the camera gate — the four ms gauges are gated on
+    /// fps_received > 0 (a paused/hidden screen tile paints nothing => "at live"), while the
+    /// skip-to-live COUNTER folds UNCONDITIONALLY (a stream that fell idle must keep reporting its
+    /// lifetime total). Mutation check: moving a ms gauge outside the gate makes its assert read
+    /// nonzero and fail; moving the counter inside the gate makes its assert read 0 and fail.
+    #[test]
+    fn screen_playout_ms_gauges_gated_but_counter_folds_when_fps_received_zero() {
+        let pb = health_packet_with_screen_playout_stats(0.0);
+        let stats = pb
+            .peer_stats
+            .get("peer-1")
+            .expect("peer stats must be present")
+            .screen_video_stats
+            .as_ref()
+            .expect("screen video stats must be present");
+
+        assert_eq!(stats.fps_received, 0.0);
+        // ms gauges gated to 0 at fps 0 ...
+        assert_eq!(stats.playout_latency_ms, 0.0);
+        assert_eq!(stats.playout_stage1_span_ms, 0.0);
+        assert_eq!(stats.playout_paint_lag_ms, 0.0);
+        assert_eq!(stats.content_staleness_ms, 0.0);
+        // ... but the cumulative COUNTER still reports its lifetime value.
+        assert_eq!(stats.playout_skip_to_live_total, 7);
     }
 
     /// Build a health packet whose peer carries NetEQ audio stats. `playout_latency_ms` is

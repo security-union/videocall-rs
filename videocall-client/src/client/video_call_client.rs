@@ -57,6 +57,7 @@ use videocall_types::protos::meeting_packet::meeting_packet::MeetingEventType;
 use videocall_types::protos::meeting_packet::MeetingPacket;
 use web_time::{SystemTime, UNIX_EPOCH};
 
+use super::reactions::{resolve_reaction_display_name, REACTION_DISPLAY_NAME_MAX_CHARS};
 use videocall_types::protos::layer_hint_packet::{layer_hint_packet::MediaKind, LayerHintPacket};
 use videocall_types::protos::layer_preference_packet::{
     layer_preference_packet::Entry as LayerPreferenceEntry, LayerPreferencePacket,
@@ -64,6 +65,8 @@ use videocall_types::protos::layer_preference_packet::{
 use videocall_types::protos::packet_wrapper::packet_wrapper::PacketType;
 use videocall_types::protos::packet_wrapper::PacketWrapper;
 use videocall_types::protos::peer_event::PeerEvent;
+use videocall_types::protos::reaction_packet::reaction_packet::ReactionType;
+use videocall_types::protos::reaction_packet::ReactionPacket;
 use videocall_types::protos::rsa_packet::RsaPacket;
 use videocall_types::protos::viewport_packet::ViewportPacket;
 use videocall_types::Callback;
@@ -281,7 +284,12 @@ pub struct VideoCallClientOptions {
     pub on_host_revoked: Option<Callback<String>>,
 
     /// Callback triggered when a peer publishes a `PEER_EVENT` that targets
-    /// this client. Emits `(source_user_id, event_type, stream_id)`.
+    /// this client. Emits `(source_user_id, event_type, source_session_id)`,
+    /// where the third element is the SENDER's own `session_id` (carried in the
+    /// wire `PeerEvent.stream_id`, empty when the sender's session was not yet
+    /// assigned). Recording-state consumers key on this session id so a
+    /// per-session action is not attributed to every session of the sender's
+    /// user_id; consumers that don't need it (screen-decode-started) ignore it.
     ///
     /// Currently used to deliver `screen_decode_started` acknowledgements
     /// from peers that have begun rendering this client's shared screen
@@ -313,6 +321,27 @@ pub struct VideoCallClientOptions {
     /// decimal string; an empty string indicates an unknown session_id
     /// (legacy/unset path).
     pub on_peer_joined: Option<Callback<(String, String, String)>>,
+
+    /// Callback fired when a peer's ephemeral REACTION is received (issue
+    /// #1884). Emits `(sender_session_id, reaction_enum_i32, resolved_name)`:
+    /// - `sender_session_id` is the envelope session_id — the attribution anchor
+    ///   the client resolves against its display-name cache, not the in-packet
+    ///   name. For REACTION specifically the relay stamps this UNCONDITIONALLY
+    ///   with the sender's authenticated session before fan-out (see
+    ///   `stamp_reaction_for_broadcast` in actix-api), so — unlike the general
+    ///   envelope session_id, which is only relay-stamped when the client sends 0
+    ///   and is otherwise client-forgeable — a REACTION's sender_session_id is a
+    ///   trustworthy identity anchor: a peer cannot forge a reaction attributed
+    ///   to someone else;
+    /// - `reaction_enum_i32` is a defined `ReactionType` value (1..=7) — the
+    ///   client already dropped `UNSPECIFIED`/unknown, so the UI can map it to
+    ///   an emoji/label directly;
+    /// - `resolved_name` is the display name resolved via the display-name
+    ///   cache, falling back to the sanitized in-packet name, then "Someone".
+    ///
+    /// The client never fires this for the local user's OWN reaction (the relay
+    /// self-skips the sender); the UI renders its own echo on click instead.
+    pub on_reaction: Option<Callback<(u64, i32, String)>>,
 
     /// When `false`, all inbound `MEDIA` packets (audio, video, screen) are
     /// silently discarded and no peer decoder workers are created.  Only
@@ -387,6 +416,7 @@ struct InnerOptions {
     on_peer_event: Option<Callback<(String, String, String)>>,
     on_peer_left: Option<Callback<(String, String, String)>>,
     on_peer_joined: Option<Callback<(String, String, String)>>,
+    on_reaction: Option<Callback<(u64, i32, String)>>,
     on_display_name_changed: Option<Callback<(String, String, u64)>>,
     decode_media: bool,
 }
@@ -1062,6 +1092,171 @@ mod layer_switch_freshness_window_tests {
     }
 }
 
+#[cfg(test)]
+mod dedup_on_connected_tests {
+    use super::{dedup_on_connected, ConnectionState};
+
+    /// A `Connected` on `server_url`/`is_webtransport` whose elected connection
+    /// carries `connection_id` — the field the de-dup keys on. `rtt` drifts
+    /// between emissions of one election, so it is arbitrary here.
+    fn connected(server_url: &str, is_webtransport: bool, connection_id: &str) -> ConnectionState {
+        ConnectionState::Connected {
+            server_url: server_url.to_string(),
+            rtt: 40.0,
+            is_webtransport,
+            connection_id: connection_id.to_string(),
+        }
+    }
+
+    fn reconnecting() -> ConnectionState {
+        ConnectionState::Reconnecting {
+            server_url: "srv-a".to_string(),
+            attempt: 1,
+        }
+    }
+
+    /// Drive a sequence of states through the de-dup exactly as the
+    /// `on_state_changed` handler does (feed the returned `last` back in) and
+    /// return how many times `on_connected` would be emitted.
+    fn count_emits(states: &[ConnectionState]) -> usize {
+        let mut last: Option<String> = None;
+        let mut emits = 0;
+        for state in states {
+            let (should_emit, new_last) = dedup_on_connected(state, last);
+            if should_emit {
+                emits += 1;
+            }
+            last = new_last;
+        }
+        emits
+    }
+
+    #[test]
+    fn cold_start_single_connected_emits_once() {
+        assert_eq!(count_emits(&[connected("srv-a", false, "wt_0")]), 1);
+    }
+
+    #[test]
+    fn reconnect_loop_double_emit_emits_once() {
+        // The reconnect loop reads and re-emits the SAME elected connection
+        // (report_state then get_connection_state → identical connection_id) on top
+        // of the election's report. Only ONE on_connected — hence one /participants
+        // reseed. MUTATION SENTINEL: if `dedup_on_connected` always returned
+        // `(true, _)` (every Connected emits on_connected), this would be 2.
+        let emits = count_emits(&[
+            reconnecting(),
+            connected("srv-a", false, "wt_0"), // report_state emit
+            connected("srv-a", false, "wt_0"), // reconnect loop re-emit (same id)
+        ]);
+        assert_eq!(emits, 1, "re-emit of the same connection must emit once");
+    }
+
+    #[test]
+    fn same_host_reelection_emits_again() {
+        // Degradation-triggered re-election that proceeds onto
+        // a fresh candidate on the SAME host+transport is a genuine session change
+        // (old NATS subscription dropped, new one opened) where a HOST_REVOKED can be
+        // swallowed — it MUST emit so the host-set reseed runs. `start_reelection`
+        // sets Testing silently (no emit), so there is NO intervening non-Connected
+        // state; only the new `connection_id` (generation suffix `wt_0` → `wt_0_g1`)
+        // distinguishes it. MUTATION SENTINEL: keying the de-dup back on
+        // (server_url, is_webtransport) — the original bug — makes this 1 and fails,
+        // because server_url and is_webtransport are byte-identical here.
+        let emits = count_emits(&[
+            connected("srv-a", true, "wt_0"),    // active connection
+            connected("srv-a", true, "wt_0_g1"), // re-election winner, same host+WT
+        ]);
+        assert_eq!(
+            emits, 2,
+            "same-host re-election is a new session and must emit again"
+        );
+    }
+
+    #[test]
+    fn n_proceeding_reelections_emit_each() {
+        // Each proceeding re-election bumps the generation → new connection_id → a
+        // genuine session change that must emit. They do NOT collapse (unlike a
+        // redundant double-emit, which repeats one id).
+        let states: Vec<ConnectionState> = (0..5)
+            .map(|g| connected("srv-a", true, &format!("wt_0_g{g}")))
+            .collect();
+        assert_eq!(count_emits(&states), 5);
+    }
+
+    #[test]
+    fn reelection_to_different_server_emits_again() {
+        // A genuine re-election onto a DIFFERENT server (new id, different host) is a
+        // new connect where a HOST_REVOKED could have been swallowed — must emit.
+        let emits = count_emits(&[
+            connected("srv-a", false, "ws_0"),
+            connected("srv-b", false, "ws_1_g1"),
+        ]);
+        assert_eq!(emits, 2);
+    }
+
+    #[test]
+    fn non_connected_state_resets_dedup() {
+        // A full reconnect emits Reconnecting and resets the generation, so the new
+        // election's id can RECUR (e.g. `wt_0`). The non-Connected reset is what
+        // forces the next Connected to emit despite the id collision. MUTATION
+        // SENTINEL: if the non-Connected arm returned the previous `last` instead of
+        // `None`, the recurring `wt_0` would be suppressed and this would be 1.
+        let emits = count_emits(&[
+            connected("srv-a", false, "wt_0"),
+            reconnecting(),
+            connected("srv-a", false, "wt_0"), // same id after generation reset
+        ]);
+        assert_eq!(emits, 2);
+    }
+
+    #[test]
+    fn non_connected_states_never_emit() {
+        assert_eq!(
+            count_emits(&[
+                reconnecting(),
+                ConnectionState::Testing {
+                    progress: 0.5,
+                    servers_tested: 1,
+                    total_servers: 2,
+                },
+                ConnectionState::Failed {
+                    error: "boom".to_string(),
+                    last_known_server: None,
+                },
+            ]),
+            0
+        );
+    }
+}
+
+/// Emit the top-level `on_connected` callback once per genuine (re)connect.
+///
+/// A reconnect emits `Connected` more than once for one connect, and each used to
+/// call `on_connected`. Keys on the elected `connection_id`, not
+/// `(server_url, is_webtransport)`: a re-election onto the same host+transport is
+/// a new session (new NATS subscription, new id via the generation suffix) and
+/// must emit, but has an identical `(server_url, is_webtransport)`. A new id emits
+/// again; a re-emit of the same id is suppressed. `last` is the id we last
+/// emitted for, or `None` if the last state was not `Connected` — non-`Connected`
+/// states clear it, which also covers a full reconnect (generation resets, so an
+/// id like `wt_0` can recur).
+///
+/// Returns `(should_emit, new_last)`.
+fn dedup_on_connected(state: &ConnectionState, last: Option<String>) -> (bool, Option<String>) {
+    match state {
+        ConnectionState::Connected { connection_id, .. } => {
+            if last.as_deref() == Some(connection_id.as_str()) {
+                // Redundant re-emit of the same elected connection — suppress.
+                (false, last)
+            } else {
+                (true, Some(connection_id.clone()))
+            }
+        }
+        // Non-Connected states reset the de-dup so the next genuine connect emits.
+        _ => (false, None),
+    }
+}
+
 fn handle_connected_reconnect_resets(
     inner: &Weak<RefCell<Inner>>,
     early_seed_timer: &Rc<RefCell<Option<Interval>>>,
@@ -1499,6 +1694,7 @@ impl VideoCallClient {
                     on_display_name_changed: options.on_display_name_changed.clone(),
                     on_peer_left: options.on_peer_left.clone(),
                     on_peer_joined: options.on_peer_joined.clone(),
+                    on_reaction: options.on_reaction.clone(),
                     decode_media: options.decode_media,
                 },
                 connection_controller: connection_controller.clone(),
@@ -1730,6 +1926,11 @@ impl VideoCallClient {
                 // atom DIRECTLY (NOT via `Inner`), same rationale, so the handler can
                 // set it on every (re)connect even under a contended `Inner` borrow.
                 let audio_detector_reconnect_reseed = self.audio_detector_reconnect_reseed.clone();
+                // `connection_id` of the last `Connected` we emitted `on_connected`
+                // for, so each genuine (re)connect emits it once. Lives for the whole
+                // session (reconnects reuse the same manager). See `dedup_on_connected`.
+                let last_connected_identity: Rc<RefCell<Option<String>>> =
+                    Rc::new(RefCell::new(None));
                 Callback::from(move |state: ConnectionState| {
                     if let Some(inner) = Weak::upgrade(&inner) {
                         if let Ok(mut inner) = inner.try_borrow_mut() {
@@ -1745,9 +1946,19 @@ impl VideoCallClient {
                     }
                     info!("Connection state changed: {state:?} in video call client");
 
+                    // Emit `on_connected` once per genuine connect (see
+                    // `dedup_on_connected`). The reconnect resets and viewport
+                    // re-send below still run on every `Connected` — they are
+                    // idempotent.
+                    let (should_emit_on_connected, new_last) =
+                        dedup_on_connected(&state, last_connected_identity.borrow().clone());
+                    *last_connected_identity.borrow_mut() = new_last;
+
                     match state {
                         ConnectionState::Connected { .. } => {
-                            on_connected.emit(());
+                            if should_emit_on_connected {
+                                on_connected.emit(());
+                            }
 
                             handle_connected_reconnect_resets(
                                 &inner,
@@ -2046,6 +2257,34 @@ impl VideoCallClient {
         false
     }
 
+    /// Issue #1883: THIS client's own ACTIVE transport, as the same
+    /// `"webtransport"` / `"websocket"` vocabulary the per-tile transport badge
+    /// maps (`transport_badge_from_str`). `None` when no connection is active yet
+    /// (pre-election cold start / disconnected) or the controller cell is
+    /// momentarily borrowed — a render-nothing default.
+    ///
+    /// Reflects the CURRENT elected transport, re-read each call: it resolves the
+    /// live elected/preserved connection (`ConnectionManager::get_active_connection`),
+    /// so it tracks election, reconnect, and WT→WS fallback rather than caching a
+    /// cold-start value. This is the LOCAL client-wide transport — distinct from a
+    /// remote peer's `peer_status`-reported transport (a decode-pipeline property
+    /// that only exists for REMOTE peers), which is why the self tile cannot use
+    /// the per-peer signal and needs this accessor.
+    pub fn active_transport(&self) -> Option<&'static str> {
+        if let Ok(cc) = self.connection_controller.try_borrow() {
+            if let Some(controller) = cc.as_ref() {
+                return controller.active_transport().map(|is_wt| {
+                    if is_wt {
+                        "webtransport"
+                    } else {
+                        "websocket"
+                    }
+                });
+            }
+        }
+        None
+    }
+
     /// Tear down only the active `ConnectionController` without touching
     /// the `Rc` cycles inside `Inner`. Used by `connect_with_rtt_testing`
     /// when a stale controller in `Failed` state needs to be replaced.
@@ -2152,6 +2391,31 @@ impl VideoCallClient {
         }
     }
 
+    /// Return all canvas elements currently wired to camera-video decoders,
+    /// as `[(session_id, HtmlCanvasElement)]`.
+    ///
+    /// This bypasses the Dioxus DOM entirely: the recording module calls this
+    /// to composite remote video even when `show_canvas = false` (budget
+    /// pressure, camera-on/off race, force_avatar, etc.).  Only peers whose
+    /// decoder has an attached canvas are included.
+    pub fn peer_video_canvases(&self) -> Vec<(String, web_sys::HtmlCanvasElement)> {
+        match self.inner.try_borrow() {
+            Ok(inner) => inner.peer_decode_manager.peer_video_canvases(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Notify the decoder manager that recording state changed.
+    ///
+    /// This compatibility hook intentionally does not alter decode allocation:
+    /// recordings follow the same local visibility/budget set as the UI, so an
+    /// opt-in recording cannot force off-screen decode work or publisher PLIs.
+    pub fn set_recording_active(&self, active: bool) {
+        if let Ok(inner) = self.inner.try_borrow() {
+            inner.peer_decode_manager.set_recording_active(active);
+        }
+    }
+
     /// Number of OTHER (remote) peers currently in the call — the count of
     /// [`sorted_peer_keys`](Self::sorted_peer_keys) WITHOUT cloning the key Vec.
     ///
@@ -2199,6 +2463,43 @@ impl VideoCallClient {
                     "Failed to borrow inner in get_peer_user_id for session_id: {}",
                     session_id
                 );
+                None
+            }
+        }
+    }
+
+    /// Authoritatively answer "is a peer with this `user_id` currently connected?"
+    ///
+    /// Distinct from [`has_peer_with_user_id`](Self::has_peer_with_user_id), which
+    /// fails to `false` on a busy borrow (fine for its toast-suppression use). This
+    /// variant preserves the borrow-fail signal so a pin-release decision can tell
+    /// "genuinely absent" from "couldn't read":
+    /// - `Some(true)`  — a connected peer resolves to `user_id`.
+    /// - `Some(false)` — the peer table was read AND no connected peer has that
+    ///   `user_id` (the peer genuinely left).
+    /// - `None`        — the `inner` borrow was momentarily busy, so the peer
+    ///   table could NOT be read this tick (issue #1172). A borrow-fail is NOT
+    ///   "peer gone".
+    ///
+    /// Callers deciding to RELEASE a pin (or any latched, per-peer UI state) must
+    /// treat `None` as "no reading this tick" and HOLD their prior state — never
+    /// as an absence. Resolving the whole question inside ONE borrow (rather than
+    /// pairing `sorted_peer_keys()` with per-key `get_peer_user_id()`, each of
+    /// which independently collapses to empty/`None` on a busy borrow) is what
+    /// makes the answer authoritative: an empty result can only mean genuine
+    /// absence, never an unread table.
+    pub fn peer_user_id_present(&self, user_id: &str) -> Option<bool> {
+        match self.inner.try_borrow() {
+            Ok(inner) => {
+                let mgr = &inner.peer_decode_manager;
+                let present = mgr
+                    .sorted_keys()
+                    .iter()
+                    .any(|sid| mgr.get(sid).is_some_and(|peer| peer.user_id == user_id));
+                Some(present)
+            }
+            Err(_) => {
+                warn!("Failed to borrow inner in peer_user_id_present for user_id: {user_id}");
                 None
             }
         }
@@ -2847,16 +3148,13 @@ impl VideoCallClient {
     /// This is useful for the UI to decide whether a PARTICIPANT_JOINED
     /// event represents a genuinely new participant or a reconnection of
     /// an already-known participant.
+    ///
+    /// Fails to `false` on a busy borrow — fine for its toast-suppression use
+    /// (worst case: one spurious join toast), unlike
+    /// [`peer_user_id_present`](Self::peer_user_id_present), whose callers
+    /// need to distinguish "genuinely absent" from "couldn't read".
     pub fn has_peer_with_user_id(&self, user_id: &str) -> bool {
-        match self.inner.try_borrow() {
-            Ok(inner) => inner.peer_decode_manager.sorted_keys().iter().any(|sid| {
-                inner
-                    .peer_decode_manager
-                    .get(sid)
-                    .is_some_and(|peer| peer.user_id == user_id)
-            }),
-            Err(_) => false,
-        }
+        self.peer_user_id_present(user_id).unwrap_or(false)
     }
 
     /// Returns `true` if a peer with the given `session_id` (as a decimal
@@ -3097,6 +3395,197 @@ impl VideoCallClient {
             ..Default::default()
         };
         self.send_packet(wrapper);
+    }
+
+    /// Send a unicast `PEER_EVENT` to `target_user_id` with the given `event_type`.
+    ///
+    /// Used by the UI to broadcast recording-state changes to every remote peer
+    /// (the caller must iterate `sorted_peer_keys()` / `get_peer_user_id()` and
+    /// call this once per peer).  `event_type` should be one of the
+    /// `PEER_EVENT_*` constants exported from `videocall_client`.
+    ///
+    /// `stream_id` carries the SENDER's own `session_id` (the value
+    /// `get_own_session_id` returns, or empty when the session has not yet been
+    /// assigned). Recording is a per-session/per-device action — one browser tab
+    /// can record while another tab of the SAME authenticated user does not — so
+    /// receivers key the per-recorder indicator on this session id, NOT on
+    /// `source_peer_id` (the user_id). Without it, two sessions of one account
+    /// would share a single recording bit and a non-recording sibling tab would
+    /// show a false indicator. Event types that don't care about the source
+    /// session (e.g. screen-decode-started) simply ignore it.
+    pub fn send_peer_event(&self, target_user_id: &str, event_type: &str) {
+        use videocall_types::protos::peer_event::PeerEvent;
+
+        // Stamp the sender's own session id so receivers can attribute the event
+        // to THIS connection rather than to every session of our user_id.
+        let source_session_id = self.get_own_session_id().unwrap_or_default();
+        let peer_event = PeerEvent {
+            target_peer_id: target_user_id.as_bytes().to_vec(),
+            source_peer_id: self.options.user_id.as_bytes().to_vec(),
+            event_type: event_type.to_string(),
+            stream_id: source_session_id,
+            ..Default::default()
+        };
+
+        let data = match peer_event.write_to_bytes() {
+            Ok(d) => d,
+            Err(e) => {
+                log::error!("Failed to serialize PeerEvent({event_type}): {e}");
+                return;
+            }
+        };
+
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::PEER_EVENT.into(),
+            user_id: self.options.user_id.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+        self.send_packet(wrapper);
+    }
+
+    /// Broadcast an ephemeral REACTION to the room (issue #1884).
+    ///
+    /// Modeled on the VIEWPORT/LAYER_PREFERENCE senders: build a `ReactionPacket`
+    /// and dispatch it on the reliable Control stream. The relay validates the
+    /// closed enum on ingress, rate-limits per sender, and RE-BROADCASTS it on
+    /// the media fan-out (self-skipping this sender — the UI renders its own
+    /// local echo on click, so it never relies on the wire for its own reaction).
+    ///
+    /// The inner `ReactionPacket` is CLEARTEXT — deliberately NOT E2EE-sealed
+    /// even when E2EE is enabled — because the relay must read `reaction` to
+    /// enforce the allowlist and a reaction is broadcast-public by definition
+    /// (see the proto doc). The `display_name` carried here is a COSMETIC
+    /// pre-join-cache-race fallback only (attribution anchors on the
+    /// relay-stamped envelope session_id); it is capped to the render cap so the
+    /// wire never carries more than the consumer will show.
+    ///
+    /// This method does NOT self-throttle: the UI gates each click through
+    /// [`crate::client::reactions::ReactionSelfThrottle`] first (so an
+    /// over-limit click is a silent no-op with pressed feedback but no echo),
+    /// then calls this only when the send is allowed.
+    pub fn send_reaction(&self, reaction: ReactionType) {
+        // Cap the local display name by CHARACTERS (never split a UTF-8
+        // codepoint) so the cosmetic in-packet name honors the <=64 cap.
+        let display_name: Vec<u8> = self
+            .options
+            .display_name
+            .chars()
+            .take(REACTION_DISPLAY_NAME_MAX_CHARS)
+            .collect::<String>()
+            .into_bytes();
+        let packet = ReactionPacket {
+            reaction: reaction.into(),
+            display_name,
+            ..Default::default()
+        };
+        let data = match packet.write_to_bytes() {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to serialize ReactionPacket: {e}");
+                return;
+            }
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::REACTION.into(),
+            user_id: self.options.user_id.as_bytes().to_vec(),
+            data,
+            ..Default::default()
+        };
+        self.send_packet(wrapper);
+    }
+
+    /// Ensure the `SharedAudioContext` is initialised and expose it together
+    /// with the master gain node as `window.__vcSharedAudioCtx` /
+    /// `window.__vcMasterGain` so the JS recording module can build its own
+    /// composite audio mix (remote peers + local mic + screen-share) directly
+    /// on top of the shared graph.
+    pub fn prepare_recording_audio_stream(&self) {
+        crate::audio::shared_audio_context::SharedAudioContext::prepare_recording_stream();
+    }
+
+    /// Expose `window.__vcGetPeerVideoCanvases` as a JS callable that returns an
+    /// `Array` of `{id, canvas}` objects for every peer whose video decoder has
+    /// an attached canvas element.
+    ///
+    /// Called once before recording starts so the JS recording module can call
+    /// `window.__vcGetPeerVideoCanvases()` on every `drawFrame()` tick and read
+    /// peer canvases directly from the decoder — bypassing the Dioxus DOM and
+    /// avoiding the `show_canvas = false` / budget-pressure / camera-on-race
+    /// that causes remote video to be missed.
+    ///
+    /// Also installs the parallel `window.__vcGetPeerScreenCanvases` so the
+    /// recording module can composite remote screen shares directly from the
+    /// screen-decoder canvas, avoiding the DOM lookup on `.split-screen-tile`
+    /// that misses screen shares started mid-recording.
+    pub fn prepare_recording_peer_canvases(&self) {
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+
+        // ── window.__vcGetPeerVideoCanvases ──────────────────────────────
+        {
+            let inner = self.inner.clone();
+            let closure =
+                wasm_bindgen::closure::Closure::<dyn Fn() -> js_sys::Array>::new(move || {
+                    let arr = js_sys::Array::new();
+                    if let Ok(inner) = inner.try_borrow() {
+                        for (sid, canvas) in inner.peer_decode_manager.peer_video_canvases() {
+                            let obj = js_sys::Object::new();
+                            let _ = js_sys::Reflect::set(
+                                &obj,
+                                &wasm_bindgen::JsValue::from_str("id"),
+                                &wasm_bindgen::JsValue::from_str(&sid),
+                            );
+                            let _ = js_sys::Reflect::set(
+                                &obj,
+                                &wasm_bindgen::JsValue::from_str("canvas"),
+                                &wasm_bindgen::JsValue::from(canvas),
+                            );
+                            arr.push(&wasm_bindgen::JsValue::from(obj));
+                        }
+                    }
+                    arr
+                });
+            let _ = js_sys::Reflect::set(
+                &window,
+                &wasm_bindgen::JsValue::from_str("__vcGetPeerVideoCanvases"),
+                closure.as_ref(),
+            );
+            closure.forget(); // keep alive for the duration of the page
+        }
+
+        // ── window.__vcGetPeerScreenCanvases ─────────────────────────────
+        {
+            let inner = self.inner.clone();
+            let closure =
+                wasm_bindgen::closure::Closure::<dyn Fn() -> js_sys::Array>::new(move || {
+                    let arr = js_sys::Array::new();
+                    if let Ok(inner) = inner.try_borrow() {
+                        for (sid, canvas) in inner.peer_decode_manager.peer_screen_canvases() {
+                            let obj = js_sys::Object::new();
+                            let _ = js_sys::Reflect::set(
+                                &obj,
+                                &wasm_bindgen::JsValue::from_str("id"),
+                                &wasm_bindgen::JsValue::from_str(&sid),
+                            );
+                            let _ = js_sys::Reflect::set(
+                                &obj,
+                                &wasm_bindgen::JsValue::from_str("canvas"),
+                                &wasm_bindgen::JsValue::from(canvas),
+                            );
+                            arr.push(&wasm_bindgen::JsValue::from(obj));
+                        }
+                    }
+                    arr
+                });
+            let _ = js_sys::Reflect::set(
+                &window,
+                &wasm_bindgen::JsValue::from_str("__vcGetPeerScreenCanvases"),
+                closure.as_ref(),
+            );
+            closure.forget(); // keep alive for the duration of the page
+        }
     }
 
     // NOTE(#1108): `subscribe_diagnostics` (the per-(media-type) channel that
@@ -3552,6 +4041,20 @@ impl Inner {
                 self.peer_decode_manager
                     .ensure_peer(response.session_id, &peer_user_id)
             };
+        // Issue #1878: refresh the decode manager's view of THIS client's active
+        // transport from the authoritative controller signal before decoding, so
+        // the per-peer audio-datagram-loss tracker is scoped to WebTransport and
+        // stays correct across re-election and WT↔WS transport switches (no stale
+        // cache). Reads `false` when the controller is momentarily borrowed or no
+        // connection is active — the safe default (no datagram-loss accounting).
+        let receiver_on_webtransport = self
+            .connection_controller
+            .try_borrow()
+            .ok()
+            .and_then(|cc| cc.as_ref().map(|c| c.active_is_webtransport()))
+            .unwrap_or(false);
+        self.peer_decode_manager
+            .set_receiver_on_webtransport(receiver_on_webtransport);
         match response.packet_type.enum_value() {
             Ok(PacketType::AES_KEY) => {
                 // Observer/lobby clients must not receive encryption keys (defense-in-depth).
@@ -4488,6 +4991,62 @@ impl Inner {
                     self.seed_local_congestion_and_publish(now_ms, false);
                 }
             }
+            Ok(PacketType::REACTION) => {
+                // #1884: a peer's ephemeral reaction, re-broadcast to the room on
+                // the media fan-out. The inner ReactionPacket is CLEARTEXT (the
+                // relay validated the closed enum at ingress); we re-validate here
+                // (defense-in-depth) and IGNORE anything the relay would have
+                // dropped, so a bug/downgrade on either side fails safe.
+                //
+                // Self-skip: the relay never re-broadcasts us our OWN reaction
+                // (it self-skips the source on the fan-out), but the transport
+                // self-filter can still let a self-stamped packet through during
+                // an election, so guard here too. Mirror the sibling
+                // CONGESTION/LAYER_HINT arms: skip when the envelope session_id is
+                // our current session OR any recent one in `session_id_history`,
+                // so a self-reaction stamped with a superseded session_id after a
+                // re-election is not double-rendered (local echo + wire). The
+                // sender renders its own echo locally on click, never from the wire.
+                if self.own_session_id == Some(response.session_id)
+                    || self.session_id_history.contains(&response.session_id)
+                {
+                    return peer_status;
+                }
+                match ReactionPacket::parse_from_bytes(&response.data) {
+                    Ok(reaction) => match reaction.reaction.enum_value() {
+                        // Unknown/reserved (Err) or UNSPECIFIED: not a renderable
+                        // reaction — ignore, matching the relay ingress allowlist.
+                        Err(_) | Ok(ReactionType::REACTION_TYPE_UNSPECIFIED) => {}
+                        // Any defined 1..=7 reaction.
+                        Ok(_) => {
+                            if let Some(cb) = &self.options.on_reaction {
+                                // Attribution anchor: the envelope session_id,
+                                // resolved via the display-name cache. For
+                                // REACTION the relay stamps this UNCONDITIONALLY
+                                // with the sender's authenticated session before
+                                // fan-out (stamp_reaction_for_broadcast in
+                                // actix-api), so it is a TRUSTWORTHY identity
+                                // anchor here — a peer cannot forge a reaction
+                                // attributed to another participant (the general
+                                // "stamped only when the client sends 0" rule,
+                                // which leaves other cleartext types forgeable,
+                                // does not apply to REACTION). The in-packet
+                                // display_name remains a sanitized cosmetic
+                                // fallback ONLY, never identity.
+                                let cached = self
+                                    .peer_decode_manager
+                                    .get_peer_display_name(&response.session_id.to_string());
+                                let name =
+                                    resolve_reaction_display_name(cached, &reaction.display_name);
+                                cb.emit((response.session_id, reaction.reaction.value(), name));
+                            }
+                        }
+                    },
+                    Err(e) => {
+                        debug!("Failed to parse REACTION packet: {e}");
+                    }
+                }
+            }
             Ok(PacketType::PACKET_TYPE_UNKNOWN) => {
                 error!(
                     "Received packet with unknown packet type from {}",
@@ -4640,6 +5199,7 @@ mod disconnect_tests {
             vad_threshold: None,
             on_peer_left: None,
             on_peer_joined: None,
+            on_reaction: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
@@ -4842,6 +5402,7 @@ mod dedup_tests {
             vad_threshold: None,
             on_peer_left: None,
             on_peer_joined: None,
+            on_reaction: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
@@ -5196,6 +5757,7 @@ mod cooldown_reset_hardening_tests {
             on_meeting_settings_updated: None,
             on_peer_left: None,
             on_peer_joined: None,
+            on_reaction: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,
@@ -6105,6 +6667,13 @@ fn suppresses_peer_creation(
 /// to this set without first reconciling it with the transport-filter whitelist
 /// (the two gates must agree), which is exactly what #1481 tracks.
 fn suppresses_peer_creation_for_packet(response: &PacketWrapper, decode_media: bool) -> bool {
+    // #1884: a REACTION is a room-wide ephemeral broadcast rendered as a floating
+    // overlay, NOT a participant tile. It must never spawn a peer — a camera-off
+    // participant who only reacts would otherwise get a spurious empty tile. Its
+    // sender name resolves via the display-name cache, independent of any tile.
+    if response.packet_type == PacketType::REACTION.into() {
+        return true;
+    }
     let is_self_addressed_control = response.packet_type == PacketType::CONGESTION.into()
         || response.packet_type == PacketType::LAYER_HINT.into();
     suppresses_peer_creation(
@@ -6223,6 +6792,22 @@ mod self_peer_suppression_tests {
         assert!(
             suppresses_peer_creation_for_packet(&p, true),
             "SESSION_ASSIGNED must be suppressed purely on packet type (our own session)"
+        );
+    }
+
+    /// #1884: a REACTION is a room-wide ephemeral broadcast rendered as a
+    /// floating overlay, NOT a participant tile. A foreign nonzero-session
+    /// REACTION with decode on must still be suppressed purely on packet type —
+    /// otherwise a camera-off participant who only reacts gets a spurious empty
+    /// tile. ADVERSARIAL: remove the early-return in
+    /// `suppresses_peer_creation_for_packet` and this flips (the packet would be
+    /// treated like foreign MEDIA and create a peer).
+    #[test]
+    fn wiring_reaction_packet_is_suppressed() {
+        let p = packet(PacketType::REACTION, 42, b"alice@example.com");
+        assert!(
+            suppresses_peer_creation_for_packet(&p, true),
+            "a REACTION must never create a peer tile (it renders as a floating overlay)"
         );
     }
 

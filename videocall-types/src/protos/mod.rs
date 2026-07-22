@@ -11,6 +11,7 @@ pub mod media_packet;
 pub mod meeting_packet;
 pub mod packet_wrapper;
 pub mod peer_event;
+pub mod reaction_packet;
 pub mod rsa_packet;
 pub mod server_connection_packet;
 pub mod viewport_packet;

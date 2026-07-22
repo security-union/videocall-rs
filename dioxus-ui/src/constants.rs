@@ -877,6 +877,7 @@ pub fn oauth_flow() -> Option<String> {
 pub fn is_pkce_flow() -> bool {
     oauth_enabled().unwrap_or(false) && oauth_flow().as_deref() == Some("pkce")
 }
+
 pub fn meeting_api_base_url() -> Result<String, String> {
     app_config().map(|c| {
         c.meeting_api_base_url

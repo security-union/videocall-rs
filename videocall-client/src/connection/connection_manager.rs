@@ -487,6 +487,7 @@ pub enum ConnectionState {
         server_url: String,
         rtt: f64,
         is_webtransport: bool,
+        connection_id: String,
     },
     Reconnecting {
         server_url: String,
@@ -3962,6 +3963,7 @@ impl ConnectionManager {
                         server_url: url_redact::redact_for_diag(measurement.url.as_str()),
                         rtt: measurement.average_rtt.unwrap_or(0.0),
                         is_webtransport: measurement.is_webtransport,
+                        connection_id: connection_id.clone(),
                     }
                 } else {
                     ConnectionState::Failed {
@@ -4156,9 +4158,21 @@ impl ConnectionManager {
     /// start) — the safe default: no early-seed runs until a WebTransport
     /// winner is actually elected.
     pub fn active_is_webtransport(&self) -> bool {
+        self.active_transport().unwrap_or(false)
+    }
+
+    /// The active connection's transport as a tri-state (issue #1883):
+    /// `Some(true)` = WebTransport, `Some(false)` = WebSocket, `None` = no active
+    /// connection yet (pre-election cold start / disconnected). Reads the SAME
+    /// elected/preserved connection [`Self::get_active_connection`] resolves — the
+    /// winner in `connections`, or the preserved `old_active_connection` during
+    /// re-election — so it reflects the CURRENT transport across election,
+    /// reconnect, and WT→WS fallback. Unlike [`Self::active_is_webtransport`],
+    /// which collapses "no connection" and "WS" both to `false`, this keeps them
+    /// distinct so a caller can render "WS" vs "not yet known".
+    pub fn active_transport(&self) -> Option<bool> {
         self.get_active_connection()
             .map(|conn| conn.is_webtransport())
-            .unwrap_or(false)
     }
 
     pub fn disconnect(&mut self) -> anyhow::Result<()> {
@@ -4295,6 +4309,7 @@ impl ConnectionManager {
                         server_url: url_redact::redact_for_diag(measurement.url.as_str()),
                         rtt: measurement.average_rtt.unwrap_or(0.0),
                         is_webtransport: measurement.is_webtransport,
+                        connection_id: connection_id.clone(),
                     }
                 } else {
                     ConnectionState::Failed {
@@ -6917,6 +6932,69 @@ mod tests {
         );
     }
 
+    /// Issue #1883: the tri-state `active_transport` distinguishes "no active
+    /// connection" (`None`) from an active WS connection (`Some(false)`) — the
+    /// distinction the self-tile badge needs (render nothing vs render "WS").
+    /// `active_is_webtransport` collapses both to `false`, so it cannot.
+    ///
+    /// MUTATION CHECK: pre-election must be `None` (fails if it returns
+    /// `Some(false)`); WS winner must be `Some(false)` (fails if `None` or
+    /// `Some(true)`); WT winner must be `Some(true)`.
+    #[test]
+    fn active_transport_tri_state_across_lifecycle() {
+        // Pre-election / disconnected: no active connection → None (NOT Some(false)).
+        let mgr = make_test_manager();
+        assert_eq!(mgr.active_transport(), None);
+        assert!(!mgr.active_is_webtransport());
+
+        // Elected WebSocket winner → Some(false) (distinct from the None above).
+        let mut mgr = make_test_manager();
+        mgr.connections.insert(
+            "ws_0".to_string(),
+            Connection::new_for_test_with_transport(false),
+        );
+        *mgr.active_connection_id.borrow_mut() = Some("ws_0".to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "ws_0".to_string(),
+            elected_at: 0.0,
+        };
+        assert_eq!(mgr.active_transport(), Some(false));
+
+        // Elected WebTransport winner → Some(true).
+        let mut mgr = make_test_manager();
+        mgr.connections.insert(
+            "wt_0".to_string(),
+            Connection::new_for_test_with_transport(true),
+        );
+        *mgr.active_connection_id.borrow_mut() = Some("wt_0".to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "wt_0".to_string(),
+            elected_at: 0.0,
+        };
+        assert_eq!(mgr.active_transport(), Some(true));
+
+        // WT→WS TRANSITION on the SAME manager instance (the fallback / re-election
+        // case the accessor exists to reflect): re-point the active connection to a
+        // WS connection and confirm the read FLIPS Some(true) → Some(false). This
+        // pins the "reflects the CURRENT transport, re-read each call" contract —
+        // the earlier blocks each use a fresh manager, so without this the accessor
+        // could cache and still pass them.
+        mgr.connections.insert(
+            "ws_1".to_string(),
+            Connection::new_for_test_with_transport(false),
+        );
+        *mgr.active_connection_id.borrow_mut() = Some("ws_1".to_string());
+        mgr.election_state = ElectionState::Elected {
+            connection_id: "ws_1".to_string(),
+            elected_at: 1.0,
+        };
+        assert_eq!(
+            mgr.active_transport(),
+            Some(false),
+            "after re-electing a WS winner the accessor must reflect the NEW transport"
+        );
+    }
+
     // ===================================================================
     // 8. ReconnectionPhase and ConnectionState enum variants
     // ===================================================================
@@ -6953,6 +7031,7 @@ mod tests {
             server_url: "wss://test".to_string(),
             rtt: 42.0,
             is_webtransport: true,
+            connection_id: "wt_0".to_string(),
         };
         assert!(matches!(connected, ConnectionState::Connected { .. }));
 

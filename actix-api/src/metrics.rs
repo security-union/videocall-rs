@@ -616,6 +616,21 @@ lazy_static! {
     )
     .expect("Failed to create keyframe_requests_per_sec metric");
 
+    /// Per-peer windowed receive-side audio DATAGRAM loss rate (#1878). Audio
+    /// sibling of `videocall_video_seq_loss_per_sec`, and like it recovers to 0
+    /// rather than latching. Reads 0.0 on WebSocket (audio rides ordered TCP, so
+    /// datagram loss is impossible) and ~0 on E2EE-WT (audio on the reliable
+    /// unistream); the client folds 0.0 on a mid-call WT→WS fallback so the gauge
+    /// un-latches. Sustained nonzero => plaintext-datagram audio dropped (e.g.
+    /// incoming-datagram queue overflow on a main-thread stall), a burst-loss
+    /// NetEQ cannot conceal.
+    pub static ref AUDIO_DATAGRAM_LOSS_PER_SEC: GaugeVec = register_gauge_vec!(
+        "videocall_audio_datagram_loss_per_sec",
+        "Per-peer windowed receive-side audio datagram loss rate (lost audio packets/sec) observed by a WebTransport receiver; sustained nonzero => audio datagrams being dropped",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create audio_datagram_loss_per_sec metric");
+
     /// Per-peer buffered video playout latency in ms (#1252): how far behind live a receiver's
     /// decoded video is, spanning the jitter-buffer backlog (stage 1) + WebCodecs decoder queue
     /// (stage 2). Reported only while the tile is actively receiving (fps_received > 0); 0 = at
@@ -1097,6 +1112,75 @@ lazy_static! {
         &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
     )
     .expect("Failed to create screen_video_bitrate_kbps metric");
+
+    // ----- Screen-share playout family (#1660) -----
+    //
+    // Screen-prefixed siblings of the camera VIDEO_PLAYOUT_* / VIDEO_CONTENT_STALENESS_MS /
+    // VIDEO_SKIP_TO_LIVE_TOTAL family. Screen-decoder playout stats are the SAME VideoStats
+    // shape as camera (produced by the same decoder playout path), and PR #1657 routed them
+    // into the client's screen_video_stats bucket; #1660 exports that bucket. A dedicated
+    // screen-prefixed gauge (not a stream_kind label on the camera gauges) matches the
+    // SCREEN_VIDEO_FPS / SCREEN_VIDEO_BITRATE_KBPS precedent above and keeps the camera series
+    // byte-identical so existing camera dashboards/alerts don't silently start blending in
+    // screen series. Same 6-label pair set as the camera family, so per-pair
+    // `remove_per_peer_metrics` cleanup GCs them the same way.
+
+    /// Per-peer buffered screen-share playout latency in ms (#1660): screen sibling of
+    /// `videocall_video_playout_latency_ms`. How far behind live a receiver's decoded screen
+    /// video is (jitter-buffer backlog + decoder queue). Reported only while the tile is
+    /// actively receiving (fps_received > 0); 0 = at live.
+    pub static ref SCREEN_VIDEO_PLAYOUT_LATENCY_MS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_playout_latency_ms",
+        "Per-peer buffered screen-share playout latency in ms (how far behind live); screen sibling of videocall_video_playout_latency_ms",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create screen_video_playout_latency_ms metric");
+
+    /// Per-peer stage-1 attribution of `videocall_screen_video_playout_latency_ms` (#1660): the
+    /// jitter-buffer backlog span alone. Screen sibling of
+    /// `videocall_video_playout_stage1_span_ms`.
+    pub static ref SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_playout_stage1_span_ms",
+        "Per-peer jitter-buffer backlog span in ms — stage-1 attribution of videocall_screen_video_playout_latency_ms",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create screen_video_playout_stage1_span_ms metric");
+
+    /// Per-peer stage-3 paint lag in ms for the screen stream (#1660): decoded-but-unpainted
+    /// backlog in the worker->main postMessage + paint queues. Screen sibling of
+    /// `videocall_video_playout_paint_lag_ms`. Reported only while fps_received > 0; 0 = at live.
+    pub static ref SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_playout_paint_lag_ms",
+        "Per-peer stage-3 paint lag in ms for the screen stream — decoded-but-unpainted backlog in the worker->main postMessage + paint queues (#1660)",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create screen_video_playout_paint_lag_ms metric");
+
+    /// Per-peer content staleness in ms for the screen stream (#1660): the AGE of the screen
+    /// content currently being painted, as distinct from the queue-DEPTH gauges above. Screen
+    /// sibling of `videocall_video_content_staleness_ms`. UNBOUNDED (unlike playout_latency_ms's
+    /// 1800ms client cap) — this is the gauge that lets a screen-share freeze that drains stale
+    /// content (paint_lag ~0 while content ages by minutes) be charted, which the camera-only
+    /// export could not do. Reported only while fps_received > 0; 0 = at live.
+    pub static ref SCREEN_VIDEO_CONTENT_STALENESS_MS: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_content_staleness_ms",
+        "Per-peer content age in ms of the painted screen video — screen content-staleness (#1660); UNBOUNDED (unlike playout_latency_ms's 1800ms cap). A screen stream draining stale content keeps paint_lag ~0 while this climbs",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create screen_video_content_staleness_ms metric");
+
+    /// Per-peer cumulative count of resync-to-live governor skips for the screen stream (#1660):
+    /// screen sibling of `videocall_video_skip_to_live_total`. A COUNTER value held in a GaugeVec
+    /// (set to the current cumulative total) so per-pair `remove_label_values` cleanup GCs it with
+    /// the sibling screen playout gauges. Reported unconditionally (even at fps 0); resets to 0 on
+    /// the client's `reset_pipeline()`, so query with `increase()`/`rate()`. A rising value proves
+    /// the screen-stream governor fired.
+    pub static ref SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL: GaugeVec = register_gauge_vec!(
+        "videocall_screen_video_skip_to_live_total",
+        "Cumulative resync-to-live governor skips per receiver→source pair for the screen stream (#1660); a rising value proves the governor fired",
+        &["meeting_id", "session_id", "from_peer", "to_peer", "reporter_name", "peer_name"]
+    )
+    .expect("Failed to create screen_video_skip_to_live_total metric");
 
     // ===== TIER TRANSITION COUNTER =====
     //

@@ -97,6 +97,20 @@ pub struct MediaMetricsOverlay {
     pub audio_kbps: Option<u32>,
 }
 
+/// Issue 1821: pre-resolved stats for the shared-content tile's overlay. Built in
+/// `peer_tile.rs` (only for the ScreenOnly sharer tile, and only when the
+/// diagnostics checkbox is on) from the `screen_resolution` (decoded WxH) and
+/// `screen_fps` (arrival rate) signals the tile already maintains. Screen shares
+/// carry no audio in this app, so there is no audio field.
+#[derive(Clone, PartialEq, Debug)]
+pub struct ScreenMetricsOverlay {
+    /// Decoded screen-share resolution `(width, height)` in px. `None` → em-dash
+    /// (not yet decoded).
+    pub resolution: Option<(u32, u32)>,
+    /// Screen-share frames per second (arrival rate). `None` → em-dash.
+    pub fps: Option<f64>,
+}
+
 /// Parse a `"{w}x{h}"` resolution string (the format `peer_tile.rs` stores in its
 /// `video_resolution` signal) into `(w, h)`. Returns `None` for an empty or
 /// malformed string, or if either dimension is 0. Pure / host-tested.
@@ -299,9 +313,91 @@ pub fn media_metrics_overlay(data: Option<&MediaMetricsOverlay>) -> Element {
     }
 }
 
+/// Issue 1821: format the shared-content stats line — `"↓ 1920×1080 · 30fps"`.
+/// Received-only (screen always arrives FROM a peer), so it always leads with the
+/// `↓` glyph and has NO audio segment. Each field independently renders an
+/// em-dash (`\u{2014}`) when absent so the shape is stable pre-decode. Pure /
+/// host-tested — a wording change breaks a test.
+pub fn format_screen_metrics_line(resolution: Option<(u32, u32)>, fps: Option<f64>) -> String {
+    let dash = "\u{2014}";
+    let res = resolution
+        .map(|(w, h)| format!("{w}\u{00d7}{h}"))
+        .unwrap_or_else(|| dash.to_string());
+    let fps = fps
+        .map(|f| format!("{}fps", f.round() as i64))
+        .unwrap_or_else(|| format!("{dash}fps"));
+    format!("\u{2193} {res} \u{b7} {fps}")
+}
+
+/// Issue 1821: render the shared-content tile's stats overlay for `data`, or an
+/// empty node when `None` (checkbox off / not the sharer tile). `aria-hidden`
+/// and `pointer-events: none` (CSS) exactly like the camera
+/// [`media_metrics_overlay`] — a passive, decorative duplicate of data the
+/// diagnostics drawer already exposes; the checkbox is the AT control.
+pub fn screen_metrics_overlay(data: Option<&ScreenMetricsOverlay>) -> Element {
+    let Some(d) = data else {
+        return rsx! {};
+    };
+    let line = format_screen_metrics_line(d.resolution, d.fps);
+    rsx! {
+        div {
+            class: "media-metrics-overlay media-metrics-overlay--screen",
+            "aria-hidden": "true",
+            "data-testid": "media-metrics-overlay-screen",
+            "{line}"
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn formats_screen_line_full() {
+        // issue 1821: received-only (↓), no audio segment.
+        assert_eq!(
+            format_screen_metrics_line(Some((1920, 1080)), Some(30.0)),
+            "\u{2193} 1920\u{00d7}1080 \u{b7} 30fps"
+        );
+    }
+
+    #[test]
+    fn screen_line_rounds_fps_and_em_dashes_missing() {
+        // fps rounds to a whole number.
+        assert_eq!(
+            format_screen_metrics_line(Some((1280, 720)), Some(14.6)),
+            "\u{2193} 1280\u{00d7}720 \u{b7} 15fps"
+        );
+        // Pre-decode: both fields em-dash, shape preserved, still no audio segment.
+        assert_eq!(
+            format_screen_metrics_line(None, None),
+            "\u{2193} \u{2014} \u{b7} \u{2014}fps"
+        );
+        // Resolution known, fps not yet.
+        assert_eq!(
+            format_screen_metrics_line(Some((640, 360)), None),
+            "\u{2193} 640\u{00d7}360 \u{b7} \u{2014}fps"
+        );
+    }
+
+    #[test]
+    fn screen_line_has_no_audio_segment() {
+        // issue 1821 (guard): the screen line must never carry the "· Nk" audio
+        // segment the camera line has — screen shares carry no audio here. If
+        // someone copies the camera formatter, the "k" tail would appear.
+        let line = format_screen_metrics_line(Some((1920, 1080)), Some(30.0));
+        assert!(
+            !line.contains('k'),
+            "screen line must have no audio segment: {line}"
+        );
+        // Exactly two dot-separated segments (res · fps), not three.
+        assert_eq!(
+            line.matches('\u{b7}').count(),
+            1,
+            "screen line has one middot: {line}"
+        );
+    }
 
     #[test]
     fn parses_valid_resolution() {

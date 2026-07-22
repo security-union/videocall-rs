@@ -269,6 +269,206 @@ const SCREEN_STATIC_REENCODE_POLL_MS: u32 = 150;
 /// sustained joiner churn.
 const SCREEN_SYNTHETIC_LOG_THROTTLE_MS: f64 = 1_000.0;
 
+/// Post-quiet budget of static-share keyframe FLOOR emits (issue #1903).
+///
+/// When a screen share goes STATIC (capture stops emitting frames) the encode loop's timer branch
+/// re-encodes the retained frame as a keyframe on a wall-clock FLOOR
+/// (`SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`) so a receiver whose `KEYFRAME_REQUEST` was LOST — WS
+/// HOL-blocking, relay suppression, packet loss — still recovers even though its PLI never reached
+/// the publisher. The pre-#1903 code only re-encoded the retained frame ON a pending PLI, so a lost
+/// PLI meant an indefinite freeze on stale content (the field's "shared content freezes and never
+/// refreshes"). Without this floor the periodic GOP keyframe fires ONLY in the real-frame branch, so
+/// a paused capture emits no keyframe at all between PLIs.
+///
+/// The floor is BOUNDED — not a perpetual idle-bandwidth drain — in two independent ways: (1) it
+/// fires at most once per `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS` (the same 3s cadence the
+/// moving-content periodic GOP uses, so a share emits keyframes at one uniform cadence whether moving
+/// or paused, and never at capture fps); and (2) this budget caps how many CONSECUTIVE floor
+/// keyframes go out after the last real frame. Each real captured frame REPLENISHES the budget, so
+/// every content change earns a fresh recovery window (covering a change whose delta was lost to some
+/// receiver), and a genuinely-idle share (content unchanged for minutes — where every receiver is
+/// already showing the correct last frame) stops re-encoding after `BUDGET` cycles instead of
+/// spending ~150KB/3s room-wide forever.
+///
+/// 4: at the 3s floor that is a 12s post-quiet recovery window — comfortably longer than a receiver's
+/// own reactive retry/escalation cadence (the codecs jitter buffer re-arms its proactive PLI and
+/// escalates within ~6–8s), so a lost PLI has several independent chances to be covered before the
+/// floor backs off. A PLI arriving after the budget is spent is still served immediately by the
+/// existing on-demand path (that path is ungated by this budget).
+const SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET: u32 = 4;
+/// Compile-time guard: the floor must permit at least one post-quiet recovery keyframe. A `0` budget
+/// would silently disable the #1903 insurance path (the timer branch's `maybe_floor` gate is never
+/// true), re-opening the "freeze never refreshes" defect with no test failing.
+const _: () = assert!(SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET > 0);
+
+/// Pure decision for the static-share keyframe FLOOR (issue #1903), extracted as a host-testable
+/// free function (mirroring `should_teardown_shed_layer` / `periodic_keyframe_due`) so the
+/// wall-clock + budget gate is pinned by a native unit test off the wasm-only encode loop.
+///
+/// Returns `true` iff a floor keyframe is due NOW: the post-quiet `budget_remaining` is not yet
+/// exhausted AND at least `floor_ms` has elapsed since the last keyframe of ANY kind
+/// (`last_keyframe_emit_ms`, updated by every periodic/forced/floor emit). `None` last-emit ⇒ `false`:
+/// on a share that has not emitted a keyframe yet there is no retained frame to re-encode, and the
+/// real-frame branch owns the first keyframe. The `>=` boundary is inclusive, matching
+/// `periodic_keyframe_due`.
+fn static_keyframe_floor_due(
+    now_ms: f64,
+    last_keyframe_emit_ms: Option<f64>,
+    floor_ms: f64,
+    budget_remaining: u32,
+) -> bool {
+    if budget_remaining == 0 {
+        return false;
+    }
+    match last_keyframe_emit_ms {
+        Some(last) => now_ms - last >= floor_ms,
+        None => false,
+    }
+}
+
+/// Static-share keyframe-FLOOR budget transition on a FLOOR emit (issue #1903): consume exactly one
+/// unit, saturating at 0. Single source of truth for the encode loop's post-emit decrement, extracted
+/// so a native test pins it — without this, deleting the loop's decrement would let the floor emit
+/// every `SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS` FOREVER on a truly-idle share (unbounded idle
+/// bandwidth), and every existing test would still pass.
+fn floor_budget_after_emit(budget_remaining: u32) -> u32 {
+    budget_remaining.saturating_sub(1)
+}
+
+/// Static-share keyframe-FLOOR budget transition on a REAL captured frame (issue #1903): re-arm to the
+/// full `SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET` so every content change earns a fresh post-quiet recovery
+/// window. Single source of truth for the encode loop's replenish, extracted so a native test pins it —
+/// without this, dropping the replenish would cap the floor at `SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET`
+/// emits per encoder LIFETIME (a share that goes quiet, recovers, and goes quiet again would never
+/// re-issue floor keyframes), and every existing test would still pass.
+fn floor_budget_replenished() -> u32 {
+    SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET
+}
+
+/// How many simulcast layers (base + active upper rungs) a **pure-insurance** static-share FLOOR
+/// keyframe (issue #1903) should re-encode, given the current screen AQ tier (issue #1531 /
+/// #1903-perf follow-up). Pure + host-testable (sibling of [`static_keyframe_floor_due`]) so a
+/// native test pins the per-tier policy off the wasm-only encode loop.
+///
+/// ## Why the floor fan-out needs a pressure gate (the perf-review finding)
+/// The #1903 floor re-encodes the retained frame on the base layer AND every active higher layer
+/// (`local_active_layers`). During a STATIC capture the encoder queue reads clear (no frames are
+/// submitted), so the sender AQ's backpressure-driven layer-shed cannot re-evaluate — the active
+/// count does NOT track a degrading uplink. On a low/constrained screen tier that lets the floor
+/// fan a 2–3-layer keyframe burst (~200–800 kbps averaged) into a coordinated ~400 kbps window and
+/// crowd audio. This gate caps the floor's fan-out by the sustained AQ pressure signal — the tier
+/// index — INDEPENDENTLY of the (possibly stale-high) active count.
+///
+/// ## Signal: the screen tier index is the sustained-pressure projection
+/// The AQ controller steps the screen tier down under sustained congestion / backpressure / RTT, so
+/// the tier index is a coherent, already-in-scope projection of the same controller state the live
+/// fan-out consults via `shared_active_layer_count`. In the dominant "already-degraded-when-the-share
+/// paused" case (the reviewer's target) the controller has ALREADY stepped the tier to `medium`/`low`
+/// and shed to base while frames were still flowing, so the tier reads constrained at floor-emit time
+/// and this gate reduces the burst. The transient "healthy-at-pause, degrades-mid-static" edge is not
+/// caught by the tier (it, too, cannot step down without frames) but is bounded independently by the
+/// floor's own emit budget ([`SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET`], ~4 emits over ~12 s).
+///
+/// ## Modes (who recovers how) — [`SCREEN_QUALITY_TIERS`] is ordered high→low, so idx 0 = healthiest
+/// - **healthy tier (`high`, idx 0)** → FULL fan-out (`active_layers`). Every subscribed layer gets a
+///   keyframe; any receiver recovers directly.
+/// - **second-lowest (`medium`, idx `len-2`)** → base + the lowest active upper rung (`min(active, 2)`).
+///   Base and lowest-upper receivers recover from THIS floor; a receiver on a higher rung recovers via
+///   the next REAL captured frame (which always fans out to the full active set), via the controller
+///   shedding that rung (it migrates the receiver down through the relay layer-union), or via its own
+///   reactive PLI — which, when it reaches the publisher, is served at FULL active fan-out (the caller
+///   applies this gate ONLY to unrequested insurance emits, never to a pending PLI).
+/// - **lowest (`low`, idx `len-1`)** → base only. Under the lowest tier the controller has almost
+///   certainly already shed to base (`active == 1`), so there is typically no upper-layer receiver to
+///   strand; if a rung is transiently still active, its receiver recovers via the same real-frame /
+///   PLI paths above. This is the reviewer's "NOT base-only universally" caveat honored: base-only is
+///   confined to the scarcest tier, where crowding audio is the dominant harm.
+///
+/// The result is always clamped into `1..=active_layers`, so the base rung is always re-keyed and the
+/// gate can never fan OUT beyond what the live path already caps at.
+fn floor_fanout_layer_count(screen_tier_index: usize, active_layers: usize) -> usize {
+    let active = active_layers.max(1); // base (layer 0) is always published
+    let n = SCREEN_QUALITY_TIERS.len();
+    let ceiling = if n >= 2 && screen_tier_index >= n - 1 {
+        1 // lowest tier: base only
+    } else if n >= 3 && screen_tier_index == n - 2 {
+        active.min(2) // second-lowest: base + lowest active upper rung
+    } else {
+        active // healthy tier: full fan-out
+    };
+    ceiling.clamp(1, active)
+}
+
+/// The static-share keyframe-FLOOR accounting that MUST survive a screen-encoder `'restart`
+/// (issue #1903, live-stack root cause). Groups the two pieces of floor state a `'restart` previously
+/// wiped — the post-quiet emit `budget` and the floor's OWN cadence `clock_ms` — so both are carried
+/// across an encoder restart (fatal encode error / closed codec / stream replace) instead of being
+/// zeroed.
+///
+/// ## Why this exists (the live defect the unit tests missed)
+/// The first #1903 cut declared the budget INSIDE the `'restart` loop and drove the floor cadence off
+/// the encode loop's `last_keyframe_emit_ms`, which is ALSO re-declared to `None` inside `'restart`
+/// (its #1311 reset is deliberate). So any `'restart` reset BOTH to their disarmed values (budget 0 /
+/// clock `None`), and because ONLY a fresh REAL captured frame restores them, a share that had gone
+/// static (parked capture, no new frame) stayed permanently disarmed — the floor never fired on the
+/// live stack even though every pure-helper unit test passed. This account is held OUTSIDE `'restart`
+/// and carried across restarts by [`ScreenFloorAccount::carry_across_restart`], and it keeps its own
+/// cadence clock SEPARATE from `last_keyframe_emit_ms` precisely so it does not inherit that #1311
+/// reset.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScreenFloorAccount {
+    /// Post-quiet floor-emit budget; see [`SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET`]. `0` ⇒ backed off.
+    budget: u32,
+    /// Wall-clock (`performance.now()`, ms) of the last keyframe of ANY kind the floor has observed —
+    /// a real-arm periodic/PLI keyframe, or a timer-arm floor/PLI re-encode. Drives the floor's
+    /// ≥`floor_ms` cadence. `None` until the first keyframe (no retained frame to re-encode yet).
+    clock_ms: Option<f64>,
+}
+
+impl ScreenFloorAccount {
+    /// Cold state: no budget, no cadence anchor. Matches a share that has produced no frame yet.
+    fn idle() -> Self {
+        Self {
+            budget: 0,
+            clock_ms: None,
+        }
+    }
+
+    /// A real captured frame just published: re-arm the post-quiet budget so every content CHANGE
+    /// earns a fresh recovery window.
+    fn on_captured_frame(&mut self) {
+        self.budget = floor_budget_replenished();
+    }
+
+    /// A keyframe of any kind was emitted at `now_ms` (real-arm periodic/PLI, or a timer-arm PLI that
+    /// was not floor-driven): stamp the cadence anchor so the floor waits a full `floor_ms` before its
+    /// next keyframe. Does NOT touch the budget.
+    fn on_keyframe_emitted(&mut self, now_ms: f64) {
+        self.clock_ms = Some(now_ms);
+    }
+
+    /// A FLOOR keyframe was emitted at `now_ms`: consume one budget unit AND stamp the cadence anchor.
+    fn on_floor_emitted(&mut self, now_ms: f64) {
+        self.budget = floor_budget_after_emit(self.budget);
+        self.clock_ms = Some(now_ms);
+    }
+
+    /// Whether a floor keyframe is due now: budget available AND ≥`floor_ms` since the last keyframe.
+    fn floor_due(&self, now_ms: f64, floor_ms: f64) -> bool {
+        static_keyframe_floor_due(now_ms, self.clock_ms, floor_ms, self.budget)
+    }
+
+    /// Carry the account across an encoder `'restart` (issue #1903). Returns `self` UNCHANGED by
+    /// design: the budget and cadence clock survive a restart so a static share that restarts still
+    /// floors. Written as an explicit transition (rather than relying only on the field being declared
+    /// outside `'restart`) so the survival contract is pinned by a native test — reverting this to
+    /// `Self::idle()` reproduces the live permanent-disarm bug and fails
+    /// `floor_account_survives_restart_and_floors_on_static`.
+    fn carry_across_restart(self) -> Self {
+        self
+    }
+}
+
 /// Pure teardown decision (issue #1230, host-testable single source of truth) —
 /// sibling of the camera helper. Returns `true` iff `shed_since_ms` is `Some(t)`
 /// AND `now_ms - t >= dwell_threshold_ms`; `None` ⇒ `false` (not currently shed,
@@ -293,6 +493,18 @@ fn stop_media_stream_tracks(stream: &MediaStream) {
                 track.stop();
             }
         }
+    }
+}
+
+/// Close the retained static-share `VideoFrame` (issues #1841/#1903) if one is held, taking it out of
+/// `retained`. A held `VideoFrame` owns a native/GPU buffer, so every exit from the encode task must
+/// release it. Since #1903 stopped closing the retained frame on each `'restart` (so the static-share
+/// keyframe path survives a restart), the `'restart`-internal give-up `return;` paths — which bypass
+/// the encode loop's final cleanup — must call this before returning, or the frame leaks. Idempotent:
+/// a no-op on `None`, so it is safe on give-up paths that ran before any frame was retained.
+fn close_retained_frame(retained: &mut Option<VideoFrame>) {
+    if let Some(frame) = retained.take() {
+        frame.close();
     }
 }
 
@@ -2327,15 +2539,35 @@ impl ScreenEncoder {
         let mut _onended_handler: Option<Closure<dyn FnMut()>> = None;
 
         // Retained last-encoded VideoFrame for the static-share keyframe path (issue
-        // #1841). Declared OUTSIDE `'restart` so it is in scope for BOTH the
-        // per-restart cleanup (which closes it before a rebuild, since a frame at the
-        // OLD encoder dims must never reach a rebuilt encoder) and the final cleanup
-        // (which closes it on user-stop / unrecoverable exit). Set only inside the
+        // #1841). Declared OUTSIDE `'restart` so it is in scope for the final cleanup
+        // (which closes it on user-stop / unrecoverable exit) AND — post-#1903 — so it
+        // SURVIVES an encoder `'restart`: a static share that restarts (fatal encode
+        // error / closed codec / stream replace) has no fresh frame to re-seed it, so
+        // closing it on restart (as the pre-#1903 code did) left the static-share
+        // keyframe path — both the #1841 on-demand PLI re-encode AND the #1903 floor —
+        // with nothing to encode and thus permanently disarmed. Set only inside the
         // `'encode` loop, right after a successful encode, and holds EXACTLY ONE open
-        // frame at a time (close-prior-on-replace). A retained frame that outlived the
-        // encoder would leak a native/GPU buffer and stall the capture pipeline, so
-        // every teardown path closes it.
+        // frame at a time (close-prior-on-replace, so it never leaks along the encode
+        // path). The `'restart`-internal give-up `return;` paths bypass the final
+        // cleanup, so each closes it via `close_retained_frame` before returning.
+        //
+        // Re-encoding a retained frame whose native dims no longer match a rebuilt
+        // encoder (only possible after a DIMENSION-changing restart) is SAFE: Chromium's
+        // WebCodecs `VideoEncoder` SCALES the input frame to the configured dims and
+        // emits a valid keyframe — the exact behavior the #1841 path already relies on
+        // when it encodes a raw 1080p capture frame into downscaled simulcast-tier
+        // encoders every frame. So the recovery keyframe still goes out (scaled), and a
+        // genuine codec fault would surface asynchronously via the error callback, not a
+        // synchronous `encode_with_options` `Err`. Either way it self-heals on the next
+        // real frame — strictly better than the pre-#1903 permanent freeze.
         let mut last_encoded_frame: Option<VideoFrame> = None;
+        // Static-share keyframe-FLOOR accounting (issue #1903). Declared OUTSIDE
+        // `'restart` (alongside `last_encoded_frame`) so the budget and the floor's
+        // cadence clock SURVIVE an encoder restart — the live root cause was that the
+        // pre-fix budget/clock lived inside `'restart` and were zeroed on every restart,
+        // permanently disarming the floor on a static share. Carried across each restart
+        // by `ScreenFloorAccount::carry_across_restart` (a no-op by design).
+        let mut floor_account = ScreenFloorAccount::idle();
         // One-time INFO latch: `true` once the retained-frame path has served a
         // keyframe request, so the first engagement of the #1841 static path is a
         // single clear signal in field logs rather than a per-emit stream.
@@ -2343,6 +2575,10 @@ impl ScreenEncoder {
         // `performance.now()` of the last throttled synthetic-re-encode DEBUG line
         // (issue #1841), so the DEBUG path can't spam under sustained joiner churn.
         let mut last_synthetic_log_ms: f64 = 0.0;
+        // `performance.now()` of the last #1903 static-tick floor-state DEBUG line, throttled
+        // separately from the emit log so a QUIET (non-emitting) tick can still surface the floor's
+        // decision inputs once per window for e2e/field diagnosis without spamming every 150ms tick.
+        let mut last_floor_debug_ms: f64 = 0.0;
 
         // Setup FPS tracking and screen output handler.
         // These closures are created once and shared across encoder restarts
@@ -2458,6 +2694,9 @@ impl ScreenEncoder {
                             "Screen encoder failed after repeated restarts".to_string(),
                         );
                     }
+                    // #1903: this give-up return bypasses the encode loop's final cleanup, so release
+                    // the retained static-share frame here (it now survives `'restart`, so it may be held).
+                    close_retained_frame(&mut last_encoded_frame);
                     return;
                 }
                 // Check if stop() was called or track ended during backoff
@@ -2546,6 +2785,9 @@ impl ScreenEncoder {
                                     }
                                 }
                                 enabled.store(false, Ordering::Release);
+                                // #1903: release the retained static-share frame before this give-up
+                                // return bypasses the encode loop's final cleanup (it survives `'restart`).
+                                close_retained_frame(&mut last_encoded_frame);
                                 return;
                             }
                         },
@@ -2556,6 +2798,9 @@ impl ScreenEncoder {
                                 callback.emit(ScreenShareEvent::Failed(error_msg));
                             }
                             enabled.store(false, Ordering::Release);
+                            // #1903: release the retained static-share frame before this give-up return
+                            // bypasses the encode loop's final cleanup (it survives `'restart`).
+                            close_retained_frame(&mut last_encoded_frame);
                             return;
                         }
                     };
@@ -2914,6 +3159,11 @@ impl ScreenEncoder {
                     let msg = format!("ScreenEncoder: failed to create track processor: {e:?}");
                     error!("{msg}");
                     let _ = screen_encoder.close();
+                    // #1903: release the retained static-share frame before either give-up return below
+                    // bypasses the encode loop's final cleanup (it survives `'restart`). On the restart
+                    // path a frame from the prior session may be held; on the first attempt it is `None`
+                    // and this is a harmless no-op.
+                    close_retained_frame(&mut last_encoded_frame);
                     if restart_count > 0 {
                         // On restart, a processor failure means the capture track is dead.
                         // getDisplayMedia can't be re-called without a user gesture -- give up.
@@ -2951,6 +3201,9 @@ impl ScreenEncoder {
                     );
                     error!("{msg}");
                     let _ = screen_encoder.close();
+                    // #1903: release the retained static-share frame before this give-up return bypasses
+                    // the encode loop's final cleanup (it survives `'restart`).
+                    close_retained_frame(&mut last_encoded_frame);
                     cleanup_on_error(stream_ref, &enabled, &on_state_change, msg);
                     return;
                 }
@@ -2979,6 +3232,12 @@ impl ScreenEncoder {
             // its own reset via `keyframe_cooldown_reset` in the decision below (issue
             // #1311) — mirroring the camera encoder.
             let mut last_keyframe_emit_ms: Option<f64> = None;
+            // NOTE (issue #1903): the static-share keyframe-FLOOR budget and cadence clock are NOT
+            // declared here. They live in `floor_account` OUTSIDE `'restart` so they survive an encoder
+            // restart — declaring them here (as the first #1903 cut did, alongside `last_keyframe_emit_ms`)
+            // is exactly the live defect: a restart zeroed them and a static capture never restored them,
+            // permanently disarming the floor. `last_keyframe_emit_ms` still resets here on purpose (its
+            // #1311 cooldown must start clean per restart); the floor deliberately does NOT reuse it.
             let mut current_encoder_width = width;
             let mut current_encoder_height = height;
 
@@ -3408,45 +3667,70 @@ impl ScreenEncoder {
                         // so we never start a second read on the same reader.
                         read_fut = pending_read;
 
-                        // ON-DEMAND ONLY: service a pending PLI by re-encoding the
-                        // retained frame as a keyframe. We deliberately do NOT
-                        // synthesize the periodic GOP here — a static share emitting an
-                        // unchanged keyframe room-wide every interval would waste
-                        // idle bandwidth for no benefit, and any decoder that actually
-                        // needs a frame reliably fires a KEYFRAME_REQUEST (with backoff
-                        // + escalation; see videocall-codecs jitter_buffer), which sets
-                        // `force_keyframe`. If a future no-PLI decoder path is found,
-                        // this gate — not a periodic timer — is where to revisit it.
+                        // Re-encode the retained frame as a keyframe when EITHER a receiver's
+                        // KEYFRAME_REQUEST is pending (on-demand, issue #1841) OR the static-share
+                        // wall-clock FLOOR is due (issue #1903).
+                        //
+                        // The floor is the insurance path the pre-#1903 "on-demand only" gate lacked:
+                        // a paused capture never runs the real-frame arm, so the periodic GOP keyframe
+                        // (which lives there) never fires, and a receiver whose PLI was LOST — WS
+                        // HOL-blocking, relay suppression, packet loss — would hold stale content
+                        // forever ("shared content freezes and never refreshes"). The floor emits at
+                        // the SAME 3s cadence as the moving-content periodic GOP
+                        // (`SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`), so a share emits keyframes at
+                        // one uniform cadence whether moving or paused (never at capture fps), and is
+                        // bounded by `floor_account`'s budget so a truly-idle share backs off after a
+                        // few cycles instead of spending idle bandwidth room-wide forever. `floor_account`
+                        // lives OUTSIDE `'restart` (issue #1903 live fix) so this survives an encoder
+                        // restart on a static share.
                         let pli_pending = force_keyframe.load(Ordering::Acquire);
-                        if pli_pending {
+                        let now = window()
+                            .performance()
+                            .expect("Performance API not available")
+                            .now();
+                        let floor_due =
+                            floor_account.floor_due(now, SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS);
+                        // #1903 live-instrumentation: one throttled DEBUG line of the floor's decision
+                        // inputs on EVERY static tick — logged BEFORE the emit gate (and independent of
+                        // budget / retained-frame presence) so an e2e/field pass can see exactly WHY a
+                        // tick did or didn't floor, including the disarmed states (budget 0, clock None,
+                        // no retained frame) this fix targets.
+                        if now - last_floor_debug_ms >= SCREEN_SYNTHETIC_LOG_THROTTLE_MS {
+                            last_floor_debug_ms = now;
+                            log::debug!(
+                                "ScreenEncoder: static tick — floor_due={floor_due} budget={} clock_ms={:?} retained={} pli_pending={pli_pending}",
+                                floor_account.budget,
+                                floor_account.clock_ms,
+                                last_encoded_frame.is_some(),
+                            );
+                        }
+                        if pli_pending || floor_due {
                             if let Some(retained) = last_encoded_frame.as_ref() {
-                                let now = window()
-                                    .performance()
-                                    .expect("Performance API not available")
-                                    .now();
-                                // Consume the #1311 cooldown-reset edge ONLY when
-                                // actually servicing a PLI. On a static share the
-                                // real-frame arm never runs, so the timer branch is the
-                                // only consumer that can un-gate the first post-reconnect
-                                // PLI — but it must NOT consume the edge on a quiet
-                                // no-PLI tick. Unlike the real arm (which folds the
-                                // reset into `last_keyframe_emit_ms` every frame via the
-                                // decision), the timer arm has no per-tick store, so
-                                // consuming it early would discard the reset before a
-                                // later joiner PLI could use it. Same task as the real
-                                // arm (mutually exclusive per select tick), so this is
-                                // not a new racing consumer.
-                                let cooldown_reset =
-                                    keyframe_cooldown_reset.swap(false, Ordering::AcqRel);
-                                // Reuse the SAME shared keyframe decision the real arm
-                                // calls, so the screen PLI coalescer
-                                // (ENCODER_PLI_COOLDOWN_MS = 2000ms) collapses a
-                                // late-joiner WAVE into a single synthetic re-encode.
+                                // Consume the #1311 cooldown-reset edge ONLY when actually
+                                // servicing a PLI. On a static share the real-frame arm never
+                                // runs, so the timer branch is the only consumer that can un-gate
+                                // the first post-reconnect PLI — but it must NOT consume the edge
+                                // on a quiet no-PLI tick. A pure FLOOR emit does not need the edge
+                                // (a periodic/floor keyframe is ungated by the PLI cooldown), so we
+                                // leave it un-swapped for a later joiner PLI. Unlike the real arm
+                                // (which folds the reset into `last_keyframe_emit_ms` every frame
+                                // via the decision), the timer arm has no per-tick store, so
+                                // consuming it early would discard the reset. Mutually exclusive
+                                // with the real arm per select tick, so not a new racing consumer.
+                                let cooldown_reset = if pli_pending {
+                                    keyframe_cooldown_reset.swap(false, Ordering::AcqRel)
+                                } else {
+                                    false
+                                };
+                                // Reuse the SAME shared keyframe decision the real arm calls, so
+                                // the screen PLI coalescer (ENCODER_PLI_COOLDOWN_MS = 2000ms)
+                                // collapses a late-joiner WAVE into a single re-encode, and
+                                // `is_periodic: floor_due` makes a floor emit ungated by that
+                                // cooldown exactly like the moving-content periodic GOP.
                                 let decision = keyframe_tick_decision(KeyframeTickInput {
                                     now_ms: now,
-                                    pli_pending: true,
-                                    // The synthetic path never drives the periodic GOP.
-                                    is_periodic: false,
+                                    pli_pending,
+                                    is_periodic: floor_due,
                                     cooldown_reset,
                                     last_keyframe_emit_ms,
                                     cooldown_ms: ENCODER_PLI_COOLDOWN_MS,
@@ -3455,20 +3739,39 @@ impl ScreenEncoder {
                                 if decision.want_keyframe {
                                     let opts = VideoEncoderEncodeOptions::new();
                                     opts.set_key_frame(true);
-                                    // Re-encode the retained frame on the base encoder
-                                    // AND every active higher layer, mirroring the
-                                    // real-frame fan-out so all published rungs stay
-                                    // keyframe-synchronized. Encoding a retained frame
-                                    // is valid: the real path already encodes ONE frame
-                                    // up to N times (base + layers) before its single
-                                    // close, so encode() does not consume the frame.
+                                    // Issue #1531 / #1903-perf: how many rungs this floor emit
+                                    // fans out to. A REAL pending PLI (`pli_pending`) is a receiver
+                                    // actively asking to recover, so honor it at FULL active
+                                    // fan-out — never starve a real request. A PURE-insurance floor
+                                    // emit (no PLI pending) is pressure-gated by the screen tier:
+                                    // on a constrained tier a multi-layer keyframe burst would crowd
+                                    // audio in the coordinated uplink window, and the active count is
+                                    // stale during a static capture (the backpressure shed can't
+                                    // re-evaluate with no frames flowing), so `floor_fanout_layer_count`
+                                    // caps the fan-out by the sustained AQ tier signal instead. Always
+                                    // >= 1 (base is always re-keyed) and <= local_active_layers.
+                                    let fanout_layers = if pli_pending {
+                                        local_active_layers
+                                    } else {
+                                        floor_fanout_layer_count(
+                                            shared_screen_tier_index.load(Ordering::Relaxed)
+                                                as usize,
+                                            local_active_layers,
+                                        )
+                                    };
+                                    // Re-encode the retained frame on the base encoder AND every
+                                    // fanned-out higher layer, mirroring the real-frame fan-out so
+                                    // the published rungs stay keyframe-synchronized. Encoding a
+                                    // retained frame is valid: the real path already encodes ONE
+                                    // frame up to N times (base + layers) before its single close,
+                                    // so encode() does not consume the frame.
                                     if let Err(e) =
                                         screen_encoder.encode_with_options(retained, &opts)
                                     {
                                         error!("ScreenEncoder: static-share synthetic re-encode failed (base): {e:?}");
                                     }
                                     for layer in extra_layers.iter_mut() {
-                                        if (layer.layer_id as usize) < local_active_layers {
+                                        if (layer.layer_id as usize) < fanout_layers {
                                             if let Err(e) =
                                                 layer.encoder.encode_with_options(retained, &opts)
                                             {
@@ -3479,18 +3782,29 @@ impl ScreenEncoder {
                                     if decision.clear_force_keyframe {
                                         force_keyframe.store(false, Ordering::Release);
                                     }
+                                    // Issue #1903: a FLOOR-driven emit consumes one budget unit AND
+                                    // stamps the floor cadence clock, so a truly-static share backs
+                                    // off after SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET cycles. A PLI-only
+                                    // emit (floor not yet due) leaves the budget untouched but still
+                                    // stamps the clock — a keyframe just went out room-wide, so the
+                                    // floor must wait a full cadence before its next one.
+                                    if floor_due {
+                                        floor_account.on_floor_emitted(now);
+                                    } else {
+                                        floor_account.on_keyframe_emitted(now);
+                                    }
                                     if !served_synthetic_once {
                                         served_synthetic_once = true;
                                         log::info!(
-                                            "ScreenEncoder: static screen share — served a late keyframe request by re-encoding the retained frame (issue #1841)"
-                                        );
+                                                "ScreenEncoder: static screen share — re-encoded the retained frame as a keyframe (on-demand PLI #1841 / wall-clock floor #1903)"
+                                            );
                                     } else if now - last_synthetic_log_ms
                                         >= SCREEN_SYNTHETIC_LOG_THROTTLE_MS
                                     {
                                         last_synthetic_log_ms = now;
                                         log::debug!(
-                                            "ScreenEncoder: synthetic keyframe re-encode of retained frame (static share, PLI held/emitted)"
-                                        );
+                                                "ScreenEncoder: synthetic keyframe re-encode of retained frame (static share; pli_pending={pli_pending}, floor_due={floor_due})"
+                                            );
                                     }
                                 }
                             }
@@ -3636,6 +3950,13 @@ impl ScreenEncoder {
                         });
                         let want_keyframe = decision.want_keyframe;
                         last_keyframe_emit_ms = decision.last_keyframe_emit_ms;
+                        // Issue #1903: stamp the floor's cadence clock on every real-arm keyframe
+                        // (periodic GOP or PLI) so the floor measures its ≥cadence gap from the last
+                        // keyframe of ANY kind. When capture then parks, the clock is frozen at this
+                        // keyframe and the floor fires exactly one cadence later.
+                        if want_keyframe {
+                            floor_account.on_keyframe_emitted(now);
+                        }
                         if decision.clear_force_keyframe {
                             // ANY keyframe (periodic or forced) is broadcast to the whole
                             // room and satisfies every pending PLI, so clear the request
@@ -3860,6 +4181,12 @@ impl ScreenEncoder {
                         shared_encoder_queue_depth.store(max_active_queue_depth, Ordering::Relaxed);
 
                         screen_frame_counter += 1;
+                        // Issue #1903: a real captured frame just published, so re-arm the
+                        // static-share keyframe-FLOOR budget. This is what makes every content
+                        // CHANGE earn a fresh post-quiet recovery window (so a change whose delta was
+                        // lost to some receiver is re-broadcast as a floor keyframe once capture goes
+                        // quiet), while a share that stays truly static drains the budget and stops.
+                        floor_account.on_captured_frame();
                     }
                     Err(e) => {
                         error!("Error reading screen frame: {e:?}");
@@ -3880,13 +4207,25 @@ impl ScreenEncoder {
             for layer in &extra_layers {
                 let _ = layer.encoder.close();
             }
-            // Close the retained static-share frame before the next 'restart rebuilds
-            // the encoder(s) (issue #1841 reconfigure-invalidation): a frame captured
-            // at the OLD encoder dims must never reach a rebuilt encoder. The next real
-            // frame re-seeds it.
-            if let Some(frame) = last_encoded_frame.take() {
-                frame.close();
-            }
+            // Issue #1903 (live root-cause fix): do NOT close `last_encoded_frame` here. The pre-#1903
+            // code took/closed it on every restart so a next real frame would re-seed it — but on a
+            // share that has gone STATIC the restart is not followed by any new frame, so closing it
+            // left the static-share keyframe path (both the #1841 on-demand PLI re-encode and the #1903
+            // floor) with nothing to encode and permanently frozen. Carrying it across the restart lets
+            // recovery re-encode it as a keyframe on the rebuilt encoder. After a dimension-changing
+            // restart the retained frame's native dims can differ from the rebuilt encoder's config;
+            // that is SAFE — WebCodecs scales the frame to the configured dims and emits a valid keyframe
+            // (the same scaling the #1841 downscaled-tier path relies on every frame). The frame does
+            // not leak: `.replace()` closes the prior frame on the next real frame, and every give-up
+            // `return;` inside `'restart` now closes it via `close_retained_frame` (those paths bypass
+            // the final cleanup); it is otherwise closed on the final (user-stop / unrecoverable) exit
+            // path below.
+            //
+            // Carry the static-share FLOOR accounting across the restart too (issue #1903). This is a
+            // no-op by design — `floor_account` lives OUTSIDE `'restart` so its budget and cadence clock
+            // already persist — but making the transition explicit pins the survival contract (a
+            // `carry_across_restart` that reset the account would reproduce the live disarm bug).
+            floor_account = floor_account.carry_across_restart();
             // Drop the higher layers (and their closures) before the next
             // 'restart iteration rebuilds them.
             drop(extra_layers);
@@ -3960,6 +4299,9 @@ mod tests {
     use super::cause_hint_from_trigger;
     use super::clamp_screen_layer_count;
     use super::clear_screen_sharing_flags;
+    use super::floor_budget_after_emit;
+    use super::floor_budget_replenished;
+    use super::floor_fanout_layer_count;
     use super::is_fatal_encoder_error_message;
     use super::keyframe_tick_decision;
     use super::record_screen_restart;
@@ -3969,18 +4311,290 @@ mod tests {
     use super::screen_encoder_restarts_other;
     use super::should_reacquire_screen_capture;
     use super::should_teardown_shed_layer;
+    use super::static_keyframe_floor_due;
     use super::wt_drop_step_down_decision;
     use super::wt_saturation_step_down_decision;
     use super::KeyframeTickInput;
     use super::RestartReason;
     use super::ScreenEncoder;
+    use super::ScreenFloorAccount;
     use super::SCREEN_SIMULCAST_MAX_SUPPORTED_LAYERS;
+    use super::SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET;
     use super::SHED_TEARDOWN_DWELL_MS;
+    use crate::adaptive_quality_constants::SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
     use crate::adaptive_quality_constants::{
         WS_SELF_CONGESTION_WINDOW_MS, WT_SATURATION_STALL_THRESHOLD, WT_SATURATION_WINDOW_MS,
         WT_SELF_CONGESTION_DROP_THRESHOLD, WT_SELF_CONGESTION_WINDOW_MS,
     };
     use crate::{Callback, ScreenShareEvent, VideoCallClient, VideoCallClientOptions};
+
+    /// Issue #1903: the static-share keyframe FLOOR gate. Drives the REAL production predicate
+    /// (`static_keyframe_floor_due`, the fn the encode loop's timer branch calls) so a mutation to
+    /// any of its three rules breaks an assertion here. The floor cadence under test is the exact
+    /// production constant the loop passes in (`SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`), and the
+    /// budget is the real `SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET` — not a re-declared copy.
+    #[test]
+    fn static_keyframe_floor_due_respects_cadence_budget_and_first_frame() {
+        let floor = SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+
+        // No keyframe emitted yet (None): nothing to re-encode, so never due — the real-frame arm
+        // owns the first keyframe. (Deleting the `None => false` guard flips this.)
+        assert!(
+            !static_keyframe_floor_due(10_000.0, None, floor, SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET),
+            "with no prior keyframe the floor is never due"
+        );
+
+        // Budget exhausted: a truly-idle share that already spent its window must back off even long
+        // after the last keyframe. (Deleting the `budget_remaining == 0` guard flips this.)
+        assert!(
+            !static_keyframe_floor_due(1_000_000.0, Some(0.0), floor, 0),
+            "an exhausted floor budget suppresses further floor keyframes"
+        );
+
+        // Within the floor window: not yet due. (Mutating `>=`→`<=`/inverting the compare flips this.)
+        assert!(
+            !static_keyframe_floor_due(
+                1_000.0 + floor - 1.0,
+                Some(1_000.0),
+                floor,
+                SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET
+            ),
+            "inside the floor cadence window the floor is not yet due"
+        );
+
+        // Exactly at the inclusive boundary WITH budget: due. (Mutating `>=`→`>` flips this.)
+        assert!(
+            static_keyframe_floor_due(
+                1_000.0 + floor,
+                Some(1_000.0),
+                floor,
+                SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET
+            ),
+            "at exactly floor_ms since the last keyframe (budget available) the floor fires"
+        );
+
+        // Past the window with a single remaining budget unit: still due (the last covered cycle).
+        assert!(
+            static_keyframe_floor_due(1_000.0 + floor + 500.0, Some(1_000.0), floor, 1),
+            "past the window with budget remaining the floor is due"
+        );
+    }
+
+    /// Issue #1903 — the static-share FLOOR budget ACCOUNTING (the loop side effects the gate test
+    /// above does not exercise). Simulates the encode loop's quiet-tick budget bookkeeping through the
+    /// SAME production helpers the loop calls (`static_keyframe_floor_due`, `floor_budget_after_emit`,
+    /// `floor_budget_replenished`), pinning two behaviors that were previously untested loop side
+    /// effects. First: after capture goes quiet the floor emits EXACTLY
+    /// `SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET` keyframes, then backs off (does not re-encode room-wide
+    /// forever). Second: a real captured frame re-arms the budget so a later quiet period earns a fresh
+    /// window.
+    ///
+    /// MUTATION RECEIPTS (verified by reverting each in turn). Making `floor_budget_after_emit(b)`
+    /// return `b` (decrement removed) leaves the budget undrained, so `static_keyframe_floor_due` stays
+    /// true every tick and the emit count overruns `SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET` — the "emits
+    /// exactly BUDGET" assertion fails. Making `floor_budget_replenished()` return `0` (replenish
+    /// removed) leaves the budget at 0 after a captured frame, so the re-arm and resume assertions fail.
+    #[test]
+    fn static_floor_budget_stops_after_full_budget_and_rearms_on_captured_frame() {
+        let floor = SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+
+        // A captured frame re-arms to the FULL budget.
+        let mut budget = floor_budget_replenished();
+        assert_eq!(
+            budget, SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET,
+            "a real captured frame must re-arm the floor budget to the full value"
+        );
+
+        // (a) Drive many floor-interval ticks with NO intervening real frame (no replenish). Count how
+        // many floor keyframes actually emit; it must be EXACTLY the budget, then stop.
+        let mut last_kf = 1_000.0f64;
+        let mut now = last_kf;
+        let mut emits = 0u32;
+        for _ in 0..(SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET + 5) {
+            now += floor;
+            if static_keyframe_floor_due(now, Some(last_kf), floor, budget) {
+                emits += 1;
+                budget = floor_budget_after_emit(budget);
+                last_kf = now;
+            }
+        }
+        assert_eq!(
+            emits, SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET,
+            "a quiet static share must emit exactly SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET floor keyframes, then back off"
+        );
+        assert_eq!(
+            budget, 0,
+            "the floor budget must be fully drained after its window"
+        );
+        now += floor;
+        assert!(
+            !static_keyframe_floor_due(now, Some(last_kf), floor, budget),
+            "with the budget drained the floor must stay off (no perpetual idle-bandwidth re-encode)"
+        );
+
+        // (b) A real captured frame re-arms the budget → the floor resumes for another full window.
+        budget = floor_budget_replenished();
+        assert!(
+            static_keyframe_floor_due(now + floor, Some(last_kf), floor, budget),
+            "after a captured frame re-arms the budget, the floor must be due again"
+        );
+        let mut emits_after_rearm = 0u32;
+        for _ in 0..(SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET + 5) {
+            now += floor;
+            if static_keyframe_floor_due(now, Some(last_kf), floor, budget) {
+                emits_after_rearm += 1;
+                budget = floor_budget_after_emit(budget);
+                last_kf = now;
+            }
+        }
+        assert_eq!(
+            emits_after_rearm, SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET,
+            "after re-arming, the floor must again emit exactly SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET keyframes"
+        );
+    }
+
+    /// Issue #1903 (LIVE-STACK root cause) — the static-share FLOOR accounting MUST survive an encoder
+    /// `'restart`. The first #1903 cut kept the budget and cadence clock INSIDE the encode loop's
+    /// `'restart` scope (and drove the floor off the `'restart`-reset `last_keyframe_emit_ms`), so an
+    /// encoder restart (fatal encode error / closed codec / stream replace) zeroed them; on a share that
+    /// had gone STATIC no fresh frame followed to restore them, so the floor NEVER fired again on the
+    /// live docker stack even though every pure-helper test passed. This drives the real
+    /// `ScreenFloorAccount` transitions the encode loop calls — including `carry_across_restart` at the
+    /// restart boundary — and asserts the floor is still due after a restart-then-static.
+    ///
+    /// FAILS ON THE BROKEN SEMANTIC (verified): making `carry_across_restart(self) -> Self` return
+    /// `Self::idle()` (reset budget/clock on restart — the pre-fix behavior) drops the budget to 0 and
+    /// the clock to `None`, so the post-restart `floor_due` assertion fails. This is the receipt the
+    /// live bug demanded: it pins the loop-wiring/lifecycle contract, not just the pure helpers.
+    #[test]
+    fn floor_account_survives_restart_and_floors_on_static() {
+        let floor = SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS;
+
+        // Active sharing: a captured frame arms the budget; a keyframe stamps the floor cadence clock.
+        let mut acct = ScreenFloorAccount::idle();
+        acct.on_captured_frame();
+        let t_kf = 10_000.0f64;
+        acct.on_keyframe_emitted(t_kf);
+        assert_eq!(
+            acct.budget, SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET,
+            "a captured frame arms the full floor budget"
+        );
+
+        // An encoder restart fires while the share is ALREADY static — no fresh frame follows. The
+        // account is carried across the restart exactly as the encode loop does at the restart boundary.
+        acct = acct.carry_across_restart();
+
+        // Not due within the cadence window...
+        assert!(
+            !acct.floor_due(t_kf + floor - 1.0, floor),
+            "the floor is not due before one full cadence has elapsed"
+        );
+        // ...but DUE one cadence after the last keyframe — PROVING the budget and cadence clock survived
+        // the restart. On the pre-fix (reset-on-restart) semantic this is false forever (clock None,
+        // budget 0), which is exactly the live freeze.
+        assert!(
+            acct.floor_due(t_kf + floor, floor),
+            "after a restart-then-static the floor must still become due — budget+clock survive the restart (#1903)"
+        );
+
+        // And it still drains correctly post-restart: exactly BUDGET floor emits, then backs off.
+        let mut now = t_kf;
+        let mut emits = 0u32;
+        for _ in 0..(SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET + 5) {
+            now += floor;
+            if acct.floor_due(now, floor) {
+                emits += 1;
+                acct.on_floor_emitted(now);
+            }
+        }
+        assert_eq!(
+            emits, SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET,
+            "after a restart the floor still emits exactly SCREEN_STATIC_KEYFRAME_FLOOR_BUDGET keyframes then backs off"
+        );
+    }
+
+    /// Issue #1531 / #1903-perf: pins the STATIC-share floor keyframe fan-out policy
+    /// against the screen AQ tier. `SCREEN_QUALITY_TIERS` is ordered high→low, so a
+    /// LOWER (more-constrained) tier index caps the fan-out MORE aggressively. Calls
+    /// the production `floor_fanout_layer_count` so a mutation to the policy (e.g.
+    /// dropping the tier gate and always fanning to `active`, or inverting the tier
+    /// order) fails here.
+    ///
+    /// Mutation guards, per assertion:
+    /// - healthy `high` tier fans out to the FULL active set (deleting the tier gate
+    ///   is indistinguishable here, but the constrained-tier cases below break);
+    /// - `medium` caps at base + one upper rung (`min(active, 2)`) — a mutation that
+    ///   returned `active` for medium flips the 3-active case from 2 → 3 and FAILS;
+    /// - `low` (lowest) caps at base-only (1) — a mutation that returned `active` or
+    ///   `min(active, 2)` flips the 3-active case from 1 → 3/2 and FAILS;
+    /// - the clamp keeps the result in `1..=active` for every tier.
+    #[test]
+    fn floor_fanout_layer_count_gates_by_screen_tier() {
+        use crate::adaptive_quality_constants::SCREEN_QUALITY_TIERS;
+        let n = SCREEN_QUALITY_TIERS.len(); // high→low, so idx 0 = healthiest
+        let high = 0;
+        let medium = n - 2;
+        let low = n - 1;
+
+        // Healthy `high` tier → full fan-out at each active count.
+        assert_eq!(
+            floor_fanout_layer_count(high, 3),
+            3,
+            "high tier fans out fully (3 active)"
+        );
+        assert_eq!(
+            floor_fanout_layer_count(high, 2),
+            2,
+            "high tier fans out fully (2 active)"
+        );
+        assert_eq!(
+            floor_fanout_layer_count(high, 1),
+            1,
+            "high tier, single active → base only"
+        );
+
+        // `medium` tier → base + at most one upper rung, regardless of how many are active.
+        assert_eq!(
+            floor_fanout_layer_count(medium, 3),
+            2,
+            "medium tier caps a 3-active share at base + one upper rung"
+        );
+        assert_eq!(
+            floor_fanout_layer_count(medium, 2),
+            2,
+            "medium tier with 2 active keeps base + the one upper rung"
+        );
+        assert_eq!(
+            floor_fanout_layer_count(medium, 1),
+            1,
+            "medium tier with a single active layer stays base only"
+        );
+
+        // `low` (lowest) tier → base only, regardless of active count.
+        assert_eq!(
+            floor_fanout_layer_count(low, 3),
+            1,
+            "the lowest tier emits a base-only floor keyframe even with 3 active layers"
+        );
+        assert_eq!(
+            floor_fanout_layer_count(low, 1),
+            1,
+            "lowest tier, single active → base only"
+        );
+
+        // Defensive: an out-of-range (stale) tier index resolves as the lowest tier
+        // (base only), never fans out beyond active, and never returns 0.
+        assert_eq!(
+            floor_fanout_layer_count(n + 10, 3),
+            1,
+            "an out-of-range tier index caps at base-only (treated as the lowest tier)"
+        );
+        assert_eq!(
+            floor_fanout_layer_count(high, 0),
+            1,
+            "a 0 active count still re-keys the base rung (clamp floor of 1)"
+        );
+    }
 
     /// Issue #1832: the BASE (single-stream / layer-0) screen encoder resolves
     /// its `framerate` rate-control hint from the ACTIVE `SCREEN_QUALITY_TIERS`
@@ -4074,6 +4688,7 @@ mod tests {
             on_meeting_settings_updated: None,
             on_peer_left: None,
             on_peer_joined: None,
+            on_reaction: None,
             on_display_name_changed: None,
             on_host_mute: None,
             on_host_disable_video: None,

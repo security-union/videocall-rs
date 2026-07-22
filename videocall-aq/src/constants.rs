@@ -1192,17 +1192,120 @@ pub const CAMERA_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 /// Periodic keyframes ensure recovery from packet loss on screen share streams.
 pub const SCREEN_KEYFRAME_INTERVAL_FRAMES: u32 = 150;
 
-/// Wall-clock ceiling on the camera periodic keyframe interval (milliseconds).
+/// **Base** wall-clock ceiling on the camera periodic keyframe interval
+/// (milliseconds) — the #1510 freeze-recovery guarantee for the tiers where it
+/// matters most (full_hd … low).
+///
 /// The frame-counted `keyframe_interval_frames` only guarantees ~5s at the tier's
 /// nominal fps. Under CPU load or at low AQ tiers the actual fps drops and the
 /// frame-counted floor stretches to 10–17s. This wall-clock cap guarantees a
 /// periodic keyframe at least every 5s regardless of actual encode rate (issue #1510).
+///
+/// Issue #1531 makes the *effective* ceiling tier- and transport-aware via
+/// [`camera_periodic_keyframe_max_interval_ms`]: the two lowest tiers relax the cap
+/// (they are the most bandwidth-scarce, so a forced I-frame every 5s costs a larger
+/// share of the tier budget), and a lossless (WS) transport extends that relief band
+/// one tier higher. This constant is the value returned for every non-relaxed tier,
+/// so the #1510 ≤5s guarantee is preserved unchanged on full_hd … low over WebTransport.
 pub const PERIODIC_KEYFRAME_MAX_INTERVAL_MS: f64 = 5000.0;
+
+/// Relaxed camera periodic-keyframe ceiling (ms) for the second-lowest AQ tier
+/// (`very_low`, 480×270 / 15 fps / ~250 kbps) — and, on a lossless transport, also
+/// for the `low` tier (issue #1531).
+///
+/// At the very lowest tiers bandwidth is scarcest, so a forced I-frame every 5s is a
+/// disproportionate share of the tier budget. Relaxing to ~7s cuts that overhead
+/// while keeping freeze recovery bounded. See [`camera_periodic_keyframe_max_interval_ms`].
+pub const PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS: f64 = 7000.0;
+
+/// Relaxed camera periodic-keyframe ceiling (ms) for the lowest AQ tier
+/// (`minimal`, 426×240 / 10 fps / ~150 kbps) — the scarcest link (issue #1531).
+///
+/// Bounded at 8s: this is the **absolute** camera periodic-keyframe ceiling across
+/// all tiers/transports. It is deliberately kept close to the receiver-side
+/// keyframe-less-hold escalation (`MAX_KEYFRAME_LESS_HOLD_MS` = 6s, issue #1662 in
+/// `videocall-codecs`). Relaxing past ~8s would widen the window in which a desynced
+/// receiver resets its decoder (#1662) and then still waits for the periodic keyframe;
+/// 8s keeps that post-reset wait ≤2s. See [`camera_periodic_keyframe_max_interval_ms`].
+pub const PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS: f64 = 8000.0;
+
+/// Effective camera periodic-keyframe wall-clock ceiling (ms) for the current AQ
+/// tier and transport (issue #1531). Pure so a host test pins the per-tier /
+/// per-transport selection off the wasm-only encode loop.
+///
+/// `tier_index` indexes [`VIDEO_QUALITY_TIERS`] (0 = full_hd … `len-1` = minimal),
+/// resolved positionally-from-the-bottom so a future ladder-length change keeps
+/// working. `lossless_transport` is `true` on a reliable/ordered transport (WebSocket)
+/// where periodic keyframes are *insurance* — there is no datagram loss to actively
+/// recover from and `KEYFRAME_REQUEST`s are reliably delivered — so the relief band
+/// extends one tier higher than on lossy WebTransport.
+///
+/// Selection (for the current 8-tier ladder):
+/// - lowest tier (`minimal`, idx 7) → [`PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS`] (8s)
+/// - second-lowest (`very_low`, idx 6) → [`PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS`] (7s)
+/// - third-lowest (`low`, idx 5) → 7s **only on a lossless transport**, else the base 5s
+/// - every higher tier (full_hd … standard) → [`PERIODIC_KEYFRAME_MAX_INTERVAL_MS`] (5s)
+///
+/// No combination exceeds 8s, bounding the #1662 receiver-side interaction (see
+/// [`PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS`]). Screen shares are deliberately
+/// NOT relaxed this way — screen keeps the flat 3s
+/// [`SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS`] recovery guarantee on every tier
+/// (static screen content = keyframes are the only paintable data), and its tier
+/// relief lives in the static-share floor fan-out instead (issue #1903 follow-up).
+pub fn camera_periodic_keyframe_max_interval_ms(
+    tier_index: usize,
+    lossless_transport: bool,
+) -> f64 {
+    let n = VIDEO_QUALITY_TIERS.len();
+    // Positions from the bottom of the ladder (most-constrained first).
+    let minimal = n.saturating_sub(1);
+    let very_low = n.saturating_sub(2);
+    let low = n.saturating_sub(3);
+
+    if tier_index >= minimal {
+        PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS
+    } else if tier_index == very_low {
+        PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS
+    } else if lossless_transport && tier_index == low {
+        // Lossless (WS) insurance-only relief extends one tier up to `low`.
+        PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS
+    } else {
+        PERIODIC_KEYFRAME_MAX_INTERVAL_MS
+    }
+}
 
 /// Wall-clock ceiling for screen-share periodic keyframes (milliseconds).
 /// Screen tiers use a ~3s nominal GOP for text readability. The screen-specific
 /// cap preserves that 3s design intent under low-fps conditions (issue #1510).
+///
+/// Deliberately flat across all screen tiers and both transports (issue #1531):
+/// screen content is keyframe-critical (a static share = keyframes are the only
+/// paintable content; #1899/#1903), so the 3s recovery guarantee is NOT relaxed on
+/// low tiers the way the camera cadence is. The tier/congestion relief for screen is
+/// applied to the static-share keyframe FLOOR fan-out (how many simulcast layers a
+/// floor keyframe re-encodes), not to the cadence — see `screen_encoder.rs`.
 pub const SCREEN_PERIODIC_KEYFRAME_MAX_INTERVAL_MS: f64 = 3000.0;
+
+// --- Issue #1531 compile-time invariants for the camera keyframe-ceiling relief ---
+// The relief must be monotonic toward the scarcest tiers (a lower tier never emits
+// keyframes MORE often than a higher one) and the base must remain the #1510 5s
+// guarantee, so a future retune that inverts the relaxation or regresses the base
+// fails the build rather than silently flattening the policy.
+const _: () = assert!(
+    PERIODIC_KEYFRAME_MAX_INTERVAL_MS <= PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS,
+    "very_low ceiling must not be tighter than the base (relief only relaxes)"
+);
+const _: () = assert!(
+    PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS
+        <= PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS,
+    "minimal ceiling must not be tighter than very_low (relief deepens toward the floor)"
+);
+// The absolute ceiling stays bounded so the #1662 (MAX_KEYFRAME_LESS_HOLD_MS = 6s)
+// receiver interaction cannot be widened past ~2s by a retune.
+const _: () = assert!(
+    PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS <= 8000.0,
+    "the lowest-tier camera keyframe ceiling must stay <= 8s to bound the #1662 receiver interaction"
+);
 
 /// Max time to wait for a keyframe before requesting one (milliseconds).
 /// After packet loss is detected, if no keyframe arrives within this window, send PLI.
@@ -3127,6 +3230,107 @@ mod tests {
                 idx,
                 SCREEN_QUALITY_TIERS.len(),
             );
+        }
+    }
+
+    // =====================================================================
+    // Issue #1531: tier- and transport-aware camera periodic-keyframe ceiling
+    // =====================================================================
+
+    /// Pins the per-tier selection over WebTransport (the lossy, primary path):
+    /// full_hd … low keep the flat 5s #1510 guarantee, and ONLY the two lowest
+    /// tiers relax (very_low → 7s, minimal → 8s). Calls the production
+    /// [`camera_periodic_keyframe_max_interval_ms`] so a mutation to the selection
+    /// (flattening a relaxed tier back to the base, or relaxing a tier that must
+    /// stay at 5s) fails here.
+    #[test]
+    fn camera_keyframe_ceiling_wt_relaxes_only_two_lowest_tiers() {
+        let n = VIDEO_QUALITY_TIERS.len();
+        // Every tier from full_hd (0) through `low` (n-3) keeps the base 5s over WT.
+        for idx in 0..=(n - 3) {
+            assert_eq!(
+                camera_periodic_keyframe_max_interval_ms(idx, /* lossless */ false),
+                PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                "tier {idx} over WebTransport must keep the flat #1510 5s ceiling"
+            );
+        }
+        // very_low (n-2) relaxes to 7s.
+        assert_eq!(
+            camera_periodic_keyframe_max_interval_ms(n - 2, false),
+            PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS,
+            "very_low over WebTransport must relax to the 7s ceiling"
+        );
+        // minimal (n-1) relaxes to 8s.
+        assert_eq!(
+            camera_periodic_keyframe_max_interval_ms(n - 1, false),
+            PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS,
+            "minimal over WebTransport must relax to the 8s ceiling"
+        );
+        // Out-of-range (defensive: a clamp bug upstream) saturates to the lowest
+        // tier's relaxed value, never a tighter one.
+        assert_eq!(
+            camera_periodic_keyframe_max_interval_ms(n + 5, false),
+            PERIODIC_KEYFRAME_MAX_INTERVAL_MINIMAL_TIER_MS,
+            "an out-of-range tier index must resolve as the lowest (minimal) tier"
+        );
+    }
+
+    /// Pins the TRANSPORT axis: on a lossless (WS) transport the insurance-only
+    /// relief extends one tier higher — the `low` tier (n-3) relaxes to 7s where
+    /// over WebTransport it stays at the flat 5s. The very_low/minimal values are
+    /// transport-independent. This is the mutation guard for the
+    /// `lossless_transport && tier_index == low` arm: deleting it collapses the
+    /// `low`-tier WS value back to 5s and fails the first assertion.
+    #[test]
+    fn camera_keyframe_ceiling_lossless_transport_extends_relief_band() {
+        let n = VIDEO_QUALITY_TIERS.len();
+        let low = n - 3;
+
+        // `low` differs by transport: 5s over WT, 7s over lossless WS.
+        assert_eq!(
+            camera_periodic_keyframe_max_interval_ms(low, false),
+            PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+            "the `low` tier over WebTransport must stay at the flat 5s ceiling"
+        );
+        assert_eq!(
+            camera_periodic_keyframe_max_interval_ms(low, true),
+            PERIODIC_KEYFRAME_MAX_INTERVAL_VERY_LOW_TIER_MS,
+            "the `low` tier over a lossless (WS) transport must relax to 7s (insurance-only)"
+        );
+        // A healthy mid tier does NOT gain relief from lossless transport.
+        assert_eq!(
+            camera_periodic_keyframe_max_interval_ms(low - 1, true),
+            PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+            "a tier above `low` must keep the 5s ceiling even on a lossless transport"
+        );
+        // very_low / minimal are transport-independent (already relaxed on both).
+        assert_eq!(
+            camera_periodic_keyframe_max_interval_ms(n - 2, true),
+            camera_periodic_keyframe_max_interval_ms(n - 2, false),
+            "very_low ceiling must be transport-independent"
+        );
+        assert_eq!(
+            camera_periodic_keyframe_max_interval_ms(n - 1, true),
+            camera_periodic_keyframe_max_interval_ms(n - 1, false),
+            "minimal ceiling must be transport-independent"
+        );
+    }
+
+    /// The effective ceiling must never exceed the absolute 8s bound on any
+    /// (tier, transport) combination — the #1662 receiver-interaction guard. A
+    /// retune that pushed any tier past 8s fails here (belt-and-suspenders with the
+    /// compile-time invariant on the constant).
+    #[test]
+    fn camera_keyframe_ceiling_never_exceeds_absolute_bound() {
+        let n = VIDEO_QUALITY_TIERS.len();
+        for idx in 0..n {
+            for &lossless in &[false, true] {
+                let ms = camera_periodic_keyframe_max_interval_ms(idx, lossless);
+                assert!(
+                    (PERIODIC_KEYFRAME_MAX_INTERVAL_MS..=8000.0).contains(&ms),
+                    "tier {idx} (lossless={lossless}) ceiling {ms}ms must stay within [5s, 8s]"
+                );
+            }
         }
     }
 }

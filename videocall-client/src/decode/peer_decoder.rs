@@ -740,6 +740,19 @@ impl VideoPeerDecoder {
     /// `canvas_generator.rs` (full-bleed is now a plain CSS class toggle inside the
     /// one grid template), which keeps Dioxus diffing the tile in place and REUSING
     /// the same canvas node so this method is never re-entered with a torn-down tile.
+    /// Return the canvas element currently wired to this decoder, if any.
+    ///
+    /// Used by the recording module to composite peer video directly from the
+    /// decoder's canvas rather than relying on the Dioxus-rendered DOM element,
+    /// which may not be mounted when `show_canvas = false` (budget pressure,
+    /// camera-on/off race, etc.).
+    pub fn get_canvas(&self) -> Option<HtmlCanvasElement> {
+        self.canvas_renderer
+            .borrow()
+            .as_ref()
+            .map(|r| r.canvas.clone())
+    }
+
     pub fn set_canvas(&self, canvas: HtmlCanvasElement) -> Result<(), JsValue> {
         // Idempotency guard: borrow is dropped at the end of this block, before
         // the later `borrow_mut()`, so there is no RefCell conflict.
@@ -956,6 +969,30 @@ impl VideoPeerDecoder {
         // `paint_enabled` already guards the still-hidden case, but taking the frame here also
         // covers the re-enable-before-rAF race and releases GPU memory immediately. On the host
         // test path the mailbox is always empty, so `take()` is `None` and `close()` is never hit.
+        if let Some(frame) = self.latest_frame.borrow_mut().take() {
+            frame.close();
+        }
+        if let Some(renderer) = self.canvas_renderer.borrow().as_ref() {
+            let width = renderer.canvas.width();
+            let height = renderer.canvas.height();
+            renderer
+                .context
+                .clear_rect(0.0, 0.0, width as f64, height as f64);
+        }
+    }
+
+    /// Clear the canvas pixels unconditionally — used when the remote peer
+    /// actually turns their camera off (not budget-pressure invisibility).
+    ///
+    /// This explicit variant documents call sites where the media source itself
+    /// stopped, rather than a decode-budget visibility transition.
+    pub fn force_clear_canvas(&self) {
+        self.paint_enabled.set(false);
+        // Issue #1783 compose with #1746: drop any frame still held for
+        // presentation so a pending rAF cannot repaint the tile after we wipe it
+        // (mirror of the drain in `clear_canvas`). Unlike `clear_canvas`, this
+        // runs even while recording, so the recording output switches to the
+        // avatar immediately instead of freezing on the peer's last frame.
         if let Some(frame) = self.latest_frame.borrow_mut().take() {
             frame.close();
         }

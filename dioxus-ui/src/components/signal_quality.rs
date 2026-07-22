@@ -735,6 +735,18 @@ pub struct SignalInfo {
     /// [`crate::components::media_metrics_overlay::media_metrics_overlay`] inside
     /// the tile's `.canvas-container`.
     pub metrics_overlay: Option<crate::components::media_metrics_overlay::MediaMetricsOverlay>,
+    /// Issue 1821: decoded screen-share resolution `(w, h)` for the ScreenOnly
+    /// sharer tile, populated ALWAYS (independent of the diagnostics checkbox) so
+    /// the actual-size (1:1) control can re-derive its target live when the
+    /// presenter's resolution changes. `None` for non-screen tiles / pre-decode.
+    pub screen_resolution: Option<(u32, u32)>,
+    /// Issue 1821: pre-resolved shared-content stats overlay payload, or `None`
+    /// when the "Show media metrics on tiles" checkbox is off or this is not the
+    /// ScreenOnly sharer tile. Rendered by
+    /// [`crate::components::media_metrics_overlay::screen_metrics_overlay`] inside
+    /// the shared-content tile's `.canvas-container`.
+    pub screen_metrics_overlay:
+        Option<crate::components::media_metrics_overlay::ScreenMetricsOverlay>,
 }
 
 // ---------------------------------------------------------------------------

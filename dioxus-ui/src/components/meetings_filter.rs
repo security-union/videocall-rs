@@ -429,6 +429,7 @@ mod tests {
             waiting_count: 0,
             has_password: false,
             allow_guests: false,
+            recording_allowed_for_all: false,
             waiting_room_enabled: true,
             admitted_can_admit: false,
             end_on_host_leave: true,

@@ -20,11 +20,11 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::components::canvas_generator::{
-    generate_for_peer, AudioLevels, SignalPopupHandlers, TileMode,
+    generate_for_peer, AudioLevels, PinnedTile, SignalPopupHandlers, TileMode,
 };
 use crate::components::media_metrics_overlay::{
     next_overlay_fps, overlay_audio_kbps, overlay_painted_fps_sample, parse_resolution,
-    MediaMetricsOverlay, MediaMetricsOverlayCtx,
+    MediaMetricsOverlay, MediaMetricsOverlayCtx, ScreenMetricsOverlay,
 };
 use crate::components::signal_quality::{
     PeerSignalHistory, SampleData, SignalInfo, SignalMeterMode, SignalPopupPosition,
@@ -54,7 +54,7 @@ pub fn PeerTile(
     /// sessions (HCL issue 828) are not mis-classified as self.
     #[props(default)]
     my_session_id: Option<String>,
-    #[props(default)] pinned_peer_id: Option<String>,
+    #[props(default)] pinned_peer_id: Option<PinnedTile>,
     #[props(default)] room_id: Option<String>,
     #[props(default = false)] is_current_user_host: bool,
     /// HCL bug #2: scope of the signal-meter popup this tile owns. The
@@ -83,7 +83,7 @@ pub fn PeerTile(
     /// `false`, so existing call sites render exactly as before.
     #[props(default = false)]
     force_avatar: bool,
-    on_toggle_pin: EventHandler<String>,
+    on_toggle_pin: EventHandler<PinnedTile>,
     /// Issue #1466: fired when the user clicks the per-tile PLAY button on a
     /// decode-budget-PAUSED tile to force-decode this peer. Receives the tile's
     /// `session_id` (the `peer_id`/`key`), which `attendants.rs` toggles into
@@ -432,18 +432,21 @@ pub fn PeerTile(
     //      an unclassified transport. When the flag is off, `badge_transport`
     //      is `None` regardless of transport, so nothing renders.
     //
-    // REMOTE-ONLY (deliberate scope decision): the local user's OWN tile
-    // receives no remote `peer_status` event (only the decode pipeline for
-    // REMOTE peers emits `peer_status` + `peer_transport`, see
-    // `peer_decode_manager.rs`), so its `peer_transport()` signal stays `None`
-    // → `Unknown` → `None`, and the local tile shows NO badge. Sourcing the
-    // local transport would require a public `VideoCallClient` accessor for the
-    // client-wide active transport (the underlying `active_is_webtransport()`
-    // lives only on `ConnectionController`/`ConnectionManager`, not on the
-    // public `VideoCallClient` API), which is a videocall-client change outside
-    // this videocall-ui-only task. Until that accessor is exposed, the badge is
-    // remote-peer-only by design; the local tile simply renders nothing rather
-    // than guessing.
+    // REMOTE-SOURCED here (issue #1883): this signal is fed ONLY by the remote
+    // `peer_status` / `peer_transport` diagnostics metric the decode pipeline
+    // emits for REMOTE peers (`peer_decode_manager.rs`). Every tile this function
+    // renders IS a remote peer — `attendants.rs` filters the local session out of
+    // the peer-tile list (`display_peers` excludes `get_own_session_id()`), so
+    // `is_self_peer` is only ever true here for a SIBLING SAME-ACCOUNT tab, which
+    // is itself a separate remote connection with its OWN announced transport.
+    // Sourcing such a sibling tile from the LOCAL transport would be wrong (it is
+    // a different connection), so it correctly stays remote-sourced.
+    //
+    // The local user's OWN self-view is rendered by `Host` (host.rs), NOT a
+    // `PeerTile`. Issue #1883 adds the self transport badge THERE, sourced from
+    // the public `VideoCallClient::active_transport()` accessor (the client-wide
+    // active transport) — mirroring how issue #1768 puts the self media-metrics
+    // overlay in `Host` and peer overlays here.
     let badge_transport: Option<crate::components::canvas_generator::TransportBadge> =
         if crate::constants::transport_badge_enabled().unwrap_or(false) {
             use crate::components::canvas_generator::{transport_badge_from_str, TransportBadge};
@@ -693,6 +696,30 @@ pub fn PeerTile(
         None
     };
 
+    // Issue 1821: shared-content tile stats. Only the ScreenOnly sharer tile
+    // renders the received screen share, so build these only for it (reading the
+    // screen signals subscribes THIS tile to resolution/fps changes — desired for
+    // the sharer tile, avoided for every other tile). `screen_resolution` is
+    // populated ALWAYS (the actual-size 1:1 control re-derives its target live off
+    // presenter-resolution changes, independent of the diagnostics checkbox); the
+    // overlay payload is gated by the SAME checkbox as the camera overlay.
+    let is_screen_only_tile = matches!(render_mode, TileMode::ScreenOnly);
+    let screen_resolution_now: Option<(u32, u32)> = if is_screen_only_tile {
+        parse_resolution(&screen_resolution())
+    } else {
+        None
+    };
+    let screen_metrics_overlay: Option<ScreenMetricsOverlay> =
+        if is_screen_only_tile && overlay_enabled {
+            let fps_now = screen_fps();
+            Some(ScreenMetricsOverlay {
+                resolution: screen_resolution_now,
+                fps: (fps_now > 0.0).then_some(fps_now),
+            })
+        } else {
+            None
+        };
+
     generate_for_peer(
         &client,
         &peer_id,
@@ -717,6 +744,8 @@ pub fn PeerTile(
             device_info: sig_device_info,
             badge_transport,
             metrics_overlay,
+            screen_resolution: screen_resolution_now,
+            screen_metrics_overlay,
         },
         SignalPopupHandlers {
             show: show_signal_popup,
@@ -731,7 +760,7 @@ pub fn PeerTile(
         on_disable_video,
         on_kick,
         on_transfer_host,
-        pinned_peer_id.as_deref(),
+        pinned_peer_id.as_ref(),
         on_toggle_pin,
         &appearance,
         on_request_decode,

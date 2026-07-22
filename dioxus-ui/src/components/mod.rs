@@ -37,6 +37,10 @@ pub mod okta_sign_in_button;
 pub mod peer_list_item;
 pub mod performance_settings;
 pub mod preferences_settings_panel;
+// Issue #1884: pure reaction UI logic (enum→glyph table + overlay coalesce/cap),
+// host-testable.
+pub mod reactions;
+pub mod reactions_overlay;
 // Issue 1175: pure zoom/pan math for received shared content (host-testable).
 pub mod screen_share_zoom;
 // Issue 1175: imperative glue to detach shared content into a separate window.

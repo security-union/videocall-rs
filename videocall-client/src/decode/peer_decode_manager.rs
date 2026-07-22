@@ -299,6 +299,68 @@ struct SequenceTracker {
     kf_per_sec: f64,
 }
 
+/// Reorder-tolerant sequence-gap counter shared by the video [`SequenceTracker`]
+/// and the audio [`AudioDatagramLossTracker`] (issue #1878).
+///
+/// Records `seq` into a 64-position bitfield window rooted at `*high_seq` and
+/// returns the number of NEW packets confirmed lost — positions that shifted off
+/// the window without ever being marked seen. Tolerates up to 63 positions of
+/// reordering before declaring loss (WebTransport delivers video on separate
+/// unistreams and audio on unordered datagrams, so both can arrive out of order).
+///
+/// Extracted verbatim from the former inline `SequenceTracker::record_seq` body
+/// so the two trackers share ONE implementation of this subtle bitfield logic
+/// rather than duplicating it. It is pure over its two `&mut` state words, so it
+/// is unit-testable on the native host target and both callers are guarded by
+/// the same existing tests.
+fn record_seq_into_reorder_window(
+    high_seq: &mut Option<u64>,
+    seen_bits: &mut u64,
+    seq: u64,
+) -> u32 {
+    let Some(high) = *high_seq else {
+        // First packet -- initialize. Mark all window positions as "seen"
+        // so that pre-stream positions (sequence numbers that never
+        // existed) are not counted as lost when the window advances.
+        *high_seq = Some(seq);
+        *seen_bits = u64::MAX;
+        return 0;
+    };
+
+    if seq > high {
+        // New highest -- shift window left and count losses.
+        // Compare in u64 space first to avoid truncation on huge gaps.
+        let gap = seq - high;
+        let shift = gap.min(64) as u32;
+        let new_lost = if gap >= 64 {
+            // Entire window shifted out. Count unseen bits in old window.
+            // count_zeros() on u64 returns at most 64 (the window size).
+            seen_bits.count_zeros()
+        } else {
+            // Count the bits that will shift off (the top `shift` bits).
+            let mask = !((1u64 << (64 - shift)) - 1);
+            let shifting_out = *seen_bits & mask;
+            let lost_in_shift = shift - shifting_out.count_ones();
+            // Shift and mark the new seq as seen.
+            *seen_bits = (*seen_bits << shift) | 1;
+            lost_in_shift
+        };
+        if gap >= 64 {
+            *seen_bits = 1; // only the new packet is seen
+        }
+        *high_seq = Some(seq);
+        new_lost
+    } else if high - seq < 64 {
+        // Out-of-order but within window -- mark as seen (no loss).
+        let bit_pos = (high - seq) as u32;
+        *seen_bits |= 1u64 << bit_pos;
+        0
+    } else {
+        // Too old (beyond window) -- ignore silently.
+        0
+    }
+}
+
 impl SequenceTracker {
     fn new() -> Self {
         Self {
@@ -320,48 +382,9 @@ impl SequenceTracker {
     /// Record a sequence number. Returns the number of NEW lost packets
     /// detected (packets that shifted off the window unseen).
     fn record_seq(&mut self, seq: u64) -> u32 {
-        let Some(high) = self.high_seq else {
-            // First packet -- initialize. Mark all window positions as "seen"
-            // so that pre-stream positions (negative sequence numbers that never
-            // existed) are not counted as lost when the window advances.
-            self.high_seq = Some(seq);
-            self.seen_bits = u64::MAX;
-            return 0;
-        };
-
-        if seq > high {
-            // New highest -- shift window left and count losses.
-            // Compare in u64 space first to avoid truncation on huge gaps.
-            let gap = seq - high;
-            let shift = gap.min(64) as u32;
-            let new_lost = if gap >= 64 {
-                // Entire window shifted out. Count unseen bits in old window.
-                // count_zeros() on u64 returns at most 64 (the window size).
-                self.seen_bits.count_zeros()
-            } else {
-                // Count the bits that will shift off (the top `shift` bits).
-                let mask = !((1u64 << (64 - shift)) - 1);
-                let shifting_out = self.seen_bits & mask;
-                let lost_in_shift = shift - shifting_out.count_ones();
-                // Shift and mark the new seq as seen.
-                self.seen_bits = (self.seen_bits << shift) | 1;
-                lost_in_shift
-            };
-            if gap >= 64 {
-                self.seen_bits = 1; // only the new packet is seen
-            }
-            self.high_seq = Some(seq);
-            self.lost_count += new_lost;
-            new_lost
-        } else if high - seq < 64 {
-            // Out-of-order but within window -- mark as seen (no loss).
-            let bit_pos = (high - seq) as u32;
-            self.seen_bits |= 1u64 << bit_pos;
-            0
-        } else {
-            // Too old (beyond window) -- ignore silently.
-            0
-        }
+        let new_lost = record_seq_into_reorder_window(&mut self.high_seq, &mut self.seen_bits, seq);
+        self.lost_count += new_lost;
+        new_lost
     }
 
     /// Check if a keyframe request should be sent. Returns `true` if yes.
@@ -521,6 +544,170 @@ impl SequenceTracker {
         self.loss_detected_at_ms = None;
         self.window_lost = 0;
         self.window_kf_requests = 0;
+    }
+}
+
+/// A backward jump in the audio sequence at least this large is treated as a
+/// sender-side stream RESTART (e.g. the mic encoder is recreated on a device
+/// change — `microphone_encoder` re-initialises its `sequence_number` to 0),
+/// NOT as reordering, so [`AudioDatagramLossTracker`] re-anchors to the new
+/// baseline. It is far above the 64-position reorder window (unordered
+/// datagrams reorder on a millisecond scale, i.e. a handful of positions at
+/// 50 pps), so a genuine live-stream straggler can never trip it. A reset-to-0
+/// trips it only ONCE the high-water mark has reached this gap (>= 1024 — i.e.
+/// after ~20 s at 50 pps); a restart in the FIRST ~20 s (high-water mark < 1024)
+/// does NOT re-anchor and instead lands in the shared window's "too old, ignore"
+/// branch, self-healing once the new sequence climbs back past the old mark
+/// (< 1024 packets). This guard matters for the LARGE-mark case: without it, a
+/// restart after a long-running stream would leave the tracker effectively
+/// wedged — the new low sequence would take many thousands of packets to climb
+/// back — silently blinding the loss signal. (The sub-1024 blind spot is noted
+/// as a known limitation on [`AudioDatagramLossTracker`].)
+const AUDIO_SEQ_RESET_REANCHOR_GAP: u64 = 1024;
+
+/// Windowed receive-side audio packet-loss tracker for the WebTransport
+/// **datagram** path (issue #1878).
+///
+/// ## The pathology this makes visible
+///
+/// With E2EE off, the relay routes small Opus AUDIO frames onto unreliable QUIC
+/// datagrams (`wt_chat_session.rs` `build_outbound`). Our incoming-datagram
+/// reader (`videocall-transport::webtransport::start_listening_incoming_datagrams`)
+/// runs as a `spawn_local` task on the MAIN thread. When the main thread stalls
+/// (a long task — the #1878 trigger, correlated in the field with the
+/// "CPU-stall suppression budget exhausted" log), the reader cannot drain and
+/// the browser drops the oldest queued datagrams. Nothing counted this: the
+/// relay's `send_datagram` is best-effort (returns `Ok`) and the client's
+/// `datagram_drop_count` is SEND-side only. The result is a contiguous audio
+/// burst-loss NetEQ cannot conceal (56% vs 2% concealment WT-vs-WS in the field).
+///
+/// ## What it measures
+///
+/// The per-frame audio `sequence` is dense (+1 per frame — see
+/// `microphone_encoder`), so a gap in the sequence of RECEIVED audio packets is
+/// a dropped datagram. This reuses the same reorder-tolerant 64-position window
+/// as the video [`SequenceTracker`] (via [`record_seq_into_reorder_window`]) and
+/// publishes a windowed lost-packets/sec rate, so the datagram loss surfaces on
+/// the diagnostics bus / health reporter exactly like `video_seq_loss_per_sec`.
+///
+/// ## Scoping (why it reads ~0 except under the pathology)
+///
+/// Fed only when THIS receiver's active transport is WebTransport (see
+/// `Peer::receiver_on_webtransport`). On WebSocket audio rides one ordered TCP
+/// stream, and on E2EE-on WebTransport it rides the reliable audio unistream;
+/// neither produces sequence gaps under the identical stall (they buffer and
+/// deliver late-but-complete), so this rate is ~0 there and nonzero only when
+/// audio is actually losing datagrams.
+///
+/// ## Known limitations
+///
+/// 1. **Burst severity is under-reported; treat this as a PRESENCE signal, not a
+///    precise magnitude.** Loss is only declared when a skipped position shifts
+///    off the 64-slot reorder window, so a single contiguous forward gap can
+///    contribute at most ~64 to the count regardless of how many hundreds of
+///    consecutive datagrams were actually lost. A multi-second burst therefore
+///    reads as "nonzero, sustained" rather than its true magnitude. This is
+///    inherited verbatim from the video [`SequenceTracker`] window and is
+///    consistent by design — the goal is to make the previously-invisible
+///    datagram loss OBSERVABLE (nonzero when audio is dropping, ~0 otherwise),
+///    which the window delivers.
+/// 2. **Audio simulcast (non-default `max_layers > 1`) can blind the tracker
+///    across a layer switch.** Each simulcast layer carries its own dense
+///    sequence, so a receive switch to a LAGGING audio layer is a BACKWARD jump.
+///    If that jump is smaller than [`AUDIO_SEQ_RESET_REANCHOR_GAP`] it is not a
+///    restart — it lands in the shared window's "too old, ignore" branch, so the
+///    tracker stays pinned at the old high-water mark and silently ignores the
+///    new layer's packets until its sequence climbs back past that mark (up to a
+///    few seconds). Audio simulcast is OFF by default (single audio layer, dense
+///    monotonic sequence — no switch, no blind spot), so this does not affect the
+///    shipped configuration. If audio simulcast is ever rolled out, re-anchor
+///    this tracker on an audio-layer switch exactly like video does in
+///    [`SequenceTracker::reanchor_for_layer_switch`].
+/// 3. **A sender restart in the first ~20 s of a stream is a temporary blind
+///    spot.** The mic encoder re-initialises `sequence_number` to 0 on restart
+///    (e.g. a mid-call device change). If it restarts while the high-water mark
+///    is still below [`AUDIO_SEQ_RESET_REANCHOR_GAP`] (< 1024, ~20 s at 50 pps),
+///    the backward jump is too small to trip the restart re-anchor, so the new
+///    low sequences land in the shared window's "too old, ignore" branch and are
+///    not tracked until the sequence climbs back past the old mark (< 1024
+///    packets, so it self-heals within ~20 s — it does not wedge). A restart at a
+///    LARGER mark is caught by the re-anchor guard, so only this early window is
+///    affected; loss during it is under-counted, never over-counted.
+struct AudioDatagramLossTracker {
+    /// Highest audio sequence seen so far. `None` before the first packet.
+    high_seq: Option<u64>,
+    /// Bitfield of recently seen sequences (bit 0 = `high_seq`), shared shape
+    /// with [`SequenceTracker::seen_bits`].
+    seen_bits: u64,
+    /// Start of the current ~1s rate window (ms). 0 = not yet started.
+    window_start_ms: u64,
+    /// Lost packets accumulated in the current window.
+    window_lost: u32,
+    /// Most recently computed windowed loss rate (lost packets/sec). Stable
+    /// between window rollovers.
+    loss_per_sec: f64,
+}
+
+impl AudioDatagramLossTracker {
+    fn new() -> Self {
+        Self {
+            high_seq: None,
+            seen_bits: 0,
+            window_start_ms: 0,
+            window_lost: 0,
+            loss_per_sec: 0.0,
+        }
+    }
+
+    /// Record one received audio sequence number. Returns the number of NEW
+    /// lost packets detected (gaps that shifted off the reorder window unseen).
+    ///
+    /// Re-anchors on a large BACKWARD jump (sender restart), so a mic-encoder
+    /// restart cannot wedge the tracker — see [`AUDIO_SEQ_RESET_REANCHOR_GAP`].
+    fn record_seq(&mut self, seq: u64) -> u32 {
+        if let Some(high) = self.high_seq {
+            if seq < high && high - seq >= AUDIO_SEQ_RESET_REANCHOR_GAP {
+                // Sender-side sequence reset: forget the old baseline so the
+                // next packet establishes a fresh one (returns 0 loss) instead
+                // of being ignored as "too old" forever.
+                self.high_seq = None;
+                self.seen_bits = 0;
+            }
+        }
+        record_seq_into_reorder_window(&mut self.high_seq, &mut self.seen_bits, seq)
+    }
+
+    /// Feed this window's newly-lost count and roll the ~1s rate window when it
+    /// expires. Returns `Some(loss_per_sec)` exactly on rollover (so the caller
+    /// throttles bus emission to ~1 Hz per peer), else `None`. Mirrors
+    /// [`SequenceTracker::observe_window`] (same 1000 ms window, same
+    /// elapsed-normalised rate) minus the keyframe-request accounting audio
+    /// does not have.
+    fn observe_window(&mut self, now: u64, new_lost: u32) -> Option<f64> {
+        if self.window_start_ms == 0 {
+            self.window_start_ms = now;
+        }
+        self.window_lost = self.window_lost.saturating_add(new_lost);
+
+        let elapsed = now.saturating_sub(self.window_start_ms);
+        if elapsed >= 1000 {
+            // Normalise by the ACTUAL elapsed window (not a fixed 1000 ms) so a
+            // window that ran long — sparse arrival, a stalled tab — still
+            // yields a correct per-second rate. `elapsed >= 1000` guarantees
+            // `denom` is never zero.
+            let denom = elapsed as f64;
+            self.loss_per_sec = self.window_lost as f64 * 1000.0 / denom;
+            self.window_lost = 0;
+            self.window_start_ms = now;
+            return Some(self.loss_per_sec);
+        }
+        None
+    }
+
+    /// Most recently computed windowed loss rate (lost audio packets/sec).
+    #[cfg(test)]
+    fn loss_per_sec(&self) -> f64 {
+        self.loss_per_sec
     }
 }
 
@@ -724,6 +911,15 @@ pub struct Peer {
     last_video_switch: LastLayerSwitch,
     /// Issue #1460 observability: SCREEN-kind sibling of `last_video_switch`.
     last_screen_switch: LastLayerSwitch,
+    /// Issue #1878: whether THIS receiver's active transport is WebTransport,
+    /// refreshed by [`PeerDecodeManager::decode`] on every packet from the
+    /// authoritative [`ConnectionController::active_is_webtransport`] signal.
+    /// Gates [`Peer::audio_datagram_loss`]: audio can only ride unreliable
+    /// datagrams on WebTransport, so on WebSocket the tracker stays idle.
+    receiver_on_webtransport: bool,
+    /// Issue #1878: windowed receive-side audio datagram loss for this peer,
+    /// fed in the AUDIO decode arm only while `receiver_on_webtransport`.
+    audio_datagram_loss: AudioDatagramLossTracker,
 }
 
 /// HCL bug #1: window during which a recent media frame suppresses a stale
@@ -1056,8 +1252,12 @@ impl Peer {
                 kf_per_sec: 0.0,
             },
             // Phase 3: per-peer SCREEN + AUDIO choosers, mirroring VIDEO.
+            // #1899: the SCREEN chooser runs in screen-mode so the yo-yo
+            // oscillation latch is active (a static share re-arms a keyframe wait
+            // on every switch and self-oscillates); VIDEO/AUDIO stay on the plain
+            // `new` — the camera↔screen divergence is deliberate.
             selected_screen_layer: 0,
-            screen_layer_chooser: LayerChooser::new(now_ms()),
+            screen_layer_chooser: LayerChooser::new_screen(now_ms()),
             screen_layer_availability: LayerAvailability::new(),
             last_screen_downlink: DownlinkSample {
                 loss_per_sec: 0.0,
@@ -1080,6 +1280,11 @@ impl Peer {
             // Issue #1460 observability: never-switched sentinel.
             last_video_switch: LastLayerSwitch::default(),
             last_screen_switch: LastLayerSwitch::default(),
+            // Issue #1878: default to false; set per-packet by the manager from
+            // the live active transport. A fresh peer accrues no audio datagram
+            // loss until we confirm the receiver is on WebTransport.
+            receiver_on_webtransport: false,
+            audio_datagram_loss: AudioDatagramLossTracker::new(),
         })
     }
 
@@ -1102,17 +1307,15 @@ impl Peer {
         let screen_decoder = VideoPeerDecoder::new(None, MEDIA_TYPE_SCREEN)?;
 
         // Attempt to set canvas immediately if available in DOM
-        if let Some(window) = web_sys::window() {
-            if let Some(document) = window.document() {
-                if let Some(canvas_element) = document.get_element_by_id(video_canvas_id) {
-                    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-                        let _ = video_decoder.set_canvas(canvas);
-                    }
+        if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+            if let Some(canvas_element) = document.get_element_by_id(video_canvas_id) {
+                if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+                    let _ = video_decoder.set_canvas(canvas);
                 }
-                if let Some(canvas_element) = document.get_element_by_id(screen_canvas_id) {
-                    if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
-                        let _ = screen_decoder.set_canvas(canvas);
-                    }
+            }
+            if let Some(canvas_element) = document.get_element_by_id(screen_canvas_id) {
+                if let Ok(canvas) = canvas_element.dyn_into::<web_sys::HtmlCanvasElement>() {
+                    let _ = screen_decoder.set_canvas(canvas);
                 }
             }
         }
@@ -1874,6 +2077,10 @@ impl Peer {
             // frame is cleared at the same instant the tile flips to the
             // avatar — no lingering freeze-frame (#1034).
             self.video.flush();
+            // Force-clear the canvas so the recording output shows the avatar
+            // rather than a frozen last frame (recording_active guard does not
+            // apply for a genuine camera-off command).
+            self.video.force_clear_canvas();
             changed = true;
             debug!(
                 "force_media_off: disabled video for peer {} (host command)",
@@ -1913,6 +2120,30 @@ impl Peer {
                 metric!("to_peer", self.sid_str.clone()),
                 metric!("video_seq_loss_per_sec", loss_per_sec),
                 metric!("keyframe_requests_per_sec", kf_per_sec),
+            ],
+        };
+        let _ = global_sender().try_broadcast(evt);
+    }
+
+    /// Emit the windowed receive-side audio DATAGRAM loss rate on the
+    /// diagnostics bus (issue #1878). Published under the `"neteq"` subsystem —
+    /// the per-peer AUDIO bucket — with the same `from_peer`/`to_peer` routing
+    /// keys as [`Self::emit_loss_metrics`], so the existing health_reporter
+    /// `"neteq"` handler folds it into this peer's audio health next to the
+    /// NetEQ concealment stats. Called at most ~1 Hz per peer (only on rate-
+    /// window rollover), so it stays off the per-packet hot path.
+    ///
+    /// `local_user_id` is the reporting (local) client — the `from_peer`;
+    /// `self.sid_str` is the observed remote peer — the `to_peer`.
+    fn emit_audio_datagram_loss(&self, local_user_id: &str, loss_per_sec: f64) {
+        let evt = DiagEvent {
+            subsystem: "neteq",
+            stream_id: None,
+            ts_ms: now_ms(),
+            metrics: vec![
+                metric!("from_peer", local_user_id.to_string()),
+                metric!("to_peer", self.sid_str.clone()),
+                metric!("wt_datagram_audio_loss_per_sec", loss_per_sec),
             ],
         };
         let _ = global_sender().try_broadcast(evt);
@@ -2141,7 +2372,11 @@ impl Peer {
                 // Skip video decoding when the peer tile is not visible in the
                 // viewport. The next keyframe after visibility is restored will
                 // allow the decoder to recover naturally.
-                if !self.visible {
+                //
+                // Recording follows the same local visibility/decode set the
+                // participant is already viewing. Off-budget peers remain
+                // avatars instead of forcing extra decode work on this device.
+                if !should_decode_visible_peer(self.visible) {
                     return Ok((media_type, DecodeStatus::SKIPPED, None));
                 }
 
@@ -2189,6 +2424,25 @@ impl Peer {
                 // straggler-drop path so the next heartbeat can detect
                 // recent audio frames and suppress a stale-muted heartbeat.
                 self.last_audio_frame_ms = now;
+
+                // Issue #1878: receive-side audio DATAGRAM loss accounting.
+                // Recorded on ARRIVAL — before the mute/straggler gate below —
+                // so a mute-off transition does not manufacture a phantom gap,
+                // and only while THIS receiver is on WebTransport (the sole
+                // transport that can carry audio on unreliable datagrams). The
+                // dense per-frame `sequence` (see `microphone_encoder`) turns a
+                // dropped datagram into a countable gap; the windowed rate is
+                // emitted to the diagnostics bus / health reporter on rollover.
+                if self.receiver_on_webtransport {
+                    if let Some(seq) = packet.audio_metadata.as_ref().map(|am| am.sequence) {
+                        let new_lost = self.audio_datagram_loss.record_seq(seq);
+                        if let Some(loss_per_sec) =
+                            self.audio_datagram_loss.observe_window(now, new_lost)
+                        {
+                            self.emit_audio_datagram_loss(local_user_id, loss_per_sec);
+                        }
+                    }
+                }
 
                 if !self.audio_enabled {
                     if !self.has_received_heartbeat {
@@ -2281,7 +2535,8 @@ impl Peer {
                 // Still propagate any keyframe request from gap detection so
                 // that the sender starts producing keyframes before the tile
                 // becomes visible again.
-                if !self.visible {
+                //
+                if !should_decode_visible_peer(self.visible) {
                     return Ok((media_type, DecodeStatus::SKIPPED, kf_request));
                 }
 
@@ -2407,6 +2662,13 @@ impl Peer {
                     // Flush video decoder when video is turned off
                     if video_turned_off {
                         self.video.flush();
+                        // Clear the canvas unconditionally so the recording
+                        // output shows the avatar instead of a frozen last
+                        // frame.  clear_canvas() would skip the pixel wipe
+                        // when recording_active=true, which is only the right
+                        // behaviour for budget-pressure invisibility — not for
+                        // a genuine camera-off event.
+                        self.video.force_clear_canvas();
                         debug!(
                             "Flushed video decoder for peer {} (video turned off)",
                             self.session_id
@@ -2426,6 +2688,10 @@ impl Peer {
                     // Flush screen decoder when screen sharing is turned off
                     if screen_turned_off {
                         self.screen.flush();
+                        // A stopped share is a source-state transition, not a
+                        // visibility shed. Wipe the decoder canvas so the
+                        // recording compositor cannot retain a frozen frame.
+                        self.screen.force_clear_canvas();
                         debug!(
                             "Flushed screen decoder for peer {} (screen turned off)",
                             self.session_id
@@ -2588,6 +2854,13 @@ fn should_clear_canvas(prev_visible: bool, new_visible: bool) -> bool {
     prev_visible && !new_visible
 }
 
+/// Decode eligibility is the participant's local visible set, independent of
+/// whether client-side recording is active. Both camera and screen paths call
+/// this helper before reaching their decoder.
+fn should_decode_visible_peer(visible: bool) -> bool {
+    visible
+}
+
 fn parse_media_packet(data: &[u8]) -> Result<Arc<MediaPacket>, PeerDecodeError> {
     Ok(Arc::new(
         MediaPacket::parse_from_bytes(data).map_err(|_| PeerDecodeError::PacketParseError)?,
@@ -2681,6 +2954,13 @@ pub struct PeerDecodeManager {
     /// `connected_peers` loop in `tick_layer_choosers`, which skips absent peers —
     /// and the UI overwrites the whole map on the next viewport event.
     peer_tile_hints: HashMap<u64, crate::decode::layer_chooser::TileHint>,
+    /// Issue #1878: whether THIS client's currently-active transport is
+    /// WebTransport. Refreshed on every inbound packet from the authoritative
+    /// [`ConnectionController::active_is_webtransport`] via
+    /// [`Self::set_receiver_on_webtransport`], then stamped onto each `Peer`
+    /// before decode so the per-peer audio-datagram-loss tracker runs only when
+    /// audio can actually ride datagrams. Defaults to `false` (pre-connect).
+    receiver_on_webtransport: bool,
     /// Test-only count of how many times `log_peer_leave_decode_snapshot`
     /// actually emitted, so #1399 coalescing can be asserted directly
     /// (O(N) -> constant under a within-window cascade). `Cell` because the
@@ -2717,6 +2997,7 @@ impl PeerDecodeManager {
             last_delete_peer_snapshot_ms: 0,
             pli_budget: Rc::new(RefCell::new(PliBudget::new())),
             peer_tile_hints: HashMap::new(),
+            receiver_on_webtransport: false,
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -2743,6 +3024,7 @@ impl PeerDecodeManager {
             last_delete_peer_snapshot_ms: 0,
             pli_budget: Rc::new(RefCell::new(PliBudget::new())),
             peer_tile_hints: HashMap::new(),
+            receiver_on_webtransport: false,
             #[cfg(test)]
             snapshot_emits: std::cell::Cell::new(0),
         }
@@ -2769,6 +3051,16 @@ impl PeerDecodeManager {
     pub fn set_send_packet_callback(&mut self, callback: Callback<PacketWrapper>, user_id: String) {
         self.send_packet = Some(callback);
         self.local_user_id = user_id;
+    }
+
+    /// Issue #1878: record whether THIS client's active transport is
+    /// WebTransport. Called by `VideoCallClient` on every inbound packet from
+    /// the live [`ConnectionController::active_is_webtransport`] signal, so the
+    /// value tracks re-election and WT↔WS transport switches with no stale
+    /// cache. `decode` stamps it onto the target `Peer` so the audio-datagram-
+    /// loss tracker is fed only when audio can ride datagrams.
+    pub fn set_receiver_on_webtransport(&mut self, on_webtransport: bool) {
+        self.receiver_on_webtransport = on_webtransport;
     }
 
     /// Store the per-peer rendered-tile-size hints pushed by the UI (issue #1256
@@ -2950,17 +3242,80 @@ impl PeerDecodeManager {
     }
 
     /// Set the canvas element for a peer's video decoder
+    /// Set the canvas element for a peer's camera video decoder.
+    ///
+    /// When the canvas is attached and the peer's camera is on, a keyframe
+    /// request is sent immediately.  This handles late joiners and re-mounts
+    /// (e.g. the peer turned the camera on after recording started, or the
+    /// canvas was unmounted and remounted by the Dioxus render cycle): the
+    /// first keyframe was decoded before the canvas existed, so the decoder
+    /// needs a fresh one to render.  Without the request the canvas stays
+    /// blank until the jitter buffer eviction timer fires.
     pub fn set_peer_video_canvas(
         &self,
         peer_id: u64,
         canvas: web_sys::HtmlCanvasElement,
     ) -> Result<(), JsValue> {
         if let Some(peer) = self.connected_peers.get(&peer_id) {
-            peer.video.set_canvas(canvas)
+            peer.video.set_canvas(canvas)?;
+            if peer.video_enabled {
+                // `peer_id` is the relay session_id of the target peer (#1124).
+                self.send_keyframe_request(&peer.user_id, peer_id, MediaType::VIDEO);
+            }
+            Ok(())
         } else {
             Err(JsValue::from_str(&format!("Peer {peer_id} not found")))
         }
     }
+
+    /// Return the canvas elements that are currently wired to camera-video
+    /// decoders for all connected peers.
+    ///
+    /// Each entry is `(session_id_string, HtmlCanvasElement)`.  Only peers
+    /// whose video decoder has an attached canvas are included — peers whose
+    /// camera is off (no canvas ever set) are silently omitted.
+    ///
+    /// Used by the recording module to composite remote video directly from
+    /// the decoder's live canvas rather than relying on the Dioxus DOM, which
+    /// may not have the `<canvas>` element mounted when `show_canvas = false`
+    /// (budget pressure, camera-on/off race, etc.).
+    pub fn peer_video_canvases(&self) -> Vec<(String, web_sys::HtmlCanvasElement)> {
+        self.connected_peers
+            .ordered_keys()
+            .iter()
+            .filter_map(|sid| {
+                let peer = self.connected_peers.get(sid)?;
+                let canvas = peer.video.get_canvas()?;
+                Some((peer.sid_str.clone(), canvas))
+            })
+            .collect()
+    }
+
+    /// Return every peer's currently-attached screen-share decoder canvas.
+    ///
+    /// Mirror of [`peer_video_canvases`] for the remote screen-share stream.
+    /// Used by the recording module to composite remote screen-share directly
+    /// from the decoder's live canvas rather than relying on the Dioxus DOM,
+    /// which may not have the `<canvas>` element mounted yet when the peer
+    /// first starts sharing (the tile only appears after a re-render).
+    pub fn peer_screen_canvases(&self) -> Vec<(String, web_sys::HtmlCanvasElement)> {
+        self.connected_peers
+            .ordered_keys()
+            .iter()
+            .filter_map(|sid| {
+                let peer = self.connected_peers.get(sid)?;
+                let canvas = peer.screen.get_canvas()?;
+                Some((peer.sid_str.clone(), canvas))
+            })
+            .collect()
+    }
+
+    /// Compatibility hook for the recording UI.
+    ///
+    /// Recording deliberately follows the participant's existing local decode
+    /// and visibility set. Starting a recording must not force off-screen peers
+    /// to decode, create hidden canvases, or change publisher behavior.
+    pub fn set_recording_active(&self, _active: bool) {}
 
     /// Set the canvas element for a peer's screen share decoder.
     ///
@@ -3898,6 +4253,10 @@ impl PeerDecodeManager {
                 }
                 peer.context_initialized = true;
             }
+            // Issue #1878: stamp the live active transport onto the peer so the
+            // AUDIO arm's datagram-loss tracker runs only when this receiver is
+            // on WebTransport (audio can ride datagrams only there).
+            peer.receiver_on_webtransport = self.receiver_on_webtransport;
             match peer.decode(&packet, userid) {
                 Ok((MediaType::HEARTBEAT, _, _)) => {
                     peer.on_activity();
@@ -4144,7 +4503,7 @@ impl PeerDecodeManager {
         let from_peer = self.local_session_id.clone().unwrap_or_default();
         peer.video
             .set_stream_context(from_peer.clone(), sid_str.clone());
-        peer.screen.set_stream_context(from_peer, sid_str);
+        peer.screen.set_stream_context(from_peer, sid_str.clone());
         // Apply cached display name if PARTICIPANT_JOINED arrived before
         // the first media packet created this peer entry.
         if let Some(cached_name) = self.display_name_cache.get(&session_id) {
@@ -4163,6 +4522,35 @@ impl PeerDecodeManager {
         // Phase 6: invalidate the sorted-keys cache so the next
         // `sorted_string_keys()` call rebuilds with the new peer.
         self.invalidate_sorted_string_keys();
+
+        // If the Dioxus UI already rendered this peer's tile before the first
+        // media packet arrived (PARTICIPANT_JOINED fires before any media),
+        // the `use_effect` in UserVideo will have tried `set_peer_video_canvas`
+        // but found the peer absent from `connected_peers` and logged a debug
+        // message.  Since `use_effect` only runs once on mount, the canvas
+        // would never be registered unless we attempt it here too.
+        //
+        // The canvas element id is the bare `session_id` string — see the
+        // UserVideo RSX `canvas { id: "{id}", ... }`.  The `video_canvas_id`
+        // field uses a "video-" prefix (legacy) that no longer matches the DOM.
+        if let Some(peer_ref) = self.connected_peers.get(&session_id) {
+            if let Some(window) = web_sys::window() {
+                if let Some(document) = window.document() {
+                    if let Some(el) = document.get_element_by_id(&sid_str) {
+                        if let Ok(canvas) = el.dyn_into::<web_sys::HtmlCanvasElement>() {
+                            if let Err(e) = peer_ref.video.set_canvas(canvas) {
+                                log::debug!(
+                                    "add_peer: could not register canvas for {sid_str}: {e:?}"
+                                );
+                            } else {
+                                log::debug!("add_peer: registered canvas for {sid_str} from DOM");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(())
     }
 
@@ -4822,6 +5210,8 @@ fn make_test_peer(session_id: u64) -> (Peer, Rc<std::cell::Cell<bool>>) {
         last_audio_frame_ms: 0,
         last_video_switch: LastLayerSwitch::default(),
         last_screen_switch: LastLayerSwitch::default(),
+        receiver_on_webtransport: false,
+        audio_datagram_loss: AudioDatagramLossTracker::new(),
     };
     (peer, muted_handle)
 }
@@ -4868,6 +5258,104 @@ mod tests {
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
+
+    // ── Issue #1878: receive-side audio DATAGRAM loss accounting ─────────────
+    // Pure native `#[test]`s over the production `AudioDatagramLossTracker`
+    // (run by the CI "cargo test videocall-client (native libtest)" job). These
+    // are the regression guard for the #1878 instrumentation: they exercise the
+    // exact production `record_seq` / `observe_window` the AUDIO decode arm
+    // calls, so a mutation that stops counting datagram loss (or drops the
+    // windowed rate) fails here.
+
+    /// A gap in the received audio sequence is counted as loss once the skipped
+    /// position leaves the 64-slot reorder window. Mutating `record_seq` /
+    /// `record_seq_into_reorder_window` to stop counting fails this.
+    #[test]
+    fn audio_datagram_loss_counts_sequence_gap() {
+        let mut t = AudioDatagramLossTracker::new();
+        assert_eq!(t.record_seq(0), 0, "first packet establishes the baseline");
+        // Sequence 1 (a datagram) never arrives; receive 2..=65 in order. Loss
+        // for position 1 is declared exactly when it shifts off the reorder
+        // window (at high == 65), never before (reorder tolerance).
+        let mut total_lost = 0u32;
+        for seq in 2..=65u64 {
+            total_lost += t.record_seq(seq);
+        }
+        assert_eq!(
+            total_lost, 1,
+            "the one skipped audio datagram must be counted once it leaves the reorder window"
+        );
+    }
+
+    /// An out-of-order-but-received datagram (within the window) is NOT loss,
+    /// even after the window advances far past it.
+    #[test]
+    fn audio_datagram_loss_tolerates_reordering() {
+        let mut t = AudioDatagramLossTracker::new();
+        assert_eq!(t.record_seq(0), 0);
+        assert_eq!(t.record_seq(2), 0);
+        assert_eq!(
+            t.record_seq(1),
+            0,
+            "an in-window out-of-order datagram is not loss"
+        );
+        let mut lost = 0u32;
+        for seq in 3..=70u64 {
+            lost += t.record_seq(seq);
+        }
+        assert_eq!(
+            lost, 0,
+            "a reordered-but-received datagram must never be counted as lost"
+        );
+    }
+
+    /// The ~1s window normalises accumulated loss into a per-second rate on
+    /// rollover, and only on rollover.
+    #[test]
+    fn audio_datagram_loss_windowed_rate() {
+        let mut t = AudioDatagramLossTracker::new();
+        assert_eq!(
+            t.observe_window(10_000, 0),
+            None,
+            "no rollover before the window fills"
+        );
+        assert_eq!(t.observe_window(10_500, 2), None);
+        // Exactly 1000ms elapsed (10_000 -> 11_000) with 2 lost => 2.0/sec.
+        assert_eq!(t.observe_window(11_000, 0), Some(2.0));
+        assert_eq!(t.loss_per_sec(), 2.0);
+        // A fresh window has started; no immediate second rollover.
+        assert_eq!(t.observe_window(11_500, 0), None);
+    }
+
+    /// A large BACKWARD jump (mic-encoder restart resets `sequence` to 0)
+    /// re-anchors instead of wedging the tracker on the "too old" branch, and
+    /// loss detection resumes on the new stream. Removing the re-anchor guard
+    /// leaves the tracker pinned at the old high-water mark and fails the final
+    /// assertion.
+    #[test]
+    fn audio_datagram_loss_reanchors_on_sender_reset() {
+        let mut t = AudioDatagramLossTracker::new();
+        assert_eq!(t.record_seq(50_000), 0);
+        assert_eq!(t.record_seq(50_001), 0);
+        // Sender restart: sequence resets to 0 (>= AUDIO_SEQ_RESET_REANCHOR_GAP
+        // below the high-water mark) -> re-anchor, not loss.
+        assert_eq!(
+            t.record_seq(0),
+            0,
+            "a sender-side sequence reset re-anchors and is not counted as loss"
+        );
+        assert_eq!(t.record_seq(1), 0);
+        // A real gap in the NEW stream (skip 2) is still detected once it leaves
+        // the window — proving the tracker did not wedge after the reset.
+        let mut lost = 0u32;
+        for seq in 3..=66u64 {
+            lost += t.record_seq(seq);
+        }
+        assert_eq!(
+            lost, 1,
+            "loss detection must resume on the new stream after a sender-reset re-anchor"
+        );
+    }
 
     // `MockAudioDecoder`, `make_test_peer`, and `make_zero_loss_top_peer` were
     // hoisted to the parent module (still `#[cfg(test)]`) so the production-only
@@ -5847,6 +6335,25 @@ mod tests {
         );
     }
 
+    /// A real screen-share stop must clear the decoder canvas gate, not merely
+    /// flush codec state. Removing `force_clear_canvas()` from the heartbeat
+    /// transition leaves this exact production paint flag enabled and fails.
+    #[wasm_bindgen_test]
+    fn screen_disable_force_clears_the_last_frame() {
+        let (mut peer, _muted) = make_test_peer(81);
+        assert!(peer.screen.paint_enabled_for_test());
+
+        let _ = peer.decode(&heartbeat_packet(81, false, false, true), "");
+        assert!(peer.screen_enabled);
+
+        let _ = peer.decode(&heartbeat_packet(81, false, false, false), "");
+        assert!(!peer.screen_enabled);
+        assert!(
+            !peer.screen.paint_enabled_for_test(),
+            "screen-off must disable painting so a recording cannot retain the frozen last frame"
+        );
+    }
+
     // -- audio_level tests -------------------------------------------------
 
     /// A freshly created peer should have audio_level == 0.0.
@@ -6794,6 +7301,15 @@ mod tests {
     }
 
     // -- Visibility-based skip tests ----------------------------------------
+
+    /// Native policy pin for both production media gates. A recording state is
+    /// intentionally not an input: hidden camera and screen peers stay outside
+    /// the decode set. Flipping either truth-table result fails this test.
+    #[test]
+    fn decode_eligibility_is_strictly_visibility_based() {
+        assert!(should_decode_visible_peer(true));
+        assert!(!should_decode_visible_peer(false));
+    }
 
     /// Setting peer visibility to false should cause VIDEO decoding to return
     /// SKIPPED status.
@@ -9682,6 +10198,8 @@ mod tests {
                 last_audio_frame_ms: 0,
                 last_video_switch: LastLayerSwitch::default(),
                 last_screen_switch: LastLayerSwitch::default(),
+                receiver_on_webtransport: false,
+                audio_datagram_loss: AudioDatagramLossTracker::new(),
             };
             manager.connected_peers.insert(sid, peer);
         }
@@ -9791,6 +10309,8 @@ mod tests {
             last_audio_frame_ms: 0,
             last_video_switch: LastLayerSwitch::default(),
             last_screen_switch: LastLayerSwitch::default(),
+            receiver_on_webtransport: false,
+            audio_datagram_loss: AudioDatagramLossTracker::new(),
         };
         manager.connected_peers.insert(510, peer);
 
@@ -9871,6 +10391,8 @@ mod tests {
             last_audio_frame_ms: 0,
             last_video_switch: LastLayerSwitch::default(),
             last_screen_switch: LastLayerSwitch::default(),
+            receiver_on_webtransport: false,
+            audio_datagram_loss: AudioDatagramLossTracker::new(),
         };
         manager.connected_peers.insert(520, peer);
 
@@ -11185,6 +11707,55 @@ mod tests {
             ctx,
             Some(("99".to_string(), "500".to_string())),
             "from_peer must be local session_id '99', not email/user_id"
+        );
+    }
+
+    // ── recording preserves the local decode budget ─────────────────────────
+
+    /// Starting a recording must not bypass the camera visibility gate. The
+    /// paint flag is the production decoder's observable source of truth: the
+    /// invisible skip leaves it disabled, while a forced decode re-enables it
+    /// inside `VideoPeerDecoder::decode` before pushing the frame.
+    #[wasm_bindgen_test]
+    fn recording_does_not_force_invisible_video_decode() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _) = make_test_peer(1);
+        manager.connected_peers.insert(1, peer);
+        manager.set_recording_active(true);
+
+        let peer = manager.connected_peers.get_mut(&1).unwrap();
+        let _ = peer.decode(&heartbeat_packet(1, true, true, false), "");
+        peer.visible = false;
+        peer.video.clear_canvas();
+        assert!(!peer.video.paint_enabled_for_test());
+
+        let _ = peer.decode(&video_frame_packet(1), "").unwrap();
+        assert!(
+            !peer.video.paint_enabled_for_test(),
+            "recording must leave off-screen camera decode budget-gated"
+        );
+    }
+
+    /// Screen share uses the same local visibility set. Reintroducing the old
+    /// recording override reaches `VideoPeerDecoder::decode`, which flips this
+    /// exact paint flag back to true and fails the assertion.
+    #[wasm_bindgen_test]
+    fn recording_does_not_force_invisible_screen_decode() {
+        let mut manager = PeerDecodeManager::new();
+        let (peer, _) = make_test_peer(2);
+        manager.connected_peers.insert(2, peer);
+        manager.set_recording_active(true);
+
+        let peer = manager.connected_peers.get_mut(&2).unwrap();
+        let _ = peer.decode(&heartbeat_packet(2, false, false, true), "");
+        peer.visible = false;
+        peer.screen.clear_canvas();
+        assert!(!peer.screen.paint_enabled_for_test());
+
+        let _ = peer.decode(&screen_frame_packet(2), "").unwrap();
+        assert!(
+            !peer.screen.paint_enabled_for_test(),
+            "recording must leave off-screen screen-share decode budget-gated"
         );
     }
 }

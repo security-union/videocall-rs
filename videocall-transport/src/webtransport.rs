@@ -32,6 +32,85 @@ pub fn datagram_drop_count() -> u64 {
     DATAGRAM_DROP_COUNT.load(Ordering::Relaxed)
 }
 
+/// Issue #1878 mitigation — INCOMING datagram queue CAPACITY (number of
+/// datagrams the browser buffers in the network process before dropping the
+/// OLDEST). Aggregate incoming audio scales with the number of SENDERS (each
+/// ~50 pps), so which of the two limits binds first during a stall depends on
+/// fan-out: at LOW fan-out the survivable window is bounded by AGE
+/// ([`INCOMING_DATAGRAM_MAX_AGE_MS`], 3 s) — e.g. a single sender queues ~150
+/// datagrams in 3 s, far under this mark; at HIGH fan-out it is bounded by
+/// CAPACITY — e.g. 20 senders queue ~3000 datagrams in 3 s, exceeding 2048, so
+/// the oldest are dropped before they age out. 2048 is a deliberately generous
+/// ceiling (each buffered audio datagram is one small Opus frame, so worst-case
+/// memory is well under 1 MB) that keeps AGE the binding limit for typical
+/// meetings while capping memory at large fan-out.
+const INCOMING_DATAGRAM_HIGH_WATER_MARK: f64 = 2048.0;
+
+/// Issue #1878 mitigation — INCOMING datagram staleness bound (ms): the browser
+/// discards a queued datagram older than this. Per the W3C spec the default
+/// `incomingMaxAge` is `null` = datagrams are NEVER age-dropped (UNBOUNDED),
+/// which reads back as NaN. We deliberately BOUND that spec-unbounded default at
+/// 3 s — a NetEQ-friendly staleness cap, since audio more than ~3 s stale is
+/// unusable for real-time playout anyway (NetEQ would discard it), so retaining
+/// it would only waste queue capacity fresher audio needs. This is therefore a
+/// TIGHTENING of the default, not a raise: that 3 s cap is exactly what age-drops
+/// the OLDEST audio during a stall LONGER than 3 s (only PARTIALLY mitigated) —
+/// the full fix is carrying audio on a reliable/partially-reliable stream, a
+/// relay+client protocol change (follow-up).
+const INCOMING_DATAGRAM_MAX_AGE_MS: f64 = 3000.0;
+
+/// Widen the browser's INCOMING QUIC-datagram receive queue so a main-thread
+/// stall does not silently drop audio (issue #1878).
+///
+/// Under E2EE-off WebTransport the relay routes small Opus AUDIO frames onto
+/// unreliable datagrams. Our incoming-datagram reader
+/// ([`WebTransportService::start_listening_incoming_datagrams`]) runs as a
+/// `spawn_local` task on the MAIN thread. When the main thread stalls (a long
+/// task — the #1878 trigger, correlated in the field with the "CPU-stall
+/// suppression budget exhausted" log), the reader cannot drain and the browser
+/// drops the OLDEST queued datagrams — silently, because the relay's
+/// `send_datagram` is best-effort (returns `Ok`) and the client's
+/// [`datagram_drop_count`] is SEND-side only. That is a contiguous audio
+/// burst-loss NetEQ cannot conceal (56% vs 2% concealment WT-vs-WS in the field).
+///
+/// Raising `incomingHighWaterMark` (queue capacity) and `incomingMaxAge`
+/// (staleness bound) lets the network process HOLD the backlog across a bounded
+/// stall and deliver it late-but-COMPLETE once the main thread frees up —
+/// mirroring how TCP kernel buffering lets WebSocket survive the identical stall.
+/// The reader living on the stalled main thread does not prevent this: the
+/// buffering happens off-thread in the network process. Steady-state adds no
+/// latency (the queue drains immediately); only during a stall is audio
+/// delivered later, which NetEQ absorbs (it tolerates late audio; it cannot
+/// conceal a multi-second gap).
+///
+/// The two knobs are tuned in OPPOSITE directions, deliberately:
+/// `incomingHighWaterMark` is only ever RAISED (we never lower a UA default that
+/// is already more generous), whereas `incomingMaxAge` is BOUNDED at 3 s — a
+/// TIGHTENING of the spec's UNBOUNDED (`null`) default, because audio staler than
+/// that is unusable (see [`INCOMING_DATAGRAM_MAX_AGE_MS`]).
+fn configure_incoming_datagram_queue(datagrams: &WebTransportDatagramDuplexStream) {
+    let prev_hwm = datagrams.incoming_high_water_mark();
+    let prev_age = datagrams.incoming_max_age();
+    // Capacity: raise toward our target, never below an already-larger UA default.
+    if prev_hwm < INCOMING_DATAGRAM_HIGH_WATER_MARK {
+        datagrams.set_incoming_high_water_mark(INCOMING_DATAGRAM_HIGH_WATER_MARK);
+    }
+    // Staleness: the spec default is `null` = unbounded (never age-drop), read
+    // back as NaN — bound it to our cap. A finite UA default SMALLER than the cap
+    // is raised to it; a finite default already >= the cap (more generous) is left
+    // as-is. So this TIGHTENS an unbounded default but never lowers a finite one.
+    if prev_age.is_nan() || prev_age < INCOMING_DATAGRAM_MAX_AGE_MS {
+        datagrams.set_incoming_max_age(INCOMING_DATAGRAM_MAX_AGE_MS);
+    }
+    log!(format!(
+        "WT incoming datagram queue tuned (issue #1878): highWaterMark {} -> {}, maxAge {} -> {} ms",
+        prev_hwm,
+        datagrams.incoming_high_water_mark(),
+        prev_age,
+        datagrams.incoming_max_age()
+    ));
+}
+
 /// Cumulative count of frames dropped on the persistent unidirectional QUIC
 /// streams (`send_on_persistent_stream`) because the write failed and the
 /// stream had to be evicted.
@@ -966,6 +1045,9 @@ impl WebTransportService {
         datagrams: WebTransportDatagramDuplexStream,
         callback: Callback<Vec<u8>>,
     ) {
+        // Issue #1878: widen the incoming datagram queue BEFORE taking the reader
+        // so a main-thread stall does not overflow it and silently drop audio.
+        configure_incoming_datagram_queue(&datagrams);
         let incoming_datagrams: ReadableStreamDefaultReader =
             datagrams.readable().get_reader().unchecked_into();
         wasm_bindgen_futures::spawn_local(async move {

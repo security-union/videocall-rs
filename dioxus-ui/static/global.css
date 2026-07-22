@@ -57,6 +57,21 @@
   width: 100%;
   height: 100%;
 }
+/* Meeting-wide status bar reserve for the full-bleed single-peer tile.
+   Unlike in-flow grid tiles, `.grid-item.full-bleed` is `position: fixed;
+   inset: 0; height: 100vh`, so it escapes the grid's `pad_top` and the bar
+   would otherwise overlap its `.floating-name` label (the reported 2-participant
+   bug). When attendants.rs mounts the bar it adds `status-bar-active` to
+   `#grid-container` and sets `--status-bar-reserve` (px) to the SAME value it
+   adds to `pad_top`, so the tile's top inset always matches the painted bar
+   height. Overriding `top`/`height`/`max-height` shrinks and re-centers the
+   fixed tile into the area BELOW the bar; the rule vanishes (tile back to full
+   viewport) the instant the class/var are gone. */
+#grid-container.status-bar-active .grid-item.full-bleed {
+  top: var(--status-bar-reserve, 0px);
+  height: calc(100vh - var(--status-bar-reserve, 0px));
+  max-height: calc(100vh - var(--status-bar-reserve, 0px));
+}
 /* 2-peer layout: each tile fills its half of the viewport.
    Overrides the `aspect-ratio: 3 / 2` cap from `.grid-item` (style.css) and
    the centering from `place-self: center`. Single-peer is handled by
@@ -3428,7 +3443,10 @@ html[data-theme="light"] #invite-overlay p {
   background: transparent;
 }
 
-.ss-detach-btn[aria-pressed="true"] {
+/* issue 1821: the actual-size (1:1) toggle shares the detach toggle's engaged
+   highlight so a "pinned" control reads the same across the bar. */
+.ss-detach-btn[aria-pressed="true"],
+.ss-actual-btn[aria-pressed="true"] {
   background: rgba(76, 139, 245, 0.35);
 }
 
@@ -4145,4 +4163,147 @@ html[data-theme="light"] #invite-overlay p {
 .split-peer-tile .transport-badge {
   font-size: 9px;
   padding: 1px var(--space-1);
+}
+
+/* ---------------------------------------------------------------
+   Recording UI — button active state, status banners, rec dot
+   --------------------------------------------------------------- */
+
+@keyframes rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+/* Record button — active/recording state */
+.video-control-button.record-active {
+  background: rgba(255, 69, 58, 0.9);
+  border-color: #ff453a;
+  box-shadow: 0 0 0 0 rgba(255, 69, 58, 0.4);
+  animation: rec-pulse 1.5s ease-in-out infinite;
+}
+
+/* Pulsing red dot used in both banners */
+.rec-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff453a;
+  animation: rec-pulse 1.5s ease-in-out infinite;
+  flex-shrink: 0;
+}
+
+.recording-status-banner,
+.recording-saved-banner {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.4rem 1rem;
+  background: rgba(13, 19, 31, 0.92);
+  border-radius: 2rem;
+  color: white;
+  font-size: 0.85rem;
+  font-weight: 500;
+}
+
+/* Local recording status (shown only to the participant who started recording) */
+.recording-status-banner {
+  border: 1px solid rgba(255, 69, 58, 0.5);
+}
+
+/* Brief confirmation shown to the recorder when recording has been saved */
+.recording-saved-banner {
+  border: 1px solid rgba(255, 69, 58, 0.5);
+}
+
+/* ---------------------------------------------------------------
+   Meeting-wide status bar (Google-Meet style).
+
+   A general-purpose, in-flow horizontal strip anchored to the TOP of
+   `#main-container`, ABOVE the video-tile grid. Unlike a floating pill,
+   it reserves real vertical space: attendants.rs adds its height
+   (`STATUS_BAR_RESERVE`) to the grid's `pad_top` while it is mounted, so
+   the tiles resize/shift below it and its contents never overlap tile
+   chrome such as the per-tile `.floating-name` label.
+
+   It currently hosts a single item — the meeting-wide recording status —
+   but is structured generically so future meeting-level statuses can be
+   appended as sibling `.meeting-status-item`s.
+
+   The bar's `height` here MUST stay in sync with `STATUS_BAR_RESERVE`
+   (desktop) / `STATUS_BAR_RESERVE_MOBILE` (mobile) in attendants.rs, and
+   the 567px breakpoint below mirrors that file's `vw < 568.0` grid-padding
+   branch, so the reserved space always equals the painted bar height.
+
+   Deliberately NOT built on `.peer-toast` — so it never inherits that
+   class's `toast-exit ... 7.5s forwards` auto-fade, which would silently
+   hide it after ~8s while recording continues. It has only an entrance
+   animation; there is no exit animation, so it stays fully visible until
+   Dioxus unmounts the whole bar when `any_session_recording` flips false.
+   --------------------------------------------------------------- */
+.meeting-status-bar {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 40px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 0.75rem;
+  padding: 0 1rem;
+  box-sizing: border-box;
+  pointer-events: none;
+  animation: status-bar-enter 0.3s ease-out;
+}
+
+.meeting-status-item {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.9rem;
+  background: rgba(13, 19, 31, 0.92);
+  border: 1px solid rgba(255, 69, 58, 0.7);
+  border-radius: 2rem;
+  color: white;
+  font-size: 0.85rem;
+  font-weight: 600;
+  line-height: 1.2;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+}
+
+.meeting-status-item-label {
+  white-space: nowrap;
+}
+
+@keyframes status-bar-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-8px);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .meeting-status-bar {
+    animation: none;
+  }
+}
+
+/* Mobile (matches attendants.rs `vw < 568.0`): shorter bar, in sync with
+   STATUS_BAR_RESERVE_MOBILE so the reserved space equals the painted height. */
+@media (max-width: 567px) {
+  .meeting-status-bar {
+    height: 32px;
+    padding: 0 0.5rem;
+  }
+
+  .meeting-status-item {
+    font-size: 0.8rem;
+    padding: 0.3rem 0.7rem;
+  }
 }

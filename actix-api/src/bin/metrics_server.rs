@@ -51,27 +51,31 @@ type DisplayNameMap = Arc<Mutex<HashMap<String, String>>>;
 // Import shared Prometheus metrics
 use sec_api::metrics::{
     ACTIVE_SESSIONS_TOTAL, ADAPTIVE_AUDIO_TIER, ADAPTIVE_SCREEN_TIER, ADAPTIVE_VIDEO_TIER,
-    AUDIO_CONCEALMENT_PCT, AUDIO_CONGESTION_CEILING, AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE,
-    BATTERY_CHARGING, BATTERY_LEVEL, CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER,
-    CLIENT_ACTIVE_SERVER_RTT_MS, CLIENT_AGENT_MEMORY_BYTES, CLIENT_CPU_THROTTLED, CLIENT_INFO,
-    CLIENT_LONGTASK_DURATION_MS, CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES,
-    CLIENT_NETWORK_DOWNLINK_MAX, CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC,
-    CLIENT_PACKETS_SENT_PER_SEC, CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS,
-    CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED, CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES,
-    DATAGRAM_DROPS, DECODER_ERRORS_TOTAL, DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP,
-    DECODE_BUDGET_NATURAL, DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE,
-    DECODE_BUDGET_PRESSURED, ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS,
-    ENCODER_QUEUE_DEPTH, ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
+    AUDIO_CONCEALMENT_PCT, AUDIO_CONGESTION_CEILING, AUDIO_DATAGRAM_LOSS_PER_SEC,
+    AUDIO_PLAYOUT_LATENCY_MS, AUDIO_QUALITY_SCORE, BATTERY_CHARGING, BATTERY_LEVEL,
+    CALL_QUALITY_SCORE, CAPABILITY_SCORE, CLIENT_ACTIVE_SERVER, CLIENT_ACTIVE_SERVER_RTT_MS,
+    CLIENT_AGENT_MEMORY_BYTES, CLIENT_CPU_THROTTLED, CLIENT_INFO, CLIENT_LONGTASK_DURATION_MS,
+    CLIENT_MEMORY_TOTAL_BYTES, CLIENT_MEMORY_USED_BYTES, CLIENT_NETWORK_DOWNLINK_MAX,
+    CLIENT_NETWORK_TYPE, CLIENT_PACKETS_RECEIVED_PER_SEC, CLIENT_PACKETS_SENT_PER_SEC,
+    CLIENT_REELECTION_TOTAL, CLIENT_RENDER_FPS, CLIENT_SEND_QUEUE_BYTES, CLIENT_TAB_THROTTLED,
+    CLIENT_TAB_VISIBLE, CLIENT_WASM_MEMORY_BYTES, DATAGRAM_DROPS, DECODER_ERRORS_TOTAL,
+    DECODE_ACTIVE_SET_SIZE, DECODE_BUDGET_EFFECTIVE_CAP, DECODE_BUDGET_NATURAL,
+    DECODE_BUDGET_OVERRIDE_FIXED_N, DECODE_BUDGET_OVERRIDE_MODE, DECODE_BUDGET_PRESSURED,
+    ENCODER_ACTIVE_LAYERS, ENCODER_EFFECTIVE_LAYERS, ENCODER_OUTPUT_FPS, ENCODER_QUEUE_DEPTH,
+    ENCODER_RESTART_TOTAL, ENCODER_TARGET_BITRATE_KBPS, HEALTH_REPORTS_TOTAL,
     KEYFRAME_REQUESTS_PER_SEC, KEYFRAME_REQUESTS_SENT_TOTAL, MEETING_PARTICIPANTS,
     NETEQ_ACCELERATE_OPS_PER_SEC, NETEQ_AUDIO_BUFFER_MS, NETEQ_EXPAND_OPS_PER_SEC,
     NETEQ_NORMAL_OPS_PER_SEC, NETEQ_PACKETS_AWAITING_DECODE, NETEQ_PACKETS_PER_SEC,
     NETEQ_TARGET_DELAY_MS, PEER_AUDIO_ENABLED, PEER_CAN_LISTEN, PEER_CAN_SEE,
     PEER_CONNECTIONS_TOTAL, PEER_VIDEO_ENABLED, RECEIVED_LAYER, RTT_PROBE_DROPPED_TOTAL,
     RTT_PROBE_STALE_SUPPRESSIONS_TOTAL, SCREEN_SHARING_ACTIVE, SCREEN_VIDEO_BITRATE_KBPS,
-    SCREEN_VIDEO_FPS, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED, TIER_TRANSITIONS_TOTAL,
-    VIDEO_BITRATE_KBPS, VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS, VIDEO_FRAMES_DROPPED,
-    VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS, VIDEO_PLAYOUT_STAGE1_SPAN_MS,
-    VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC, VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
+    SCREEN_VIDEO_CONTENT_STALENESS_MS, SCREEN_VIDEO_FPS, SCREEN_VIDEO_PLAYOUT_LATENCY_MS,
+    SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS, SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS,
+    SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL, SELF_AUDIO_ENABLED, SELF_VIDEO_ENABLED,
+    TIER_TRANSITIONS_TOTAL, VIDEO_BITRATE_KBPS, VIDEO_CONTENT_STALENESS_MS, VIDEO_FPS,
+    VIDEO_FRAMES_DROPPED, VIDEO_PLAYOUT_LATENCY_MS, VIDEO_PLAYOUT_PAINT_LAG_MS,
+    VIDEO_PLAYOUT_STAGE1_SPAN_MS, VIDEO_QUALITY_SCORE, VIDEO_SEQ_LOSS_PER_SEC,
+    VIDEO_SKIP_TO_LIVE_TOTAL, WEBSOCKET_DROPS,
 };
 
 async fn metrics_handler(
@@ -499,6 +503,7 @@ fn remove_per_peer_metrics(
     let _ = AUDIO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_QUALITY_SCORE.remove_label_values(&labels);
     let _ = VIDEO_SEQ_LOSS_PER_SEC.remove_label_values(&labels);
+    let _ = AUDIO_DATAGRAM_LOSS_PER_SEC.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
     let _ = VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
@@ -510,6 +515,14 @@ fn remove_per_peer_metrics(
     let _ = DECODER_ERRORS_TOTAL.remove_label_values(&labels);
     let _ = SCREEN_VIDEO_FPS.remove_label_values(&labels);
     let _ = SCREEN_VIDEO_BITRATE_KBPS.remove_label_values(&labels);
+    // Screen-share playout family (#1660): sweep the screen siblings so they do not
+    // leak per-pair series after the peer/session departs (mirrors the camera
+    // VIDEO_PLAYOUT_* / VIDEO_CONTENT_STALENESS_MS / VIDEO_SKIP_TO_LIVE_TOTAL removals above).
+    let _ = SCREEN_VIDEO_PLAYOUT_LATENCY_MS.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_CONTENT_STALENESS_MS.remove_label_values(&labels);
+    let _ = SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL.remove_label_values(&labels);
 
     // #1561: RECEIVED_LAYER uses a different label set (reporter-centric, not pair).
     // The `to_peer` in the per-pair labels above is the peer whose media we RECEIVE;
@@ -1623,6 +1636,33 @@ fn process_health_packet_to_metrics_pb(
                     SCREEN_VIDEO_BITRATE_KBPS
                         .with_label_values(&peer_labels)
                         .set(screen_stats.bitrate_kbps as f64);
+
+                    // Screen-share playout family (#1660): screen siblings of the camera
+                    // VIDEO_PLAYOUT_* / VIDEO_CONTENT_STALENESS_MS / VIDEO_SKIP_TO_LIVE_TOTAL
+                    // block above. PR #1657 routed the screen decoder's playout stats into
+                    // screen_video_stats; this exports them so a screen-share freeze can be
+                    // charted (previously only the camera bucket's playout family reached
+                    // Prometheus). Set UNCONDITIONALLY (same recover-to-0 rationale as the
+                    // camera block): the client reports nonzero ms values only while
+                    // fps_received > 0, so a stopped/hidden share reads 0 here rather than a
+                    // stale latch; content_staleness_ms is UNBOUNDED (unlike the 1800ms-capped
+                    // playout_latency_ms) and skip_to_live_total is a cumulative counter folded
+                    // unconditionally.
+                    SCREEN_VIDEO_PLAYOUT_LATENCY_MS
+                        .with_label_values(&peer_labels)
+                        .set(screen_stats.playout_latency_ms);
+                    SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS
+                        .with_label_values(&peer_labels)
+                        .set(screen_stats.playout_stage1_span_ms);
+                    SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS
+                        .with_label_values(&peer_labels)
+                        .set(screen_stats.playout_paint_lag_ms);
+                    SCREEN_VIDEO_CONTENT_STALENESS_MS
+                        .with_label_values(&peer_labels)
+                        .set(screen_stats.content_staleness_ms);
+                    SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL
+                        .with_label_values(&peer_labels)
+                        .set(screen_stats.playout_skip_to_live_total as f64);
                 }
 
                 // Decode errors
@@ -1650,6 +1690,19 @@ fn process_health_packet_to_metrics_pb(
                     KEYFRAME_REQUESTS_PER_SEC
                         .with_label_values(&peer_labels)
                         .set(kf);
+                }
+
+                // Receive-side audio DATAGRAM loss (#1878): audio sibling of the
+                // video seq-loss gauge above. Current clients fold this
+                // unconditionally (the live value on WebTransport, definitional
+                // 0.0 on WebSocket), so it is always set and the gauge recovers to
+                // 0 instead of latching — including on a mid-call WT→WS fallback.
+                // The `if let Some` still guards against an older client that
+                // predates the field and omits it.
+                if let Some(loss) = peer_data.audio_datagram_loss_per_sec {
+                    AUDIO_DATAGRAM_LOSS_PER_SEC
+                        .with_label_values(&peer_labels)
+                        .set(loss);
                 }
 
                 // Audio concealment percentage (from NetEQ expand events)
@@ -2424,6 +2477,228 @@ mod tests {
             Some(5000.0),
             "the VIDEO_CONTENT_STALENESS_MS export path must run and set the unbounded (>1800ms) \
              content age; None here means the .set(video_stats.content_staleness_ms) line is missing"
+        );
+    }
+
+    #[test]
+    fn test_audio_datagram_loss_metric_export() {
+        // Regression test for #1878. A WebTransport reporter folds the windowed
+        // receive-side audio DATAGRAM loss rate into PeerStats.audio_datagram_loss_per_sec,
+        // and the metrics server must export it as the per-peer gauge
+        // videocall_audio_datagram_loss_per_sec (the audio sibling of
+        // videocall_video_seq_loss_per_sec). Reverting the AUDIO_DATAGRAM_LOSS_PER_SEC
+        // `.set(loss)` export line makes gauge_value() return None and breaks this
+        // test — the mutation sensitivity CLAUDE.md requires.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // A WT audio peer losing 12.5 audio datagrams/sec (a burst NetEQ cannot conceal).
+        let mut ps = PbPeerStats::new();
+        ps.can_listen = true;
+        ps.audio_enabled = true;
+        ps.audio_datagram_loss_per_sec = Some(12.5);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_adl_1878".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_adl_1878",
+            "meet_adl_1878",
+            "alice_adl_1878",
+            peer_stats,
+        );
+
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        // from_peer = reporter (reporting_user_id); to_peer = the peer being reported on
+        // (the peer_stats map key). Same mapping as the video seq-loss / staleness exports.
+        assert_eq!(
+            gauge_value(
+                "videocall_audio_datagram_loss_per_sec",
+                &[
+                    ("meeting_id", "meet_adl_1878"),
+                    ("session_id", "sess_adl_1878"),
+                    ("from_peer", "alice_adl_1878"),
+                    ("to_peer", "bob_adl_1878"),
+                ],
+            ),
+            Some(12.5),
+            "the AUDIO_DATAGRAM_LOSS_PER_SEC export path must run and set the folded loss rate; \
+             None here means the .set(loss) export line is missing"
+        );
+    }
+
+    #[test]
+    fn test_screen_playout_family_exported_from_screen_bucket() {
+        // Regression test for #1660 (umbrella #1903). PR #1657 routed a peer's SCREEN-decoder
+        // playout stats into the client's screen_video_stats bucket, but the server exported the
+        // playout family from the CAMERA video_stats bucket only — the screen block set just
+        // SCREEN_VIDEO_FPS / SCREEN_VIDEO_BITRATE_KBPS, so screen content-staleness (and the whole
+        // playout family for screens) never reached Prometheus and a screen-share freeze could not
+        // be charted. This drives peer_data.screen_video_stats (NOT video_stats) and asserts every
+        // screen-prefixed playout gauge is exported. Reverting any of the five screen `.set(...)`
+        // export lines makes the matching gauge_value() return None and fails the corresponding
+        // assert — the mutation sensitivity CLAUDE.md requires. Because ONLY screen_video_stats is
+        // populated here (video_stats is left None), it also proves the family is read from the
+        // screen bucket, not the camera bucket.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        // Active screen tile (fps_received > 0) whose painted content is 7000ms (7s) stale — a
+        // value well above playout_latency_ms's 1800ms client-side cap, proving the screen
+        // content-staleness gauge is UNBOUNDED like its camera sibling.
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 12.0;
+        screen_vs.playout_latency_ms = 1200.0;
+        screen_vs.playout_stage1_span_ms = 800.0;
+        screen_vs.playout_paint_lag_ms = 300.0;
+        screen_vs.content_staleness_ms = 7000.0;
+        screen_vs.playout_skip_to_live_total = 4;
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        // Deliberately leave ps.video_stats (the camera bucket) None: the values below can only
+        // come from the screen bucket, so a stray camera-bucket read would export 0/None.
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert("bob_scr_1660".to_string(), ps);
+
+        let hp = create_test_health_packet(
+            "sess_scr_1660",
+            "meet_scr_1660",
+            "alice_scr_1660",
+            peer_stats,
+        );
+
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        // from_peer = reporter (reporting_user_id); to_peer = the reported peer (peer_stats key).
+        // reporter_name/peer_name fall back to the reporter/peer id when no display name is set
+        // (create_test_health_packet leaves display names unset), so assert all 6 labels.
+        let labels = [
+            ("meeting_id", "meet_scr_1660"),
+            ("session_id", "sess_scr_1660"),
+            ("from_peer", "alice_scr_1660"),
+            ("to_peer", "bob_scr_1660"),
+            ("reporter_name", "alice_scr_1660"),
+            ("peer_name", "bob_scr_1660"),
+        ];
+
+        assert_eq!(
+            gauge_value("videocall_screen_video_content_staleness_ms", &labels),
+            Some(7000.0),
+            "SCREEN_VIDEO_CONTENT_STALENESS_MS must export the unbounded (>1800ms) screen content \
+             age from screen_video_stats; None => the .set(screen_stats.content_staleness_ms) line \
+             is missing (the #1660 gap this test guards)"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_playout_latency_ms", &labels),
+            Some(1200.0),
+            "SCREEN_VIDEO_PLAYOUT_LATENCY_MS must export screen_stats.playout_latency_ms"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_playout_stage1_span_ms", &labels),
+            Some(800.0),
+            "SCREEN_VIDEO_PLAYOUT_STAGE1_SPAN_MS must export screen_stats.playout_stage1_span_ms"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_playout_paint_lag_ms", &labels),
+            Some(300.0),
+            "SCREEN_VIDEO_PLAYOUT_PAINT_LAG_MS must export screen_stats.playout_paint_lag_ms"
+        );
+        assert_eq!(
+            gauge_value("videocall_screen_video_skip_to_live_total", &labels),
+            Some(4.0),
+            "SCREEN_VIDEO_SKIP_TO_LIVE_TOTAL must export screen_stats.playout_skip_to_live_total"
+        );
+    }
+
+    #[test]
+    fn test_screen_playout_family_gc_removes_series() {
+        // Cleanup regression for #1660 — mirrors test_remove_session_metrics_removes_exported_series
+        // and test_rtt_probe_resilience_metrics_exported_and_gc, but drives the screen playout
+        // family. The five new screen gauges are per-pair (6-label) series just like the camera
+        // family, so they MUST be swept in remove_per_peer_metrics or they leak per-pair cardinality
+        // after the reporter's session is reaped. Reverting any of the five
+        // SCREEN_VIDEO_*.remove_label_values lines leaves that series alive after GC and fails the
+        // corresponding !series_exists assert — the mutation sensitivity for the cleanup sweep.
+        let tracker: SessionTracker = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut screen_vs = PbVideoStats::new();
+        screen_vs.fps_received = 12.0;
+        screen_vs.playout_latency_ms = 1500.0;
+        screen_vs.playout_stage1_span_ms = 900.0;
+        screen_vs.playout_paint_lag_ms = 250.0;
+        screen_vs.content_staleness_ms = 6000.0;
+        screen_vs.playout_skip_to_live_total = 2;
+
+        let mut ps = PbPeerStats::new();
+        ps.can_see = true;
+        ps.video_enabled = true;
+        ps.screen_video_stats = ::protobuf::MessageField::some(screen_vs);
+
+        let meeting_id = "meet_scr_gc_1660";
+        let session_id = "sess_scr_gc_1660";
+        let reporting_user_id = "alice_scr_gc_1660";
+        let to_peer = "bob_scr_gc_1660";
+
+        let mut peer_stats = std::collections::HashMap::new();
+        peer_stats.insert(to_peer.to_string(), ps);
+
+        let hp = create_test_health_packet(session_id, meeting_id, reporting_user_id, peer_stats);
+        let result = process_health_packet_to_metrics_pb(
+            &hp,
+            &tracker,
+            &Arc::new(Mutex::new(HashMap::new())),
+        );
+        assert!(result.is_ok());
+
+        let labels = [
+            ("meeting_id", meeting_id),
+            ("session_id", session_id),
+            ("from_peer", reporting_user_id),
+            ("to_peer", to_peer),
+        ];
+        let screen_playout_series = [
+            "videocall_screen_video_playout_latency_ms",
+            "videocall_screen_video_playout_stage1_span_ms",
+            "videocall_screen_video_playout_paint_lag_ms",
+            "videocall_screen_video_content_staleness_ms",
+            "videocall_screen_video_skip_to_live_total",
+        ];
+
+        // All five must be present after export (guards the export path too).
+        assert!(
+            screen_playout_series
+                .iter()
+                .all(|name| series_exists(name, &labels)),
+            "all five screen playout-family series must exist after export"
+        );
+
+        // GC the reporter session and confirm every screen playout series is swept.
+        let session_key = format!("{meeting_id}_{session_id}_{reporting_user_id}");
+        let info = {
+            let guard = tracker.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(&session_key).unwrap().clone()
+        };
+        remove_session_metrics(&info);
+
+        assert!(
+            screen_playout_series
+                .iter()
+                .all(|name| !series_exists(name, &labels)),
+            "remove_per_peer_metrics must sweep every screen playout-family series; a surviving \
+             series means a SCREEN_VIDEO_*.remove_label_values line is missing (per-pair leak)"
         );
     }
 

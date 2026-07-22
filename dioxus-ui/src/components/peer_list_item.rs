@@ -18,6 +18,7 @@
 
 use crate::components::icons::mic::MicIcon;
 use crate::components::icons::peer::PeerIcon;
+use crate::components::icons::recording::RecordingIcon;
 use crate::context::AppearanceSettingsCtx;
 use dioxus::prelude::*;
 
@@ -26,6 +27,7 @@ pub fn PeerListItem(
     name: String,
     #[props(default)] tooltip: String,
     #[props(default)] is_host: bool,
+    #[props(default)] is_recording: bool,
     #[props(default)] is_self: bool,
     #[props(default)] is_guest: bool,
     #[props(default = true)] muted: bool,
@@ -85,6 +87,9 @@ pub fn PeerListItem(
                     }
                     if is_guest {
                         span { class: "guest-badge", "Guest" }
+                    }
+                    if is_recording {
+                        RecordingIcon {}
                     }
                     if is_self {
                         button {

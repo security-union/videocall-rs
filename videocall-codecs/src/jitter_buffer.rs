@@ -159,6 +159,12 @@ const _: () =
 ///   recovery that was about to land, it accelerates accepting it. It is genuinely load-bearing
 ///   only under sustained starvation (relay suppression, flapping publisher, a keyframe that keeps
 ///   failing to decode), exactly the 18-30s freezes the field showed.
+///   Issue #1531 note: the two lowest camera tiers (very_low/minimal) now emit periodic keyframes at
+///   7-8s — ABOVE this 6s ceiling. Still benign: this escalation fires ONLY in the keyframe-LESS
+///   starved branch (a healthy stream never ages its head past `MAX_PLAYOUT_AGE_MS` = 1800ms, the
+///   skip-to-live deadline), and on a genuinely starved receiver pre-empting a just-past-6s periodic
+///   keyframe only accelerates recovery (as above). #1531's 8s ABSOLUTE camera ceiling bounds the
+///   resulting post-reset wait to <=2s.
 /// - It is far enough below the field-observed 28s tail that the worst-case freeze is cut from tens
 ///   of seconds to ~6s + one keyframe RTT, which a viewer perceives as "it reconnected" rather than
 ///   "it is broken."
@@ -641,8 +647,28 @@ pub struct JitterBuffer<T> {
     /// which was the 1:1 coupling that created the storm.
     awaiting_proactive_keyframe: bool,
 
-    /// Keyframe-less hold-ceiling escalation hook (issue #1662). Invoked with the current
-    /// `head_age_ms` on EVERY tick that the keyframe-less held-last-good freeze is at/above
+    /// Wall-clock (ms) at which the CURRENT continuous keyframe-less-stale hold began (issue #1903).
+    /// Set on the first `enforce_freshness_deadline` tick that enters the keyframe-less branch
+    /// (stale head, NO buffered keyframe) while this is `None`; cleared the instant a keyframe is
+    /// inserted (`insert_frame`) or on `flush()`. `current_time - hold_since` is therefore the
+    /// duration of the ongoing keyframe-less freeze, measured independently of the buffered
+    /// HEAD-of-line age.
+    ///
+    /// Why it exists (the field shape #1662's `head_age`-only ceiling misses): when a publisher
+    /// keeps sending deltas that cannot decode (no keyframe reference), the freshness deadline evicts
+    /// the stale head every tick, so the buffered `head_age` is PINNED just above `MAX_PLAYOUT_AGE_MS`
+    /// (~1.8s) and never climbs to `MAX_KEYFRAME_LESS_HOLD_MS` (6s) — yet playout is frozen on the
+    /// last-good frame the whole time. Field logs (meeting_sync 2026-07-20) showed `head_age` pinned
+    /// at p50 1810ms while receivers stayed frozen for 10s+. This clock lets the ceiling escalation
+    /// (`signal_keyframe_less_ceiling`) also fire on freeze DURATION, so the "deltas flowing, keyframe
+    /// missing" shape is bounded the same way the "buffer growing, head aging" shape already is.
+    /// `None` after cold-start and after `flush()` are the same state: no keyframe-less hold in
+    /// progress.
+    keyframe_less_hold_since_ms: Option<u128>,
+
+    /// Keyframe-less hold-ceiling escalation hook (issue #1662). Invoked with the effective
+    /// freeze-age (the larger of the buffered `head_age_ms` and the continuous keyframe-less-hold
+    /// duration, issue #1903) on EVERY tick that the keyframe-less held-last-good freeze is at/above
     /// `MAX_KEYFRAME_LESS_HOLD_MS`. Returns `true` iff the worker GATED IN this escalation (cooldown
     /// elapsed) — only then does the buffer call `self.decoder.reset()` for the actual recovery.
     ///
@@ -757,6 +783,7 @@ impl<T> JitterBuffer<T> {
             last_keyframe_request_ms: None,
             consecutive_proactive_keyframe_requests: 0,
             awaiting_proactive_keyframe: false,
+            keyframe_less_hold_since_ms: None,
             last_freshness_skip: None,
             last_freshness_skip_emit_ms: None,
             pending_freshness_skip: None,
@@ -826,8 +853,26 @@ impl<T> JitterBuffer<T> {
         // gate. Placed before old-frame rejection because the gate is about "did the publisher
         // respond to our PLI" — even a retransmitted keyframe proves it did. On a lossless WS
         // path the PLI-triggered keyframe always arrives; on WT the timeout backstop handles loss.
-        if frame.frame_type == FrameType::KeyFrame && self.awaiting_proactive_keyframe {
-            self.awaiting_proactive_keyframe = false;
+        if frame.frame_type == FrameType::KeyFrame {
+            if self.awaiting_proactive_keyframe {
+                self.awaiting_proactive_keyframe = false;
+            }
+            // Issue #1903: a keyframe is now buffered, so the keyframe-less freeze is over — the next
+            // `enforce_freshness_deadline` tick will take the `has_keyframe` skip-to-live path, not the
+            // keyframe-less branch. Reset the continuous-hold clock so the duration-based ceiling
+            // escalation re-baselines for any FUTURE keyframe-less episode instead of counting across
+            // this recovery. Unconditional (unlike the `awaiting` clear) because the clock can be set
+            // even when no proactive PLI is in flight.
+            //
+            // DELIBERATELY before the old-frame rejection below (matching the #1479 `awaiting` clear
+            // it sits with): a rejected OLD/duplicate keyframe (`seq <= last_decoded`, not a stream
+            // restart) still re-baselines the freeze clock, which can delay a duration escalation by up
+            // to `MAX_KEYFRAME_LESS_HOLD_MS`. That is tolerated on purpose — a keyframe arriving at all
+            // (even a retransmit) is evidence the publisher is responsive, so giving natural recovery
+            // one more window before the expensive decoder reset is the safer bias, and the shape
+            // (a duplicate keyframe landing mid keyframe-less freeze) is rare. If the freeze truly
+            // persists, the clock re-arms on the next keyframe-less tick and escalates a window later.
+            self.keyframe_less_hold_since_ms = None;
         }
 
         // --- Pre-insertion checks ---
@@ -1274,7 +1319,33 @@ impl<T> JitterBuffer<T> {
             // (`escalated: false`) is recorded below as usual; the worker posts the escalation
             // diagnostic (`escalated: true`) separately and force-emitted, so the two do not race
             // through this buffer's ~1s `record_freshness_skip` throttle.
-            self.signal_keyframe_less_ceiling(head_age_ms);
+            //
+            // Issue #1903: start (or continue) the continuous keyframe-less-hold clock. We are in the
+            // keyframe-less branch, which is reached only AFTER the `head_age_ms < MAX_PLAYOUT_AGE_MS`
+            // early return, so reaching here means "stale AND no buffered keyframe" — the freeze
+            // condition itself. `get_or_insert` anchors the clock to `current_time_ms` on the FIRST
+            // such tick (so the duration starts at 0 and cannot retroactively escalate a transient
+            // stall) and preserves it across subsequent ticks so the duration accrues. It is reset the
+            // instant a keyframe arrives (`insert_frame`) or on `flush()`.
+            //
+            // INTENDED: the clock is NOT reset when the buffer merely drains to empty mid-freeze. Only
+            // a keyframe arrival ends the freeze — an empty-then-deltas-only resume is the SAME
+            // keyframe-less freeze continuing (the resumed deltas still cannot decode against the
+            // held-last-good frame), so `get_or_insert` finding a surviving clock and immediately
+            // escalating on resume is correct: the receiver has been frozen the whole span and
+            // deltas-only playout will not unfreeze it, so resetting the decoder to re-arm keyframe
+            // recovery is exactly the right response. The clock is cleared by a buffered keyframe
+            // (`insert_frame`), a `flush()` stream restart, or the reset's `new()` rebuild — but NOT by a
+            // CONTINUOUS delta that advances playout against the held-last-good frame without a keyframe.
+            // So after such a delta-only recovery the clock can briefly linger stale; that is bounded and
+            // self-healing — the publisher's next periodic keyframe clears it, and if the freeze instead
+            // genuinely resumes before then, the worst case is one 8s-cooldown-gated escalation firing a
+            // cadence early, which is a benign decoder-reset response to a keyframe-less stream anyway.
+            let hold_since = *self
+                .keyframe_less_hold_since_ms
+                .get_or_insert(current_time_ms);
+            let keyframe_less_hold_duration_ms = current_time_ms.saturating_sub(hold_since) as f64;
+            self.signal_keyframe_less_ceiling(head_age_ms, keyframe_less_hold_duration_ms);
 
             let stale_cutoff = head_key + 1;
             let dropped_before = self.dropped_frames_count;
@@ -1387,13 +1458,28 @@ impl<T> JitterBuffer<T> {
     ///
     /// Called from the keyframe-less branch of `enforce_freshness_deadline` once the head-of-line
     /// backlog is confirmed stale (`head_age_ms >= MAX_PLAYOUT_AGE_MS`) AND no keyframe is buffered.
-    /// When `head_age_ms >= MAX_KEYFRAME_LESS_HOLD_MS` — the held-last-good freeze has outlasted even
-    /// the publisher's slowest (5s camera) periodic-keyframe recovery window, so natural recovery has
-    /// genuinely failed (relay suppression, flapping publisher, or the arriving keyframe not
-    /// decoding) — it asks the injected `request_escalation` hook whether to escalate, passing the
-    /// current `head_age_ms`. If the hook returns `true` (the worker's cooldown allowed it), the
-    /// buffer fires `self.decoder.reset()` for the actual recovery. Below the ceiling it does nothing
-    /// (the cheaper eviction + throttled #1479 PLI own recovery).
+    /// The escalation fires on the EFFECTIVE freeze-age = `head_age_ms.max(hold_duration_ms)` (issue
+    /// #1903), where `hold_duration_ms` is how long this keyframe-less freeze has continuously
+    /// persisted (`keyframe_less_hold_since_ms`). When that effective age `>= MAX_KEYFRAME_LESS_HOLD_MS`
+    /// — the held-last-good freeze has outlasted even the publisher's slowest (5s camera)
+    /// periodic-keyframe recovery window, so natural recovery has genuinely failed (relay suppression,
+    /// flapping publisher, or the arriving keyframe not decoding) — it asks the injected
+    /// `request_escalation` hook whether to escalate, passing the effective age. If the hook returns
+    /// `true` (the worker's cooldown allowed it), the buffer fires `self.decoder.reset()` for the
+    /// actual recovery. Below the ceiling it does nothing (the cheaper eviction + throttled #1479 PLI
+    /// own recovery).
+    ///
+    /// ## Why the effective age is `max(head_age, hold_duration)` (issue #1903)
+    /// The original #1662 trigger used `head_age_ms` alone. That bounds the "buffer growing, head
+    /// aging" shape (a paused/silent publisher whose one stale backlog ages monotonically), but MISSES
+    /// the field's dominant "deltas flowing, keyframe missing" shape: the publisher keeps sending
+    /// undecodable deltas, the freshness deadline evicts the stale head every tick, so `head_age` is
+    /// PINNED just above `MAX_PLAYOUT_AGE_MS` (~1.8s) and never reaches the 6s ceiling — while playout
+    /// stays frozen indefinitely. The continuous-hold duration DOES climb in that shape, so taking the
+    /// max bounds BOTH shapes with one ceiling. The `max` also means this never fires EARLIER than the
+    /// old `head_age`-only trigger for the aging-backlog shape (the duration is ≤ head_age there since
+    /// both started at the same stale head), so the below-ceiling "don't pre-empt cheap recovery"
+    /// guarantee is preserved.
     ///
     /// Split of responsibilities (#1662 review B1/B2):
     /// - The buffer DETECTS the ceiling crossing (every tick) and OWNS the `reset()` call, because
@@ -1436,8 +1522,17 @@ impl<T> JitterBuffer<T> {
     /// case is a pre-existing limitation of where the deadline runs (the last-good frame lives in the
     /// decoder, not the buffer); it is out of scope here and is covered by the client's reactive
     /// `peer_decode_manager` recovery and the publisher's periodic keyframe.
-    fn signal_keyframe_less_ceiling(&self, head_age_ms: f64) {
-        if head_age_ms >= MAX_KEYFRAME_LESS_HOLD_MS && (self.request_escalation)(head_age_ms) {
+    fn signal_keyframe_less_ceiling(&self, head_age_ms: f64, hold_duration_ms: f64) {
+        // Issue #1903: escalate on whichever is larger — the buffered head-of-line age (aging-backlog
+        // shape) or the continuous keyframe-less-hold duration (deltas-flowing shape). Passing the
+        // effective age to the escalation hook keeps the `escalated: true` diagnostic's `head_age_ms` a
+        // faithful freeze-severity measure for field logs. (This affects ONLY the escalation/reset
+        // diagnostic path — the separate #1479 cross-sender PLI budget is fed by the `request_keyframe`
+        // hook at the eviction site with the raw `head_age_ms`, and is unchanged by this.)
+        let effective_age_ms = head_age_ms.max(hold_duration_ms);
+        if effective_age_ms >= MAX_KEYFRAME_LESS_HOLD_MS
+            && (self.request_escalation)(effective_age_ms)
+        {
             // The worker's cooldown gated this escalation IN and already force-posted the
             // `escalated: true` diagnostic. Fire the recovery primitive on our own decoder.
             self.decoder.reset();
@@ -1668,6 +1763,12 @@ impl<T> JitterBuffer<T> {
         self.last_keyframe_request_ms = None;
         self.consecutive_proactive_keyframe_requests = 0;
         self.awaiting_proactive_keyframe = false;
+        // Reset the continuous keyframe-less-hold clock (issue #1903) so a post-flush stream restart
+        // does not inherit a stale freeze-duration that could escalate (decoder reset) the instant the
+        // first post-restart keyframe-less tick runs. A restart is a fresh start: any keyframe-less
+        // hold begins counting from zero. `None`-after-cold-start and `None`-after-flush are the same
+        // state.
+        self.keyframe_less_hold_since_ms = None;
         // NOTE (issue #1662): the keyframe-less hold-ceiling escalation cooldown anchor is NOT a
         // field of this buffer — it lives in the worker thread-local (`LAST_KEYFRAME_LESS_ESCALATION_MS`
         // in `bin/worker_decoder.rs`) so it survives the buffer rebuild a reset triggers. There is
@@ -4880,5 +4981,88 @@ mod tests {
             "the re-escalation advances the anchor to the new now_ms"
         );
         assert!(skip2.escalated);
+    }
+
+    /// #1903 regression: the keyframe-less ceiling escalation MUST also fire when the buffered
+    /// head-of-line age is PINNED below `MAX_KEYFRAME_LESS_HOLD_MS` by continuously-arriving deltas —
+    /// the field's dominant "deltas flowing, keyframe missing" freeze shape (meeting_sync 2026-07-20:
+    /// `head_age` pinned at p50 1810ms while receivers stayed frozen 10s+). The #1662 `head_age`-only
+    /// trigger never fires in this shape; the continuous keyframe-less-hold DURATION does.
+    ///
+    /// Drives the REAL production path (`find_and_move_continuous_frames` → `enforce_freshness_deadline`
+    /// keyframe-less branch → `signal_keyframe_less_ceiling` → hook → `decoder.reset()`). Each poll
+    /// inserts ONE fresh delta whose arrival is a FIXED `pinned_age` (2000ms — above the 1800ms
+    /// freshness deadline, well below the 6000ms ceiling) in the past, so the head evicted every poll
+    /// is always ~2000ms old and `head_age` structurally never reaches the ceiling; only the freeze
+    /// duration (poll-clock advance since the first keyframe-less tick) crosses it.
+    ///
+    /// FAILS ON UNFIXED CODE: reverting `signal_keyframe_less_ceiling` to the `head_age_ms`-only
+    /// trigger (dropping `.max(hold_duration_ms)`) makes the effective age a constant ~2000ms, so the
+    /// hook is never consulted and both `spy.count()` and `reset_count` stay 0.
+    #[test]
+    fn keyframe_less_hold_duration_escalates_when_head_age_pinned_below_ceiling() {
+        let decoded_frames = Arc::new(Mutex::new(Vec::new()));
+        let reset_count = Arc::new(AtomicU32::new(0));
+        let mock = Box::new(MockDecoder::new_with_vec_and_depth(
+            decoded_frames,
+            Arc::new(AtomicU32::new(0)),
+            reset_count.clone(),
+        ));
+        let spy = EscalationSpy::new(true); // gate open → a gated-in escalation fires the reset
+        let mut jb = JitterBuffer::with_recovery_hooks(mock, Box::new(|_| {}), spy.hook());
+
+        // last-good = seq 1.
+        jb.insert_frame(create_test_frame(1, FrameType::KeyFrame), 100);
+        jb.find_and_move_continuous_frames(200);
+        assert_eq!(jb.last_decoded_sequence_number, Some(1));
+
+        // `pinned_age` sits between the freshness deadline and the keyframe-less ceiling so head_age
+        // is stale-but-pinned every poll and can never itself trip the ceiling.
+        let pinned_age = 2000u128;
+        assert!((pinned_age as f64) > MAX_PLAYOUT_AGE_MS);
+        assert!((pinned_age as f64) < MAX_KEYFRAME_LESS_HOLD_MS);
+
+        // Advance the poll clock past MAX_KEYFRAME_LESS_HOLD_MS in 500ms steps. Each step feeds one
+        // fresh delta whose arrival is exactly `pinned_age` old, so the perpetual head stays ~2000ms
+        // old while the freeze DURATION accrues to the ceiling.
+        let base = 1_000_000u128;
+        let step = 500u128;
+        let steps = ((MAX_KEYFRAME_LESS_HOLD_MS as u128) / step) + 2; // comfortably past 6000ms
+        for k in 0..=steps {
+            let poll_time = base + step * k;
+            // One fresh delta per poll, sequence derived from the poll index so seqs stay strictly
+            // increasing and above the decoded keyframe (seq 1).
+            let seq = 2u64 + k as u64;
+            jb.insert_frame(
+                create_test_frame(seq, FrameType::DeltaFrame),
+                poll_time - pinned_age,
+            );
+            jb.find_and_move_continuous_frames(poll_time);
+        }
+
+        assert!(
+            spy.count() >= 1,
+            "a keyframe-less freeze whose DURATION crossed the ceiling must consult the escalation hook even though head_age was pinned below it (#1903)"
+        );
+        assert!(
+            reset_count.load(Ordering::SeqCst) >= 1,
+            "a gated-in duration escalation must fire the decoder reset"
+        );
+        assert!(
+            spy.last_head_age() >= MAX_KEYFRAME_LESS_HOLD_MS,
+            "the hook must receive the effective freeze-age (>= ceiling), not the pinned ~2000ms head_age: {}",
+            spy.last_head_age()
+        );
+
+        // A keyframe finally arrives: the hold clock clears so a LATER independent keyframe-less
+        // episode re-baselines from zero rather than counting across the recovery.
+        jb.insert_frame(
+            create_test_frame(1, FrameType::KeyFrame),
+            base + step * steps + 10,
+        );
+        assert!(
+            jb.keyframe_less_hold_since_ms.is_none(),
+            "a keyframe arrival must clear the continuous keyframe-less-hold clock (#1903)"
+        );
     }
 }

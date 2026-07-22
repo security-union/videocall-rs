@@ -7,6 +7,7 @@ pub mod discord;
 pub mod mic;
 pub mod peer;
 pub mod push_pin;
+pub mod recording;
 pub mod signal_bars;
 pub mod youtube;
 pub mod zoom;

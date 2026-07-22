@@ -116,6 +116,7 @@ pub async fn create_meeting(
     let admitted_can_admit = body.admitted_can_admit.unwrap_or(false);
     let end_on_host_leave = body.end_on_host_leave.unwrap_or(true);
     let allow_guests = body.allow_guests.unwrap_or(false);
+    let recording_allowed_for_all = body.recording_allowed_for_all.unwrap_or(false);
 
     let row = db_meetings::create_with_options(
         &state.db,
@@ -127,6 +128,7 @@ pub async fn create_meeting(
         admitted_can_admit,
         end_on_host_leave,
         allow_guests,
+        recording_allowed_for_all,
     )
     .await
     .map_err(|e| match e {
@@ -162,6 +164,7 @@ pub async fn create_meeting(
         admitted_can_admit: row.admitted_can_admit,
         end_on_host_leave: row.end_on_host_leave,
         allow_guests: row.allow_guests,
+        recording_allowed_for_all: row.recording_allowed_for_all,
     };
 
     Ok((StatusCode::CREATED, Json(APIResponse::ok(response))))
@@ -216,6 +219,7 @@ pub async fn list_meetings(
             admitted_can_admit: row.admitted_can_admit,
             end_on_host_leave: row.end_on_host_leave,
             allow_guests: row.allow_guests,
+            recording_allowed_for_all: row.recording_allowed_for_all,
         });
     }
 
@@ -350,6 +354,7 @@ pub async fn list_feed(
                 waiting_count: row.waiting_count,
                 has_password: row.password_hash.is_some(),
                 allow_guests: row.allow_guests,
+                recording_allowed_for_all: row.recording_allowed_for_all,
                 waiting_room_enabled: row.waiting_room_enabled,
                 admitted_can_admit: row.admitted_can_admit,
                 end_on_host_leave: row.end_on_host_leave,
@@ -398,6 +403,7 @@ pub async fn get_meeting(
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
         allow_guests: row.allow_guests,
+        recording_allowed_for_all: row.recording_allowed_for_all,
     })))
 }
 
@@ -470,6 +476,7 @@ pub async fn end_meeting_handler(
             ended_at: meeting.ended_at.map(|t| t.timestamp_millis()),
             your_status,
             allow_guests: meeting.allow_guests,
+            recording_allowed_for_all: meeting.recording_allowed_for_all,
         })));
     }
 
@@ -518,6 +525,7 @@ pub async fn end_meeting_handler(
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
         allow_guests: row.allow_guests,
+        recording_allowed_for_all: row.recording_allowed_for_all,
     })))
 }
 
@@ -531,7 +539,8 @@ pub async fn update_meeting(
     let settings_updated = body.waiting_room_enabled.is_some()
         || body.admitted_can_admit.is_some()
         || body.end_on_host_leave.is_some()
-        || body.allow_guests.is_some();
+        || body.allow_guests.is_some()
+        || body.recording_allowed_for_all.is_some();
 
     let row = if settings_updated {
         // Atomically update both settings within a single transaction.
@@ -545,6 +554,7 @@ pub async fn update_meeting(
             body.admitted_can_admit,
             body.end_on_host_leave,
             body.allow_guests,
+            body.recording_allowed_for_all,
         )
         .await?
         {
@@ -587,6 +597,7 @@ pub async fn update_meeting(
             admitted_can_admit: row.admitted_can_admit,
             waiting_room_enabled: row.waiting_room_enabled,
             allow_guests: row.allow_guests,
+            recording_allowed_for_all: row.recording_allowed_for_all,
         };
         nats_events::publish_internal_meeting_settings_update(
             state.nats.as_ref(),
@@ -629,6 +640,7 @@ pub async fn update_meeting(
         ended_at: row.ended_at.map(|t| t.timestamp_millis()),
         your_status,
         allow_guests: row.allow_guests,
+        recording_allowed_for_all: row.recording_allowed_for_all,
     })))
 }
 

@@ -57,6 +57,10 @@ chrono = { version = "0.4.44", features = ["serde", "clock"] }
 [dependencies.web-sys]
 version = "0.3.72"
 features = [
+    # Issue 1821: non-passive `wheel` listener for Ctrl+wheel / trackpad-pinch
+    # zoom (Dioxus `onwheel` is passive → preventDefault no-ops).
+    "AddEventListenerOptions",
+    "WheelEvent",
     "AnalyserNode",
     "AudioContext",
     "AudioContextState",

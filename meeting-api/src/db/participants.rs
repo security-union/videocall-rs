@@ -721,6 +721,7 @@ impl ParticipantRow {
             host_display_name: None,
             host_user_id: None,
             allow_guests: false,
+            recording_allowed_for_all: false,
         }
     }
 }

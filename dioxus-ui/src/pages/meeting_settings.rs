@@ -37,6 +37,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
     let mut admitted_can_admit_toggle = use_signal(|| false);
     let mut end_on_host_leave_toggle = use_signal(|| true);
     let mut allow_guests_toggle = use_signal(|| false);
+    let mut recording_allowed_for_all_toggle = use_signal(|| false);
     let saving = use_signal(|| false);
     let toggle_error = use_signal(|| None::<String>);
     let mut ending = use_signal(|| false);
@@ -75,6 +76,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                         admitted_can_admit_toggle.set(info.admitted_can_admit);
                         end_on_host_leave_toggle.set(info.end_on_host_leave);
                         allow_guests_toggle.set(info.allow_guests);
+                        recording_allowed_for_all_toggle.set(info.recording_allowed_for_all);
                         meeting.set(Some(info));
                         loading.set(false);
                     }
@@ -456,6 +458,7 @@ pub fn MeetingSettingsPage(id: String) -> Element {
                 admitted_can_admit_toggle,
                 end_on_host_leave_toggle,
                 allow_guests_toggle,
+                recording_allowed_for_all_toggle,
                 saving,
                 toggle_error,
             }

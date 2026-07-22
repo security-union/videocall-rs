@@ -52,10 +52,11 @@ async fn create_idle_meeting(
         creator_id,
         None,
         &json!([]),
-        // waiting_room_enabled / admitted_can_admit / end_on_host_leave / allow_guests
+        // waiting_room_enabled / admitted_can_admit / end_on_host_leave / allow_guests / recording_allowed_for_all
         true,
         false,
         true,
+        false,
         false,
     )
     .await

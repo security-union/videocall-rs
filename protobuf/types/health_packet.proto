@@ -136,6 +136,15 @@ message PeerStats {
   // that cannot recover — feeds video_quality_score so it can't read 100/100
   // during a keyframe storm.
   optional double keyframe_requests_per_sec = 16;
+
+  // Per-peer receive-side audio DATAGRAM loss rate (lost audio packets/sec,
+  // windowed) observed for this peer while THIS client is on WebTransport
+  // (#1878). The audio sibling of video_seq_loss_per_sec (field 15). Nonzero
+  // only when audio riding unreliable QUIC datagrams is being dropped (e.g. the
+  // browser's incoming-datagram queue overflowing during a main-thread stall) —
+  // a pathology previously invisible in every dashboard. ~0 on WebSocket and on
+  // E2EE-on WebTransport (both reliable paths).
+  optional double audio_datagram_loss_per_sec = 17;
 }
 
 message HealthPacket {

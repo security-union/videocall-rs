@@ -24,13 +24,14 @@
 
 use crate::actors::chat_server::ChatServer;
 use crate::actors::packet_handler::{
-    classify_packet, outbound_keyframe_observation, KeyframeRequestLimiter, KeyframeTarget,
-    PacketKind,
+    classify_packet, keyframe_per_pair_budget, outbound_keyframe_observation,
+    stamp_reaction_for_broadcast, KeyframeRequestLimiter, KeyframeTarget, PacketKind,
+    ReactionRateLimiter,
 };
 use crate::client_diagnostics::health_processor;
 use crate::constants::{
     CONGESTION_DROP_THRESHOLD, CONGESTION_NOTIFY_MIN_INTERVAL, CONGESTION_WINDOW,
-    KEYFRAME_CONGESTION_RELAX_WINDOW,
+    KEYFRAME_CONGESTION_RELAX_WINDOW, REACTION_DISPLAY_NAME_MAX_BYTES,
 };
 use crate::messages::server::{ClientMessage, Connect, Disconnect, JoinRoom, Packet};
 use crate::messages::session::Message;
@@ -379,6 +380,9 @@ pub struct SessionLogic {
     pub congestion_tracker: CongestionTracker,
     /// Per-session rate limiter for KEYFRAME_REQUEST packets.
     pub keyframe_limiter: KeyframeRequestLimiter,
+    /// Per-session rate limiter for client-authored REACTION broadcasts (#1884).
+    /// Meters this SENDER's reactions before they are re-broadcast to the room.
+    pub reaction_limiter: ReactionRateLimiter,
     /// Shared receiver-downlink-congestion signal for #1219 Half 2.
     ///
     /// Written by THIS transport actor in [`SessionLogic::on_outbound_drop`]
@@ -437,6 +441,7 @@ impl SessionLogic {
             end_on_host_leave,
             congestion_tracker: CongestionTracker::new(),
             keyframe_limiter: KeyframeRequestLimiter::new(),
+            reaction_limiter: ReactionRateLimiter::new(),
             downlink_congested_epoch: Arc::new(AtomicU64::new(DOWNLINK_EPOCH_NEVER)),
         }
     }
@@ -712,16 +717,91 @@ impl SessionLogic {
                     .keyframe_limiter
                     .allow_with_congestion(target, kind, layer, congested)
                 {
+                    // #1899: log the media kind, congestion state, and the
+                    // per-pair budget that applied (via the SAME
+                    // `keyframe_per_pair_budget` the limiter enforced, so the log
+                    // cannot misreport it). The field diagnosis of the
+                    // screen-freeze bug depended on knowing SCREEN requests were
+                    // being throttled at the camera budget — surfacing kind +
+                    // budget here makes the next diagnosis a single grep.
                     warn!(
-                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting user {} session {}",
+                        "Rate-limiting KEYFRAME_REQUEST from session {} (user {}) targeting user {} session {} kind={:?} congested={} per_pair_budget={}",
                         self.id,
                         self.user_id,
                         String::from_utf8_lossy(&target_user_id),
                         target_session_id,
+                        kind,
+                        congested,
+                        keyframe_per_pair_budget(kind, congested),
                     );
                     return InboundAction::Processed;
                 }
                 InboundAction::Forward(Arc::new(data.to_vec()))
+            }
+            PacketKind::Reaction => {
+                // Waiting-room isolation: an observer must NOT broadcast a
+                // reaction into the meeting. A REACTION is re-broadcast on the
+                // media fan-out, so an observer-sent one would reach every
+                // active participant — the same isolation break the Data and
+                // KeyframeRequest observer guards prevent. Mirror them here.
+                if self.observer {
+                    return InboundAction::Processed;
+                }
+                // Per-sender rate limit (#1884). The closed-enum validation
+                // already ran in `classify_packet` (an invalid reaction is
+                // `PacketKind::Dropped` and never reaches here), so this meters
+                // ONLY valid reactions against this sender's window — a flood of
+                // invalid reactions cannot consume the budget. Over budget →
+                // drop as Processed (no fan-out); within budget → forward on the
+                // standard media fan-out (re-broadcast room-wide; the relay
+                // self-skips the sender, which renders its own local echo).
+                //
+                // No sealing: the inner packet stays CLEARTEXT. Before fan-out
+                // the relay UNCONDITIONALLY re-stamps the envelope session_id to
+                // THIS sender's authenticated session (`self.id`) and bounds the
+                // cosmetic display_name (see `stamp_reaction_for_broadcast`).
+                // That is what makes reaction attribution trustworthy: it anchors
+                // on a relay-authenticated session_id, never a client-supplied
+                // one (a forged non-zero session_id would otherwise impersonate a
+                // victim, cleartext, with no E2EE backstop), and the downstream
+                // self-echo suppression that keys on session_id becomes reliable
+                // for REACTION.
+                //
+                // `debug!` (not `warn!` like the keyframe path): a well-behaved
+                // client self-throttles STRICTLY below this relay cap, so a hit
+                // is only reachable by a misbehaving or forged client — logging
+                // every drop at warn would hand a reaction flood a
+                // log-amplification lever. The drop itself is the enforcement.
+                if !self.reaction_limiter.allow() {
+                    debug!(
+                        "Rate-limiting REACTION from session {} (user {})",
+                        self.id, self.user_id
+                    );
+                    return InboundAction::Processed;
+                }
+                // SECURITY (#1884, web-security-auditor BLOCKER): this arm MUST
+                // forward ONLY the output of `stamp_reaction_for_broadcast` —
+                // never the raw inbound `data`. A REACTION is the one
+                // client-authored packet re-broadcast CLEARTEXT to the whole
+                // room, so its envelope session_id must be the relay's
+                // authenticated session, not a client-supplied (forgeable) one;
+                // forwarding raw `data` here (e.g. `Forward(Arc::new(data.to_vec()))`)
+                // reopens the victim-impersonation vector — and would do so with
+                // every test still GREEN, because
+                // `test_stamp_reaction_overwrites_forged_session_id` guards the
+                // stamping fn, not this call site. To make that mistake
+                // impossible-by-accident we SHADOW `data` with the stamped
+                // `Option<Vec<u8>>` below: the raw `&[u8]` is no longer reachable
+                // in this scope, so an accidental passthrough will not compile.
+                //
+                // Fail-closed: an (already enum-validated) packet that will not
+                // re-serialize is dropped, never fanned out unstamped.
+                let data =
+                    stamp_reaction_for_broadcast(data, self.id, REACTION_DISPLAY_NAME_MAX_BYTES);
+                match data {
+                    Some(bytes) => InboundAction::Forward(Arc::new(bytes)),
+                    None => InboundAction::Processed,
+                }
             }
             PacketKind::Data => {
                 if self.observer {

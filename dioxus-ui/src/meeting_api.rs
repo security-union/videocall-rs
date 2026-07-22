@@ -266,12 +266,14 @@ pub async fn update_meeting(
     admitted_can_admit: Option<bool>,
     end_on_host_leave: Option<bool>,
     allow_guests: Option<bool>,
+    recording_allowed_for_all: Option<bool>,
 ) -> Result<MeetingInfo, JoinError> {
     let req = videocall_meeting_types::requests::UpdateMeetingRequest {
         waiting_room_enabled,
         admitted_can_admit,
         end_on_host_leave,
         allow_guests,
+        recording_allowed_for_all,
     };
     let req = &req;
     with_refresh_retry(|| async move { client()?.update_meeting(meeting_id, req).await }).await
@@ -342,6 +344,7 @@ pub async fn create_meeting(
         admitted_can_admit: Some(false),
         allow_guests: Some(allow_guests),
         end_on_host_leave: None,
+        recording_allowed_for_all: None,
     };
     let req = &req;
     with_refresh_retry(|| async move { client()?.create_meeting(req).await }).await

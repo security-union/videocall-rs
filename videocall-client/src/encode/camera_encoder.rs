@@ -160,8 +160,8 @@ use super::encoder_state::{
 use super::transform::transform_video_chunk;
 
 use crate::adaptive_quality_constants::{
-    simulcast_layers, AUDIO_QUALITY_TIERS, BITRATE_CHANGE_THRESHOLD,
-    PERIODIC_KEYFRAME_MAX_INTERVAL_MS, SIMULCAST_LAYER_FPS_THROTTLE_SLACK, VIDEO_QUALITY_TIERS,
+    camera_periodic_keyframe_max_interval_ms, simulcast_layers, AUDIO_QUALITY_TIERS,
+    BITRATE_CHANGE_THRESHOLD, SIMULCAST_LAYER_FPS_THROTTLE_SLACK, VIDEO_QUALITY_TIERS,
 };
 use crate::constants::get_video_codec_string;
 use crate::diagnostics::adaptive_quality_manager::TierTransitionRecord;
@@ -2416,6 +2416,11 @@ impl CameraEncoder {
         let tier_max_width = self.tier_max_width.clone();
         let tier_max_height = self.tier_max_height.clone();
         let tier_keyframe_interval = self.tier_keyframe_interval.clone();
+        // Issue #1531: the live camera AQ tier index. The encode loop READS it per
+        // frame to resolve the tier-aware periodic-keyframe wall-clock ceiling
+        // (`camera_periodic_keyframe_max_interval_ms`); the two lowest tiers relax
+        // the #1510 cap so a scarce-bandwidth publisher spends fewer forced I-frames.
+        let shared_video_tier_index = self.shared_video_tier_index.clone();
         let force_keyframe = self.force_keyframe.clone();
         // Number of simulcast layers to encode this session (issue #989).
         // n_layers == 1 → single encoder, byte-identical to the legacy path
@@ -3193,6 +3198,16 @@ impl CameraEncoder {
                 // Refreshed from the shared atomic at the top of every frame.
                 let mut local_active_layers: usize;
 
+                // Issue #1531: sticky "am I on a lossless (WS) transport" cache for
+                // the transport-aware periodic-keyframe ceiling. Refreshed each frame
+                // from `client.active_transport()`, but only on a definitive `Some`
+                // read — a transient `None` (controller cell momentarily borrowed,
+                // pre-election cold start) leaves the last-known value intact rather
+                // than dropping the WS relief for one frame. Defaults `false` (lossy /
+                // WebTransport), i.e. the tighter #1510 ceiling, until the transport
+                // is first known — the safe direction.
+                let mut lossless_transport = false;
+
                 // Track whether we have successfully encoded at least one frame
                 // in this restart cycle. Used to reset restart_count on success.
                 let mut encoded_ok_this_cycle = false;
@@ -3701,12 +3716,24 @@ impl CameraEncoder {
                             // never lost; added recovery latency is bounded by the
                             // cooldown. The periodic GOP keyframe is never gated.
                             let now_ms = window().performance().unwrap().now();
+                            // Issue #1531: refresh the sticky transport cache, then
+                            // resolve the tier- and transport-aware wall-clock ceiling.
+                            // On the lowest AQ tiers the ceiling relaxes (7–8s) so a
+                            // bandwidth-scarce publisher spends fewer forced I-frames;
+                            // full_hd … low keep the flat 5s #1510 guarantee over WT.
+                            if let Some(t) = client.active_transport() {
+                                lossless_transport = t == "websocket";
+                            }
+                            let keyframe_max_interval_ms = camera_periodic_keyframe_max_interval_ms(
+                                shared_video_tier_index.load(Ordering::Relaxed) as usize,
+                                lossless_transport,
+                            );
                             let is_periodic_keyframe = periodic_keyframe_due(
                                 video_frame_counter,
                                 local_keyframe_interval,
                                 now_ms,
                                 last_keyframe_emit_ms,
-                                PERIODIC_KEYFRAME_MAX_INTERVAL_MS,
+                                keyframe_max_interval_ms,
                             );
                             // Resolve the keyframe decision via the shared single
                             // source of truth (issue #1347 item 2: the camera AND

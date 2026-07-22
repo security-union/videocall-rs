@@ -149,13 +149,15 @@ test.describe("Device settings modal", () => {
     const decayValue = decaySlider.locator(
       "xpath=ancestor::div[contains(@class, 'appearance-slider-row')]//span[contains(@class, 'appearance-slider-value')]",
     );
-    const decayHelper = page
-      .locator(".speaker-highlight-controls .appearance-section-helper")
-      .filter({ hasText: "Decay controls how long the glow lingers after speech." });
+    const decayHelpIcon = page.locator('[data-testid="speaker-highlight-decay-help"]');
 
     await expect(decaySlider).toHaveValue("50");
     await expect(decayValue).toHaveText("50%");
-    await expect(decayHelper).toBeVisible();
+    await expect(decayHelpIcon).toBeVisible();
+    await expect(decayHelpIcon).toHaveAttribute(
+      "data-tooltip",
+      "Decay controls how long the glow lingers after speech. 0% is instant on/off; 100% is the longest lingering tail.",
+    );
 
     await decaySlider.fill("20");
     await expect(decayValue).toHaveText("20%");

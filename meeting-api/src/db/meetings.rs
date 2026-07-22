@@ -90,6 +90,13 @@ pub struct MeetingRow {
     pub admitted_can_admit: bool,
     pub end_on_host_leave: bool,
     pub allow_guests: bool,
+    /// Whether the record button is shown to all admitted participants (not
+    /// just the host).  Defaults to `false`: only the host sees the record
+    /// button unless explicitly opened up.  This is a UI-visibility gate,
+    /// not an access-control enforcement — recording is entirely
+    /// client-side, so this flag does not prevent a non-host from recording
+    /// by other means.
+    pub recording_allowed_for_all: bool,
 }
 
 /// Create a new meeting. Uses INSERT ... ON CONFLICT to handle the partial unique index.
@@ -110,6 +117,7 @@ pub async fn create(
         false,
         true,
         false,
+        false,
     )
     .await
 }
@@ -126,14 +134,15 @@ pub async fn create_with_options(
     admitted_can_admit: bool,
     end_on_host_leave: bool,
     allow_guests: bool,
+    recording_allowed_for_all: bool,
 ) -> Result<MeetingRow, sqlx::Error> {
     sqlx::query_as::<_, MeetingRow>(
         r#"
-        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests)
-        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5, $6, $7, $8)
+        INSERT INTO meetings (room_id, creator_id, started_at, password_hash, state, attendees, waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all)
+        VALUES ($1, $2, NOW(), $3, 'idle', $4, $5, $6, $7, $8, $9)
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all
         "#,
     )
     .bind(room_id)
@@ -144,6 +153,7 @@ pub async fn create_with_options(
     .bind(admitted_can_admit)
     .bind(end_on_host_leave)
     .bind(allow_guests)
+    .bind(recording_allowed_for_all)
     .fetch_one(pool)
     .await
 }
@@ -157,7 +167,7 @@ pub async fn get_by_room_id(
         r#"
         SELECT id, room_id, started_at, ended_at, created_at, updated_at,
                deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-               waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
+               waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all
         FROM meetings
         WHERE room_id = $1 AND deleted_at IS NULL
         "#,
@@ -179,7 +189,7 @@ pub async fn list_by_owner(
         r#"
         SELECT DISTINCT m.id, m.room_id, m.started_at, m.ended_at, m.created_at, m.updated_at,
                m.deleted_at, m.creator_id, m.password_hash, m.state, m.attendees, m.host_display_name,
-               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests
+               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests, m.recording_allowed_for_all
         FROM meetings m
         LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $1
         WHERE m.deleted_at IS NULL
@@ -244,7 +254,7 @@ pub async fn search_by_owner(
         r#"
         SELECT DISTINCT m.id, m.room_id, m.started_at, m.ended_at, m.created_at, m.updated_at,
                m.deleted_at, m.creator_id, m.password_hash, m.state, m.attendees, m.host_display_name,
-               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests
+               m.waiting_room_enabled, m.admitted_can_admit, m.end_on_host_leave, m.allow_guests, m.recording_allowed_for_all
         FROM meetings m
         LEFT JOIN meeting_participants p ON p.meeting_id = m.id AND p.user_id = $2
         WHERE m.deleted_at IS NULL
@@ -400,6 +410,7 @@ pub struct FeedMeetingRow {
     pub host_display_name: Option<String>,
     pub password_hash: Option<String>,
     pub allow_guests: bool,
+    pub recording_allowed_for_all: bool,
     pub waiting_room_enabled: bool,
     pub end_on_host_leave: bool,
     pub admitted_can_admit: bool,
@@ -464,6 +475,7 @@ pub async fn list_feed_for_user(
                m.host_display_name,
                m.password_hash,
                m.allow_guests,
+               m.recording_allowed_for_all,
                m.waiting_room_enabled,
                m.end_on_host_leave,
                m.admitted_can_admit,
@@ -519,7 +531,7 @@ pub async fn soft_delete(
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all
         "#,
     )
     .bind(room_id)
@@ -687,9 +699,11 @@ pub async fn set_host_display_name(
     Ok(())
 }
 
-/// Atomically update the waiting_room_enabled, admitted_can_admit, end_on_host_leave, and allow_guests settings for a meeting.
+/// Atomically update the waiting_room_enabled, admitted_can_admit, end_on_host_leave,
+/// allow_guests, and recording_allowed_for_all settings for a meeting.
 /// When disabling the waiting room, auto-admits all currently waiting participants
 /// within the same transaction to prevent race conditions.
+#[allow(clippy::too_many_arguments)]
 pub async fn update_meeting_settings(
     pool: &PgPool,
     room_id: &str,
@@ -698,6 +712,7 @@ pub async fn update_meeting_settings(
     admitted_can_admit: Option<bool>,
     end_on_host_leave: Option<bool>,
     allow_guests: Option<bool>,
+    recording_allowed_for_all: Option<bool>,
 ) -> Result<Option<MeetingRow>, sqlx::Error> {
     let mut tx = pool.begin().await?;
 
@@ -707,11 +722,12 @@ pub async fn update_meeting_settings(
         SET waiting_room_enabled = COALESCE($3, waiting_room_enabled),
             admitted_can_admit = COALESCE($4, admitted_can_admit),
             end_on_host_leave = COALESCE($5, end_on_host_leave),
-            allow_guests = COALESCE($6, allow_guests)
+            allow_guests = COALESCE($6, allow_guests),
+            recording_allowed_for_all = COALESCE($7, recording_allowed_for_all)
         WHERE room_id = $1 AND creator_id = $2 AND deleted_at IS NULL
         RETURNING id, room_id, started_at, ended_at, created_at, updated_at,
                   deleted_at, creator_id, password_hash, state, attendees, host_display_name,
-                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests
+                  waiting_room_enabled, admitted_can_admit, end_on_host_leave, allow_guests, recording_allowed_for_all
         "#,
     )
     .bind(room_id)
@@ -720,6 +736,7 @@ pub async fn update_meeting_settings(
     .bind(admitted_can_admit)
     .bind(end_on_host_leave)
     .bind(allow_guests)
+    .bind(recording_allowed_for_all)
     .fetch_optional(&mut *tx)
     .await?;
 

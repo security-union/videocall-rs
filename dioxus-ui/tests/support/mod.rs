@@ -322,7 +322,8 @@ pub fn mock_fetch_meetings_empty() {
                         end_on_host_leave: true,
                         host_display_name: 'Host User',
                         host_user_id: 'host@example.com',
-                        allow_guests: false
+                        allow_guests: false,
+                        recording_allowed_for_all: false
                     }
                 };
             } else if (url.match(/\/api\/v1\/meetings\/[^/]+\/status$/)) {
@@ -343,14 +344,16 @@ pub fn mock_fetch_meetings_empty() {
                         end_on_host_leave: true,
                         host_display_name: 'Host User',
                         host_user_id: 'host@example.com',
-                        allow_guests: false
+                        allow_guests: false,
+                        recording_allowed_for_all: false
                     }
                 };
             } else if (url.match(/\/api\/v1\/meetings\/[^/]+\/guest-info$/)) {
                 body = {
                     success: true,
                     result: {
-                        allow_guests: false
+                        allow_guests: false,
+                        recording_allowed_for_all: false
                     }
                 };
             } else if (url.match(/\/api\/v1\/meetings$/) && method === 'POST') {
@@ -366,7 +369,8 @@ pub fn mock_fetch_meetings_empty() {
                         waiting_room_enabled: true,
                         admitted_can_admit: false,
                         end_on_host_leave: true,
-                        allow_guests: false
+                        allow_guests: false,
+                        recording_allowed_for_all: false
                     }
                 };
             } else if (url.match(/\/profile$/)) {

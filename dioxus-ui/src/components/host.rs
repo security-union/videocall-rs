@@ -1214,6 +1214,15 @@ pub fn Host(
         }
     };
 
+    // Issue 1885: the self tile's WT/WS transport badge, the connection LED, and
+    // the RTT quality warning now render TOGETHER in one flex cluster
+    // (`.host-tile-chrome`) alongside the self-view in `attendants.rs`, so they
+    // sit side by side and never overlap (mirroring the peer tiles'
+    // `.tile-top-icons`). The badge derivation + render therefore live at that
+    // cluster's site now, NOT here — this component no longer draws the badge or
+    // owns the `connected_epoch` re-render trigger (`call_start_time`, read in
+    // the cluster, serves that role there).
+
     rsx! {
         // Always render the <video> element so Dioxus never destroys it.
         // The camera encoder attaches srcObject via JS; if Dioxus recreates
@@ -1230,6 +1239,10 @@ pub fn Host(
             video { class: "self-camera", autoplay: true, id: VIDEO_ELEMENT_ID, playsinline: "true", muted: true, controls: false }
             // Issue 1768: SENDING-metrics overlay on the local self-view.
             {media_metrics_overlay(self_metrics_overlay.as_ref())}
+            // Issue 1885: the transport badge is NOT rendered here anymore — it
+            // moved into the `.host-tile-chrome` flex cluster (with the connection
+            // LED + quality warning) in attendants.rs, so it no longer overlaps
+            // the LED and persists through camera on/off from a single site.
         }
         // Always-mounted screen share preview — toggled via style so the element
         // exists in the DOM before attach_screen_preview() runs.
@@ -1253,6 +1266,10 @@ pub fn Host(
                     }
                     span { class: "placeholder-text", "Camera Off" }
                 }
+                // Issue 1885: the transport badge is rendered once in the
+                // `.host-tile-chrome` cluster (attendants.rs), a direct `.host`
+                // child, so it already persists through camera-off — no per-branch
+                // copy is needed here (this is what removed the LED overlap).
             }
         }
 

@@ -52,6 +52,37 @@ test.describe("Action bar customize mode", () => {
     await expect(page.locator(".glass-select-menu")).toBeVisible({ timeout: 5_000 });
   }
 
+  // Reload the current /meeting/<id> page and land back in the grid.
+  //
+  // Reloading a meeting URL returns the app to the pre-join lobby (the
+  // "Start Meeting" / "Join Meeting" button reappears), so the button must be
+  // re-clicked to re-enter the call. In an environment where the reload lands
+  // straight in the grid, the button never appears and the click is skipped —
+  // this helper is robust to both behaviours. localStorage (e.g. a seeded or
+  // just-modified `vc_action_bar_layout`) survives the reload untouched, so
+  // callers that clear/seed storage before reloading keep that state.
+  async function reloadToGrid(page: Page): Promise<void> {
+    await page.reload();
+    const grid = page.locator("#grid-container");
+    const joinButton = page.getByText(/Start Meeting|Join Meeting/);
+    const which = await Promise.race([
+      grid.waitFor({ state: "visible", timeout: 20_000 }).then(() => "grid" as const),
+      joinButton
+        .first()
+        .waitFor({ state: "visible", timeout: 20_000 })
+        .then(() => "join" as const),
+    ]);
+    if (which === "join") {
+      if ((await joinButton.count()) > 0 && (await joinButton.first().isVisible())) {
+        await joinButton
+          .first()
+          .click()
+          .catch(() => undefined);
+      }
+    }
+    await expect(grid).toBeVisible({ timeout: 15_000 });
+  }
+
   async function enterCustomizeMode(page: Page): Promise<void> {
     await openDockMenu(page);
     const customizeOption = page.locator('.glass-select-option[role="option"]', {
@@ -78,7 +109,11 @@ test.describe("Action bar customize mode", () => {
     // Verify the HangUp button is present but clicking it does NOT navigate away.
     const hangupBtn = page.locator(".hangup-wrapper button");
     await expect(hangupBtn).toBeVisible({ timeout: 5_000 });
-    await hangupBtn.click();
+    // In customize mode the nav container sits above the hangup button and
+    // intercepts pointer events, so a normal click stalls on the
+    // actionability check. Force the click: this still dispatches the button's
+    // onclick, which is exactly the no-op handler this test verifies.
+    await hangupBtn.click({ force: true });
     // We should still be in the meeting (grid visible, customize-mode still on)
     await page.waitForTimeout(500);
     await expect(page.locator("#grid-container")).toBeVisible();
@@ -97,8 +132,7 @@ test.describe("Action bar customize mode", () => {
     // Clear any persisted layout before entering customize mode
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
     // Reload to pick up default layout
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await enterCustomizeMode(page);
 
@@ -174,6 +208,7 @@ test.describe("Action bar customize mode", () => {
     const DEFAULT_LAYOUT = [
       "mic",
       "camera",
+      "reactions",
       "screen",
       "participants",
       "density",
@@ -237,8 +272,7 @@ test.describe("Action bar customize mode", () => {
     await joinMeeting(page, "remove_persists_reload");
 
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await enterCustomizeMode(page);
 
@@ -290,8 +324,7 @@ test.describe("Action bar customize mode", () => {
     // gone. Pre-fix, the loader appended every missing default on load —
     // this would have resurrected the slot and made countAfterReload equal
     // initialCount again.
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
     await page.locator(".video-controls-container").hover();
     await page.waitForTimeout(300);
 
@@ -319,8 +352,7 @@ test.describe("Action bar customize mode", () => {
     await joinMeeting(page, "mic_camera_pinned");
 
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await enterCustomizeMode(page);
 
@@ -351,8 +383,7 @@ test.describe("Action bar customize mode", () => {
 
     // Start from a clean default layout so the snapshot is deterministic.
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     // Expand the bar so every slot (primary + secondary + dock + hangup +
     // mock-peers) is visible BEFORE customize mode. Without this, secondary
@@ -429,8 +460,7 @@ test.describe("Action bar customize mode", () => {
 
     // Clear persisted layout
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await enterCustomizeMode(page);
 
@@ -487,8 +517,7 @@ test.describe("Action bar customize mode", () => {
     await joinMeeting(page, "kbd_reorder");
 
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await enterCustomizeMode(page);
 
@@ -497,12 +526,12 @@ test.describe("Action bar customize mode", () => {
     // deliberately NOT focusable (see the "wrappers are not focusable"
     // test) — focus lives on the inner button so a11y users get exactly
     // one tab stop per slot.
-    const screenWrapper = page.locator(
-      '.video-controls-container .action-bar-slot-wrapper[data-slot="screen"]',
+    const reactionsWrapper = page.locator(
+      '.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"]',
     );
-    await expect(screenWrapper).toBeVisible({ timeout: 5_000 });
-    const screenInnerButton = screenWrapper.locator("> button.video-control-button").first();
-    await expect(screenInnerButton).toBeVisible({ timeout: 5_000 });
+    await expect(reactionsWrapper).toBeVisible({ timeout: 5_000 });
+    const reactionsInnerButton = reactionsWrapper.locator("> button.video-control-button").first();
+    await expect(reactionsInnerButton).toBeVisible({ timeout: 5_000 });
 
     // Capture the original slot order so the after-state is a real delta,
     // not just "some value was saved" (mutation-sensitivity).
@@ -521,32 +550,32 @@ test.describe("Action bar customize mode", () => {
     const before = await readOrder();
     expect(before.length).toBeGreaterThan(2);
 
-    // Focus Screen share's inner button and press Right arrow. The event bubbles to
+    // Focus Reactions's inner button and press Right arrow. The event bubbles to
     // the nav's onkeydown, which resolves the slot via `.closest([data-slot])`.
-    await screenInnerButton.focus();
-    await expect(screenInnerButton).toBeFocused();
+    await reactionsInnerButton.focus();
+    await expect(reactionsInnerButton).toBeFocused();
     await page.keyboard.press("ArrowRight");
     await page.waitForTimeout(150);
 
     const after = await readOrder();
-    // The *order in which Screen share appears* must have moved by exactly one to
+    // The *order in which Reactions appears* must have moved by exactly one to
     // the right (single-step per key — a live-tester report said arrows
     // could "jump to position 9 then walk back" when OS auto-repeat or
     // modifier keys were involved; the handler now blocks both, so a single
     // press moves by exactly one).
-    const beforeScreenIdx = before.indexOf("screen");
-    const afterScreenIdx = after.indexOf("screen");
+    const beforeReactionsIdx = before.indexOf("reactions");
+    const afterReactionsIdx = after.indexOf("reactions");
     expect(
-      afterScreenIdx,
-      `Screen share did not move right by exactly one on a single ArrowRight (before=${beforeScreenIdx}, after=${afterScreenIdx})`,
-    ).toBe(beforeScreenIdx + 1);
+      afterReactionsIdx,
+      `Reactions did not move right by exactly one on a single ArrowRight (before=${beforeReactionsIdx}, after=${afterReactionsIdx})`,
+    ).toBe(beforeReactionsIdx + 1);
 
     // Focus must stay on the moved slot so Tab continues from that control
     // instead of restarting navigation from the beginning of the bar.
-    const movedScreenButton = page
-      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="screen"] > button')
+    const movedReactionsButton = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"] > button')
       .first();
-    await expect(movedScreenButton).toBeFocused({ timeout: 2_000 });
+    await expect(movedReactionsButton).toBeFocused({ timeout: 2_000 });
 
     // The keyboard move must persist without needing to press Done — every
     // arrow keystroke saves. Verifies the handler calls save_action_bar_layout.
@@ -567,7 +596,9 @@ test.describe("Action bar customize mode", () => {
     );
     const liveTexts = await liveRegions.allTextContents();
     const combined = liveTexts.join(" | ");
-    expect(combined).toMatch(new RegExp(`Screen share moved to position ${afterScreenIdx + 1} of `));
+    expect(combined).toMatch(
+      new RegExp(`Reactions moved to position ${afterReactionsIdx + 1} of `),
+    );
 
     // ArrowLeft at the leftmost slot must NOT overflow into a negative
     // index (clamp behaviour) — the announcement should say "already at
@@ -590,8 +621,7 @@ test.describe("Action bar customize mode", () => {
     // `after` is captured just after the ArrowRight move; the subsequent
     // ArrowLeft on Mic is a no-op (clamp at index 0), so the on-reload
     // visual order must equal `after`.
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
     // Re-enter customize mode so all slots (including secondary ones that
     // are otherwise `display:none`) are visible for the `readOrder` walk.
     await enterCustomizeMode(page);
@@ -604,6 +634,109 @@ test.describe("Action bar customize mode", () => {
     ).toEqual(after);
   });
 
+  test("keyboard arrow keys reorder the Record slot (data-slot regression)", async ({ page }) => {
+    // REGRESSION (#1756): the Record slot wrapper was the ONE customizable slot
+    // that shipped without its `data-slot` attribute — a merge-conflict casualty
+    // from combining the recording feature and the keyboard-reorder a11y feature.
+    // The nav-level onkeydown resolves the focused slot via
+    // `target.closest(".action-bar-slot-wrapper[data-slot]")`; because the Record
+    // wrapper lacked `[data-slot]`, that `closest()` skipped past it and returned
+    // None, so ArrowLeft/Right/Home/End on a focused Record button were SILENT
+    // no-ops (no move, no aria-live announcement, no crash). Mouse drag still
+    // worked because its `closest()` call doesn't require `[data-slot]`.
+    //
+    // Unit tests in action_bar_layout.rs (`apply_keyboard_reorder`, `from_slug`)
+    // operate on a plain `Vec<ActionBarSlot>` and never touch the rendered DOM,
+    // so a missing HTML attribute is invisible to them — which is exactly how the
+    // bug shipped past CI. Only a DOM-level test can observe it.
+    //
+    // The current renderer creates every slot through one keyed wrapper and sets
+    // `"data-slot": slot.slug()`. Mutation sensitivity: omit that attribute, or
+    // break Recording's `slug()` mapping, and this test FAILS — the
+    // `[data-slot="recording"]` locator matches nothing, "recording" disappears
+    // from `readOrder()`, and the arrow press emits no aria-live announcement.
+    //
+    // joinMeeting joins as the FIRST participant, which makes this user the host,
+    // so `record_slot_visible` is true and the Record button renders (no extra
+    // setup needed for host-only visibility).
+    await joinMeeting(page, "kbd_reorder_record");
+
+    await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
+    await reloadToGrid(page);
+
+    await enterCustomizeMode(page);
+
+    // The Record wrapper must carry `data-slot="recording"`. On the unfixed code
+    // this element does not exist and the assertion below fails outright.
+    const recordWrapper = page.locator(
+      '.video-controls-container .action-bar-slot-wrapper[data-slot="recording"]',
+    );
+    await expect(recordWrapper).toBeVisible({ timeout: 5_000 });
+    const recordInnerButton = recordWrapper
+      .locator('> button[data-testid="record-button"]')
+      .first();
+    await expect(recordInnerButton).toBeVisible({ timeout: 5_000 });
+
+    // Same `readOrder()` walk as the sibling keyboard test: the slots that the
+    // `[data-slot]` selector matches, sorted by their computed CSS `order`. If
+    // the Record wrapper lacks `data-slot`, "recording" simply never appears in
+    // this list — that absence is itself how the regression hid.
+    const readOrder = async () =>
+      page
+        .locator(".video-controls-container .action-bar-slot-wrapper[data-slot]")
+        .evaluateAll((els) =>
+          els
+            .map((el) => ({
+              slot: el.getAttribute("data-slot") as string,
+              order: parseInt(window.getComputedStyle(el as HTMLElement).order || "0", 10),
+            }))
+            .sort((a, b) => a.order - b.order)
+            .map((s) => s.slot),
+        );
+    const before = await readOrder();
+    // Record sits at index 8 of the 10-entry DEFAULT_SLOTS, so it must be present
+    // (and not at either edge) for a single ArrowLeft to produce a real move.
+    expect(before, `"recording" not present in slot order: ${before.join(",")}`).toContain(
+      "recording",
+    );
+    const beforeRecIdx = before.indexOf("recording");
+    expect(beforeRecIdx).toBeGreaterThan(0); // not leftmost — ArrowLeft will move it
+
+    // Focus Record's inner button and press ArrowLeft. The event bubbles to the
+    // nav onkeydown, which resolves the slot via `.closest([data-slot])`.
+    await recordInnerButton.focus();
+    await expect(recordInnerButton).toBeFocused();
+    await page.keyboard.press("ArrowLeft");
+    await page.waitForTimeout(150);
+
+    const after = await readOrder();
+    const afterRecIdx = after.indexOf("recording");
+    // Core proof: Record actually moved one position left. On the unfixed code
+    // "recording" is absent from both lists, so this comparison could not hold.
+    expect(
+      afterRecIdx,
+      `Record did not move left by exactly one on a single ArrowLeft (before=${beforeRecIdx}, after=${afterRecIdx})`,
+    ).toBe(beforeRecIdx - 1);
+
+    // The keyboard move must persist to v2 storage without pressing Done.
+    const stored = await page.evaluate(() => localStorage.getItem("vc_action_bar_layout"));
+    expect(stored).not.toBeNull();
+    const layout = JSON.parse(stored as string);
+    expect(layout).toMatchObject({ v: 2 });
+    expect(layout.slots).toEqual(after);
+    expect(layout.slots).not.toEqual(before);
+
+    // Screen-reader announcement must reference the Record slot's new position.
+    // `ActionBarSlot::Recording.display_name()` is "Record" (NOT "Recording").
+    const liveRegions = page.locator(
+      '.controls .visually-hidden[role="status"][aria-live="polite"]',
+    );
+    const liveTexts = await liveRegions.allTextContents();
+    expect(liveTexts.join(" | ")).toMatch(
+      new RegExp(`Record moved to position ${afterRecIdx + 1} of `),
+    );
+  });
+
   test("modifier + Arrow does NOT reorder a slot (Cmd/Ctrl+Arrow is a browser shortcut)", async ({
     page,
   }) => {
@@ -613,17 +746,16 @@ test.describe("Action bar customize mode", () => {
     // keeps its own shortcut behaviour instead.
     await joinMeeting(page, "kbd_no_modifier_reorder");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
     await enterCustomizeMode(page);
 
-    const screenInner = page
-      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="screen"] > button')
+    const reactionsInner = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"] > button')
       .first();
-    await screenInner.focus();
+    await reactionsInner.focus();
 
     // Try every reasonable modifier + ArrowRight combination. None must move
-    // Screen share and none must persist a layout change.
+    // Reactions and none must persist a layout change.
     for (const mod of ["Meta", "Control", "Alt", "Shift"] as const) {
       await page.keyboard.press(`${mod}+ArrowRight`);
       await page.waitForTimeout(80);
@@ -640,13 +772,13 @@ test.describe("Action bar customize mode", () => {
           .sort((a, b) => a.order - b.order)
           .map((s) => s.slot),
       );
-    expect(order.indexOf("screen")).toBe(2); // still at default position 3 (0-indexed 2)
+    expect(order.indexOf("reactions")).toBe(2); // still at default position 3 (0-indexed 2)
 
     // Nothing was persisted (storage still absent or reflects default).
     const stored = await page.evaluate(() => localStorage.getItem("vc_action_bar_layout"));
     if (stored) {
       const layout = JSON.parse(stored);
-      expect(layout.slots?.[2]).toBe("screen");
+      expect(layout.slots?.[2]).toBe("reactions");
     }
   });
 
@@ -658,8 +790,7 @@ test.describe("Action bar customize mode", () => {
     // tabindex attribute at all, in either mode.
     await joinMeeting(page, "kbd_single_tab_stop");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     // Snapshot outside customize mode first: hover to reveal all slots.
     await page.locator(".video-controls-container").hover();
@@ -699,8 +830,7 @@ test.describe("Action bar customize mode", () => {
     // silently rejects `.focus()` — Playwright's toBeFocused fails).
     await joinMeeting(page, "kbd_all_slots_focusable");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await enterCustomizeMode(page);
     // Hover to expand so secondary slots exist in the DOM.
@@ -728,7 +858,7 @@ test.describe("Action bar customize mode", () => {
       // isn't available (see MicButton/CameraButton `disabled: !available`).
       // On the E2E stack the browser exposes fake devices so `available` is
       // true for both — but be resilient to a headless quirk by only pinning
-      // the non-hardware slots strictly. ScreenShare, PeerList,
+      // the non-hardware slots strictly. ScreenShare, Reactions, PeerList,
       // DensityMode, Diagnostics, DeviceSettings, MeetingOptions must never
       // be disabled in customize mode.
       const hardwareGated = slotName === "mic" || slotName === "camera";
@@ -761,8 +891,7 @@ test.describe("Action bar customize mode", () => {
     // changed after reorder.
     await joinMeeting(page, "kbd_tab_order_matches_visual");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await enterCustomizeMode(page);
     // Hover to expand so all slots render.
@@ -783,17 +912,17 @@ test.describe("Action bar customize mode", () => {
         );
 
     const before = await readSlotOrder();
-    const screenBtn = page
-      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="screen"] > button')
+    const reactionsBtn = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"] > button')
       .first();
-    await expect(screenBtn).toBeVisible({ timeout: 5_000 });
-    await screenBtn.focus();
-    await expect(screenBtn).toBeFocused();
+    await expect(reactionsBtn).toBeVisible({ timeout: 5_000 });
+    await reactionsBtn.focus();
+    await expect(reactionsBtn).toBeFocused();
     await page.keyboard.press("ArrowRight");
     await page.waitForTimeout(150);
 
     const after = await readSlotOrder();
-    expect(after.indexOf("screen")).toBe(before.indexOf("screen") + 1);
+    expect(after.indexOf("reactions")).toBe(before.indexOf("reactions") + 1);
     expect(after).not.toEqual(before);
 
     // Gather (DOM index, visual order, tag) for every focusable button
@@ -883,8 +1012,7 @@ test.describe("Action bar customize mode", () => {
     // customize mode or reset the bar at all.
     await joinMeeting(page, "kbd_dock_menu_options");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     // Hover to reveal the action bar, then focus the dock-menu trigger
     // (button with id="dock-menu-trigger", newly added by this fix).
@@ -960,8 +1088,7 @@ test.describe("Action bar customize mode", () => {
     // focus lands on the first slot button (Mic/Sound by default).
     await joinMeeting(page, "kbd_enter_customize");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await page.locator(".video-controls-container").hover();
     await page.waitForTimeout(300);
@@ -1068,8 +1195,9 @@ test.describe("Action bar customize mode", () => {
         "vc_action_bar_layout",
         JSON.stringify({
           v: 2,
-          slots: ["camera", "mic", "screen"], // reordered + missing several defaults
+          slots: ["camera", "mic", "reactions"], // reordered + missing several defaults
           hidden: [
+            "screen",
             "participants",
             "density",
             "diagnostics",
@@ -1079,8 +1207,7 @@ test.describe("Action bar customize mode", () => {
         }),
       );
     });
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     // Verify the seeded layout took effect.
     const seeded = await page.evaluate(() => localStorage.getItem("vc_action_bar_layout"));
@@ -1130,8 +1257,7 @@ test.describe("Action bar customize mode", () => {
     // the mode is entered.
     await joinMeeting(page, "aria_live_always_mounted");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     // Hover just to make sure the controls container is in the DOM.
     await page.locator(".video-controls-container").hover();
@@ -1205,8 +1331,7 @@ test.describe("Action bar customize mode", () => {
     // <body> instead of #dock-menu-trigger.
     await joinMeeting(page, "kbd_done_focus_restore");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await enterCustomizeMode(page);
     const done = page.locator("button.action-bar-done-trigger");
@@ -1243,20 +1368,19 @@ test.describe("Action bar customize mode", () => {
     // branch in that handler makes Escape a no-op and this test fails.
     await joinMeeting(page, "kbd_escape_exits_customize");
     await page.evaluate(() => localStorage.removeItem("vc_action_bar_layout"));
-    await page.reload();
-    await expect(page.locator("#grid-container")).toBeVisible({ timeout: 15_000 });
+    await reloadToGrid(page);
 
     await enterCustomizeMode(page);
 
     // Focus a slot button inside the bar so the Escape event fires on a
     // realistic target (not on Done itself, which would also close the
     // menu via its own click semantics).
-    const screenBtn = page
-      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="screen"] > button')
+    const reactionsBtn = page
+      .locator('.video-controls-container .action-bar-slot-wrapper[data-slot="reactions"] > button')
       .first();
-    await expect(screenBtn).toBeVisible({ timeout: 5_000 });
-    await screenBtn.focus();
-    await expect(screenBtn).toBeFocused();
+    await expect(reactionsBtn).toBeVisible({ timeout: 5_000 });
+    await reactionsBtn.focus();
+    await expect(reactionsBtn).toBeFocused();
 
     await page.keyboard.press("Escape");
 

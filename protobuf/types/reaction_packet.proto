@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+// Client -> relay -> all-peers ephemeral reaction broadcast (issue #1884).
+// Carried inside a PacketWrapper whose packet_type is REACTION (17).
+// Unlike VIEWPORT/LAYER_PREFERENCE (relay-consumed, never re-broadcast), a
+// REACTION is RE-BROADCAST on the standard media fan-out
+// (room.{room}.{sender_sid} -> wildcard). The relay self-skips the sender,
+// so the sender never receives its own reaction (it renders a local echo).
+//
+// NOT E2EE-sealed: CLEARTEXT even when E2EE_ENABLED=true, because the relay
+// must read `reaction` to enforce the closed-enum allowlist on ingress
+// (unknown value -> drop) and a reaction is broadcast-public by definition.
+// Put NO private data in this message.
+//
+// Attribution: WHO is anchored on the relay-stamped envelope session_id,
+// resolved via the client's display_name_cache. `display_name` is a COSMETIC
+// fallback only (pre-join cache race); never identity/authorization. Mirrors
+// MeetingPacket.display_name (field 10).
+message ReactionPacket {
+  enum ReactionType {
+    REACTION_TYPE_UNSPECIFIED = 0;
+    THUMBS_UP   = 1;
+    THUMBS_DOWN = 2;
+    LAUGH       = 3;
+    APPLAUSE    = 4;
+    HEART       = 5;
+    THINKING    = 6;
+    PARTY       = 7;
+    reserved 8 to 31; // future reactions; relay+client treat unknown -> drop
+  }
+
+  ReactionType reaction = 1;
+  // Cosmetic display-name fallback (see message doc). Attacker-controlled:
+  // client renders as ESCAPED text and caps length (<=64). Optional.
+  bytes display_name = 2;
+}

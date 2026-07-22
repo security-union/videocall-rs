@@ -46,6 +46,14 @@ pub const SYSTEM_USER_ID: &str = "system-&^%$#@!";
 /// at one source of truth.
 pub const PEER_EVENT_SCREEN_DECODE_STARTED: &str = "screen_decode_started";
 
+/// `PeerEvent.event_type` broadcast to all room participants when a peer
+/// starts recording the meeting. Consumers display an informational banner.
+pub const PEER_EVENT_RECORDING_STARTED: &str = "recording_started";
+
+/// `PeerEvent.event_type` broadcast to all room participants when a peer
+/// stops recording the meeting.
+pub const PEER_EVENT_RECORDING_STOPPED: &str = "recording_stopped";
+
 impl std::fmt::Display for protos::media_packet::media_packet::MediaType {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
@@ -107,6 +115,9 @@ impl std::fmt::Display for protos::packet_wrapper::packet_wrapper::PacketType {
             }
             protos::packet_wrapper::packet_wrapper::PacketType::DOWNLINK_CONGESTION => {
                 write!(f, "DOWNLINK_CONGESTION")
+            }
+            protos::packet_wrapper::packet_wrapper::PacketType::REACTION => {
+                write!(f, "REACTION")
             }
         }
     }
@@ -190,6 +201,124 @@ mod video_stats_wire_tests {
         assert_eq!(
             decoded.content_staleness_ms, 0.0,
             "a VideoStats without field 9 must decode content_staleness_ms as the proto3 default 0.0"
+        );
+    }
+}
+
+#[cfg(test)]
+mod reaction_packet_wire_tests {
+    //! Wire-format round-trip coverage for `ReactionPacket` and the
+    //! `PacketWrapper.PacketType::REACTION = 17` envelope discriminant (issue #1884).
+    //!
+    //! These exercise the REAL generated encode/decode path
+    //! (`protobuf::Message::{write_to_bytes, parse_from_bytes}`) — not an in-memory field set —
+    //! so they fail if `reaction` (field 1, tag 8) or `display_name` (field 2, tag 18) is
+    //! mis-tagged, dropped, or read with the wrong wire type, and they pin the closed-enum
+    //! contract the relay's ingress allowlist depends on.
+    use crate::protos::packet_wrapper::packet_wrapper::PacketType;
+    use crate::protos::reaction_packet::reaction_packet::ReactionType;
+    use crate::protos::reaction_packet::ReactionPacket;
+    use protobuf::{Enum, EnumOrUnknown, Message};
+
+    /// Every defined reaction (1..=7) survives a wire round-trip as the same enum value.
+    #[test]
+    fn all_defined_reactions_survive_wire_round_trip() {
+        let all = [
+            ReactionType::THUMBS_UP,
+            ReactionType::THUMBS_DOWN,
+            ReactionType::LAUGH,
+            ReactionType::APPLAUSE,
+            ReactionType::HEART,
+            ReactionType::THINKING,
+            ReactionType::PARTY,
+        ];
+        // Guard against a future enum edit silently shrinking the covered set: the design pins
+        // exactly 7 broadcastable reactions in v1.
+        assert_eq!(all.len(), 7, "expected exactly 7 defined reactions in v1");
+
+        for r in all {
+            let mut pkt = ReactionPacket::new();
+            pkt.reaction = EnumOrUnknown::new(r);
+            let bytes = pkt
+                .write_to_bytes()
+                .expect("ReactionPacket must serialize to protobuf bytes");
+            let decoded = ReactionPacket::parse_from_bytes(&bytes)
+                .expect("serialized ReactionPacket must parse back");
+            assert_eq!(
+                decoded.reaction.enum_value(),
+                Ok(r),
+                "reaction {r:?} (field 1) must round-trip through the wire unchanged"
+            );
+        }
+    }
+
+    /// The cosmetic `display_name` bytes survive the wire alongside the reaction. The wire
+    /// preserves the full byte string (the <=64 cap is a client-render concern, not a wire one),
+    /// so a name longer than the cap must still decode intact here.
+    #[test]
+    fn display_name_survives_wire_round_trip() {
+        let mut pkt = ReactionPacket::new();
+        pkt.reaction = EnumOrUnknown::new(ReactionType::HEART);
+        // 80 bytes: deliberately longer than the client's 64-byte render cap to prove the wire
+        // itself does not truncate — capping happens on the render side, not here.
+        let name = "x".repeat(80).into_bytes();
+        pkt.display_name = name.clone();
+
+        let bytes = pkt
+            .write_to_bytes()
+            .expect("ReactionPacket must serialize to protobuf bytes");
+        let decoded = ReactionPacket::parse_from_bytes(&bytes)
+            .expect("serialized ReactionPacket must parse back");
+
+        assert_eq!(
+            decoded.reaction.enum_value(),
+            Ok(ReactionType::HEART),
+            "reaction must survive alongside a display_name"
+        );
+        assert_eq!(
+            decoded.display_name, name,
+            "display_name (field 2) must round-trip through the wire unchanged"
+        );
+    }
+
+    /// A reaction the wire carries that is NOT in the closed enum (e.g. a newer client using a
+    /// reserved value, or a forged value) decodes as `EnumOrUnknown::Unknown` — the exact
+    /// signal the relay ingress and the client consume path key their "drop unknown" branch on.
+    #[test]
+    fn unknown_reaction_value_decodes_as_unknown() {
+        let mut pkt = ReactionPacket::new();
+        // 99 is outside the defined 0..=7 range (and the reserved 8..=31 band).
+        pkt.reaction = EnumOrUnknown::from_i32(99);
+
+        let bytes = pkt
+            .write_to_bytes()
+            .expect("ReactionPacket with an unknown enum must serialize");
+        let decoded = ReactionPacket::parse_from_bytes(&bytes)
+            .expect("serialized ReactionPacket must parse back");
+
+        // `enum_value()` returns Err(raw) for a value the closed enum does not define — this is
+        // the drop signal. `from_i32(99)` is None for the same reason.
+        assert_eq!(
+            decoded.reaction.enum_value(),
+            Err(99),
+            "an unknown reaction value must decode as EnumOrUnknown::Unknown(99), never a defined variant"
+        );
+        assert_eq!(
+            ReactionType::from_i32(99),
+            None,
+            "99 is not a defined ReactionType"
+        );
+    }
+
+    /// The envelope discriminant is pinned at 17 (15/16 reserved for the unmerged #1843). If a
+    /// future edit renumbers REACTION this fails, catching a silent wire-compat break with peers
+    /// and the relay's classify arm.
+    #[test]
+    fn reaction_packet_type_is_wire_value_17() {
+        assert_eq!(
+            PacketType::REACTION.value(),
+            17,
+            "PacketType::REACTION must be wire value 17 (15/16 reserved for #1843)"
         );
     }
 }

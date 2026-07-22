@@ -17,15 +17,16 @@
  */
 
 use crate::components::action_bar_layout::{
-    apply_keyboard_reorder, load_action_bar_layout, remove_action_bar_layout,
+    apply_keyboard_reorder, load_action_bar_layout, record_slot_visible, remove_action_bar_layout,
     save_action_bar_layout, ActionBarSlot, DEFAULT_SLOTS,
 };
 use crate::components::decode_budget::{
-    build_decoded_bucket, decide_step, effective_cap, expand_decoded_for_requested,
-    ios_decode_tile_ceiling, is_sole_real_tile, merge_pinned_decode, merge_user_requested_decode,
-    partition_camera_tiles, presenter_cap_ceiling, presenter_extra_shed_pressure,
-    promote_requested_into_decoded, should_clear_force_decode_on_override_change, BudgetSample,
-    BudgetState, BudgetStep, MIN_CAP,
+    build_decoded_bucket, build_unified_render_list, decide_step, effective_cap,
+    expand_decoded_for_requested, ios_decode_tile_ceiling, is_sole_real_tile, merge_pinned_decode,
+    merge_user_requested_decode, partition_camera_tiles, presenter_cap_ceiling,
+    presenter_extra_shed_pressure, promote_requested_into_decoded,
+    should_clear_force_decode_on_override_change, BudgetSample, BudgetState, BudgetStep,
+    TileRenderMode, MIN_CAP,
 };
 use crate::components::decode_budget_banner::DecodeBudgetBanner;
 use crate::components::decode_paused_pill::DecodePausedPill;
@@ -33,7 +34,10 @@ use crate::components::pre_join_preview::PreviewEngine;
 use crate::components::signal_quality::SignalMeterMode;
 use crate::components::{
     browser_compatibility::BrowserCompatibility,
-    canvas_generator::{speak_style, TileMode},
+    canvas_generator::{
+        next_pin_target, speak_style, transport_badge, transport_badge_from_str, PinnedTile,
+        TileMode, TransportBadge,
+    },
     connection_quality_indicator::ConnectionQualityIndicator,
     diagnostics::Diagnostics,
     host::Host,
@@ -45,10 +49,12 @@ use crate::components::{
     peer_tile::PeerTile,
     performance_settings::{DiagnosticsReader, PerfControlsHandle},
     pre_join_settings_card::PreJoinSettingsCard,
+    reactions_overlay::ReactionsOverlay,
     update_display_name_modal::UpdateDisplayNameModal,
     video_control_buttons::{
-        CameraButton, DensityModeButton, DeviceSettingsButton, DiagnosticsButton, HangUpButton,
-        MeetingOptionsButton, MicButton, MockPeersButton, PeerListButton, ScreenShareButton,
+        js_state_to_record_button_state, CameraButton, DensityModeButton, DeviceSettingsButton,
+        DiagnosticsButton, HangUpButton, MeetingOptionsButton, MicButton, MockPeersButton,
+        PeerListButton, ReactionsButton, RecordButton, RecordButtonState, ScreenShareButton,
     },
 };
 use crate::console_log_collector::{
@@ -56,8 +62,8 @@ use crate::console_log_collector::{
 };
 use crate::constants::actix_websocket_base;
 use crate::constants::{
-    mock_peers_enabled, server_election_period_ms, users_allowed_to_stream, webtransport_host_base,
-    CANVAS_LIMIT,
+    mock_peers_enabled, server_election_period_ms, transport_badge_enabled,
+    users_allowed_to_stream, webtransport_host_base, CANVAS_LIMIT,
 };
 use crate::context::{
     html_media_set_sink_id_supported, load_appearance_settings_from_storage,
@@ -70,11 +76,18 @@ use crate::context::{
     AppearanceSettingsCtx, AutohideCtx, CroppedTilesCtx, DecodeBudgetCtx, DecodeBudgetOverride,
     DensityModeCtx, DetachedShareCtx, DisplayNameCtx, DockPosition, DockPositionCtx,
     HostRefreshNonceCtx, HostSetCtx, LocalAudioLevelCtx, MeetingTime, PeerMediaState,
-    PeerSignalHistoryMap, PeerStatusMap, ScreenZoomCtx, ScreenZoomState, SignalPopupStateMap,
-    TransportPreference, TransportPreferenceCtx, UserRequestedDecodeCtx,
+    PeerSignalHistoryMap, PeerStatusMap, RecordingSetCtx, ScreenActualSizeCtx, ScreenZoomCtx,
+    ScreenZoomState, SignalPopupStateMap, TransportPreference, TransportPreferenceCtx,
+    UserRequestedDecodeCtx,
 };
 use crate::local_storage::{load_bool, load_f64, save_f64};
 use crate::types::DeviceInfo;
+// Issue #1884: reaction enum, the closed wire vocabulary the palette + overlay use.
+use crate::components::reactions::{
+    compose_reaction_announcement, integrate_reaction, reaction_glyph, reaction_glyph_from_i32,
+    step_reaction, would_integrate_mutate, FloatingReaction, IntegrateOutcome, REACTIONS,
+    REACTION_FLOAT_LIFETIME_MS, REACTION_PALETTE_AUTOHIDE_MS, REACTION_SR_THROTTLE_MS,
+};
 use dioxus::prelude::Element as DioxusElement;
 use dioxus::prelude::*;
 use dioxus::web::WebEventExt;
@@ -89,14 +102,85 @@ use videocall_client::Callback as VcCallback;
 use videocall_client::MediaDeviceList;
 use videocall_client::{
     ConnectionLostReason, MediaAccessKind, MediaDeviceAccess, MediaPermission,
-    MediaPermissionsErrorState, PermissionState, ScreenShareEvent, VideoCallClient,
-    VideoCallClientOptions,
+    MediaPermissionsErrorState, PermissionState, ReactionSelfThrottle, ScreenShareEvent,
+    VideoCallClient, VideoCallClientOptions,
 };
 #[cfg(feature = "media-server-jwt-auth")]
 use videocall_client::{RefreshRoomTokenCallback, RefreshedTokens};
+use videocall_types::protos::reaction_packet::reaction_packet::ReactionType;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_futures::JsFuture;
+
+/// Call `window.__vcRecording.start(peerIds, onStateChange, localUserName, isLocalUserHost)` via
+/// `js_sys::Reflect` so we can pass a dynamic array and a Rust closure.
+fn js_recording_start(
+    peer_ids: &[String],
+    on_state_change: &js_sys::Function,
+    local_display_name: &str,
+    is_local_user_host: bool,
+) {
+    let window = match web_sys::window() {
+        Some(w) => w,
+        None => return,
+    };
+    let rec = match js_sys::Reflect::get(&window, &JsValue::from_str("__vcRecording")) {
+        Ok(v) => v,
+        Err(_) => {
+            log::error!("[recording] window.__vcRecording not found — is recording.js loaded?");
+            return;
+        }
+    };
+    let start_fn = match js_sys::Reflect::get(&rec, &JsValue::from_str("start")) {
+        Ok(f) => f,
+        Err(_) => {
+            log::error!("[recording] window.__vcRecording.start not found");
+            return;
+        }
+    };
+    let ids_array = js_sys::Array::new();
+    for id in peer_ids {
+        ids_array.push(&JsValue::from_str(id));
+    }
+    let start_fn: js_sys::Function = match start_fn.dyn_into() {
+        Ok(f) => f,
+        Err(_) => {
+            log::error!("[recording] window.__vcRecording.start is not a function");
+            return;
+        }
+    };
+    let args = js_sys::Array::new();
+    args.push(&ids_array.into());
+    args.push(on_state_change);
+    args.push(&JsValue::from_str(local_display_name));
+    args.push(&JsValue::from_bool(is_local_user_host));
+    if let Err(e) = start_fn.apply(&rec, &args) {
+        log::error!("[recording] window.__vcRecording.start() threw: {e:?}");
+    }
+}
+
+/// Call `window.__vcRecording.stop()`.
+fn js_recording_stop() {
+    let window = match web_sys::window() {
+        Some(w) => w,
+        None => return,
+    };
+    let rec = match js_sys::Reflect::get(&window, &JsValue::from_str("__vcRecording")) {
+        Ok(v) => v,
+        Err(_) => return,
+    };
+    let stop_fn = match js_sys::Reflect::get(&rec, &JsValue::from_str("stop")) {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    let stop_fn: js_sys::Function = match stop_fn.dyn_into() {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if let Err(e) = stop_fn.call0(&rec) {
+        log::error!("[recording] window.__vcRecording.stop() threw: {e:?}");
+    }
+}
 
 /// Minimum width (px) a drawer can be dragged to. Below this the panel chrome
 /// (headers, controls) stops being usable. The floor is driven by the
@@ -107,6 +191,19 @@ const DRAWER_MIN_WIDTH: f64 = 300.0;
 /// Absolute maximum drawer width (px). The per-side cap is the smaller of this
 /// and 50% of the viewport (see `max_for_side` in the render body).
 const DRAWER_MAX_ABS: f64 = 720.0;
+
+/// Vertical space (px) reserved at the top of the tile grid for the meeting-wide
+/// status bar (`.meeting-status-bar`) while it is mounted. Added to the grid's
+/// `pad_top` so the bar's contents never overlap tile chrome (e.g. the per-tile
+/// `.floating-name` label). MUST equal the `.meeting-status-bar` `height` in
+/// global.css — the bar sits in `[0, RESERVE]` and the grid's existing `pad_top`
+/// then becomes the breathing gap between the bar and the first tile row.
+/// Desktop value (viewport width >= 568px); pairs with the CSS default height.
+const STATUS_BAR_RESERVE: f64 = 40.0;
+/// Mobile value (viewport width < 568px); pairs with the `max-width: 567px`
+/// `.meeting-status-bar` height override in global.css. The 568px breakpoint
+/// mirrors the `vw < 568.0` grid-padding branch below.
+const STATUS_BAR_RESERVE_MOBILE: f64 = 32.0;
 
 /// Which drawer (if any) is currently being resized by a pointer drag. Tracked
 /// at the meeting-view level because the width signals live here; the pointer
@@ -594,6 +691,237 @@ fn reconnect_delay_ms(attempt: u32) -> Option<u32> {
     Some((base as f64 + jitter).max(500.0) as u32)
 }
 
+/// Push (or coalesce) one reaction float into `active` and schedule its
+/// lifetime-bounded removal (issue 1884). Shared by the local-echo send path
+/// and the `on_reaction` receive path so the coalesce/cap math and the timer
+/// bookkeeping live in exactly one place.
+///
+/// `id_counter` mints the stable per-float id (Timeout removal key + Dioxus list
+/// key). The removal Timeout captures the float's `born_ms`; because a coalesce
+/// resets `born_ms` and schedules a fresh timer, a stale timer whose captured
+/// `born_ms` no longer matches the float is a no-op — last-write-wins on the
+/// lifetime, so a repeatedly-coalesced float lives a full lifetime from its most
+/// recent repeat rather than vanishing at the first float's deadline.
+///
+/// PERF (#1884 perf review): a reaction that would be DROPPED at the cap must
+/// not `write()` the signal — a write dirties `active_reactions` and re-renders
+/// the overlay for no change. So we predict the outcome read-only via
+/// [`would_integrate_mutate`] and only take `write()` when it will actually
+/// mutate. (No TOCTOU: this runs synchronously on the single wasm thread with no
+/// await between the read and the write.)
+///
+/// LIFECYCLE (#1884 perf review): the removal Timeout is `.forget()`-ed and can
+/// fire up to `REACTION_FLOAT_LIFETIME_MS` AFTER this component unmounts (user
+/// hangs up right after a reaction). In dioxus-signals 0.7, `write()` on a
+/// dropped scope PANICS (`try_write().unwrap()`), so the closure uses
+/// `try_write()` and no-ops if the signal is already gone.
+fn push_reaction_float(
+    mut active: Signal<Vec<FloatingReaction>>,
+    id_counter: &Rc<Cell<u64>>,
+    sender_session: u64,
+    emoji: String,
+    name: String,
+) {
+    let now = js_sys::Date::now();
+    let id = id_counter.get();
+    // Horizontal launch jitter in [-35, 35]% so simultaneous floats fan out
+    // across the overlay instead of stacking in one column.
+    let offset_pct = js_sys::Math::random() as f32 * 70.0 - 35.0;
+    let incoming = FloatingReaction {
+        id,
+        sender_session,
+        emoji,
+        name,
+        count: 1,
+        offset_pct,
+        born_ms: now,
+    };
+    // Read-only pre-check: if this reaction would be dropped at the cap, bail
+    // BEFORE any write() so the overlay is not re-rendered for a no-op. `read()`
+    // in this (non-render) context does not subscribe anything.
+    if !would_integrate_mutate(&active.read(), &incoming, now) {
+        return;
+    }
+    // A float is actually being created/coalesced, so consume the id and mutate.
+    id_counter.set(id.wrapping_add(1));
+    // Scope the write guard so it is dropped before the removal Timeout closure
+    // (which also writes the same signal) can run.
+    let outcome = {
+        let mut list = active.write();
+        integrate_reaction(&mut list, incoming, now)
+    };
+    // Pushed and Coalesced both (re)arm a removal timer keyed on (id, born_ms).
+    // Dropped is unreachable here (would_integrate_mutate gated it out above),
+    // but handle it defensively rather than unwrap.
+    let removal_id = match outcome {
+        IntegrateOutcome::Pushed(id) | IntegrateOutcome::Coalesced(id) => id,
+        IntegrateOutcome::Dropped => return,
+    };
+    Timeout::new(REACTION_FLOAT_LIFETIME_MS, move || {
+        // Peek read-only first: only take write() (which re-renders the overlay)
+        // when this timer's float is STILL present with the born_ms it was armed
+        // for. A stale timer — the float was coalesced and re-timed, or already
+        // removed — must NOT dirty the signal (perf review). try_read also
+        // guards unmount: it returns Err on a dropped scope, so we never touch a
+        // gone signal. (Neither try_read nor try_write here subscribes anything —
+        // this runs in a Timeout, not a render.)
+        let still_present = active
+            .try_read()
+            .map(|list| list.iter().any(|r| r.id == removal_id && r.born_ms == now))
+            .unwrap_or(false);
+        if still_present {
+            // try_write (not write): the owning component may unmount between the
+            // peek and here; a plain write() would panic on the dropped signal
+            // (dioxus-signals 0.7 write() = try_write().unwrap()).
+            if let Ok(mut list) = active.try_write() {
+                list.retain(|r| !(r.id == removal_id && r.born_ms == now));
+            }
+        }
+    })
+    .forget();
+}
+
+/// Buffer one peer reaction for screen-reader announcement and, if no flush is
+/// already pending, schedule the throttled drain (issue #1884). Called ONLY on
+/// the receive path — the local "You" echo is never announced. The flush fires
+/// `REACTION_SR_THROTTLE_MS` after the first buffered item, drains everything
+/// accumulated in that window through [`compose_reaction_announcement`], and
+/// resets the scheduled flag so the next reaction opens a fresh window — giving
+/// at most one utterance per throttle interval even under a burst.
+fn schedule_reaction_announcement(
+    mut announcement: Signal<String>,
+    buffer: &Rc<RefCell<Vec<(String, String)>>>,
+    flush_scheduled: &Rc<Cell<bool>>,
+    name: String,
+    label: String,
+) {
+    buffer.borrow_mut().push((name, label));
+    if flush_scheduled.get() {
+        // A drain is already pending; it will pick up this item too.
+        return;
+    }
+    flush_scheduled.set(true);
+    let buffer = buffer.clone();
+    let flush_scheduled = flush_scheduled.clone();
+    Timeout::new(REACTION_SR_THROTTLE_MS, move || {
+        flush_scheduled.set(false);
+        let items = std::mem::take(&mut *buffer.borrow_mut());
+        if let Some(text) = compose_reaction_announcement(&items) {
+            // try_write: like the removal timer, this flush can fire after the
+            // owning component unmounts; a plain set() would panic on the
+            // dropped signal (dioxus-signals 0.7 write() = try_write().unwrap()).
+            if let Ok(mut a) = announcement.try_write() {
+                *a = text;
+            }
+        }
+    })
+    .forget();
+}
+
+/// Is DOM focus currently inside the open reactions palette? Used by the
+/// auto-hide timer to decide whether to pull focus back to the trigger on close
+/// (issue #1884): only steal focus when it lives inside the palette that is
+/// about to unmount — never when the user has since focused something else
+/// (that would yank focus out from under them; cf. the #1756 focus-drop
+/// hazard). Fail-safe to `false` (do not steal) if anything is missing.
+fn focus_is_in_reactions_palette() -> bool {
+    let Some(doc) = window().document() else {
+        return false;
+    };
+    let Some(active) = doc.active_element() else {
+        return false;
+    };
+    let Some(palette) = doc.query_selector(".reactions-palette").ok().flatten() else {
+        return false;
+    };
+    palette.contains(Some(active.unchecked_ref()))
+}
+
+/// Is the element inside the palette focused via the KEYBOARD (issue #1884, UX
+/// B3)? `document.activeElement` is inside `.reactions-palette` AND matches
+/// `:focus-visible` — the browser's own modality signal: true for keyboard
+/// focus (arrows/Tab), false for a plain pointer click (which leaves the clicked
+/// option focused but NOT focus-visible). The auto-hide timer uses this to PAUSE
+/// (re-arm) for a keyboard user parked in the palette — never yanking their
+/// focus — while a mouse user still gets the 5s auto-hide. Fail-safe `false`
+/// (treat as mouse → allow close) if anything is missing. (Chosen over a manual
+/// keyboard-nav flag because `:focus-visible` is the browser-maintained modality
+/// truth and needs no set/clear bookkeeping that could desync; Chromium — the
+/// e2e target — evaluates it in `Element.matches`.)
+fn reaction_focus_visible_in_palette() -> bool {
+    let Some(doc) = window().document() else {
+        return false;
+    };
+    let Some(active) = doc.active_element() else {
+        return false;
+    };
+    let Some(palette) = doc.query_selector(".reactions-palette").ok().flatten() else {
+        return false;
+    };
+    if !palette.contains(Some(active.unchecked_ref())) {
+        return false;
+    }
+    active.matches(":focus-visible").unwrap_or(false)
+}
+
+/// Arm (or restart) the reactions palette auto-hide timer (issue #1884). Called
+/// on every reaction click — the first click after opening starts the window,
+/// each subsequent click restarts it. `gen` is a monotonic generation the timer
+/// captures and re-checks when it fires; the timer no-ops unless the generation
+/// is UNCHANGED since it was armed. The generation is bumped by TWO things:
+///   * a later reaction click (restart — the newer click owns the window), and
+///   * EVERY palette close, via the invalidation `use_effect` on `reactions_open`
+///     (see its comment). That close-bump is what makes a timer armed in one
+///     palette session unable to close a LATER, freshly-reopened one: the close
+///     that separates the two sessions advances the generation, so the stale
+///     timer fails this check. (Without it, an Escape-close that left the
+///     generation untouched let a reopened, never-re-clicked palette inherit the
+///     old 5s deadline and close ~mid-session — the #1884 reopen blocker.)
+///
+/// The closure is also unmount-safe via try_read/try_write.
+fn arm_reaction_autohide(mut reactions_open: Signal<bool>, gen: &Rc<Cell<u64>>) {
+    let armed = gen.get().wrapping_add(1);
+    gen.set(armed);
+    let gen = gen.clone();
+    Timeout::new(REACTION_PALETTE_AUTOHIDE_MS, move || {
+        // Stale if the generation moved since arming — a newer click restarted
+        // the window, OR the palette has closed at least once (the close-bump),
+        // so this timer must not act.
+        if gen.get() != armed {
+            return;
+        }
+        // Unmount guard (try_read returns Err on a dropped scope) plus
+        // defense-in-depth; the generation check above already rejects a timer
+        // whose palette closed, since every close bumps the generation.
+        let still_open = reactions_open.try_read().map(|o| *o).unwrap_or(false);
+        if !still_open {
+            return;
+        }
+        // UX B3 — modality-aware pause: if a keyboard-focused (focus-visible)
+        // element is inside the palette, the user is navigating by keyboard, so
+        // RE-ARM instead of closing — never yank keyboard focus out. A mouse
+        // click leaves the clicked option plain-focused (NOT focus-visible), so
+        // pointer users still get the 5s auto-hide. (Without the modality split,
+        // a "focus inside → re-arm" rule would make the palette NEVER auto-hide
+        // for mouse users, since a click leaves focus on the option.)
+        if reaction_focus_visible_in_palette() {
+            arm_reaction_autohide(reactions_open, &gen);
+            return;
+        }
+        // Close. Restore focus to the trigger only if plain (non-focus-visible)
+        // focus is inside the palette we are about to close; otherwise close
+        // silently so we never yank focus from wherever the user moved it.
+        let focus_inside = focus_is_in_reactions_palette();
+        if let Ok(mut open) = reactions_open.try_write() {
+            *open = false;
+        }
+        if focus_inside {
+            focus_element_by_id("reactions-trigger");
+        }
+    })
+    .forget();
+}
+
 /// Schedule a reconnection attempt with exponential backoff and jitter.
 ///
 /// Refreshes the room token, rebuilds lobby URLs, updates the client, and
@@ -752,6 +1080,85 @@ fn bump_host_event_seq(mut seq: Signal<u64>) {
 fn should_reconcile_host_on_connect(first_connect: &Cell<bool>, is_guest: bool) -> bool {
     let was_first = first_connect.replace(false);
     !was_first && !is_guest
+}
+
+/// How the LOCAL user's own entry in the live recording set must change when the
+/// recorder's JS state machine reaches `new_state`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalRecordingSetOp {
+    /// Recording just became active — show our own recording icon.
+    Insert,
+    /// Recording returned to idle (clean save OR any abort) — hide our icon.
+    Remove,
+    /// A transient transition (Activating / Stopping / Saving) — leave the icon
+    /// as-is. Inserting or removing here would flicker the icon on every
+    /// setup/teardown step.
+    Noop,
+}
+
+/// Map a recorder state transition to the mutation the LOCAL user needs in the
+/// recording set. The icon is bound to the `Recording` state only: it appears on
+/// entry to `Recording` and disappears on return to `Idle`, and is untouched by
+/// the intermediate busy states. Kept pure so the mapping is unit-testable and
+/// its mutation-sensitivity can be pinned (see `mod tests`).
+fn local_recording_set_op(new_state: &RecordButtonState) -> LocalRecordingSetOp {
+    match new_state {
+        RecordButtonState::Recording => LocalRecordingSetOp::Insert,
+        RecordButtonState::Idle => LocalRecordingSetOp::Remove,
+        RecordButtonState::Activating | RecordButtonState::Stopping | RecordButtonState::Saving => {
+            LocalRecordingSetOp::Noop
+        }
+    }
+}
+
+/// Resolve the key to use in the per-recorder set (`RecordingSetCtx`) for a
+/// received `RECORDING_STARTED` / `RECORDING_STOPPED` peer event.
+///
+/// The set is keyed by **`session_id`, not `user_id`** (see `RecordingSetCtx`
+/// docs): recording is a per-session/per-device action, so two sessions of the
+/// SAME authenticated account (same `source_user_id`) must produce independent
+/// entries — otherwise a non-recording sibling tab shows a false icon. The
+/// recorder's own session id arrives in the wire `stream_id`, surfaced here as
+/// `source_session_id`. Returns `None` when it is empty (the sender's session
+/// was not yet assigned) — a "" key matches no tile and would be inert clutter.
+///
+/// `source_user_id` is deliberately ignored for keying: using it is exactly the
+/// bug this indirection guards against. Kept pure so the session-vs-user-id
+/// choice is unit-testable and mutation-pinnable (see `mod tests`).
+fn recording_event_key<'a>(source_user_id: &'a str, source_session_id: &'a str) -> Option<&'a str> {
+    // Intentionally unused: keying the recording set by user_id collapses
+    // sibling sessions of one account into a single shared bit — the shipped bug.
+    let _ = source_user_id;
+    if source_session_id.is_empty() {
+        None
+    } else {
+        Some(source_session_id)
+    }
+}
+
+/// The meeting-wide "is anyone recording right now" aggregate that drives the
+/// single persistent recording indicator shown to EVERY participant (recorders
+/// included).
+///
+/// This is deliberately a set-emptiness check over `RecordingSetCtx`'s
+/// session-keyed set, NOT a single `Option<who-last-touched-it>`. That property
+/// is exactly the acceptance criterion the feature requires and the reason the
+/// old `remote_recording_banner: Signal<Option<String>>` was removed: an
+/// `Option<String>` can only record "who was the LAST session to start/stop",
+/// so with two concurrent recorders A then B, B's stop wrongly cleared the
+/// banner while A was still recording. Reference-counting via the set makes the
+/// indicator:
+///   - appear on the FIRST recorder's start (empty → non-empty),
+///   - stay unchanged on any additional concurrent start/stop while ≥1 remains,
+///   - disappear only when the LAST recorder stops (non-empty → empty).
+///
+/// Because the set is session-keyed and maintained on `RECORDING_STARTED` /
+/// `RECORDING_STOPPED` AND on `on_peer_left` (a recorder crashing/leaving
+/// without a clean stop still decrements it), this boolean is correct across all
+/// lifecycle paths. Kept pure so the aggregate is unit-testable and its
+/// mutation-sensitivity can be pinned (see `mod tests`).
+fn any_session_recording(recording_set: &HashSet<String>) -> bool {
+    !recording_set.is_empty()
 }
 
 /// Decide what a completed `/participants` roster read should do to the host
@@ -1176,6 +1583,23 @@ fn overflow_slot_icon(slot: ActionBarSlot) -> Element {
                 path { d: "M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" }
             }
         },
+        // Issue #1884: Reactions (smiley), mirroring the ReactionsButton glyph.
+        ActionBarSlot::Reactions => rsx! {
+            svg {
+                "aria-hidden": "true",
+                xmlns: "http://www.w3.org/2000/svg",
+                view_box: "0 0 24 24",
+                fill: "none",
+                stroke: "currentColor",
+                stroke_width: "2",
+                stroke_linecap: "round",
+                stroke_linejoin: "round",
+                circle { cx: "12", cy: "12", r: "10" }
+                path { d: "M8 14s1.5 2 4 2 4-2 4-2" }
+                line { x1: "9", y1: "9", x2: "9.01", y2: "9" }
+                line { x1: "15", y1: "9", x2: "15.01", y2: "9" }
+            }
+        },
         // Mic + Camera never appear in the overflow popover.
         _ => rsx! {},
     }
@@ -1187,11 +1611,17 @@ fn is_action_bar_slot_visible(
     ios_device: bool,
     has_screen_share: bool,
     is_owner: bool,
+    recording_visible: bool,
 ) -> bool {
     match slot {
         ActionBarSlot::ScreenShare => customize_mode || !ios_device,
         ActionBarSlot::DensityMode => customize_mode || !has_screen_share,
         ActionBarSlot::MeetingOptions => is_owner,
+        // Recording gating (#1746): guests never see it, the host always does,
+        // authenticated non-hosts only when the meeting allows it. The caller
+        // pre-computes this via `record_slot_visible` so the per-slot rule stays
+        // host-testable and this function keeps a single `bool` for it.
+        ActionBarSlot::Recording => recording_visible,
         _ => true,
     }
 }
@@ -1202,6 +1632,7 @@ fn visible_action_bar_slots(
     ios_device: bool,
     has_screen_share: bool,
     is_owner: bool,
+    recording_visible: bool,
 ) -> Vec<ActionBarSlot> {
     slots
         .iter()
@@ -1213,6 +1644,7 @@ fn visible_action_bar_slots(
                 ios_device,
                 has_screen_share,
                 is_owner,
+                recording_visible,
             )
         })
         .collect()
@@ -1225,6 +1657,7 @@ fn merge_visible_action_bar_slots(
     ios_device: bool,
     has_screen_share: bool,
     is_owner: bool,
+    recording_visible: bool,
 ) -> Vec<ActionBarSlot> {
     let mut visible_idx = 0usize;
     full_slots
@@ -1237,6 +1670,7 @@ fn merge_visible_action_bar_slots(
                 ios_device,
                 has_screen_share,
                 is_owner,
+                recording_visible,
             ) {
                 let mapped_slot = reordered_visible_slots
                     .get(visible_idx)
@@ -1278,6 +1712,11 @@ pub fn AttendantsComponent(
     #[props(default)] admitted_can_admit: bool,
     #[props(default = true)] end_on_host_leave: bool,
     #[props(default = false)] allow_guests: bool,
+    /// Whether the record button is shown to all admitted participants.
+    /// Defaults to `false` so only the host sees the record button unless
+    /// the owner opens it up in the meeting-options controls.
+    #[props(default = false)]
+    recording_allowed_for_all: bool,
 ) -> DioxusElement {
     // Clone props that will be used in multiple closures
     let id_for_peer_list = id.clone();
@@ -1285,6 +1724,14 @@ pub fn AttendantsComponent(
     let status_observer_token_for_settings_refresh = status_observer_token.clone();
 
     // --- State signals ---
+    // Declared here (rather than alongside its sibling meeting-option toggles
+    // further down) because the action-bar overflow-visibility effect below
+    // needs it live: `record_slot_visible` must read the CURRENT value, not the
+    // `recording_allowed_for_all` prop's initial snapshot, or a host toggling
+    // "allow recording for all" mid-meeting would leave the Record slot's
+    // overflow-menu placement stale until an unrelated effect dependency (e.g.
+    // a resize) happened to re-trigger this effect.
+    let mut recording_allowed_for_all_toggle = use_signal(move || recording_allowed_for_all);
     let mut screen_share_state = use_signal(|| ScreenShareState::Idle);
     let screen_share_toast_state: Signal<Option<ScreenShareToastState>> = use_signal(|| None);
     let screen_share_toast_timer: Signal<Option<Timeout>> = use_signal(|| None);
@@ -1537,7 +1984,14 @@ pub fn AttendantsComponent(
         // dead popover items (e.g. ScreenShare on iOS, MeetingOptions for
         // non-owners, DensityMode during screen-share).
         let ios_device = is_ios();
-        let visible = visible_action_bar_slots(&slots, false, ios_device, has_ss, is_owner);
+        let visible = visible_action_bar_slots(
+            &slots,
+            false,
+            ios_device,
+            has_ss,
+            is_owner,
+            record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
+        );
 
         let is_vertical = dock != DockPosition::Bottom;
         let available = if is_vertical { vh } else { vw } - 40.0;
@@ -1618,6 +2072,33 @@ pub fn AttendantsComponent(
     });
 
     let encoder_settings = use_signal(|| None::<String>);
+
+    // --- Recording state ---
+    // `RecordButtonState` drives the button appearance; `recording_banner` is the
+    // per-recording state message shown ONLY to the local recorder.
+    let mut record_state: Signal<RecordButtonState> = use_signal(|| RecordButtonState::Idle);
+    // Live set of the `session_id`(s) currently recording — local user and
+    // remotes. Independent per recorder (see `RecordingSetCtx`): each entry is
+    // inserted on that session's RECORDING_STARTED (and the local user's own →
+    // Recording JS transition) and removed on its RECORDING_STOPPED / departure,
+    // so several peers can record at once and one stopping never clears another's
+    // icon. Keyed by session_id, not user_id, so two sessions of the SAME
+    // account stay independent (see `RecordingSetCtx`'s doc comment).
+    // Purely live — NOT seeded from any roster (no persisted "who is recording").
+    let recording_peer_ids: Signal<HashSet<String>> = use_signal(HashSet::new);
+    // Derived meeting-wide "is anyone recording" boolean, memoized so a no-op
+    // set mutation (a 2nd/3rd concurrent recorder starting or stopping while at
+    // least one other stays active) does not re-render this whole component —
+    // only an actual true↔false flip does. See `any_session_recording`.
+    let any_recording_active = use_memo(move || any_session_recording(&recording_peer_ids.read()));
+    // Brief "Recording saved" toast shown to the recorder when recording completes.
+    let recording_saved_toast: Signal<bool> = use_signal(|| false);
+    // Stable JS closure passed to `window.__vcRecording.start()` so the JS
+    // callback updates `record_state` when the recorder transitions.
+    #[allow(clippy::type_complexity)]
+    let state_cb: Rc<RefCell<Option<Closure<dyn FnMut(String)>>>> =
+        use_hook(|| Rc::new(RefCell::new(None)));
+
     // Last peer count logged by the meeting-view render log below — lets that
     // log fire only on changes (edge-trigger) instead of every re-render.
     let mut last_logged_peer_count = use_signal(|| None::<usize>);
@@ -1634,6 +2115,42 @@ pub fn AttendantsComponent(
     // Initialized to the current density_mode when the popover opens;
     // arrow keys move it; Enter/Space commits it as the new density_mode.
     let mut density_highlight: Signal<DensityMode> = use_signal(|| DensityMode::Auto);
+    // Issue #1884: reactions palette open state + keyboard-highlighted option
+    // (mirrors density_open/density_highlight). Seeded to the first reaction when
+    // the palette opens; arrow keys move it; Enter/Space sends it.
+    let mut reactions_open = use_signal(|| false);
+    let mut reaction_highlight: Signal<ReactionType> = use_signal(|| ReactionType::THUMBS_UP);
+    // Issue 1884: the floating-overlay model. `active_reactions` holds the live
+    // rising-emoji floats (local echo + peers), rendered by the reactions
+    // overlay; `reaction_pressed` tags the palette button that was just
+    // activated so it shows ~150ms of pressed feedback before the palette
+    // auto-closes. `reaction_id_counter` mints a stable, monotonic id per float
+    // (Timeout removal key + Dioxus list key); `reaction_throttle` is the one
+    // per-client send self-throttle every reaction click is gated through (a
+    // rejected click is a silent no-op that still shows pressed feedback).
+    let active_reactions: Signal<Vec<FloatingReaction>> = use_signal(Vec::new);
+    let mut reaction_pressed: Signal<Option<ReactionType>> = use_signal(|| None);
+    let reaction_id_counter = use_hook(|| Rc::new(Cell::new(0u64)));
+    let reaction_throttle = use_hook(|| Rc::new(RefCell::new(ReactionSelfThrottle::new())));
+    // Generation counter for the palette auto-hide timer (issue #1884): the
+    // palette stays open ~REACTION_PALETTE_AUTOHIDE_MS after a reaction click so
+    // the user can react several times in a row. Each click bumps this so the
+    // previous timer no-ops (restart-safe); Escape / outside-click / the X close
+    // immediately and the pending timer then finds the palette already closed.
+    let reaction_autohide_gen = use_hook(|| Rc::new(Cell::new(0u64)));
+    // Timestamp (ms) of the last ACCEPTED reaction activation, for the local
+    // press gate (issue #1884 perf): activations closer together than ~150ms
+    // (held-key repeat, 20-30/s) are coalesced — skipped before ANY signal
+    // write — so key-repeat can never sustain whole-component re-renders. Narrows
+    // "every click restarts the window" to "every click >=150ms apart restarts".
+    let reaction_last_press = use_hook(|| Rc::new(Cell::new(0f64)));
+    // Screen-reader announcement channel + its throttle state. Peer reactions
+    // are buffered in `reaction_sr_buffer` and flushed to `reaction_announcement`
+    // at most once per REACTION_SR_THROTTLE_MS; `reaction_sr_flush_scheduled`
+    // debounces the flush Timeout so a burst schedules exactly one drain.
+    let reaction_announcement: Signal<String> = use_signal(String::new);
+    let reaction_sr_buffer = use_hook(|| Rc::new(RefCell::new(Vec::<(String, String)>::new())));
+    let reaction_sr_flush_scheduled = use_hook(|| Rc::new(Cell::new(false)));
 
     // When the popover opens, seed the highlight from the current mode
     // and auto-focus that option after the DOM settles.
@@ -1648,6 +2165,46 @@ pub fn AttendantsComponent(
             .forget();
         }
     });
+
+    // Issue 1884: when the reactions palette opens, move focus onto the
+    // currently-highlighted option after the DOM settles (mirrors density) so a
+    // keyboard user lands inside the menu and the arrow keys work immediately.
+    // `reaction_highlight` is read with `.peek()` (non-tracking) so this effect
+    // depends only on `reactions_open` — the arrow-key handler already moves
+    // focus itself, and re-running this on every highlight change would schedule
+    // redundant focus jumps.
+    use_effect(move || {
+        if reactions_open() {
+            if let Some((_, _, slug)) = reaction_glyph(*reaction_highlight.peek()) {
+                let active_id = format!("reaction-opt-{slug}");
+                Timeout::new(100, move || {
+                    focus_element_by_id(&active_id);
+                })
+                .forget();
+            }
+        }
+    });
+
+    // Issue 1884 (reopen blocker): invalidate any outstanding palette auto-hide
+    // timer whenever the palette CLOSES, from ANY path. Reading `reactions_open`
+    // subscribes this effect to its transitions, so the trigger toggle, Escape,
+    // outside-click, the X, AND the mutual-exclusion arms
+    // (density/dock/overflow/…) — present and future — route their
+    // `reactions_open.set(false)` through this single generation bump without any
+    // site needing to know the timer exists. Bumping makes a timer armed in a
+    // PRIOR palette session no-op, so a stale timer can never close a
+    // freshly-reopened palette. We bump on CLOSE only (not open): every reopen is
+    // preceded by a close, so this covers all reopen cases while never risking
+    // invalidation of a just-armed timer. `reaction_autohide_gen` is a plain
+    // `Cell` (not a signal), so the bump triggers no re-render and cannot loop.
+    {
+        let reaction_autohide_gen = reaction_autohide_gen.clone();
+        use_effect(move || {
+            if !reactions_open() {
+                reaction_autohide_gen.set(reaction_autohide_gen.get().wrapping_add(1));
+            }
+        });
+    }
 
     // --- Adaptive decode budget (issue #987, task 1a.3) ---
     // Manual override for the adaptive controller. `Auto` runs the loop;
@@ -1993,7 +2550,15 @@ pub fn AttendantsComponent(
     let connecting = use_signal(|| false);
     let local_speaking = use_signal(|| false);
     let local_audio_level = use_signal(|| 0.0f32);
-    let mut pinned_peer_id: Signal<Option<String>> = use_signal(|| None);
+    // The single maximized tile, or `None`. Carries BOTH the peer's user_id and
+    // which of their tiles (camera vs shared screen) is pinned — see
+    // `PinnedTile`. During a screen share the sharer renders as two tiles that
+    // share one user_id, so a bare user_id could not tell "pin the screen" from
+    // "pin the camera". Decode-budget read sites below key off only the
+    // `.user_id` part (they force-decode the pinned PEER regardless of which of
+    // their tiles is spotlighted); only the per-tile maximize rendering uses the
+    // `.kind`.
+    let mut pinned_peer_id: Signal<Option<PinnedTile>> = use_signal(|| None);
     // Screen-share to participants panel ratio. Default 0.667 gives a 2:1 split.
     // Clamped to [0.3, 0.85] by the resize handle (screen share 30%–85% of width).
     let mut screen_share_ratio: Signal<f64> = use_signal(|| 0.667);
@@ -2156,6 +2721,10 @@ pub fn AttendantsComponent(
     // (like crop) so `on_peer_removed` can clean them up when a sharer leaves.
     let screen_zoom_signal: Signal<HashMap<String, ScreenZoomState>> = use_signal(HashMap::new);
     let detached_share_signal: Signal<Option<String>> = use_signal(|| None);
+    // Issue 1821: the peer currently pinned to actual-size (1:1), or None. One at
+    // a time (mirrors `detached_share_signal`). Created here so `on_peer_removed`
+    // can clear it when the engaged sharer leaves.
+    let screen_actual_size_signal: Signal<Option<String>> = use_signal(|| None);
 
     // Read transport preference from context BEFORE use_hook (hooks must not
     // be called inside the hook closure).
@@ -2232,6 +2801,40 @@ pub fn AttendantsComponent(
             webtransport_urls,
             enable_e2ee: e2ee_enabled,
             enable_webtransport: effective_wt_enabled,
+            // Issue 1884: reaction receive callback. Fires ONLY for peers (the
+            // relay self-skips the sender, so our own reaction never comes back
+            // over the wire — the UI renders its own "You" echo on click). The
+            // client hands us the relay-stamped `session_id`, the wire reaction
+            // value, and the resolved display name (cache-authoritative, cosmetic
+            // in-packet fallback, both already length-capped + sanitized). We map
+            // the value to a glyph (dropping any value outside the closed 1..=7
+            // enum), push a rising float, and queue a throttled SR announcement.
+            on_reaction: {
+                let reaction_sr_buffer = reaction_sr_buffer.clone();
+                let reaction_sr_flush_scheduled = reaction_sr_flush_scheduled.clone();
+                let reaction_id_counter = reaction_id_counter.clone();
+                Some(VcCallback::from(
+                    move |(sender_session, reaction_value, name): (u64, i32, String)| {
+                        if let Some((emoji, label, _slug)) = reaction_glyph_from_i32(reaction_value)
+                        {
+                            push_reaction_float(
+                                active_reactions,
+                                &reaction_id_counter,
+                                sender_session,
+                                emoji.to_string(),
+                                name.clone(),
+                            );
+                            schedule_reaction_announcement(
+                                reaction_announcement,
+                                &reaction_sr_buffer,
+                                &reaction_sr_flush_scheduled,
+                                name,
+                                label.to_string(),
+                            );
+                        }
+                    },
+                ))
+            },
             on_connected: {
                 let meeting_id_for_log = id.clone();
                 // Initial room_token for console-log upload auth. The collector
@@ -2414,6 +3017,11 @@ pub fn AttendantsComponent(
                     crate::components::screen_share_detach::teardown(&peer_id);
                     detached.set(None);
                 }
+                // Issue 1821: drop this peer's actual-size (1:1) intent if it held it.
+                let mut actual_size = screen_actual_size_signal;
+                if actual_size.peek().as_deref() == Some(peer_id.as_str()) {
+                    actual_size.set(None);
+                }
             })),
             on_peers_removed_batch: Some(VcCallback::from(move |peer_ids: Vec<String>| {
                 // Phase 6 fix: bump `peer_list_version` exactly once per
@@ -2514,6 +3122,13 @@ pub fn AttendantsComponent(
 
                             if allow_guests_toggle() != status.allow_guests {
                                 allow_guests_toggle.set(status.allow_guests);
+                            }
+
+                            if recording_allowed_for_all_toggle()
+                                != status.recording_allowed_for_all
+                            {
+                                recording_allowed_for_all_toggle
+                                    .set(status.recording_allowed_for_all);
                             }
                         }
                         Err(e) => {
@@ -2654,36 +3269,64 @@ pub fn AttendantsComponent(
                 }
             })),
             on_peer_event: Some(VcCallback::from(
-                move |(source_user_id, event_type, _stream_id): (String, String, String)| {
-                    if event_type != videocall_client::PEER_EVENT_SCREEN_DECODE_STARTED {
-                        log::debug!("Ignoring PEER_EVENT with unknown event_type: {event_type}");
-                        return;
-                    }
-                    log::info!("PEER_EVENT screen_decode_started received from {source_user_id}");
-                    let mut screen_share_toast_state = screen_share_toast_state;
-                    let mut screen_share_toast_timer = screen_share_toast_timer;
-                    if !matches!(
-                        screen_share_toast_state.peek().as_ref(),
-                        Some(ScreenShareToastState::Starting)
-                    ) {
-                        return;
-                    }
-                    screen_share_toast_state.set(Some(ScreenShareToastState::SuccessfullyShared));
-                    screen_share_toast_timer.set(Some(Timeout::new(4_000, move || {
-                        let mut s = screen_share_toast_state;
-                        if matches!(
-                            s.peek().as_ref(),
-                            Some(ScreenShareToastState::SuccessfullyShared)
+                move |(source_user_id, event_type, source_session_id): (String, String, String)| {
+                    if event_type == videocall_client::PEER_EVENT_SCREEN_DECODE_STARTED {
+                        log::info!(
+                            "PEER_EVENT screen_decode_started received from {source_user_id}"
+                        );
+                        let mut screen_share_toast_state = screen_share_toast_state;
+                        let mut screen_share_toast_timer = screen_share_toast_timer;
+                        if !matches!(
+                            screen_share_toast_state.peek().as_ref(),
+                            Some(ScreenShareToastState::Starting)
                         ) {
-                            s.set(None);
+                            return;
                         }
-                    })));
+                        screen_share_toast_state
+                            .set(Some(ScreenShareToastState::SuccessfullyShared));
+                        screen_share_toast_timer.set(Some(Timeout::new(4_000, move || {
+                            let mut s = screen_share_toast_state;
+                            if matches!(
+                                s.peek().as_ref(),
+                                Some(ScreenShareToastState::SuccessfullyShared)
+                            ) {
+                                s.set(None);
+                            }
+                        })));
+                    } else if event_type == videocall_client::PEER_EVENT_RECORDING_STARTED {
+                        log::info!(
+                            "PEER_EVENT recording_started received from user={source_user_id} session={source_session_id}"
+                        );
+                        // Independent per-recorder tracking, keyed by the sender's
+                        // SESSION id (carried in the wire `stream_id`) so a second
+                        // tab of the same account is not falsely marked recording.
+                        // Covers late joiners too — the local recorder re-announces
+                        // STARTED to each new peer in `on_peer_joined`.
+                        if let Some(key) = recording_event_key(&source_user_id, &source_session_id)
+                        {
+                            let mut rec_ids = recording_peer_ids;
+                            rec_ids.write().insert(key.to_string());
+                        }
+                    } else if event_type == videocall_client::PEER_EVENT_RECORDING_STOPPED {
+                        log::info!(
+                            "PEER_EVENT recording_stopped received from user={source_user_id} session={source_session_id}"
+                        );
+                        // Removal by SESSION id is naturally correct with several
+                        // concurrent recorders — it only affects THIS session's icon.
+                        if let Some(key) = recording_event_key(&source_user_id, &source_session_id)
+                        {
+                            let mut rec_ids = recording_peer_ids;
+                            rec_ids.write().remove(key);
+                        }
+                    } else {
+                        log::debug!("Ignoring PEER_EVENT with unknown event_type: {event_type}");
+                    }
                 },
             )),
             on_peer_left: {
                 let client_cell = client_for_reconnect.clone();
                 Some(VcCallback::from(
-                    move |(display_name, user_id, _session_id): (String, String, String)| {
+                    move |(display_name, user_id, session_id): (String, String, String)| {
                         log::debug!("TOAST-RX: peer left: {} ({})", display_name, user_id);
 
                         // Suppress replayed "left" events during a transport reconnect.
@@ -2702,9 +3345,30 @@ pub fn AttendantsComponent(
                         }
 
                         let settings = appearance_settings.peek();
-                        let show_toast = settings.show_exit_notifications;
+                        // Always show notifications while recording so join/leave events are captured.
+                        let show_toast = settings.show_exit_notifications
+                            || !matches!(*record_state.peek(), RecordButtonState::Idle);
                         let play_sound = settings.play_exit_sound;
                         drop(settings);
+
+                        // A departing recorder can no longer send RECORDING_STOPPED,
+                        // so drop its recording icon (and decrement the meeting-wide
+                        // `any_session_recording` aggregate that drives the persistent
+                        // indicator). The set is keyed by SESSION id (per-recorder), so
+                        // remove the departing session — a sibling session of the
+                        // same user_id that is still recording keeps its own icon.
+                        // Guard the write behind a `peek` membership check — an
+                        // unconditional `write()` marks the signal dirty and
+                        // re-renders every PeerTile + the peer list even when the
+                        // departing peer wasn't recording (the common case), which
+                        // fans out O(n) wasted re-renders during reconnection waves.
+                        // Mirrors the other `peek`-guarded set writes in this file.
+                        {
+                            let mut rec_ids = recording_peer_ids;
+                            if rec_ids.peek().contains(&session_id) {
+                                rec_ids.write().remove(&session_id);
+                            }
+                        }
 
                         if show_toast {
                             let mut toast_counter = toast_counter;
@@ -2782,8 +3446,11 @@ pub fn AttendantsComponent(
                         );
 
                         let settings = appearance_settings.peek();
-                        let show_toast = settings.show_entry_notifications;
+                        // Always show notifications while recording so join/leave events are captured.
+                        let show_toast = settings.show_entry_notifications
+                            || !matches!(*record_state.peek(), RecordButtonState::Idle);
                         let play_sound = settings.play_entry_sound;
+
                         drop(settings);
 
                         let suppress_toast = if let Some(ref client) = *client_cell.borrow() {
@@ -2846,7 +3513,7 @@ pub fn AttendantsComponent(
                             }
                             let id = *toast_counter.peek();
                             toast_counter.set(id + 1);
-                            current.push((id, display_name, user_id, true));
+                            current.push((id, display_name, user_id.clone(), true));
                             peer_toasts.set(current);
                             {
                                 let v = *toast_version.peek();
@@ -2876,6 +3543,49 @@ pub fn AttendantsComponent(
                         {
                             let mut v = peer_list_version;
                             v.set(v() + 1);
+                        }
+                        // If recording is in progress, notify the newly joined peer so they
+                        // see the `.meeting-status-bar` recording status immediately, and their
+                        // client marks THIS session recording (the send stamps our own
+                        // session id into the wire `stream_id`).
+                        //
+                        // KNOWN LIMITATION (deferred follow-up, intentionally NOT fixed
+                        // here): if the joining peer shares our own `user_id` (a sibling
+                        // session of the same authenticated account, e.g. the same login
+                        // in another tab), our client never fires this `on_peer_joined`
+                        // for it — the self-guard in `video_call_client.rs` (~:4041)
+                        // suppresses PARTICIPANT_JOINED whose `target_user_id` equals our
+                        // own `user_id`, comparing by user_id rather than session_id. So
+                        // this re-announce is not sent to that sibling, and our recording
+                        // icon won't reach it until a genuinely new user_id joins.
+                        // Fixing that touches shared core session-emission (it would start
+                        // surfacing same-account second-tab joins to everyone) and is
+                        // tracked separately.
+                        //
+                        // Deferred via `Timeout::new(0, ...)`: this whole `on_peer_joined`
+                        // callback runs SYNCHRONOUSLY, nested inside `Inner::on_inbound_media`
+                        // while it still holds `inner.borrow_mut()` on the client's shared
+                        // `RefCell`. `send_peer_event` needs our own session id via
+                        // `get_own_session_id()`, which does a defensive `try_borrow()` on
+                        // that SAME `RefCell` — a reentrant borrow that silently fails and
+                        // returns `None` (empty session id) if called synchronously here.
+                        // That emptied the `stream_id`, so `recording_event_key` (which
+                        // rejects an empty session) dropped the announce entirely — the
+                        // newly joined peer's client never learned we were recording.
+                        // Deferring to a 0ms timeout runs this after the current call stack
+                        // (and its borrow) unwinds, so `get_own_session_id()` succeeds.
+                        if !matches!(*record_state.peek(), RecordButtonState::Idle) {
+                            let client_cell = client_cell.clone();
+                            let user_id = user_id.clone();
+                            Timeout::new(0, move || {
+                                if let Some(ref client) = *client_cell.borrow() {
+                                    client.send_peer_event(
+                                        &user_id,
+                                        videocall_client::PEER_EVENT_RECORDING_STARTED,
+                                    );
+                                }
+                            })
+                            .forget();
                         }
                     },
                 ))
@@ -3895,6 +4605,9 @@ pub fn AttendantsComponent(
     // Provide the host set so peer-list rows and video tiles render a host
     // indicator for the current host.
     use_context_provider(|| HostSetCtx(host_set_signal));
+    // Provide the recording set so peer-list rows and video tiles render a
+    // per-recorder indicator for every participant currently recording.
+    use_context_provider(|| RecordingSetCtx(recording_peer_ids));
     let mut meeting_time_signal = use_signal(MeetingTime::default);
     use_context_provider(|| meeting_time_signal);
     let local_audio_level_ctx = use_context_provider(|| LocalAudioLevelCtx(local_audio_level));
@@ -3958,6 +4671,9 @@ pub fn AttendantsComponent(
     // zoom viewport / controls in `canvas_generator`.
     use_context_provider(|| ScreenZoomCtx(screen_zoom_signal));
     use_context_provider(|| DetachedShareCtx(detached_share_signal));
+    // Issue 1821: the actual-size (1:1) engaged-peer intent, consumed by the
+    // shared-content tile's zoom controls / viewport in `canvas_generator`.
+    use_context_provider(|| ScreenActualSizeCtx(screen_actual_size_signal));
 
     // Issue 1768: media-metrics overlay toggle. `MediaMetricsOverlayCtx` is the
     // enabled flag every PeerTile (remote overlays) and `Host` (the self overlay)
@@ -5733,6 +6449,25 @@ pub fn AttendantsComponent(
             }
         }
     };
+    // Meeting-wide status bar reserve (recording status, today). While the bar
+    // is mounted it occupies `[0, reserve]` at the very top of `#main-container`;
+    // add that height to `pad_top` so tiles (and their `.floating-name` labels)
+    // are pushed below it instead of being overlapped. Because `avail_h` (and
+    // every downstream `compute_layout` call) is derived from this single
+    // `pad_top`, the tiles resize to fit the reduced area in ALL three layout
+    // paths, and expand back the instant the bar unmounts. Zero when idle, so no
+    // space is reserved when nothing is recording. Matched to the CSS bar height
+    // per viewport (the 568px breakpoint mirrors the padding branch above).
+    let status_bar_reserve = if any_recording_active() {
+        if vw < 568.0 {
+            STATUS_BAR_RESERVE_MOBILE
+        } else {
+            STATUS_BAR_RESERVE
+        }
+    } else {
+        0.0
+    };
+    let pad_top = pad_top + status_bar_reserve;
     // Per-side resize cap reused by the drag handler below. The smaller of the
     // absolute max and half the viewport. The DRAWER_MIN_WIDTH lower bound here is
     // inert above the 568px breakpoint (where the CSS hides the resize handle on
@@ -6044,11 +6779,15 @@ pub fn AttendantsComponent(
     // `all_tiles` holds session_ids; the pin is keyed by user_id, so resolve the
     // pin's index via `client.get_peer_user_id` (mock "mock-N" tiles never match a
     // real user_id) and pass it in — the helper is kept pure / DOM-free.
-    let pinned_idx = pinned_peer_id.peek().as_deref().and_then(|pinned_user_id| {
-        all_tiles
-            .iter()
-            .position(|tile_id| client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id))
-    });
+    let pinned_idx = pinned_peer_id
+        .peek()
+        .as_ref()
+        .map(|p| p.user_id.as_str())
+        .and_then(|pinned_user_id| {
+            all_tiles.iter().position(|tile_id| {
+                client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
+            })
+        });
     // Reading `user_requested_decode.read()` HERE is one of the two parent-scope
     // reactive reads (the other is the phase-4 merge) that make a per-tile PLAY
     // click re-render the parent — see the reactivity note on the signal.
@@ -6109,36 +6848,28 @@ pub fn AttendantsComponent(
         .collect();
 
     // --- Lone-peer full-bleed predicate (issues #1465, #508) ---
-    // The #508 single-peer presentation renders the SOLE remote peer full-bleed
-    // (its content — live video, or the "Camera Off" placeholder — filling the
-    // tile). Before #1465 that was keyed off `visible_tile_count == 1`, because
-    // a single on-screen tile could only ever be a decoded video tile.
-    //
-    // The #1465 partition broke that assumption: camera-OFF real peers are no
-    // longer in `visible_tiles`/`avatar_tiles` — they render from the separate
-    // `camera_off_tiles` group. So `visible_tile_count == 1` no longer means the
-    // peer is alone on screen: a camera-on peer (visible) can render ALONGSIDE a
-    // camera-off peer (camera_off), giving `visible == 1` while two tiles are
-    // actually shown. Keying full-bleed off `visible_tile_count` would then make
-    // BOTH the lone-camera-on rule and the camera-off rule believe they are
-    // alone, full-bleeding two tiles at once.
-    //
-    // The correct key is the TOTAL displayed real-peer tiles across all three
-    // render groups. `is_sole_real_tile` computes exactly that sum; the
-    // visible_tiles loop and the camera_off_tiles loop below both gate full-bleed
-    // on this single shared value, so at most one tile can ever be full-bleed.
-    //
-    // No-cap byte-identity invariant (#1465): with exactly one camera-ON peer and
-    // zero camera-off peers the cap is inactive, so `visible_tiles.len() == 1`
-    // while `avatar_tiles` and `camera_off_tiles` are empty. The sum is 1 →
-    // `sole_real_tile` is true → that lone peer is full-bleed, exactly as before
-    // the partition. (Mocks are excluded from full-bleed separately via the
-    // `!is_mock` guard on the visible_tiles rule.)
+    // The TOTAL displayed real-peer tiles across all three render groups
+    // determines whether the single tile should fill the viewport.
     let sole_real_tile = is_sole_real_tile(
         visible_tiles.len(),
         avatar_tiles.len(),
         camera_off_tiles.len(),
     );
+
+    // --- Unified render list (stable join-time grid order) ---
+    // Merge the three tile buckets into a SINGLE join-time-ordered render list
+    // so that camera on/off toggling changes WHAT renders in a grid cell (live
+    // video vs placeholder) but NOT WHERE in the grid the peer appears. Before
+    // this unification the three groups were rendered sequentially (decoded,
+    // then avatar, then camera-off), causing tiles to jump between groups when a
+    // peer toggled their camera.
+    // Unified render list: all tiles in join-time order regardless of camera
+    // state. The normal grid only renders when `!has_screen_share`; screen-share
+    // mode uses `ss_unified_tiles` instead.
+    let unified_tiles: Vec<(String, TileRenderMode)> = {
+        let join_map = peer_join_time.read();
+        build_unified_render_list(&visible_tiles, &avatar_tiles, &camera_off_tiles, &join_map)
+    };
 
     // Build the peer-list sidebar entries keyed by `session_id` so each open
     // browser tab is its own row. `user_id` is carried alongside only for
@@ -6208,133 +6939,147 @@ pub fn AttendantsComponent(
     // The SS panel renders ALL tiles in the DOM (vertical scroll, no +N badge),
     // so the camera-off group is the WHOLE `camera_off_real` set here — there is
     // no displayed-window cap to apply.
-    let (ss_decoded_tiles, ss_avatar_tiles, ss_camera_off_tiles) = if has_screen_share {
-        let mut ss_all: Vec<String> = Vec::with_capacity(camera_on_real.len() + mock_count);
-        ss_all.extend_from_slice(&camera_on_real);
-        ss_all.extend_from_slice(&mock_ids);
-        {
-            let join_map = peer_join_time.read();
-            ss_all.sort_by(|a, b| {
-                let jt_a = join_map.get(a).copied().unwrap_or(0.0);
-                let jt_b = join_map.get(b).copied().unwrap_or(0.0);
-                jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal)
-            });
-        }
-
-        // Base decoded window before user PLAY requests expand it.
-        let ss_base_budget = budget_cap.max(MIN_CAP).min(ss_all.len());
-        // --- SS user-requested decode bucket expansion (issues #1466 / #1286) ---
-        // Mirrors the normal-grid expansion: count the DISTINCT user-requested
-        // peers present in `ss_all` but ranked AT/AFTER `ss_base_budget`, then
-        // expand the decoded window to admit them so they render live rather than
-        // decoded-but-shown-paused. Clamped by the device ceiling (#1286) and the
-        // canvas limit, then by `ss_all.len()` — the SS panel renders ALL tiles
-        // (vertical scroll, no +N badge), so the displayed-window clamp is the
-        // full `ss_all` length, NOT `displayed_tile_count`.
-        let ss_requested_off_budget = {
-            let requested = user_requested_decode.read();
-            if requested.is_empty() {
-                0
-            } else {
-                ss_all
-                    .iter()
-                    .skip(ss_base_budget)
-                    .filter(|tile_id| requested.contains(*tile_id))
-                    .count()
-            }
-        };
-        let ss_budget = expand_decoded_for_requested(
-            ss_base_budget,
-            ss_requested_off_budget,
-            device_decode_ceiling,
-            CANVAS_LIMIT,
-        )
-        .min(ss_all.len());
-
-        // Promote active speakers into the (possibly expanded) decoded window.
-        {
-            let speech_map = peer_speech_priority.read();
-            let join_map = peer_join_time.read();
-            promote_speakers(
-                &mut ss_all,
-                ss_budget,
-                &speech_map,
-                &join_map,
-                now_ms,
-                SPEAKER_ACTIVE_MS,
-            );
-        }
-
-        // --- SS pin-swap (mirrors the normal grid's pin-swap at lines above) ---
-        // If the pinned peer is ranked beyond `ss_budget`, swap it into the
-        // last decoded slot so it renders with live video instead of avatar.
-        // The SS panel renders ALL tiles (no +N badge), so this swap always lands
-        // the pin in `ss_decoded_tiles` → `decoded_bucket`, so phase 3's #1489
-        // intersection admits it. Without the swap a pinned off-budget SS peer
-        // would render as avatar despite being decoded (wasted decode +
-        // misleading UI).
-        if ss_budget > 0 && ss_budget < ss_all.len() {
-            if let Some(pinned_user_id) = pinned_peer_id.peek().as_deref() {
-                let pinned_idx = ss_all.iter().position(|tile_id| {
-                    client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
+    let (ss_decoded_tiles, ss_avatar_tiles, _ss_camera_off_tiles, ss_unified_tiles) =
+        if has_screen_share {
+            let mut ss_all: Vec<String> = Vec::with_capacity(camera_on_real.len() + mock_count);
+            ss_all.extend_from_slice(&camera_on_real);
+            ss_all.extend_from_slice(&mock_ids);
+            {
+                let join_map = peer_join_time.read();
+                ss_all.sort_by(|a, b| {
+                    let jt_a = join_map.get(a).copied().unwrap_or(0.0);
+                    let jt_b = join_map.get(b).copied().unwrap_or(0.0);
+                    jt_a.partial_cmp(&jt_b).unwrap_or(std::cmp::Ordering::Equal)
                 });
-                if let Some(idx) = pinned_idx {
-                    if idx >= ss_budget {
-                        ss_all.swap(ss_budget - 1, idx);
+            }
+
+            // Base decoded window before user PLAY requests expand it.
+            let ss_base_budget = budget_cap.max(MIN_CAP).min(ss_all.len());
+            // --- SS user-requested decode bucket expansion (issues #1466 / #1286) ---
+            // Mirrors the normal-grid expansion: count the DISTINCT user-requested
+            // peers present in `ss_all` but ranked AT/AFTER `ss_base_budget`, then
+            // expand the decoded window to admit them so they render live rather than
+            // decoded-but-shown-paused. Clamped by the device ceiling (#1286) and the
+            // canvas limit, then by `ss_all.len()` — the SS panel renders ALL tiles
+            // (vertical scroll, no +N badge), so the displayed-window clamp is the
+            // full `ss_all` length, NOT `displayed_tile_count`.
+            let ss_requested_off_budget = {
+                let requested = user_requested_decode.read();
+                if requested.is_empty() {
+                    0
+                } else {
+                    ss_all
+                        .iter()
+                        .skip(ss_base_budget)
+                        .filter(|tile_id| requested.contains(*tile_id))
+                        .count()
+                }
+            };
+            let ss_budget = expand_decoded_for_requested(
+                ss_base_budget,
+                ss_requested_off_budget,
+                device_decode_ceiling,
+                CANVAS_LIMIT,
+            )
+            .min(ss_all.len());
+
+            // Promote active speakers into the (possibly expanded) decoded window.
+            {
+                let speech_map = peer_speech_priority.read();
+                let join_map = peer_join_time.read();
+                promote_speakers(
+                    &mut ss_all,
+                    ss_budget,
+                    &speech_map,
+                    &join_map,
+                    now_ms,
+                    SPEAKER_ACTIVE_MS,
+                );
+            }
+
+            // --- SS pin-swap (mirrors the normal grid's pin-swap at lines above) ---
+            // If the pinned peer is ranked beyond `ss_budget`, swap it into the
+            // last decoded slot so it renders with live video instead of avatar.
+            // The SS panel renders ALL tiles (no +N badge), so this swap always lands
+            // the pin in `ss_decoded_tiles` → `decoded_bucket`, so phase 3's #1489
+            // intersection admits it. Without the swap a pinned off-budget SS peer
+            // would render as avatar despite being decoded (wasted decode +
+            // misleading UI).
+            if ss_budget > 0 && ss_budget < ss_all.len() {
+                if let Some(pinned_user_id) =
+                    pinned_peer_id.peek().as_ref().map(|p| p.user_id.as_str())
+                {
+                    let pinned_idx = ss_all.iter().position(|tile_id| {
+                        client.get_peer_user_id(tile_id).as_deref() == Some(pinned_user_id)
+                    });
+                    if let Some(idx) = pinned_idx {
+                        if idx >= ss_budget {
+                            ss_all.swap(ss_budget - 1, idx);
+                        }
                     }
                 }
             }
-        }
 
-        // --- SS user-requested decode promotion (issue #1466 / #1286) ---
-        // Mirrors the normal-grid user-requested promotion: `ss_budget` was just
-        // EXPANDED above to admit the PLAY requests, so the decoded window has
-        // room for them. Any requested peer still ranked beyond `ss_budget` is
-        // swapped into a DISTINCT decoded slot (cursor walking down from
-        // `ss_budget - 1`, skipping the pinned slot) so render agrees with the
-        // phase-4 decode set. Same distinct-slot discipline so multiple requested
-        // peers never overwrite each other or the pinned peer. Requests the
-        // expansion could NOT admit (beyond the device ceiling #1286) have no
-        // slot, correctly stay paused avatars, and are kept OUT of
-        // `active_decode_set` by the decoded-bucket-intersecting phase-4 merge.
-        {
-            let requested = user_requested_decode.read();
-            // Resolve the pinned peer's post-swap decoded slot (needs `client`, not
-            // host-testable) and pass it into the shared pure helper. The SS panel renders ALL
-            // tiles (vertical scroll, no +N badge), so `displayed_tile_count = ss_all.len()` —
-            // every off-budget tile is renderable, so the helper's true-overflow bound (#1470)
-            // never excludes an SS peer, preserving the prior inline-loop behaviour.
-            // `ss_budget < ss_all.len()` mirrors the helper's own early-return bound, so we skip
-            // the `get_peer_user_id` scan in the budget-covers-all-tiles case (where the helper
-            // does nothing anyway).
-            let pinned_slot: Option<usize> =
-                if ss_budget > 0 && ss_budget < ss_all.len() && !requested.is_empty() {
-                    pinned_peer_id.peek().as_deref().and_then(|pu| {
-                        ss_all.iter().take(ss_budget).position(|tile_id| {
-                            client.get_peer_user_id(tile_id).as_deref() == Some(pu)
-                        })
-                    })
-                } else {
-                    None
-                };
-            let ss_displayed = ss_all.len();
-            promote_requested_into_decoded(
-                &mut ss_all,
-                ss_budget,
-                ss_displayed,
-                &requested,
-                pinned_slot,
-            );
-        }
+            // --- SS user-requested decode promotion (issue #1466 / #1286) ---
+            // Mirrors the normal-grid user-requested promotion: `ss_budget` was just
+            // EXPANDED above to admit the PLAY requests, so the decoded window has
+            // room for them. Any requested peer still ranked beyond `ss_budget` is
+            // swapped into a DISTINCT decoded slot (cursor walking down from
+            // `ss_budget - 1`, skipping the pinned slot) so render agrees with the
+            // phase-4 decode set. Same distinct-slot discipline so multiple requested
+            // peers never overwrite each other or the pinned peer. Requests the
+            // expansion could NOT admit (beyond the device ceiling #1286) have no
+            // slot, correctly stay paused avatars, and are kept OUT of
+            // `active_decode_set` by the decoded-bucket-intersecting phase-4 merge.
+            {
+                let requested = user_requested_decode.read();
+                // Resolve the pinned peer's post-swap decoded slot (needs `client`, not
+                // host-testable) and pass it into the shared pure helper. The SS panel renders ALL
+                // tiles (vertical scroll, no +N badge), so `displayed_tile_count = ss_all.len()` —
+                // every off-budget tile is renderable, so the helper's true-overflow bound (#1470)
+                // never excludes an SS peer, preserving the prior inline-loop behaviour.
+                // `ss_budget < ss_all.len()` mirrors the helper's own early-return bound, so we skip
+                // the `get_peer_user_id` scan in the budget-covers-all-tiles case (where the helper
+                // does nothing anyway).
+                let pinned_slot: Option<usize> =
+                    if ss_budget > 0 && ss_budget < ss_all.len() && !requested.is_empty() {
+                        pinned_peer_id
+                            .peek()
+                            .as_ref()
+                            .map(|p| p.user_id.as_str())
+                            .and_then(|pu| {
+                                ss_all.iter().take(ss_budget).position(|tile_id| {
+                                    client.get_peer_user_id(tile_id).as_deref() == Some(pu)
+                                })
+                            })
+                    } else {
+                        None
+                    };
+                let ss_displayed = ss_all.len();
+                promote_requested_into_decoded(
+                    &mut ss_all,
+                    ss_budget,
+                    ss_displayed,
+                    &requested,
+                    pinned_slot,
+                );
+            }
 
-        // Split: first ss_budget tiles get video decode, rest get avatars.
-        let decoded: Vec<String> = ss_all.iter().take(ss_budget).cloned().collect();
-        let avatars: Vec<String> = ss_all.iter().skip(ss_budget).cloned().collect();
-        // Camera-off peers (issue #1465): plain avatars, never dashed/budgeted.
-        (decoded, avatars, camera_off_real.clone())
-    } else {
-        (Vec::new(), Vec::new(), Vec::new())
-    };
+            // Split: first ss_budget tiles get video decode, rest get avatars.
+            let decoded: Vec<String> = ss_all.iter().take(ss_budget).cloned().collect();
+            let avatars: Vec<String> = ss_all.iter().skip(ss_budget).cloned().collect();
+            // Camera-off peers (issue #1465): plain avatars, never dashed/budgeted.
+            let off = camera_off_real.clone();
+            // Unified join-time-ordered render list for the SS right panel so that
+            // camera toggling does not reorder tiles.
+            let unified = {
+                let join_map = peer_join_time.read();
+                build_unified_render_list(&decoded, &avatars, &off, &join_map)
+            };
+            (decoded, avatars, off, unified)
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
 
     // ORDERING INVARIANT: the active decode set is built in 4 phases:
     //   1. Visible layout peers (here)
@@ -6394,12 +7139,17 @@ pub fn AttendantsComponent(
     let container_style = if has_screen_share {
         // Screen-share panel on the left, participant panel on the right (ratio draggable 0.3–0.85).
         // The container is full-bleed; the overlay drawers float over it without reflowing it.
-        "position: absolute; left: 0; right: 0; top: 0; bottom: 0; height: 100%; \
-         display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
-         padding: 16px 16px 80px 16px; \
-         align-items: stretch; box-sizing: border-box; \
-         grid-template-columns: none; grid-template-rows: none;"
-            .to_string()
+        // The status bar reserve is folded into the top padding on the SAME
+        // condition as the grid path, so the share/participant panels never sit
+        // under the bar while recording is active. 16px is the base top padding.
+        let ss_pad_top = 16.0 + status_bar_reserve;
+        format!(
+            "position: absolute; left: 0; right: 0; top: 0; bottom: 0; height: 100%; \
+             display: flex; flex-direction: row; flex-wrap: nowrap; gap: 10px; \
+             padding: {ss_pad_top:.0}px 16px 80px 16px; \
+             align-items: stretch; box-sizing: border-box; \
+             grid-template-columns: none; grid-template-rows: none;"
+        )
     } else {
         // Google Meet–style grid: reuse vw/vh/gap/avail computed above.
         // Explicitly reset all flex properties so the transition from
@@ -6445,7 +7195,8 @@ pub fn AttendantsComponent(
              height: 100%; \
              grid-template-columns: {track_cols}; grid-template-rows: {track_rows}; \
              {pack} \
-             --tile-w: {tw:.0}px; --tile-h: {th:.0}px;"
+             --tile-w: {tw:.0}px; --tile-h: {th:.0}px; \
+             --status-bar-reserve: {status_bar_reserve:.0}px;"
         )
     };
 
@@ -6467,11 +7218,21 @@ pub fn AttendantsComponent(
     // and stall for a keyframe), and add `share-detached` so CSS hides the share
     // pane OFF-SCREEN (canvas stays composited) and expands the peer grid to full.
     let share_detached = has_screen_share && detached_share_signal.read().is_some();
-    let container_class = match (has_screen_share, share_detached) {
+    let mut container_class = match (has_screen_share, share_detached) {
         (true, true) => format!("participants-{tile_count} has-screen-share share-detached"),
         (true, false) => format!("participants-{tile_count} has-screen-share"),
         (false, _) => format!("participants-{tile_count}"),
     };
+    // While the meeting-wide status bar is mounted, tag the grid so CSS can inset
+    // the ONE tile type that escapes the grid `pad_top`: the `position: fixed`
+    // `.grid-item.full-bleed` single-remote-peer tile (the 2-participant case).
+    // In-flow multi-tile layouts are already handled by the `pad_top` reserve
+    // above; only the fixed full-bleed tile needs the CSS top inset (it reads the
+    // `--status-bar-reserve` px value set in `container_style`). Empty when idle,
+    // so the tile expands back to the full viewport the moment the bar unmounts.
+    if status_bar_reserve > 0.0 {
+        container_class.push_str(" status-bar-active");
+    }
 
     let meeting_link = {
         let origin = window().location().origin().unwrap_or_default();
@@ -6503,6 +7264,7 @@ pub fn AttendantsComponent(
                             admitted_can_admit_toggle,
                             end_on_host_leave_toggle,
                             allow_guests_toggle,
+                            recording_allowed_for_all_toggle,
                             saving,
                             toggle_error,
                             connection_error,
@@ -6653,15 +7415,25 @@ pub fn AttendantsComponent(
         }
     }
 
-    // Clear stale pin: if the pinned peer left the meeting, reset to None so
-    // that is_speaking_suppressed() no longer suppresses glow for everyone.
+    // Clear stale pin: if the pinned peer GENUINELY left the meeting, reset to
+    // None so is_speaking_suppressed() no longer suppresses glow for everyone (and
+    // the reactive maximize releases).
+    //
+    // Authoritative presence (issue #1172): `peer_user_id_present` answers
+    // present/absent/unread inside ONE `inner` borrow. The previous
+    // `display_peers.iter().any(get_peer_user_id == pid)` form collapsed to
+    // "absent" whenever EITHER `sorted_peer_keys()` (→ empty Vec) OR
+    // `get_peer_user_id()` (→ None) hit a momentarily-busy borrow — so a render
+    // that coincided with a decode/audio mutable borrow un-pinned a peer who
+    // never left. A speaking pinned peer maximizes that risk (more audio =>
+    // more borrows, more renders). We now clear ONLY on a CONFIRMED absence and
+    // HOLD on an unread tick.
     {
         let current_pinned = pinned_peer_id();
-        if let Some(ref pid) = current_pinned {
-            let still_exists = display_peers
-                .iter()
-                .any(|peer_id| client.get_peer_user_id(peer_id).as_deref() == Some(pid));
-            if !still_exists {
+        if let Some(ref pin) = current_pinned {
+            let pid = pin.user_id.as_str();
+            let present = client.peer_user_id_present(pid);
+            if should_clear_stale_pin(Some(pid), present) {
                 pinned_peer_id.set(None);
             }
         }
@@ -6680,7 +7452,7 @@ pub fn AttendantsComponent(
     // not `visible_tiles`/`ss_decoded_tiles`) so it is intentionally excluded —
     // it has no video to decode and its audio is independent of this set.
     let current_pinned = pinned_peer_id();
-    if let Some(pinned_user_id) = current_pinned.as_deref() {
+    if let Some(pinned_user_id) = current_pinned.as_ref().map(|p| p.user_id.as_str()) {
         if let Some(pinned_session_id) = display_peers
             .iter()
             .find(|peer_id| client.get_peer_user_id(peer_id).as_deref() == Some(pinned_user_id))
@@ -6779,12 +7551,16 @@ pub fn AttendantsComponent(
         use videocall_client::TileHint;
         // The pinned peer is held by USER_ID; resolve it to the session_id present
         // in `active_decode_set` so the (Uncapped) pin exemption matches a real peer.
-        let pinned_session: Option<u64> = pinned_peer_id.peek().as_deref().and_then(|pu| {
-            active_decode_set
-                .iter()
-                .copied()
-                .find(|sid| client.get_peer_user_id(&sid.to_string()).as_deref() == Some(pu))
-        });
+        let pinned_session: Option<u64> = pinned_peer_id
+            .peek()
+            .as_ref()
+            .map(|p| p.user_id.as_str())
+            .and_then(|pu| {
+                active_decode_set
+                    .iter()
+                    .copied()
+                    .find(|sid| client.get_peer_user_id(&sid.to_string()).as_deref() == Some(pu))
+            });
         // `active_screen_sharer` is a SESSION_ID string (it comes from the
         // session-id-keyed `screen_share_stack`).
         let screen_session: Option<u64> = active_screen_sharer
@@ -6823,17 +7599,25 @@ pub fn AttendantsComponent(
 
     let toggle_pin = {
         let client = client.clone();
-        move |pid: String| {
-            // pid is already a user_id from canvas_generator.rs.
+        move |target: PinnedTile| {
+            // target.user_id is already a user_id from canvas_generator.rs.
             // Keep normalization defensive in case a session_id is passed in the future.
-            let normalized = client.get_peer_user_id(&pid).unwrap_or_else(|| pid.clone());
+            let normalized = PinnedTile {
+                user_id: client
+                    .get_peer_user_id(&target.user_id)
+                    .unwrap_or(target.user_id),
+                kind: target.kind,
+            };
 
+            // Clicking the SAME (peer, tile-kind) that is already pinned releases
+            // the pin; clicking a DIFFERENT one — including the SAME peer's OTHER
+            // tile-kind (e.g. their screen while their camera is pinned) — SWITCHES
+            // the spotlight to it. See `next_pin_target` for the reducer semantics:
+            // equality includes `kind`, so pinning the camera while the screen is
+            // pinned un-maximizes the screen and maximizes the camera.
             let cur = pinned_peer_id();
-            if cur.as_deref() == Some(normalized.as_str()) {
-                pinned_peer_id.set(None);
-            } else {
-                pinned_peer_id.set(Some(normalized));
-            }
+            let next = next_pin_target(cur.as_ref(), normalized);
+            pinned_peer_id.set(next);
         }
     };
 
@@ -6856,6 +7640,67 @@ pub fn AttendantsComponent(
             }
         });
 
+    // Issue 1884: activate a reaction from the palette (mouse click or
+    // keyboard Enter/Space). The palette STAYS OPEN after a click so the user
+    // can fire several reactions in a row; it auto-hides
+    // ~REACTION_PALETTE_AUTOHIDE_MS after the LATEST click (Escape /
+    // outside-click / the X close it immediately). EVERY activation shows ~150ms
+    // of pressed feedback on the chosen option AND (re)arms the auto-hide timer
+    // — INCLUDING an over-budget click, which the send self-throttle turns into
+    // a silent no-op (no wire packet, no echo) but which still gets the pressed
+    // feedback and keeps the window alive (the user is engaged). An allowed send
+    // fires the wire packet AND pushes the local "You" echo, because the relay
+    // self-skips the sender (the UI must render its own reaction rather than
+    // wait for it to come back over the wire).
+    let send_reaction: EventHandler<ReactionType> = {
+        let client = client.clone();
+        let reaction_throttle = reaction_throttle.clone();
+        let reaction_id_counter = reaction_id_counter.clone();
+        let reaction_autohide_gen = reaction_autohide_gen.clone();
+        let reaction_last_press = reaction_last_press.clone();
+        EventHandler::new(move |reaction: ReactionType| {
+            let now = js_sys::Date::now();
+            // Local press gate (perf, approved deviation): a held Enter/Space on
+            // a focused option key-repeats at 20-30/s; without this each repeat
+            // would set reaction_pressed twice + re-arm, i.e. ~2 whole-component
+            // re-renders per repeat. Coalesce anything within the ~150ms pressed
+            // window — skip BEFORE any signal write (no pressed render, no
+            // re-arm, no send). A repeat this fast is throttle-rejected anyway,
+            // so nothing user-visible is lost; intentional clicking (>=150ms
+            // apart) is unaffected.
+            if now - reaction_last_press.get() < 150.0 {
+                return;
+            }
+            reaction_last_press.set(now);
+            reaction_pressed.set(Some(reaction));
+            let allowed = reaction_throttle.borrow_mut().try_acquire(now);
+            if allowed {
+                client.send_reaction(reaction);
+                if let Some((emoji, _label, _slug)) = reaction_glyph(reaction) {
+                    push_reaction_float(
+                        active_reactions,
+                        &reaction_id_counter,
+                        u64::MAX,
+                        emoji.to_string(),
+                        "You".to_string(),
+                    );
+                }
+            }
+            // (Re)arm the auto-hide window on every click (throttled or not), so
+            // sequential reactions keep the palette open.
+            arm_reaction_autohide(reactions_open, &reaction_autohide_gen);
+            // Clear the ~150ms pressed feedback WITHOUT closing (the palette
+            // stays open now). try_write: this can fire after unmount, where a
+            // plain set() would panic on the dropped signal.
+            Timeout::new(150, move || {
+                if let Ok(mut pressed) = reaction_pressed.try_write() {
+                    *pressed = None;
+                }
+            })
+            .forget();
+        })
+    };
+
     rsx! {
         div {
             // Provide MeetingTime context
@@ -6865,6 +7710,7 @@ pub fn AttendantsComponent(
                 onclick: move |evt: MouseEvent| {
                     dock_menu_open.set(false);
                     density_open.set(false);
+                    reactions_open.set(false);
                     mock_peers_open.set(false);
                     overflow_menu_open.set(false);
                     // Background (video-grid) clicks also light-dismiss the open
@@ -6892,11 +7738,6 @@ pub fn AttendantsComponent(
                     // the peer list (issue #1790). The `else if` chain guarantees
                     // each Escape closes EXACTLY one surface. The dock menu keeps its
                     // own Esc handler (with stop_propagation).
-                    //
-                    // The chat drawer is DELIBERATELY excluded from this
-                    // light-dismiss: its message composer means a stray background
-                    // Escape must not risk discarding an in-progress draft. That is
-                    // out of issue-1790 scope.
                     let key = evt.key();
                     if key == Key::Escape {
                         if overflow_menu_open() {
@@ -6909,6 +7750,14 @@ pub fn AttendantsComponent(
                             evt.prevent_default();
                             density_open.set(false);
                             focus_element_by_id("density-mode-trigger");
+                        } else if reactions_open() {
+                            // Issue 1884: the reactions palette is a density-tier
+                            // popover, so Escape peels it before the side panels
+                            // and restores focus to its action-bar trigger.
+                            evt.stop_propagation();
+                            evt.prevent_default();
+                            reactions_open.set(false);
+                            focus_element_by_id("reactions-trigger");
                         } else if mock_peers_open() {
                             evt.stop_propagation();
                             evt.prevent_default();
@@ -6942,14 +7791,95 @@ pub fn AttendantsComponent(
                 },
                 BrowserCompatibility {}
 
+                // Meeting-wide status bar (Google-Meet style). A general-purpose,
+                // in-flow horizontal strip anchored ABOVE the tile grid — it does
+                // not float over tiles. While mounted it reserves `pad_top` space
+                // (see `status_bar_reserve` above) so its contents never overlap
+                // tile chrome such as the per-tile `.floating-name` label. Today it
+                // hosts a single item — the meeting-wide recording status — but is
+                // structured so future meeting-level statuses can be appended as
+                // sibling `.meeting-status-item`s.
+                //
+                // Presence is driven by the `any_session_recording` aggregate over
+                // the session-keyed recording set: it appears on the first
+                // recorder's start, is unaffected by additional concurrent
+                // recorders starting/stopping, and the WHOLE bar unmounts (collapsing
+                // its reserved height back into the tile area) only when the LAST
+                // recorder stops or its session leaves. Deliberately does NOT carry
+                // the `.peer-toast` class: that class auto-fades via `toast-exit ...
+                // 7.5s forwards`, which would silently hide it after ~8s even while
+                // recording continues. It has an entrance animation only.
+                if any_recording_active() {
+                    div { class: "meeting-status-bar",
+                        div {
+                            class: "meeting-status-item meeting-status-item--recording",
+                            role: "status",
+                            aria_live: "polite",
+                            aria_label: "This meeting is being recorded",
+                            title: "This meeting is being recorded",
+                            span { class: "rec-dot" }
+                            span { class: "meeting-status-item-label", "Recording" }
+                        }
+                    }
+                }
+
+                // Issue 1884: floating reactions overlay + SR live region, in a
+                // scoped child so an incoming reaction re-renders only its ~15
+                // nodes — NOT this ~8,900-line RSX and every keyed PeerTile
+                // (#1296 blast radius, perf review). The signals are only PASSED
+                // here (a copy that does not subscribe); the child reads them.
+                ReactionsOverlay { active_reactions, reaction_announcement }
+
                 // "participant joined/left" toast notifications
                 if !peer_toasts().is_empty()
                     || show_muted_toast()
                     || show_video_off_toast()
                     || host_change_toast().is_some()
                     || screen_share_toast_state().is_some()
+                    || !matches!(record_state(), RecordButtonState::Idle)
+                    || recording_saved_toast()
                 {
                     div { class: "peer-toasts",
+                        // Local recording status banner — visible only to the participant who started recording.
+                        {
+                            let label = match record_state() {
+                                RecordButtonState::Activating => Some("Starting recording…"),
+                                RecordButtonState::Recording => Some("Recording"),
+                                RecordButtonState::Stopping => Some("Stopping recording…"),
+                                RecordButtonState::Saving => Some("Saving recording…"),
+                                RecordButtonState::Idle => None,
+                            };
+                            if let Some(msg) = label {
+                                rsx! {
+                                    div {
+                                        class: "peer-toast recording-status-banner",
+                                        role: "status",
+                                        aria_live: "polite",
+                                        aria_label: "{msg}",
+                                        span { class: "rec-dot" }
+                                        span { class: "toast-text",
+                                            span { class: "toast-name", "{msg}" }
+                                        }
+                                    }
+                                }
+                            } else {
+                                rsx! {}
+                            }
+                        }
+                        // Recording-saved notification — shown briefly to the recorder when recording completes.
+                        if recording_saved_toast() {
+                            div {
+                                class: "peer-toast recording-saved-banner",
+                                role: "status",
+                                aria_live: "polite",
+                                aria_label: "Recording saved",
+                                span { class: "rec-dot" }
+                                span { class: "toast-text",
+                                    span { class: "toast-name", "Recording saved" }
+                                }
+                            }
+                        }
+
                         // Screen-share visibility toast (HCL issue 893). @token-exempt
                         // Rendered first so it sits above other transient toasts.
                         {
@@ -7345,62 +8275,29 @@ pub fn AttendantsComponent(
                                     },
                                 }
                                 // Right panel — CSS grid via auto-fill (see .ss-peer-panel in style.css).
+                                // Single unified loop sorted by join time so camera
+                                // toggling does not reorder tiles in the SS panel.
                                 div {
                                     class: "ss-peer-panel",
                                     style: "width: {right_pct:.2}%;",
-                                    // Decoded tiles — live video canvas
-                                    for tile_id in ss_decoded_tiles.iter() {
+                                    for (tile_id, tile_render_mode) in ss_unified_tiles.iter() {
                                         {
                                             let is_mock = tile_id.starts_with("mock-");
+                                            let force_avatar = *tile_render_mode == TileRenderMode::Avatar;
                                             if is_mock {
                                                 rsx! {
                                                     PeerTile {
                                                         key: "tile-{tile_id}",
                                                         peer_id: tile_id.clone(),
                                                         full_bleed: false,
+                                                        force_avatar,
                                                         host_user_id: host_user_id.clone(),
                                                         render_mode: TileMode::VideoOnly,
                                                         my_session_id: my_session_id.clone(),
-                                                        on_toggle_pin: move |_: String| {},
+                                                        on_toggle_pin: move |_: PinnedTile| {},
                                                     }
                                                 }
-                                            } else {
-                                                rsx! {
-                                                    PeerTile {
-                                                        key: "tile-{tile_id}",
-                                                        peer_id: tile_id.clone(),
-                                                        full_bleed: false,
-                                                        host_user_id: host_user_id.clone(),
-                                                        render_mode: TileMode::VideoOnly,
-                                                        my_session_id: my_session_id.clone(),
-                                                        pinned_peer_id: current_pinned.clone(),
-                                                        on_toggle_pin: toggle_pin.clone(),
-                                                        room_id: Some(id.clone()),
-                                                        is_current_user_host: is_owner,
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    // Off-budget avatar tiles — rendered in DOM
-                                    // but no video decode (force_avatar: true).
-                                    for tile_id in ss_avatar_tiles.iter() {
-                                        {
-                                            let is_mock = tile_id.starts_with("mock-");
-                                            if is_mock {
-                                                rsx! {
-                                                    PeerTile {
-                                                        key: "tile-{tile_id}",
-                                                        peer_id: tile_id.clone(),
-                                                        full_bleed: false,
-                                                        force_avatar: true,
-                                                        host_user_id: host_user_id.clone(),
-                                                        render_mode: TileMode::VideoOnly,
-                                                        my_session_id: my_session_id.clone(),
-                                                        on_toggle_pin: move |_: String| {},
-                                                    }
-                                                }
-                                            } else {
+                                            } else if force_avatar {
                                                 rsx! {
                                                     PeerTile {
                                                         key: "tile-{tile_id}",
@@ -7418,56 +8315,75 @@ pub fn AttendantsComponent(
                                                         is_current_user_host: is_owner,
                                                     }
                                                 }
+                                            } else {
+                                                rsx! {
+                                                    PeerTile {
+                                                        key: "tile-{tile_id}",
+                                                        peer_id: tile_id.clone(),
+                                                        full_bleed: false,
+                                                        host_user_id: host_user_id.clone(),
+                                                        render_mode: TileMode::VideoOnly,
+                                                        my_session_id: my_session_id.clone(),
+                                                        pinned_peer_id: current_pinned.clone(),
+                                                        on_toggle_pin: toggle_pin.clone(),
+                                                        room_id: Some(id.clone()),
+                                                        is_current_user_host: is_owner,
+                                                    }
+                                                }
                                             }
-                                        }
-                                    }
-                                    // Camera-off peers (issue #1465): real peers
-                                    // with no video to decode. Rendered as PLAIN
-                                    // avatars (no `force_avatar` → no dashed
-                                    // off-budget outline). Always the real-peer
-                                    // arm — these are never mocks.
-                                    for tile_id in ss_camera_off_tiles.iter() {
-                                        PeerTile {
-                                            key: "tile-{tile_id}",
-                                            peer_id: tile_id.clone(),
-                                            full_bleed: false,
-                                            host_user_id: host_user_id.clone(),
-                                            render_mode: TileMode::VideoOnly,
-                                            my_session_id: my_session_id.clone(),
-                                            pinned_peer_id: current_pinned.clone(),
-                                            on_toggle_pin: toggle_pin.clone(),
-                                            room_id: Some(id.clone()),
-                                            is_current_user_host: is_owner,
                                         }
                                     }
                                 }
                             }
                         }
                     } else {
-                        // ---- Normal grid layout ----
-                        for tile_id in visible_tiles.iter() {
+                        // ---- Normal grid layout (unified join-time order) ----
+                        // Single render loop over ALL tile buckets merged by join
+                        // time. Camera on/off determines WHAT renders (live video,
+                        // avatar, or camera-off placeholder) but NOT WHERE in the
+                        // grid the tile sits — toggling a camera never reorders tiles.
+                        for (tile_id, tile_render_mode) in unified_tiles.iter() {
                             {
                                 let is_mock = tile_id.starts_with("mock-");
-                                // Full-bleed only when this is the single tile on
-                                // screen across ALL render groups (issues #1465,
-                                // #508) — see `sole_real_tile` above. Was keyed
-                                // off `visible_tile_count == 1`, which the #1465
-                                // camera-off split made unsafe.
                                 let full_bleed = !is_mock
                                     && sole_real_tile
                                     && !client.is_screen_share_enabled_for_peer(tile_id);
+                                let force_avatar = *tile_render_mode == TileRenderMode::Avatar;
                                 if is_mock {
                                     rsx! {
                                         PeerTile {
                                             key: "tile-{tile_id}",
                                             peer_id: tile_id.clone(),
                                             full_bleed: false,
+                                            force_avatar,
                                             host_user_id: host_user_id.clone(),
                                             my_session_id: my_session_id.clone(),
-                                            on_toggle_pin: move |_: String| {},
+                                            on_toggle_pin: move |_: PinnedTile| {},
+                                        }
+                                    }
+                                } else if force_avatar {
+                                    // Off-budget avatar tile (issue #987): camera-on
+                                    // peer beyond the decode budget. Dashed outline,
+                                    // PLAY button to force-decode (#1466).
+                                    rsx! {
+                                        PeerTile {
+                                            key: "tile-{tile_id}",
+                                            peer_id: tile_id.clone(),
+                                            full_bleed: false,
+                                            force_avatar: true,
+                                            host_user_id: host_user_id.clone(),
+                                            my_session_id: my_session_id.clone(),
+                                            pinned_peer_id: current_pinned.clone(),
+                                            on_toggle_pin: toggle_pin.clone(),
+                                            on_request_decode: toggle_request_decode,
+                                            room_id: Some(id.clone()),
+                                            is_current_user_host: is_owner,
                                         }
                                     }
                                 } else {
+                                    // Decoded tile (live video) or camera-off tile
+                                    // (plain avatar, no dashed outline). Both render
+                                    // without `force_avatar`.
                                     rsx! {
                                         PeerTile {
                                             key: "tile-{tile_id}",
@@ -7480,94 +8396,6 @@ pub fn AttendantsComponent(
                                             room_id: Some(id.clone()),
                                             is_current_user_host: is_owner,
                                         }
-                                    }
-                                }
-                            }
-                        }
-
-                        // ---- Off-budget avatar tiles (issue #987, task 1a.4) ----
-                        // Peers the layout could show but the decode-budget cap
-                        // excluded from video decode. They render via the SAME
-                        // `PeerTile` component with `force_avatar: true`, so they
-                        // show the avatar/initials placeholder (no canvas, no
-                        // decode) while keeping name, mic state and host controls.
-                        // They are NOT in `active_decode_set` (it is built from
-                        // `visible_tiles` only), but their audio is untouched.
-                        // `avatar_tiles` is empty unless a budget cap is active,
-                        // so this loop is a no-op on the default path.
-                        for tile_id in avatar_tiles.iter() {
-                            {
-                                let is_mock = tile_id.starts_with("mock-");
-                                if is_mock {
-                                    rsx! {
-                                        PeerTile {
-                                            key: "tile-{tile_id}",
-                                            peer_id: tile_id.clone(),
-                                            full_bleed: false,
-                                            force_avatar: true,
-                                            host_user_id: host_user_id.clone(),
-                                            my_session_id: my_session_id.clone(),
-                                            on_toggle_pin: move |_: String| {},
-                                        }
-                                    }
-                                } else {
-                                    rsx! {
-                                        PeerTile {
-                                            key: "tile-{tile_id}",
-                                            peer_id: tile_id.clone(),
-                                            full_bleed: false,
-                                            force_avatar: true,
-                                            host_user_id: host_user_id.clone(),
-                                            my_session_id: my_session_id.clone(),
-                                            pinned_peer_id: current_pinned.clone(),
-                                            on_toggle_pin: toggle_pin.clone(),
-                                            // Issue #1466: PLAY button force-decodes this off-budget peer.
-                                            on_request_decode: toggle_request_decode,
-                                            room_id: Some(id.clone()),
-                                            is_current_user_host: is_owner,
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // ---- Camera-off peers (issue #1465) ----
-                        // Real peers with no video to decode. They occupy the
-                        // remaining displayed grid cells (after camera-on +
-                        // avatar tiles) and render as PLAIN avatars — NO
-                        // `force_avatar`, so NO dashed off-budget outline (the
-                        // #1465 fix: a cameraless peer is not "paused", it has
-                        // nothing to shed). Capped to `off_to_render` so any
-                        // camera-off peers in the overflow region stay folded
-                        // into the +N badge and the rendered tile count still
-                        // equals `tile_count` (see proof above). Always the
-                        // real-peer arm — these are never mocks.
-                        //
-                        // Full-bleed (issues #1465, #508): a lone camera-off
-                        // remote peer renders full-bleed — the "Camera Off"
-                        // placeholder fills the tile, matching the pre-#1465
-                        // single-peer presentation (canvas_generator renders this
-                        // correctly with no change). `sole_real_tile` guarantees
-                        // there is no other decoded / avatar / camera-off tile, so
-                        // this rule and the visible_tiles rule can never both
-                        // believe their tile is alone. These entries are never
-                        // mocks, so the `!is_mock` guard the visible rule carries
-                        // is unconditionally true here and omitted.
-                        for tile_id in camera_off_tiles.iter() {
-                            {
-                                let full_bleed = sole_real_tile
-                                    && !client.is_screen_share_enabled_for_peer(tile_id);
-                                rsx! {
-                                    PeerTile {
-                                        key: "tile-{tile_id}",
-                                        peer_id: tile_id.clone(),
-                                        full_bleed,
-                                        host_user_id: host_user_id.clone(),
-                                        my_session_id: my_session_id.clone(),
-                                        pinned_peer_id: current_pinned.clone(),
-                                        on_toggle_pin: toggle_pin.clone(),
-                                        room_id: Some(id.clone()),
-                                        is_current_user_host: is_owner,
                                     }
                                 }
                             }
@@ -7659,6 +8487,7 @@ pub fn AttendantsComponent(
                             id: "host-controls-nav",
                             class: "host",
                             style: "box-shadow: none; transition: border-color 0.3s ease-out, box-shadow 1.5s ease-out;",
+                            "data-speaking": if local_speaking() { "true" } else { "false" },
                             onmounted: move |evt| {
                                 if let Some(elem) = evt.try_as_web_event() {
                                     host_el.set(Some(elem));
@@ -7805,6 +8634,7 @@ pub fn AttendantsComponent(
                                             ios_device,
                                             has_screen_share,
                                             is_owner,
+                                            record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                         );
                                         let Some(result) = apply_keyboard_reorder(&mut visible_slots, slot, delta, absolute) else { return; };
                                         let len = visible_slots.len();
@@ -7824,6 +8654,7 @@ pub fn AttendantsComponent(
                                             ios_device,
                                             has_screen_share,
                                             is_owner,
+                                            record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                         );
                                         action_bar_slots.set(next);
                                         save_action_bar_layout(&action_bar_slots.read(), &action_bar_hidden.read());
@@ -7879,6 +8710,7 @@ pub fn AttendantsComponent(
                                                 ios_device,
                                                 has_screen_share,
                                                 is_owner,
+                                                record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                             );
                                             let orig_idx = orig_visible.iter().position(|s| *s == dragged).unwrap_or(0);
                                             let num_slots = orig_visible.len();
@@ -7896,6 +8728,7 @@ pub fn AttendantsComponent(
                                                     ios_device,
                                                     has_screen_share,
                                                     is_owner,
+                                                    record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                                 );
                                                 if let Some(cur) = next_visible.iter().position(|s| *s == dragged) {
                                                     next_visible.remove(cur);
@@ -7907,6 +8740,7 @@ pub fn AttendantsComponent(
                                                         ios_device,
                                                         has_screen_share,
                                                         is_owner,
+                                                        record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                                     );
                                                     action_bar_slots.set(next_full);
                                                 }
@@ -8009,6 +8843,7 @@ pub fn AttendantsComponent(
                                         is_ios(),
                                         has_screen_share,
                                         is_owner,
+                                        record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                     ) {
                                         {
                                         let slug = slot.slug();
@@ -8063,6 +8898,7 @@ pub fn AttendantsComponent(
                                                                 is_ios(),
                                                                 has_screen_share,
                                                                 is_owner,
+                                                                record_slot_visible(is_owner, is_guest, recording_allowed_for_all_toggle()),
                                                             );
                                                             let src_idx = src_visible.iter().position(|s| *s == slot).unwrap_or(0);
                                                             dragging_slot.set(Some(slot));
@@ -8282,6 +9118,7 @@ pub fn AttendantsComponent(
                                                                         peer_list_open.set(opening);
                                                                         if opening {
                                                                             density_open.set(false);
+                                                                            reactions_open.set(false);
                                                                             dock_menu_open.set(false);
                                                                             mock_peers_open.set(false);
                                                                         }
@@ -8304,8 +9141,33 @@ pub fn AttendantsComponent(
                                                                             density_highlight.set(density_mode());
                                                                             dock_menu_open.set(false);
                                                                             mock_peers_open.set(false);
+                                                                            reactions_open.set(false);
                                                                         }
                                                                         density_open.set(opening);
+                                                                    },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::Reactions => rsx! {
+                                                                ReactionsButton {
+                                                                    id: "reactions-trigger",
+                                                                    open: reactions_open(),
+                                                                    onclick: move |e: MouseEvent| {
+                                                                        if customize_mode() { return; }
+                                                                        e.stop_propagation();
+                                                                        let opening = !reactions_open();
+                                                                        if opening {
+                                                                            // Seed the keyboard highlight to the
+                                                                            // first option before opening (mirrors
+                                                                            // density) so no stale-highlight flash.
+                                                                            reaction_highlight
+                                                                                .set(ReactionType::THUMBS_UP);
+                                                                            // Close sibling action-bar popovers.
+                                                                            density_open.set(false);
+                                                                            dock_menu_open.set(false);
+                                                                            mock_peers_open.set(false);
+                                                                            overflow_menu_open.set(false);
+                                                                        }
+                                                                        reactions_open.set(opening);
                                                                     },
                                                                 }
                                                             },
@@ -8324,6 +9186,7 @@ pub fn AttendantsComponent(
                                                                         if opening {
                                                                             device_settings_open.set(false);
                                                                             density_open.set(false);
+                                                                            reactions_open.set(false);
                                                                             dock_menu_open.set(false);
                                                                             mock_peers_open.set(false);
                                                                             meeting_options_open.set(false);
@@ -8345,6 +9208,7 @@ pub fn AttendantsComponent(
                                                                             peer_list_open.set(false);
                                                                             diagnostics_open.set(false);
                                                                             density_open.set(false);
+                                                                            reactions_open.set(false);
                                                                             dock_menu_open.set(false);
                                                                             mock_peers_open.set(false);
                                                                             meeting_options_open.set(false);
@@ -8364,10 +9228,113 @@ pub fn AttendantsComponent(
                                                                             peer_list_open.set(false);
                                                                             diagnostics_open.set(false);
                                                                             density_open.set(false);
+                                                                            reactions_open.set(false);
                                                                             dock_menu_open.set(false);
                                                                             mock_peers_open.set(false);
                                                                         }
                                                                     },
+                                                                }
+                                                            },
+                                                            ActionBarSlot::Recording => {
+                                                                // Recording controls (#1746): host / allowed
+                                                                // participants start & stop a client-side
+                                                                // recording. Visibility is gated upstream in
+                                                                // `visible_action_bar_slots` via
+                                                                // `record_slot_visible`, so this arm only
+                                                                // renders when the slot is actually shown.
+                                                                let rec_client = client.clone();
+                                                                let state_cb_clone = state_cb.clone();
+                                                                rsx! {
+                                                                    RecordButton {
+                                                                        state: record_state(),
+                                                                        onclick: move |_| {
+                                                                            if customize_mode() { return; }
+                                                                            match record_state() {
+                                                                                RecordButtonState::Idle => {
+                                                                                    let peer_ids: Vec<String> =
+                                                                                        rec_client.sorted_peer_keys();
+                                                                                    rec_client.prepare_recording_audio_stream();
+                                                                                    rec_client.prepare_recording_peer_canvases();
+                                                                                    // Clone for the async state callback — the onclick
+                                                                                    // closure retains its own handle for the STARTED fan-out below.
+                                                                                    let rec_client_cb = rec_client.clone();
+                                                                                    // Own the LOCAL SESSION id up front so the state callback can
+                                                                                    // add/remove OUR OWN recording icon (mirrors the per-peer set
+                                                                                    // updates driven by remote RECORDING_STARTED/STOPPED events).
+                                                                                    // The set is keyed by session_id (per-recorder), and the peer
+                                                                                    // list self-row also keys on the local session id — so recording
+                                                                                    // marks THIS tab only, not a sibling tab of the same account.
+                                                                                    let self_session = rec_client.get_own_session_id().unwrap_or_default();
+                                                                                    let mut rec_ids = recording_peer_ids;
+                                                                                    let cb = Closure::new(
+                                                                                        move |js_state: String| {
+                                                                                            let new_state = js_state_to_record_button_state(&js_state);
+                                                                                            if new_state == RecordButtonState::Idle {
+                                                                                                // Notify peers for every exit: normal save AND any abort
+                                                                                                // (cancel on file picker, MediaRecorder failure, etc.).
+                                                                                                for session_id in rec_client_cb.sorted_peer_keys() {
+                                                                                                    if let Some(uid) =
+                                                                                                        rec_client_cb.get_peer_user_id(&session_id)
+                                                                                                    {
+                                                                                                        rec_client_cb.send_peer_event(
+                                                                                                            &uid,
+                                                                                                            videocall_client::PEER_EVENT_RECORDING_STOPPED,
+                                                                                                        );
+                                                                                                    }
+                                                                                                }
+                                                                                                // Toast only on clean save, not on abort ("idle").
+                                                                                                if js_state == "saved" {
+                                                                                                    let mut saved = recording_saved_toast;
+                                                                                                    saved.set(true);
+                                                                                                    Timeout::new(6_000, move || saved.set(false)).forget();
+                                                                                                }
+                                                                                            }
+                                                                                            // Add/remove OUR OWN recording icon based on the
+                                                                                            // transition: insert on Recording, remove on Idle
+                                                                                            // (save or abort), untouched during busy states.
+                                                                                            match local_recording_set_op(&new_state) {
+                                                                                                LocalRecordingSetOp::Insert => {
+                                                                                                    if !self_session.is_empty() {
+                                                                                                        rec_ids.write().insert(self_session.clone());
+                                                                                                    }
+                                                                                                }
+                                                                                                LocalRecordingSetOp::Remove => {
+                                                                                                    rec_ids.write().remove(&self_session);
+                                                                                                }
+                                                                                                LocalRecordingSetOp::Noop => {}
+                                                                                            }
+                                                                                            record_state.set(new_state);
+                                                                                        },
+                                                                                    );
+                                                                                    let js_fn: &js_sys::Function =
+                                                                                        cb.as_ref().unchecked_ref();
+                                                                                    js_recording_start(
+                                                                                        &peer_ids,
+                                                                                        js_fn,
+                                                                                        &current_display_name(),
+                                                                                        is_owner,
+                                                                                    );
+                                                                                    *state_cb_clone.borrow_mut() = Some(cb);
+                                                                                    for session_id in &peer_ids {
+                                                                                        if let Some(uid) =
+                                                                                            rec_client.get_peer_user_id(session_id)
+                                                                                        {
+                                                                                            rec_client.send_peer_event(
+                                                                                                &uid,
+                                                                                                videocall_client::PEER_EVENT_RECORDING_STARTED,
+                                                                                            );
+                                                                                        }
+                                                                                    }
+                                                                                }
+                                                                                RecordButtonState::Recording => {
+                                                                                    // RECORDING_STOPPED is handled in the → Idle state callback so every
+                                                                                    // exit path (stop click, abort, failure) is covered once.
+                                                                                    js_recording_stop();
+                                                                                }
+                                                                                _ => {}
+                                                                            }
+                                                                        },
+                                                                    }
                                                                 }
                                                             },
                                                         }
@@ -8428,6 +9395,7 @@ pub fn AttendantsComponent(
                                                 if opening {
                                                     dock_menu_open.set(false);
                                                     density_open.set(false);
+                                                    reactions_open.set(false);
                                                     mock_peers_open.set(false);
                                                 }
                                             },
@@ -8487,6 +9455,7 @@ pub fn AttendantsComponent(
                                                                                     peer_list_open.set(opening);
                                                                                     if opening {
                                                                                         density_open.set(false);
+                                                                                        reactions_open.set(false);
                                                                                         dock_menu_open.set(false);
                                                                                         mock_peers_open.set(false);
                                                                                     }
@@ -8495,6 +9464,7 @@ pub fn AttendantsComponent(
                                                                                     let opening = !density_open();
                                                                                     density_open.set(opening);
                                                                                     if opening {
+                                                                                        reactions_open.set(false);
                                                                                         dock_menu_open.set(false);
                                                                                         mock_peers_open.set(false);
                                                                                     }
@@ -8505,6 +9475,7 @@ pub fn AttendantsComponent(
                                                                                     if opening {
                                                                                         device_settings_open.set(false);
                                                                                         density_open.set(false);
+                                                                                        reactions_open.set(false);
                                                                                         dock_menu_open.set(false);
                                                                                         mock_peers_open.set(false);
                                                                                         meeting_options_open.set(false);
@@ -8520,6 +9491,7 @@ pub fn AttendantsComponent(
                                                                                         peer_list_open.set(false);
                                                                                         diagnostics_open.set(false);
                                                                                         density_open.set(false);
+                                                                                        reactions_open.set(false);
                                                                                         dock_menu_open.set(false);
                                                                                         mock_peers_open.set(false);
                                                                                         meeting_options_open.set(false);
@@ -8532,6 +9504,20 @@ pub fn AttendantsComponent(
                                                                                         device_settings_open.set(false);
                                                                                         peer_list_open.set(false);
                                                                                         diagnostics_open.set(false);
+                                                                                        density_open.set(false);
+                                                                                        reactions_open.set(false);
+                                                                                        dock_menu_open.set(false);
+                                                                                        mock_peers_open.set(false);
+                                                                                    }
+                                                                                }
+                                                                                // Issue #1884: open the reactions palette
+                                                                                // from the overflow menu (mirrors density).
+                                                                                ActionBarSlot::Reactions => {
+                                                                                    let opening = !reactions_open();
+                                                                                    reactions_open.set(opening);
+                                                                                    if opening {
+                                                                                        reaction_highlight
+                                                                                            .set(ReactionType::THUMBS_UP);
                                                                                         density_open.set(false);
                                                                                         dock_menu_open.set(false);
                                                                                         mock_peers_open.set(false);
@@ -8619,6 +9605,7 @@ pub fn AttendantsComponent(
                                                         dock_menu_open.set(opening);
                                                         if opening {
                                                             density_open.set(false);
+                                                            reactions_open.set(false);
                                                             mock_peers_open.set(false);
                                                         }
                                                     },
@@ -8643,6 +9630,7 @@ pub fn AttendantsComponent(
                                                             } else {
                                                                 dock_menu_open.set(true);
                                                                 density_open.set(false);
+                                                                reactions_open.set(false);
                                                                 mock_peers_open.set(false);
                                                                 Timeout::new(0, || {
                                                                     focus_glass_option_at(".dock-position-wrapper", false);
@@ -8657,6 +9645,7 @@ pub fn AttendantsComponent(
                                                             } else {
                                                                 dock_menu_open.set(true);
                                                                 density_open.set(false);
+                                                                reactions_open.set(false);
                                                                 mock_peers_open.set(false);
                                                                 Timeout::new(0, || {
                                                                     focus_glass_option_at(".dock-position-wrapper", true);
@@ -8873,6 +9862,7 @@ pub fn AttendantsComponent(
                                                                     peer_list_open.set(false);
                                                                     diagnostics_open.set(false);
                                                                     density_open.set(false);
+                                                                    reactions_open.set(false);
                                                                     mock_peers_open.set(false);
                                                                     meeting_options_open.set(false);
                                                                 }
@@ -8892,6 +9882,7 @@ pub fn AttendantsComponent(
                                                                     peer_list_open.set(false);
                                                                     diagnostics_open.set(false);
                                                                     density_open.set(false);
+                                                                    reactions_open.set(false);
                                                                     mock_peers_open.set(false);
                                                                     meeting_options_open.set(false);
                                                                 }
@@ -8921,6 +9912,7 @@ pub fn AttendantsComponent(
                                                         mock_peers_open.set(opening);
                                                         if opening {
                                                             density_open.set(false);
+                                                            reactions_open.set(false);
                                                             dock_menu_open.set(false);
                                                         }
                                                     },
@@ -8940,6 +9932,21 @@ pub fn AttendantsComponent(
                                                     onclick: move |_| {
                                                         if customize_mode() { return; }
                                                         log::info!("Hanging up - resetting to initial state");
+                                                    // If recording is active, stop it and notify peers
+                                                    // before disconnecting so no banner stays stuck.
+                                                    if !matches!(record_state(), RecordButtonState::Idle) {
+                                                        js_recording_stop();
+                                                        for session_id in hangup_client.sorted_peer_keys() {
+                                                            if let Some(uid) =
+                                                                hangup_client.get_peer_user_id(&session_id)
+                                                            {
+                                                                hangup_client.send_peer_event(
+                                                                    &uid,
+                                                                    videocall_client::PEER_EVENT_RECORDING_STOPPED,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
                                                     // Flush console logs before disconnecting so the
                                                     // final chunk reaches the server while the session
                                                     // is still active.
@@ -9017,8 +10024,10 @@ pub fn AttendantsComponent(
                                                             ActionBarSlot::ScreenShare => rsx! { ScreenShareButton { active: matches!(screen_share_state(), ScreenShareState::Active), disabled: true, onclick: |_| {} } },
                                                             ActionBarSlot::PeerList => rsx! { PeerListButton { open: peer_list_open(), onclick: |_| {} } },
                                                             ActionBarSlot::DensityMode => rsx! { DensityModeButton { label: density_mode().label().to_string(), open: density_open(), onclick: |_: MouseEvent| {} } },
+                                                            ActionBarSlot::Reactions => rsx! { ReactionsButton { open: reactions_open(), onclick: |_: MouseEvent| {} } },
                                                             ActionBarSlot::Diagnostics => rsx! { DiagnosticsButton { open: diagnostics_open(), onclick: |_| {} } },
                                                             ActionBarSlot::DeviceSettings => rsx! { DeviceSettingsButton { open: device_settings_open(), onclick: |_| {} } },
+                                                            ActionBarSlot::Recording => rsx! { RecordButton { state: record_state(), onclick: |_| {} } },
                                                             ActionBarSlot::MeetingOptions => rsx! { MeetingOptionsButton { open: meeting_options_open(), onclick: |_| {} } },
                                                         }
                                                     }
@@ -9242,16 +10251,54 @@ pub fn AttendantsComponent(
                             if is_guest {
                                 div { class: "guest-badge-preview", "Guest" }
                             }
+                            // Issue 1885: the self-view's top-right chrome — the
+                            // connection LED, the WT/WS transport badge (#1885),
+                            // and the RTT quality warning — share ONE flex cluster
+                            // (mirroring the peer tiles' `.tile-top-icons`, where
+                            // the badge sits adjacent to the signal meter). Before,
+                            // each was absolutely pinned to the same top-right
+                            // corner: the badge (#1885) landed under the LED (and
+                            // overlapped the quality pill), so they stacked instead
+                            // of sitting side by side. As flex items they lay out
+                            // in a row with a gap and never overlap, in any
+                            // combination (badge only-when-flag-on, quality
+                            // only-when-degraded). Row-reverse keeps the LED at the
+                            // far-right corner it has always occupied.
                             {
                                 let status_client = client.clone();
+                                // Self transport badge (#1885): SAME flag + mapping
+                                // as the peer badge, sourced from the LOCAL client's
+                                // active transport. `call_start_time()` gates on
+                                // "connected at least once" AND is the re-render
+                                // trigger (restamped every on_connected, cleared on
+                                // teardown), so this re-derives the CURRENT transport
+                                // (appears once elected; tracks reconnect / WT→WS
+                                // fallback). Only `Some(Wt|Ws)` renders.
+                                let self_badge_transport: Option<TransportBadge> =
+                                    if call_start_time().is_some()
+                                        && transport_badge_enabled().unwrap_or(false)
+                                    {
+                                        match status_client.active_transport() {
+                                            Some(raw) => match transport_badge_from_str(raw) {
+                                                TransportBadge::Unknown => None,
+                                                known => Some(known),
+                                            },
+                                            None => None,
+                                        }
+                                    } else {
+                                        None
+                                    };
                                 rsx! {
-                                    div {
-                                        class: if status_client.is_connected() { "connection-led connected" } else { "connection-led connecting" },
-                                        title: if status_client.is_connected() { "Connected" } else { "Connecting" },
+                                    div { class: "host-tile-chrome",
+                                        div {
+                                            class: if status_client.is_connected() { "connection-led connected" } else { "connection-led connecting" },
+                                            title: if status_client.is_connected() { "Connected" } else { "Connecting" },
+                                        }
+                                        {transport_badge(self_badge_transport, true)}
+                                        ConnectionQualityIndicator {}
                                     }
                                 }
                             }
-                            ConnectionQualityIndicator {}
                         }
                     }
                 }
@@ -9510,6 +10557,7 @@ pub fn AttendantsComponent(
                                 admitted_can_admit_toggle,
                                 end_on_host_leave_toggle,
                                 allow_guests_toggle,
+                                recording_allowed_for_all_toggle,
                                 saving,
                                 toggle_error,
                             }
@@ -9822,6 +10870,129 @@ pub fn AttendantsComponent(
                         }
                     }
                 }
+
+                // Issue 1884: reactions palette — a fixed, screen-centered
+                // TOOLBAR (UX B2). role=toolbar (not menu): the palette persists
+                // after activation and holds a non-menuitem close (X), which SR
+                // menu mode would hide — toolbar semantics fit a persistent strip
+                // of controls. Arrow/Home/End move the roving highlight across the
+                // 7 option buttons; Enter/Space is native <button> activation;
+                // Tab is NOT intercepted, so it flows highlighted-option -> X ->
+                // out of the toolbar (the X's keyboard reachability — the roving
+                // is keyed on ReactionType, so threading the X into it is
+                // invasive; the accepted fallback is to let Tab reach it). Escape
+                // bubbles to #main-container's popover-tier chain. NOT gated on
+                // `has_screen_share`: reacting must work while someone presents.
+                if reactions_open() {
+                    div { class: "reactions-palette",
+                        id: "reactions-palette",
+                        role: "toolbar",
+                        "aria-orientation": "horizontal",
+                        "aria-label": "Send a reaction",
+                        "data-testid": "reactions-palette",
+                        onclick: move |e: MouseEvent| e.stop_propagation(),
+                        onkeydown: move |evt: Event<KeyboardData>| {
+                            let key = evt.key();
+                            if key == Key::ArrowRight || key == Key::ArrowDown {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                let next = step_reaction(reaction_highlight(), 1);
+                                reaction_highlight.set(next);
+                                if let Some((_, _, slug)) = reaction_glyph(next) {
+                                    focus_element_by_id(&format!("reaction-opt-{slug}"));
+                                }
+                            } else if key == Key::ArrowLeft || key == Key::ArrowUp {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                let prev = step_reaction(reaction_highlight(), -1);
+                                reaction_highlight.set(prev);
+                                if let Some((_, _, slug)) = reaction_glyph(prev) {
+                                    focus_element_by_id(&format!("reaction-opt-{slug}"));
+                                }
+                            } else if key == Key::Home {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                let first = REACTIONS[0];
+                                reaction_highlight.set(first);
+                                if let Some((_, _, slug)) = reaction_glyph(first) {
+                                    focus_element_by_id(&format!("reaction-opt-{slug}"));
+                                }
+                            } else if key == Key::End {
+                                evt.stop_propagation();
+                                evt.prevent_default();
+                                let last = REACTIONS[REACTIONS.len() - 1];
+                                reaction_highlight.set(last);
+                                if let Some((_, _, slug)) = reaction_glyph(last) {
+                                    focus_element_by_id(&format!("reaction-opt-{slug}"));
+                                }
+                            }
+                            // No Tab branch (UX B2): a toolbar does not trap Tab.
+                            // Letting it through moves focus highlighted-option ->
+                            // X -> out, which is how the X becomes keyboard
+                            // reachable. Escape still closes (via #main-container).
+                        },
+                        for reaction in REACTIONS {
+                            {
+                                match reaction_glyph(reaction) {
+                                    Some((emoji, label, slug)) => rsx! {
+                                        button {
+                                            key: "{slug}",
+                                            id: "reaction-opt-{slug}",
+                                            class: {
+                                                let active = reaction_highlight() == reaction;
+                                                let pressed = reaction_pressed() == Some(reaction);
+                                                match (active, pressed) {
+                                                    (true, true) => "reaction-option active is-pressed",
+                                                    (true, false) => "reaction-option active",
+                                                    (false, true) => "reaction-option is-pressed",
+                                                    (false, false) => "reaction-option",
+                                                }
+                                            },
+                                            "data-testid": "reaction-option-{slug}",
+                                            r#type: "button",
+                                            // UX B2: plain toolbar buttons, not
+                                            // role=menuitem. Roving tabindex keeps
+                                            // arrow-key navigation; the accessible
+                                            // name stays "React with {label}".
+                                            tabindex: if reaction_highlight() == reaction { "0" } else { "-1" },
+                                            "aria-label": "React with {label}",
+                                            onclick: move |e: MouseEvent| {
+                                                e.stop_propagation();
+                                                reaction_highlight.set(reaction);
+                                                send_reaction.call(reaction);
+                                            },
+                                            span {
+                                                class: "reaction-option__emoji",
+                                                "aria-hidden": "true",
+                                                "{emoji}"
+                                            }
+                                        }
+                                    },
+                                    None => rsx! {},
+                                }
+                            }
+                        }
+                        // Issue 1884: manual close (X), last control in the
+                        // toolbar (UX B2). Closes immediately and restores focus
+                        // to the trigger, exactly like the Escape path. Reuses
+                        // the shared `.close-button` tokens (scoped to 44px + a
+                        // focus ring in style.css). Keyboard-reachable via Tab now
+                        // that the toolbar does not trap Tab: default tabindex 0,
+                        // so from the highlighted (roving) option Tab lands here.
+                        button {
+                            class: "close-button",
+                            r#type: "button",
+                            "data-testid": "reactions-close",
+                            "aria-label": "Close reactions",
+                            onclick: move |e: MouseEvent| {
+                                e.stop_propagation();
+                                reactions_open.set(false);
+                                focus_element_by_id("reactions-trigger");
+                            },
+                            "\u{00d7}"
+                        }
+                    }
+                }
             }
         }
     }
@@ -9928,6 +11099,30 @@ fn parse_speaking_peer(evt: &videocall_diagnostics::DiagEvent) -> Option<String>
     } else {
         None
     }
+}
+
+/// Decide whether a stale tile pin should be cleared this render.
+///
+/// The pinned peer is keyed by `user_id`. `pinned_still_present` is the
+/// authoritative presence lookup for that user_id
+/// ([`VideoCallClient::peer_user_id_present`]):
+/// - `Some(true)`  — the peer is confirmed present → keep the pin.
+/// - `Some(false)` — the peer is confirmed absent (genuinely left) → clear.
+/// - `None`        — the peer table could not be read this tick (transient
+///   `inner` borrow contention, issue #1172) → HOLD the pin.
+///
+/// Only a CONFIRMED absence clears the pin. Holding on `None` is what stops a
+/// speech-driven re-render — which coincides with a busy `inner` borrow far more
+/// often while a peer is actively speaking (more audio packets = more mutable
+/// borrows, more `peer_list_version` bumps = more renders) — from spuriously
+/// un-pinning a peer who never left. Because the pin now also drives the
+/// reactive maximize class, a spurious clear here would visibly un-maximize the
+/// tile, so the fail-closed hold matters for the render, not just decode/glow.
+pub(crate) fn should_clear_stale_pin(
+    pinned: Option<&str>,
+    pinned_still_present: Option<bool>,
+) -> bool {
+    pinned.is_some() && pinned_still_present == Some(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -10314,6 +11509,202 @@ mod tests {
         );
     }
 
+    // ── local recording-set transition mapping (per-tile recording icon) ──
+
+    /// The LOCAL recorder's own icon is bound to the `Recording` state ONLY: it
+    /// must be inserted on entry to `Recording`, removed on return to `Idle`
+    /// (whether a clean save or an abort), and left untouched during the transient
+    /// busy states. Reverting the icon feature (or misrouting a transition, e.g.
+    /// inserting on `Activating` so the icon flickers on before recording is live,
+    /// or dropping the `Idle → Remove` so the icon sticks after stopping) fails
+    /// this assertion.
+    #[test]
+    fn local_recording_set_op_maps_only_recording_and_idle() {
+        assert_eq!(
+            local_recording_set_op(&RecordButtonState::Recording),
+            LocalRecordingSetOp::Insert,
+            "entering Recording must show the local icon"
+        );
+        assert_eq!(
+            local_recording_set_op(&RecordButtonState::Idle),
+            LocalRecordingSetOp::Remove,
+            "returning to Idle (save or abort) must hide the local icon"
+        );
+        for busy in [
+            RecordButtonState::Activating,
+            RecordButtonState::Stopping,
+            RecordButtonState::Saving,
+        ] {
+            assert_eq!(
+                local_recording_set_op(&busy),
+                LocalRecordingSetOp::Noop,
+                "transient state {busy:?} must not touch the local icon"
+            );
+        }
+    }
+
+    /// Independence + rapid-cycle guard. Two users recording concurrently, driven
+    /// through the SAME production decision (`local_recording_set_op`) that the
+    /// record-state callback uses, plus a remote peer tracked by set membership:
+    /// stopping one recorder must NEVER clear another's entry, and a rapid
+    /// start→stop→start on one user must leave no residue and not disturb the
+    /// other ("Icon doesn't have dependencies between each other"). The set op is
+    /// applied exactly as the callback applies it — via the production mapping.
+    #[test]
+    fn recording_entries_are_independent_across_recorders() {
+        fn apply(set: &mut HashSet<String>, uid: &str, state: &RecordButtonState) {
+            match local_recording_set_op(state) {
+                LocalRecordingSetOp::Insert => {
+                    set.insert(uid.to_string());
+                }
+                LocalRecordingSetOp::Remove => {
+                    set.remove(uid);
+                }
+                LocalRecordingSetOp::Noop => {}
+            }
+        }
+
+        let mut set: HashSet<String> = HashSet::new();
+        // A and B both start recording.
+        apply(&mut set, "userA", &RecordButtonState::Recording);
+        apply(&mut set, "userB", &RecordButtonState::Recording);
+        assert!(set.contains("userA") && set.contains("userB"));
+
+        // A rapidly stops then starts again; B is never referenced.
+        apply(&mut set, "userA", &RecordButtonState::Stopping); // transient: no-op
+        apply(&mut set, "userA", &RecordButtonState::Idle); // A's icon off
+        assert!(
+            !set.contains("userA") && set.contains("userB"),
+            "A stopping must not affect B"
+        );
+        apply(&mut set, "userA", &RecordButtonState::Recording); // A back on
+        assert!(set.contains("userA") && set.contains("userB"));
+
+        // B stops: only B's entry clears, A stays.
+        apply(&mut set, "userB", &RecordButtonState::Idle);
+        assert!(
+            set.contains("userA") && !set.contains("userB"),
+            "B stopping must not affect A"
+        );
+    }
+
+    /// Core Fix A regression guard: the per-recorder set is keyed by the sender's
+    /// **session_id** (from the wire `stream_id`), NOT its `user_id`, so two
+    /// sessions of ONE authenticated account stay independent.
+    ///
+    /// Scenario from the shipped bug: "Alisa" (session `sessAlisa`) and "Viktor"
+    /// (session `sessViktor`) are two tabs of the same account, so they share one
+    /// `user_id` (`acct@x`). Alisa records; Viktor does not. Applied through the
+    /// SAME production decision (`recording_event_key`) the `on_peer_event`
+    /// handler uses, plus the render-time membership check the tiles/rows use
+    /// (`RecordingSetCtx::is_recording(session_id)` == `set.contains`).
+    ///
+    /// Mutation sensitivity: revert `recording_event_key` to key by `user_id`
+    /// (return `Some(source_user_id)`) and BOTH sibling sessions resolve to the
+    /// same `acct@x` entry — Viktor's `contains("sessViktor")` flips true and the
+    /// false-positive assertion fails. Drop the empty-session guard and the "no
+    /// key when unassigned" assertion fails.
+    #[test]
+    fn recording_set_keys_on_session_not_user_id() {
+        // Alisa's RECORDING_STARTED arrives: (source_user_id = acct@x,
+        // source_session_id = sessAlisa). Insert exactly what production inserts.
+        let mut set: HashSet<String> = HashSet::new();
+        if let Some(key) = recording_event_key("acct@x", "sessAlisa") {
+            set.insert(key.to_string());
+        }
+
+        // The membership check the tiles / peer-list rows perform is
+        // `RecordingSetCtx::is_recording(session_id)` == `set.contains(session_id)`.
+        assert!(
+            set.contains("sessAlisa"),
+            "Alisa's own session must show the recording icon"
+        );
+        assert!(
+            !set.contains("sessViktor"),
+            "sibling session of the SAME account must NOT show a false recording icon"
+        );
+        assert!(
+            !set.contains("acct@x"),
+            "the set must never be keyed by user_id (that collapses siblings)"
+        );
+
+        // The keying choice itself: same user_id, different sessions -> different
+        // keys; and user_id is never returned.
+        assert_eq!(
+            recording_event_key("acct@x", "sessAlisa"),
+            Some("sessAlisa")
+        );
+        assert_ne!(
+            recording_event_key("acct@x", "sessAlisa"),
+            recording_event_key("acct@x", "sessViktor"),
+            "two sessions of one account must yield distinct recording keys"
+        );
+
+        // An unassigned (empty) sender session yields no key — no inert "" entry.
+        assert_eq!(recording_event_key("acct@x", ""), None);
+    }
+
+    /// Meeting-wide recording indicator aggregate (`any_session_recording`).
+    ///
+    /// Walks the EXACT literal acceptance criteria for the persistent indicator
+    /// through the SAME session-keyed set the production render reads, driven by
+    /// the SAME production derivation (`any_session_recording`):
+    ///   (a) OFF with no recorders; ON the moment the FIRST recorder starts.
+    ///   (b) a SECOND concurrent recorder starting causes NO change (stays ON).
+    ///   (c) stopping the second (non-last) recorder leaves it ON (first remains).
+    ///   (d) stopping the LAST recorder turns it OFF.
+    /// The crash/leave path is the same `set.remove` as a clean stop, so this
+    /// also covers a recorder departing without a clean RECORDING_STOPPED.
+    ///
+    /// Mutation sensitivity: this is precisely the bug the old
+    /// `remote_recording_banner: Option<String>` could not express. Replace
+    /// `any_session_recording` with the old "last writer wins" semantics — e.g.
+    /// have step (c) clear the indicator because the LAST session to touch it
+    /// stopped — and assertion (c) fails (it would observe OFF while the first
+    /// recorder is still active). Inverting the emptiness check, or hardcoding
+    /// `true`/`false`, fails (a)/(d).
+    #[test]
+    fn any_session_recording_tracks_last_recorder() {
+        let mut set: HashSet<String> = HashSet::new();
+
+        // (a) No recorders → indicator OFF.
+        assert!(
+            !any_session_recording(&set),
+            "no recorders: indicator must be hidden"
+        );
+
+        // (a) First recorder (Alena) starts → indicator ON.
+        set.insert("sessAlena".to_string());
+        assert!(
+            any_session_recording(&set),
+            "first recorder starting must show the indicator"
+        );
+
+        // (b) A second recorder (Alisa) starts while Alena still records →
+        // still ON, nothing changes about the aggregate.
+        set.insert("sessAlisa".to_string());
+        assert!(
+            any_session_recording(&set),
+            "second concurrent recorder must not change the indicator (stays on)"
+        );
+
+        // (c) The second (non-last) recorder stops → Alena still records →
+        // indicator MUST remain ON. This is the exact case the old
+        // Option<String> banner got wrong.
+        set.remove("sessAlisa");
+        assert!(
+            any_session_recording(&set),
+            "stopping a non-last recorder must leave the indicator on (first still active)"
+        );
+
+        // (d) The last recorder stops → indicator OFF.
+        set.remove("sessAlena");
+        assert!(
+            !any_session_recording(&set),
+            "only the LAST recorder stopping may hide the indicator"
+        );
+    }
+
     // ── roster-seed seq-recheck clobber guard ──
 
     /// Build a minimal admitted `ParticipantStatusResponse` for the guard tests.
@@ -10336,6 +11727,7 @@ mod tests {
             host_display_name: None,
             host_user_id: None,
             allow_guests: false,
+            recording_allowed_for_all: false,
         }
     }
 
@@ -10691,5 +12083,43 @@ mod tests {
             2,
             "second bump should have fired after re-arm"
         );
+    }
+
+    // ── Stale-pin clear decision (bug: pin un-pins when the pinned peer speaks) ──
+    // These guard `should_clear_stale_pin`, the production decision used by the
+    // per-render stale-pin cleanup. The regression is the `None` (unread table)
+    // case: the old cleanup treated an unread/borrow-failed peer table as
+    // "absent" and released the pin. Reverting the fix to clear on `None` (or on
+    // any non-`Some(true)`) flips `unread_tick_holds_pin` to a failure.
+
+    /// Nothing pinned → never clear, regardless of the lookup result.
+    #[test]
+    fn no_pin_never_clears() {
+        assert!(!should_clear_stale_pin(None, Some(false)));
+        assert!(!should_clear_stale_pin(None, None));
+        assert!(!should_clear_stale_pin(None, Some(true)));
+    }
+
+    /// Peer CONFIRMED present → keep the pin.
+    #[test]
+    fn present_peer_keeps_pin() {
+        assert!(!should_clear_stale_pin(Some("alice"), Some(true)));
+    }
+
+    /// Peer CONFIRMED absent (genuinely left) → clear the pin. This is the
+    /// behavior the cleanup exists to deliver; if it stops firing, a departed
+    /// peer would suppress everyone's glow forever.
+    #[test]
+    fn absent_peer_clears_pin() {
+        assert!(should_clear_stale_pin(Some("alice"), Some(false)));
+    }
+
+    /// Unread peer table (transient `inner` borrow-fail, issue #1172) → HOLD.
+    /// This is the bug-#1 regression guard: a speech-driven re-render coinciding
+    /// with a busy borrow must NOT release the pin (which would also un-maximize
+    /// the reactively-pinned tile). Fails if the decision treats `None` as gone.
+    #[test]
+    fn unread_tick_holds_pin() {
+        assert!(!should_clear_stale_pin(Some("alice"), None));
     }
 }

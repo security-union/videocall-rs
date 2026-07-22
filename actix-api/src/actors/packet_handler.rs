@@ -29,11 +29,16 @@ use videocall_types::protos::media_packet::media_packet::MediaType;
 use videocall_types::protos::media_packet::MediaPacket;
 use videocall_types::protos::packet_wrapper::packet_wrapper::{MediaKind, PacketType};
 use videocall_types::protos::packet_wrapper::PacketWrapper;
+use videocall_types::protos::reaction_packet::reaction_packet::ReactionType;
+use videocall_types::protos::reaction_packet::ReactionPacket;
 
 use crate::constants::{
     KEYFRAME_LIMITER_CLEANUP_INTERVAL, KEYFRAME_REQUEST_MAX_LAYER_ID, KEYFRAME_REQUEST_MAX_PER_SEC,
     KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER, KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED,
+    KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN,
+    KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN_CONGESTED,
     KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS, KEYFRAME_REQUEST_WINDOW_MS,
+    REACTION_MAX_PER_WINDOW, REACTION_WINDOW_MS,
 };
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -109,6 +114,43 @@ impl KeyframeMediaKind {
     }
 }
 
+/// The per-`(receiver, target_sender)` KEYFRAME_REQUEST budget that applies to a
+/// request of `kind`, given whether the receiver is currently `congested`
+/// (issue #1899).
+///
+/// This is the SINGLE source of truth for the per-pair cap: both the enforcement
+/// site ([`KeyframeRequestLimiter::allow_with_congestion`]) and the rate-limit
+/// `warn!` log in `SessionLogic::handle_inbound` call it, so the value the log
+/// reports can never drift from the value the limiter actually enforced.
+///
+/// - **SCREEN** gets the raised budgets ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN`]
+///   / [`..._SCREEN_CONGESTED`]) because a static screen share has no
+///   inter-frame fallback — a missed keyframe freezes the tile indefinitely, so
+///   its steady-state cap must permit prompt re-request (see the constants' docs
+///   for the field rationale).
+/// - **VIDEO** keeps the original camera budgets
+///   ([`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`] / [`..._CONGESTED`])
+///   byte-for-byte — the #1479 PLI-storm protection for camera is unchanged.
+/// - **Other** is the fail-open bucket for AUDIO / `MEDIA_KIND_UNSPECIFIED` / an
+///   unrecognised (older-client, forged, or — should it ever become unreadable —
+///   E2EE-obscured) request byte-string. It maps to the CAMERA budget: the
+///   conservative default is to treat an unknown kind as the tighter,
+///   storm-safe camera cap, never to hand out SCREEN's wider budget on an
+///   unverified kind. (Today a KEYFRAME_REQUEST's inner `MediaPacket` — including
+///   the `b"VIDEO"`/`b"SCREEN"` marker — is cleartext even under E2EE, so a
+///   current client's SCREEN request is correctly classified; `Other` is the
+///   documented, safe-by-construction fallback for everything else.)
+pub(crate) fn keyframe_per_pair_budget(kind: KeyframeMediaKind, congested: bool) -> u32 {
+    match (kind, congested) {
+        (KeyframeMediaKind::Screen, false) => KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN,
+        (KeyframeMediaKind::Screen, true) => {
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN_CONGESTED
+        }
+        (_, false) => KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER,
+        (_, true) => KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED,
+    }
+}
+
 /// Classification of an incoming packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PacketKind {
@@ -151,6 +193,19 @@ pub enum PacketKind {
         layer: u32,
         kind: KeyframeMediaKind,
     },
+    /// REACTION packet (#1884) that PASSED closed-enum ingress validation in
+    /// [`classify_packet`] (the inner cleartext `ReactionPacket` parsed and its
+    /// `reaction` is a defined, non-`UNSPECIFIED` value). It is subject to the
+    /// per-sender [`ReactionRateLimiter`] in `SessionLogic::handle_inbound`;
+    /// within budget it is FORWARDED on the standard media fan-out (re-broadcast
+    /// to the room, sender self-skipped), over budget it is dropped as Processed.
+    ///
+    /// A distinct variant (rather than plain [`PacketKind::Data`]) is what lets
+    /// the stateful per-session limiter run in `handle_inbound` while the
+    /// stateless enum validation stays here — so an INVALID reaction is
+    /// classified [`PacketKind::Dropped`] and never reaches the limiter, and a
+    /// flood of invalid reactions cannot consume a sender's valid budget.
+    Reaction,
 }
 
 /// Classify a packet based on its contents.
@@ -212,6 +267,37 @@ pub fn classify_packet(data: &[u8]) -> PacketKind {
     // participants from broadcasting fake host actions.
     if packet_wrapper.packet_type == PacketType::MEETING.into() {
         return PacketKind::Dropped;
+    }
+
+    // Validate and classify client-originated REACTION packets (#1884).
+    //
+    // A REACTION is the ONLY client-authored packet the relay RE-BROADCASTS to
+    // the whole room (on the media fan-out) — unlike VIEWPORT/LAYER_PREFERENCE,
+    // which the relay consumes and never re-broadcasts. That broadcast reach is
+    // why its content is validated at ingress: the inner `ReactionPacket` is
+    // CLEARTEXT (never AES-sealed, even under E2EE — see the proto doc)
+    // precisely so the relay can enforce the closed-enum allowlist HERE. Parse
+    // it; a reaction that is UNSPECIFIED(0), an unknown/reserved value, or
+    // unparseable is dropped as Processed (no fan-out).
+    //
+    // Validation runs HERE, BEFORE the per-sender `ReactionRateLimiter` in
+    // `SessionLogic::handle_inbound`, so a flood of INVALID reactions is
+    // discarded without ever reaching (and thus without consuming) a sender's
+    // valid-budget window. A VALID reaction becomes `PacketKind::Reaction`; the
+    // stateful limiter then decides forward-vs-drop. Both the WS and WT paths
+    // route inbound through the shared `handle_inbound` → `classify_packet`, so
+    // this single arm is the sole enforcement point across transports.
+    if packet_wrapper.packet_type == PacketType::REACTION.into() {
+        let Ok(reaction) = ReactionPacket::parse_from_bytes(&packet_wrapper.data) else {
+            return PacketKind::Dropped;
+        };
+        // `enum_value()` returns `Err(raw)` for an unknown/reserved wire value
+        // (the closed-enum drop signal); `UNSPECIFIED(0)` is the proto3 default
+        // and is not a real reaction. Both drop; every defined 1..=7 forwards.
+        return match reaction.reaction.enum_value() {
+            Ok(ReactionType::REACTION_TYPE_UNSPECIFIED) | Err(_) => PacketKind::Dropped,
+            Ok(_) => PacketKind::Reaction,
+        };
     }
 
     // Check if it's a MEDIA packet (RTT, keyframe request, or regular media).
@@ -459,16 +545,20 @@ impl KeyframeRequestLimiter {
     /// allowed through. Both the per-pair budget and the global cap must
     /// admit the request.
     ///
-    /// `congested` indicates the requesting receiver is in active congestion
-    /// (issue #979): the relay has recently had to drop inbound media
-    /// destined for it, so its decoder is likely frozen and in genuine need
-    /// of a fresh keyframe. When set, the **per-pair** budget is relaxed from
-    /// [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER`] to
-    /// [`KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED`] so recovery is
-    /// possible even if some keyframe responses are themselves lost. The
-    /// global per-receiver ceiling ([`KEYFRAME_REQUEST_MAX_PER_SEC`]) is
-    /// **never** relaxed, so the pre-existing keyframe-storm risk (OSS #814)
-    /// stays bounded — this relaxes the cap, it does not remove it.
+    /// The per-pair budget is chosen by [`keyframe_per_pair_budget`] from the
+    /// request `kind` and `congested`. `kind` (issue #1899): a **SCREEN** stream
+    /// has no inter-frame fallback, so a missed keyframe freezes the tile
+    /// indefinitely; it gets a higher per-pair budget than **VIDEO** (whose
+    /// camera budget is unchanged — the #1479 storm protection is intact) so a
+    /// frozen static share can re-request promptly. `congested` (issue #979):
+    /// the relay has recently had to drop inbound media destined for this
+    /// receiver, so its decoder is likely frozen and in genuine need of a fresh
+    /// keyframe; when set, the **per-pair** budget is relaxed to that kind's
+    /// congested budget so recovery is possible even if some keyframe responses
+    /// are themselves lost. The global per-receiver ceiling
+    /// ([`KEYFRAME_REQUEST_MAX_PER_SEC`]) is **never** relaxed for any kind, so
+    /// the pre-existing keyframe-storm risk (OSS #814) stays bounded — this
+    /// relaxes the per-pair cap, it does not remove the ceiling.
     ///
     /// ## #1297 — delivery-aware relaxation (the lossless-WS recovery path)
     ///
@@ -518,11 +608,12 @@ impl KeyframeRequestLimiter {
         let window = Duration::from_millis(KEYFRAME_REQUEST_WINDOW_MS);
         let min_retry = Duration::from_millis(KEYFRAME_REQUEST_STILL_WAITING_MIN_RETRY_MS);
 
-        let per_pair_max = if congested {
-            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED
-        } else {
-            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER
-        };
+        // #1899: the per-pair budget is kind-aware. SCREEN gets a higher cap
+        // (no inter-frame fallback → a missed keyframe freezes the tile), VIDEO
+        // and the fail-open Other bucket keep the camera budgets unchanged. The
+        // congested relaxation still layers on top per kind. `keyframe_per_pair_budget`
+        // is the shared source of truth so the rate-limit log cannot misreport it.
+        let per_pair_max = keyframe_per_pair_budget(kind, congested);
 
         self.calls_since_cleanup = self.calls_since_cleanup.wrapping_add(1);
         if self.calls_since_cleanup >= KEYFRAME_LIMITER_CLEANUP_INTERVAL {
@@ -669,6 +760,133 @@ impl KeyframeRequestLimiter {
         self.per_target
             .retain(|_, entry| now.duration_since(entry.window_start) <= stale_threshold);
     }
+}
+
+/// Per-session tumbling-window rate limiter for REACTION packets (#1884).
+///
+/// Each SENDING session owns one `ReactionRateLimiter`. A REACTION is a
+/// client-authored packet the relay RE-BROADCASTS to the whole room on the
+/// media fan-out, so — like the KEYFRAME_REQUEST path — it needs an abuse
+/// ceiling. Here that is a SINGLE per-sender bucket of
+/// [`REACTION_MAX_PER_WINDOW`] per [`REACTION_WINDOW_MS`]: there is no
+/// per-target dimension (a reaction is aimed at the room, not one peer), no
+/// global/relaxation layer, and no delivery-awareness — one bucket, one window.
+///
+/// This is the RELAY ceiling. The browser client self-throttles STRICTLY below
+/// it (≤3 per rolling 1000ms AND ≥350ms between sends — see videocall-client's
+/// reaction self-throttle), so a well-behaved client never reaches this cap; it
+/// clamps a misbehaving or forged client, and it is enforced identically on
+/// both transports because WS and WT both route inbound through the shared
+/// `SessionLogic::handle_inbound`.
+///
+/// Closed-enum validation runs in [`classify_packet`] BEFORE a reaction ever
+/// reaches this limiter (an invalid reaction is classified
+/// [`PacketKind::Dropped`]), so a flood of invalid reactions cannot consume a
+/// sender's valid-budget window here.
+///
+/// Reuses [`WindowCounter`] for the tumbling-window math; its keyframe-only
+/// `waiting_since` field stays `None` (unused for reactions) and is untouched by
+/// [`WindowCounter::try_consume`].
+pub struct ReactionRateLimiter {
+    window: WindowCounter,
+}
+
+impl Default for ReactionRateLimiter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ReactionRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            window: WindowCounter::new(Instant::now()),
+        }
+    }
+
+    /// Try to consume one reaction slot for this sender. Returns `true` when the
+    /// reaction is within budget for the current window (forward it), `false`
+    /// when the per-sender budget is saturated (drop it as Processed). The
+    /// window slides on its own: once [`REACTION_WINDOW_MS`] elapses with the
+    /// next call, the count resets and the budget refills.
+    pub fn allow(&mut self) -> bool {
+        self.window.try_consume(
+            Instant::now(),
+            Duration::from_millis(REACTION_WINDOW_MS),
+            REACTION_MAX_PER_WINDOW,
+        )
+    }
+}
+
+/// Return the largest index `<= max` at which `bytes` can be truncated without
+/// splitting a UTF-8 codepoint (a byte-slice analogue of the unstable
+/// `str::floor_char_boundary`). If `bytes[max]` is a UTF-8 continuation byte
+/// (`0b10xx_xxxx`) we back up to the leading byte of the straddling codepoint so
+/// the partial codepoint is dropped whole, never emitted split. For bytes that
+/// are not valid UTF-8 this still returns a bound `<= max`.
+fn floor_utf8_boundary(bytes: &[u8], max: usize) -> usize {
+    if max >= bytes.len() {
+        return bytes.len();
+    }
+    let mut end = max;
+    while end > 0 && (bytes[end] & 0b1100_0000) == 0b1000_0000 {
+        end -= 1;
+    }
+    end
+}
+
+/// Re-stamp a validated REACTION `PacketWrapper` for room fan-out (#1884,
+/// security). This is the point at which the relay makes reaction attribution
+/// TRUSTWORTHY:
+///
+/// 1. It overwrites `PacketWrapper.session_id` UNCONDITIONALLY with
+///    `authenticated_session` (the relay's own session id for this sender),
+///    NOT only when the client sent `0` like the generic publish-path stamp
+///    (`chat_server::handle` for `ClientMessage`). Because a REACTION is the one
+///    client-authored packet the relay RE-BROADCASTS cleartext to the whole
+///    room, a client-supplied non-zero `session_id` is an impersonation vector:
+///    a malicious participant could stamp a victim's session (learned from
+///    presence) and have the reaction attributed to the victim's real display
+///    name and screen-reader announcement — with no E2EE backstop (unlike
+///    MEDIA). Overwriting here closes that: attribution now anchors on the
+///    relay-authenticated session for every REACTION, and the downstream
+///    self-echo suppression (which keys on this session_id) becomes trustworthy
+///    for REACTION as a side effect. Well-behaved clients send `0`, so this is
+///    behavior-transparent for legitimate traffic.
+/// 2. It bounds the cosmetic `display_name` to `max_name_bytes`, truncating at a
+///    UTF-8 char boundary. The name is attacker-controlled and fanned out to
+///    every participant, so an oversized value is an egress-amplification
+///    surface; the client caps at 64 chars but the relay must not rely on client
+///    cooperation. Truncate (not drop): the reaction itself is valid and the
+///    name is only a cosmetic fallback.
+///
+/// Runs on the shared `SessionLogic::handle_inbound` REACTION path (both WS and
+/// WT), AFTER closed-enum validation (`classify_packet`) and the per-sender
+/// rate limiter — so the ordering "validate enum → meter → stamp → fan out" is
+/// preserved. Returns `None` (→ caller drops the reaction, fail-closed, never
+/// fanning out an unstamped packet) if the wrapper or inner packet cannot be
+/// parsed/reserialized; that is unreachable for a packet `classify_packet`
+/// already accepted as `PacketKind::Reaction`, but the fail-closed default is
+/// the safe one.
+pub fn stamp_reaction_for_broadcast(
+    data: &[u8],
+    authenticated_session: u64,
+    max_name_bytes: usize,
+) -> Option<Vec<u8>> {
+    let mut wrapper = PacketWrapper::parse_from_bytes(data).ok()?;
+    wrapper.session_id = authenticated_session;
+
+    // Bound the cosmetic display_name. Parse the inner packet only to measure
+    // it; re-serialize the inner (and thus rewrite `wrapper.data`) ONLY when we
+    // actually truncate, so the common in-bound case pays no re-encode cost.
+    let mut inner = ReactionPacket::parse_from_bytes(&wrapper.data).ok()?;
+    if inner.display_name.len() > max_name_bytes {
+        let end = floor_utf8_boundary(&inner.display_name, max_name_bytes);
+        inner.display_name.truncate(end);
+        wrapper.data = inner.write_to_bytes().ok()?;
+    }
+
+    wrapper.write_to_bytes().ok()
 }
 
 /// Cheap delivery-observation peek for an OUTBOUND forwarded frame (#1297).
@@ -2368,6 +2586,537 @@ mod tests {
                 0u32
             )),
             "stale entry must persist below the cleanup threshold (amortized)"
+        );
+    }
+
+    // =====================================================================
+    // #1899: SCREEN gets a higher per-pair keyframe budget than camera
+    // =====================================================================
+
+    #[test]
+    fn test_keyframe_per_pair_budget_screen_higher_camera_unchanged() {
+        // Pins the budget-selection SOURCE OF TRUTH (`keyframe_per_pair_budget`),
+        // the same fn both the limiter and the rate-limit log call.
+        //
+        // ADVERSARIAL (mutation): flip the `Screen` arm to return a camera
+        // constant (revert #1899) → the two "> camera" assertions FAIL. Widen the
+        // `(_, false)` camera arm to the SCREEN constant → the "camera unchanged"
+        // assertion FAILS.
+
+        // VIDEO keeps the camera budgets byte-for-byte (#1479 unchanged).
+        assert_eq!(
+            keyframe_per_pair_budget(KeyframeMediaKind::Video, false),
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER,
+            "VIDEO steady-state budget must stay the camera value"
+        );
+        assert_eq!(
+            keyframe_per_pair_budget(KeyframeMediaKind::Video, true),
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED,
+            "VIDEO congested budget must stay the camera value"
+        );
+
+        // Other (AUDIO / UNSPECIFIED / unparseable / E2EE-obscured request) maps
+        // to the CAMERA budget — the conservative fallback (never SCREEN's wider
+        // budget on an unverified kind).
+        assert_eq!(
+            keyframe_per_pair_budget(KeyframeMediaKind::Other, false),
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER,
+            "Other (E2EE/unparseable fallback) must get the camera steady-state budget"
+        );
+        assert_eq!(
+            keyframe_per_pair_budget(KeyframeMediaKind::Other, true),
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_CONGESTED,
+            "Other congested must get the camera congested budget"
+        );
+
+        // SCREEN gets the raised budgets.
+        assert_eq!(
+            keyframe_per_pair_budget(KeyframeMediaKind::Screen, false),
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN,
+        );
+        assert_eq!(
+            keyframe_per_pair_budget(KeyframeMediaKind::Screen, true),
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN_CONGESTED,
+        );
+
+        // Load-bearing design invariants (fail if SCREEN were reverted to the
+        // camera budget, or the congested relaxation collapsed):
+        assert!(
+            keyframe_per_pair_budget(KeyframeMediaKind::Screen, false)
+                > keyframe_per_pair_budget(KeyframeMediaKind::Video, false),
+            "SCREEN steady-state must exceed camera steady-state (#1899)"
+        );
+        assert!(
+            keyframe_per_pair_budget(KeyframeMediaKind::Screen, true)
+                > keyframe_per_pair_budget(KeyframeMediaKind::Screen, false),
+            "SCREEN congested must be strictly more permissive than SCREEN steady-state"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_screen_admits_burst_camera_would_block() {
+        // THE #1899 CORE PROOF, driven through the real limiter. A SCREEN sender
+        // must admit a burst up to its raised per-pair budget within ONE window;
+        // the same burst on the camera (VIDEO) budget is clipped after the first
+        // request. This is the frozen-static-share recovery the field bug needed.
+        //
+        // ADVERSARIAL (mutation): revert the SCREEN arm of `keyframe_per_pair_budget`
+        // to the camera budget (1/sec) → only the FIRST screen request is admitted
+        // and the `admitted == SCREEN budget` assertion FAILS.
+        let mut limiter = KeyframeRequestLimiter::new();
+        let screen_target = KeyframeTarget::Session(4201);
+
+        let mut screen_admitted = 0u32;
+        // Drive one more request than the budget to also prove the ceiling bites.
+        for _ in 0..(KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN + 1) {
+            if limiter.allow(screen_target.clone(), KeyframeMediaKind::Screen, 0) {
+                screen_admitted += 1;
+            }
+        }
+        assert_eq!(
+            screen_admitted, KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN,
+            "a SCREEN sender must admit exactly its raised per-pair budget in one \
+             window (the old camera budget of {} would starve it — #1899)",
+            KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER
+        );
+
+        // Same burst on a FRESH camera (VIDEO) target: only the first is admitted.
+        let camera_target = KeyframeTarget::Session(4202);
+        let mut camera_admitted = 0u32;
+        for _ in 0..(KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN + 1) {
+            if limiter.allow(camera_target.clone(), KeyframeMediaKind::Video, 0) {
+                camera_admitted += 1;
+            }
+        }
+        assert_eq!(
+            camera_admitted, KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER,
+            "camera (VIDEO) must still admit only its unchanged 1/sec budget"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_camera_budget_unchanged_by_screen_raise() {
+        // Guards against the SCREEN raise accidentally widening the camera path.
+        // A VIDEO sender must admit EXACTLY its (unchanged) steady-state budget in
+        // one window, then be denied — regardless of the SCREEN budget's value.
+        //
+        // ADVERSARIAL (mutation): widen the `(_, false)` camera arm to the SCREEN
+        // constant → the second VIDEO request is admitted and the `!admitted`
+        // assertion FAILS.
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = KeyframeTarget::Session(4301);
+
+        let mut admitted = 0u32;
+        for _ in 0..KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER {
+            if limiter.allow(target.clone(), KeyframeMediaKind::Video, 0) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER,
+            "camera steady-state budget must be exactly the unchanged camera value"
+        );
+        // The immediately-following request (strict budget exhausted, min-retry
+        // not elapsed) must be denied — the camera cap is NOT the wider SCREEN cap.
+        assert!(
+            !limiter.allow(target, KeyframeMediaKind::Video, 0),
+            "a VIDEO request past the camera budget must be denied within the window"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_screen_flood_ceiling_still_engages() {
+        // The raised SCREEN budget is a HIGHER ceiling, not an exemption: a flood
+        // beyond the (steady-state and congested) SCREEN budget in one window is
+        // still denied. This is what keeps the publisher-side coalescer — not an
+        // unbounded relay — as the sole storm backstop under a reconnection wave.
+        //
+        // ADVERSARIAL (mutation): make SCREEN exempt (return e.g. u32::MAX from the
+        // Screen arm) → the over-budget request is admitted and the `!` assertion
+        // FAILS.
+
+        // Steady-state ceiling.
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = KeyframeTarget::Session(4401);
+        for _ in 0..KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN {
+            assert!(limiter.allow(target.clone(), KeyframeMediaKind::Screen, 0));
+        }
+        assert!(
+            !limiter.allow(target, KeyframeMediaKind::Screen, 0),
+            "a SCREEN request past the raised steady-state budget must still be denied"
+        );
+
+        // Congested ceiling (a screen share on a lossy link): higher, but bounded.
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = KeyframeTarget::Session(4402);
+        for _ in 0..KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER_SCREEN_CONGESTED {
+            assert!(limiter.allow_with_congestion(
+                target.clone(),
+                KeyframeMediaKind::Screen,
+                0,
+                true
+            ));
+        }
+        assert!(
+            !limiter.allow_with_congestion(target, KeyframeMediaKind::Screen, 0, true),
+            "a SCREEN request past the raised CONGESTED budget must still be denied \
+             (the ceiling engages at the new higher bound, not never)"
+        );
+    }
+
+    #[test]
+    fn test_keyframe_limiter_unparseable_kind_uses_camera_budget() {
+        // E2EE / older-client / forged request whose inner data byte-string is not
+        // `b"VIDEO"`/`b"SCREEN"` classifies to `KeyframeMediaKind::Other`
+        // (see `from_request_data`). The documented fallback is the CAMERA budget,
+        // never SCREEN's wider one — so an unverified kind cannot be used to obtain
+        // the higher screen budget.
+        //
+        // ADVERSARIAL (mutation): map `Other` to the SCREEN budget → the second
+        // Other request is admitted and the `!admitted` assertion FAILS.
+        let mut limiter = KeyframeRequestLimiter::new();
+        let target = KeyframeTarget::Session(4501);
+
+        let mut admitted = 0u32;
+        for _ in 0..KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER {
+            if limiter.allow(target.clone(), KeyframeMediaKind::Other, 0) {
+                admitted += 1;
+            }
+        }
+        assert_eq!(
+            admitted, KEYFRAME_REQUEST_MAX_PER_SEC_PER_SENDER,
+            "an unparseable-kind (Other) request must get the camera budget"
+        );
+        assert!(
+            !limiter.allow(target, KeyframeMediaKind::Other, 0),
+            "Other must be throttled at the camera budget, not handed SCREEN's wider budget"
+        );
+        // And confirm the classification an E2EE/older request produces IS Other,
+        // so the budget this test pins is the one such a request receives.
+        assert_eq!(
+            KeyframeMediaKind::from_request_data(b""),
+            KeyframeMediaKind::Other,
+            "an empty/unparseable request kind classifies to Other (the fallback bucket)"
+        );
+    }
+
+    // =====================================================================
+    // #1884: REACTION classify validation + per-sender rate limiter
+    // =====================================================================
+
+    /// Build the raw bytes of a `PacketWrapper{REACTION}` whose inner cleartext
+    /// `ReactionPacket` carries `reaction`. Exercises the REAL wire path
+    /// `classify_packet` parses (not an in-memory struct), so these tests pin
+    /// the production ingress-validation contract.
+    fn reaction_wrapper_bytes(reaction: ::protobuf::EnumOrUnknown<ReactionType>) -> Vec<u8> {
+        let inner = ReactionPacket {
+            reaction,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::REACTION.into(),
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    #[test]
+    fn test_classify_valid_reaction_is_forwardable() {
+        // Every defined reaction (1..=7) classifies as `Reaction` — the
+        // forwardable class the per-sender limiter meters before the media
+        // fan-out.
+        //
+        // ADVERSARIAL (mutation): delete the REACTION arm in `classify_packet`
+        // and a REACTION falls through to the default `Data` tail → `Reaction !=
+        // Data` fails this. Delete only the validation (always return Reaction)
+        // and the UNSPECIFIED/unknown tests below fail instead.
+        for r in [
+            ReactionType::THUMBS_UP,
+            ReactionType::THUMBS_DOWN,
+            ReactionType::LAUGH,
+            ReactionType::APPLAUSE,
+            ReactionType::HEART,
+            ReactionType::THINKING,
+            ReactionType::PARTY,
+        ] {
+            let bytes = reaction_wrapper_bytes(::protobuf::EnumOrUnknown::new(r));
+            assert_eq!(
+                classify_packet(&bytes),
+                PacketKind::Reaction,
+                "a valid reaction {r:?} must classify as Reaction (forwarded), not Data or Dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_classify_unspecified_reaction_dropped() {
+        // UNSPECIFIED(0) is the proto3 default, never a real reaction → Dropped
+        // (Processed, no fan-out). Pins the "invalid → Processed-dropped" half of
+        // the ingress contract; fails if the validation arm is removed (then it
+        // would classify as Data, not Dropped).
+        let bytes = reaction_wrapper_bytes(::protobuf::EnumOrUnknown::new(
+            ReactionType::REACTION_TYPE_UNSPECIFIED,
+        ));
+        assert_eq!(
+            classify_packet(&bytes),
+            PacketKind::Dropped,
+            "an UNSPECIFIED reaction must be dropped as Processed, never forwarded"
+        );
+    }
+
+    #[test]
+    fn test_classify_unknown_reaction_value_dropped() {
+        // An unknown/reserved wire value (e.g. a newer or forged client sending
+        // 99) decodes as `EnumOrUnknown::Unknown` → Dropped. This is the
+        // closed-enum allowlist the relay enforces at ingress so an attacker
+        // cannot broadcast arbitrary content through this type.
+        //
+        // ADVERSARIAL (mutation): drop the `Err(_)` arm (forward unknowns) and 99
+        // would classify as Reaction → this fails.
+        let bytes = reaction_wrapper_bytes(::protobuf::EnumOrUnknown::from_i32(99));
+        assert_eq!(
+            classify_packet(&bytes),
+            PacketKind::Dropped,
+            "an unknown/reserved reaction value must be dropped (closed-enum allowlist)"
+        );
+    }
+
+    #[test]
+    fn test_classify_unparseable_reaction_dropped_fail_closed() {
+        // A REACTION envelope whose inner bytes are NOT a parseable
+        // ReactionPacket (e.g. a client that wrongly AES-sealed it, or garbage)
+        // is dropped fail-closed — never forwarded as opaque Data. The inner
+        // bytes are a field-1 varint tag (0x08) followed by an unterminated
+        // varint (0x80 with the continuation bit set, then EOF), which forces a
+        // protobuf parse error.
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::REACTION.into(),
+            data: vec![0x08, 0x80],
+            ..Default::default()
+        };
+        let bytes = wrapper.write_to_bytes().unwrap();
+        assert_eq!(
+            classify_packet(&bytes),
+            PacketKind::Dropped,
+            "an unparseable inner ReactionPacket must be dropped fail-closed, not forwarded"
+        );
+    }
+
+    #[test]
+    fn test_reaction_limiter_admits_up_to_max_then_drops() {
+        // Up to REACTION_MAX_PER_WINDOW reactions in one window are admitted; the
+        // next is dropped. All calls happen within microseconds so the window
+        // never slides — deterministic without a sleep.
+        //
+        // ADVERSARIAL (mutation): raising the cap or removing the `count < max`
+        // check in `try_consume` would admit the (MAX+1)th → the final assert
+        // fails.
+        let mut limiter = ReactionRateLimiter::new();
+        for i in 0..REACTION_MAX_PER_WINDOW {
+            assert!(
+                limiter.allow(),
+                "reaction {i} within the per-sender budget must be admitted"
+            );
+        }
+        assert!(
+            !limiter.allow(),
+            "the reaction after REACTION_MAX_PER_WINDOW ({REACTION_MAX_PER_WINDOW}) in one \
+             window must be dropped (over budget)"
+        );
+    }
+
+    #[test]
+    fn test_reaction_limiter_window_slides_and_resets() {
+        // Once the window elapses the per-sender budget refills. Rewind the
+        // internal `window_start` (same-module access, exactly as the keyframe
+        // limiter tests do) to avoid a real sleep.
+        //
+        // ADVERSARIAL (mutation): remove the window-roll reset in `try_consume`
+        // and the post-slide allow would stay denied → this fails.
+        let mut limiter = ReactionRateLimiter::new();
+        for _ in 0..REACTION_MAX_PER_WINDOW {
+            assert!(limiter.allow());
+        }
+        assert!(
+            !limiter.allow(),
+            "budget must be exhausted within a single window"
+        );
+
+        // Push window_start past REACTION_WINDOW_MS into the past so the next
+        // call rolls the window.
+        limiter.window.window_start =
+            Instant::now() - Duration::from_millis(REACTION_WINDOW_MS + 50);
+
+        assert!(
+            limiter.allow(),
+            "after the window slides, the per-sender reaction budget must refill"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // #1884 (security): unconditional session_id stamp + display_name bound
+    // via `stamp_reaction_for_broadcast` (the relay-side attribution fix).
+    // ---------------------------------------------------------------------
+
+    /// Build the raw bytes of a `PacketWrapper{REACTION}` carrying an inner
+    /// `ReactionPacket` with the given envelope `session_id`, reaction, and raw
+    /// `display_name` bytes — the exact wire shape `stamp_reaction_for_broadcast`
+    /// re-stamps.
+    fn reaction_wrapper_with(
+        session_id: u64,
+        reaction: ReactionType,
+        display_name: Vec<u8>,
+    ) -> Vec<u8> {
+        let inner = ReactionPacket {
+            reaction: reaction.into(),
+            display_name,
+            ..Default::default()
+        };
+        let wrapper = PacketWrapper {
+            packet_type: PacketType::REACTION.into(),
+            session_id,
+            data: inner.write_to_bytes().unwrap(),
+            ..Default::default()
+        };
+        wrapper.write_to_bytes().unwrap()
+    }
+
+    #[test]
+    fn test_stamp_reaction_overwrites_forged_session_id() {
+        // SECURITY (#1884): a REACTION arriving with a NON-ZERO session_id is a
+        // forge — a malicious authenticated client stamping a victim's session
+        // (learned from presence) to have the reaction attributed to the
+        // victim's real display name / SR announcement, cleartext, with no E2EE
+        // backstop. The relay must overwrite it with THIS sender's authenticated
+        // session before fan-out.
+        //
+        // ADVERSARIAL (mutation): revert the stamp to the old publish-path
+        // "only if session_id == 0" behavior (or delete the
+        // `wrapper.session_id = authenticated_session` line) and the forged 9999
+        // survives → this fails.
+        const FORGED_VICTIM: u64 = 9999;
+        const AUTHENTICATED: u64 = 42;
+        let bytes = reaction_wrapper_with(FORGED_VICTIM, ReactionType::THUMBS_UP, Vec::new());
+
+        let stamped = stamp_reaction_for_broadcast(
+            &bytes,
+            AUTHENTICATED,
+            crate::constants::REACTION_DISPLAY_NAME_MAX_BYTES,
+        )
+        .expect("a valid REACTION must re-stamp");
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.session_id, AUTHENTICATED,
+            "a forged non-zero session_id must be overwritten with the authenticated session"
+        );
+    }
+
+    #[test]
+    fn test_stamp_reaction_stamps_zero_session_id() {
+        // Happy path: a well-behaved client sends session_id = 0; the relay
+        // stamps its authenticated session. ADVERSARIAL: remove the stamp and 0
+        // survives → fails.
+        const AUTHENTICATED: u64 = 7;
+        let bytes = reaction_wrapper_with(0, ReactionType::HEART, Vec::new());
+
+        let stamped = stamp_reaction_for_broadcast(
+            &bytes,
+            AUTHENTICATED,
+            crate::constants::REACTION_DISPLAY_NAME_MAX_BYTES,
+        )
+        .unwrap();
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(
+            out.session_id, AUTHENTICATED,
+            "session_id=0 must be stamped with the authenticated session (no happy-path regression)"
+        );
+    }
+
+    #[test]
+    fn test_stamp_reaction_truncates_overlong_display_name() {
+        // An oversized cosmetic display_name (egress-amplification surface) is
+        // truncated to the server bound at ingress. ADVERSARIAL: remove the cap
+        // branch and the 400-byte name survives → fails.
+        const AUTHENTICATED: u64 = 1;
+        let cap = crate::constants::REACTION_DISPLAY_NAME_MAX_BYTES;
+        let bytes = reaction_wrapper_with(0, ReactionType::PARTY, "x".repeat(400).into_bytes());
+
+        let stamped = stamp_reaction_for_broadcast(&bytes, AUTHENTICATED, cap).unwrap();
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        let out_inner = ReactionPacket::parse_from_bytes(&out.data).unwrap();
+        assert!(
+            out_inner.display_name.len() <= cap,
+            "display_name must be truncated to the server bound"
+        );
+        assert!(
+            !out_inner.display_name.is_empty(),
+            "an all-ASCII overlong name must truncate to a non-empty bound"
+        );
+        assert!(
+            std::str::from_utf8(&out_inner.display_name).is_ok(),
+            "truncation must leave valid UTF-8"
+        );
+        assert_eq!(
+            out_inner.reaction.enum_value(),
+            Ok(ReactionType::PARTY),
+            "the reaction itself must survive the name truncation"
+        );
+    }
+
+    #[test]
+    fn test_stamp_reaction_truncation_never_splits_a_codepoint() {
+        // 100 × 'あ' (E3 81 82 = 3 bytes) = 300 bytes. A cap of 256 lands at byte
+        // 256, which is mid-codepoint (256 = 3*85 + 1), so a naive byte truncate
+        // would split 'あ' and yield invalid UTF-8. floor_utf8_boundary must back
+        // up to byte 255 (85 whole codepoints).
+        //
+        // ADVERSARIAL (mutation): replace floor_utf8_boundary with a plain
+        // `truncate(max)` and the result ends in a split sequence → from_utf8
+        // fails → this fails.
+        const AUTHENTICATED: u64 = 1;
+        let bytes = reaction_wrapper_with(0, ReactionType::LAUGH, "あ".repeat(100).into_bytes());
+
+        let stamped = stamp_reaction_for_broadcast(&bytes, AUTHENTICATED, 256).unwrap();
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        let out_inner = ReactionPacket::parse_from_bytes(&out.data).unwrap();
+        assert!(out_inner.display_name.len() <= 256);
+        let s = std::str::from_utf8(&out_inner.display_name)
+            .expect("truncation must produce valid UTF-8 (no split codepoint)");
+        assert!(
+            !s.is_empty() && s.chars().all(|c| c == 'あ'),
+            "only whole codepoints may survive truncation"
+        );
+    }
+
+    #[test]
+    fn test_stamp_reaction_preserves_enum_and_short_name_and_still_classifies() {
+        // A within-bound reaction is preserved unchanged (enum + name), only the
+        // session_id is stamped, and the stamped bytes STILL classify as a
+        // forwardable Reaction — tying the stamp output back to the ingress
+        // contract (a stamp that corrupted the packet would break re-classify).
+        const AUTHENTICATED: u64 = 5;
+        let bytes = reaction_wrapper_with(0, ReactionType::APPLAUSE, b"Bob".to_vec());
+
+        let stamped = stamp_reaction_for_broadcast(
+            &bytes,
+            AUTHENTICATED,
+            crate::constants::REACTION_DISPLAY_NAME_MAX_BYTES,
+        )
+        .unwrap();
+        assert_eq!(
+            classify_packet(&stamped),
+            PacketKind::Reaction,
+            "stamped bytes must still classify as a forwardable Reaction"
+        );
+        let out = PacketWrapper::parse_from_bytes(&stamped).unwrap();
+        assert_eq!(out.session_id, AUTHENTICATED);
+        let out_inner = ReactionPacket::parse_from_bytes(&out.data).unwrap();
+        assert_eq!(out_inner.reaction.enum_value(), Ok(ReactionType::APPLAUSE));
+        assert_eq!(
+            out_inner.display_name,
+            b"Bob".to_vec(),
+            "a within-bound display_name must be preserved unchanged"
         );
     }
 }

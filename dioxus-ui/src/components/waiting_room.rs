@@ -113,6 +113,9 @@ pub fn WaitingRoom(
                 webtransport_urls,
                 enable_e2ee: false,
                 enable_webtransport: effective_wt_enabled,
+                // Issue #1884: waiting-room OBSERVER client — no in-call reaction
+                // overlay, so no reaction callback.
+                on_reaction: None,
                 on_connected: VcCallback::from(move |_| {
                     log::info!("Observer connection established (waiting room)");
                     obs_conn_on_connect.set(true);

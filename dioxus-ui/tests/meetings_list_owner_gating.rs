@@ -104,6 +104,7 @@ fn feed_body_with_one_owned_one_not_owned() -> String {
                     "waiting_count": 0,
                     "has_password": false,
                     "allow_guests": false,
+                    "recording_allowed_for_all": false,
                     "waiting_room_enabled": true,
                     "admitted_can_admit": false,
                     "end_on_host_leave": true
@@ -122,6 +123,7 @@ fn feed_body_with_one_owned_one_not_owned() -> String {
                     "waiting_count": 0,
                     "has_password": false,
                     "allow_guests": false,
+                    "recording_allowed_for_all": false,
                     "waiting_room_enabled": true,
                     "admitted_can_admit": false,
                     "end_on_host_leave": true
@@ -246,6 +248,7 @@ async fn meetings_list_omits_owner_affordances_for_not_owned_row() {
                     "waiting_count": 0,
                     "has_password": false,
                     "allow_guests": false,
+                    "recording_allowed_for_all": false,
                     "waiting_room_enabled": true,
                     "admitted_can_admit": false,
                     "end_on_host_leave": true

@@ -217,6 +217,17 @@ h3 {
   margin-left: 6px;
 }
 
+/* Recording indicator shown next to a recorder's name in their video tile and
+   in the peer list. One is rendered per active recorder (see RecordingSetCtx),
+   independently of the others. Kept visually distinct from the "(Host)" text and
+   the guest badge — a small red-dot emoji, no badge chrome. */
+.recording-indicator {
+  font-size: 0.85em;
+  margin-left: var(--space-1);
+  flex-shrink: 0;
+  line-height: 1;
+}
+
 /* Guest badge on camera preview (bottom-right corner) */
 .guest-badge-preview {
   position: absolute;
@@ -921,6 +932,15 @@ canvas {
    cue only, never the sole distinction. */
 .media-metrics-overlay--self {
   border-left: 2px solid var(--accent, #4da3ff); /* @token-exempt: secondary cue, themed fallback */
+}
+
+/* issue 1821: shared-content (screen) stats overlay — same bottom-anchored,
+   passive, aria-hidden readout as the camera overlay (res·fps, no audio). Left-
+   aligned so it hugs the corner of the wide shared-content tile rather than
+   centering under the bottom-center zoom bar's column. No self/peer accent
+   border — a received screen share has no self/peer distinction. */
+.media-metrics-overlay--screen {
+  text-align: left;
 }
 
 /* issue 1768: diagnostics-drawer overlay toggle row — checkbox + label inline. */
@@ -2019,6 +2039,69 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   height: min(100%, calc(100vw * 9 / 16));
 }
 
+/* Screen-share split layout: a pinned side-panel peer tile must maximize over
+   the shared screen, exactly like `.grid-item-pinned` does in the normal grid.
+   The base `.split-peer-tile` rule is defined LATER in this file than
+   `.grid-item-pinned`, so at equal single-class specificity `.split-peer-tile`
+   would win the `position`/`width`/`height` cascade and cancel the maximize —
+   which is why pinning appeared to do nothing at all during screen share. The
+   compound `.split-peer-tile.grid-item-pinned` selector (specificity 0,2,0)
+   beats the single-class base rule regardless of source order, and resetting
+   `aspect-ratio` lets the explicit `height: 100%` apply. z-index sits above the
+   split-area tiles/handle (max z-index 60 in this region) so the maximized tile
+   covers the share. */
+.split-peer-tile.grid-item-pinned {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  aspect-ratio: auto;
+  z-index: 100;
+  /* Drop the tile's 2px thumbnail border when maximized. `.split-peer-tile`
+     is `box-sizing: border-box`, so that border eats INTO the fixed 100% box —
+     the letterboxed canvas below would resolve `100%` against 1276x716 (a
+     4px-smaller content box) instead of the full viewport. The normal-grid
+     `.grid-item-pinned` shows no such inset (its `.grid-item` is content-box,
+     so the border sits OUTSIDE the 100% and is clipped off-screen), so the
+     pinned camera looked measurably smaller during screen share than in a
+     plain meeting. Removing the border here reclaims those 4px so the canvas
+     fills the full viewport identically in both contexts. */
+  border: none;
+}
+
+.split-peer-tile.grid-item-pinned .canvas-container {
+  width: min(100%, calc(100vh * 16 / 9));
+  height: min(100%, calc(100vw * 9 / 16));
+  /* Corner radius is intentionally NOT overridden: the base
+     `.split-peer-tile .canvas-container` radius (10px) already matches the
+     normal-grid `.grid-item .canvas-container` radius (calc(var(--radius-lg) -
+     2px) = 10px in global.css), so a maximized camera tile keeps the SAME
+     rounded corners with or without screen share. */
+}
+
+/* Screen-share split layout: a pinned LEFT-panel screen tile must maximize over
+   the whole split area, mirroring the right-panel `.split-peer-tile` rule above.
+   Same reasoning applies to source order: the base `.split-screen-tile` rule is
+   defined LATER than `.grid-item-pinned`, so a single-class `.grid-item-pinned`
+   would lose the `z-index` cascade to the region's stacked tiles/handle (max
+   z-index 60 here). The compound `.split-screen-tile.grid-item-pinned`
+   (specificity 0,2,0) lifts it to the SAME z-index (100) as a maximized
+   `.split-peer-tile`, so both maximized tile kinds sit at one level. Only ONE of
+   a sharer's two tiles is ever pinned at a time (pin identity is now
+   kind-aware — see `PinnedTile`), so the two never stack against each other.
+   No `.canvas-container` override is emitted here on purpose: the screen tile
+   keeps its base 100%/100% canvas (the shared content sets its own aspect via
+   the zoom viewport), unlike the camera tile which letterboxes 16/9. */
+.split-screen-tile.grid-item-pinned {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 100;
+}
+
 /* ============================================================
    Simulation info message
    ============================================================ */
@@ -2455,15 +2538,32 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    Connection LED
    ============================================================ */
 
-.connection-led {
+/* issue 1885: one flex cluster for the self-view's top-right chrome — the
+   connection LED, the WT/WS transport badge (issue 1885), and the RTT quality warning
+   — mirroring the peer tiles' `.tile-top-icons`. Previously each was absolutely
+   pinned to the same top-right corner, so the badge stacked UNDER the LED and
+   overlapped the quality pill. row-reverse keeps the LED in the far-right corner
+   it has always occupied; flex + gap lay the badge and the (conditional) quality
+   pill out to its left with no overlap, in any combination. */
+.host-tile-chrome {
   position: absolute;
   top: 8px;
   right: 8px;
+  display: flex;
+  flex-direction: row-reverse;
+  align-items: center;
+  gap: var(--space-1);
+  z-index: 5;
+}
+
+.connection-led {
+  /* issue 1885: a flex item inside `.host-tile-chrome` (no longer individually
+     pinned to the corner), so the badge/quality can sit beside it. */
+  flex-shrink: 0;
   width: 12px;
   height: 12px;
   border-radius: 50%;
   border: 2px solid var(--connection-led-border);
-  z-index: 5;
   transition: all 0.3s ease;
   box-shadow: 0 2px 4px var(--connection-led-shadow);
   /* @token-exempt: LED glow, no matching token */
@@ -2498,10 +2598,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 
 @media (max-width: 37.5em) {
   .connection-led {
+    /* issue 1885: size only — position comes from the `.host-tile-chrome` flex
+       cluster, no per-element corner pin. */
     width: 10px;
     height: 10px;
-    top: 6px;
-    right: 6px;
   }
 }
 
@@ -2510,16 +2610,17 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
    ============================================================ */
 
 .connection-quality-indicator {
-  position: absolute;
-  top: 8px;
-  right: 28px;
+  /* issue 1885: a flex item inside `.host-tile-chrome` (no longer pinned to the
+     corner at right:28). It renders only on a degraded connection, so it simply
+     takes its place in the cluster row when present and occupies nothing when
+     absent — no fixed offset to collide with the badge. */
+  flex-shrink: 0;
   display: flex;
   align-items: center;
   gap: var(--space-1);
   padding: 3px var(--space-2) 3px var(--space-1);
   background: var(--overlay-heavy);
   border-radius: var(--radius-lg);
-  z-index: 5;
   opacity: 0;
   transform: translateY(4px);
   transition:
@@ -4623,7 +4724,10 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
   width: 100%;
   max-height: 180px;
   border-bottom: 1px solid var(--border);
-  border-radius: 0;
+  /* Bottom corners match ancestor tile .host minus 2px border so the preview's
+     square corners don't peek above the speaking glow at the tile's
+     rounded bottom edge (same pattern as .grid-item .canvas-container). */
+  border-radius: 0 0 calc(var(--radius-lg) - 2px) calc(var(--radius-lg) - 2px);
   background: var(--bg);
   object-fit: contain;
   pointer-events: none;
@@ -4675,6 +4779,23 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .settings-info-icon:hover::after {
+  opacity: 1;
+}
+
+.speaker-highlight-help-icon::after {
+  content: attr(data-tooltip);
+  left: calc(100% + 18px);
+  right: auto;
+  top: auto;
+  bottom: calc(100% + 12px);
+  transform: none;
+  max-width: 220px;
+  width: min(220px, 52vw);
+  text-align: left;
+  z-index: 30;
+}
+
+.speaker-highlight-help-icon:hover::after {
   opacity: 1;
 }
 
@@ -4825,6 +4946,16 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
     transform: translateX(-50%);
   }
 
+  .speaker-highlight-help-icon::after {
+    left: calc(100% + 10px);
+    right: auto;
+    top: auto;
+    bottom: calc(100% + 10px);
+    transform: none;
+    width: min(180px, 58vw);
+    max-width: 180px;
+  }
+
   .settings-field {
     padding: var(--space-3) 0;
   }
@@ -4863,7 +4994,11 @@ details.diag-disclosure[open] > .diag-disclosure-summary .diag-disclosure-chev {
 }
 
 .host-video-wrapper {
-  border-radius: 0;
+  /* Top corners match ancestor tile .host minus 2px border — mirrors the
+     .grid-item .canvas-container pattern (global.css) so the child's
+    own corners align with the ancestor's rounded clip and no square-corner
+     artifact appears above the speaking glow under GPU compositing. */
+  border-radius: calc(var(--radius-lg) - 2px) calc(var(--radius-lg) - 2px) 0 0;
   overflow: hidden;
   border: none;
   box-shadow: none;
@@ -5463,7 +5598,7 @@ html[data-theme="light"] .decode-paused-pill-action {
 
 .settings-panel {
   position: relative;
-  z-index: 2;
+  z-index: 3;
 
   margin: var(--space-1);
   padding: 40px 54px 48px 44px;
@@ -5518,6 +5653,7 @@ html[data-theme="light"] .decode-paused-pill-action {
   gap: 2px;
 
   position: relative;
+  z-index: 1;
   overflow: hidden;
 }
 
@@ -8617,6 +8753,214 @@ html[data-theme="light"] .glow-switch input:checked+.glow-switch-track::after {
   opacity: 0.6;
 }
 
+/* ===== Reactions palette — mirrors .density-popover vocabulary (issue 1884) ===== */
+.reactions-palette {
+  position: fixed;
+  bottom: 104px;
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--glass-popover-bg);
+  border: 1px solid var(--glass-popover-border);
+  border-radius: var(--radius-lg);
+  padding: var(--space-2);
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  justify-content: center;
+  /* issue 1884: centre the shorter close (X) button against the 44px reaction
+     options rather than letting it sit top-aligned. */
+  align-items: center;
+  max-width: min(360px, calc(100% - 32px));
+  z-index: 9100;
+  backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  -webkit-backdrop-filter: blur(var(--effect-blur-glass)) saturate(1.1);
+  box-shadow: var(--glass-popover-shadow);
+}
+
+.reaction-option {
+  width: 44px;
+  height: 44px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-md);
+  background: transparent;
+  cursor: pointer;
+  font-size: 24px;
+  line-height: 1;
+  transition:
+    transform 0.12s ease,
+    background 0.15s ease;
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+}
+
+.reaction-option:hover {
+  background: var(--settings-ghost-bg-hover);
+}
+
+.reaction-option.active {
+  background: var(--settings-ghost-bg-selected);
+}
+
+.reaction-option:active,
+.reaction-option.is-pressed {
+  transform: scale(0.86);
+}
+
+.reaction-option:focus-visible {
+  outline: 2px solid var(--accent, rgba(120, 160, 220, 0.55));
+  /* @token-exempt: var() fallback */
+  outline-offset: -2px;
+}
+
+.reaction-option[aria-disabled="true"],
+.reaction-option[disabled] {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* issue 1884 (UX N1): the close (X) is now a keyboard-reachable toolbar control,
+   so it needs the same focus-visible ring as the options and should match their
+   44px hit target. Scoped to the palette so the shared 32px .close-button base
+   (chat / peer list / diagnostics) is untouched. */
+.reactions-palette .close-button {
+  width: 44px;
+  height: 44px;
+}
+
+.reactions-palette .close-button:focus-visible {
+  outline: 2px solid var(--accent, rgba(120, 160, 220, 0.55));
+  /* @token-exempt: var() fallback */
+  outline-offset: -2px;
+}
+
+/* ===== Floating reactions overlay (net-new animation, issue 1884) ===== */
+.reactions-overlay {
+  position: fixed;
+  bottom: 96px;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(480px, calc(100% - 32px));
+  height: 60vh;
+  max-height: 420px;
+  z-index: 1090;
+  pointer-events: none;
+  overflow: hidden;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+}
+
+.reaction-float {
+  position: absolute;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  pointer-events: none;
+  will-change: transform, opacity;
+  animation: reaction-rise 4s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+
+.reaction-float__emoji {
+  font-size: 40px;
+  line-height: 1;
+  filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.6));
+  /* @token-exempt: legibility shadow over video */
+  font-family: "Apple Color Emoji", "Segoe UI Emoji", "Noto Color Emoji", sans-serif;
+}
+
+.reaction-float__name {
+  /* @token-exempt: solid dark chip over video */
+  background: var(--fixed-dark);
+  color: var(--on-dark-text-high);
+  font-size: var(--fs-2);
+  font-weight: 600;
+  line-height: 1.2;
+  padding: 2px 8px;
+  border-radius: var(--radius-sm);
+  max-width: 140px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.reaction-float__count {
+  /* @token-exempt: on-accent white */
+  background: var(--accent);
+  color: #fff;
+  font-size: var(--fs-2);
+  font-weight: 700;
+  border-radius: 999px;
+  padding: 0 6px;
+  min-width: 18px;
+  text-align: center;
+}
+
+@keyframes reaction-rise {
+  /* UX NB-1: every transform-bearing keyframe carries translateX(-50%) so the
+     float stays centred on its `left: calc(50% + offset%)` anchor. The
+     animation overwrites `transform`, so a base-rule translateX would not
+     survive — it must live in the keyframes. */
+  0% {
+    transform: translateX(-50%) translateY(20px) scale(0.7);
+    opacity: 0;
+  }
+  12% {
+    transform: translateX(-50%) translateY(0) scale(1);
+    opacity: 1;
+  }
+  75% {
+    opacity: 1;
+  }
+  100% {
+    transform: translateX(-50%) translateY(-320px) scale(1);
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .reactions-overlay {
+    /* UX NB-1: centre the static stack (design §4d "bottom-center"). The
+       animated path centres each float with translateX(-50%) in the
+       reaction-rise keyframes, but that transform is WRONG for these
+       position:static items (it would shift each one half its width off the
+       stack), so the reduced-motion variant centres via the flex cross axis
+       instead — align-items: center, not translateX. */
+    align-items: center;
+    flex-direction: column-reverse;
+    gap: var(--space-2);
+  }
+  .reaction-float {
+    position: static;
+    animation: reaction-fade 3s ease forwards;
+  }
+  .reaction-float__emoji {
+    filter: none;
+  }
+  .reaction-option:active,
+  .reaction-option.is-pressed {
+    transform: none;
+  }
+  @keyframes reaction-fade {
+    0% {
+      opacity: 0;
+    }
+    10% {
+      opacity: 1;
+    }
+    80% {
+      opacity: 1;
+    }
+    100% {
+      opacity: 0;
+    }
+  }
+}
+
 /* =========================
 FLOATING GLASS INVITE
 ========================= */
@@ -10176,11 +10520,17 @@ details.perf-peers[open] .perf-peers__chev {
 }
 
 /* Ensure the dragged slot can extend beyond the bar (the cursor may roam
-   to a neighbor outside the slot box). The host-controls nav (`.host`)
-   and its `.controls` child both clip with `overflow: hidden`, so un-clip
-   the whole chain while in customize mode. */
-#host-controls-nav.host,
-#host-controls-nav.host .controls,
+  to a neighbor outside the slot box). The host-controls nav (`.host`)
+  clips with `overflow: hidden`, so un-clip the relevant container chain
+  while in customize mode. Scoped with :has() so the
+   overflow override never applies outside customize mode — without this
+   scope the parent's overflow:hidden clip is permanently defeated and
+   child content corners poke through the speaking glow border-radius. */
+#host-controls-nav.host:has(.customize-mode),
+#host-controls-nav.host:has(.customize-mode) > .controls {
+  overflow: visible !important;
+}
+
 #host-controls-nav.host .video-controls-container.customize-mode,
 #host-controls-nav.host .video-controls-container.customize-mode.drag-active {
   overflow: visible !important;

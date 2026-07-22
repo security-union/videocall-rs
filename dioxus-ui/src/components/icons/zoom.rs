@@ -66,6 +66,39 @@ pub fn ZoomResetIcon() -> Element {
     }
 }
 
+/// Issue 1821: actual-size (1:1) — a rounded rectangle framing a centered "1:1"
+/// glyph. The frame is stroked like its siblings; the "1:1" is FILLED with
+/// `currentColor` (a stroked glyph this small reads as a smudge), so it inherits
+/// the control-bar color the same way.
+#[component]
+pub fn ActualSizeIcon() -> Element {
+    rsx! {
+        svg {
+            class: "w-8",
+            xmlns: "http://www.w3.org/2000/svg",
+            view_box: "0 0 24 24",
+            fill: "none",
+            stroke: "currentColor",
+            stroke_width: "2",
+            stroke_linecap: "round",
+            stroke_linejoin: "round",
+            rect { x: "3", y: "5", width: "18", height: "14", rx: "2" }
+            text {
+                x: "12",
+                y: "12",
+                fill: "currentColor",
+                stroke: "none",
+                font_size: "9",
+                font_weight: "700",
+                text_anchor: "middle",
+                dominant_baseline: "central",
+                font_family: "system-ui, sans-serif",
+                "1:1"
+            }
+        }
+    }
+}
+
 /// Box with an outward arrow — open shared content in a separate window. Reused
 /// (with a rotated meaning) for the reattach affordance in the placeholder.
 #[component]

@@ -48,6 +48,7 @@ pub fn PreJoinSettingsCard(
     admitted_can_admit_toggle: Signal<bool>,
     end_on_host_leave_toggle: Signal<bool>,
     allow_guests_toggle: Signal<bool>,
+    recording_allowed_for_all_toggle: Signal<bool>,
     saving: Signal<bool>,
     toggle_error: Signal<Option<String>>,
     connection_error: Signal<Option<String>>,
@@ -127,6 +128,7 @@ pub fn PreJoinSettingsCard(
                     admitted_can_admit_toggle,
                     end_on_host_leave_toggle,
                     allow_guests_toggle,
+                    recording_allowed_for_all_toggle,
                     saving,
                     toggle_error,
                 }

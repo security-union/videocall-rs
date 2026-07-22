@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.14...videocall-codecs-v0.1.15) - 2026-07-22
+
+### Added
+
+- pure-Rust VP9 codec (encoder + decoder) — remove C libvpx from videocall-cli & bot ([#884](https://github.com/security-union/videocall-rs/pull/884))
+
+### Other
+
+- ship fat (arm64+x86_64) macOS & Mac Catalyst xcframework slices ([#888](https://github.com/security-union/videocall-rs/pull/888))
+
 ## [0.1.14](https://github.com/security-union/videocall-rs/compare/videocall-codecs-v0.1.13...videocall-codecs-v0.1.14) - 2026-06-30
 
 ### Other

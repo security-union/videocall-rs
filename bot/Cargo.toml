@@ -1,6 +1,6 @@
 [package]
 name = "bot"
-version = "1.2.0"
+version = "1.3.0"
 edition = "2018"
 license = "MIT OR Apache-2.0"
 description = "A bot for the videocall project"
@@ -32,7 +32,7 @@ image = "0.25.5"  # JPEG processing
 # Pure-Rust VP9 encoding (replaces C libvpx/env-libvpx-sys). Default features pull
 # in zero C dependencies; the legacy libvpx backend is opt-in via the `libvpx`
 # feature below.
-videocall-codecs = { path = "../videocall-codecs", version = "0.1.14" }
+videocall-codecs = { path = "../videocall-codecs", version = "0.1.15" }
 
 # Configuration
 serde = { version = "1.0", features = ["derive"] }

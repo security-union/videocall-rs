@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.10](https://github.com/security-union/videocall-rs/compare/videocall-nokhwa-v0.10.9...videocall-nokhwa-v0.10.10) - 2026-07-22
+
+### Other
+
+- macOS camera integration rewrite: Swift AVFoundation capture layer replacing objc nokhwa bindings ([#890](https://github.com/security-union/videocall-rs/pull/890))
+
 ## [0.10.9](https://github.com/security-union/videocall-rs/compare/videocall-nokhwa-v0.10.8...videocall-nokhwa-v0.10.9) - 2025-06-23
 
 ### Other

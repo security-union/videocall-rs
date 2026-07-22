@@ -1,16 +1,18 @@
 # US East Matomo configuration using Bitnami chart
   # Regional deployment configuration for matomo.videocall.rs
 
-# Global security override to allow AWS ECR images
+# Global security override to allow non-default (bitnamilegacy) images
 global:
   security:
     allowInsecureImages: true
 
 matomo:
-  # Override image to use AWS ECR public registry with Bitnami images
+  # Bitnami deleted the entire public.ecr.aws/bitnami/* registry; the archived
+  # bitnamilegacy repos on Docker Hub carry the identical tag we already run.
+  # Registry/repository move only — version is unchanged.
   image:
-    registry: public.ecr.aws
-    repository: bitnami/matomo
+    registry: docker.io
+    repository: bitnamilegacy/matomo
     tag: 5.3.2-debian-12-r12
     pullPolicy: IfNotPresent
 
@@ -40,9 +42,10 @@ matomo:
   # MariaDB configuration - auto-generate passwords
   mariadb:
     enabled: true
+    # Same registry migration as above — identical tag, bitnamilegacy on Docker Hub.
     image:
-      registry: public.ecr.aws
-      repository: bitnami/mariadb
+      registry: docker.io
+      repository: bitnamilegacy/mariadb
       tag: 11.4.4-debian-12-r3
     auth:
       # Leave passwords empty to auto-generate secure random passwords
@@ -64,6 +67,19 @@ matomo:
   persistence:
     enabled: true
     size: 10Gi
+
+  # ⚠️  LATENT DELETED-IMAGE LANDMINE — read before enabling optional features.
+  # The matomo 10.0.25 chart still defaults several optional images to
+  # docker.io/bitnami/* coordinates that now 404 on Docker Hub:
+  #   volumePermissions.image -> bitnami/os-shell:12-debian-12-r50
+  #   metrics.image           -> bitnami/apache-exporter:1.0.10-debian-12-r55
+  #   certificates.image      -> bitnami/os-shell:12-debian-12-r50
+  # None of them are rendered today (all three features default to enabled:false,
+  # and volume permissions are handled by the custom busybox initContainer below).
+  # But flipping volumePermissions.enabled, metrics.enabled, or certificates on
+  # would schedule a pod referencing a deleted image and land in an instant
+  # ImagePullBackOff. If you enable any of them, override the corresponding
+  # image.repository to the bitnamilegacy/* equivalent at the same time.
 
   # Init container to fix volume permissions for Bitnami image
   initContainers:

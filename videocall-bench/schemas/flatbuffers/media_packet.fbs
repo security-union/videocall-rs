@@ -1,0 +1,49 @@
+namespace videocall.bench;
+
+enum MediaType : byte {
+  Unknown = 0,
+  Video = 1,
+  Audio = 2,
+  Screen = 3,
+  Heartbeat = 4,
+  Rtt = 5,
+}
+
+enum VideoCodec : byte {
+  Unspecified = 0,
+  Vp8 = 1,
+  Vp9Profile0Level10_8bit = 2,
+}
+
+table AudioMetadata {
+  audio_format: string;
+  audio_number_of_channels: uint32;
+  audio_number_of_frames: uint32;
+  audio_sample_rate: float32;
+  sequence: uint64;
+}
+
+table VideoMetadata {
+  sequence: uint64;
+  codec: VideoCodec;
+}
+
+table HeartbeatMetadata {
+  video_enabled: bool;
+  audio_enabled: bool;
+  screen_enabled: bool;
+}
+
+table MediaPacket {
+  media_type: MediaType;
+  email: string;
+  data: [ubyte];
+  frame_type: string;
+  timestamp: float64;
+  duration: float64;
+  audio_metadata: AudioMetadata;
+  video_metadata: VideoMetadata;
+  heartbeat_metadata: HeartbeatMetadata;
+}
+
+root_type MediaPacket;
